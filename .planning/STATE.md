@@ -12,10 +12,10 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 **Phase:** 1 of 7 (Foundation & Agentic Contracts)
 **Current Plan:** 4
 **Total Plans in Phase:** 4
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-21
 
-**Progress:** [████████░░] 75%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -30,6 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 01 P03 | 15min | 3 tasks | 15 files |
 
 *Updated after each plan completion*
+| Phase 01 P04 | 37min | 3 tasks | 18 files |
 
 ## Accumulated Context
 
@@ -50,6 +51,10 @@ Recent decisions affecting current work:
 - [Phase 01]: Secret chain encodes the LOCKED order (env tokens → keyring → USER/PASSWORD) — BasicEnvStore is separate so keyring comes before basic; KeyringStore resolve fails soft, set/delete surface errors
 - [Phase 01]: profile add skips pre-resolution (--profile naming a NEW profile must not fail); add's envelope echoes post-add active state; config save re-asserts 0600 on overwrite
 - [Phase 01]: URL trailing-slash normalization pinned in goldens (typed url::Url beats storing strings); ActionOutput::render_json is monomorphic per-variant (Serialize not dyn-compatible)
+- [Phase 01]: [Phase 01]: GatewayApi locked on async_trait, ONE coarse method (gateway_info) — Phase 2 grows it by capability; auth headers token-XOR-basic enforced by a match, Secret::expose() confined to the single header-construction site
+- [Phase 01]: [Phase 01]: version behavior matrix LOCKED — unreachable gateway → exit 0 + warning inside data (never a top-level field); refusal (exit 6) only when the gateway ANSWERED <8.3.1/unparseable; SecretUnavailable degrades to header-less via resolve_secret_opt, never blocks version
+- [Phase 01]: [Phase 01]: below_minimum compares against plain semver 8.3.1 (research sketch's 8.3.1.0 constant cannot parse — semver is strict); GatewayInfo carries a serde(skip) endpoint field so action-built GatewayTooOld populates CORE-05
+- [Phase 01]: [Phase 01]: completions print RAW to stdout regardless of --json (the one sanctioned success-path exception, README-documented) and dispatch before config load; require_confirmation guard (exit 2, hint names --yes + IGNITION_YES=1) pinned in main.rs, #[expect(dead_code)] until Phase 3's first destructive caller
 
 ### Pending Todos
 
@@ -64,7 +69,7 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-21T17:00:44Z
-**Last Date:** 2026-08-21T17:00:44Z
-**Stopped At:** Completed 01-03-PLAN.md (profiles, config, secrets: TOML config + SecretStore seam + profile subcommands + keyring smoke CI)
+**Last session:** 2026-08-21T17:41:15.851Z
+**Last Date:** 2026-08-21T17:41:15.851Z
+**Stopped At:** Completed 01-04-PLAN.md (Phase 1 complete: gateway seam, version matrix, completions, guard — CORE-01..08 all test-enforced)
 **Resume file:** None
