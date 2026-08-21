@@ -1,0 +1,5264 @@
+{
+ "info": {
+  "title": "Ignition HTTP API",
+  "description": "### About this page\nThis specification covers all public HTTP API endpoints for the Ignition platform and currently\ninstalled modules. It is intended to be used by developers to understand the capabilities and\ndata formats used by the API. This documentation is generated from the\n[OpenAPI](https://www.openapis.org/) specification document which is available in JSON format\n[here](/openapi.json).\n",
+  "contact": {
+   "url": "https://support.inductiveautomation.com/",
+   "email": "support@inductiveautomation.com"
+  },
+  "license": {
+   "name": "Inductive Automation EULA",
+   "url": "https://inductiveautomation.com/ignition/license"
+  },
+  "version": "1.0.0",
+  "x-logo": {
+   "url": "/res/sys/img/homepage/gw_hp_ignition_logo.png",
+   "altText": "Ignition by Inductive Automation"
+  }
+ },
+ "paths": {
+  "/data/api/v1/designer/{id}": {
+   "get": {
+    "tags": [
+     "designer-sessions"
+    ],
+    "summary": "Designer Session Details",
+    "description": "Get details about a specific designer session.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "description": "The public ID of the designer session.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "404": {
+      "description": "The designer session was not found."
+     },
+     "200": {
+      "description": "The designer session details.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "id": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "user": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "uptime": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "lastcomm": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "timeout": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "memory": {
+           "type": "object",
+           "properties": {
+            "used": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            },
+            "max": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "project": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "address": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "timezone": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   },
+   "delete": {
+    "tags": [
+     "designer-sessions"
+    ],
+    "summary": "Prune Designer Session",
+    "description": "Prune a dormant designer session.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "description": "The public ID of the designer session.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "401": {
+      "description": "The user is not authorized to prune the session."
+     },
+     "404": {
+      "description": "The designer session was not found."
+     },
+     "200": {
+      "description": "The session was pruned.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "message": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/designers": {
+   "get": {
+    "tags": [
+     "designer-sessions"
+    ],
+    "summary": "Designer Sessions",
+    "description": "Get a list of active designer sessions.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "user": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "uptime": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "lastcomm": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "timeout": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "memory": {
+              "type": "object",
+              "properties": {
+               "used": {
+                "type": "number",
+                "x-ignition-non-secret": false
+               },
+               "max": {
+                "type": "number",
+                "x-ignition-non-secret": false
+               }
+              },
+              "x-ignition-non-secret": false
+             },
+             "project": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "address": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "timezone": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          },
+          "metrics": {
+           "type": "object",
+           "additionalProperties": {
+            "oneOf": [
+             {
+              "$ref": "#/components/schemas/CounterMetric"
+             },
+             {
+              "$ref": "#/components/schemas/GaugeMetric"
+             },
+             {
+              "$ref": "#/components/schemas/MeterMetric"
+             },
+             {
+              "$ref": "#/components/schemas/TimerMetric"
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/diagnostics/bundle/download": {
+   "get": {
+    "tags": [
+     "thread-diagnostics"
+    ],
+    "summary": "Download Diagnostics Bundle",
+    "description": "Download the most recently generated diagnostics bundle.",
+    "parameters": [],
+    "responses": {},
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/diagnostics/bundle/generate": {
+   "post": {
+    "tags": [
+     "thread-diagnostics"
+    ],
+    "summary": "Diagnostics Generate Bundle",
+    "description": "Generate a new diagnostics bundle.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Generation started successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "properties": {
+          "state": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/diagnostics/bundle/status": {
+   "get": {
+    "tags": [
+     "thread-diagnostics"
+    ],
+    "summary": "Diagnostics Bundle Status",
+    "description": "The current status of the diagnostics bundle.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "State retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "properties": {
+          "state": {
+           "type": "string"
+          },
+          "fileSize": {
+           "type": "integer"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/diagnostics/threads/deadlocks": {
+   "get": {
+    "tags": [
+     "thread-diagnostics"
+    ],
+    "summary": "Deadlocked Threads",
+    "description": "A list of thread Ids for threads that are deadlocked.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "List of deadlocked threads retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "deadlocks": {
+           "type": "array",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/diagnostics/threads/dump/formatted": {
+   "get": {
+    "tags": [
+     "thread-diagnostics"
+    ],
+    "summary": "Thread Dump (Formatted)",
+    "description": "Thread dump in legacy format for backward compatibility. Note: Not all fields in response shape are guaranteed.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Thread dump retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "properties": {
+          "version": {
+           "type": "string"
+          },
+          "threads": {
+           "type": "array",
+           "items": {
+            "properties": {
+             "name": {
+              "type": "string"
+             },
+             "id": {
+              "type": "integer"
+             },
+             "state": {
+              "type": "string"
+             },
+             "daemon": {
+              "type": "boolean"
+             },
+             "system": {
+              "type": "string"
+             },
+             "scope": {
+              "type": "string"
+             },
+             "cpuUsage": {
+              "type": "number"
+             },
+             "waitingFor": {
+              "type": "object",
+              "properties": {
+               "lock": {
+                "type": "string"
+               }
+              }
+             },
+             "stacktrace": {
+              "type": "array",
+              "items": {
+               "type": "string"
+              }
+             },
+             "lockedMonitors": {
+              "type": "array",
+              "items": {
+               "type": "object",
+               "properties": {
+                "lock": {
+                 "type": "string"
+                },
+                "frame": {
+                 "type": "string"
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/diagnostics/threads/threaddump": {
+   "get": {
+    "tags": [
+     "thread-diagnostics"
+    ],
+    "summary": "Thread Dump",
+    "description": "An object containing information about the various threads running on the Ignition Gateway.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "threadId": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "name": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "shortName": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "tpcSystem": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "tpcScope": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "threadState": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "cpu": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "daemon": {
+              "type": "boolean",
+              "x-ignition-non-secret": false
+             },
+             "stacktrace": {
+              "type": "object",
+              "properties": {
+               "header": {
+                "type": "string",
+                "x-ignition-non-secret": false
+               },
+               "elements": {
+                "type": "array",
+                "items": {
+                 "type": "string",
+                 "elements": "string"
+                },
+                "x-ignition-non-secret": false
+               }
+              },
+              "x-ignition-non-secret": false
+             },
+             "monitors": {
+              "type": "array",
+              "items": {
+               "type": "string",
+               "monitors": "string"
+              },
+              "x-ignition-non-secret": false
+             },
+             "locks": {
+              "type": "array",
+              "items": {
+               "type": "string",
+               "locks": "string"
+              },
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/gateway-info": {
+   "get": {
+    "tags": [
+     "gateway-info"
+    ],
+    "summary": "Gateway Info",
+    "description": "Information about this gateway.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Gateway information returned successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "name": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "redundancyRole": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "edition": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "hostname": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "port": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "ignitionVersion": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "deploymentMode": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "timeZone": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "timeZoneId": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "jvmVersion": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "allowUnsignedModules": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "license": {
+           "type": "object",
+           "properties": {
+            "mode": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "validForVersion": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            },
+            "expirationDate": {
+             "type": "string",
+             "format": "date-time",
+             "x-ignition-non-secret": false
+            },
+            "licenseRestrictions": {
+             "type": "array",
+             "items": {
+              "type": "object",
+              "properties": {
+               "name": {
+                "type": "string",
+                "x-ignition-non-secret": false
+               },
+               "value": {
+                "type": "string",
+                "x-ignition-non-secret": false
+               }
+              }
+             },
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs": {
+   "get": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Logs",
+    "description": "Returns logs from the Ignition Gateway. Accepts query parameters in order to filter the result set.",
+    "parameters": [
+     {
+      "name": "properties",
+      "in": "query",
+      "description": "Filters logs using the logger's MDC filtering properties. Must be provided in pairs as a list of strings.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "properties": "role,server,module-name,OPC-UA"
+       }
+      }
+     },
+     {
+      "name": "minLevel",
+      "in": "query",
+      "description": "Returned logs will be of level 'minLevel' and higher. One of [TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF]",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "minLevel": "DEBUG"
+       }
+      }
+     },
+     {
+      "name": "allowedMarkers",
+      "in": "query",
+      "description": "List of strings of allowed system event IDs.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "allowedMarkers": "clockDrift,metroConnectionEvent"
+       }
+      }
+     },
+     {
+      "name": "startTime",
+      "in": "query",
+      "description": "Include results starting from this timestamp (Epoch millis).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "number",
+       "example": {
+        "startTime": 1714413384736
+       }
+      }
+     },
+     {
+      "name": "endTime",
+      "in": "query",
+      "description": "Include results up to this timestamp (Epoch millis).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "number",
+       "example": {
+        "endTime": 1714413481459
+       }
+      }
+     },
+     {
+      "name": "logger",
+      "in": "query",
+      "description": "Filter for particular loggers by name.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "logger": "Reporting"
+       }
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "properties": {
+             "timestamp": {
+              "type": "integer"
+             },
+             "loggerName": {
+              "type": "string"
+             },
+             "level": {
+              "type": "string"
+             },
+             "message": {
+              "type": "string"
+             },
+             "stack": {
+              "type": "array"
+             },
+             "mdc": {
+              "type": "object"
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/download": {
+   "get": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Download Logs",
+    "description": "Download a copy of the system log from the internal database.",
+    "parameters": [],
+    "responses": {},
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/levelreset": {
+   "post": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Reset Logger Levels",
+    "description": "Resets all of the logger levels to their default level.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Levels reset successfully. List of Loggers returned."
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/loggers": {
+   "get": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Loggers",
+    "description": "Returns a list of all the loggers, their current levels, and the name of the context in which they live.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "name": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "level": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "context": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/loggers/{loggerName}": {
+   "post": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Set Logger Level",
+    "description": "Set level for a specific logger.",
+    "parameters": [
+     {
+      "name": "loggerName",
+      "in": "path",
+      "description": "The name of the logger.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "level",
+      "in": "query",
+      "description": "The desired logger level. One of [TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF]",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "level": "DEBUG"
+       }
+      }
+     }
+    ],
+    "responses": {},
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/monitoring-session": {
+   "post": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Monitoring Session Logs",
+    "description": "Creates a logging session that allows setting of levels and filters that will expire when the web session does. Logging levels will be set back to their defaults once this session expires.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "requestBody": {
+     "description": "A JSON object containing the MDC filtering criteria and the log level to set.",
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "sessionKey": {
+          "description": "Unique identifier to use for this monitored session. Gets used in conjunction with the servlet session id.",
+          "type": "string",
+          "x-ignition-non-secret": true
+         },
+         "level": {
+          "description": "The level to set the logger.",
+          "type": "string",
+          "enum": [
+           "TRACE",
+           "DEBUG",
+           "INFO",
+           "WARN",
+           "ERROR",
+           "FATAL",
+           "OFF"
+          ],
+          "x-ignition-non-secret": false
+         },
+         "filters": {
+          "description": "List of key:value pairs for MDC filtering.",
+          "type": "array",
+          "items": {
+           "type": "object"
+          },
+          "x-ignition-non-secret": false
+         },
+         "since": {
+          "description": "Time to start showing logging events from.",
+          "type": "number",
+          "x-ignition-non-secret": false
+         }
+        }
+       },
+       "example": {
+        "sessionKey": "my_database_session_name",
+        "level": "TRACE",
+        "filters": [
+         {
+          "database": "example_connection_name"
+         }
+        ],
+        "since": 0
+       }
+      }
+     }
+    },
+    "responses": {
+     "400": {
+      "description": "Malformed body or missing parameter"
+     },
+     "500": {
+      "description": "Error retreiving monitoring session."
+     },
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "properties": {
+             "timestamp": {
+              "type": "integer"
+             },
+             "loggerName": {
+              "type": "string"
+             },
+             "level": {
+              "type": "string"
+             },
+             "message": {
+              "type": "string"
+             },
+             "stack": {
+              "type": "array"
+             },
+             "mdc": {
+              "type": "object"
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/properties": {
+   "post": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Modify Logger Context Properties (Bulk)",
+    "description": "Bulk operation for setting or removing LoggingFilter properties. In a POST body, supply a JSON\nobject in the following shapes. For adding new properties:\n```\n{\n    \"apply\": [\n        {\n            \"key\": \"route-group\",\n            \"vals\": [\n                \"config\"\n            ],\n            \"lvl\": \"DEBUG\"\n        }\n    ]\n}\n```\nTo remove properties:\n```\n{\n    \"remove\": [\n        {\n            \"key\": \"route-group\",\n            \"vals\": [\n                \"config\"\n            ],\n            \"lvl\": \"DEBUG\"\n        }\n    ]\n}\n```\n",
+    "parameters": [],
+    "responses": {},
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/properties/applied": {
+   "get": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Applied Logger Context Properties",
+    "description": "A JSON Object containing the all currently applied logging properties.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "key": {
+              "type": "string",
+              "x-ignition-non-secret": true
+             },
+             "values": {
+              "type": "array",
+              "items": {
+               "type": "object",
+               "properties": {
+                "value": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                },
+                "lvl": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                }
+               }
+              },
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/properties/registered": {
+   "get": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Registered Logger Context Properties",
+    "description": "A JSON Object containing the all currently registered logging properties.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "key": {
+              "type": "string",
+              "x-ignition-non-secret": true
+             },
+             "values": {
+              "type": "array",
+              "items": {
+               "type": "string",
+               "values": "string"
+              },
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/logs/properties/{key}": {
+   "post": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Add Logger Context Property",
+    "description": "Adds the specified property to the current logging context.",
+    "parameters": [
+     {
+      "name": "key",
+      "in": "path",
+      "description": "The registry key to  add.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "value",
+      "in": "query",
+      "description": "The name of the logger property to set.",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "value": "client"
+       }
+      }
+     },
+     {
+      "name": "level",
+      "in": "query",
+      "description": "The level to set the specified logger. One of [TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF]",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "level": "DEBUG"
+       }
+      }
+     }
+    ],
+    "responses": {},
+    "deprecated": false,
+    "x-internal": false
+   },
+   "delete": {
+    "tags": [
+     "logging"
+    ],
+    "summary": "Remove Logger Context Property",
+    "description": "Removes the specified property from the current logging context. If only the key is specified, all values under that key will be removed.",
+    "parameters": [
+     {
+      "name": "key",
+      "in": "path",
+      "description": "The property key to remove.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "value",
+      "in": "query",
+      "description": "The name of the logger property to set.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "value": "client"
+       }
+      }
+     },
+     {
+      "name": "level",
+      "in": "query",
+      "description": "The level to set the specified logger. One of [TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF]",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "level": "DEBUG"
+       }
+      }
+     }
+    ],
+    "responses": {},
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/certificate": {
+   "get": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "View Certificate Information",
+    "description": "Get details about the certificate for a given module.",
+    "parameters": [
+     {
+      "name": "moduleId",
+      "in": "query",
+      "description": "The ID of the module to get the certificate for.",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "moduleId": "com.example.moduleid"
+       }
+      }
+     }
+    ],
+    "responses": {
+     "500": {
+      "description": "Error retrieving the certificate."
+     },
+     "404": {
+      "description": "No certificate found for module."
+     },
+     "200": {
+      "description": "Module certificate returned successfully",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "notValidAfter": {
+           "type": "string",
+           "format": "date-time",
+           "x-ignition-non-secret": false
+          },
+          "notValidBefore": {
+           "type": "string",
+           "format": "date-time",
+           "x-ignition-non-secret": false
+          },
+          "subjectName": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "issuerName": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "selfSigned": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "serialNumber": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   },
+   "post": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Accept Certificate",
+    "description": "Accept a module's certificate.",
+    "parameters": [
+     {
+      "name": "moduleId",
+      "in": "query",
+      "description": "The ID of the module to accept the certificate for.",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "moduleId": "com.example.moduleid"
+       }
+      }
+     }
+    ],
+    "responses": {
+     "400": {
+      "description": "Required parameter or certificate missing."
+     },
+     "200": {
+      "description": "Module certificate accepted.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "success": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "message": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Certificate already accepted."
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/eula": {
+   "get": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "View EULA",
+    "description": "Retrieves the given module's EULA as HTML.",
+    "parameters": [
+     {
+      "name": "moduleId",
+      "in": "query",
+      "description": "The ID of the module to retrieve the EULA from.",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "moduleId": "com.example.moduleid"
+       }
+      }
+     }
+    ],
+    "responses": {
+     "500": {
+      "description": "Error retrieving EULA from module."
+     },
+     "404": {
+      "description": "No EULA found for module."
+     },
+     "200": {
+      "description": "EULA successfully retrieved for module."
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   },
+   "post": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Accept EULA",
+    "description": "Accept a module's EULA",
+    "parameters": [
+     {
+      "name": "moduleId",
+      "in": "query",
+      "description": "The ID of the module to accept the EULA for.",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "moduleId": "com.example.moduleid"
+       }
+      }
+     }
+    ],
+    "responses": {
+     "400": {
+      "description": "Required parameter or license file missing."
+     },
+     "200": {
+      "description": "EULA accepted successfully",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "success": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "message": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "EULA already accepted."
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/healthy": {
+   "get": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "All Healthy Modules",
+    "description": "A list of all \"healthy\" (non-quarantined) modules on this Ignition Gateway.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "description": "The ID of the module.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "onStartup": {
+              "description": "The action to be performed on the module on the next gateway startup.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "shouldUpgrade": {
+              "description": "Module is pending upgrade on next gateway startup.",
+              "type": "boolean",
+              "x-ignition-non-secret": false
+             },
+             "name": {
+              "description": "The module name.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "version": {
+              "description": "Module version.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "description": {
+              "description": "Module description. Only available on fully loaded modules.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "docUrl": {
+              "description": "URL to module documentation, if available. Only available on fully loaded modules.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "vendorId": {
+              "description": "Vendor ID. Only available on fully loaded modules.",
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "vendorName": {
+              "description": "Vendor Name. Only available on fully loaded modules.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "selfSigned": {
+              "description": "If this module is signed with a self-signed certificate.",
+              "type": "boolean",
+              "x-ignition-non-secret": false
+             },
+             "state": {
+              "description": "Module state. Only available on fully loaded modules.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "faultCause": {
+              "description": "For modules that fail to load, this is the provided fault cause.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "exception": {
+              "description": "For modules that fail to load, this is the exception thrown.",
+              "type": "object",
+              "properties": {
+               "message": {
+                "type": "string"
+               },
+               "stacktrace": {
+                "type": "array",
+                "items": {
+                 "type": "string"
+                }
+               }
+              }
+             },
+             "faultTime": {
+              "description": "For modules that fail to load, this is the time of the fault.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "licenseState": {
+              "description": "Module license state. Only available on fully loaded modules.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "startupTime": {
+              "description": "The time the module started. Only available on fully loaded modules.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "restrictions": {
+              "description": "License parameters/restriction for the module. Only available on fully loaded modules.",
+              "type": "object",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/install": {
+   "post": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Install Module",
+    "description": "Completes installation of a previously uploaded module",
+    "parameters": [
+     {
+      "name": "moduleId",
+      "in": "query",
+      "description": "The moduleId of the module to be installed.",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "moduleId": "com.example.moduleid"
+       }
+      }
+     }
+    ],
+    "responses": {
+     "400": {
+      "description": "Missing parameter: moduleId"
+     },
+     "200": {
+      "description": "Module installed successfully",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "filename": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "onStartup": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "certFingerprint": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "licenseAgreementHash": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "upgradeVersion": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "upgradeFilename": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/quarantined": {
+   "get": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Quarantined Modules",
+    "description": "Information about all quarantined modules on this Ignition Gateway.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "description": "The ID of the module.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "name": {
+              "description": "The module name.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "version": {
+              "description": "Module version.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "certAccepted": {
+              "description": "Whether this module's certificate has already been accepted.",
+              "type": "boolean",
+              "x-ignition-non-secret": false
+             },
+             "licenseAccepted": {
+              "description": "Whether this module's license has already been accepted.",
+              "type": "boolean",
+              "x-ignition-non-secret": false
+             },
+             "reason": {
+              "description": "The reason this module was quarantined.",
+              "type": "string",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/toggle-state": {
+   "put": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Toggle Module State",
+    "description": "Enable and disable Ignition Modules. Allows for operating on multiple modules per request.",
+    "parameters": [],
+    "requestBody": {
+     "description": "A JSON object containing two lists of module IDs. One list for enabling, another for disabling.",
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "enable": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "enable": "string"
+          },
+          "x-ignition-non-secret": false
+         },
+         "disable": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "disable": "string"
+          },
+          "x-ignition-non-secret": false
+         }
+        }
+       },
+       "example": {
+        "enable": [
+         "com.example.moduleid.a",
+         "com.example.moduleid.b"
+        ],
+        "disable": [
+         "com.example.moduleid.c",
+         "com.example.moduleid.d"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "500": {
+      "description": "Error reading request body"
+     },
+     "200": {
+      "description": "An object containing success state, and another object containing lists of modules that failed to enable/disable.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "success": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "failedUpdates": {
+           "type": "object",
+           "properties": {
+            "enable": {
+             "type": "array",
+             "items": {
+              "type": "string",
+              "enable": "string"
+             },
+             "x-ignition-non-secret": false
+            },
+            "disable": {
+             "type": "array",
+             "items": {
+              "type": "string",
+              "disable": "string"
+             },
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/uninstall": {
+   "delete": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Uninstall Module[s]",
+    "description": "Configures module[s] to be uninstalled on the next Gateway restart.",
+    "parameters": [],
+    "requestBody": {
+     "description": "A JSON object containing a list of module IDs to uninstall.",
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "uninstall": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "uninstall": "string"
+          },
+          "x-ignition-non-secret": false
+         }
+        }
+       },
+       "example": {
+        "uninstall": [
+         "com.example.moduleid.a",
+         "com.example.moduleid.b"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "500": {
+      "description": "Error reading request body"
+     },
+     "200": {
+      "description": "Module set for uninstallation successfully",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "success": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "message": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/modules/upload": {
+   "post": {
+    "tags": [
+     "modules"
+    ],
+    "summary": "Upload Module",
+    "description": "Upload an Ignition Module to prepare for installation.",
+    "parameters": [
+     {
+      "name": "fileName",
+      "in": "query",
+      "description": "Used as the filename when the .modl is uploaded to the gateway's file system. This is arbitrary and will result in the module being stored at the module root location (typically `{ignition-install-dir}/user-lib/modules/{fileName}`)",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "example": {
+        "fileName": "Perspective-module-signed.modl"
+       }
+      }
+     }
+    ],
+    "requestBody": {
+     "description": "The module .modl file, sent in the request body as a binary stream",
+     "required": true,
+     "content": {
+      "binary stream": {}
+     }
+    },
+    "responses": {
+     "400": {
+      "description": "Missing parameter: fileName or error reading module file."
+     },
+     "200": {
+      "description": "Module file uploaded successfully",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "moduleId": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "licenseAccepted": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "certAccepted": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "containsEula": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          },
+          "containsCert": {
+           "type": "boolean",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/overview": {
+   "get": {
+    "tags": [
+     "overview"
+    ],
+    "summary": "Gateway Overview",
+    "description": "General status information about this Ignition Gateway.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Overview information retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "version": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "redundancy": {
+           "type": "object",
+           "properties": {
+            "role": {
+             "type": "string",
+             "enum": [
+              "Independent",
+              "Backup",
+              "Master"
+             ],
+             "x-ignition-non-secret": false
+            },
+            "activityLevel": {
+             "type": "string",
+             "enum": [
+              "Undecided",
+              "Cold",
+              "Warm",
+              "Hot",
+              "Active"
+             ],
+             "x-ignition-non-secret": false
+            },
+            "projectState": {
+             "type": "string",
+             "enum": [
+              "Unknown",
+              "Incompatible",
+              "Edition_Incompatible",
+              "Modules_Incompatible",
+              "OutOfDate",
+              "Good"
+             ],
+             "x-ignition-non-secret": false
+            },
+            "localAddress": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "peerStatus": {
+             "type": "object",
+             "properties": {
+              "info": {
+               "type": "object",
+               "properties": {
+                "address": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                },
+                "version": {
+                 "type": "object",
+                 "properties": {
+                  "major": {
+                   "type": "number",
+                   "x-ignition-non-secret": false
+                  },
+                  "minor": {
+                   "type": "number",
+                   "x-ignition-non-secret": false
+                  },
+                  "rev": {
+                   "type": "number",
+                   "x-ignition-non-secret": false
+                  },
+                  "build": {
+                   "type": "number",
+                   "x-ignition-non-secret": false
+                  },
+                  "beta": {
+                   "type": "number",
+                   "x-ignition-non-secret": false
+                  },
+                  "rc": {
+                   "type": "number",
+                   "x-ignition-non-secret": false
+                  },
+                  "dev": {
+                   "type": "boolean",
+                   "x-ignition-non-secret": false
+                  },
+                  "snapshot": {
+                   "type": "boolean",
+                   "x-ignition-non-secret": false
+                  }
+                 },
+                 "x-ignition-non-secret": false
+                },
+                "level": {
+                 "type": "string",
+                 "enum": [
+                  "Undecided",
+                  "Cold",
+                  "Warm",
+                  "Hot",
+                  "Active"
+                 ],
+                 "x-ignition-non-secret": false
+                },
+                "projState": {
+                 "type": "string",
+                 "enum": [
+                  "Unknown",
+                  "Incompatible",
+                  "Edition_Incompatible",
+                  "Modules_Incompatible",
+                  "OutOfDate",
+                  "Good"
+                 ],
+                 "x-ignition-non-secret": false
+                },
+                "moduleHash": {
+                 "type": "number",
+                 "x-ignition-non-secret": false
+                },
+                "activeTime": {
+                 "type": "number",
+                 "x-ignition-non-secret": false
+                },
+                "activeMode": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                },
+                "edition": {
+                 "type": "string",
+                 "enum": [
+                  "",
+                  "edge",
+                  "maker",
+                  "cloud"
+                 ],
+                 "x-ignition-non-secret": false
+                }
+               },
+               "x-ignition-non-secret": false
+              }
+             },
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "java": {
+           "type": "object",
+           "properties": {
+            "version": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "vendor": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "name": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "os": {
+           "type": "object",
+           "properties": {
+            "name": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "arch": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "version": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "cloudEnv": {
+           "type": "object",
+           "x-ignition-non-secret": false
+          },
+          "uptime": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "timezone": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "locale": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "time": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "memory": {
+           "type": "array",
+           "x-ignition-non-secret": false
+          },
+          "cpu": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "disk": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            },
+            "used": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "license": {
+           "type": "object",
+           "properties": {
+            "state": {
+             "type": "string",
+             "x-ignition-non-secret": false
+            },
+            "trialRemaining": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "gatewayName": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "libPath": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "processId": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "nics": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "name": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "displayName": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "address": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             }
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "gcNames": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "driftRate": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/overview/connections": {
+   "get": {
+    "tags": [
+     "overview"
+    ],
+    "summary": "Connections Overview",
+    "description": "A list of various connections (DB, OPC, etc.) on this Ignition Gateway.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "title": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "img": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "actions": {
+              "type": "array",
+              "items": {
+               "type": "object",
+               "properties": {
+                "label": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                },
+                "url": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                }
+               }
+              },
+              "x-ignition-non-secret": false
+             },
+             "lines": {
+              "type": "array",
+              "items": {
+               "type": "object",
+               "properties": {
+                "text": {
+                 "type": "string",
+                 "x-ignition-non-secret": false
+                },
+                "error": {
+                 "type": "boolean",
+                 "x-ignition-non-secret": false
+                }
+               }
+              },
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/overview/gan": {
+   "get": {
+    "tags": [
+     "overview"
+    ],
+    "summary": "Gateway Network",
+    "description": "Information about the Gateway Network.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Gateway Network information retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "totalConnections": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "runningConnections": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "outgoingByteRate": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "incomingByteRate": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "remoteGateways": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/overview/name": {
+   "get": {
+    "tags": [
+     "overview"
+    ],
+    "summary": "Gateway Name",
+    "description": "This Ignition Gateway's name.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Gateway name retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "gatewayName": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "cleanGatewayName": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/overview/problems": {
+   "get": {
+    "tags": [
+     "overview"
+    ],
+    "summary": "Problems Overview",
+    "description": "A list of objects representing problems on the gateway that are considered 'critical'",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "title": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "description": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "resolution": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "url": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "actionLabel": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/restart-tasks/pending": {
+   "get": {
+    "tags": [
+     "restart-tasks"
+    ],
+    "summary": "Get all required restart tasks",
+    "description": "Get a list of all tasks that are currently pending a gateway restart to complete.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "List of all tasks that are currently pending a gateway restart to complete.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "properties": {
+          "pending": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          }
+         },
+         "examples": [
+          {
+           "pending": [
+            "Module Uninstalled: com.test.test",
+            "Module Enabled: com.test.test2"
+           ]
+          }
+         ]
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/restart-tasks/restart": {
+   "post": {
+    "tags": [
+     "restart-tasks"
+    ],
+    "summary": "Restart the Gateway",
+    "description": "Restarts the gateway. **This will be disruptive to anyone currently using this gateway.** Proceed with caution.",
+    "parameters": [
+     {
+      "name": "confirm",
+      "in": "query",
+      "description": "Whether to confirm the restart.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "boolean",
+       "example": {
+        "confirm": "true"
+       }
+      }
+     }
+    ],
+    "responses": {
+     "400": {
+      "description": "Please confirm restart through a 'confirm' query parameter."
+     },
+     "200": {
+      "description": "Gateway will be restarted."
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/systemPerformance/charts": {
+   "get": {
+    "tags": [
+     "system-performance"
+    ],
+    "summary": "Historic Performance Data",
+    "description": "Returns a list of historical gateway CPU and memory usage.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Data retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "cpuChartDatapoints": {
+           "type": "array",
+           "items": {
+            "properties": {
+             "histId": {
+              "type": "integer"
+             },
+             "timestamp": {
+              "type": "integer"
+             },
+             "value": {
+              "type": "number"
+             }
+            }
+           }
+          },
+          "memoryChartDatapoints": {
+           "properties": {
+            "heapMemoryDatapoints": {
+             "type": "array",
+             "items": {
+              "properties": {
+               "histId": {
+                "type": "integer"
+               },
+               "timestamp": {
+                "type": "integer"
+               },
+               "value": {
+                "type": "number"
+               }
+              }
+             }
+            },
+            "nonHeapMemoryDatapoints": {
+             "type": "array",
+             "items": {
+              "properties": {
+               "histId": {
+                "type": "integer"
+               },
+               "timestamp": {
+                "type": "integer"
+               },
+               "value": {
+                "type": "number"
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/systemPerformance/currentGauges": {
+   "get": {
+    "tags": [
+     "system-performance"
+    ],
+    "summary": "Current Performance Data",
+    "description": "Returns an object containing the current gateway CPU and memory usage.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Data retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "cpu": {
+           "type": "number"
+          },
+          "heapMemory": {
+           "type": "number"
+          },
+          "nonHeapMemory": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/systemPerformance/driftEvents": {
+   "get": {
+    "tags": [
+     "system-performance"
+    ],
+    "summary": "System Clock Drift Events",
+    "description": "Returns a list of historical system clock drift events.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Data retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "clockDriftEvents": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "description": {
+              "type": "string"
+             },
+             "status": {
+              "type": "string"
+             },
+             "timestamp": {
+              "type": "integer"
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/systemPerformance/driftGauge": {
+   "get": {
+    "tags": [
+     "system-performance"
+    ],
+    "summary": "Current System Clock Drift",
+    "description": "Returns the current drift of the system clock.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Data retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "clockDrift": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/api/v1/systemPerformance/threads": {
+   "get": {
+    "tags": [
+     "system-performance"
+    ],
+    "summary": "Thread Execution Data",
+    "description": "Return the current number of various types of threads running on the gateway.",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Data retrieved successfully.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "running": {
+           "type": "integer"
+          },
+          "waiting": {
+           "type": "integer"
+          },
+          "timedWaiting": {
+           "type": "integer"
+          },
+          "blocked": {
+           "type": "integer"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/perspective/api/v1/session/{sessionId}": {
+   "get": {
+    "tags": [
+     "perspective-sessions"
+    ],
+    "summary": "Perspective Session Detail",
+    "description": "Returns the details about a single session.",
+    "parameters": [
+     {
+      "name": "sessionId",
+      "in": "path",
+      "description": "ID of the session to return",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "404": {
+      "description": "The session ID does not exist"
+     },
+     "200": {
+      "description": "Success.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "description": "Details about a perspective session",
+         "type": "object",
+         "properties": {
+          "userAgent": {
+           "type": "string"
+          },
+          "id": {
+           "type": "string"
+          },
+          "username": {
+           "type": "string"
+          },
+          "authorized": {
+           "type": "boolean"
+          },
+          "project": {
+           "type": "string"
+          },
+          "clientAddress": {
+           "type": "string"
+          },
+          "lastComm": {
+           "type": "number"
+          },
+          "sessionScope": {
+           "type": "string"
+          },
+          "activePages": {
+           "type": "number"
+          },
+          "recentBytesSent": {
+           "type": "number"
+          },
+          "totalBytesSent": {
+           "type": "number"
+          },
+          "pageIds": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "metrics": {
+           "type": "object",
+           "additionalProperties": {
+            "oneOf": [
+             {
+              "$ref": "#/components/schemas/CounterMetric"
+             },
+             {
+              "$ref": "#/components/schemas/GaugeMetric"
+             },
+             {
+              "$ref": "#/components/schemas/MeterMetric"
+             },
+             {
+              "$ref": "#/components/schemas/TimerMetric"
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/perspective/api/v1/session/{sessionId}/page/{pageId}/views": {
+   "get": {
+    "tags": [
+     "perspective-sessions"
+    ],
+    "summary": "Perspective Views",
+    "description": "Retrieves a list of all views active on a single page of a single session.",
+    "parameters": [
+     {
+      "name": "sessionId",
+      "in": "path",
+      "description": "ID of the session",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "pageId",
+      "in": "path",
+      "description": "ID of the page",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "404": {
+      "description": "The session ID or page ID does not exist"
+     },
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "resourcePath": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "mountPath": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "componentCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "bindingCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/perspective/api/v1/session/{sessionId}/pages": {
+   "get": {
+    "tags": [
+     "perspective-sessions"
+    ],
+    "summary": "Perspective Pages",
+    "description": "Retrieves a list of all pages in a session.",
+    "parameters": [
+     {
+      "name": "sessionId",
+      "in": "path",
+      "description": "ID of the session",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "404": {
+      "description": "The session ID does not exist"
+     },
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "created": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "lastKeepalive": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "roundtrip": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "connectCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "viewCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "componentCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "bindingCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/perspective/api/v1/sessions": {
+   "delete": {
+    "tags": [
+     "perspective-sessions"
+    ],
+    "summary": "Terminate Perspective Session(s)",
+    "description": "Terminates one or more perspective sessions.",
+    "parameters": [
+     {
+      "name": "sessionId",
+      "in": "query",
+      "description": "ID of the session to terminate",
+      "required": true,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     },
+     {
+      "name": "message",
+      "in": "query",
+      "description": "Message to send to the client",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "400": {
+      "description": "The request was malformed."
+     },
+     "404": {
+      "description": "No valid sessions found to close."
+     },
+     "200": {
+      "description": "Success. Returns the number of sessions terminated.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "terminated": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/perspective/api/v1/sessions/": {
+   "get": {
+    "tags": [
+     "perspective-sessions"
+    ],
+    "summary": "Perspective Sessions",
+    "description": "Retrieves a list of all active perspective sessions.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "description": "Details about a perspective session",
+            "type": "object",
+            "properties": {
+             "userAgent": {
+              "type": "string"
+             },
+             "id": {
+              "type": "string"
+             },
+             "username": {
+              "type": "string"
+             },
+             "authorized": {
+              "type": "boolean"
+             },
+             "project": {
+              "type": "string"
+             },
+             "clientAddress": {
+              "type": "string"
+             },
+             "lastComm": {
+              "type": "number"
+             },
+             "sessionScope": {
+              "type": "string"
+             },
+             "activePages": {
+              "type": "number"
+             },
+             "recentBytesSent": {
+              "type": "number"
+             },
+             "totalBytesSent": {
+              "type": "number"
+             },
+             "pageIds": {
+              "type": "array",
+              "items": {
+               "type": "string"
+              }
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/vision/api/v1/client/{id}": {
+   "get": {
+    "tags": [
+     "vision-sessions"
+    ],
+    "summary": "Session Details",
+    "description": "Details of a specific client session.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "description": "The session ID.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Session details",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "id": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "user": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "uptime": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "lastcomm": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "timeout": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          },
+          "memory": {
+           "type": "object",
+           "properties": {
+            "used": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            },
+            "max": {
+             "type": "number",
+             "x-ignition-non-secret": false
+            }
+           },
+           "x-ignition-non-secret": false
+          },
+          "project": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "address": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "timezone": {
+           "type": "string",
+           "x-ignition-non-secret": false
+          },
+          "tagCount": {
+           "type": "number",
+           "x-ignition-non-secret": false
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   },
+   "delete": {
+    "tags": [
+     "vision-sessions"
+    ],
+    "summary": "Terminate Session",
+    "description": "Terminate a specific client session.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "description": "The public ID of the session.",
+      "required": true,
+      "deprecated": false,
+      "style": "simple",
+      "explode": false,
+      "allowReserved": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "401": {
+      "description": "The user is not authorized to terminate the session."
+     },
+     "404": {
+      "description": "The Vision client session was not found"
+     },
+     "200": {
+      "description": "Session terminated",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "message": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  },
+  "/data/vision/api/v1/clients": {
+   "get": {
+    "tags": [
+     "vision-sessions"
+    ],
+    "summary": "Client Sessions",
+    "description": "Lists active client sessions.",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "description": "The maximum number of items to return.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        25
+       ]
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "description": "The number of items to skip before returning results.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": false,
+      "schema": {
+       "type": "integer",
+       "examples": [
+        50
+       ]
+      }
+     },
+     {
+      "name": "sortBy",
+      "in": "query",
+      "description": "The name of a field to sort by. Use `asc(fieldName)` or `desc(fieldName)`\nto specify the sort direction as ascending or descending, respectively.\n",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "asc(field1)"
+       ]
+      }
+     },
+     {
+      "name": "search",
+      "in": "query",
+      "description": "A search string to filter items by. Terms separated by whitespace.",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "string",
+       "examples": [
+        "word"
+       ]
+      }
+     },
+     {
+      "name": "filter",
+      "in": "query",
+      "description": "Filter items by field name, using format like `fieldName[op]=value` where `op` is one of: `eq` (equals), `ne` (not equals), `cn` (contains), `sw` (starts with), `ew` (ends with), `gt` (greater than), `gte` (greater than or equal), `lt` (less than), `lte` (less than or equal), `rgx` (regular expression).",
+      "required": false,
+      "deprecated": false,
+      "style": "form",
+      "explode": true,
+      "allowReserved": true,
+      "schema": {
+       "type": "object",
+       "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_]+\\[(eq|ne|cn|sw|ew|gt|gte|lt|lte|rgx)\\]$"
+       },
+       "additionalProperties": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "examples": [
+        {
+         "field1[eq]": "value",
+         "field2[cn]": "word",
+         "field3[gt]": 42
+        }
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success. Returns a list of items and related metadata.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "user": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "uptime": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "lastcomm": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "timeout": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             },
+             "memory": {
+              "type": "object",
+              "properties": {
+               "used": {
+                "type": "number",
+                "x-ignition-non-secret": false
+               },
+               "max": {
+                "type": "number",
+                "x-ignition-non-secret": false
+               }
+              },
+              "x-ignition-non-secret": false
+             },
+             "project": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "address": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "timezone": {
+              "type": "string",
+              "x-ignition-non-secret": false
+             },
+             "tagCount": {
+              "type": "number",
+              "x-ignition-non-secret": false
+             }
+            }
+           }
+          },
+          "metadata": {
+           "type": "object",
+           "properties": {
+            "total": {
+             "type": "number",
+             "description": "The total number of items available"
+            },
+            "matching": {
+             "type": "number",
+             "description": "The number of items matching the filter and/or search criteria"
+            },
+            "limit": {
+             "type": "number",
+             "description": "The maximum number of items to return, as specified in the query parameter"
+            },
+            "offset": {
+             "type": "number",
+             "description": "The number of items to skip before starting to return items, as specified in the query parameter"
+            }
+           }
+          },
+          "metrics": {
+           "type": "object",
+           "additionalProperties": {
+            "oneOf": [
+             {
+              "$ref": "#/components/schemas/CounterMetric"
+             },
+             {
+              "$ref": "#/components/schemas/GaugeMetric"
+             },
+             {
+              "$ref": "#/components/schemas/MeterMetric"
+             },
+             {
+              "$ref": "#/components/schemas/TimerMetric"
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "deprecated": false,
+    "x-internal": false
+   }
+  }
+ }
+}
