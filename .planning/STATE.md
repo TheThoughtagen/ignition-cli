@@ -9,19 +9,19 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 
 ## Current Position
 
-**Phase:** 1 of 7 (Foundation & Agentic Contracts)
-**Current Plan:** 4
-**Total Plans in Phase:** 4
-**Status:** Phase 1 COMPLETE & VERIFIED (25/25 must-haves, CI green on ubuntu/macos/keyring-smoke — run 32517734178) — ready to plan Phase 2
+**Phase:** 2 of 7 (Gateway Health & Inspection)
+**Current Plan:** 1 of 5 complete (02-01 done) — next: 02-02
+**Total Plans in Phase:** 5
+**Status:** 02-01 COMPLETE (classifier + additive taxonomy + IgnitionMock + live suite; tests/clippy/fmt green) — ready to execute 02-02
 **Last Activity:** 2026-08-21
 
-**Progress:** [██████████] 100%
+**Progress:** [██████░░░░] 56%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Total execution time: 113min
+- Total plans completed: 5
+- Total execution time: 132min
 
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
@@ -29,8 +29,10 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 01 P02 | 53min | 3 tasks | 9 files |
 | Phase 01 P03 | 15min | 3 tasks | 15 files |
 | Phase 01 P04 | 37min | 3 tasks | 18 files |
+| Phase 02 P01 | 19min | 3 tasks | 14 files |
 
 *Updated after each plan completion*
+| Phase 02 P01 | 19min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -56,6 +58,10 @@ Recent decisions affecting current work:
 - [Phase 01]: [Phase 01]: below_minimum compares against plain semver 8.3.1 (research sketch's 8.3.1.0 constant cannot parse — semver is strict); GatewayInfo carries a serde(skip) endpoint field so action-built GatewayTooOld populates CORE-05
 - [Phase 01]: completions print RAW to stdout regardless of --json (the one sanctioned success-path exception, README-documented) and dispatch before config load; require_confirmation guard (exit 2, hint names --yes + IGNITION_YES=1) pinned in main.rs, #[cfg_attr(not(test), expect(dead_code))] until Phase 3's first destructive caller
 - [Phase 01 CI bring-up]: #[expect(dead_code)] on test-exercised fns is unfulfilled in test-target clippy compiles → gate with #[cfg_attr(not(test), expect(...))]; keyring store-unavailable is debug (expected headless condition — warn noise preceded JSON envelopes on stderr); stderr-envelope tests parse from first '{' (log-tolerant)
+- [Phase 02]: [Phase 02-01]: GatewayInfo serializes under gateway-native camelCase keys (rename=ignitionVersion + alias=version) — passthrough-shaped --json data; state/uptime dropped (not on the real payload; 02-02 sources them from /overview + /StatusPing)
+- [Phase 02]: [Phase 02-01]: classify() is the single status→content-type→redirect mapping site running before every .json(); redirect(Policy::none()) pinned so uncommissioned 302s can never masquerade as 200; Basic demoted with a loud per-call warning (dead on 8.3 /data)
+- [Phase 02]: [Phase 02-01]: three ADDITIVE exit-6 slugs (gateway_not_commissioned, gateway_restarting, not_found) + status-aware 401/403 auth hints; wiremock gotchas recorded: set_body_string forces text/plain (use set_body_raw), scoped MockGuard drop unmounts fixtures
+- [Phase 02]: [Phase 02-01]: gateway-info REQUIRES auth under 8.3 default security (header-less → 401 Jetty HTML, re-verified live on the research rig) — 83-api's auth:none tag does not hold; live suite is skip-by-default green no-op
 
 ### Pending Todos
 
@@ -65,11 +71,11 @@ None yet.
 
 - Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF) — resolve at Phase 4 planning
 - Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
-- Phase 2 gap: live-gateway auth verification (token header across /data + /webdev, Basic viability) — resolve empirically in Phase 2
+- ~~Phase 2 gap: live-gateway auth verification (token header across /data + /webdev, Basic viability)~~ CLOSED by 02-01: claims verified empirically during research + wiremock-pinned; executable proof path = live_gateway.rs `-- --ignored` (needs IGNITION_LIVE_URL/IGNITION_LIVE_TOKEN per 02-USER-SETUP.md; research rig `ign-research` still up on port 18088 if a fresh token is created). /webdev half re-checks in Phase 5.
 - ~~Phase 1: smoke-test keyring 4.1 on headless Linux CI~~ CLOSED & CI-CONFIRMED: keyring-smoke job green on ubuntu headless (run 32517734178, 2026-08-21)
 
 ## Session Continuity
 
-**Last session:** 2026-08-21
-**Stopped At:** Phase 1 verified PASSED (25/25, CI green) after pushing repo to github.com/TheThoughtagen/ignition-cli and fixing two CI-only issues (clippy expect gating, keyring debug demotion)
+**Last session:** 2026-08-21T23:07:35.505Z
+**Stopped At:** Completed 02-01-PLAN.md (classifier + taxonomy + harnesses + live suite)
 **Resume file:** None
