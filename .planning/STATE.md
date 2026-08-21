@@ -10,25 +10,26 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 1 of 7 (Foundation & Agentic Contracts)
-**Current Plan:** 3
+**Current Plan:** 4
 **Total Plans in Phase:** 4
 **Status:** Ready to execute
 **Last Activity:** 2026-08-21
 
-**Progress:** [█████░░░░░] 50%
+**Progress:** [████████░░] 75%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Total execution time: 8min
+- Total plans completed: 3
+- Total execution time: 76min
 
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 01 P01 | 8min | 3 tasks | 13 files |
+| Phase 01 P02 | 53min | 3 tasks | 9 files |
+| Phase 01 P03 | 15min | 3 tasks | 15 files |
 
 *Updated after each plan completion*
-| Phase 01 P02 | 53min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -46,6 +47,9 @@ Recent decisions affecting current work:
 - [Phase 01]: [Phase 01]: Agentic output contract FROZEN — envelope exactly {ok,profile,data}/{ok,profile,error}, exit taxonomy 1-7 with stable slugs, errors-on-stderr in all modes; changing shape/slugs/codes is a breaking change for agents
 - [Phase 01]: [Phase 01]: Exit-code table lives in exactly two places (CoreError::exit_code() + README), enforced by the enumerated unit test and snapbox goldens; --compact implies --json, resolved once in RenderMode::resolve
 - [Phase 01]: [Phase 01]: snapbox inline goldens: str! trims leading+trailing newlines, Cow<str> lacks IntoData — use stdout_for_golden (strip println's single trailing newline) and pass &str; isolate IGNITION_CLI_CONFIG per spawn; [..]-elide dynamic values
+- [Phase 01]: Secret chain encodes the LOCKED order (env tokens → keyring → USER/PASSWORD) — BasicEnvStore is separate so keyring comes before basic; KeyringStore resolve fails soft, set/delete surface errors
+- [Phase 01]: profile add skips pre-resolution (--profile naming a NEW profile must not fail); add's envelope echoes post-add active state; config save re-asserts 0600 on overwrite
+- [Phase 01]: URL trailing-slash normalization pinned in goldens (typed url::Url beats storing strings); ActionOutput::render_json is monomorphic per-variant (Serialize not dyn-compatible)
 
 ### Pending Todos
 
@@ -56,11 +60,11 @@ None yet.
 - Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF) — resolve at Phase 4 planning
 - Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
 - Phase 2 gap: live-gateway auth verification (token header across /data + /webdev, Basic viability) — resolve empirically in Phase 2
-- Phase 1: smoke-test keyring 4.1 on headless Linux CI
+- ~~Phase 1: smoke-test keyring 4.1 on headless Linux CI~~ CLOSED 01-03: keyring-smoke CI job (gnome-keyring recipe verbatim from keyring-rs CI); smoke passes locally on macOS
 
 ## Session Continuity
 
-**Last session:** 2026-08-21T16:34:41.700Z
-**Last Date:** 2026-08-21T16:34:41.700Z
-**Stopped At:** Completed 01-02-PLAN.md (agentic output contract: taxonomy, envelopes, render modes, golden harness)
+**Last session:** 2026-08-21T17:00:44Z
+**Last Date:** 2026-08-21T17:00:44Z
+**Stopped At:** Completed 01-03-PLAN.md (profiles, config, secrets: TOML config + SecretStore seam + profile subcommands + keyring smoke CI)
 **Resume file:** None
