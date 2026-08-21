@@ -1,12 +1,16 @@
 //! Wiremock HTTP contract tests for the [`ReqwestGatewayApi`] seam
 //! (research Pattern 5): auth-header construction (token XOR basic XOR
 //! neither — never both), 200 parse, 401 → Auth (exit 5), unreachable →
-//! Network (exit 4).
+//! Network (exit 4), plus the FULL classifier matrix every observed 8.3
+//! gateway error shape maps through (02-RESEARCH §Auth Model 4).
 //!
 //! The base64 literal is `base64("admin:sekret")` — precomputed so the
 //! test needs no base64 dependency; the exact-value matcher on the
 //! `Authorization` header proves reqwest's `basic_auth` encoding.
 
+mod common;
+
+use common::IgnitionMock;
 use ignition_core::client::{GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{Credential, Secret};
 use ignition_core::error::CoreError;
@@ -227,24 +231,17 @@ async fn live_capture_gateway_info_parses() {
 /// `gateway_not_commissioned` (exit 6) with the commissioning hint.
 #[tokio::test]
 async fn redirect_to_welcome_maps_to_not_commissioned() {
-    let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(GATEWAY_INFO_PATH))
-        .respond_with(
-            wiremock::ResponseTemplate::new(302)
-                .insert_header("Location", "/welcome;jsessionid=abc?foo=bar"),
-        )
-        .expect(1)
-        .mount(&server)
+    let mock = IgnitionMock::start().await;
+    mock.redirect(GATEWAY_INFO_PATH, "/welcome;jsessionid=abc?foo=bar")
         .await;
 
-    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
     let err = api.gateway_info().await.expect_err("302 must fail");
     match &err {
         CoreError::GatewayNotCommissioned { endpoint } => {
             assert_eq!(
                 endpoint.as_deref(),
-                Some(format!("{}{}", server.uri(), GATEWAY_INFO_PATH).as_str()),
+                Some(format!("{}{}", mock.uri(), GATEWAY_INFO_PATH).as_str()),
                 "endpoint populated (CORE-05)"
             );
         }
@@ -258,5 +255,164 @@ async fn redirect_to_welcome_maps_to_not_commissioned() {
             .contains("commissioning wizard"),
         "hint names the wizard: {:?}",
         err.hint()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The classifier matrix (02-RESEARCH §Auth Model 4) — every observed
+// live-gateway error shape, each pinned to its LOCKED class + slug + exit
+// code + endpoint + hint substring, driven through IgnitionMock so later
+// plans' scenarios stay 3-liners.
+// ---------------------------------------------------------------------------
+
+/// Shared assertions for a classified matrix scenario.
+async fn classify_scenario(mock: IgnitionMock) -> CoreError {
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let err = api.gateway_info().await.expect_err("scenario must fail");
+    // Internal carries its URL inside the message text instead (the only
+    // variant without an endpoint field); every other class populates
+    // endpoint (CORE-05).
+    if !matches!(err, CoreError::Internal(_)) {
+        assert_eq!(
+            err.endpoint().as_deref(),
+            Some(format!("{}{}", mock.uri(), GATEWAY_INFO_PATH).as_str()),
+            "endpoint populated for every classified scenario (CORE-05)"
+        );
+    }
+    err
+}
+
+/// HTML 401 (the Jetty page /data/api/v1 always answers with) → Auth
+/// (exit 5), hint naming the FULL `name:key` token format — never an
+/// internal decode error on the HTML body.
+#[tokio::test]
+async fn html_401_classifies_auth_with_name_key_hint() {
+    let mock = IgnitionMock::start().await;
+    mock.html_error("GET", GATEWAY_INFO_PATH, 401).await;
+
+    let err = classify_scenario(mock).await;
+    assert!(
+        matches!(&err, CoreError::Auth { status: 401, .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(err.code(), "auth_rejected");
+    assert!(
+        err.hint().expect("hint").contains("name:key"),
+        "401 hint names the name:key format: {:?}",
+        err.hint()
+    );
+}
+
+/// HTML 403 → Auth (exit 5) with the three-part setup hint.
+#[tokio::test]
+async fn html_403_classifies_auth_with_three_parts_hint() {
+    let mock = IgnitionMock::start().await;
+    mock.html_error("GET", GATEWAY_INFO_PATH, 403).await;
+
+    let err = classify_scenario(mock).await;
+    assert!(
+        matches!(&err, CoreError::Auth { status: 403, .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    let hint = err.hint().expect("hint");
+    assert!(
+        hint.contains("three parts") && hint.contains("secure connections"),
+        "403 hint carries the three-part setup: {hint}"
+    );
+}
+
+/// 302 → `/idp/…` (not logged in — shouldn't happen for token auth, but
+/// observed on `/data/app/*`) → Auth class.
+#[tokio::test]
+async fn redirect_to_idp_classifies_auth() {
+    let mock = IgnitionMock::start().await;
+    mock.redirect(GATEWAY_INFO_PATH, "/idp/default/authn/login")
+        .await;
+
+    let err = classify_scenario(mock).await;
+    assert!(
+        matches!(&err, CoreError::Auth { status: 302, .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+}
+
+/// 503 during the restart window (webserver up, services down — verified
+/// lifecycle) → `gateway_restarting` (exit 6) with the `ign wait restart`
+/// hint, never a fatal Network.
+#[tokio::test]
+async fn service_unavailable_classifies_gateway_restarting() {
+    let mock = IgnitionMock::start().await;
+    mock.status_json(
+        "GET",
+        GATEWAY_INFO_PATH,
+        503,
+        serde_json::json!({"message": "Service Unavailable"}),
+    )
+    .await;
+
+    let err = classify_scenario(mock).await;
+    assert!(
+        matches!(&err, CoreError::GatewayRestarting { .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(err.code(), "gateway_restarting");
+    assert!(
+        err.hint().expect("hint").contains("ign wait restart"),
+        "hint names the wait command: {:?}",
+        err.hint()
+    );
+}
+
+/// 404 JSON `{"message": "No route match for path: …"}` → `not_found`
+/// (exit 6) — the shape a pre-8.3 gateway also answers with.
+#[tokio::test]
+async fn not_found_json_classifies_not_found() {
+    let mock = IgnitionMock::start().await;
+    mock.status_json(
+        "GET",
+        GATEWAY_INFO_PATH,
+        404,
+        serde_json::json!({"message": "No route match for path: /data/api/v1/gateway-info"}),
+    )
+    .await;
+
+    let err = classify_scenario(mock).await;
+    assert!(
+        matches!(&err, CoreError::NotFound { .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(err.code(), "not_found");
+    assert!(
+        err.hint().expect("hint").contains("pre-8.3"),
+        "hint mentions the pre-8.3 possibility: {:?}",
+        err.hint()
+    );
+}
+
+/// Unclassifiable 500 HTML → Internal (exit 1) with the Jetty page's own
+/// sniffed `Error 500` detail folded into the message (not a bare
+/// `.json()` decode crash).
+#[tokio::test]
+async fn internal_500_html_sniffs_detail() {
+    let mock = IgnitionMock::start().await;
+    mock.html_error("GET", GATEWAY_INFO_PATH, 500).await;
+
+    let err = classify_scenario(mock).await;
+    let CoreError::Internal(message) = &err else {
+        panic!("wrong class: {err}")
+    };
+    assert_eq!(err.exit_code(), 1);
+    assert!(
+        message.contains("Error 500"),
+        "message carries the sniffed Jetty title: {message}"
+    );
+    assert!(
+        message.contains("Server Error"),
+        "message carries the sniffed MESSAGE row: {message}"
     );
 }

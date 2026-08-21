@@ -29,6 +29,7 @@
 use std::time::Duration;
 
 mod classify;
+pub mod query;
 pub mod version;
 
 use crate::client::version::GatewayInfo;
@@ -112,16 +113,21 @@ impl ReqwestGatewayApi {
         request
     }
 
-    /// GET `path` → classify → deserialize into `T`. `auth = false`
-    /// fetches header-less (the `/StatusPing` readiness probe, 02-02 —
-    /// it must work with broken credentials).
+    /// GET `path` (with the standard [`ListQuery`] params when given) →
+    /// classify → deserialize into `T`. `auth = false` fetches header-less
+    /// (the `/StatusPing` readiness probe, 02-02 — it must work with
+    /// broken credentials).
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
+        query: Option<&query::ListQuery>,
         auth: bool,
     ) -> Result<T, CoreError> {
         let url = self.url_for(path);
         let mut request = self.client.get(url.clone());
+        if let Some(query) = query {
+            request = request.query(&query.to_query_pairs());
+        }
         if auth {
             request = self.apply_auth(request);
         }
@@ -182,7 +188,7 @@ fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
 #[async_trait::async_trait]
 impl GatewayApi for ReqwestGatewayApi {
     async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
-        let mut info: GatewayInfo = self.get_json(GATEWAY_INFO_PATH, true).await?;
+        let mut info: GatewayInfo = self.get_json(GATEWAY_INFO_PATH, None, true).await?;
         info.endpoint = Some(self.url_for(GATEWAY_INFO_PATH).to_string());
         Ok(info)
     }
