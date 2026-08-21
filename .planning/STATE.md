@@ -9,29 +9,23 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 
 ## Current Position
 
-Phase: 1 of 7 (Foundation & Agentic Contracts)
-Plan: 0 of 4 in current phase
-Status: Ready to plan
-Last activity: 2026-08-21 — Roadmap created (7 phases, 53/53 requirements mapped)
+**Phase:** 1 of 7 (Foundation & Agentic Contracts)
+**Current Plan:** 2 of 4
+**Total Plans in Phase:** 4
+**Status:** Ready to execute
+**Last Activity:** 2026-08-21
 
-Progress: [░░░░░░░░░░] 0%
+**Progress:** [███░░░░░░░] 25%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: -
+- Total plans completed: 1
+- Total execution time: 8min
 
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| - | - | - | - |
-
-**Recent Trend:**
-- Last 5 plans: -
-- Trend: -
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 01 P01 | 8min | 3 tasks | 13 files |
 
 *Updated after each plan completion*
 
@@ -44,6 +38,10 @@ Recent decisions affecting current work:
 
 - Roadmap: 7-phase order follows research convergence — contracts → inspection → projects → rig → WebDev/tags → TUI → interop (rig before WebDev: rig is the self-managed fixture; TUI last: consumes finished action surface)
 - Roadmap: `ign script run` command surfaces in Phase 7 per orchestrator call (scriptExec route ships in Phase 5's webdev/ sources; security posture is a Phase 5 spike)
+- [Phase 01]: MSRV locked at 1.88 (keyring 4.1.x floor), correcting STACK.md's 1.85
+- [Phase 01]: Workspace shape final from commit one: three crates (ignition-cli bin 'ign' / ignition-core lib / ignition-tui zero-dep stub), tui feature gate default-on, no Windows CI
+- [Phase 01]: CLI contract chassis: five global clap args defined once, main() -> ExitCode single exit point, env defaults in exactly one function, stderr-only diagnostics
+- [Phase 01]: Edition 2024 let-chains in apply_env_defaults keep clippy -D warnings clean without allows
 
 ### Pending Todos
 
@@ -58,6 +56,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-21
-Stopped at: ROADMAP.md, STATE.md written; REQUIREMENTS.md traceability updated. Phase 1 ready for `/gsd-plan-phase 1`.
-Resume file: None
+**Last session:** 2026-08-21T15:33:18.810Z
+**Last Date:** 2026-08-21T15:33:18.810Z
+**Stopped At:** Completed 01-01-PLAN.md (workspace skeleton + CLI chassis; CI committed)
+**Resume file:** None
