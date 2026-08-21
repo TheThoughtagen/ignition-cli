@@ -2,8 +2,8 @@
 //! subcommand enum.
 //!
 //! Placement rules (Phase 1 research, Pattern 1):
-//! - Globals use `global = true` so they propagate to every subcommand;
-//!   subcommand structs never redeclare them.
+//! - Globals set the `global` arg attribute so they propagate to every
+//!   subcommand; subcommand structs never redeclare them.
 //! - Never mark a global arg `required` (clap rejects required globals).
 
 use clap::{ArgAction, Parser, Subcommand};

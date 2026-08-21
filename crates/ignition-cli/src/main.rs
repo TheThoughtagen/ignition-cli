@@ -8,7 +8,8 @@
 //! - Env→flag precedence happens in exactly ONE place: [`apply_env_defaults`].
 //! - Diagnostics go to stderr only ([`init_tracing`]); stdout is reserved for
 //!   data output.
-//! - No `std::process::exit` anywhere outside clap's `Error::exit`.
+//! - No direct exit calls anywhere outside clap's `Error::exit` (the Phase-1
+//!   single-exit-point discipline).
 
 mod cli;
 
