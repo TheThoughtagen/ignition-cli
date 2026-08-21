@@ -7,15 +7,16 @@
 //! Invariants (ARCHITECTURE.md layering, made structural in Phase 1):
 //! - Core compiles without clap and without ratatui.
 //! - Core never prints to stdout — it returns models; the binary renders.
-//! - Actions are plain functions over injected [`GatewayApi`]-style seams, so
-//!   the CLI and the TUI call the same code.
+//! - Actions are plain functions over injected [`client::GatewayApi`]-style
+//!   seams, so the CLI and the TUI call the same code.
 //!
-//! Modules `client` is added by the later plans of Phase 1; `error` (the
-//! LOCKED exit-code taxonomy + failure envelope), `output` (the LOCKED
-//! success envelope), `config` (discovery, profiles, secrets), and
-//! `actions` (the shared verb layer) are the contract core.
+//! Module map: `error` (the LOCKED exit-code taxonomy + failure envelope),
+//! `output` (the LOCKED success envelope), `config` (discovery, profiles,
+//! secrets), `client` (the [`client::GatewayApi`] seam + GatewayInfo), and
+//! `actions` (the shared verb layer).
 
 pub mod actions;
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod output;
