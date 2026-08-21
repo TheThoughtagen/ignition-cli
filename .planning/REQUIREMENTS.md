@@ -126,13 +126,65 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (to be filled by roadmap) | | |
+| CORE-01 | Phase 1 | Pending |
+| CORE-02 | Phase 1 | Pending |
+| CORE-03 | Phase 1 | Pending |
+| CORE-04 | Phase 1 | Pending |
+| CORE-05 | Phase 1 | Pending |
+| CORE-06 | Phase 1 | Pending |
+| CORE-07 | Phase 1 | Pending |
+| CORE-08 | Phase 1 | Pending |
+| HLTH-01 | Phase 2 | Pending |
+| HLTH-02 | Phase 2 | Pending |
+| HLTH-03 | Phase 2 | Pending |
+| HLTH-04 | Phase 2 | Pending |
+| HLTH-05 | Phase 2 | Pending |
+| HLTH-06 | Phase 2 | Pending |
+| HLTH-07 | Phase 2 | Pending |
+| HLTH-08 | Phase 2 | Pending |
+| HLTH-09 | Phase 2 | Pending |
+| HLTH-10 | Phase 2 | Pending |
+| HLTH-11 | Phase 2 | Pending |
+| PROJ-01 | Phase 3 | Pending |
+| PROJ-02 | Phase 3 | Pending |
+| PROJ-03 | Phase 3 | Pending |
+| PROJ-04 | Phase 3 | Pending |
+| PROJ-05 | Phase 3 | Pending |
+| RIG-01 | Phase 4 | Pending |
+| RIG-02 | Phase 4 | Pending |
+| RIG-03 | Phase 4 | Pending |
+| RIG-04 | Phase 4 | Pending |
+| WEB-01 | Phase 5 | Pending |
+| WEB-02 | Phase 5 | Pending |
+| TAGS-01 | Phase 5 | Pending |
+| TAGS-02 | Phase 5 | Pending |
+| TAGS-03 | Phase 5 | Pending |
+| TAGS-04 | Phase 5 | Pending |
+| TAGS-05 | Phase 5 | Pending |
+| TAGS-06 | Phase 5 | Pending |
+| TAGS-07 | Phase 5 | Pending |
+| TAGS-08 | Phase 5 | Pending |
+| TAGS-09 | Phase 5 | Pending |
+| TUI-01 | Phase 6 | Pending |
+| TUI-02 | Phase 6 | Pending |
+| TUI-03 | Phase 6 | Pending |
+| TUI-04 | Phase 6 | Pending |
+| TUI-05 | Phase 6 | Pending |
+| TUI-06 | Phase 6 | Pending |
+| SYNC-01 | Phase 7 | Pending |
+| SYNC-02 | Phase 7 | Pending |
+| SCRPT-01 | Phase 7 | Pending |
+| BKUP-01 | Phase 7 | Pending |
+| BKUP-02 | Phase 7 | Pending |
+| INTR-01 | Phase 7 | Pending |
+| INTR-02 | Phase 7 | Pending |
+| INTR-03 | Phase 7 | Pending |
 
 **Coverage:**
-- v1 requirements: 46 total
-- Mapped to phases: 0
-- Unmapped: 46 ⚠️
+- v1 requirements: 53 total (previous footer said 46 — corrected 2026-08-21; actual REQ-ID count is 53)
+- Mapped to phases: 53
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-08-20*
-*Last updated: 2026-08-20 after initial definition*
+*Last updated: 2026-08-21 after roadmap creation (traceability filled, count corrected)*
