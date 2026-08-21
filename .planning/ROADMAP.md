@@ -56,13 +56,16 @@ Plans:
   3. User can list, fetch, download, and tail (`-f`) gateway logs, and get/set per-logger levels
   4. User can restart the gateway (optionally `--wait` for ready) and run `ign wait` to poll for gateway up, restart complete, or module ready
   5. `ign doctor` diagnoses connectivity, auth (incl. the three-part token-setup failure causes), read/write permission, WebDev-route presence, and rig detection
-**Plans**: 4 plans (TBD)
+**Plans**: 5 plans (sequential waves 1→5 — every plan grows the single `impl GatewayApi` block in client/mod.rs plus the cli.rs/main.rs/render.rs choke files, so no parallelism is honest for this phase)
+
+*Planner refinement:* the sketch's 02-02 carried six capabilities (status/modules/metrics/db/opc/sessions — HLTH-01/02/05/06/07/08) in one plan, over the 2–3-task context budget; split into status+modules+metrics (02-02) and sessions+connections (02-03). 02-01 absorbs the research-mandated Phase-1 correction (real 8.3 gateways return `ignitionVersion`, not `version`) plus three ADDITIVE exit-6 slugs (`gateway_not_commissioned`, `gateway_restarting`, `not_found`) from the live-verified error matrix. Locked decisions honored throughout: frozen envelope, coarse async_trait GatewayApi growth, single-site Secret::expose(), snapbox golden conventions, and the --yes guard (first destructive caller: `sessions terminate` in 02-03).
 
 Plans:
-- [ ] 02-01: GatewayClient — header auth (token + Basic fallback), per-class timeouts, HTML error-body sniffing; live-gateway auth verification (flagged gap)
-- [ ] 02-02: status/info/modules, db/opc connections, metrics, sessions (+terminate)
-- [ ] 02-03: logs (list/fetch/download/tail) + logger levels get/set
-- [ ] 02-04: restart `--wait`, `wait` primitives, full `doctor`
+- [ ] 02-01-PLAN.md — Live-truth client foundation: ignitionVersion fix + status→content-type→redirect classifier + additive taxonomy slugs + ListEnvelope/IgnitionMock harness + live-gateway suite (closes the flagged auth-verification gap)
+- [ ] 02-02-PLAN.md — `ign status` / `ign modules` / `ign metrics` (overview + unauth /StatusPing anchor + systemPerformance endpoints; HLTH-01/02/07)
+- [ ] 02-03-PLAN.md — `ign sessions` (+ terminate — first --yes caller, dead_code gate removed) + `ign connections` (resources/list database+opc with healthchecks passthrough; HLTH-08/05/06)
+- [ ] 02-04-PLAN.md — `ign logs` tree (list / tail -f / download .idb) + logger levels get/set, shared poll helper (HLTH-03/04)
+- [ ] 02-05-PLAN.md — `ign restart --wait` + `ign wait gateway|restart|module` + full `ign doctor` (three-part token-setup diagnosis; HLTH-09/10/11)
 
 ### Phase 3: Project Operations
 **Goal:** A user can create, move, export, import, and surgically edit Ignition projects entirely from the CLI — the gateway webpage's project management replaced, and the first mutating commands prove the `--yes`/collision-policy conventions.
