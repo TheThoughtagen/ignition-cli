@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 1 of 7 (Foundation & Agentic Contracts)
-**Current Plan:** 2 of 4
+**Current Plan:** 3
 **Total Plans in Phase:** 4
 **Status:** Ready to execute
 **Last Activity:** 2026-08-21
 
-**Progress:** [███░░░░░░░] 25%
+**Progress:** [█████░░░░░] 50%
 
 ## Performance Metrics
 
@@ -28,6 +28,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 01 P01 | 8min | 3 tasks | 13 files |
 
 *Updated after each plan completion*
+| Phase 01 P02 | 53min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -42,6 +43,9 @@ Recent decisions affecting current work:
 - [Phase 01]: Workspace shape final from commit one: three crates (ignition-cli bin 'ign' / ignition-core lib / ignition-tui zero-dep stub), tui feature gate default-on, no Windows CI
 - [Phase 01]: CLI contract chassis: five global clap args defined once, main() -> ExitCode single exit point, env defaults in exactly one function, stderr-only diagnostics
 - [Phase 01]: Edition 2024 let-chains in apply_env_defaults keep clippy -D warnings clean without allows
+- [Phase 01]: [Phase 01]: Agentic output contract FROZEN — envelope exactly {ok,profile,data}/{ok,profile,error}, exit taxonomy 1-7 with stable slugs, errors-on-stderr in all modes; changing shape/slugs/codes is a breaking change for agents
+- [Phase 01]: [Phase 01]: Exit-code table lives in exactly two places (CoreError::exit_code() + README), enforced by the enumerated unit test and snapbox goldens; --compact implies --json, resolved once in RenderMode::resolve
+- [Phase 01]: [Phase 01]: snapbox inline goldens: str! trims leading+trailing newlines, Cow<str> lacks IntoData — use stdout_for_golden (strip println's single trailing newline) and pass &str; isolate IGNITION_CLI_CONFIG per spawn; [..]-elide dynamic values
 
 ### Pending Todos
 
@@ -56,7 +60,7 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-21T15:33:18.810Z
-**Last Date:** 2026-08-21T15:33:18.810Z
-**Stopped At:** Completed 01-01-PLAN.md (workspace skeleton + CLI chassis; CI committed)
+**Last session:** 2026-08-21T16:34:41.700Z
+**Last Date:** 2026-08-21T16:34:41.700Z
+**Stopped At:** Completed 01-02-PLAN.md (agentic output contract: taxonomy, envelopes, render modes, golden harness)
 **Resume file:** None
