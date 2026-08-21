@@ -187,6 +187,22 @@ mod tests {
         async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
             unimplemented!("version FakeApi only serves gateway_info")
         }
+        async fn database_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn opc_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
     }
 
     fn info(version: &str) -> GatewayInfo {

@@ -221,3 +221,73 @@ async fn live_inspection_endpoints_parse() {
         .expect("live currentGauges must deserialize");
     assert!(gauges.cpu >= 0.0, "cpu percent: {}", gauges.cpu);
 }
+
+// ---------------------------------------------------------------------------
+// 02-03 additions: sessions + connections live checks (read-only; empty
+// is the expected state on a fresh rig — the checks exist to run against
+// a gateway WITH sessions/connections, capturing the populated shapes).
+// ---------------------------------------------------------------------------
+
+/// The three session-family lists against a live gateway: all must
+/// answer the standard envelope (items may be empty on a headless rig —
+/// a connected Designer/Perspective session makes them non-empty).
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN"]
+async fn live_session_families_parse() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    let designers = api
+        .designers(&Default::default())
+        .await
+        .expect("live designers list must deserialize");
+    let sessions = api
+        .perspective_sessions(&Default::default())
+        .await
+        .expect("live perspective list must deserialize (trailing-slash path)");
+    let clients = api
+        .vision_clients(&Default::default())
+        .await
+        .expect("live vision list must deserialize");
+    eprintln!(
+        "live sessions: {} designers, {} perspective, {} vision",
+        designers.items.len(),
+        sessions.items.len(),
+        clients.items.len()
+    );
+}
+
+/// HLTH-05/06 verification step (research Open Question 1): list the
+/// connection resource families against a live gateway. EMPTY is fine
+/// (the research rig had zero); when a gateway HAS connections, dump the
+/// populated `healthchecks` shapes so the passthrough can be upgraded to
+/// a typed model — until then the shape stays LOW-confidence.
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN (empty lists OK)"]
+async fn live_connections() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    let database = api
+        .database_connections()
+        .await
+        .expect("live database-connection resource list must deserialize");
+    let opc = api
+        .opc_connections()
+        .await
+        .expect("live opc-connection resource list must deserialize");
+    for connection in database.items.iter().chain(opc.items.iter()) {
+        // Capture hook: the FIRST gateway with a configured connection
+        // prints the populated healthchecks shape here.
+        eprintln!(
+            "live connection {:?} enabled={} healthchecks={}",
+            connection.name, connection.enabled, connection.healthchecks
+        );
+    }
+}

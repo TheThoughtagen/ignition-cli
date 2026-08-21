@@ -32,12 +32,14 @@
 use std::time::Duration;
 
 mod classify;
+pub mod connections;
 pub mod metrics;
 pub mod query;
 pub mod sessions;
 pub mod status;
 pub mod version;
 
+use crate::client::connections::GatewayConnection;
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::query::ListEnvelope;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
@@ -114,6 +116,14 @@ pub trait GatewayApi: Send + Sync {
     /// DELETE `/data/api/v1/designer/{id}` — prune a Designer session.
     /// Audit-logged server-side.
     async fn prune_designer(&self, id: &str) -> Result<(), CoreError>;
+    /// Fetch `/data/api/v1/resources/list/ignition/database-connection`
+    /// (authed) — the web UI's Connections→Databases poll (HLTH-05).
+    /// `healthchecks` is raw passthrough (LOW-confidence populated
+    /// shape, research Open Question 1).
+    async fn database_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError>;
+    /// Fetch `/data/api/v1/resources/list/ignition/opc-connection`
+    /// (authed) — the Connections→OPC poll (HLTH-06), same family.
+    async fn opc_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -366,6 +376,26 @@ impl GatewayApi for ReqwestGatewayApi {
     async fn prune_designer(&self, id: &str) -> Result<(), CoreError> {
         self.delete_with_query(&sessions::designer_prune_path(id), &[])
             .await
+    }
+
+    async fn database_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError> {
+        // The UI polls the resource list with limit=-1 — same convention
+        // as every other list capability.
+        self.get_json(
+            connections::DATABASE_CONNECTIONS_PATH,
+            Some(&query::ListQuery::default()),
+            true,
+        )
+        .await
+    }
+
+    async fn opc_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError> {
+        self.get_json(
+            connections::OPC_CONNECTIONS_PATH,
+            Some(&query::ListQuery::default()),
+            true,
+        )
+        .await
     }
 }
 

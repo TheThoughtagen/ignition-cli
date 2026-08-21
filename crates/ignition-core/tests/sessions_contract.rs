@@ -354,3 +354,94 @@ async fn vision_terminate_nonexistent_id_is_not_found() {
     assert!(matches!(&err, CoreError::NotFound { .. }));
     assert_eq!(err.exit_code(), 6);
 }
+
+// ---------------------------------------------------------------------------
+// DB/OPC connections (Task 2, HLTH-05/06) — the resource-list mechanism
+// the web UI polls; the ignition-mcp `/connections/*` paths are
+// inventions and appear nowhere. `healthchecks` is raw passthrough
+// (LOW-confidence populated shape, research Open Question 1).
+// ---------------------------------------------------------------------------
+
+/// Both resource-list paths parse a plausible item
+/// `{name, enabled, healthchecks: {…}}` through the passthrough model,
+/// with the UI's `limit=-1` convention on the query (matcher-pinned).
+#[tokio::test]
+async fn database_connections_parse_with_limit_minus_one() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/list/ignition/database-connection",
+        ))
+        .and(wiremock::matchers::query_param("limit", "-1"))
+        .and(wiremock::matchers::query_param("offset", "0"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    {
+                        "name": "MyPostgres",
+                        "enabled": true,
+                        "healthchecks": {"jdbc": "FAIR"},
+                        "collection": "database-connections"
+                    }
+                ],
+                "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let page = api
+        .database_connections()
+        .await
+        .expect("resource list must parse");
+    let connection = &page.items[0];
+    assert_eq!(connection.name, "MyPostgres");
+    assert!(connection.enabled);
+    assert_eq!(connection.healthchecks["jdbc"], "FAIR");
+    assert_eq!(page.metadata.total, 1);
+}
+
+/// The OPC family rides the same mechanism (path-pinned separately).
+#[tokio::test]
+async fn opc_connections_parse_the_same_mechanism() {
+    let mock = IgnitionMock::start().await;
+    mock.list_json(
+        "GET",
+        "/data/api/v1/resources/list/ignition/opc-connection",
+        serde_json::json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+        }),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let page = api
+        .opc_connections()
+        .await
+        .expect("empty OPC list is the research gateway's observed state");
+    assert_eq!(page.items.len(), 0, "the research rig had zero connections");
+}
+
+/// HTML 401 on the resource list → Auth (exit 5) — authed read, the
+/// standard Jetty body.
+#[tokio::test]
+async fn database_connections_html_401_classifies_auth() {
+    let mock = IgnitionMock::start().await;
+    mock.html_error(
+        "GET",
+        "/data/api/v1/resources/list/ignition/database-connection",
+        401,
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let err = api.database_connections().await.expect_err("401 must fail");
+    assert!(
+        matches!(&err, CoreError::Auth { status: 401, .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+}

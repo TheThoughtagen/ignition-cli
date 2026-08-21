@@ -333,6 +333,22 @@ mod tests {
         async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
             unreachable!("not part of this double's actions")
         }
+        async fn database_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unreachable!("not part of this double's actions")
+        }
+        async fn opc_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unreachable!("not part of this double's actions")
+        }
     }
 
     /// status merges all three sources under the documented keys —
@@ -442,6 +458,22 @@ mod tests {
             unreachable!("not part of this action")
         }
         async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn database_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn opc_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
             unreachable!("not part of this action")
         }
     }
