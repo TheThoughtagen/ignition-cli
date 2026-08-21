@@ -130,3 +130,48 @@ fn human_mode_is_not_json() {
         "human mode must not parse as JSON: {stdout}"
     );
 }
+
+/// With a config present, the envelope's `profile` echo is REAL (01-03
+/// threads the resolved name through) — goldens change value, never shape.
+/// The same command with no config keeps `"profile": null` (covered by
+/// `version_json_envelope_shape` above and `no_config_version_exit_0` in
+/// `contract_profile.rs`).
+#[test]
+fn version_json_envelope_with_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"
+active = "dev"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+"#,
+    )
+    .expect("write config");
+
+    let out = Command::cargo_bin("ign")
+        .expect("binary 'ign' not found")
+        .env("IGNITION_CLI_CONFIG", &config)
+        .args(["version", "--json"])
+        .output()
+        .expect("spawn ign");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+{
+  "ok": true,
+  "profile": "dev",
+  "data": {
+    "cli_version": "[..]"
+  }
+}
+"#]],
+    );
+}

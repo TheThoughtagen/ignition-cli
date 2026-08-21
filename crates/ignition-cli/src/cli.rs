@@ -5,6 +5,8 @@
 //! - Globals set the `global` arg attribute so they propagate to every
 //!   subcommand; subcommand structs never redeclare them.
 //! - Never mark a global arg `required` (clap rejects required globals).
+//! - Flags-only, zero interactive prompts — ever (research anti-pattern:
+//!   "Prompting ever").
 
 use clap::{ArgAction, Parser, Subcommand};
 
@@ -45,7 +47,56 @@ pub enum Commands {
     /// Print version information (CLI only for now; gateway check arrives in a later plan)
     Version,
 
+    /// Manage gateway profiles
+    #[command(arg_required_else_help = true)]
+    Profile(ProfileArgs),
+
     /// Interactive TUI cockpit
     #[cfg(feature = "tui")]
     Tui,
+}
+
+/// Profile subcommands (nested: a struct wrapper carrying the subcommand
+/// enum, so `Commands::Profile` gets an `Args` payload).
+#[derive(Debug, clap::Args)]
+pub struct ProfileArgs {
+    #[command(subcommand)]
+    pub command: ProfileCmd,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(arg_required_else_help = true)]
+pub enum ProfileCmd {
+    /// Add (or overwrite) a gateway profile
+    Add {
+        /// Profile name
+        name: String,
+        /// Gateway base URL (e.g. http://localhost:9088)
+        url: String,
+        /// Optional display label
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Name of the env var holding the auth token
+        #[arg(long, value_name = "VAR")]
+        token_env: Option<String>,
+        /// Keyring user string for the token (service is always ignition-cli)
+        #[arg(long, value_name = "USER")]
+        keyring: Option<String>,
+        /// Name of the env var holding the basic-auth user (with --password-env)
+        #[arg(long, value_name = "VAR")]
+        user_env: Option<String>,
+        /// Name of the env var holding the basic-auth password (with --user-env)
+        #[arg(long, value_name = "VAR")]
+        password_env: Option<String>,
+        /// Make this profile the active one
+        #[arg(long)]
+        active: bool,
+    },
+    /// List configured profiles
+    List,
+    /// Switch the active profile
+    Use {
+        /// Profile name to activate
+        name: String,
+    },
 }
