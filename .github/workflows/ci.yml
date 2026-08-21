@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        # No Windows — LOCKED planner decision (macOS/Linux primary targets).
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      # Env-store paths only: no secret service needed until the keyring
+      # smoke job lands with plan 01-03.
+      - run: cargo test --workspace
+      # Prove the lean/agent build (no TUI feature) compiles.
+      - run: cargo build -p ignition-cli --no-default-features

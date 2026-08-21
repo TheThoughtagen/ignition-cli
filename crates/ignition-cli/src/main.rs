@@ -61,12 +61,11 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
 /// `IGNITION_PROFILE` (when --profile absent), `IGNITION_JSON=1`, `IGNITION_YES=1`.
 /// Subcommand code only ever reads the struct — single precedence point.
 fn apply_env_defaults(cli: &mut Cli) {
-    if cli.profile.is_none() {
-        if let Ok(profile) = std::env::var("IGNITION_PROFILE")
-            && !profile.is_empty()
-        {
-            cli.profile = Some(profile);
-        }
+    if cli.profile.is_none()
+        && let Ok(profile) = std::env::var("IGNITION_PROFILE")
+        && !profile.is_empty()
+    {
+        cli.profile = Some(profile);
     }
     if !cli.json && std::env::var("IGNITION_JSON").is_ok_and(|v| v == "1") {
         cli.json = true;
