@@ -33,8 +33,11 @@ use std::time::Duration;
 
 mod classify;
 pub mod query;
+pub mod status;
 pub mod version;
 
+use crate::client::query::ListEnvelope;
+use crate::client::status::{ModuleInfo, Overview, StatusPing};
 use crate::client::version::GatewayInfo;
 use crate::config::{Credential, Profile};
 use crate::error::CoreError;
@@ -43,11 +46,29 @@ use crate::error::CoreError;
 const GATEWAY_INFO_PATH: &str = "/data/api/v1/gateway-info";
 
 /// One capability per method — coarse on purpose. Phase 2 adds status,
-/// modules, logs, … as methods here; actions never see reqwest types.
+/// modules, metrics, … as methods here; actions never see reqwest types.
+///
+/// (All impl bodies live in the ONE `impl GatewayApi for
+/// ReqwestGatewayApi` block below: Rust rejects a second impl block of
+/// the same trait for the same type, so the per-capability files own the
+/// models + verified path constants and this block owns the delegation.)
 #[async_trait::async_trait]
 pub trait GatewayApi: Send + Sync {
     /// Fetch `/data/api/v1/gateway-info`.
     async fn gateway_info(&self) -> Result<GatewayInfo, CoreError>;
+    /// Fetch `/data/api/v1/overview` (authed) — platform + runtime.
+    async fn overview(&self) -> Result<Overview, CoreError>;
+    /// Fetch `/StatusPing` **header-less** (auth=false) — the
+    /// unauthenticated readiness anchor: it must keep answering when
+    /// credentials are broken or absent and mid-restart (02-02).
+    async fn status_ping(&self) -> Result<StatusPing, CoreError>;
+    /// Fetch `/data/api/v1/modules/healthy` (`quarantined = false`) or
+    /// `/modules/quarantined` (`true`) with the standard list params.
+    async fn modules(
+        &self,
+        quarantined: bool,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<ModuleInfo>, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -194,6 +215,30 @@ impl GatewayApi for ReqwestGatewayApi {
         let mut info: GatewayInfo = self.get_json(GATEWAY_INFO_PATH, None, true).await?;
         info.endpoint = Some(self.url_for(GATEWAY_INFO_PATH).to_string());
         Ok(info)
+    }
+
+    async fn overview(&self) -> Result<Overview, CoreError> {
+        self.get_json(status::OVERVIEW_PATH, None, true).await
+    }
+
+    async fn status_ping(&self) -> Result<StatusPing, CoreError> {
+        // auth = false — the whole point: the readiness anchor must not
+        // depend on credentials (pinned by the wiremock header-absence
+        // proof in tests/status_contract.rs).
+        self.get_json(status::STATUS_PING_PATH, None, false).await
+    }
+
+    async fn modules(
+        &self,
+        quarantined: bool,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<ModuleInfo>, CoreError> {
+        let path = if quarantined {
+            status::MODULES_QUARANTINED_PATH
+        } else {
+            status::MODULES_HEALTHY_PATH
+        };
+        self.get_json(path, Some(query), true).await
     }
 }
 

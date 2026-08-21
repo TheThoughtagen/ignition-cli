@@ -115,6 +115,24 @@ mod tests {
                 }),
             }
         }
+
+        // The version matrix only exercises gateway_info — the Phase-2
+        // capabilities are unimplemented in THIS double (inspect.rs's
+        // fakes serve them).
+        async fn overview(&self) -> Result<crate::client::status::Overview, CoreError> {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn status_ping(&self) -> Result<crate::client::status::StatusPing, CoreError> {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn modules(
+            &self,
+            _quarantined: bool,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::status::ModuleInfo>, CoreError>
+        {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
     }
 
     fn info(version: &str) -> GatewayInfo {
