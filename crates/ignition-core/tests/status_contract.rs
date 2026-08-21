@@ -198,3 +198,120 @@ async fn modules_parses_live_capture_and_passes_limit_minus_one() {
     );
     assert_eq!(page.metadata.total, 1);
 }
+
+// ---------------------------------------------------------------------------
+// systemPerformance metrics (Task 2) — the verified paths under
+// /data/api/v1/systemPerformance/ (the ignition-mcp `/system/metrics`
+// path is an invention; these three are live-verified).
+// ---------------------------------------------------------------------------
+
+/// currentGauges parses the exact live capture: cpu 4.88 PERCENT,
+/// heap/max bytes.
+#[tokio::test]
+async fn metrics_current_parses_the_live_capture() {
+    let mock = IgnitionMock::start().await;
+    mock.status_json(
+        "GET",
+        "/data/api/v1/systemPerformance/currentGauges",
+        200,
+        serde_json::json!({
+            "cpu": 4.88,
+            "heapMemory": 240000000i64,
+            "maxMemory": 1073741824i64
+        }),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let gauges = api.metrics_current().await.expect("live gauges must parse");
+    assert!((gauges.cpu - 4.88).abs() < f64::EPSILON, "percent");
+    assert_eq!(gauges.heap_memory, 240000000);
+    assert_eq!(gauges.max_memory, 1073741824);
+}
+
+/// threads parses the exact live capture (running 32 / waiting 39 /
+/// timedWaiting 51 / blocked 0).
+#[tokio::test]
+async fn metrics_threads_parses_the_live_capture() {
+    let mock = IgnitionMock::start().await;
+    mock.status_json(
+        "GET",
+        "/data/api/v1/systemPerformance/threads",
+        200,
+        serde_json::json!({"running": 32, "waiting": 39, "timedWaiting": 51, "blocked": 0}),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let counts = api
+        .metrics_threads()
+        .await
+        .expect("live threads must parse");
+    assert_eq!(counts.running, 32);
+    assert_eq!(counts.waiting, 39);
+    assert_eq!(counts.timed_waiting, 51);
+    assert_eq!(counts.blocked, 0);
+}
+
+/// charts parses the NESTED wire shape (one datapoint per series —
+/// epoch-ms timestamps, cpu percent / memory bytes).
+#[tokio::test]
+async fn metrics_historic_parses_the_nested_wire_shape() {
+    let mock = IgnitionMock::start().await;
+    mock.status_json(
+        "GET",
+        "/data/api/v1/systemPerformance/charts",
+        200,
+        serde_json::json!({
+            "cpuChartDatapoints": [
+                {"histId": 1, "timestamp": 1787346747022i64, "value": 4.88}
+            ],
+            "memoryChartDatapoints": {
+                "heapMemoryDatapoints": [
+                    {"histId": 2, "timestamp": 1787346747022i64, "value": 240000000.0}
+                ],
+                "nonHeapMemoryDatapoints": [
+                    {"histId": 3, "timestamp": 1787346747022i64, "value": 52000000.0}
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let charts = api
+        .metrics_historic()
+        .await
+        .expect("live charts must parse");
+    assert_eq!(charts.cpu_datapoints.len(), 1);
+    assert_eq!(
+        charts.cpu_datapoints[0].timestamp, 1787346747022,
+        "epoch ms"
+    );
+    assert_eq!(charts.heap_memory_datapoints.len(), 1);
+    assert_eq!(charts.non_heap_memory_datapoints.len(), 1);
+}
+
+/// 404 on a WRONG metrics path (e.g. the invented `/system/metrics`)
+/// proves the point: the verified paths are the only ones the client
+/// calls — this pins `not_found` (exit 6) for the family.
+#[tokio::test]
+async fn metrics_wrong_path_404_classifies_not_found() {
+    let mock = IgnitionMock::start().await;
+    mock.status_json(
+        "GET",
+        "/data/api/v1/systemPerformance/currentGauges",
+        404,
+        serde_json::json!({"message": "No route match for path: /data/api/v1/systemPerformance/currentGauges"}),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let err = api.metrics_current().await.expect_err("404 must fail");
+    assert!(
+        matches!(&err, CoreError::NotFound { .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(err.code(), "not_found");
+}

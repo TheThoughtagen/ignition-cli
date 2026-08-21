@@ -32,10 +32,12 @@
 use std::time::Duration;
 
 mod classify;
+pub mod metrics;
 pub mod query;
 pub mod status;
 pub mod version;
 
+use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::query::ListEnvelope;
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
 use crate::client::version::GatewayInfo;
@@ -69,6 +71,15 @@ pub trait GatewayApi: Send + Sync {
         quarantined: bool,
         query: &query::ListQuery,
     ) -> Result<ListEnvelope<ModuleInfo>, CoreError>;
+    /// Fetch `/data/api/v1/systemPerformance/currentGauges` (authed) —
+    /// cpu in PERCENT (contrast [`Overview::cpu`], a 0–1 fraction).
+    async fn metrics_current(&self) -> Result<CurrentGauges, CoreError>;
+    /// Fetch `/data/api/v1/systemPerformance/charts` (authed) — historic
+    /// cpu/heap/non-heap datapoints (epoch-ms timestamps).
+    async fn metrics_historic(&self) -> Result<PerformanceCharts, CoreError>;
+    /// Fetch `/data/api/v1/systemPerformance/threads` (authed) — thread
+    /// execution counts (running/waiting/timedWaiting/blocked).
+    async fn metrics_threads(&self) -> Result<ThreadCounts, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -239,6 +250,19 @@ impl GatewayApi for ReqwestGatewayApi {
             status::MODULES_HEALTHY_PATH
         };
         self.get_json(path, Some(query), true).await
+    }
+
+    async fn metrics_current(&self) -> Result<CurrentGauges, CoreError> {
+        self.get_json(metrics::CURRENT_GAUGES_PATH, None, true)
+            .await
+    }
+
+    async fn metrics_historic(&self) -> Result<PerformanceCharts, CoreError> {
+        self.get_json(metrics::CHARTS_PATH, None, true).await
+    }
+
+    async fn metrics_threads(&self) -> Result<ThreadCounts, CoreError> {
+        self.get_json(metrics::THREADS_PATH, None, true).await
     }
 }
 
