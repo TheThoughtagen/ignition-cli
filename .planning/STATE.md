@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 2 of 7 (Gateway Health & Inspection)
-**Current Plan:** 2
+**Current Plan:** 3
 **Total Plans in Phase:** 5
 **Status:** Ready to execute
 **Last Activity:** 2026-08-21
 
-**Progress:** [███████░░░] 67%
+**Progress:** [████████░░] 78%
 
 ## Performance Metrics
 
@@ -34,6 +34,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 *Updated after each plan completion*
 | Phase 02 P01 | 19min | 3 tasks | 14 files |
 | Phase 02 P02 | 12min | 3 tasks | 14 files |
+| Phase Phase 02 PP03 | 14min | 3 tasks | 15 files |
 
 ## Accumulated Context
 
@@ -66,6 +67,9 @@ Recent decisions affecting current work:
 - [Phase 02]: [Phase 02-02]: Two-layer naming LOCKED — client models stay wire-faithful (gateway-native camelCase renames + flatten passthrough); the status action re-exposes selected fields under unit-explicit keys (uptime_ms, cpu_fraction, trial_remaining_s); overview cpu 0-1 fraction vs gauges percent documented at both fields, never converted
 - [Phase 02]: [Phase 02-02]: Inspection commands (status/modules/metrics) REQUIRE a credential — resolve_secret → SecretUnavailable exit 3 (inverse of version's header-less degradation); LOCKED secret chain now built in exactly one place (secret_chain() in main.rs); status = read of a HEALTHY gateway, failed sub-calls exit per taxonomy
 - [Phase 02]: [Phase 02-02]: ModuleInfo tolerates the quarantined reduced shape (state/licenseState/vendorName/startupTime Option per openapi — fully-loaded-only; startup_time is a String on the wire); PerformanceCharts parses the nested memoryChartDatapoints wire shape into a flat model; /StatusPing fetched header-less via auth=false (wiremock header-absence proof — the 02-05 wait anchor)
+- [Phase Phase 02]: [Phase 02-03]: require_confirmation dead-code gate REMOVED in Phase 2/02-03 (sessions terminate = first destructive caller) — earlier than the logged 'until Phase 3'; the attribute's own reason string mandates removal at the first real caller. Guard fires BEFORE profile/secret/client resolution: refusal = exit 2 with null profile, zero config/network work; usage-class errors lead — Plan key_link + must_have truth #2; clippy -D warnings clean with the gate gone is the proof
+- [Phase Phase 02]: [Phase 02-03]: sessions --type rides the SessionsArgs top level and terminate's id is --id <ID> — LOCKED must_have truths overrode the plan's nested-List/positional-id sketch; JSON data always carries ALL family keys (filtered-out = [], endpoints never called) — the stable agent shape all filtered list commands inherit — must_haves are the user contract; agents must never key-hunt
+- [Phase Phase 02]: [Phase 02-03]: Perspective path discipline contract-pinned by recorded-request proofs — GET /data/perspective/api/v1/sessions/ EXACT trailing slash (Pitfall 8), DELETE no-trailing-slash with sessionId/message as QUERY params + empty body; connections ride resources/list/ignition/{database,opc}-connection with healthchecks RAW passthrough (LOW-confidence until live capture — live_connections hook + UAT open question) — Wire subtleties asserted on the REQUEST, not just response parsing
 
 ### Pending Todos
 
@@ -80,6 +84,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-21T23:26:51.130Z
-**Stopped At:** Completed 02-02-PLAN.md (status/modules/metrics inspection surface)
+**Last session:** 2026-08-21T23:42:43.883Z
+**Stopped At:** Completed 02-03-PLAN.md (sessions/terminate + connections, first --yes caller)
 **Resume file:** None
