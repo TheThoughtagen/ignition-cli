@@ -23,7 +23,7 @@ thiserror = "2.0"
 semver = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2.5"
+url = { version = "2.5", features = ["serde"] } # serde feature: Profile.url round-trips through TOML/JSON
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

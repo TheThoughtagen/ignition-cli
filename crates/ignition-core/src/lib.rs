@@ -10,9 +10,11 @@
 //! - Actions are plain functions over injected [`GatewayApi`]-style seams, so
 //!   the CLI and the TUI call the same code.
 //!
-//! Modules `config`, `client`, and `actions` are added by the later plans of
-//! Phase 1; `error` (the LOCKED exit-code taxonomy + failure envelope) and
-//! `output` (the LOCKED success envelope) are the contract core.
+//! Modules `client` and `actions` are added by the later plans of Phase 1;
+//! `error` (the LOCKED exit-code taxonomy + failure envelope), `output` (the
+//! LOCKED success envelope), and `config` (discovery, profiles, secrets)
+//! are the contract core.
 
+pub mod config;
 pub mod error;
 pub mod output;
