@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 2 of 7 (Gateway Health & Inspection)
-**Current Plan:** 1 of 5 complete (02-01 done) — next: 02-02
+**Current Plan:** 2
 **Total Plans in Phase:** 5
-**Status:** 02-01 COMPLETE (classifier + additive taxonomy + IgnitionMock + live suite; tests/clippy/fmt green) — ready to execute 02-02
+**Status:** Ready to execute
 **Last Activity:** 2026-08-21
 
-**Progress:** [██████░░░░] 56%
+**Progress:** [███████░░░] 67%
 
 ## Performance Metrics
 
@@ -33,6 +33,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 
 *Updated after each plan completion*
 | Phase 02 P01 | 19min | 3 tasks | 14 files |
+| Phase 02 P02 | 12min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -62,6 +63,9 @@ Recent decisions affecting current work:
 - [Phase 02]: [Phase 02-01]: classify() is the single status→content-type→redirect mapping site running before every .json(); redirect(Policy::none()) pinned so uncommissioned 302s can never masquerade as 200; Basic demoted with a loud per-call warning (dead on 8.3 /data)
 - [Phase 02]: [Phase 02-01]: three ADDITIVE exit-6 slugs (gateway_not_commissioned, gateway_restarting, not_found) + status-aware 401/403 auth hints; wiremock gotchas recorded: set_body_string forces text/plain (use set_body_raw), scoped MockGuard drop unmounts fixtures
 - [Phase 02]: [Phase 02-01]: gateway-info REQUIRES auth under 8.3 default security (header-less → 401 Jetty HTML, re-verified live on the research rig) — 83-api's auth:none tag does not hold; live suite is skip-by-default green no-op
+- [Phase 02]: [Phase 02-02]: Two-layer naming LOCKED — client models stay wire-faithful (gateway-native camelCase renames + flatten passthrough); the status action re-exposes selected fields under unit-explicit keys (uptime_ms, cpu_fraction, trial_remaining_s); overview cpu 0-1 fraction vs gauges percent documented at both fields, never converted
+- [Phase 02]: [Phase 02-02]: Inspection commands (status/modules/metrics) REQUIRE a credential — resolve_secret → SecretUnavailable exit 3 (inverse of version's header-less degradation); LOCKED secret chain now built in exactly one place (secret_chain() in main.rs); status = read of a HEALTHY gateway, failed sub-calls exit per taxonomy
+- [Phase 02]: [Phase 02-02]: ModuleInfo tolerates the quarantined reduced shape (state/licenseState/vendorName/startupTime Option per openapi — fully-loaded-only; startup_time is a String on the wire); PerformanceCharts parses the nested memoryChartDatapoints wire shape into a flat model; /StatusPing fetched header-less via auth=false (wiremock header-absence proof — the 02-05 wait anchor)
 
 ### Pending Todos
 
@@ -76,6 +80,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-21T23:07:35.505Z
-**Stopped At:** Completed 02-01-PLAN.md (classifier + taxonomy + harnesses + live suite)
+**Last session:** 2026-08-21T23:26:51.130Z
+**Stopped At:** Completed 02-02-PLAN.md (status/modules/metrics inspection surface)
 **Resume file:** None
