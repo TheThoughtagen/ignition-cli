@@ -17,6 +17,7 @@ tui = ["dep:ignition-tui"]
 ignition-core = { workspace = true }
 ignition-tui = { workspace = true, optional = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

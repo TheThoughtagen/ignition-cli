@@ -47,6 +47,14 @@ pub enum Commands {
     /// Print version information (CLI always; gateway check when a profile resolves)
     Version,
 
+    /// Generate shell completions (bash, zsh, fish, …) — the one stdout exception
+    #[command(arg_required_else_help = true)]
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::aot::Shell,
+    },
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),

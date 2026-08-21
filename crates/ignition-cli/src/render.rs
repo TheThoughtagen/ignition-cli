@@ -50,6 +50,14 @@ impl RenderMode {
 
 /// Success path — ALWAYS stdout.
 pub fn render_ok(out: &ActionOutput, profile: Option<&str>, mode: RenderMode) {
+    // The ONE sanctioned stdout exception: completions print the raw
+    // script regardless of --json (shells source stdout; see completions.rs
+    // and the README contract note). No profile header either — the script
+    // must stay clean for sourcing.
+    if let ActionOutput::Completions { shell } = out {
+        print!("{}", crate::completions::completions(*shell));
+        return;
+    }
     match mode {
         RenderMode::Human => render_human(out, profile),
         RenderMode::PrettyJson => {
@@ -99,6 +107,11 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
             for warning in &result.warnings {
                 println!("warning: {warning}");
             }
+        }
+        // Unreachable: render_ok intercepts Completions before mode
+        // dispatch (the sanctioned stdout exception).
+        ActionOutput::Completions { shell } => {
+            print!("{}", crate::completions::completions(*shell));
         }
         ActionOutput::ProfileAdd(result) => {
             println!("added profile {} ({})", result.name, result.url);

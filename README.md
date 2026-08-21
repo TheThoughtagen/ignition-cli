@@ -18,6 +18,10 @@ Two documented exceptions: clap usage errors exit 2 and are rendered by clap
 itself (not JSON); the exit-2 class also covers destructive operations run
 without `--yes`.
 
+One success-path exception: `ign completions <SHELL>` writes the raw
+completion script to stdout regardless of `--json` — shells source its
+output directly, so it is never JSON-wrapped.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs

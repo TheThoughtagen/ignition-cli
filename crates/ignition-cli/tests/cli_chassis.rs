@@ -88,3 +88,61 @@ fn verbose_keeps_stdout_version_line_only() {
             env!("CARGO_PKG_VERSION")
         ));
 }
+
+// ---------------------------------------------------------------------------
+// Completions (CORE-07)
+// ---------------------------------------------------------------------------
+
+/// All three shells generate; each output carries its shell-appropriate
+/// marker (bash: `_ign` function prefix, zsh: `#compdef ign`, fish:
+/// `complete -c ign`).
+#[test]
+fn completions_bash_generate() {
+    ign()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(contains("_ign"));
+}
+
+#[test]
+fn completions_zsh_generate() {
+    ign()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(contains("#compdef ign"));
+}
+
+#[test]
+fn completions_fish_generate() {
+    ign()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(contains("complete -c ign"));
+}
+
+/// Bare `completions` (no shell) is a clap usage error → exit 2
+/// (`arg_required_else_help`).
+#[test]
+fn completions_without_shell_exit_2() {
+    ign()
+        .args(["completions"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("SHELL"));
+}
+
+/// The ONE sanctioned stdout exception: the script prints RAW even under
+/// `--json` (shells source stdout — never an envelope).
+#[test]
+fn completions_ignore_json_flag() {
+    ign()
+        .args(["completions", "bash", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("_ign"))
+        .stdout(contains("complete -F _ign"));
+}

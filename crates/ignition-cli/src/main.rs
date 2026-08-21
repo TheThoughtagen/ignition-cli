@@ -17,6 +17,7 @@
 //! - No direct exit calls anywhere outside clap's `Error::exit`.
 
 mod cli;
+mod completions;
 mod render;
 
 use std::process::ExitCode;
@@ -37,6 +38,13 @@ use crate::render::{RenderMode, render_error, render_ok};
 enum ActionOutput {
     /// `ign version` — CLI version + optional gateway report + warnings.
     Version(actions::version::VersionResult),
+    /// `ign completions <SHELL>` — raw script text on stdout, the ONE
+    /// sanctioned exception: printed verbatim regardless of `--json`
+    /// (shells source stdout; see `render_ok`).
+    Completions {
+        /// Target shell.
+        shell: clap_complete::aot::Shell,
+    },
     /// `ign profile add`.
     ProfileAdd(actions::profile::ProfileAddResult),
     /// `ign profile list`.
@@ -54,6 +62,10 @@ impl ActionOutput {
 
         match self {
             ActionOutput::Version(result) => render_success(profile, result, compact),
+            // Unreachable in practice (render_ok intercepts Completions
+            // before mode dispatch) — but degrades to the correct raw
+            // script rather than panicking if that bypass ever moves.
+            ActionOutput::Completions { shell } => crate::completions::completions(*shell),
             ActionOutput::ProfileAdd(result) => render_success(profile, result, compact),
             ActionOutput::ProfileList(result) => render_success(profile, result, compact),
             ActionOutput::ProfileUse(result) => render_success(profile, result, compact),
@@ -103,6 +115,11 @@ fn main() -> ExitCode {
 /// install, exit 0, envelope `profile: null`); an unknown name is
 /// `profile_not_found` (exit 3) everywhere.
 async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>) {
+    // Completions never touch config — shells source them at install
+    // time, and a broken config.toml must not break `completions`.
+    if let Commands::Completions { shell } = cli.command {
+        return (None, Ok(ActionOutput::Completions { shell }));
+    }
     let path = config::config_path();
     let mut config = match config::load(&path) {
         Ok(config) => config,
@@ -189,6 +206,12 @@ async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>)
                 Err(err) => (None, Err(err)),
             },
         },
+        // Runtime-unreachable: dispatch returns early for Completions
+        // before config load (a broken config must not break `completions`);
+        // the arm exists only for match exhaustiveness.
+        Commands::Completions { .. } => {
+            unreachable!("completions handled before config load")
+        }
         #[cfg(feature = "tui")]
         Commands::Tui => (
             None,
@@ -271,6 +294,26 @@ fn apply_env_defaults(cli: &mut Cli) {
     }
 }
 
+/// CORE-06 pattern, proven now so later phases inherit it verbatim
+/// (`project delete` in Phase 3, `rig reset` in Phase 4): destructive
+/// operations refuse without `--yes` — which already merges `IGNITION_YES`
+/// via [`apply_env_defaults`] — with a usage-class error (exit 2: it names
+/// a flag the caller must add) whose hint says exactly that. Pinned here
+/// in main.rs, no separate confirm.rs file.
+#[expect(
+    dead_code,
+    reason = "no destructive command exists in Phase 1; first caller is Phase 3's project delete — the expectation flags removal when it gains a caller"
+)]
+fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
+    if yes {
+        Ok(())
+    } else {
+        Err(CoreError::ConfirmationRequired {
+            operation: operation.to_string(),
+        })
+    }
+}
+
 /// stderr-only tracing init. Filter levels: 0=warn (default), 1=info, 2=debug,
 /// 3+=trace. `IGNITION_LOG`, when set, overrides the verbosity-derived filter
 /// (pass-through to EnvFilter, RUST_LOG-style directives).
@@ -291,4 +334,33 @@ fn init_tracing(verbosity: u8) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_confirmation;
+
+    /// CORE-06 guard proof: without `--yes` → usage-class error (exit 2,
+    /// `confirmation_required` slug) with a hint naming BOTH the flag and
+    /// the env escape hatch; with `--yes` → Ok. (`IGNITION_YES=1` reaches
+    /// the guard as `yes == true` via `apply_env_defaults`, binary-tested
+    /// by `cli_chassis::env_yes_flag_is_accepted`.) Phase 3+ (`project
+    /// delete`, `rig reset`) inherits this helper verbatim.
+    #[test]
+    fn confirmation_guard_refuses_without_yes() {
+        let err = require_confirmation(false, "project delete").expect_err("refuses without --yes");
+        assert_eq!(err.exit_code(), 2, "usage class — it names a missing flag");
+        assert_eq!(err.code(), "confirmation_required");
+        let hint = err.hint().expect("hint required");
+        assert!(
+            hint.contains("--yes") && hint.contains("IGNITION_YES"),
+            "hint names the flag and the env escape hatch: {hint}"
+        );
+        assert!(
+            err.to_string().contains("project delete"),
+            "message names the operation: {err}"
+        );
+
+        require_confirmation(true, "project delete").expect("--yes confirms");
+    }
 }

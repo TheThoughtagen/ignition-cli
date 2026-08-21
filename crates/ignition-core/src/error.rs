@@ -128,8 +128,8 @@ impl CoreError {
                     .to_string(),
             ),
             Self::ConfirmationRequired { .. } => Some(
-                "rerun the command with --yes to confirm the destructive \
-                 operation"
+                "this operation is destructive; re-run with --yes or set \
+                  IGNITION_YES=1"
                     .to_string(),
             ),
             Self::ProfileNotFound { known, .. } => Some(if known.is_empty() {
