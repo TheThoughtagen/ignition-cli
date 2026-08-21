@@ -1,0 +1,5 @@
+# Rust build output.
+# Cargo.lock is COMMITTED on purpose: binary crate — reproducible agent installs.
+/target
+.DS_Store
+/tmp

@@ -1,0 +1,28 @@
+[package]
+name = "ignition-cli"
+description = "ign — operate Ignition 8.3+ gateways from the terminal"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "ign"
+path = "src/main.rs"
+
+[features]
+default = ["tui"]
+tui = ["dep:ignition-tui"]
+
+[dependencies]
+ignition-core = { workspace = true }
+ignition-tui = { workspace = true, optional = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+snapbox = { workspace = true }

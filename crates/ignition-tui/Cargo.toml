@@ -1,0 +1,11 @@
+[package]
+name = "ignition-tui"
+description = "Ratatui TUI cockpit for ign — deliberate stub until Phase 6"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# Deliberately ZERO dependencies: no ratatui until Phase 6. This crate exists
+# so the workspace shape and the `tui` feature gate in ignition-cli are final
+# from day one (structural proof, per Phase 1 research).
+[dependencies]

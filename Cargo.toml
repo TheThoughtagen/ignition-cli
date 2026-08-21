@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/ignition-cli", "crates/ignition-core", "crates/ignition-tui"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88" # CORRECTED: keyring 4.1.x floor (was 1.85 in STACK.md)
+version = "0.1.0"
+
+[workspace.dependencies]
+ignition-core = { path = "crates/ignition-core" }
+ignition-tui = { path = "crates/ignition-tui" }
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.13", default-features = true, features = ["json"] }
+toml = "1.1"
+directories = "6.0"
+keyring = "4.1"
+thiserror = "2.0"
+semver = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+# dev
+wiremock = "0.6"
+snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only
+assert_cmd = "2.2"
+predicates = "3.1"
+tempfile = "3.27"
