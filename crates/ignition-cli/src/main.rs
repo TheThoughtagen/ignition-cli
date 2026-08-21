@@ -1,59 +1,97 @@
 //! `ign` binary — single-exit-point dispatch chassis.
 //!
 //! Flow: `Cli::try_parse` → `apply_env_defaults` → `init_tracing` → tokio
-//! runtime → `dispatch` → one of exactly two `ExitCode` return values (plus
-//! clap's own `e.exit()` for usage errors, exit 2 by design).
+//! runtime → `dispatch` → exactly one of: success (render to stdout, exit 0)
+//! or a [`CoreError`] (render to stderr, exit via the LOCKED
+//! `CoreError::exit_code` mapping — the only place exit codes are decided).
 //!
 //! Contracts established here (Phase 1 research, Patterns 1 + 4):
 //! - Env→flag precedence happens in exactly ONE place: [`apply_env_defaults`].
+//! - Render mode is decided exactly ONCE: [`RenderMode::resolve`]
+//!   (`--compact` implies `--json`).
 //! - Diagnostics go to stderr only ([`init_tracing`]); stdout is reserved for
-//!   data output.
-//! - No direct exit calls anywhere outside clap's `Error::exit` (the Phase-1
-//!   single-exit-point discipline).
+//!   data output; errors render to stderr in every mode — no crossover.
+//! - No direct exit calls anywhere outside clap's `Error::exit`.
 
 mod cli;
+mod render;
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Commands};
+use ignition_core::error::CoreError;
 
-fn main() -> ExitCode {
-    let mut cli = match Cli::try_parse() {
-        Ok(c) => c,
-        // clap renders usage errors itself (exit 2) and help/version (exit 0)
-        // — by design, do NOT build a clap error hook.
-        Err(e) => e.exit(),
-    };
-    apply_env_defaults(&mut cli);
-    init_tracing(cli.verbose);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build async runtime");
-    match runtime.block_on(dispatch(cli)) {
-        Ok(()) => ExitCode::SUCCESS,
-        // Simplified error surface: the typed CoreError envelope + exit-code
-        // mapping lands in plan 01-02. Errors render to stderr, never stdout.
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::from(1)
+use crate::cli::{Cli, Commands};
+use crate::render::{RenderMode, render_error, render_ok};
+
+/// What a dispatched subcommand produced. One variant per command; grows in
+/// later plans. The payload serializes as the envelope's `data` (see
+/// [`Self::data`]); human-mode rendering lives in `render.rs`.
+enum ActionOutput {
+    /// `ign version` — gateway fields arrive in 01-04.
+    Version { cli_version: &'static str },
+}
+
+/// `data` payload for [`ActionOutput::Version`] (declaration order = golden
+/// field order).
+#[derive(serde::Serialize)]
+struct VersionData<'a> {
+    cli_version: &'a str,
+}
+
+impl ActionOutput {
+    /// The JSON `data` payload for the envelope.
+    fn data(&self) -> impl serde::Serialize + '_ {
+        match self {
+            ActionOutput::Version { cli_version } => VersionData { cli_version },
         }
     }
 }
 
-/// Subcommand dispatch. The `Result<_, CoreError>` plumbing (single exit-code
-/// mapping point) arrives in plan 01-02; a plain message suffices for now.
-async fn dispatch(cli: Cli) -> Result<(), String> {
-    match cli.command {
-        Commands::Version => {
-            // Plain text; envelope rendering (--json) arrives in 01-02.
-            println!("ign {} (ignition-cli)", env!("CARGO_PKG_VERSION"));
-            Ok(())
+fn main() -> ExitCode {
+    let mut cli = match Cli::try_parse() {
+        Ok(c) => c,
+        // clap renders usage errors itself (its exit 2) and help/version
+        // (exit 0) — by design, do NOT build a clap error hook.
+        Err(e) => e.exit(),
+    };
+    apply_env_defaults(&mut cli);
+    init_tracing(cli.verbose);
+    // The ONE render-mode decision (LOCKED): --compact implies --json.
+    let mode = RenderMode::resolve(cli.json, cli.compact);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build async runtime");
+    // The envelope's profile echo stays None until config resolution lands
+    // (01-03 threads the resolved profile name through); the FIELD exists
+    // from day one so goldens change value, never shape.
+    let profile: Option<&str> = None;
+    match runtime.block_on(dispatch(cli)) {
+        Ok(out) => {
+            render_ok(&out, profile, mode);
+            ExitCode::SUCCESS
         }
+        Err(err) => {
+            render_error(&err, profile, mode);
+            // The single exit-code mapping point (LOCKED taxonomy).
+            ExitCode::from(err.exit_code())
+        }
+    }
+}
+
+/// Subcommand dispatch: typed `Result<ActionOutput, CoreError>`; rendering
+/// and exit mapping happen once, in `main`.
+async fn dispatch(cli: Cli) -> Result<ActionOutput, CoreError> {
+    match cli.command {
+        Commands::Version => Ok(ActionOutput::Version {
+            cli_version: env!("CARGO_PKG_VERSION"),
+        }),
         #[cfg(feature = "tui")]
-        Commands::Tui => Err("TUI arrives in a later phase".to_string()),
+        Commands::Tui => Err(CoreError::Internal(
+            "the TUI cockpit arrives in a later phase".into(),
+        )),
     }
 }
 

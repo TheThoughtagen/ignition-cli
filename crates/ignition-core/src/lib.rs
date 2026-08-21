@@ -11,7 +11,8 @@
 //!   the CLI and the TUI call the same code.
 //!
 //! Modules `config`, `client`, and `actions` are added by the later plans of
-//! Phase 1; `error` (the LOCKED exit-code taxonomy + failure envelope) is the
-//! contract core and lands first.
+//! Phase 1; `error` (the LOCKED exit-code taxonomy + failure envelope) and
+//! `output` (the LOCKED success envelope) are the contract core.
 
 pub mod error;
+pub mod output;

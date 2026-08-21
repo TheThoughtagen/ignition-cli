@@ -1140,6 +1140,8 @@ dependencies = [
  "ignition-core",
  "ignition-tui",
  "predicates",
+ "serde",
+ "serde_json",
  "snapbox",
  "tempfile",
  "tokio",
