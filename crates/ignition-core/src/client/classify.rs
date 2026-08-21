@@ -129,6 +129,13 @@ mod tests {
     /// (02-RESEARCH §Code Examples) — the golden fixture for the sniffer.
     const CAPTURED_401_HTML: &str = r#"<html><head><meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/><title>Error 401</title></head><body><h2>HTTP ERROR 401 Unauthorized</h2><table><tr><th>URI:</th><td>/data/api/v1/gateway-info</td></tr><tr><th>STATUS:</th><td>401</td></tr><tr><th>MESSAGE:</th><td>Unauthorized</td></tr></table></body></html>"#;
 
+    /// The raw 401 page re-captured verbatim from the still-running
+    /// research rig (curl, 2026-08-21): the same fixed template WITH its
+    /// inter-row newlines and blank line before `</body>` — pins that the
+    /// substring anchors tolerate the wire formatting, not just the
+    /// compacted doc form.
+    const CAPTURED_401_HTML_RAW: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 401</title>\n</head>\n<body><h2>HTTP ERROR 401 Unauthorized</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/gateway-info</td></tr>\n<tr><th>STATUS:</th><td>401</td></tr>\n<tr><th>MESSAGE:</th><td>Unauthorized</td></tr>\n</table>\n\n</body>\n</html>\n";
+
     /// Same fixed template with a 500 title/message — proves the scan is
     /// template-driven, not a 401 hardcode.
     const CAPTURED_500_HTML: &str = r#"<html><head><meta http-equiv="Content-Type" content="text/html;charset=ISO-8859-1"/><title>Error 500</title></head><body><h2>HTTP ERROR 500 Server Error</h2><table><tr><th>URI:</th><td>/data/api/v1/gateway-info</td></tr><tr><th>STATUS:</th><td>500</td></tr><tr><th>MESSAGE:</th><td>Server Error</td></tr></table></body></html>"#;
@@ -137,6 +144,14 @@ mod tests {
     fn sniffs_the_captured_jetty_401_page() {
         assert_eq!(
             html_error_parts(CAPTURED_401_HTML),
+            Some((401, "Unauthorized".to_string()))
+        );
+    }
+
+    #[test]
+    fn sniffs_the_raw_wire_capture_with_newlines() {
+        assert_eq!(
+            html_error_parts(CAPTURED_401_HTML_RAW),
             Some((401, "Unauthorized".to_string()))
         );
     }

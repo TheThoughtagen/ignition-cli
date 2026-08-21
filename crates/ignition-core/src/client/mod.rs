@@ -15,7 +15,10 @@
 //!
 //! Basic is loudly demoted there: valid Basic credentials → 401 on every
 //! 8.3 `/data` route (verified), so each use warns — never silently
-//! retried.
+//! retried. Note gateway-info itself DOES require auth under 8.3 default
+//! security (header-less → 401, re-verified live 2026-08-21 — the 83-api
+//! collection's `auth: none` tag does not hold); a `None` credential
+//! proceeds header-less and classifies the answer.
 //!
 //! Redirects are never followed (`Policy::none()`): an uncommissioned
 //! gateway 302s EVERYTHING to `/welcome` and the default follow would
@@ -57,8 +60,8 @@ pub struct ReqwestGatewayApi {
 impl ReqwestGatewayApi {
     /// Build from a resolved profile (post env-overlay — the dispatch site
     /// owns that precedence) and an optional credential (`None` = proceed
-    /// header-less; gateway-info attaches credentials when present but a
-    /// 200 does not require them).
+    /// header-less; the gateway's answer is then classified — 401 under
+    /// 8.3 default security).
     ///
     /// Timeouts: 10s connect / 30s overall (per-class refinements land in
     /// Phase 2). `ssl_verify = false` accepts invalid certs — dev-rig
