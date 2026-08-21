@@ -50,9 +50,8 @@ async fn token_credential_sends_token_header_only() {
     let info = api.gateway_info().await.expect("gateway_info succeeds");
 
     let expected_endpoint = format!("{}{}", server.uri(), GATEWAY_INFO_PATH);
-    assert_eq!(info.version, "8.3.2");
+    assert_eq!(info.ignition_version, "8.3.2");
     assert_eq!(info.edition.as_deref(), Some("Standard"));
-    assert_eq!(info.state.as_deref(), Some("RUNNING"));
     assert_eq!(
         info.endpoint.as_deref(),
         Some(expected_endpoint.as_str()),
@@ -100,7 +99,7 @@ async fn basic_credential_sends_authorization_only() {
         )),
     );
     let info = api.gateway_info().await.expect("gateway_info succeeds");
-    assert_eq!(info.version, "8.3.2");
+    assert_eq!(info.ignition_version, "8.3.2");
 
     let requests = guard.received_requests().await;
     assert_eq!(requests.len(), 1);
@@ -171,5 +170,93 @@ async fn connection_refused_maps_to_network_exit_4() {
         err.endpoint().as_deref(),
         Some("http://127.0.0.1:1/data/api/v1/gateway-info"),
         "Network's url doubles as its endpoint (CORE-05)"
+    );
+}
+
+/// THE live-capture regression (02-RESEARCH §Status/info): a real 8.3.6
+/// gateway answers gateway-info with `ignitionVersion` (NOT `version`) —
+/// Phase 1's model failed deserialization against every live gateway.
+/// This golden body carries the captured shape; unknown-to-the-model keys
+/// (hostname, deploymentMode, …) are tolerated by design.
+#[tokio::test]
+async fn live_capture_gateway_info_parses() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(GATEWAY_INFO_PATH))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "ign-live-rig",
+                "redundancyRole": "Independent",
+                "edition": "standard",
+                "hostname": "localhost",
+                "port": "8088",
+                "ignitionVersion": "8.3.6 (b2026042713)",
+                "deploymentMode": "STANDARD",
+                "timeZone": "America/New_York",
+                "timeZoneId": "America/New_York",
+                "jvmVersion": "17.0.11",
+                "allowUnsignedModules": false,
+                "license": {
+                    "mode": "Trial",
+                    "validForVersion": 8.3,
+                    "expirationDate": "2026-08-24T19:00:00Z",
+                    "licenseRestrictions": []
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let info = api.gateway_info().await.expect("live shape must parse");
+    assert_eq!(info.ignition_version, "8.3.6 (b2026042713)");
+    assert_eq!(info.name.as_deref(), Some("ign-live-rig"));
+    assert_eq!(
+        info.license.as_ref().expect("license present").mode,
+        "Trial"
+    );
+    assert!(!ignition_core::client::version::below_minimum(
+        &info.ignition_version
+    ));
+}
+
+/// Uncommissioned gateway = 302 → `/welcome` on EVERY route (02-RESEARCH
+/// Pitfall 6). The client MUST NOT follow the redirect (Policy::none) —
+/// the wizard HTML can never masquerade as a 200 — and classifies into
+/// `gateway_not_commissioned` (exit 6) with the commissioning hint.
+#[tokio::test]
+async fn redirect_to_welcome_maps_to_not_commissioned() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(GATEWAY_INFO_PATH))
+        .respond_with(
+            wiremock::ResponseTemplate::new(302)
+                .insert_header("Location", "/welcome;jsessionid=abc?foo=bar"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api.gateway_info().await.expect_err("302 must fail");
+    match &err {
+        CoreError::GatewayNotCommissioned { endpoint } => {
+            assert_eq!(
+                endpoint.as_deref(),
+                Some(format!("{}{}", server.uri(), GATEWAY_INFO_PATH).as_str()),
+                "endpoint populated (CORE-05)"
+            );
+        }
+        other => panic!("wrong error class: {other}"),
+    }
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(err.code(), "gateway_not_commissioned");
+    assert!(
+        err.hint()
+            .expect("hint required")
+            .contains("commissioning wizard"),
+        "hint names the wizard: {:?}",
+        err.hint()
     );
 }

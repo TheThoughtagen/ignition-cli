@@ -101,8 +101,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
             println!("ign {} (ignition-cli)", result.cli_version);
             if let Some(gateway) = &result.gateway {
                 let edition = gateway.edition.as_deref().unwrap_or("unknown edition");
-                let state = gateway.state.as_deref().unwrap_or("unknown state");
-                println!("gateway {} ({edition}, {state})", gateway.version);
+                println!("gateway {} ({edition})", gateway.ignition_version);
             }
             for warning in &result.warnings {
                 println!("warning: {warning}");

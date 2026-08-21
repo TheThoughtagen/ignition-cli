@@ -6,18 +6,29 @@
 //! one method per capability, not per endpoint — so Phase 2 grows it
 //! without churn.
 //!
-//! Auth-header rule (verified from ignition-mcp `ignition_client.py`):
-//! a token credential sends `X-Ignition-API-Token`; a basic credential
-//! sends `Authorization: Basic <b64>`; NEVER both — enforced by a `match`.
-//! [`Secret::expose`] is called at exactly this one construction site (the
+//! Auth-header rule (verified against a live 8.3.6 gateway, 02-RESEARCH
+//! §Auth Model): a token credential sends `X-Ignition-API-Token`; a basic
+//! credential sends `Authorization: Basic <b64>`; NEVER both — enforced by
+//! a match in [`ReqwestGatewayApi::apply_auth`], the ONE place
+//! [`Secret::expose`] is called outside the secret module (the
 //! grep-auditable redaction boundary; CORE-02).
 //!
-//! gateway-info is marked `auth: none` in the 83-api collection, so a
-//! `None` credential proceeds header-less (credentials attach when present
-//! but are not required on a 200; verified empirically in Phase 2).
+//! Basic is loudly demoted there: valid Basic credentials → 401 on every
+//! 8.3 `/data` route (verified), so each use warns — never silently
+//! retried.
+//!
+//! Redirects are never followed (`Policy::none()`): an uncommissioned
+//! gateway 302s EVERYTHING to `/welcome` and the default follow would
+//! render the wizard's HTML as a 200 (02-RESEARCH Pitfall 6). The 3xx is
+//! classified by [`classify`] instead.
+//!
+//! Every request runs the pipeline: build URL → apply auth (opt-in) →
+//! send (transport error → `Network`) → [`classify`] → parse the body.
+//! Nothing ever calls `.json()` on a response that skipped `classify()`.
 
 use std::time::Duration;
 
+mod classify;
 pub mod version;
 
 use crate::client::version::GatewayInfo;
@@ -45,7 +56,8 @@ pub struct ReqwestGatewayApi {
 impl ReqwestGatewayApi {
     /// Build from a resolved profile (post env-overlay — the dispatch site
     /// owns that precedence) and an optional credential (`None` = proceed
-    /// header-less; gateway-info is `auth: none`).
+    /// header-less; gateway-info attaches credentials when present but a
+    /// 200 does not require them).
     ///
     /// Timeouts: 10s connect / 30s overall (per-class refinements land in
     /// Phase 2). `ssl_verify = false` accepts invalid certs — dev-rig
@@ -73,10 +85,90 @@ impl ReqwestGatewayApi {
     fn url_for(&self, path: &str) -> url::Url {
         self.base.join(path).expect("base joins an absolute path")
     }
+
+    /// The auth-header rule in ONE place: token XOR basic XOR neither — a
+    /// match, not if/if-else chains. [`Secret::expose`] is called at
+    /// exactly this site (the redaction boundary MOVED here in 02-01, not
+    /// duplicated).
+    ///
+    /// Basic carries a loud demotion warning: it cannot authenticate 8.3
+    /// `/data` routes (verified: valid commissioned credentials → 401) —
+    /// warn once per call, never silently retry (02-RESEARCH Auth §2).
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut request = request;
+        match &self.credential {
+            Some(Credential::Token(token)) => {
+                request = request.header("X-Ignition-API-Token", token.expose());
+            }
+            Some(Credential::Basic(user, password)) => {
+                tracing::warn!(
+                    "Basic auth does not authenticate Ignition 8.3 /data routes \
+                     (verified: valid credentials → 401); use an API token"
+                );
+                request = request.basic_auth(user.expose(), Some(password.expose()));
+            }
+            None => {}
+        }
+        request
+    }
+
+    /// GET `path` → classify → deserialize into `T`. `auth = false`
+    /// fetches header-less (the `/StatusPing` readiness probe, 02-02 —
+    /// it must work with broken credentials).
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        auth: bool,
+    ) -> Result<T, CoreError> {
+        let url = self.url_for(path);
+        let mut request = self.client.get(url.clone());
+        if auth {
+            request = self.apply_auth(request);
+        }
+        let response = self.send_and_classify(request, &url).await?;
+        response.json::<T>().await.map_err(|err| {
+            CoreError::Internal(format!(
+                "response from {url} did not match the expected shape: {err}"
+            ))
+        })
+    }
+
+    /// POST `path` with an empty body → classify → hand back the response
+    /// (callers read `true`/JSON as their capability needs). No public
+    /// caller until 02-04's restart; exercised here by a unit test.
+    #[cfg_attr(not(test), expect(dead_code))]
+    async fn post_empty(&self, path: &str, auth: bool) -> Result<reqwest::Response, CoreError> {
+        let url = self.url_for(path);
+        let mut request = self.client.post(url.clone());
+        if auth {
+            request = self.apply_auth(request);
+        }
+        self.send_and_classify(request, &url).await
+    }
+
+    /// Send + transport-error mapping + [`classify`] — the shared tail of
+    /// every pipeline helper. Transport failures (connect/timeout/TLS) →
+    /// `Network` (exit 4); everything the gateway ANSWERED goes through
+    /// the classifier.
+    async fn send_and_classify(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &url::Url,
+    ) -> Result<reqwest::Response, CoreError> {
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: err,
+        })?;
+        classify::classify(response, url.as_ref()).await
+    }
 }
 
 fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
     let mut builder = reqwest::Client::builder()
+        // Never follow redirects: an uncommissioned gateway 302s everything
+        // to /welcome and the follow would render the wizard HTML as a 200
+        // (02-RESEARCH Pitfall 6). classify() maps the 3xx instead.
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30));
     if !ssl_verify {
@@ -90,44 +182,36 @@ fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
 #[async_trait::async_trait]
 impl GatewayApi for ReqwestGatewayApi {
     async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
-        let url = self.url_for(GATEWAY_INFO_PATH);
-        let mut request = self.client.get(url.clone());
-        // The auth-header rule: token XOR basic XOR neither — a match, not
-        // if/if-else chains. expose() is called at exactly this site.
-        match &self.credential {
-            Some(Credential::Token(token)) => {
-                request = request.header("X-Ignition-API-Token", token.expose());
-            }
-            Some(Credential::Basic(user, password)) => {
-                request = request.basic_auth(user.expose(), Some(password.expose()));
-            }
-            None => {}
-        }
-        // Transport failures (connect/timeout/TLS) → Network (exit 4).
-        let response = request.send().await.map_err(|err| CoreError::Network {
-            url: url.to_string(),
-            source: err,
-        })?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(CoreError::Auth {
-                status: status.as_u16(),
-                endpoint: Some(url.to_string()),
-            });
-        }
-        if !status.is_success() {
-            // Only 401/403 and 2xx are contract shapes today; Phase 2
-            // refines per-endpoint semantics.
-            return Err(CoreError::Internal(format!(
-                "unexpected HTTP {status} from {url}"
-            )));
-        }
-        let mut info = response.json::<GatewayInfo>().await.map_err(|err| {
-            CoreError::Internal(format!(
-                "gateway-info response at {url} did not match the expected shape: {err}"
-            ))
-        })?;
-        info.endpoint = Some(url.to_string());
+        let mut info: GatewayInfo = self.get_json(GATEWAY_INFO_PATH, true).await?;
+        info.endpoint = Some(self.url_for(GATEWAY_INFO_PATH).to_string());
         Ok(info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReqwestGatewayApi;
+
+    /// Exercises `post_empty` end-to-end (no public trait caller until
+    /// 02-04's restart capability): the verified restart shape is a 200
+    /// with literal body `true`, classified Ok.
+    #[tokio::test]
+    async fn post_empty_returns_the_classified_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/data/api/v1/restart-tasks/restart",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("true"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let response = api
+            .post_empty("/data/api/v1/restart-tasks/restart", true)
+            .await
+            .expect("200 classifies Ok");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 }

@@ -48,7 +48,9 @@ fn ign_version(config: &Path, envs: &[(&str, &str)]) -> std::process::Output {
         .expect("spawn ign")
 }
 
-/// Mount a 200 gateway-info mock answering with `version`.
+/// Mount a 200 gateway-info mock answering with `version` (the legacy
+/// field name — the serde alias keeps old-shape gateways parsing; the
+/// unknown `state` key proves unknown-field tolerance).
 async fn mount_gateway_info(server: &wiremock::MockServer, version: &str) {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(GATEWAY_INFO_PATH))
@@ -92,7 +94,7 @@ async fn reachable_modern_gateway_reports_version_exit_0() {
     assert_eq!(body["ok"], Value::Bool(true));
     assert_eq!(body["profile"], Value::String("dev".into()));
     assert_eq!(
-        body["data"]["gateway"]["version"],
+        body["data"]["gateway"]["ignitionVersion"],
         Value::String("8.3.2".into())
     );
     assert_eq!(
@@ -101,7 +103,8 @@ async fn reachable_modern_gateway_reports_version_exit_0() {
     );
     assert_eq!(
         body["data"]["gateway"]["state"],
-        Value::String("RUNNING".into())
+        Value::Null,
+        "state is not a model field (dropped in 02-01 — running state comes from /overview in 02-02)"
     );
     assert_eq!(body["data"]["warnings"], Value::Null, "no warnings");
 }
@@ -240,7 +243,7 @@ async fn ignition_url_overlay_beats_profile_url_before_client_construction() {
 
     let body: Value = serde_json::from_slice(&out.stdout).expect("envelope parses");
     assert_eq!(
-        body["data"]["gateway"]["version"],
+        body["data"]["gateway"]["ignitionVersion"],
         Value::String("8.3.2".into()),
         "the overlay URL (live mock) must have been used, not the dead profile URL"
     );

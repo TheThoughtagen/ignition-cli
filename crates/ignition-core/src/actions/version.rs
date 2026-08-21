@@ -57,11 +57,11 @@ pub async fn version(
     };
     match api.gateway_info().await {
         Ok(info) => {
-            if below_minimum(&info.version) {
+            if below_minimum(&info.ignition_version) {
                 // CORE-08: the gateway ANSWERED, so the refusal contract
                 // applies — refuse cleanly with the upgrade hint.
                 return Err(CoreError::GatewayTooOld {
-                    found: info.version.clone(),
+                    found: info.ignition_version.clone(),
                     minimum: MIN_GATEWAY.to_string(),
                     endpoint: info.endpoint.clone(),
                 });
@@ -119,10 +119,12 @@ mod tests {
 
     fn info(version: &str) -> GatewayInfo {
         GatewayInfo {
-            version: version.into(),
-            edition: Some("Standard".into()),
-            state: Some("RUNNING".into()),
-            uptime: None,
+            name: None,
+            redundancy_role: None,
+            edition: Some("standard".into()),
+            ignition_version: version.into(),
+            jvm_version: None,
+            license: None,
             endpoint: None,
         }
     }
@@ -141,7 +143,10 @@ mod tests {
     async fn reachable_modern_gateway_reported() {
         let api = FakeApi(FakeOutcome::Ok(info("8.3.2")));
         let result = version(Some(&api), "1.2.3").await.expect("exit 0");
-        assert_eq!(result.gateway.as_ref().expect("gateway").version, "8.3.2");
+        assert_eq!(
+            result.gateway.as_ref().expect("gateway").ignition_version,
+            "8.3.2"
+        );
         assert!(result.warnings.is_empty());
     }
 
