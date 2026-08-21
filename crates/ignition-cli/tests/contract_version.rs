@@ -133,7 +133,11 @@ fn human_mode_is_not_json() {
 
 /// With a config present, the envelope's `profile` echo is REAL (01-03
 /// threads the resolved name through) — goldens change value, never shape.
-/// The same command with no config keeps `"profile": null` (covered by
+/// Since 01-04 a resolved profile triggers the gateway check: this profile
+/// points at a dead loopback port (nothing listens on port 1) so the check
+/// degrades deterministically to the LOCKED exit-0 warning inside `data`
+/// regardless of what runs on the developer's machine. The same command
+/// with no config keeps `"profile": null` (covered by
 /// `version_json_envelope_shape` above and `no_config_version_exit_0` in
 /// `contract_profile.rs`).
 #[test]
@@ -146,7 +150,7 @@ fn version_json_envelope_with_config() {
 active = "dev"
 
 [profiles.dev]
-url = "http://localhost:9088/"
+url = "http://127.0.0.1:1/"
 "#,
     )
     .expect("write config");
@@ -159,7 +163,7 @@ url = "http://localhost:9088/"
         .expect("spawn ign");
     assert!(
         out.status.success(),
-        "stderr: {}",
+        "unreachable gateway must exit 0 (LOCKED); stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
@@ -169,7 +173,10 @@ url = "http://localhost:9088/"
   "ok": true,
   "profile": "dev",
   "data": {
-    "cli_version": "[..]"
+    "cli_version": "[..]",
+    "warnings": [
+      "gateway unreachable: http://127.0.0.1:1/data/api/v1/gateway-info"
+    ]
   }
 }
 "#]],

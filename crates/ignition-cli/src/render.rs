@@ -89,7 +89,17 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         println!("[profile: {name}]");
     }
     match out {
-        ActionOutput::Version { cli_version } => println!("ign {cli_version} (ignition-cli)"),
+        ActionOutput::Version(result) => {
+            println!("ign {} (ignition-cli)", result.cli_version);
+            if let Some(gateway) = &result.gateway {
+                let edition = gateway.edition.as_deref().unwrap_or("unknown edition");
+                let state = gateway.state.as_deref().unwrap_or("unknown state");
+                println!("gateway {} ({edition}, {state})", gateway.version);
+            }
+            for warning in &result.warnings {
+                println!("warning: {warning}");
+            }
+        }
         ActionOutput::ProfileAdd(result) => {
             println!("added profile {} ({})", result.name, result.url);
             if result.active {

@@ -24,7 +24,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use ignition_core::actions;
-use ignition_core::config::{self, Config};
+use ignition_core::client::ReqwestGatewayApi;
+use ignition_core::config::{self, AuthRef, Config, Credential, SecretStore};
 use ignition_core::error::CoreError;
 
 use crate::cli::{Cli, Commands, ProfileArgs, ProfileCmd};
@@ -32,23 +33,16 @@ use crate::render::{RenderMode, render_error, render_ok};
 
 /// What a dispatched subcommand produced. One variant per command; grows in
 /// later plans. The payload serializes as the envelope's `data` (see
-/// [`Self::data`]); human-mode rendering lives in `render.rs`.
+/// [`Self::render_json`]); human-mode rendering lives in `render.rs`.
 enum ActionOutput {
-    /// `ign version` — gateway fields arrive in 01-04.
-    Version { cli_version: &'static str },
+    /// `ign version` — CLI version + optional gateway report + warnings.
+    Version(actions::version::VersionResult),
     /// `ign profile add`.
     ProfileAdd(actions::profile::ProfileAddResult),
     /// `ign profile list`.
     ProfileList(actions::profile::ProfileListResult),
     /// `ign profile use`.
     ProfileUse(actions::profile::ProfileUseResult),
-}
-
-/// `data` payload for [`ActionOutput::Version`] (declaration order = golden
-/// field order).
-#[derive(serde::Serialize)]
-pub(crate) struct VersionData<'a> {
-    cli_version: &'a str,
 }
 
 impl ActionOutput {
@@ -59,9 +53,7 @@ impl ActionOutput {
         use ignition_core::output::render_success;
 
         match self {
-            ActionOutput::Version { cli_version } => {
-                render_success(profile, &VersionData { cli_version }, compact)
-            }
+            ActionOutput::Version(result) => render_success(profile, result, compact),
             ActionOutput::ProfileAdd(result) => render_success(profile, result, compact),
             ActionOutput::ProfileList(result) => render_success(profile, result, compact),
             ActionOutput::ProfileUse(result) => render_success(profile, result, compact),
@@ -119,12 +111,31 @@ async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>)
 
     match cli.command {
         Commands::Version => match resolve_profile_context(&mut config, cli.profile.as_deref()) {
-            Ok(selection) => (
-                selection.as_ref().map(|(name, _)| name.clone()),
-                Ok(ActionOutput::Version {
-                    cli_version: env!("CARGO_PKG_VERSION"),
-                }),
-            ),
+            Ok(None) => {
+                // Fresh install / nothing resolved: CLI version only.
+                let result = actions::version::version(None, env!("CARGO_PKG_VERSION")).await;
+                (None, result.map(ActionOutput::Version))
+            }
+            Ok(Some((name, profile))) => {
+                // Credential for the CHECK only: exhaustion degrades to
+                // header-less (version must not demand a secret; gateway-info
+                // is `auth: none`); every other credential error propagates.
+                let credential = match resolve_secret_opt(&name, &profile.auth) {
+                    Ok(credential) => credential,
+                    Err(err) => return (Some(name), Err(err)),
+                };
+                // The client is built from the POST-OVERLAY profile — the
+                // research-locked precedence (flag > IGNITION_URL env >
+                // profile value) must hold at the construction site, not
+                // just in the config unit tests.
+                let result = match ReqwestGatewayApi::new(&profile, credential) {
+                    Ok(api) => {
+                        actions::version::version(Some(&api), env!("CARGO_PKG_VERSION")).await
+                    }
+                    Err(err) => Err(err),
+                };
+                (Some(name), result.map(ActionOutput::Version))
+            }
             Err(err) => (None, Err(err)),
         },
         Commands::Profile(ProfileArgs { command }) => match command {
@@ -198,6 +209,25 @@ fn resolve_profile_context(
     let overlay_target = flag.map(str::to_string).or_else(|| config.active.clone());
     config::apply_env_overlay(config, overlay_target.as_deref());
     config::resolve_selection(config, flag)
+}
+
+/// Credential resolution degraded for non-authenticating commands: the
+/// LOCKED chain (env tokens → keyring → basic pair) with
+/// `SecretUnavailable` mapped to `Ok(None)` — version proceeds header-less
+/// (gateway-info is `auth: none`) instead of demanding a secret. Every
+/// OTHER credential error propagates.
+fn resolve_secret_opt(profile: &str, auth: &AuthRef) -> Result<Option<Credential>, CoreError> {
+    let chain: Vec<Box<dyn SecretStore>> = vec![
+        Box::new(config::EnvStore),
+        Box::new(config::KeyringStore),
+        Box::new(config::BasicEnvStore),
+    ];
+    config::resolve_secret(profile, auth, &chain)
+        .map(Some)
+        .or_else(|err| match err {
+            CoreError::SecretUnavailable { .. } => Ok(None),
+            other => Err(other),
+        })
 }
 
 /// Deterministic auth-ref construction from `profile add` flags:

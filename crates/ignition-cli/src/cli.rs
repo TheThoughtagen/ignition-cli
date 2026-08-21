@@ -44,7 +44,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Print version information (CLI only for now; gateway check arrives in a later plan)
+    /// Print version information (CLI always; gateway check when a profile resolves)
     Version,
 
     /// Manage gateway profiles

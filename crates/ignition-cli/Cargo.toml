@@ -28,3 +28,4 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 snapbox = { workspace = true }
+wiremock = { workspace = true } # binary-level gateway contract tests (version exit classes)

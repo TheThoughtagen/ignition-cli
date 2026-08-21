@@ -5,3 +5,4 @@
 //! binary (and later the TUI).
 
 pub mod profile;
+pub mod version;
