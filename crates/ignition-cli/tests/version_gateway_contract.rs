@@ -60,6 +60,19 @@ async fn mount_gateway_info(server: &wiremock::MockServer, version: &str) {
         .await;
 }
 
+/// The error envelope is the JSON object starting at the first `{` on
+/// stderr: tracing log lines share stderr by design (level 0 = warn),
+/// so platforms that emit dependency log lines ahead of the envelope
+/// must not break parsing — the envelope's presence and content are the
+/// contract, not stderr being byte-exact.
+fn stderr_envelope(out: &std::process::Output) -> Value {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let start = stderr.find('{').unwrap_or(0);
+    serde_json::from_str(&stderr[start..]).unwrap_or_else(|err| {
+        panic!("stderr envelope parses (from first '{{'; full stderr {stderr:?}): {err}")
+    })
+}
+
 /// Matrix row 2: gateway answered ≥ 8.3.1 → both versions in data, exit 0.
 #[tokio::test]
 async fn reachable_modern_gateway_reports_version_exit_0() {
@@ -106,7 +119,7 @@ async fn answered_below_minimum_refuses_exit_6() {
     assert_eq!(out.status.code(), Some(6), "target_state class");
     assert!(out.stdout.is_empty(), "errors never touch stdout");
 
-    let body: Value = serde_json::from_slice(&out.stderr).expect("stderr envelope parses");
+    let body = stderr_envelope(&out);
     assert_eq!(body["ok"], Value::Bool(false));
     assert_eq!(
         body["error"]["code"],
@@ -143,7 +156,7 @@ async fn auth_rejected_exit_5() {
     assert_eq!(out.status.code(), Some(5), "auth class");
     assert!(out.stdout.is_empty(), "errors never touch stdout");
 
-    let body: Value = serde_json::from_slice(&out.stderr).expect("stderr envelope parses");
+    let body = stderr_envelope(&out);
     assert_eq!(body["error"]["code"], Value::String("auth_rejected".into()));
     assert_eq!(
         body["error"]["endpoint"],

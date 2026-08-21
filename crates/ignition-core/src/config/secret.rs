@@ -125,10 +125,13 @@ impl SecretStore for BasicEnvStore {
 
 /// OS keyring lookup: service `ignition-cli`, user `profile:<name>`.
 ///
-/// ANY `Entry::new` failure → `tracing::warn!` + `Ok(None)` (store
-/// unavailable — headless Linux without D-Bus: skip, never fatal, never
-/// hang; keyring-rs fails fast at construction). A live entry that exists
-/// but cannot be read surfaces as `Err` (found-but-unreadable).
+/// ANY `Entry::new` failure → `tracing::debug!` + `Ok(None)` (store
+/// unavailable — headless Linux without D-Bus is an EXPECTED condition,
+/// not an anomaly: skip, never fatal, never hang; keyring-rs fails fast
+/// at construction. debug, not warn, so headless hosts don't get a
+/// non-JSON log line on stderr ahead of every JSON error envelope).
+/// A live entry that exists but cannot be read surfaces as `Err`
+/// (found-but-unreadable — THAT warns).
 pub struct KeyringStore;
 
 /// Keyring coordinates for a profile: fixed service, `profile:<name>` user.
@@ -141,7 +144,7 @@ impl SecretStore for KeyringStore {
         let entry = match keyring_entry(profile) {
             Ok(entry) => entry,
             Err(err) => {
-                tracing::warn!(error = %err, profile, "keyring unavailable; skipping");
+                tracing::debug!(error = %err, profile, "keyring unavailable; skipping");
                 return Ok(None);
             }
         };
