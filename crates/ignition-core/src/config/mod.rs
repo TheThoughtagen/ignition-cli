@@ -13,8 +13,12 @@
 //! auth env resolution lives in [`secret`].
 
 pub mod profile;
+pub mod secret;
 
 pub use profile::{AuthRef, Config, Profile};
+pub use secret::{
+    BasicEnvStore, Credential, EnvStore, KeyringStore, Secret, SecretStore, resolve_secret,
+};
 
 use std::path::{Path, PathBuf};
 
