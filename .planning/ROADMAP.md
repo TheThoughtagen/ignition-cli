@@ -35,13 +35,15 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Every subcommand supports `--json` with stable field names and `--compact`; errors render as a JSON envelope with code, message, endpoint, and actionable hint; exit codes follow the documented taxonomy (0/2/config/auth/network/target-state) — all enforced by golden-file CI tests
   4. Commands are non-interactive by default; destructive operations refuse without `--yes` or `IGNITION_YES`
   5. `ign version` checks the gateway minimum version and refuses cleanly on <8.3.1; `ign completions` generates bash/zsh/fish
-**Plans**: 4 plans (TBD, refined at planning)
+**Plans**: 4 plans (sequential waves 1→4 — all share main.rs/cli.rs/error.rs, so no parallelism is honest for this shared-foundation phase)
+
+*Planner refinement:* skeleton order 01-02/01-03 swapped — output contract now precedes profiles per research's primary recommendation ("build the contract first — every subsequent subcommand test then enforces the contract for free"), so `profile add/list/use` ship envelope-complete with zero render rework. Locked decisions: envelope `{"ok","profile","data"}`, exit-code table 0-7 (config=3, network=4, auth=5, target-state=6), `async_trait` for GatewayApi, `ign version` unreachable→exit 0 + warning, no Windows CI.
 
 Plans:
-- [ ] 01-01: Cargo workspace skeleton (ignition-cli / ignition-core / ignition-tui + webdev/ dir), clap global flags, tracing setup
-- [ ] 01-02: Profiles & config — TOML profiles, env overlay, keyring/env secret resolution, redaction
-- [ ] 01-03: Agentic output contract — JSON envelope, exit-code taxonomy, `--compact`, golden-file tests
-- [ ] 01-04: `version` gateway check, shell completions, `--yes` guards, `GatewayApi` trait seam + wiremock harness
+- [ ] 01-01-PLAN.md — Cargo workspace skeleton + CLI chassis (3 crates, MSRV 1.88, 5 clap globals, single-exit main, tui feature gate, CI check job)
+- [ ] 01-02-PLAN.md — Agentic output contract (CoreError 0-7 taxonomy, frozen envelope, --compact, snapbox golden harness, README exit-code table)
+- [ ] 01-03-PLAN.md — Profiles, config & secrets (TOML + env overlay, SecretStore env-first, keyring smoke CI job closing the STATE.md blocker, redaction canary, profile add/list/use)
+- [ ] 01-04-PLAN.md — Gateway seam & finish (GatewayApi + wiremock, `version` min-check 8.3.1 with locked behavior matrix, completions, `--yes` guard)
 
 ### Phase 2: Gateway Health & Inspection
 **Goal:** A user can fully inspect and (carefully) restart any Ignition 8.3+ gateway from the terminal with zero gateway-side setup — the first webpage replacement, plus the `doctor` and `wait` primitives everything downstream reuses.
