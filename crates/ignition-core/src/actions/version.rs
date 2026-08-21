@@ -147,6 +147,46 @@ mod tests {
         async fn metrics_threads(&self) -> Result<crate::client::metrics::ThreadCounts, CoreError> {
             unimplemented!("version FakeApi only serves gateway_info")
         }
+        async fn designers(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::sessions::DesignerInfo>,
+            CoreError,
+        > {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn perspective_sessions(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::sessions::PerspectiveSession>,
+            CoreError,
+        > {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn vision_clients(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::sessions::VisionClient>,
+            CoreError,
+        > {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn terminate_perspective_session(
+            &self,
+            _id: &str,
+            _message: Option<&str>,
+        ) -> Result<(), CoreError> {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn terminate_vision_client(&self, _id: &str) -> Result<(), CoreError> {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
+        async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
     }
 
     fn info(version: &str) -> GatewayInfo {

@@ -34,11 +34,13 @@ use std::time::Duration;
 mod classify;
 pub mod metrics;
 pub mod query;
+pub mod sessions;
 pub mod status;
 pub mod version;
 
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::query::ListEnvelope;
+use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
 use crate::client::version::GatewayInfo;
 use crate::config::{Credential, Profile};
@@ -80,6 +82,38 @@ pub trait GatewayApi: Send + Sync {
     /// Fetch `/data/api/v1/systemPerformance/threads` (authed) — thread
     /// execution counts (running/waiting/timedWaiting/blocked).
     async fn metrics_threads(&self) -> Result<ThreadCounts, CoreError>;
+    /// Fetch `/data/api/v1/designers` (authed) — active Designer
+    /// sessions (02-03, HLTH-08).
+    async fn designers(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<DesignerInfo>, CoreError>;
+    /// Fetch `/data/perspective/api/v1/sessions/` (authed) — the EXACT
+    /// trailing slash is the contract (Pitfall 8; module-scoped prefix).
+    async fn perspective_sessions(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<PerspectiveSession>, CoreError>;
+    /// Fetch `/data/vision/api/v1/clients` (authed) — active Vision
+    /// clients (designer shape + `tagCount`).
+    async fn vision_clients(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<VisionClient>, CoreError>;
+    /// DELETE `/data/perspective/api/v1/sessions?sessionId=<id>` (+ an
+    /// optional `message` shown to the session's user) — NO trailing
+    /// slash on the DELETE (spec). Audit-logged server-side.
+    async fn terminate_perspective_session(
+        &self,
+        id: &str,
+        message: Option<&str>,
+    ) -> Result<(), CoreError>;
+    /// DELETE `/data/vision/api/v1/client/{id}` — terminate a Vision
+    /// client. Audit-logged server-side.
+    async fn terminate_vision_client(&self, id: &str) -> Result<(), CoreError>;
+    /// DELETE `/data/api/v1/designer/{id}` — prune a Designer session.
+    /// Audit-logged server-side.
+    async fn prune_designer(&self, id: &str) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -187,6 +221,23 @@ impl ReqwestGatewayApi {
         self.send_and_classify(request, &url).await
     }
 
+    /// DELETE `path` with `pairs` as QUERY params (empty body) →
+    /// classify → `Ok(())` on any classified success. Token-auth DELETEs
+    /// need NO CSRF (verified 02-RESEARCH §Auth Model: CSRF is only for
+    /// cookie/session auth); the classified bodies (`{terminated: N}`,
+    /// `{message: …}`) are advisory — Ok classification IS the success
+    /// contract.
+    async fn delete_with_query(
+        &self,
+        path: &str,
+        pairs: &[(&str, String)],
+    ) -> Result<(), CoreError> {
+        let url = self.url_for(path);
+        let mut request = self.client.delete(url.clone()).query(pairs);
+        request = self.apply_auth(request);
+        self.send_and_classify(request, &url).await.map(|_| ())
+    }
+
     /// Send + transport-error mapping + [`classify`] — the shared tail of
     /// every pipeline helper. Transport failures (connect/timeout/TLS) →
     /// `Network` (exit 4); everything the gateway ANSWERED goes through
@@ -263,6 +314,58 @@ impl GatewayApi for ReqwestGatewayApi {
 
     async fn metrics_threads(&self) -> Result<ThreadCounts, CoreError> {
         self.get_json(metrics::THREADS_PATH, None, true).await
+    }
+
+    async fn designers(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<DesignerInfo>, CoreError> {
+        self.get_json(sessions::DESIGNERS_PATH, Some(query), true)
+            .await
+    }
+
+    async fn perspective_sessions(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<PerspectiveSession>, CoreError> {
+        // The trailing slash is PART OF THE PATH (Pitfall 8) — url_for's
+        // join preserves it; the exact-path wiremock matcher in
+        // tests/sessions_contract.rs pins it.
+        self.get_json(sessions::PERSPECTIVE_SESSIONS_LIST_PATH, Some(query), true)
+            .await
+    }
+
+    async fn vision_clients(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<VisionClient>, CoreError> {
+        self.get_json(sessions::VISION_CLIENTS_PATH, Some(query), true)
+            .await
+    }
+
+    async fn terminate_perspective_session(
+        &self,
+        id: &str,
+        message: Option<&str>,
+    ) -> Result<(), CoreError> {
+        // sessionId is a QUERY param on the spec's DELETE route — never
+        // a body (recorded-request proof in tests/sessions_contract.rs).
+        let mut pairs = vec![("sessionId", id.to_string())];
+        if let Some(message) = message {
+            pairs.push(("message", message.to_string()));
+        }
+        self.delete_with_query(sessions::PERSPECTIVE_SESSIONS_TERMINATE_PATH, &pairs)
+            .await
+    }
+
+    async fn terminate_vision_client(&self, id: &str) -> Result<(), CoreError> {
+        self.delete_with_query(&sessions::vision_client_terminate_path(id), &[])
+            .await
+    }
+
+    async fn prune_designer(&self, id: &str) -> Result<(), CoreError> {
+        self.delete_with_query(&sessions::designer_prune_path(id), &[])
+            .await
     }
 }
 

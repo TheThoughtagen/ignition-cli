@@ -302,6 +302,37 @@ mod tests {
                 extra: Default::default(),
             })
         }
+        async fn designers(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::sessions::DesignerInfo>, CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn perspective_sessions(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::sessions::PerspectiveSession>, CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn vision_clients(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::sessions::VisionClient>, CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn terminate_perspective_session(
+            &self,
+            _id: &str,
+            _message: Option<&str>,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn terminate_vision_client(&self, _id: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this double's actions")
+        }
     }
 
     /// status merges all three sources under the documented keys —
@@ -380,6 +411,37 @@ mod tests {
             unreachable!("not part of this action")
         }
         async fn metrics_threads(&self) -> Result<ThreadCounts, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn designers(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::sessions::DesignerInfo>, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn perspective_sessions(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::sessions::PerspectiveSession>, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn vision_clients(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::sessions::VisionClient>, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn terminate_perspective_session(
+            &self,
+            _id: &str,
+            _message: Option<&str>,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn terminate_vision_client(&self, _id: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
     }
