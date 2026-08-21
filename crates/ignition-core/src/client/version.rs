@@ -51,8 +51,17 @@ pub struct GatewayInfo {
 pub struct LicenseInfo {
     /// `"Trial"` / `"Licensed"` / …
     pub mode: String,
-    /// Trial/license expiration, when reported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Trial/license expiration, when reported. Serialized under the
+    /// gateway-native key (camelCase, like `ignitionVersion`); the
+    /// snake_case alias tolerates non-gateway shapers. (02-02 found the
+    /// missing rename silently DROPPED the gateway's `expirationDate`
+    /// on parse — the 02-01 fix covered `ignitionVersion` only.)
+    #[serde(
+        rename = "expirationDate",
+        alias = "expiration_date",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expiration_date: Option<String>,
 }
 

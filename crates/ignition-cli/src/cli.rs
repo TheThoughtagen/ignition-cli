@@ -55,6 +55,23 @@ pub enum Commands {
         shell: clap_complete::aot::Shell,
     },
 
+    /// Gateway status: identity, platform, uptime, license (incl. trial countdown)
+    Status,
+
+    /// List gateway modules (healthy by default)
+    Modules {
+        /// Show quarantined modules instead of healthy ones
+        #[arg(long)]
+        quarantined: bool,
+    },
+
+    /// Gateway performance metrics (current gauges + thread counts)
+    Metrics {
+        /// Include historic chart datapoints
+        #[arg(long)]
+        history: bool,
+    },
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),

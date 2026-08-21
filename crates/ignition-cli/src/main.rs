@@ -38,6 +38,12 @@ use crate::render::{RenderMode, render_error, render_ok};
 enum ActionOutput {
     /// `ign version` — CLI version + optional gateway report + warnings.
     Version(actions::version::VersionResult),
+    /// `ign status` — merged gateway_info + overview + status_ping.
+    Status(actions::inspect::StatusResult),
+    /// `ign modules` — healthy (default) or quarantined module rows.
+    Modules(actions::inspect::ModulesResult),
+    /// `ign metrics` — current gauges + threads (+ optional history).
+    Metrics(actions::inspect::MetricsResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -62,6 +68,9 @@ impl ActionOutput {
 
         match self {
             ActionOutput::Version(result) => render_success(profile, result, compact),
+            ActionOutput::Status(result) => render_success(profile, result, compact),
+            ActionOutput::Modules(result) => render_success(profile, result, compact),
+            ActionOutput::Metrics(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -155,6 +164,30 @@ async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>)
             }
             Err(err) => (None, Err(err)),
         },
+        // The inspection commands (02-02): authed reads of a healthy
+        // gateway. Credential REQUIRED — resolve_secret, not the
+        // header-less degradation `version` uses: these commands cannot
+        // work unauthenticated, so a missing secret is SecretUnavailable
+        // (exit 3), the correct taxonomy, not a doomed 401.
+        Commands::Status => {
+            run_inspection(&mut config, cli.profile.as_deref(), Inspection::Status).await
+        }
+        Commands::Modules { quarantined } => {
+            run_inspection(
+                &mut config,
+                cli.profile.as_deref(),
+                Inspection::Modules(quarantined),
+            )
+            .await
+        }
+        Commands::Metrics { history } => {
+            run_inspection(
+                &mut config,
+                cli.profile.as_deref(),
+                Inspection::Metrics(history),
+            )
+            .await
+        }
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {
@@ -234,18 +267,77 @@ fn resolve_profile_context(
     config::resolve_selection(config, flag)
 }
 
+/// Which inspection action a dispatch arm runs.
+enum Inspection {
+    Status,
+    Modules(bool),
+    Metrics(bool),
+}
+
+/// Shared tail of the authed inspection commands: resolve profile +
+/// REQUIRED credential + client (post-overlay profile at the
+/// construction site), then run the action. The profile name travels
+/// out even on failure so the error envelope echoes it (CORE-01).
+async fn run_inspection(
+    config: &mut Config,
+    flag: Option<&str>,
+    inspection: Inspection,
+) -> (Option<String>, Result<ActionOutput, CoreError>) {
+    let (name, api) = resolve_gateway_api(config, flag);
+    let result = match api {
+        Ok(api) => match inspection {
+            Inspection::Status => actions::inspect::status(&api)
+                .await
+                .map(ActionOutput::Status),
+            Inspection::Modules(quarantined) => actions::inspect::modules(&api, quarantined)
+                .await
+                .map(ActionOutput::Modules),
+            Inspection::Metrics(history) => actions::inspect::metrics(&api, history)
+                .await
+                .map(ActionOutput::Metrics),
+        },
+        Err(err) => Err(err),
+    };
+    (name, result)
+}
+
+/// Profile + REQUIRED credential + client for gateway commands. `None`
+/// profile → `NoActiveProfile` (these commands cannot run without a
+/// target); the LOCKED secret chain with NO degradation — a missing
+/// secret is `SecretUnavailable` (exit 3), correct for authed reads.
+fn resolve_gateway_api(
+    config: &mut Config,
+    flag: Option<&str>,
+) -> (Option<String>, Result<ReqwestGatewayApi, CoreError>) {
+    match resolve_profile_context(config, flag) {
+        Ok(None) => (None, Err(CoreError::NoActiveProfile)),
+        Ok(Some((name, profile))) => {
+            let credential = config::resolve_secret(&name, &profile.auth, &secret_chain());
+            let result = credential
+                .and_then(|credential| ReqwestGatewayApi::new(&profile, Some(credential)));
+            (Some(name), result)
+        }
+        Err(err) => (None, Err(err)),
+    }
+}
+
+/// The LOCKED secret chain (env tokens → keyring → basic pair), built in
+/// exactly one place.
+fn secret_chain() -> Vec<Box<dyn SecretStore>> {
+    vec![
+        Box::new(config::EnvStore),
+        Box::new(config::KeyringStore),
+        Box::new(config::BasicEnvStore),
+    ]
+}
+
 /// Credential resolution degraded for non-authenticating commands: the
 /// LOCKED chain (env tokens → keyring → basic pair) with
 /// `SecretUnavailable` mapped to `Ok(None)` — version proceeds header-less
 /// (gateway-info is `auth: none`) instead of demanding a secret. Every
 /// OTHER credential error propagates.
 fn resolve_secret_opt(profile: &str, auth: &AuthRef) -> Result<Option<Credential>, CoreError> {
-    let chain: Vec<Box<dyn SecretStore>> = vec![
-        Box::new(config::EnvStore),
-        Box::new(config::KeyringStore),
-        Box::new(config::BasicEnvStore),
-    ];
-    config::resolve_secret(profile, auth, &chain)
+    config::resolve_secret(profile, auth, &secret_chain())
         .map(Some)
         .or_else(|err| match err {
             CoreError::SecretUnavailable { .. } => Ok(None),

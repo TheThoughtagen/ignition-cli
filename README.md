@@ -77,3 +77,19 @@ cargo test -p ignition-core --test live_gateway -- --ignored
 
 With no envs set the suite skips cleanly (green no-op). The file header
 carries the one-command Docker rig recipe for reproducing a test gateway.
+
+## Commands
+
+| Command | What it does | Notes |
+|---------|--------------|-------|
+| `ign version` | CLI version; gateway check when a profile resolves | unreachable gateway degrades to a warning (exit 0) |
+| `ign status` | Identity, platform (Java/OS), uptime, CPU/memory/disk, license incl. trial countdown | merges gateway-info + `/overview` + unauthenticated `/StatusPing`; authed read (exit 3 without a secret, exit 5 on bad credentials) |
+| `ign modules [--quarantined]` | Every module: `id  name  version  state  licenseState` | default = healthy list; `--quarantined` swaps to the quarantined list (usually empty) |
+| `ign metrics [--history]` | Current CPU %/heap and thread execution counts | `--history` appends first/last datapoint summaries per series (`systemPerformance` endpoints) |
+| `ign profile add/list/use` | Manage gateway profiles | — |
+| `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
+
+All gateway commands honor the envelope (`--json`/`--compact`) with the
+`[profile: NAME]` header in human mode. The inspection trio (`status`,
+`modules`, `metrics`) replaces the gateway webpage's Status Overview,
+Config > Modules, and Performance & Diagnostics pages.

@@ -147,3 +147,77 @@ async fn live_basic_is_rejected() {
         err.hint()
     );
 }
+
+// ---------------------------------------------------------------------------
+// 02-02 inspection additions: read-only live checks (skip gracefully when
+// no rig is configured).
+// ---------------------------------------------------------------------------
+
+/// `/StatusPing` needs NO token (the unauthenticated readiness anchor):
+/// a URL alone must yield a state string — this is the same primitive
+/// `ign wait` (02-05) will poll.
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL (no token needed — StatusPing is unauthenticated)"]
+async fn live_status_ping_unauthenticated() {
+    let Some(url) = live_url() else {
+        skip("IGNITION_LIVE_URL not set");
+        return;
+    };
+    let api = ReqwestGatewayApi::for_tests(&url, None);
+    let ping = api
+        .status_ping()
+        .await
+        .expect("StatusPing answers without any credential");
+    assert!(
+        !ping.state.is_empty(),
+        "state surfaces verbatim: {:?}",
+        ping.state
+    );
+}
+
+/// The three authed inspection reads against a live gateway: overview
+/// parses (uptime ms ≥ 0, cpu a 0–1 fraction), healthy modules are
+/// non-empty (the standard image ships dozens), current gauges parse
+/// (cpu percent ≥ 0).
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN"]
+async fn live_inspection_endpoints_parse() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    let overview = api
+        .overview()
+        .await
+        .expect("live overview must deserialize");
+    assert!(overview.uptime >= 0, "uptime ms: {}", overview.uptime);
+    assert!(
+        (0.0..=1.0).contains(&overview.cpu),
+        "cpu is a 0–1 fraction: {}",
+        overview.cpu
+    );
+
+    let modules = api
+        .modules(false, &Default::default())
+        .await
+        .expect("live modules/healthy must deserialize");
+    assert!(
+        !modules.items.is_empty(),
+        "a standard gateway ships healthy modules"
+    );
+    assert!(modules.items.iter().all(|m| m.state.as_deref() != Some("")));
+    let active = modules
+        .items
+        .iter()
+        .filter(|m| m.state.as_deref() == Some("ACTIVE"))
+        .count();
+    assert!(active > 0, "{active} modules are ACTIVE");
+
+    let gauges = api
+        .metrics_current()
+        .await
+        .expect("live currentGauges must deserialize");
+    assert!(gauges.cpu >= 0.0, "cpu percent: {}", gauges.cpu);
+}
