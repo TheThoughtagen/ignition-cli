@@ -300,9 +300,12 @@ fn apply_env_defaults(cli: &mut Cli) {
 /// via [`apply_env_defaults`] — with a usage-class error (exit 2: it names
 /// a flag the caller must add) whose hint says exactly that. Pinned here
 /// in main.rs, no separate confirm.rs file.
-#[expect(
-    dead_code,
-    reason = "no destructive command exists in Phase 1; first caller is Phase 3's project delete — the expectation flags removal when it gains a caller"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no destructive command exists in Phase 1; first caller is Phase 3's project delete — the expectation flags removal when it gains a caller"
+    )
 )]
 fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
     if yes {
