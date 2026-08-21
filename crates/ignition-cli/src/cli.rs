@@ -72,6 +72,17 @@ pub enum Commands {
         history: bool,
     },
 
+    /// List gateway sessions (designers, Perspective, Vision) — or
+    /// terminate one via the `terminate` subcommand
+    Sessions(SessionsArgs),
+
+    /// List database/OPC connections with healthcheck status as reported
+    Connections {
+        /// Filter to one connection family (default: both)
+        #[arg(long, value_enum)]
+        r#type: Option<ConnectionType>,
+    },
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -87,6 +98,75 @@ pub enum Commands {
 pub struct ProfileArgs {
     #[command(subcommand)]
     pub command: ProfileCmd,
+}
+
+/// Sessions args: the family filter rides the TOP level so bare
+/// `ign sessions [--type X]` lists (must-have truth #1) while
+/// `ign sessions terminate …` carries the destructive half.
+#[derive(Debug, clap::Args)]
+pub struct SessionsArgs {
+    /// Filter to one session family (default: all three merged)
+    #[arg(long, value_enum)]
+    pub r#type: Option<SessionType>,
+
+    #[command(subcommand)]
+    pub command: Option<SessionsCmd>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsCmd {
+    /// Terminate (designer: prune / vision: close) a session —
+    /// destructive, refused without --yes
+    Terminate {
+        /// Session family holding the id
+        #[arg(long, value_enum)]
+        r#type: SessionType,
+        /// Session/client id to terminate (see `ign sessions`)
+        #[arg(long)]
+        id: String,
+        /// Message shown to the session's user (Perspective only)
+        #[arg(long)]
+        message: Option<String>,
+    },
+}
+
+/// CLI value-enum mirrors of the core action enums (ignition-core stays
+/// clap-free; `From` converts at the dispatch seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionType {
+    /// Designer sessions
+    Designer,
+    /// Perspective browser sessions
+    Perspective,
+    /// Vision clients
+    Vision,
+}
+
+impl From<SessionType> for ignition_core::actions::sessions::SessionType {
+    fn from(value: SessionType) -> Self {
+        match value {
+            SessionType::Designer => Self::Designer,
+            SessionType::Perspective => Self::Perspective,
+            SessionType::Vision => Self::Vision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConnectionType {
+    /// Database connections
+    Database,
+    /// OPC connections
+    Opc,
+}
+
+impl From<ConnectionType> for ignition_core::actions::connections::ConnectionType {
+    fn from(value: ConnectionType) -> Self {
+        match value {
+            ConnectionType::Database => Self::Database,
+            ConnectionType::Opc => Self::Opc,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

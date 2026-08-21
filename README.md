@@ -86,10 +86,24 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign status` | Identity, platform (Java/OS), uptime, CPU/memory/disk, license incl. trial countdown | merges gateway-info + `/overview` + unauthenticated `/StatusPing`; authed read (exit 3 without a secret, exit 5 on bad credentials) |
 | `ign modules [--quarantined]` | Every module: `id  name  version  state  licenseState` | default = healthy list; `--quarantined` swaps to the quarantined list (usually empty) |
 | `ign metrics [--history]` | Current CPU %/heap and thread execution counts | `--history` appends first/last datapoint summaries per series (`systemPerformance` endpoints) |
+| `ign sessions [--type designer\|perspective\|vision]` | All three session families in one merged output (`designers (N)` / `perspective (N)` / `vision (N)` sections) | `--type` filters to one family; JSON always carries all three keys (filtered-out = `[]`); replaces the webpage's Sessions pages |
+| `ign sessions terminate --type <T> --id <ID> [--message MSG]` | Terminate a session (designer: prune / vision: close / perspective: terminate, `--message` shown to the user) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`; a nonexistent id exits 6 (`not_found`) |
+| `ign connections [--type database\|opc]` | Database/OPC connections: `name  enabled  healthchecks` | `healthchecks` is passthrough as the gateway reports it (populated detail LOW-confidence until captured live); replaces the webpage's Connections pages |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
 All gateway commands honor the envelope (`--json`/`--compact`) with the
 `[profile: NAME]` header in human mode. The inspection trio (`status`,
 `modules`, `metrics`) replaces the gateway webpage's Status Overview,
-Config > Modules, and Performance & Diagnostics pages.
+Config > Modules, and Performance & Diagnostics pages; `sessions` and
+`connections` replace its Sessions and Connections pages.
+
+### Destructive operations
+
+Commands that change gateway state (`sessions terminate` today; `project
+delete` and `rig reset` in later phases) refuse without `--yes` (exit 2,
+`confirmation_required`, hint names both the flag and `IGNITION_YES=1`)
+— non-interactive by design, so scripts and agents pass `--yes` once
+and humans get a speed bump. The guard fires before any network
+activity: a refusal never touches the gateway. Termination mutations
+are audit-logged server-side by the gateway.

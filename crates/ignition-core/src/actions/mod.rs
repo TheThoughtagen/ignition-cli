@@ -4,6 +4,8 @@
 //! Actions NEVER print — they return serde models; rendering belongs to the
 //! binary (and later the TUI).
 
+pub mod connections;
 pub mod inspect;
 pub mod profile;
+pub mod sessions;
 pub mod version;

@@ -29,7 +29,7 @@ use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::config::{self, AuthRef, Config, Credential, SecretStore};
 use ignition_core::error::CoreError;
 
-use crate::cli::{Cli, Commands, ProfileArgs, ProfileCmd};
+use crate::cli::{Cli, Commands, ProfileArgs, ProfileCmd, SessionsArgs, SessionsCmd};
 use crate::render::{RenderMode, render_error, render_ok};
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -44,6 +44,13 @@ enum ActionOutput {
     Modules(actions::inspect::ModulesResult),
     /// `ign metrics` — current gauges + threads (+ optional history).
     Metrics(actions::inspect::MetricsResult),
+    /// `ign sessions` — the three session families merged (filtered keys
+    /// stay present-but-empty).
+    Sessions(actions::sessions::SessionsResult),
+    /// `ign sessions terminate` — the FIRST destructive command.
+    SessionsTerminate(actions::sessions::TerminateResult),
+    /// `ign connections` — DB/OPC connection status.
+    Connections(actions::connections::ConnectionsResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -71,6 +78,9 @@ impl ActionOutput {
             ActionOutput::Status(result) => render_success(profile, result, compact),
             ActionOutput::Modules(result) => render_success(profile, result, compact),
             ActionOutput::Metrics(result) => render_success(profile, result, compact),
+            ActionOutput::Sessions(result) => render_success(profile, result, compact),
+            ActionOutput::SessionsTerminate(result) => render_success(profile, result, compact),
+            ActionOutput::Connections(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -187,6 +197,56 @@ async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>)
                 Inspection::Metrics(history),
             )
             .await
+        }
+        // Sessions (02-03): the merged list is a plain authed read; the
+        // terminate half is the CLI's FIRST DESTRUCTIVE COMMAND — the
+        // guard refuses (exit 2, confirmation_required) BEFORE any API
+        // construction, so a refusal costs nothing and never depends on
+        // config/profile state (usage-class errors lead, like clap's).
+        Commands::Sessions(SessionsArgs { r#type, command }) => match command {
+            None => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::sessions::sessions(&api, r#type.map(Into::into))
+                        .await
+                        .map(ActionOutput::Sessions),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            Some(SessionsCmd::Terminate {
+                r#type,
+                id,
+                message,
+            }) => {
+                if let Err(err) = require_confirmation(cli.yes, "sessions terminate") {
+                    return (None, Err(err));
+                }
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::sessions::terminate_session(
+                        &api,
+                        r#type.into(),
+                        &id,
+                        message.as_deref(),
+                    )
+                    .await
+                    .map(ActionOutput::SessionsTerminate),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+        },
+        // Connections (02-03): authed read of the resource lists.
+        Commands::Connections { r#type } => {
+            let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+            let result = match api {
+                Ok(api) => actions::connections::connections(&api, r#type.map(Into::into))
+                    .await
+                    .map(ActionOutput::Connections),
+                Err(err) => Err(err),
+            };
+            (name, result)
         }
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
@@ -386,19 +446,15 @@ fn apply_env_defaults(cli: &mut Cli) {
     }
 }
 
-/// CORE-06 pattern, proven now so later phases inherit it verbatim
-/// (`project delete` in Phase 3, `rig reset` in Phase 4): destructive
-/// operations refuse without `--yes` — which already merges `IGNITION_YES`
-/// via [`apply_env_defaults`] — with a usage-class error (exit 2: it names
+/// CORE-06 pattern, PROVEN in production by `ign sessions terminate`
+/// (02-03 — the first destructive caller; the Phase-1 `expect(dead_code)`
+/// gate came off in the same commit it gained that caller). Later
+/// destructive operations inherit this guard verbatim (`project delete`
+/// in Phase 3, `rig reset` in Phase 4): destructive commands refuse
+/// without `--yes` — which already merges `IGNITION_YES` via
+/// [`apply_env_defaults`] — with a usage-class error (exit 2: it names
 /// a flag the caller must add) whose hint says exactly that. Pinned here
 /// in main.rs, no separate confirm.rs file.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no destructive command exists in Phase 1; first caller is Phase 3's project delete — the expectation flags removal when it gains a caller"
-    )
-)]
 fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
     if yes {
         Ok(())

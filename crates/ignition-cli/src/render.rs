@@ -14,7 +14,9 @@
 //! modes are untouched — the envelope's top-level `profile` field is their
 //! mechanism.
 
+use ignition_core::actions::connections::ConnectionsResult;
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
+use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::error::CoreError;
 use ignition_core::output::render_failure;
 
@@ -111,6 +113,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Status(result) => render_status_human(result),
         ActionOutput::Modules(result) => render_modules_human(result),
         ActionOutput::Metrics(result) => render_metrics_human(result),
+        ActionOutput::Sessions(result) => render_sessions_human(result),
+        ActionOutput::SessionsTerminate(result) => render_terminate_human(result),
+        ActionOutput::Connections(result) => render_connections_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -259,6 +264,68 @@ fn render_metrics_human(result: &MetricsResult) {
                 println!("history {label}: first {}, last {}", fmt(first), fmt(last));
             }
         }
+    }
+}
+
+/// `ign sessions` human lines: one section per family
+/// (`designers (1)` / `perspective (2)` / `vision (0)`), a row per item
+/// (`id  user/username  project  address  lastcomm`) — the webpage's
+/// Sessions pages as terminal sections.
+fn render_sessions_human(result: &SessionsResult) {
+    println!("designers ({})", result.designers.len());
+    for designer in &result.designers {
+        println!(
+            "{}  {}  {}  {}  {}",
+            designer.id, designer.user, designer.project, designer.address, designer.lastcomm
+        );
+    }
+    println!("perspective ({})", result.perspective.len());
+    for session in &result.perspective {
+        println!(
+            "{}  {}  {}  {}  {}",
+            session.id,
+            session.username,
+            session.project,
+            session.client_address,
+            session.last_comm
+        );
+    }
+    println!("vision ({})", result.vision.len());
+    for client in &result.vision {
+        println!(
+            "{}  {}  {}  {}  {}",
+            client.id, client.user, client.project, client.address, client.lastcomm
+        );
+    }
+}
+
+/// `ign sessions terminate` human line.
+fn render_terminate_human(result: &TerminateResult) {
+    println!("terminated {} session {}", result.kind, result.id);
+}
+
+/// `ign connections` human lines: `database (N)` / `opc (N)` sections
+/// with `name  enabled  healthchecks-as-reported` rows — healthchecks
+/// render as compact JSON, verbatim (the shape is passthrough by
+/// design; LOW-confidence populated detail).
+fn render_connections_human(result: &ConnectionsResult) {
+    println!("database ({})", result.database.len());
+    for connection in &result.database {
+        println!(
+            "{}  {}  {}",
+            connection.name,
+            connection.enabled,
+            serde_json::to_string(&connection.healthchecks).unwrap_or_default()
+        );
+    }
+    println!("opc ({})", result.opc.len());
+    for connection in &result.opc {
+        println!(
+            "{}  {}  {}",
+            connection.name,
+            connection.enabled,
+            serde_json::to_string(&connection.healthchecks).unwrap_or_default()
+        );
     }
 }
 
