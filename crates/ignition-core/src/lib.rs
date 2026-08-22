@@ -12,11 +12,13 @@
 //!
 //! Module map: `error` (the LOCKED exit-code taxonomy + failure envelope),
 //! `output` (the LOCKED success envelope), `config` (discovery, profiles,
-//! secrets), `client` (the [`client::GatewayApi`] seam + GatewayInfo), and
-//! `actions` (the shared verb layer).
+//! secrets), `client` (the [`client::GatewayApi`] seam + GatewayInfo),
+//! `poll` (the shared wait/retry engine), and `actions` (the shared verb
+//! layer).
 
 pub mod actions;
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod output;
+pub mod poll;

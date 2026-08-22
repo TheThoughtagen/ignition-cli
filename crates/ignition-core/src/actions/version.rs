@@ -109,9 +109,11 @@ mod tests {
                     url: url.clone(),
                     // A real transport error via instant loopback refusal —
                     // reqwest::Error has no public constructor.
-                    source: reqwest::get("http://127.0.0.1:1")
-                        .await
-                        .expect_err("dead port refuses"),
+                    source: Some(
+                        reqwest::get("http://127.0.0.1:1")
+                            .await
+                            .expect_err("dead port refuses"),
+                    ),
                 }),
             }
         }

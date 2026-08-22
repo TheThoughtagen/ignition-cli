@@ -6,6 +6,7 @@
 
 pub mod connections;
 pub mod inspect;
+pub mod logs;
 pub mod profile;
 pub mod sessions;
 pub mod version;

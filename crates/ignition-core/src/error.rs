@@ -54,11 +54,17 @@ pub enum CoreError {
     ConfigInvalid { reason: String },
 
     /// Gateway unreachable / timeout / TLS failure. Exit 4.
-    #[error("gateway unreachable at {url}: {source}")]
+    ///
+    /// `source: None` marks a POLL deadline expiry (02-04 `poll.rs`):
+    /// same class, same slug (`network_error`), no new variant — the
+    /// transport-error `source` a real failure carries is simply absent,
+    /// and `url` describes what was being waited on instead (the poll's
+    /// subject + the last observation).
+    #[error("gateway unreachable at {url}{source_note}", source_note = source.as_ref().map(|source| format!(": {source}")).unwrap_or_default())]
     Network {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: Option<reqwest::Error>,
     },
 
     /// Gateway reachable but rejected credentials (401/403). Exit 5.
@@ -307,7 +313,7 @@ mod tests {
             .expect_err("request to an unroutable port must fail");
         CoreError::Network {
             url: url.to_string(),
-            source,
+            source: Some(source),
         }
     }
 

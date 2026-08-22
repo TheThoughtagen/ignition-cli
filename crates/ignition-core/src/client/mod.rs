@@ -267,7 +267,7 @@ impl ReqwestGatewayApi {
             .map(str::to_string);
         let bytes = response.bytes().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
-            source: err,
+            source: Some(err),
         })?;
         Ok(LogDownload {
             bytes: bytes.to_vec(),
@@ -324,7 +324,7 @@ impl ReqwestGatewayApi {
     ) -> Result<reqwest::Response, CoreError> {
         let response = request.send().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
-            source: err,
+            source: Some(err),
         })?;
         classify::classify(response, url.as_ref()).await
     }
