@@ -135,6 +135,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::LoggersList(result) => render_loggers_human(result),
         ActionOutput::LoggerSet(result) => render_set_level_human(result),
         ActionOutput::LoggerReset(result) => render_reset_human(result),
+        ActionOutput::Restart(result) => render_restart_human(result),
+        ActionOutput::RestartWait(result) => render_restart_wait_human(result),
+        ActionOutput::Wait(result) => render_wait_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -410,6 +413,28 @@ fn render_reset_human(result: &ResetResult) {
     if result.reset {
         println!("reset all logger levels to defaults");
     }
+}
+
+/// `ign restart` human line (no --wait): the research-mandated
+/// advisory — the gateway answers the POST immediately, then goes down
+/// for ~1 min; steer toward `--wait`.
+fn render_restart_human(_result: &ignition_core::actions::restart::RestartResult) {
+    println!("restarting; gateway READY in ~1 min; consider `ign restart --wait`");
+}
+
+/// `ign restart --wait` human line: progress-free success (the wait
+/// printed nothing while polling — StatusPing is polled, not
+/// streamed).
+fn render_restart_wait_human(result: &ignition_core::actions::restart::RestartWaitResult) {
+    println!("gateway {} after {}s", result.state, result.elapsed_secs);
+}
+
+/// `ign wait <target>` human line: final state + elapsed.
+fn render_wait_human(result: &ignition_core::actions::restart::WaitResult) {
+    println!(
+        "{} {} after {}s",
+        result.target, result.state, result.elapsed_secs
+    );
 }
 
 /// Epoch milliseconds → an ISO-8601 UTC string

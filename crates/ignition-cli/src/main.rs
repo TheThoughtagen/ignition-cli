@@ -31,7 +31,7 @@ use ignition_core::error::CoreError;
 
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, SessionsArgs,
-    SessionsCmd,
+    SessionsCmd, WaitArgs, WaitCmd,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -68,6 +68,12 @@ enum ActionOutput {
     LoggerSet(actions::logs::SetLevelResult),
     /// `ign logs loggers reset` — all custom levels reset.
     LoggerReset(actions::logs::ResetResult),
+    /// `ign restart` — the POST fired (no wait).
+    Restart(actions::restart::RestartResult),
+    /// `ign restart --wait` — POST + floor + poll to RUNNING.
+    RestartWait(actions::restart::RestartWaitResult),
+    /// `ign wait <target>` — the target reached its terminal state.
+    Wait(actions::restart::WaitResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -106,6 +112,9 @@ impl ActionOutput {
             ActionOutput::LoggersList(result) => render_success(profile, result, compact),
             ActionOutput::LoggerSet(result) => render_success(profile, result, compact),
             ActionOutput::LoggerReset(result) => render_success(profile, result, compact),
+            ActionOutput::Restart(result) => render_success(profile, result, compact),
+            ActionOutput::RestartWait(result) => render_success(profile, result, compact),
+            ActionOutput::Wait(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -396,6 +405,110 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
             },
         },
+        // Restart (02-05, HLTH-09): the phase's one big red button —
+        // --yes-guarded ALWAYS (research Pitfall 10: it takes the
+        // gateway down; agents pass --yes). The guard fires BEFORE any
+        // API construction (the sessions-terminate precedent: a
+        // refusal costs nothing and never touches the gateway).
+        Commands::Restart {
+            wait,
+            timeout,
+            interval,
+        } => {
+            if let Err(err) = require_confirmation(cli.yes, "restart") {
+                return (None, Err(err));
+            }
+            let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+            let result = match api {
+                Ok(api) => {
+                    let interval = interval.map_or(
+                        actions::restart::DEFAULT_INTERVAL,
+                        std::time::Duration::from_secs,
+                    );
+                    let timeout = timeout.map_or(
+                        actions::restart::RESTART_TIMEOUT,
+                        std::time::Duration::from_secs,
+                    );
+                    if wait {
+                        actions::restart::restart_and_wait(
+                            &api,
+                            interval,
+                            timeout,
+                            actions::restart::RESTART_FLOOR,
+                        )
+                        .await
+                        .map(ActionOutput::RestartWait)
+                    } else {
+                        actions::restart::restart(&api)
+                            .await
+                            .map(ActionOutput::Restart)
+                    }
+                }
+                Err(err) => Err(err),
+            };
+            (name, result)
+        }
+        // Wait (02-05, HLTH-11). `gateway` and `restart` dispatch with
+        // a HEADER-LESS client (credential resolution degrades to None
+        // — the whole point is these work when auth is broken;
+        // StatusPing answers unauthenticated, even mid-restart).
+        // `wait module` is an authed read (modules needs a token).
+        Commands::Wait(WaitArgs { command }) => match command {
+            WaitCmd::Gateway { interval, timeout } => {
+                let (name, api) = resolve_headerless_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::restart::wait_gateway(
+                        &api,
+                        std::time::Duration::from_secs(interval),
+                        std::time::Duration::from_secs(timeout),
+                    )
+                    .await
+                    .map(ActionOutput::Wait),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            WaitCmd::Restart { interval, timeout } => {
+                // Restart-aware (research line 94 + Open Question 4):
+                // observing non-RUNNING once → RUNNING completes with
+                // NO floor wait; an all-RUNNING sequence is accepted
+                // only past the SAME 5 s floor as `restart --wait` —
+                // running right after `ign restart` cannot
+                // false-positive on the ~5 s grace window.
+                let (name, api) = resolve_headerless_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::restart::wait_restart(
+                        &api,
+                        std::time::Duration::from_secs(interval),
+                        std::time::Duration::from_secs(timeout),
+                        actions::restart::RESTART_FLOOR,
+                    )
+                    .await
+                    .map(ActionOutput::Wait),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            WaitCmd::Module {
+                id,
+                interval,
+                timeout,
+            } => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::restart::wait_module(
+                        &api,
+                        &id,
+                        std::time::Duration::from_secs(interval),
+                        std::time::Duration::from_secs(timeout),
+                    )
+                    .await
+                    .map(ActionOutput::Wait),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+        },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {
@@ -523,6 +636,28 @@ fn resolve_gateway_api(
             let credential = config::resolve_secret(&name, &profile.auth, &secret_chain());
             let result = credential
                 .and_then(|credential| ReqwestGatewayApi::new(&profile, Some(credential)));
+            (Some(name), result)
+        }
+        Err(err) => (None, Err(err)),
+    }
+}
+
+/// Profile + HEADER-LESS-tolerant client for the unauthenticated wait
+/// commands (`wait gateway`, `wait restart`): credential resolution
+/// DEGRADES to None — StatusPing answers with no credential, so a
+/// missing/broken secret must never block readiness polling (the whole
+/// point: these waits work when auth is broken). Other credential
+/// errors still propagate.
+fn resolve_headerless_api(
+    config: &mut Config,
+    flag: Option<&str>,
+) -> (Option<String>, Result<ReqwestGatewayApi, CoreError>) {
+    match resolve_profile_context(config, flag) {
+        Ok(None) => (None, Err(CoreError::NoActiveProfile)),
+        Ok(Some((name, profile))) => {
+            let credential = resolve_secret_opt(&name, &profile.auth);
+            let result =
+                credential.and_then(|credential| ReqwestGatewayApi::new(&profile, credential));
             (Some(name), result)
         }
         Err(err) => (None, Err(err)),

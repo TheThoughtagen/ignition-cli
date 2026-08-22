@@ -88,6 +88,25 @@ pub enum Commands {
     /// Query, tail, and download gateway logs; manage logger levels
     Logs(LogsArgs),
 
+    /// Restart the gateway — destructive, refused without --yes;
+    /// --wait polls until RUNNING
+    Restart {
+        /// Wait for the gateway to return to RUNNING (POST, then poll
+        /// /StatusPing)
+        #[arg(long)]
+        wait: bool,
+        /// Wait budget in seconds (default 300)
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+        /// Poll interval in seconds (default 2)
+        #[arg(long, value_name = "SECS")]
+        interval: Option<u64>,
+    },
+
+    /// Wait for a gateway state (readiness, restart completion, module)
+    #[command(arg_required_else_help = true)]
+    Wait(WaitArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -95,6 +114,52 @@ pub enum Commands {
     /// Interactive TUI cockpit
     #[cfg(feature = "tui")]
     Tui,
+}
+
+/// Wait targets (02-05, HLTH-11). `gateway` and `restart` poll the
+/// UNAUTHENTICATED /StatusPing (the dispatch builds a header-less
+/// client for them — waiting must work when auth is broken); `module`
+/// is an authed read.
+#[derive(Debug, clap::Args)]
+pub struct WaitArgs {
+    #[command(subcommand)]
+    pub command: WaitCmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WaitCmd {
+    /// Wait until the gateway reports RUNNING (unauthenticated
+    /// StatusPing — works even when auth is broken or absent)
+    Gateway {
+        /// Poll interval in seconds
+        #[arg(long, default_value_t = 2, value_name = "SECS")]
+        interval: u64,
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 120, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Wait for a restart to complete — restart-aware: shares
+    /// `restart --wait`'s semantics (non-RUNNING observed once →
+    /// RUNNING; a 5 s floor guards the all-RUNNING case)
+    Restart {
+        /// Poll interval in seconds
+        #[arg(long, default_value_t = 2, value_name = "SECS")]
+        interval: u64,
+        /// Give up after this many seconds (default 300)
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Wait until a module reports ACTIVE
+    Module {
+        /// Module id (see `ign modules`)
+        id: String,
+        /// Poll interval in seconds
+        #[arg(long, default_value_t = 2, value_name = "SECS")]
+        interval: u64,
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 120, value_name = "SECS")]
+        timeout: u64,
+    },
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

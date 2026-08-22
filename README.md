@@ -95,6 +95,10 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign logs loggers [--search S]` | Logger registry: `name  level  context` | explicit limit 200 (same unlimited-default guard) |
 | `ign logs loggers set <NAME> <LEVEL>` | Set one logger's level (TRACE..OFF) | **mutation**: exit 2 (`confirmation_required`) without `--yes`; audit-logged server-side |
 | `ign logs loggers reset` | Reset ALL custom logger levels to defaults | **mutation**: exit 2 without `--yes`; audit-logged server-side |
+| `ign restart [--wait] [--timeout S] [--interval S]` | Restart the gateway — the one big red button | **always `--yes`-guarded** (it takes the whole gateway down); without `--wait`: POST + "READY in ~1 min" advisory; with `--wait`: POST → 5 s floor → polls the unauthenticated `/StatusPing` until RUNNING (default 300 s budget; a timeout exits 4 naming the last observed state) |
+| `ign wait gateway [--interval S --timeout S]` | Wait until the gateway reports RUNNING | unauthenticated `/StatusPing` poll — works with no/broken credential; already-RUNNING = immediate success (default 120 s) |
+| `ign wait restart [--interval S --timeout S]` | Wait for a restart to complete | shares `restart --wait`'s semantics: a non-RUNNING state observed once → RUNNING completes immediately (witnessed restart, no floor wait); an all-RUNNING wait reports success only after the same 5 s floor — no false positive when run right after `ign restart` |
+| `ign wait module <ID> [--interval S --timeout S]` | Wait until a module reports ACTIVE | polls `modules/healthy?search=<id>` (authed); timeout names the id + last observed state |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -119,11 +123,12 @@ envelope — plan for it in pipelines).
 
 ### Destructive operations
 
-Commands that change gateway state (`sessions terminate` and the
-`logs loggers set`/`reset` mutations today; `project delete` and `rig
-reset` in later phases) refuse without `--yes` (exit 2,
+Commands that change gateway state (`sessions terminate`, the
+`logs loggers set`/`reset` mutations, and `restart` — the big one: it
+takes the whole gateway down for ~1 min) refuse without `--yes` (exit 2,
 `confirmation_required`, hint names both the flag and `IGNITION_YES=1`)
 — non-interactive by design, so scripts and agents pass `--yes` once
-and humans get a speed bump. The guard fires before any network
-activity: a refusal never touches the gateway. Termination mutations
-are audit-logged server-side by the gateway.
+and humans get a speed bump. `restart` is guarded in BOTH forms: plain
+and `--wait`. The guard fires before any network
+activity: a refusal never touches the gateway. Termination and restart
+mutations are audit-logged server-side by the gateway.
