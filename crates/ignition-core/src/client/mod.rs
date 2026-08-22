@@ -35,6 +35,7 @@ mod classify;
 pub mod connections;
 pub mod logs;
 pub mod metrics;
+pub mod projects;
 pub mod query;
 pub mod restart;
 pub mod sessions;
@@ -44,6 +45,9 @@ pub mod version;
 use crate::client::connections::GatewayConnection;
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
+use crate::client::projects::{
+    ProjectCopy, ProjectCreate, ProjectModify, ProjectRecord, ProjectRenameBody,
+};
 use crate::client::query::ListEnvelope;
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
@@ -172,6 +176,41 @@ pub trait GatewayApi: Send + Sync {
     /// 200/401/403 = exists). Deliberately NOT classified: presence
     /// IS the answer; only transport failures are errors.
     async fn webdev_route_status(&self, route: &str) -> Result<u16, CoreError>;
+    /// GET `/data/api/v1/projects/list` (authed) — every RUNNABLE
+    /// project with inheritance info from the items themselves
+    /// (PROJ-01; standard list params, `limit=-1` UI convention).
+    async fn projects(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<ProjectRecord>, CoreError>;
+    /// GET `/data/api/v1/projects/find/{name}` (authed, name
+    /// percent-encoded per segment) — one project's full record; 404 →
+    /// `NotFound` via classify (this doubles as 03-02's collision
+    /// pre-check).
+    async fn project_find(&self, name: &str) -> Result<ProjectRecord, CoreError>;
+    /// POST `/data/api/v1/projects` (authed, JSON body) — create. Ok
+    /// classification IS the success contract (create's response body
+    /// is unverified LOW — the restart `literal true` precedent;
+    /// callers that want data re-`find`). Audit-logged server-side.
+    async fn project_create(&self, body: &ProjectCreate) -> Result<(), CoreError>;
+    /// POST `/data/api/v1/projects/copy` (authed, body exactly
+    /// `{"fromName":…,"toName":…}`) — an exact copy of all resources.
+    /// Audit-logged server-side.
+    async fn project_copy(&self, from: &str, to: &str) -> Result<(), CoreError>;
+    /// POST `/data/api/v1/projects/rename/{name}` (authed, body
+    /// `{"name": "<new>"}`) — native rename, NOT copy+delete.
+    /// Audit-logged server-side.
+    async fn project_rename(&self, name: &str, new_name: &str) -> Result<(), CoreError>;
+    /// PUT `/data/api/v1/projects/{name}` (authed, JSON body WITHOUT
+    /// `name`) — modify/reparent (`set --parent` IS the inheritance
+    /// move). Audit-logged server-side.
+    async fn project_modify(&self, name: &str, body: &ProjectModify) -> Result<(), CoreError>;
+    /// DELETE `/data/api/v1/projects/{name}?confirm=true` (authed,
+    /// empty body) — the server's own confirmation guard rides the
+    /// QUERY string (Pitfall 8: BOTH layers, always — the CLI's
+    /// `--yes` and the wire's `confirm=true`). Audit-logged
+    /// server-side.
+    async fn project_delete(&self, name: &str) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -332,6 +371,38 @@ impl ReqwestGatewayApi {
         let url = self.url_for(path);
         let mut request = self.client.delete(url.clone()).query(pairs);
         request = self.apply_auth(request);
+        self.send_and_classify(request, &url).await.map(|_| ())
+    }
+
+    /// POST `path` with a JSON body → classify → hand back the response
+    /// (callers read the body as their capability needs; the project
+    /// mutations treat Ok classification AS the success contract —
+    /// those bodies are unverified LOW, the restart `literal true`
+    /// precedent). Token-auth POSTs need NO CSRF (verified 02-RESEARCH
+    /// §Auth Model). One of the two body-carrying pipeline helpers
+    /// (03-01); serde serializes struct fields in declaration order, so
+    /// recorded bodies are deterministic for the wiremock pins.
+    async fn post_json<T: serde::Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, CoreError> {
+        let url = self.url_for(path);
+        let request = self.apply_auth(self.client.post(url.clone()).json(body));
+        self.send_and_classify(request, &url).await
+    }
+
+    /// PUT `path` with a JSON body → classify → `Ok(())` (modify/
+    /// reparent; resource puts in 03-03). Token-auth PUTs need NO
+    /// CSRF. The classify-first rule holds: nothing consumes a body
+    /// that skipped classify.
+    async fn put_json<T: serde::Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<(), CoreError> {
+        let url = self.url_for(path);
+        let request = self.apply_auth(self.client.put(url.clone()).json(body));
         self.send_and_classify(request, &url).await.map(|_| ())
     }
 
@@ -588,6 +659,70 @@ impl GatewayApi for ReqwestGatewayApi {
             source: Some(err),
         })?;
         Ok(response.status().as_u16())
+    }
+
+    async fn projects(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<ProjectRecord>, CoreError> {
+        // Standard list params (limit=-1 = the UI's "everything").
+        self.get_json(
+            projects::PROJECTS_LIST_PATH,
+            Some(&query.to_query_pairs()),
+            true,
+        )
+        .await
+    }
+
+    async fn project_find(&self, name: &str) -> Result<ProjectRecord, CoreError> {
+        // The {name} segment is percent-encoded (Pitfall 6) — the
+        // spaced-name recorded-request proof in tests/projects_contract.rs.
+        self.get_json(&projects::project_find_path(name), None, true)
+            .await
+    }
+
+    async fn project_create(&self, body: &ProjectCreate) -> Result<(), CoreError> {
+        // Ok classification IS the success contract; callers that want
+        // data re-`find` (the actions layer's read-back).
+        self.post_json(projects::PROJECTS_CREATE_PATH, body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn project_copy(&self, from: &str, to: &str) -> Result<(), CoreError> {
+        let body = ProjectCopy {
+            from_name: from.to_string(),
+            to_name: to.to_string(),
+        };
+        self.post_json(projects::PROJECTS_COPY_PATH, &body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn project_rename(&self, name: &str, new_name: &str) -> Result<(), CoreError> {
+        let body = ProjectRenameBody {
+            name: new_name.to_string(),
+        };
+        self.post_json(&projects::project_rename_path(name), &body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn project_modify(&self, name: &str, body: &ProjectModify) -> Result<(), CoreError> {
+        self.put_json(&projects::project_modify_path(name), body)
+            .await
+    }
+
+    async fn project_delete(&self, name: &str) -> Result<(), CoreError> {
+        // BOTH guard layers (Pitfall 8): the CLI already refused
+        // without --yes (exit 2, pre-resolution) AND the wire request
+        // always carries the server's own `confirm=true` query param
+        // (wiremock recorded-request proof).
+        self.delete_with_query(
+            &projects::project_delete_path(name),
+            &[("confirm", "true".to_string())],
+        )
+        .await
     }
 }
 

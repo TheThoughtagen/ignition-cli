@@ -1167,6 +1167,7 @@ dependencies = [
  "async-trait",
  "directories",
  "keyring",
+ "percent-encoding",
  "reqwest",
  "semver",
  "serde",

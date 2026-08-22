@@ -655,6 +655,43 @@ mod tests {
         async fn webdev_route_status(&self, _route: &str) -> Result<u16, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn projects(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::projects::ProjectRecord>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn project_find(
+            &self,
+            _name: &str,
+        ) -> Result<crate::client::projects::ProjectRecord, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_create(
+            &self,
+            _body: &crate::client::projects::ProjectCreate,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_copy(&self, _from: &str, _to: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_rename(&self, _name: &str, _new_name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_modify(
+            &self,
+            _name: &str,
+            _body: &crate::client::projects::ProjectModify,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_delete(&self, _name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     fn healthy_rig() -> DoctorRig {
