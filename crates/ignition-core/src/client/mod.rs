@@ -33,6 +33,7 @@ use std::time::Duration;
 
 mod classify;
 pub mod connections;
+pub mod logs;
 pub mod metrics;
 pub mod query;
 pub mod sessions;
@@ -40,6 +41,7 @@ pub mod status;
 pub mod version;
 
 use crate::client::connections::GatewayConnection;
+use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::query::ListEnvelope;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
@@ -124,6 +126,30 @@ pub trait GatewayApi: Send + Sync {
     /// Fetch `/data/api/v1/resources/list/ignition/opc-connection`
     /// (authed) — the Connections→OPC poll (HLTH-06), same family.
     async fn opc_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError>;
+    /// Fetch `/data/api/v1/logs` (authed) with [`LogQuery`] — the tail
+    /// primitive: `startTime` (epoch ms) is the cursor, no server push
+    /// exists (02-04, HLTH-03). The query ALWAYS carries an explicit
+    /// `limit` (Pitfall 9 — the server default is unlimited).
+    async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError>;
+    /// GET `/data/api/v1/logs/download` (authed, per-request 120 s
+    /// timeout) — a SQLite `.idb` archive, returned byte-for-byte with
+    /// the `Content-Disposition` filename and `Content-Type`. NEVER
+    /// zipped/extracted (Pitfall 7; Don't-Hand-Roll table).
+    async fn logs_download(&self) -> Result<LogDownload, CoreError>;
+    /// Fetch `/data/api/v1/logs/loggers` (authed) — the logger registry
+    /// (HLTH-04; ~1250 loggers on a fresh gateway).
+    async fn loggers(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<LoggerInfo>, CoreError>;
+    /// POST `/data/api/v1/logs/loggers/{loggerName}?level=X` (authed,
+    /// empty body, NO CSRF — verified: token mutations need none).
+    /// Logger names are Java identifiers `[A-Za-z0-9._]` — URL-safe,
+    /// embedded as-is. Audit-logged server-side.
+    async fn set_logger_level(&self, logger: &str, level: &str) -> Result<(), CoreError>;
+    /// POST `/data/api/v1/logs/levelreset` (authed, empty body) — reset
+    /// all custom logger levels to defaults. Audit-logged server-side.
+    async fn reset_logger_levels(&self) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -192,20 +218,21 @@ impl ReqwestGatewayApi {
         request
     }
 
-    /// GET `path` (with the standard [`ListQuery`] params when given) →
-    /// classify → deserialize into `T`. `auth = false` fetches header-less
-    /// (the `/StatusPing` readiness probe, 02-02 — it must work with
-    /// broken credentials).
+    /// GET `path` (with pre-built query `pairs` when given) → classify →
+    /// deserialize into `T`. `auth = false` fetches header-less (the
+    /// `/StatusPing` readiness probe, 02-02 — it must work with broken
+    /// credentials). Callers build pairs via `to_query_pairs()` so the
+    /// param-name mapping stays in the capability files.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
-        query: Option<&query::ListQuery>,
+        pairs: Option<&[(String, String)]>,
         auth: bool,
     ) -> Result<T, CoreError> {
         let url = self.url_for(path);
         let mut request = self.client.get(url.clone());
-        if let Some(query) = query {
-            request = request.query(&query.to_query_pairs());
+        if let Some(pairs) = pairs {
+            request = request.query(&pairs);
         }
         if auth {
             request = self.apply_auth(request);
@@ -218,13 +245,51 @@ impl ReqwestGatewayApi {
         })
     }
 
-    /// POST `path` with an empty body → classify → hand back the response
-    /// (callers read `true`/JSON as their capability needs). No public
-    /// caller until 02-04's restart; exercised here by a unit test.
-    #[cfg_attr(not(test), expect(dead_code))]
-    async fn post_empty(&self, path: &str, auth: bool) -> Result<reqwest::Response, CoreError> {
+    /// GET `path` → classify → read the response as BYTES plus the
+    /// `Content-Disposition` filename and `Content-Type` — the
+    /// archive-download pipeline (02-04). `timeout` overrides the 30 s
+    /// client default PER REQUEST (a large `.idb` archive must not be
+    /// truncated) — `RequestBuilder::timeout`, not a second client.
+    async fn get_bytes(&self, path: &str, timeout: Duration) -> Result<LogDownload, CoreError> {
         let url = self.url_for(path);
-        let mut request = self.client.post(url.clone());
+        let request = self.client.get(url.clone()).timeout(timeout);
+        let request = self.apply_auth(request);
+        let response = self.send_and_classify(request, &url).await?;
+        let filename = response
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(logs::filename_from_content_disposition);
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: err,
+        })?;
+        Ok(LogDownload {
+            bytes: bytes.to_vec(),
+            filename,
+            content_type,
+        })
+    }
+
+    /// POST `path` with `pairs` as QUERY params and an empty body →
+    /// classify → hand back the response (callers read `true`/JSON as
+    /// their capability needs). Production callers since 02-04:
+    /// `set_logger_level`, `reset_logger_levels` (and 02-05's restart
+    /// with `confirm=true`). Token-auth POSTs need NO CSRF (verified
+    /// 02-RESEARCH §Auth Model).
+    async fn post_empty(
+        &self,
+        path: &str,
+        pairs: &[(&str, String)],
+        auth: bool,
+    ) -> Result<reqwest::Response, CoreError> {
+        let url = self.url_for(path);
+        let mut request = self.client.post(url.clone()).query(pairs);
         if auth {
             request = self.apply_auth(request);
         }
@@ -310,7 +375,8 @@ impl GatewayApi for ReqwestGatewayApi {
         } else {
             status::MODULES_HEALTHY_PATH
         };
-        self.get_json(path, Some(query), true).await
+        self.get_json(path, Some(&query.to_query_pairs()), true)
+            .await
     }
 
     async fn metrics_current(&self) -> Result<CurrentGauges, CoreError> {
@@ -330,8 +396,12 @@ impl GatewayApi for ReqwestGatewayApi {
         &self,
         query: &query::ListQuery,
     ) -> Result<ListEnvelope<DesignerInfo>, CoreError> {
-        self.get_json(sessions::DESIGNERS_PATH, Some(query), true)
-            .await
+        self.get_json(
+            sessions::DESIGNERS_PATH,
+            Some(&query.to_query_pairs()),
+            true,
+        )
+        .await
     }
 
     async fn perspective_sessions(
@@ -341,16 +411,24 @@ impl GatewayApi for ReqwestGatewayApi {
         // The trailing slash is PART OF THE PATH (Pitfall 8) — url_for's
         // join preserves it; the exact-path wiremock matcher in
         // tests/sessions_contract.rs pins it.
-        self.get_json(sessions::PERSPECTIVE_SESSIONS_LIST_PATH, Some(query), true)
-            .await
+        self.get_json(
+            sessions::PERSPECTIVE_SESSIONS_LIST_PATH,
+            Some(&query.to_query_pairs()),
+            true,
+        )
+        .await
     }
 
     async fn vision_clients(
         &self,
         query: &query::ListQuery,
     ) -> Result<ListEnvelope<VisionClient>, CoreError> {
-        self.get_json(sessions::VISION_CLIENTS_PATH, Some(query), true)
-            .await
+        self.get_json(
+            sessions::VISION_CLIENTS_PATH,
+            Some(&query.to_query_pairs()),
+            true,
+        )
+        .await
     }
 
     async fn terminate_perspective_session(
@@ -383,7 +461,7 @@ impl GatewayApi for ReqwestGatewayApi {
         // as every other list capability.
         self.get_json(
             connections::DATABASE_CONNECTIONS_PATH,
-            Some(&query::ListQuery::default()),
+            Some(&query::ListQuery::default().to_query_pairs()),
             true,
         )
         .await
@@ -392,10 +470,55 @@ impl GatewayApi for ReqwestGatewayApi {
     async fn opc_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError> {
         self.get_json(
             connections::OPC_CONNECTIONS_PATH,
-            Some(&query::ListQuery::default()),
+            Some(&query::ListQuery::default().to_query_pairs()),
             true,
         )
         .await
+    }
+
+    async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
+        // Explicit limit ALWAYS rides the wire (Pitfall 9) — enforced by
+        // LogQuery::to_query_pairs, pinned by the contract test.
+        self.get_json(logs::LOGS_PATH, Some(&filter.to_query_pairs()), true)
+            .await
+    }
+
+    async fn logs_download(&self) -> Result<LogDownload, CoreError> {
+        // Per-request timeout override: the 30 s client default would
+        // truncate large archives (per-class timeout WITHOUT a second
+        // client — RequestBuilder::timeout, 02-RESEARCH §Architecture).
+        self.get_bytes(
+            logs::LOGS_DOWNLOAD_PATH,
+            Duration::from_secs(logs::LOGS_DOWNLOAD_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    async fn loggers(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<LoggerInfo>, CoreError> {
+        self.get_json(logs::LOGGERS_PATH, Some(&query.to_query_pairs()), true)
+            .await
+    }
+
+    async fn set_logger_level(&self, logger: &str, level: &str) -> Result<(), CoreError> {
+        // `level` rides the QUERY string against an EMPTY body (verified
+        // live: 200 + the level flips; recorded-request proof in
+        // tests/logs_contract.rs).
+        self.post_empty(
+            &logs::logger_set_path(logger),
+            &[("level", level.to_string())],
+            true,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn reset_logger_levels(&self) -> Result<(), CoreError> {
+        self.post_empty(logs::LEVEL_RESET_PATH, &[], true)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -403,26 +526,39 @@ impl GatewayApi for ReqwestGatewayApi {
 mod tests {
     use super::ReqwestGatewayApi;
 
-    /// Exercises `post_empty` end-to-end (no public trait caller until
-    /// 02-04's restart capability): the verified restart shape is a 200
-    /// with literal body `true`, classified Ok.
+    /// Exercises `post_empty` end-to-end with the shape 02-04's
+    /// set-logger-level route uses (query param + empty body): the
+    /// verified restart shape is a 200 with literal body `true`,
+    /// classified Ok — and the query param rides the request.
     #[tokio::test]
-    async fn post_empty_returns_the_classified_response() {
+    async fn post_empty_sends_query_param_and_empty_body() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
+        let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
                 "/data/api/v1/restart-tasks/restart",
             ))
+            .and(wiremock::matchers::query_param("confirm", "true"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("true"))
             .expect(1)
-            .mount(&server)
+            .mount_as_scoped(&server)
             .await;
 
         let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
         let response = api
-            .post_empty("/data/api/v1/restart-tasks/restart", true)
+            .post_empty(
+                "/data/api/v1/restart-tasks/restart",
+                &[("confirm", "true".to_string())],
+                true,
+            )
             .await
             .expect("200 classifies Ok");
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let requests = guard.received_requests().await;
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].body.is_empty(),
+            "the POST carries NO body — params ride the query string"
+        );
     }
 }

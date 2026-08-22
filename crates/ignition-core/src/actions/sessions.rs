@@ -285,6 +285,28 @@ mod tests {
         {
             unreachable!("not part of this action")
         }
+
+        async fn logs(
+            &self,
+            _filter: &crate::client::logs::LogQuery,
+        ) -> Result<ListEnvelope<crate::client::logs::LogEntry>, CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn logs_download(&self) -> Result<crate::client::logs::LogDownload, CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn loggers(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<ListEnvelope<crate::client::logs::LoggerInfo>, CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn set_logger_level(&self, _logger: &str, _level: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this double's actions")
+        }
+        async fn reset_logger_levels(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this double's actions")
+        }
     }
 
     /// Unfiltered: all three families called and present. Filtered: ONLY
