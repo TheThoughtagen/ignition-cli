@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 3 in progress (1/3 plans) — project CRUD shipped; export/import next
+**Current focus:** Phase 3 in progress (2/3 plans) — export/import shipped; resources + e2e next
 
 ## Current Position
 
 **Phase:** 3 of 7 (Project Operations)
-**Current Plan:** 1 of 3 (complete)
+**Current Plan:** 2 of 3 (complete)
 **Total Plans in Phase:** 3
-**Status:** Phase 3 in progress — 03-01 executed
+**Status:** Phase 3 in progress — 03-02 executed
 **Last Activity:** 2026-08-22
 
-**Progress:** [████████░░] 83%
+**Progress:** [█████████░] 92%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
-- Total execution time: 132min
+- Total plans completed: 6
+- Total execution time: 161min
 
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
@@ -38,6 +38,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 02 P04 | 35min | 3 tasks | 18 files |
 | Phase 02 P05 | 40min | 3 tasks | 20 files |
 | Phase 03 P01 | 21min | 3 tasks | 13 files |
+| Phase 03 P02 | 29min | 3 tasks | 21 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,10 @@ Recent decisions affecting current work:
 - [Phase 03-01]: ProjectSetResult carries fields-touched as serde(skip) Vec<String> — the human 'set <fields> on <name>' line without deviating the flat six-key agent JSON
 - [Phase 03-01]: Project action results keep ALL six keys present (null when absent) — stable agent shape; defaultDb/tagProvider/userSource passthrough stays at the client seam; encode_segment (NON_ALPHANUMERIC) is the one per-segment encoder 03-03 resource paths reuse keeping '/'
 - [Phase 03-01]: Destructive delete pin (Pitfall 8 both layers): CLI guard refuses pre-resolution (exit 2, profile null — sessions-terminate shape verbatim) AND the wire DELETE always carries confirm=true QUERY param with empty body — wiremock recorded-request proven at both client and binary level
+- [Phase 03-02]: ImportOutcome opaque-success normalizes non-object 2xx bodies (restart's literal true included) to {"status":"success"} — object JSON passes through verbatim; agents always see a stable object
+- [Phase 03-02]: Export streams, import buffers BY DESIGN: download_to_file (classify→bytes_stream→tokio::fs, 120 s) never touches Vec<u8>; import rides a known-Content-Length application/zip body + overwrite QUERY param under a 300 s per-request timeout — Pitfall 2/3's structural answers, no second client
+- [Phase 03-02]: Collision conventions LOCKED: abort (default) = action-layer find pre-check refusing project_exists (exit 6, replace-not-merge hint) BEFORE any upload; overwrite = --yes-guarded pre-resolution with NO pre-check (server is authority); merge is not a clap value (Designer-only, README documents)
+- [Phase 03-02]: snapbox gotcha #3: str! normalizes backslashes in ACTUAL output to forward slashes — message text PK\x03\x04 goldens as PK//x03//x04 (recorded inline at the golden)
 
 ### Pending Todos
 
@@ -97,6 +102,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-22T13:21:02.148Z
-**Stopped At:** Completed 03-01-PLAN.md (project CRUD — list/new/copy/rename/set/delete)
+**Last session:** 2026-08-22T13:53:20.699Z
+**Stopped At:** Completed 03-02-PLAN.md (project export/import — streaming ZIP, collision policy, scope metadata)
 **Resume file:** None
