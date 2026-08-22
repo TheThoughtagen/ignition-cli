@@ -33,7 +33,8 @@ use serde::Serialize;
 use crate::client::GatewayApi;
 use crate::rig::compose::{
     check_output, compose_version, down_args, docker_ps_publish_args, parse_docker_ps_ldjson,
-    parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, up_args, volume_ls_args, ComposeRunner,
+    parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview, up_args, volume_ls_args,
+    ComposeRunner,
 };
 use crate::error::CoreError;
 use crate::poll::{self, PollConfig, PollState};
@@ -78,6 +79,23 @@ pub struct RigDownResult {
     pub project: String,
     /// Always `"down"` on success.
     pub state: String,
+}
+
+/// `ign rig reset` output model (04-02, all keys always).
+#[derive(Debug, Serialize)]
+pub struct RigResetResult {
+    /// Compose project name — the identity truth.
+    pub rig: String,
+    /// Compose project name.
+    pub project: String,
+    /// The volume names reset removed (the preview, reported as it
+    /// acted — what `-v` took from THIS project only).
+    pub removed_volumes: Vec<String>,
+    /// `"running"` | `"uncommissioned"` (a fresh volume usually boots
+    /// into the wizard — data, exit 0).
+    pub state: String,
+    /// Data-level warnings (uncommissioned wizard hint, skipped-wait).
+    pub warnings: Vec<String>,
 }
 
 /// One published-port row in status output (allowlist only).
@@ -276,6 +294,80 @@ pub async fn rig_down(runner: &dyn ComposeRunner, plan: &RigPlan) -> Result<RigD
     })
 }
 
+/// `ign rig reset` (04-02, RIG-01): the guarded teardown + bring-up
+/// cycle — NO stale project/trial state survives. The CLI guard
+/// (`--yes`, exit 2 before ANY resolution) lives in the dispatch (the
+/// sessions-terminate/project-delete layering); this action is the
+/// decision-complete cycle behind it:
+///
+/// 1. `reset_preview` — the project's volume names, captured for the
+///    result data (agents see what reset removes before/as it acts);
+/// 2. version gate (fail fast on missing/too-old compose);
+/// 3. `down -v --remove-orphans` — the LOCKED teardown (research:
+///    `down && up` without `-v` is the classic stale-state
+///    anti-pattern; anonymous strays and renamed-service orphans die
+///    via `--remove-orphans`);
+/// 4. `port_preflight` — AFTER teardown, BEFORE the up half: teardown
+///    frees OUR ports first, then fresh eyes catch another rig that
+///    grabbed a freed port mid-cycle;
+/// 5. `up -d --wait` (the [`rig_up`] invocation verbatim);
+/// 6. commissioned wait — [`commissioned_wait`], the ONE shared fn
+///    (the 04-01 probe reused verbatim; `poll.rs` untouched).
+pub async fn rig_reset(
+    runner: &dyn ComposeRunner,
+    plan: &RigPlan,
+    wait_timeout_s: u64,
+    gateway: Option<&dyn GatewayApi>,
+) -> Result<RigResetResult, CoreError> {
+    // 1. The preview — data for the result, reported as it acts.
+    let removed_volumes = reset_preview(runner, plan).await?;
+
+    // 2. Fail fast on a missing/too-old compose.
+    compose_version(runner).await?;
+
+    // 3. Teardown: down -v --remove-orphans (volumes die here).
+    let output = runner.run(&down_args(plan, true)).await;
+    check_output(&output, "docker compose down")?;
+
+    // 4. Port pre-flight with fresh eyes — between the halves.
+    if let Some(conflict) = port_preflight(runner, plan).await?.first() {
+        return Err(CoreError::Rig(format!(
+            "port {} in use by {} — stop it or change the rig's published port \
+             (the rig is torn down; re-run `rig up` once the port frees)",
+            conflict.port, conflict.attribution
+        )));
+    }
+
+    // 5. The up half.
+    let output = runner.run(&up_args(plan, wait_timeout_s)).await;
+    check_output(&output, "docker compose up")?;
+
+    // 6. Commissioned wait — the shared fn (uncommissioned-as-data).
+    let gateway_url = gateway_url_from(plan);
+    let mut warnings = Vec::new();
+    let state = match (gateway, &gateway_url) {
+        (Some(api), Some(url)) => {
+            commissioned_wait(api, url, wait_timeout_s, &mut warnings).await?
+        }
+        _ => {
+            warnings.push(
+                "no gateway port mapping (target 8088/443) found — skipped the \
+                 commissioned wait"
+                    .to_string(),
+            );
+            "running".to_string()
+        }
+    };
+
+    Ok(RigResetResult {
+        rig: plan.name.clone(),
+        project: plan.name.clone(),
+        removed_volumes,
+        state,
+        warnings,
+    })
+}
+
 /// `ign rig status`: version gate → `ps` LDJSON → `volume ls` →
 /// port occupancy — serialized as an ALLOWLIST (services' state/health/
 /// publishers, volume names, identity). Exit 0 even when the rig is
@@ -342,10 +434,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigStatusResult, RigUpResult, gateway_url_from,
-        rig_down, rig_status, rig_up,
+        DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigResetResult, RigStatusResult, RigUpResult,
+        gateway_url_from, rig_down, rig_reset, rig_status, rig_up,
     };
-    use crate::rig::compose::{ComposeOutput, ComposeRunner, PortMapping, down_args, up_args};
+    use crate::rig::compose::{
+        ComposeOutput, ComposeRunner, PortMapping, down_args, up_args, volume_ls_args,
+    };
     use crate::error::CoreError;
     use crate::rig::RigPlan;
 
@@ -664,6 +758,159 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // rig_reset — the guarded teardown + bring-up cycle (04-02)
+    // ---------------------------------------------------------------------
+
+    /// volume ls rows: one of ours, one foreign-prefixed (the label
+    /// filter is server-side; the name-prefix filter is defense in
+    /// depth — the preview pin).
+    const RESET_VOLUME_STDOUT: &str = concat!(
+        r#"{"Name":"fixture-rig_gw-data","Labels":{"com.docker.compose.project":"fixture-rig"}}"#,
+        "\n",
+        r#"{"Name":"other-rig_gw-data","Labels":{"com.docker.compose.project":"other-rig"}}"#,
+        "\n",
+    );
+
+    /// The full scripted cycle for a gw_plan() rig: preview (docker
+    /// volume ls) → version → down -v → preflight × 2 ports → up.
+    fn reset_cycle_outputs() -> Vec<ComposeOutput> {
+        vec![
+            ok(RESET_VOLUME_STDOUT),
+            version_ok(),
+            ok(""),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]
+    }
+
+    /// The happy cycle: preview content pinned (label-filtered names,
+    /// foreign prefix dropped), teardown LOCKED shape pinned on the
+    /// call log (`-v --remove-orphans`, explicit `-p`), pre-flight
+    /// BETWEEN the halves, up on the rig_up shape, probe → RUNNING.
+    #[tokio::test]
+    async fn reset_previews_tears_down_with_v_then_brings_up() {
+        let server = status_ping_server("RUNNING").await;
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+        let runner = FakeRunner::with(reset_cycle_outputs());
+        let result = rig_reset(&runner, &gw_plan(), 300, Some(&api))
+            .await
+            .expect("reset succeeds");
+        assert_eq!(result.rig, "fixture-rig");
+        assert_eq!(result.removed_volumes, vec!["fixture-rig_gw-data"]);
+        assert_eq!(result.state, "running");
+        assert!(result.warnings.is_empty());
+
+        // The call log pins the WHOLE cycle: program shapes AND order.
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 6, "exactly the six scripted calls: {calls:?}");
+        assert_eq!(
+            calls[0],
+            ("docker", volume_ls_args("fixture-rig")),
+            "preview rides the plain-docker volume ls shape"
+        );
+        assert_eq!(calls[1], ("docker compose", vec!["version".to_string()]));
+        // The LOCKED teardown — the REQUEST shape, not just the
+        // response (the Phase-2/3 wiremock discipline, runner edition).
+        assert_eq!(
+            calls[2],
+            (
+                "docker compose",
+                vec![
+                    "-p".to_string(),
+                    "fixture-rig".to_string(),
+                    "-f".to_string(),
+                    "/rigs/docker/compose.yml".to_string(),
+                    "down".to_string(),
+                    "--remove-orphans".to_string(),
+                    "-v".to_string(),
+                ],
+            ),
+            "down -v --remove-orphans via the runner seam"
+        );
+        // Pre-flight AFTER the teardown, BEFORE the up (fresh eyes).
+        assert_eq!(calls[3].0, "docker");
+        assert_eq!(calls[4].0, "docker");
+        assert_eq!(calls[5], ("docker compose", up_args(&gw_plan(), 300)));
+    }
+
+    /// A fresh volume terminally reports the wizard redirect →
+    /// uncommissioned is DATA (exit 0) — the same degradation as up.
+    #[tokio::test]
+    async fn reset_uncommissioned_fresh_volume_is_data() {
+        let server = uncommissioned_server().await;
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+        let runner = FakeRunner::with(reset_cycle_outputs());
+        let result = rig_reset(&runner, &gw_plan(), 1, Some(&api))
+            .await
+            .expect("uncommissioned reset is exit-0 data");
+        assert_eq!(result.state, "uncommissioned");
+        assert_eq!(result.removed_volumes, vec!["fixture-rig_gw-data"]);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("http://localhost:9088/welcome")),
+            "wizard URL in warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Port re-grabbed mid-cycle (another rig took a freed port between
+    /// the halves): Rig error with attribution, and the up NEVER ran.
+    #[tokio::test]
+    async fn reset_port_regrabbed_midcycle_errors_and_never_ups() {
+        let occupant = r#"{"Names":"other-gw-1","Labels":"com.docker.compose.project=other"}"#;
+        let runner = FakeRunner::with(vec![
+            ok(""),       // volume ls: nothing to remove
+            version_ok(),
+            ok(""),       // down -v
+            ok(occupant), // preflight 9088: re-grabbed mid-cycle
+            ok(""),       // preflight 9443: free
+        ]);
+        let err = rig_reset(&runner, &gw_plan(), 300, None)
+            .await
+            .expect_err("mid-cycle port grab aborts before the up half");
+        assert!(matches!(err, CoreError::Rig(_)));
+        assert_eq!(err.exit_code(), 7);
+        let message = err.to_string();
+        assert!(
+            message.contains("port 9088 in use by container other-gw-1 (rig other)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("torn down"),
+            "the hint names the torn-down state: {message}"
+        );
+        // The up NEVER ran — the last recorded call is the pre-flight.
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 5, "no up call: {calls:?}");
+        assert_eq!(calls.last().expect("calls exist").0, "docker");
+    }
+
+    /// Teardown failure carries compose's stderr tail.
+    #[tokio::test]
+    async fn reset_down_failure_carries_stderr_tail() {
+        let runner = FakeRunner::with(vec![
+            ok(""),
+            version_ok(),
+            ComposeOutput {
+                stdout: String::new(),
+                stderr: "cannot remove volume: in use".into(),
+                code: 1,
+            },
+        ]);
+        let err = rig_reset(&runner, &gw_plan(), 300, None)
+            .await
+            .expect_err("down -v failure errors");
+        let message = err.to_string();
+        assert!(message.contains("docker compose down failed (exit 1)"), "{message}");
+        assert!(message.contains("in use"), "{message}");
+    }
+
+    // ---------------------------------------------------------------------
     // rig_status — the allowlist pin
     // ---------------------------------------------------------------------
 
@@ -772,6 +1019,17 @@ mod tests {
         };
         let json = serde_json::to_value(&down).unwrap();
         for key in ["rig", "project", "state"] {
+            assert!(json.get(key).is_some(), "missing key {key}");
+        }
+        let reset = RigResetResult {
+            rig: "r".into(),
+            project: "r".into(),
+            removed_volumes: vec![],
+            state: "running".into(),
+            warnings: vec![],
+        };
+        let json = serde_json::to_value(&reset).unwrap();
+        for key in ["rig", "project", "removed_volumes", "state", "warnings"] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let status_keys = ["rig", "project", "compose_file", "services", "volumes", "ports_free"];

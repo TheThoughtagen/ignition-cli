@@ -40,7 +40,7 @@ pub mod compose;
 pub use compose::{
     ComposeOutput, ComposeRunner, DockerCompose, DockerPsEntry, PortMapping, Publisher,
     ServiceStatus, VolumeEntry, compose_version, config_args, docker_ps_publish_args, parse_config,
-    parse_docker_ps_ldjson,
+    parse_docker_ps_ldjson, reset_preview,
 };
 
 use crate::config::Config;

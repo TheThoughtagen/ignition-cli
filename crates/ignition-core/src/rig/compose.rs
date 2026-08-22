@@ -415,6 +415,30 @@ pub fn parse_config(stdout: &str, compose_file: &Path, project_dir: &Path) -> Re
     })
 }
 
+// ---------------------------------------------------------------------------
+// Runner-scripted ops (04-02)
+// ---------------------------------------------------------------------------
+
+/// The reset preview (04-02, RIG-01): the named-volume names `rig
+/// reset`'s `down -v` half will remove, reported in the result data so
+/// agents see WHAT reset took before/as it acts. Label-filtered at the
+/// docker layer ([`volume_ls_args`]) and name-filtered here — only
+/// `<project>_-prefixed` volumes are reset's to take (defense in
+/// depth; research Pitfall 4 shape: `Name` + `Labels`).
+pub async fn reset_preview(
+    runner: &dyn ComposeRunner,
+    plan: &RigPlan,
+) -> Result<Vec<String>, CoreError> {
+    let output = runner.run_docker(&volume_ls_args(&plan.name)).await;
+    let stdout = check_output(&output, "docker volume ls")?;
+    let prefix = format!("{}_", plan.name);
+    Ok(parse_volume_ls_ldjson(stdout)
+        .into_iter()
+        .map(|entry| entry.name)
+        .filter(|name| name.starts_with(&prefix))
+        .collect())
+}
+
 /// One `docker compose ps` publisher row (live-captured field names).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Publisher {
