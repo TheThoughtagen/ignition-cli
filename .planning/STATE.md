@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 3 in progress (2/3 plans) — export/import shipped; resources + e2e next
+**Current focus:** Phase 3 complete (3/3) — surgical resource loop + e2e harness shipped; Phase 4 (rig) planning next
 
 ## Current Position
 
 **Phase:** 3 of 7 (Project Operations)
-**Current Plan:** 2 of 3 (complete)
+**Current Plan:** 3
 **Total Plans in Phase:** 3
-**Status:** Phase 3 in progress — 03-02 executed
+**Status:** Phase 3 complete — ready for /gsd-plan-phase 4
 **Last Activity:** 2026-08-22
 
-**Progress:** [█████████░] 92%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -39,6 +39,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 02 P05 | 40min | 3 tasks | 20 files |
 | Phase 03 P01 | 21min | 3 tasks | 13 files |
 | Phase 03 P02 | 29min | 3 tasks | 21 files |
+| Phase 03 P03 | 29min | 3 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -88,6 +89,10 @@ Recent decisions affecting current work:
 - [Phase 03-02]: Export streams, import buffers BY DESIGN: download_to_file (classify→bytes_stream→tokio::fs, 120 s) never touches Vec<u8>; import rides a known-Content-Length application/zip body + overwrite QUERY param under a 300 s per-request timeout — Pitfall 2/3's structural answers, no second client
 - [Phase 03-02]: Collision conventions LOCKED: abort (default) = action-layer find pre-check refusing project_exists (exit 6, replace-not-merge hint) BEFORE any upload; overwrite = --yes-guarded pre-resolution with NO pre-check (server is authority); merge is not a clap value (Designer-only, README documents)
 - [Phase 03-02]: snapbox gotcha #3: str! normalizes backslashes in ACTUAL output to forward slashes — message text PK\x03\x04 goldens as PK//x03//x04 (recorded inline at the golden)
+- [Phase 03-03]: Resource get returns the flat stable shape {project, path, content_kind, content} — family convention (identity fields, all keys always) over the plan's enum sketch; ResourceBinary (exit 6) fences data.bin-class resources out of BOTH get and put
+- [Phase 03-03]: Added InvalidInput (exit 2, invalid_input) for put's unreadable --file/stdin — additive slug; import-specific invalid_import_file would mislabel; two-places exit-table rule synced
+- [Phase 03-03]: Resource paths over-encode via the ONE locked encoder (dots %2E, hyphens %2D, '/' preserved) — over-encoding is safe, server decodes before matching; sniffer's 8-KiB NUL window boundary pinned honestly (late lone NUL in UTF-8 = Text)
+- [Phase 03-03]: E2E harness convention LOCKED: #[ignore] tests, quiet skip without env, mutations need IGNITION_LIVE_MUTATIONS=1; openapi-capture gate writes the trimmed projects|scan|resources extract into the phase dir (phase2 precedent); replace-not-merge pinned TWO-SIDED in the loop (pre-export resource survives + post-export resource not_found)
 
 ### Pending Todos
 
@@ -102,6 +107,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-22T13:53:20.699Z
-**Stopped At:** Completed 03-02-PLAN.md (project export/import — streaming ZIP, collision policy, scope metadata)
+**Last session:** 2026-08-22T14:25:22.572Z
+**Stopped At:** Completed 03-03-PLAN.md (surgical resource loop + e2e harness — Phase 3 complete)
 **Resume file:** None
