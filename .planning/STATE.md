@@ -9,13 +9,13 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 
 ## Current Position
 
-**Phase:** 3 of 7 (Project Operations)
-**Current Plan:** 3
-**Total Plans in Phase:** 3
-**Status:** Phase 3 complete — ready for /gsd-plan-phase 4
+**Phase:** 4 of 7 (Rig Lifecycle & Trial State)
+**Current Plan:** 2
+**Total Plans in Phase:** 4
+**Status:** Plan 04-01 complete (rig engine + lifecycle core) — next: 04-02
 **Last Activity:** 2026-08-22
 
-**Progress:** [██████████] 100%
+**Progress:** [████████░░] 81%
 
 ## Performance Metrics
 
@@ -40,6 +40,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 03 P01 | 21min | 3 tasks | 13 files |
 | Phase 03 P02 | 29min | 3 tasks | 21 files |
 | Phase 03 P03 | 29min | 3 tasks | 12 files |
+| Phase 04 P01 | 42min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -93,6 +94,9 @@ Recent decisions affecting current work:
 - [Phase 03-03]: Added InvalidInput (exit 2, invalid_input) for put's unreadable --file/stdin — additive slug; import-specific invalid_import_file would mislabel; two-places exit-table rule synced
 - [Phase 03-03]: Resource paths over-encode via the ONE locked encoder (dots %2E, hyphens %2D, '/' preserved) — over-encoding is safe, server decodes before matching; sniffer's 8-KiB NUL window boundary pinned honestly (late lone NUL in UTF-8 = Text)
 - [Phase 03-03]: E2E harness convention LOCKED: #[ignore] tests, quiet skip without env, mutations need IGNITION_LIVE_MUTATIONS=1; openapi-capture gate writes the trimmed projects|scan|resources extract into the phase dir (phase2 precedent); replace-not-merge pinned TWO-SIDED in the loop (pre-export resource survives + post-export resource not_found)
+- [Phase 04-01]: Rig discovery order LOCKED: --rig > IGNITION_RIG > [rig].default > cwd candidates > git-module > WHK-Global (both home roots, first hit wins) — must-have truth overrode the plan's inverted test blurb; stale [rig].default is a loud exit-7, never a silent scan
+- [Phase 04-01]: Uncommissioned-as-data fires ONLY on the exact poll-deadline shape (Network{source:None}) + witnessed terminal-uncommissioned flag; still-STARTING at deadline stays rig_error. Research Open Question 4 RESOLVED live: --project-directory makes the rig's .env COMPOSE_PROJECT_NAME authoritative cwd-elsewhere
+- [Phase 04-01]: ComposeRunner seam carries TWO program shapes: run (docker compose) + run_docker (plain docker for volume ls / docker ps attribution); tokio process is the ONLY Phase 4 dep change; LDJSON parsing is line-based (StreamDeserializer halts at first bad line); IGNITION_RIG_ROOTS env overrides convention home roots for test isolation
 
 ### Pending Todos
 
@@ -107,6 +111,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-22T14:25:22.572Z
-**Stopped At:** Completed 03-03-PLAN.md (surgical resource loop + e2e harness — Phase 3 complete)
+**Last session:** 2026-08-22T19:36:13.067Z
+**Stopped At:** Completed 04-01-PLAN.md (rig engine + lifecycle core — ign rig up/down/status)
 **Resume file:** None
