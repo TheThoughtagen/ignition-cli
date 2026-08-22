@@ -74,6 +74,8 @@ enum ActionOutput {
     RestartWait(actions::restart::RestartWaitResult),
     /// `ign wait <target>` — the target reached its terminal state.
     Wait(actions::restart::WaitResult),
+    /// `ign doctor` — the structured checks[] report.
+    Doctor(actions::doctor::DoctorResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -115,6 +117,7 @@ impl ActionOutput {
             ActionOutput::Restart(result) => render_success(profile, result, compact),
             ActionOutput::RestartWait(result) => render_success(profile, result, compact),
             ActionOutput::Wait(result) => render_success(profile, result, compact),
+            ActionOutput::Doctor(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -508,6 +511,47 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 };
                 (name, result)
             }
+        },
+        // Doctor (02-05, HLTH-10): the self-service preflight. NEVER
+        // errors on failing CHECKS — the diagnosis completing IS the
+        // success (exit 0; agents parse checks[], humans read the
+        // table — README-documented). Only config-class problems (no
+        // profile) exit through the normal path. The credential
+        // DEGRADES to header-less: doctor diagnoses broken/absent auth
+        // for a living, so it must run without one (a 401 is then
+        // honestly reported as "no credential resolved").
+        Commands::Doctor {
+            check_write,
+            webdev_route,
+        } => match resolve_profile_context(&mut config, cli.profile.as_deref()) {
+            Ok(None) => (None, Err(CoreError::NoActiveProfile)),
+            Ok(Some((name, profile))) => {
+                let credential = resolve_secret_opt(&name, &profile.auth);
+                match credential {
+                    Ok(credential) => {
+                        let credential_present = credential.is_some();
+                        match ReqwestGatewayApi::new(&profile, credential) {
+                            Ok(api) => {
+                                let opts = actions::doctor::DoctorOptions {
+                                    check_write,
+                                    webdev_route,
+                                };
+                                let result = actions::doctor::doctor(
+                                    &api,
+                                    profile.url.as_str(),
+                                    credential_present,
+                                    &opts,
+                                )
+                                .await;
+                                (Some(name), Ok(ActionOutput::Doctor(result)))
+                            }
+                            Err(err) => (Some(name), Err(err)),
+                        }
+                    }
+                    Err(err) => (Some(name), Err(err)),
+                }
+            }
+            Err(err) => (None, Err(err)),
         },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {

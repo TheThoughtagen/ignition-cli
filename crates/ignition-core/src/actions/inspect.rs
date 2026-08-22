@@ -377,6 +377,14 @@ mod tests {
         async fn scan_projects(&self) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
+        async fn security_properties(
+            &self,
+        ) -> Result<crate::client::restart::SecurityProperties, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn webdev_route_status(&self, _route: &str) -> Result<u16, CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     /// status merges all three sources under the documented keys —
@@ -530,6 +538,14 @@ mod tests {
             unreachable!("not part of this action")
         }
         async fn scan_projects(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn security_properties(
+            &self,
+        ) -> Result<crate::client::restart::SecurityProperties, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn webdev_route_status(&self, _route: &str) -> Result<u16, CoreError> {
             unreachable!("not part of this action")
         }
     }

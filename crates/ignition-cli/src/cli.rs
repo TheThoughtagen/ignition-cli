@@ -107,6 +107,19 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Wait(WaitArgs),
 
+    /// Diagnose the gateway setup: URL, liveness, commissioning, auth,
+    /// permissions, write, WebDev route, rig — exits 0 whenever the
+    /// diagnosis completes (failing checks are data)
+    Doctor {
+        /// Probe write permission (POST scan/projects — a harmless
+        /// project rescan)
+        #[arg(long)]
+        check_write: bool,
+        /// Probe one WebDev route's presence (/system/webdev/<NAME>)
+        #[arg(long, value_name = "NAME")]
+        webdev_route: Option<String>,
+    },
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),

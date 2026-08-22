@@ -138,6 +138,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Restart(result) => render_restart_human(result),
         ActionOutput::RestartWait(result) => render_restart_wait_human(result),
         ActionOutput::Wait(result) => render_wait_human(result),
+        ActionOutput::Doctor(result) => render_doctor_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -435,6 +436,46 @@ fn render_wait_human(result: &ignition_core::actions::restart::WaitResult) {
         "{} {} after {}s",
         result.target, result.state, result.elapsed_secs
     );
+}
+
+/// `ign doctor` human table: one row per check
+/// (`name  STATUS  detail`, hint line under failures), then the count
+/// summary. The doctor exits 0 whenever the table prints — failing
+/// checks are the product (README-documented).
+fn render_doctor_human(result: &ignition_core::actions::doctor::DoctorResult) {
+    use ignition_core::actions::doctor::CheckStatus;
+    let mut ok = 0;
+    let mut warn = 0;
+    let mut fail = 0;
+    let mut skip = 0;
+    for check in &result.checks {
+        match check.status {
+            CheckStatus::Ok => ok += 1,
+            CheckStatus::Warn => warn += 1,
+            CheckStatus::Fail => fail += 1,
+            CheckStatus::Skip => skip += 1,
+        }
+        let status = match check.status {
+            CheckStatus::Ok => "OK",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+            CheckStatus::Skip => "SKIP",
+        };
+        println!("{:<12}  {:<4}  {}", check.name, status, check.detail);
+        if check.status == CheckStatus::Fail
+            && let Some(hint) = &check.hint
+        {
+            println!("  hint: {hint}");
+        }
+    }
+    let mut summary = format!(
+        "{} checks: {ok} ok, {warn} warn, {fail} fail",
+        result.checks.len()
+    );
+    if skip > 0 {
+        summary.push_str(&format!(", {skip} skip"));
+    }
+    println!("{summary}");
 }
 
 /// Epoch milliseconds → an ISO-8601 UTC string

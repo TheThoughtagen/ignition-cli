@@ -368,3 +368,56 @@ async fn live_logger_level_set_and_reset() {
         .await
         .expect("levelreset must succeed");
 }
+
+// ---------------------------------------------------------------------------
+// 02-05 addition: doctor end-to-end (read-only subset — no --check-write,
+// no --webdev-route; those probe mutations/route specifics the rig may
+// not have).
+// ---------------------------------------------------------------------------
+
+/// The full doctor sequence against a live gateway: url + liveness
+/// must be ok on any healthy rig; the checks[] table prints to stderr
+/// for eyeballing. Read-only (scan/projects never fires without
+// --check-write).
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL (+ IGNITION_LIVE_TOKEN for the authed checks)"]
+async fn live_doctor_end_to_end() {
+    let Some(url) = live_url() else {
+        skip("IGNITION_LIVE_URL not set");
+        return;
+    };
+    let token = live_token();
+    let credential = token
+        .clone()
+        .map(|token| Credential::Token(Secret::new(token)));
+    let api = ReqwestGatewayApi::for_tests(&url, credential);
+    let opts = ignition_core::actions::doctor::DoctorOptions::default();
+    let result = ignition_core::actions::doctor::doctor(&api, &url, token.is_some(), &opts).await;
+    for check in &result.checks {
+        eprintln!(
+            "live doctor: {:<12} {:?} {}",
+            check.name, check.status, check.detail
+        );
+    }
+    let by_name = |name: &str| {
+        result
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("{name} row present"))
+    };
+    assert_eq!(
+        by_name("url").status,
+        ignition_core::actions::doctor::CheckStatus::Ok
+    );
+    assert_eq!(
+        by_name("liveness").status,
+        ignition_core::actions::doctor::CheckStatus::Ok
+    );
+    if token.is_some() {
+        assert_eq!(
+            by_name("auth").status,
+            ignition_core::actions::doctor::CheckStatus::Ok
+        );
+    }
+}

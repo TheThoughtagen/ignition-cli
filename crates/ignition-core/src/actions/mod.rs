@@ -5,6 +5,7 @@
 //! binary (and later the TUI).
 
 pub mod connections;
+pub mod doctor;
 pub mod inspect;
 pub mod logs;
 pub mod profile;

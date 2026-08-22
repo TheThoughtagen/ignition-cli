@@ -31,7 +31,6 @@ pub(crate) const SCAN_PROJECTS_PATH: &str = "/data/api/v1/scan/projects";
 /// permissions deep-dive (02-RESEARCH §Doctor inputs 5b; the resource
 /// singleton read, same family 02-03 verified for the connection
 /// lists).
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const SECURITY_PROPERTIES_PATH: &str =
     "/data/api/v1/resources/ignition/security-properties";
 
@@ -68,7 +67,6 @@ pub struct SecurityProperties {
 
 /// The full probe path for one WebDev route: `/system/webdev/<route>`
 /// (ignition-mcp's verified URL shape; 02-RESEARCH §Sources).
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn webdev_route_path(route: &str) -> String {
     format!("{WEBDEV_ROOT}{route}")
 }

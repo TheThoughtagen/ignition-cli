@@ -63,7 +63,35 @@ The two rejection codes carry distinct diagnoses:
 | Response | Meaning | What to fix |
 |----------|---------|-------------|
 | 401 | token not recognized | the header must be the full `name:key` string — no `name:` prefix or wrong key → 401; Basic never works on `/data` |
-| 403 | token recognized but under-permitted | three-part setup: (1) token holds an adequate security level, (2) gateway read/write permissions include that level, (3) "Require secure connections" unchecked for http — `ign doctor` (later in Phase 2) diagnoses all three |
+| 403 | token recognized but under-permitted | three-part setup: (1) token holds an adequate security level, (2) gateway read/write permissions include that level, (3) "Require secure connections" unchecked for http — `ign doctor` diagnoses all three |
+
+### Token-setup troubleshooting (the three-part failure, `ign doctor`'s bread and butter)
+
+A 403 means the gateway RECOGNIZED your token but its security level
+doesn't satisfy the gateway's permissions. The setup has exactly three
+parts — all three must hold:
+
+1. **The token holds an adequate security level.** When creating the
+   key (Platform → Security → API Keys), pick a level the gateway's
+   permissions already accept — only leaf paths count (granting
+   `Authenticated/Roles` mid-tree logs a WARN and is ignored).
+2. **The gateway's read/write permissions include that level.** Under
+   8.3 defaults, Gateway Read/Write Permissions only include
+   `Authenticated/Roles/Administrator` — a token granted just
+   `Authenticated` gets 403 (verified live, then fixed by adding the
+   level to the permission lists). `ign doctor` reads the
+   `security-properties` config and shows you the actual wiring; when
+   even that read 403s, the wiring is your culprit.
+3. **"Require secure connections" is unchecked** when the gateway URL
+   is `http://` (the create dialog CHECKS it by default — the #1
+   http-rig trap; uncheck it).
+
+`ign doctor` walks the whole chain — URL/TCP reachability, liveness
+(no credential involved, so down-ness is never confused with bad
+auth), commissioning, 401-vs-403, the permissions wiring, write
+permission, WebDev-route presence, and Docker presence — and exits 0
+whenever the diagnosis completes so agents can parse `checks[]` from a
+broken setup without a nonzero exit getting in the way.
 
 ### Live-gateway verification (opt-in)
 
@@ -99,6 +127,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign wait gateway [--interval S --timeout S]` | Wait until the gateway reports RUNNING | unauthenticated `/StatusPing` poll — works with no/broken credential; already-RUNNING = immediate success (default 120 s) |
 | `ign wait restart [--interval S --timeout S]` | Wait for a restart to complete | shares `restart --wait`'s semantics: a non-RUNNING state observed once → RUNNING completes immediately (witnessed restart, no floor wait); an all-RUNNING wait reports success only after the same 5 s floor — no false positive when run right after `ign restart` |
 | `ign wait module <ID> [--interval S --timeout S]` | Wait until a module reports ACTIVE | polls `modules/healthy?search=<id>` (authed); timeout names the id + last observed state |
+| `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route` probes `/system/webdev/<NAME>` (404 = absent, anything else = present); config errors (no profile) still exit 3 |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 

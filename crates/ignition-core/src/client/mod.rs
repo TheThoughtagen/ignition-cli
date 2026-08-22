@@ -45,6 +45,7 @@ use crate::client::connections::GatewayConnection;
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::query::ListEnvelope;
+use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
 use crate::client::version::GatewayInfo;
@@ -161,6 +162,16 @@ pub trait GatewayApi: Send + Sync {
     /// project-rescan write probe (`ign doctor --check-write`; 2xx =
     /// write permission, 403 = read-only token).
     async fn scan_projects(&self) -> Result<(), CoreError>;
+    /// GET `/data/api/v1/resources/ignition/security-properties`
+    /// (authed) — the security config singleton; the doctor's
+    /// permissions deep-dive surfaces `readPermissions`/
+    /// `writePermissions` verbatim (passthrough shape).
+    async fn security_properties(&self) -> Result<SecurityProperties, CoreError>;
+    /// GET `/system/webdev/<route>` (authed) reporting the RAW HTTP
+    /// status — the doctor's route-presence probe (404 = absent;
+    /// 200/401/403 = exists). Deliberately NOT classified: presence
+    /// IS the answer; only transport failures are errors.
+    async fn webdev_route_status(&self, route: &str) -> Result<u16, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -558,6 +569,25 @@ impl GatewayApi for ReqwestGatewayApi {
         self.post_empty(restart::SCAN_PROJECTS_PATH, &[], true)
             .await
             .map(|_| ())
+    }
+
+    async fn security_properties(&self) -> Result<SecurityProperties, CoreError> {
+        self.get_json(restart::SECURITY_PROPERTIES_PATH, None, true)
+            .await
+    }
+
+    async fn webdev_route_status(&self, route: &str) -> Result<u16, CoreError> {
+        // The raw-status probe: send, surface the status code, never
+        // classify (404 vs 200/401/403 is the ANSWER, not an error).
+        // Only transport failures (DNS/refused/timeout) error out.
+        let path = restart::webdev_route_path(route);
+        let url = self.url_for(&path);
+        let request = self.apply_auth(self.client.get(url.clone()));
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+        })?;
+        Ok(response.status().as_u16())
     }
 }
 
