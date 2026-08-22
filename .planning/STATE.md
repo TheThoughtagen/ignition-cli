@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 2 — Gateway Health & Inspection (Phase 1 complete & verified)
+**Current focus:** Phase 2 complete (5/5 plans) — ready for verification/transition to Phase 3
 
 ## Current Position
 
 **Phase:** 2 of 7 (Gateway Health & Inspection)
-**Current Plan:** 4
+**Current Plan:** 5 of 5 (complete)
 **Total Plans in Phase:** 5
-**Status:** Ready to execute
+**Status:** Phase 2 complete — all plans executed
 **Last Activity:** 2026-08-22
 
-**Progress:** [█████████░] 89%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -36,6 +36,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 02 P02 | 12min | 3 tasks | 14 files |
 | Phase Phase 02 PP03 | 14min | 3 tasks | 15 files |
 | Phase 02 P04 | 35min | 3 tasks | 18 files |
+| Phase 02 P05 | 40min | 3 tasks | 20 files |
 
 ## Accumulated Context
 
@@ -74,6 +75,9 @@ Recent decisions affecting current work:
 - [Phase 02-04]: [Phase 02-04]: CoreError::Network.source → Option<reqwest::Error> — source:None marks a poll deadline expiry (same network_error slug/exit 4, NO new variant per plan); the deadline message rides url (subject + waited + last observation); Some-source Display byte-identical, no golden moved
 - [Phase 02-04]: [Phase 02-04]: poll.rs is THE wait engine (HRTB state-threading: for<'a> FnMut(&'a mut S) -> Probe<'a,T>) — ×1.5 backoff clamp [interval,30s], Network/GatewayRestarting retried, Auth never; 02-05's wait/restart --wait reuses it verbatim; tail maps the None-source deadline error to graceful Ok (exit 0)
 - [Phase 02-04]: [Phase 02-04]: 'ign logs' shows the NEWEST entries via sortBy=desc(timestamp) + explicit limit (gateway's own openapi asc()/desc() syntax) — 'recent' without inventing a since-window policy; EVERY logs command sends an explicit limit (default 200, loggers included — Pitfall 9); logs -f --json streams NDJSON (one compact entry per line, no envelope) — the SECOND sanctioned stdout exception, README-documented
+- [Phase 02]: [Phase 02-05]: poll HRTB constraint pinned — a probe whose state carries no lifetime or whose Done payload is non-() does not typecheck; every wait probe uses S=&mut Cell<String> + PollState::<()> with the terminal state riding the outer Cell (the tail pattern generalized) — Empirically bisected: identical closure shapes compile/fail on exactly these two properties
+- [Phase 02]: [Phase 02-05]: wait gateway + wait restart dispatch HEADER-LESS (secret degrades to None — the unauth StatusPing anchor must work when auth is broken); wait module stays authed; doctor's credential degrades too, with a credential_present flag giving the honest 401 split (no-credential vs not-recognized)
+- [Phase 02]: [Phase 02-05]: RESTART_FLOOR is ONE shared from_secs(5) const (restart_and_wait sleeps it post-POST; wait_restart requires it elapsed before all-RUNNING success, witnessing non-RUNNING short-circuits it); doctor exits 0 whenever the diagnosis completes — failing checks are data; webdev_route_status bypasses classify (404-vs-present IS the answer)
 
 ### Pending Todos
 
@@ -88,6 +92,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-22T03:44:19.656Z
-**Stopped At:** Completed 02-04-PLAN.md (logs query/tail/download + logger levels + poll engine)
+**Last session:** 2026-08-22T04:31:25.202Z
+**Stopped At:** Completed 02-05-PLAN.md (restart/wait/doctor — Phase 2 complete)
 **Resume file:** None

@@ -15,7 +15,7 @@ Build `ign` — a single Rust binary + ratatui cockpit that replaces both the Ig
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Foundation & Agentic Contracts** - The `ign` binary with profiles, auth, JSON output, error envelopes, exit codes — the contract every later command inherits
-- [ ] **Phase 2: Gateway Health & Inspection** - Read-only gateway operations against any 8.3 gateway: status, modules, logs, connections, metrics, sessions, restart, doctor, wait
+- [x] **Phase 2: Gateway Health & Inspection** - Read-only gateway operations against any 8.3 gateway: status, modules, logs, connections, metrics, sessions, restart, doctor, wait
 - [ ] **Phase 3: Project Operations** - Full project CRUD, export/import, and surgical resource editing — the gateway webpage's project pages replaced
 - [ ] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore
 - [ ] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar
@@ -171,7 +171,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation & Agentic Contracts | 4/4 | Complete | 2026-08-21 |
-| 2. Gateway Health & Inspection | 1/5 | In progress | - |
+| 2. Gateway Health & Inspection | 5/5 | Complete | 2026-08-22 |
 | 3. Project Operations | 0/3 | Not started | - |
 | 4. Rig Lifecycle & Trial State | 0/4 | Not started | - |
 | 5. WebDev Backend & Tag Operations | 0/5 | Not started | - |
