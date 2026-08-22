@@ -19,6 +19,9 @@ use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult
 use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
 };
+use ignition_core::actions::projects::{
+    ProjectCopyResult, ProjectDeleteResult, ProjectRenameResult, ProjectSetResult, ProjectsResult,
+};
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
@@ -160,6 +163,12 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
             }
         }
         ActionOutput::ProfileUse(result) => println!("active profile set to {}", result.active),
+        ActionOutput::ProjectsList(result) => render_projects_list_human(result),
+        ActionOutput::ProjectNew(result) => render_project_new_human(result),
+        ActionOutput::ProjectCopy(result) => render_project_copy_human(result),
+        ActionOutput::ProjectRename(result) => render_project_rename_human(result),
+        ActionOutput::ProjectSet(result) => render_project_set_human(result),
+        ActionOutput::ProjectDelete(result) => render_project_delete_human(result),
     }
 }
 
@@ -476,6 +485,64 @@ fn render_doctor_human(result: &ignition_core::actions::doctor::DoctorResult) {
         summary.push_str(&format!(", {skip} skip"));
     }
     println!("{summary}");
+}
+
+/// `ign project list` human rows: `name  title  enabled  parent
+/// inheritable` (absent title/parent/inheritable render as `-`) — the
+/// webpage's project list as terminal rows.
+fn render_projects_list_human(result: &ProjectsResult) {
+    for project in &result.projects {
+        let title = project.title.as_deref().unwrap_or("-");
+        let parent = project.parent.as_deref().unwrap_or("-");
+        let inheritable = match project.inheritable {
+            Some(value) => value.to_string(),
+            None => "-".to_string(),
+        };
+        println!(
+            "{}  {}  {}  {}  {}",
+            project.name, title, project.enabled, parent, inheritable
+        );
+    }
+    if result.projects.is_empty() {
+        println!("(no projects)");
+    }
+}
+
+/// `ign project new` human line: the confirmation + the parent when
+/// one was set.
+fn render_project_new_human(result: &ignition_core::actions::projects::ProjectSummary) {
+    match &result.parent {
+        Some(parent) => println!("created {} (parent {})", result.name, parent),
+        None => println!("created {}", result.name),
+    }
+}
+
+/// `ign project copy` human line.
+fn render_project_copy_human(result: &ProjectCopyResult) {
+    println!("copied {} \u{2192} {}", result.from, result.project.name);
+}
+
+/// `ign project rename` human line.
+fn render_project_rename_human(result: &ProjectRenameResult) {
+    println!(
+        "renamed {} \u{2192} {}",
+        result.previous_name, result.project.name
+    );
+}
+
+/// `ign project set` human line: which fields changed on which
+/// project (the fields-touched list rides the result display-only).
+fn render_project_set_human(result: &ProjectSetResult) {
+    println!(
+        "set {} on {}",
+        result.fields.join(", "),
+        result.project.name
+    );
+}
+
+/// `ign project delete` human line.
+fn render_project_delete_human(result: &ProjectDeleteResult) {
+    println!("deleted {}", result.deleted);
 }
 
 /// Epoch milliseconds → an ISO-8601 UTC string

@@ -30,8 +30,8 @@ use ignition_core::config::{self, AuthRef, Config, Credential, SecretStore};
 use ignition_core::error::CoreError;
 
 use crate::cli::{
-    Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, SessionsArgs,
-    SessionsCmd, WaitArgs, WaitCmd,
+    Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
+    ProjectCommand, SessionsArgs, SessionsCmd, WaitArgs, WaitCmd,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -89,6 +89,19 @@ enum ActionOutput {
     ProfileList(actions::profile::ProfileListResult),
     /// `ign profile use`.
     ProfileUse(actions::profile::ProfileUseResult),
+    /// `ign project list` — every runnable project with inheritance
+    /// info (PROJ-01).
+    ProjectsList(actions::projects::ProjectsResult),
+    /// `ign project new` — the create + read-back record.
+    ProjectNew(actions::projects::ProjectSummary),
+    /// `ign project copy` — source + destination read-back.
+    ProjectCopy(actions::projects::ProjectCopyResult),
+    /// `ign project rename` — previous name + renamed read-back.
+    ProjectRename(actions::projects::ProjectRenameResult),
+    /// `ign project set` — fields-touched (display-only) + read-back.
+    ProjectSet(actions::projects::ProjectSetResult),
+    /// `ign project delete` — the family's destructive verb.
+    ProjectDelete(actions::projects::ProjectDeleteResult),
 }
 
 impl ActionOutput {
@@ -125,6 +138,12 @@ impl ActionOutput {
             ActionOutput::ProfileAdd(result) => render_success(profile, result, compact),
             ActionOutput::ProfileList(result) => render_success(profile, result, compact),
             ActionOutput::ProfileUse(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectsList(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectNew(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectCopy(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectRename(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectSet(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectDelete(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -552,6 +571,125 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
             }
             Err(err) => (None, Err(err)),
+        },
+        // Projects (03-01, PROJ-01/02): the first project-family
+        // commands. All arms are authed (inspection-command rule: exit
+        // 3 without a credential). Delete is the family's ONE
+        // destructive verb — the sessions-terminate shape VERBATIM
+        // (LOCKED 02-03): the guard fires BEFORE resolve_gateway_api,
+        // so a refusal exits 2 with profile null and does ZERO
+        // config/secret/network work. Copy/rename/set create or
+        // relabel, never destroy — NO --yes (planner decision).
+        Commands::Project(ProjectArgs { command }) => match command {
+            ProjectCommand::List => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::projects::projects(&api)
+                        .await
+                        .map(ActionOutput::ProjectsList),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ProjectCommand::New {
+                name: project_name,
+                title,
+                description,
+                parent,
+                inheritable,
+                disabled,
+            } => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => {
+                        let opts = actions::projects::NewOptions {
+                            enabled: !disabled,
+                            title,
+                            description,
+                            parent,
+                            inheritable: inheritable.then_some(true),
+                        };
+                        actions::projects::project_new(&api, &project_name, &opts)
+                            .await
+                            .map(ActionOutput::ProjectNew)
+                    }
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ProjectCommand::Copy { src, dst } => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::projects::project_copy(&api, &src, &dst)
+                        .await
+                        .map(ActionOutput::ProjectCopy),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ProjectCommand::Rename { old_name, new_name } => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::projects::project_rename(&api, &old_name, &new_name)
+                        .await
+                        .map(ActionOutput::ProjectRename),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ProjectCommand::Set {
+                name: project_name,
+                title,
+                description,
+                parent,
+                set_enabled,
+                disabled,
+                inheritable,
+            } => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => {
+                        // --set-enabled → Some(true), --disabled →
+                        // Some(false), neither → None (don't touch).
+                        let enabled = if set_enabled {
+                            Some(true)
+                        } else if disabled {
+                            Some(false)
+                        } else {
+                            None
+                        };
+                        let opts = actions::projects::SetOptions {
+                            title,
+                            description,
+                            parent,
+                            enabled,
+                            inheritable,
+                        };
+                        actions::projects::project_set(&api, &project_name, &opts)
+                            .await
+                            .map(ActionOutput::ProjectSet)
+                    }
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ProjectCommand::Delete { name: project_name } => {
+                // The sessions-terminate shape VERBATIM: the guard
+                // refuses (exit 2, confirmation_required, profile null)
+                // BEFORE any profile/secret/client resolution — a
+                // refusal costs nothing and never touches the gateway.
+                if let Err(err) = require_confirmation(cli.yes, "project delete") {
+                    return (None, Err(err));
+                }
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::projects::project_delete(&api, &project_name)
+                        .await
+                        .map(ActionOutput::ProjectDelete),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
         },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {

@@ -370,6 +370,44 @@ async fn live_logger_level_set_and_reset() {
 }
 
 // ---------------------------------------------------------------------------
+// 03-01 addition: projects list (read-only) — optional live truth for
+// the list envelope/item shape the moment a token exists (research
+// Open Question 2: item shape MEDIUM until captured).
+// ---------------------------------------------------------------------------
+
+/// `projects/list` against a live gateway: the envelope must answer;
+/// items may be empty on a fresh rig — the check exists to capture the
+/// POPULATED item shape (the `extra` passthrough keeps corrections
+/// cheap until then).
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN (empty list OK)"]
+async fn live_projects_list() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    let page = api
+        .projects(&Default::default())
+        .await
+        .expect("live projects/list must deserialize");
+    eprintln!(
+        "live projects: {} of {} total",
+        page.items.len(),
+        page.metadata.total
+    );
+    // Capture hook: dump full records so unmodeled keys surface (the
+    // passthrough upgrade path).
+    for project in page.items.iter().take(5) {
+        eprintln!(
+            "live project {:?} parent={:?} inheritable={:?} extra={:?}",
+            project.name, project.parent, project.inheritable, project.extra
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 02-05 addition: doctor end-to-end (read-only subset — no --check-write,
 // no --webdev-route; those probe mutations/route specifics the rig may
 // not have).

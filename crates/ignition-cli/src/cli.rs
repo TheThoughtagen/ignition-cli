@@ -120,6 +120,11 @@ pub enum Commands {
         webdev_route: Option<String>,
     },
 
+    /// Manage gateway projects: list with inheritance info, new, copy,
+    /// rename, set (reparent), delete
+    #[command(arg_required_else_help = true)]
+    Project(ProjectArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -172,6 +177,91 @@ pub enum WaitCmd {
         /// Give up after this many seconds
         #[arg(long, default_value_t = 120, value_name = "SECS")]
         timeout: u64,
+    },
+}
+
+/// Project subcommands (03-01, PROJ-01/02). `delete` is the family's
+/// ONE destructive verb (`--yes`-guarded, exit 2 without); copy/
+/// rename/set create or relabel — never destroy — so they carry NO
+/// guard (planner decision per research).
+#[derive(Debug, clap::Args)]
+pub struct ProjectArgs {
+    #[command(subcommand)]
+    pub command: ProjectCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// List every runnable project: name, title, enabled, parent,
+    /// inheritable (inheritance info from the items themselves)
+    List,
+    /// Create a project (only provided fields ride the create body)
+    New {
+        /// Project name
+        name: String,
+        /// Display title
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        /// Long description
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+        /// Parent project (inheritance)
+        #[arg(long, value_name = "NAME")]
+        parent: Option<String>,
+        /// Mark this project eligible as a parent
+        #[arg(long)]
+        inheritable: bool,
+        /// Create the project disabled
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Copy a project with all its resources
+    Copy {
+        /// Source project name
+        src: String,
+        /// Destination name (must not exist)
+        dst: String,
+    },
+    /// Rename a project (native rename, not copy+delete)
+    Rename {
+        /// Current name
+        old_name: String,
+        /// New name
+        new_name: String,
+    },
+    /// Set project fields — --parent IS the inheritance move (reparent)
+    #[command(group(
+        clap::ArgGroup::new("set_fields")
+            .required(true)
+            .multiple(true)
+            .args(&["title", "description", "parent", "set_enabled", "disabled", "inheritable"])
+    ))]
+    Set {
+        /// Project name
+        name: String,
+        /// Display title
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        /// Long description
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+        /// Parent project (reparent)
+        #[arg(long, value_name = "NAME")]
+        parent: Option<String>,
+        /// Enable the project
+        #[arg(long, conflicts_with = "disabled")]
+        set_enabled: bool,
+        /// Disable the project
+        #[arg(long)]
+        disabled: bool,
+        /// Whether this project may serve as a parent (true/false)
+        #[arg(long, value_name = "BOOL")]
+        inheritable: Option<bool>,
+    },
+    /// Delete a project — destructive, refused without --yes
+    Delete {
+        /// Project name
+        name: String,
     },
 }
 

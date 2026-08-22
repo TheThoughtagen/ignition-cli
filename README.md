@@ -117,6 +117,12 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign sessions [--type designer\|perspective\|vision]` | All three session families in one merged output (`designers (N)` / `perspective (N)` / `vision (N)` sections) | `--type` filters to one family; JSON always carries all three keys (filtered-out = `[]`); replaces the webpage's Sessions pages |
 | `ign sessions terminate --type <T> --id <ID> [--message MSG]` | Terminate a session (designer: prune / vision: close / perspective: terminate, `--message` shown to the user) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`; a nonexistent id exits 6 (`not_found`) |
 | `ign connections [--type database\|opc]` | Database/OPC connections: `name  enabled  healthchecks` | `healthchecks` is passthrough as the gateway reports it (populated detail LOW-confidence until captured live); replaces the webpage's Connections pages |
+| `ign project list` | Every runnable project: `name  title  enabled  parent  inheritable` | inheritance info comes from the list items themselves; JSON items also carry `description` (all six keys always present, null when unset); replaces the webpage's Projects list |
+| `ign project new <NAME> [--title --description --parent --inheritable --disabled]` | Create a project | only provided fields ride the create body (never empty-string references); the result is a `find` read-back; audit-logged server-side |
+| `ign project copy <SRC> <DST>` | Copy a project with all its resources | non-destructive (creates DST) — no `--yes`; audit-logged server-side |
+| `ign project rename <OLD> <NEW>` | Rename a project (native rename, not copy+delete) | non-destructive relabel — no `--yes`; audit-logged server-side |
+| `ign project set <NAME> [--title --description --parent --set-enabled\|--disabled --inheritable BOOL]` | Set project fields — `--parent` IS the inheritance move (reparent) | only provided flags ride the modify body (absent = untouched); at least one field required; audit-logged server-side |
+| `ign project delete <NAME>` | Delete a project | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the wire DELETE always carries the server's own `confirm=true` query param (both guard layers); a nonexistent name exits 6 (`not_found`); audit-logged server-side |
 | `ign logs [--logger L] [--min-level L] [--since SPAN] [--limit N]` | Recent log entries, newest first (`ISO-UTC  LEVEL  logger  message`) | `--limit` is ALWAYS explicit (default 200 — the server default is unlimited); `--since` takes EPOCH-MS or `500ms/30s/5min/2h`; sorts `desc(timestamp)` so you see the NEWEST entries, never the oldest 200 |
 | `ign logs -f [--interval S] [--timeout S]` | Live tail: entries stream to stdout as they occur | poll-based (no server push exists — `GET /logs?startTime=<cursor>` IS the tail); `--timeout` expiry ends cleanly (exit 0); without it, run until Ctrl-C (default process kill, no envelope); see the streaming exception below |
 | `ign logs download [-o FILE]` | Download the log archive — a SQLite `.idb`, never a zip | bytes written exactly as received; default filename from `Content-Disposition`, else `<profile>-logs-<ts>.idb`; `--json` data is `{file, bytes, content_type}` |
@@ -135,8 +141,8 @@ All gateway commands honor the envelope (`--json`/`--compact`) with the
 `[profile: NAME]` header in human mode. The inspection trio (`status`,
 `modules`, `metrics`) replaces the gateway webpage's Status Overview,
 Config > Modules, and Performance & Diagnostics pages; `sessions`,
-`connections`, and the `logs` tree replace its Sessions, Connections,
-Logs console, and logger-config pages.
+`connections`, the `logs` tree, and the `project` tree replace its
+Sessions, Connections, Logs console, logger-config, and Projects pages.
 
 ### Streaming output (the second stdout exception)
 
@@ -152,12 +158,16 @@ envelope — plan for it in pipelines).
 
 ### Destructive operations
 
-Commands that change gateway state (`sessions terminate`, the
-`logs loggers set`/`reset` mutations, and `restart` — the big one: it
-takes the whole gateway down for ~1 min) refuse without `--yes` (exit 2,
-`confirmation_required`, hint names both the flag and `IGNITION_YES=1`)
-— non-interactive by design, so scripts and agents pass `--yes` once
-and humans get a speed bump. `restart` is guarded in BOTH forms: plain
-and `--wait`. The guard fires before any network
-activity: a refusal never touches the gateway. Termination and restart
-mutations are audit-logged server-side by the gateway.
+Commands that change gateway state (`sessions terminate`,
+`logs loggers set`/`reset`, `project delete`, and `restart` — the big
+one: it takes the whole gateway down for ~1 min) refuse without `--yes`
+(exit 2, `confirmation_required`, hint names both the flag and
+`IGNITION_YES=1`) — non-interactive by design, so scripts and agents
+pass `--yes` once and humans get a speed bump. `restart` is guarded in
+BOTH forms: plain and `--wait`. The guard fires before any network
+activity: a refusal never touches the gateway. `project delete` is
+doubly guarded — besides the CLI refusal, the wire DELETE always
+carries the gateway's own `confirm=true` query param. Termination,
+restart, and project mutations are audit-logged server-side by the
+gateway. Non-destructive project mutations (`copy`, `rename`, `set`)
+create or relabel rather than destroy, so they carry no `--yes`.
