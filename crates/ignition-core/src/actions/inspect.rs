@@ -371,6 +371,12 @@ mod tests {
         async fn reset_logger_levels(&self) -> Result<(), CoreError> {
             unreachable!("not part of this double's actions")
         }
+        async fn restart(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn scan_projects(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     /// status merges all three sources under the documented keys —
@@ -519,6 +525,12 @@ mod tests {
         }
         async fn reset_logger_levels(&self) -> Result<(), CoreError> {
             unreachable!("not part of this double's actions")
+        }
+        async fn restart(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn scan_projects(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
         }
     }
 

@@ -36,6 +36,7 @@ pub mod connections;
 pub mod logs;
 pub mod metrics;
 pub mod query;
+pub mod restart;
 pub mod sessions;
 pub mod status;
 pub mod version;
@@ -150,6 +151,16 @@ pub trait GatewayApi: Send + Sync {
     /// POST `/data/api/v1/logs/levelreset` (authed, empty body) — reset
     /// all custom logger levels to defaults. Audit-logged server-side.
     async fn reset_logger_levels(&self) -> Result<(), CoreError>;
+    /// POST `/data/api/v1/restart-tasks/restart?confirm=true` (authed,
+    /// empty body, NO CSRF — token mutations need none) — the one big
+    /// red button. The gateway answers 200 with the literal body `true`
+    /// almost immediately; the ~40 s wait is poller-side (02-05's
+    /// `restart --wait` owns it). Audit-logged server-side.
+    async fn restart(&self) -> Result<(), CoreError>;
+    /// POST `/data/api/v1/scan/projects` (authed) — the harmless
+    /// project-rescan write probe (`ign doctor --check-write`; 2xx =
+    /// write permission, 403 = read-only token).
+    async fn scan_projects(&self) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -514,6 +525,37 @@ impl GatewayApi for ReqwestGatewayApi {
 
     async fn reset_logger_levels(&self) -> Result<(), CoreError> {
         self.post_empty(logs::LEVEL_RESET_PATH, &[], true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn restart(&self) -> Result<(), CoreError> {
+        // `confirm=true` rides the QUERY string against an empty body
+        // (the verified shape; recorded-request proof in
+        // tests/restart_wait_contract.rs). Token-auth POSTs need no
+        // CSRF (02-RESEARCH §Auth Model).
+        let response = self
+            .post_empty(
+                restart::RESTART_PATH,
+                &[("confirm", "true".to_string())],
+                true,
+            )
+            .await?;
+        // Success-shape drift guard: the verified body is the literal
+        // `true`. Any other 2xx body still means the POST was accepted
+        // — warn, don't fail (the wait half reports what happens next).
+        let body = response.text().await.unwrap_or_default();
+        if body.trim() != "true" {
+            tracing::warn!(
+                body = %body,
+                "restart POST answered an unexpected 2xx body (expected the literal `true`)"
+            );
+        }
+        Ok(())
+    }
+
+    async fn scan_projects(&self) -> Result<(), CoreError> {
+        self.post_empty(restart::SCAN_PROJECTS_PATH, &[], true)
             .await
             .map(|_| ())
     }

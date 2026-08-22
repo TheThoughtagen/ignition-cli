@@ -480,6 +480,12 @@ mod tests {
         async fn reset_logger_levels(&self) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
+        async fn restart(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn scan_projects(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     /// Two pages then silence under a short deadline: entries arrive in
@@ -655,6 +661,12 @@ mod tests {
                 unreachable!("not part of this action")
             }
             async fn reset_logger_levels(&self) -> Result<(), CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn restart(&self) -> Result<(), CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn scan_projects(&self) -> Result<(), CoreError> {
                 unreachable!("not part of this action")
             }
         }
