@@ -38,6 +38,7 @@ pub mod logs;
 pub mod metrics;
 pub mod projects;
 pub mod query;
+pub mod resources;
 pub mod restart;
 pub mod sessions;
 pub mod status;
@@ -51,6 +52,7 @@ use crate::client::projects::{
     ProjectRenameBody,
 };
 use crate::client::query::ListEnvelope;
+use crate::client::resources::{ResourceContent, ResourceEntry};
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
@@ -234,6 +236,42 @@ pub trait GatewayApi: Send + Sync {
         zip: Vec<u8>,
         overwrite: bool,
     ) -> Result<ImportOutcome, CoreError>;
+    /// GET `/data/api/v1/projects/{project}/resources` (authed) —
+    /// list a project's resources; the optional `path=<prefix>` QUERY
+    /// filter rides only when `Some` (mcp's `params={"path": …}`).
+    /// ⚠ MEDIUM-confidence family: ignition-mcp-derived, absent from
+    /// the official 83-api collection — the openapi-extract gate in
+    /// tests/e2e_projects.rs settles wire truth the moment a rig
+    /// token exists (03-03).
+    async fn project_resources(
+        &self,
+        project: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListEnvelope<ResourceEntry>, CoreError>;
+    /// GET `/data/api/v1/projects/{project}/resources/{resourcePath}`
+    /// (authed) — ONE resource as RAW bytes + content type (the
+    /// JSON/text/binary decision belongs to the actions layer,
+    /// Pitfall 7). Resource paths encode per segment, `/` kept.
+    async fn project_resource_get(
+        &self,
+        project: &str,
+        path: &str,
+    ) -> Result<ResourceContent, CoreError>;
+    /// PUT `/data/api/v1/projects/{project}/resources/{resourcePath}`
+    /// (authed, raw body + declared Content-Type) — UPSERT semantics
+    /// ("if the resource doesn't exist it will be created", mcp
+    /// docs). Audit-logged server-side.
+    async fn project_resource_put(
+        &self,
+        project: &str,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), CoreError>;
+    /// DELETE `/data/api/v1/projects/{project}/resources/
+    /// {resourcePath}` (authed) — the surgical loop's destructive
+    /// verb. Audit-logged server-side.
+    async fn project_resource_delete(&self, project: &str, path: &str) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -486,6 +524,30 @@ impl ReqwestGatewayApi {
     ) -> Result<(), CoreError> {
         let url = self.url_for(path);
         let request = self.apply_auth(self.client.put(url.clone()).json(body));
+        self.send_and_classify(request, &url).await.map(|_| ())
+    }
+
+    /// PUT `path` with RAW body bytes + a declared `Content-Type` →
+    /// classify → `Ok(())` — the raw-body flavor for 03-03 resource
+    /// puts, whose bytes AND media type are decided by the actions
+    /// layer's content sniffer (`application/json` or
+    /// `text/plain; charset=utf-8`; binary input is refused BEFORE
+    /// this helper ever sees it). A `Vec<u8>` body announces its
+    /// `Content-Length` up front (the import precedent). Token-auth
+    /// PUTs need NO CSRF (02-RESEARCH §Auth Model).
+    async fn put_bytes(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), CoreError> {
+        let url = self.url_for(path);
+        let request = self
+            .client
+            .put(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body);
+        let request = self.apply_auth(request);
         self.send_and_classify(request, &url).await.map(|_| ())
     }
 
@@ -855,6 +917,61 @@ impl GatewayApi for ReqwestGatewayApi {
             .filter(|value| value.is_object())
             .unwrap_or_else(|| serde_json::json!({"status": "success"}));
         Ok(ImportOutcome { response: parsed })
+    }
+
+    async fn project_resources(
+        &self,
+        project: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListEnvelope<ResourceEntry>, CoreError> {
+        // The `path` prefix filter rides the QUERY string — and ONLY
+        // when a prefix was given (mcp's params={"path": …}; no
+        // prefix = no param, the recorded-request pins both halves).
+        let pairs: Option<Vec<(String, String)>> =
+            prefix.map(|prefix| vec![("path".to_string(), prefix.to_string())]);
+        self.get_json(
+            &resources::resources_list_path(project),
+            pairs.as_deref(),
+            true,
+        )
+        .await
+    }
+
+    async fn project_resource_get(
+        &self,
+        project: &str,
+        path: &str,
+    ) -> Result<ResourceContent, CoreError> {
+        // The existing get_bytes pipeline returns bytes + disposition
+        // filename + content type; the filename is simply unused here
+        // (resources are addressed by path, not named by the server) —
+        // reuse, don't generalize.
+        let download = self
+            .get_bytes(
+                &resources::resource_path(project, path),
+                Duration::from_secs(30),
+            )
+            .await?;
+        Ok(ResourceContent {
+            bytes: download.bytes,
+            content_type: download.content_type,
+        })
+    }
+
+    async fn project_resource_put(
+        &self,
+        project: &str,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), CoreError> {
+        self.put_bytes(&resources::resource_path(project, path), body, content_type)
+            .await
+    }
+
+    async fn project_resource_delete(&self, project: &str, path: &str) -> Result<(), CoreError> {
+        self.delete_with_query(&resources::resource_path(project, path), &[])
+            .await
     }
 }
 
