@@ -77,12 +77,14 @@ Plans:
   2. User can export a project to file and import from file or stdin, with collision policy (abort/overwrite) honored and long imports surviving via per-operation timeouts (streamed ZIPs to disk)
   3. User can list, get, put, and delete individual resources within a project — the surgical edit loop (change one view/script without re-importing everything)
   4. Export/import JSON metadata states scope explicitly (`includes`/`excludes`) so users know tag providers are not part of a project export
-**Plans**: 3 plans (TBD)
+**Plans**: 3 plans (sequential waves 1→3 — every plan grows the single `impl GatewayApi` block in client/mod.rs plus the cli.rs/main.rs/render.rs choke files, so no parallelism is honest — the Phase 1/2 pattern)
+
+*Planner refinement:* research validated the sketch with two adjustments — scope metadata (`includes`/`excludes`) moved into 03-02 (it is export/import output, not a resource concern), and `project set` (PUT modify; `--parent` = the inheritance move) made explicit in 03-01 since the roadmap's "move" maps to native rename/reparent. Locked decisions honored throughout: frozen envelope + additive-only slugs (`project_exists`, `invalid_import_file`, `resource_binary`), guard→resolve→action destructive dispatch (project delete, import-overwrite, and resource delete all fire `require_confirmation` BEFORE resolution), classify()-only error mapping, two-column wire-faithful/unit-explicit naming, serde-only actions, every new trait method stubbed into all inline test doubles, and the wiremock `set_body_raw`/MockGuard footguns.
 
 Plans:
-- [ ] 03-01: project list/new/copy/rename/delete
-- [ ] 03-02: export/import — streaming ZIP, timeout policy, collision policies, stdin import
-- [ ] 03-03: resource ls/get/put/delete + scope metadata + first e2e harness skeleton
+- [ ] 03-01-PLAN.md — project CRUD: list (inheritance info) / new / copy / rename / set (reparent) / delete (`--yes` + `confirm=true` at both guard layers) + post_json/put_json pipeline helpers (PROJ-01/02)
+- [ ] 03-02-PLAN.md — export (streaming ZIP to disk via reqwest stream + tokio fs, 120 s timeout) / import (file/stdin buffered, 300 s, application/zip) + `--collision-policy abort|overwrite` + scope metadata (PROJ-03/04)
+- [ ] 03-03-PLAN.md — resource list/get/put/delete surgical loop (binary refusal, MEDIUM-family wiremock-first + live-capture gate) + assert_cmd #[ignore] e2e harness skeleton (PROJ-05)
 
 ### Phase 4: Rig Lifecycle & Trial State
 **Goal:** A user can run a complete Docker test rig from the CLI — up/down/status/reset with compose discovery, logs, trial state management, and snapshot/restore — giving the project (and CI) a self-managed gateway fixture.
