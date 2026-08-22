@@ -531,6 +531,21 @@ mod tests {
         async fn project_delete(&self, _name: &str) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
+        async fn project_export_to_file(
+            &self,
+            _name: &str,
+            _out: &std::path::Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_import(
+            &self,
+            _name: &str,
+            _zip: Vec<u8>,
+            _overwrite: bool,
+        ) -> Result<crate::client::projects::ImportOutcome, CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     /// Two pages then silence under a short deadline: entries arrive in
@@ -757,6 +772,21 @@ mod tests {
                 unreachable!("not part of this action")
             }
             async fn project_delete(&self, _name: &str) -> Result<(), CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn project_export_to_file(
+                &self,
+                _name: &str,
+                _out: &std::path::Path,
+            ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn project_import(
+                &self,
+                _name: &str,
+                _zip: Vec<u8>,
+                _overwrite: bool,
+            ) -> Result<crate::client::projects::ImportOutcome, CoreError> {
                 unreachable!("not part of this action")
             }
         }

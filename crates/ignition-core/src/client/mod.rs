@@ -29,6 +29,7 @@
 //! send (transport error → `Network`) → [`classify`] → parse the body.
 //! Nothing ever calls `.json()` on a response that skipped `classify()`.
 
+use std::path::Path;
 use std::time::Duration;
 
 mod classify;
@@ -46,7 +47,8 @@ use crate::client::connections::GatewayConnection;
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::projects::{
-    ProjectCopy, ProjectCreate, ProjectModify, ProjectRecord, ProjectRenameBody,
+    ExportMeta, ImportOutcome, ProjectCopy, ProjectCreate, ProjectModify, ProjectRecord,
+    ProjectRenameBody,
 };
 use crate::client::query::ListEnvelope;
 use crate::client::restart::SecurityProperties;
@@ -211,6 +213,27 @@ pub trait GatewayApi: Send + Sync {
     /// `--yes` and the wire's `confirm=true`). Audit-logged
     /// server-side.
     async fn project_delete(&self, name: &str) -> Result<(), CoreError>;
+    /// GET `/data/api/v1/projects/export/{name}` (authed, per-request
+    /// [`projects::PROJECT_EXPORT_TIMEOUT`] = 120 s) — the project ZIP
+    /// STREAMED to `out` chunk-by-chunk via `bytes_stream` (Pitfall 2:
+    /// NO `Vec<u8>` accumulation anywhere), with the disposition
+    /// filename + byte count in the meta. Audit-relevant only as a
+    /// read (exports never mutate).
+    async fn project_export_to_file(&self, name: &str, out: &Path)
+    -> Result<ExportMeta, CoreError>;
+    /// POST `/data/api/v1/projects/import/{name}?overwrite=<bool>`
+    /// (authed, per-request [`projects::PROJECT_IMPORT_TIMEOUT`] =
+    /// 300 s) — the ZIP as the RAW body with `Content-Type:
+    /// application/zip` and a known `Content-Length` (a `Vec<u8>`
+    /// sidesteps the chunked-encoding question entirely — Pitfall 3's
+    /// timeout is handled by the override). Synchronous, no job IDs
+    /// (verified). Audit-logged server-side.
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -333,6 +356,66 @@ impl ReqwestGatewayApi {
         Ok(LogDownload {
             bytes: bytes.to_vec(),
             filename,
+            content_type,
+        })
+    }
+
+    /// GET `path` → classify → STREAM the body to `out` chunk-by-chunk
+    /// — the file-download pipeline (03-02). The response body is
+    /// consumed HERE, at a pipeline site, classify-first like every
+    /// other: an error answer must classify (never stream), and on
+    /// success each `bytes_stream()` chunk goes straight through
+    /// `AsyncWriteExt::write_all` into a `tokio::fs::File` — NO
+    /// `Vec<u8>` accumulation anywhere (Pitfall 2: a multi-hundred-MB
+    /// export ZIP must not buffer in memory). The response metadata
+    /// (`Content-Disposition` filename, `Content-Type`) and the
+    /// chunk-counted byte total ride out in [`ExportMeta`]. Requires
+    /// the workspace `reqwest` `stream` + `tokio` `fs` features (the
+    /// research-flagged dep gap this plan closed).
+    async fn download_to_file(
+        &self,
+        path: &str,
+        out: &Path,
+        timeout: Duration,
+    ) -> Result<ExportMeta, CoreError> {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let url = self.url_for(path);
+        let request = self.apply_auth(self.client.get(url.clone()).timeout(timeout));
+        let response = self.send_and_classify(request, &url).await?;
+        let filename = response
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(logs::filename_from_content_disposition);
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        let mut file = tokio::fs::File::create(out).await.map_err(|err| {
+            CoreError::Internal(format!("cannot create {}: {err}", out.display()))
+        })?;
+        let mut stream = response.bytes_stream();
+        let mut bytes: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| CoreError::Network {
+                url: url.to_string(),
+                source: Some(err),
+            })?;
+            file.write_all(&chunk).await.map_err(|err| {
+                CoreError::Internal(format!("cannot write {}: {err}", out.display()))
+            })?;
+            bytes += chunk.len() as u64;
+        }
+        file.flush()
+            .await
+            .map_err(|err| CoreError::Internal(format!("cannot flush {}: {err}", out.display())))?;
+        Ok(ExportMeta {
+            filename,
+            bytes,
             content_type,
         })
     }
@@ -723,6 +806,55 @@ impl GatewayApi for ReqwestGatewayApi {
             &[("confirm", "true".to_string())],
         )
         .await
+    }
+
+    async fn project_export_to_file(
+        &self,
+        name: &str,
+        out: &Path,
+    ) -> Result<ExportMeta, CoreError> {
+        // The 120 s per-request override rides the RequestBuilder (the
+        // logs-download precedent); the streaming itself lives in
+        // download_to_file (classify FIRST, then chunk loop).
+        self.download_to_file(
+            &projects::project_export_path(name),
+            out,
+            projects::PROJECT_EXPORT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn project_import(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<ImportOutcome, CoreError> {
+        // `overwrite` rides the QUERY string; the ZIP is the RAW body
+        // with Content-Type application/zip and a known Content-Length
+        // (Vec<u8> — chunked encoding never enters the picture). The
+        // 300 s per-request override owns Pitfall 3. Token-auth POSTs
+        // need no CSRF (02-RESEARCH §Auth Model).
+        let url = self.url_for(&projects::project_import_path(name));
+        let request = self
+            .client
+            .post(url.clone())
+            .timeout(projects::PROJECT_IMPORT_TIMEOUT)
+            .query(&[("overwrite", if overwrite { "true" } else { "false" })])
+            .header(reqwest::header::CONTENT_TYPE, "application/zip")
+            .body(zip);
+        let request = self.apply_auth(request);
+        let response = self.send_and_classify(request, &url).await?;
+        // Opaque-success: parse the body when it is a JSON OBJECT,
+        // else the fallback object (the body is unverified MEDIUM —
+        // restart's `literal true` is the same family and normalizes
+        // the same way, so agents always see a stable object shape).
+        let body = response.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(body.trim())
+            .ok()
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({"status": "success"}));
+        Ok(ImportOutcome { response: parsed })
     }
 }
 

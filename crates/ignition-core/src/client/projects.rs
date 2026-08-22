@@ -27,6 +27,7 @@
 //! separators.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,28 @@ pub(crate) fn project_modify_path(name: &str) -> String {
 pub(crate) fn project_delete_path(name: &str) -> String {
     format!("/data/api/v1/projects/{}", encode_segment(name))
 }
+
+/// GET path — export (`/export/{enc}`) — the ZIP body streams back
+/// with a `Content-Disposition` filename.
+pub(crate) fn project_export_path(name: &str) -> String {
+    format!("/data/api/v1/projects/export/{}", encode_segment(name))
+}
+
+/// POST path — import (`/import/{enc}` + `overwrite=<bool>` QUERY
+/// param; body = the raw ZIP bytes).
+pub(crate) fn project_import_path(name: &str) -> String {
+    format!("/data/api/v1/projects/import/{}", encode_segment(name))
+}
+
+/// Per-request export timeout (Pitfall 3): 120 s, the logs-download
+/// precedent — `RequestBuilder::timeout`, never a second client and
+/// never a global change.
+pub const PROJECT_EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Per-request import timeout (Pitfall 3, the classic default-timeout
+/// death): imports are heavy and synchronous (no job IDs — verified),
+/// so the upload rides a 300 s budget.
+pub const PROJECT_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Percent-encode ONE path segment with the NON_ALPHANUMERIC set:
 /// everything outside `[A-Za-z0-9]` is encoded — over-encoding is SAFE
@@ -193,6 +216,33 @@ pub struct ProjectCopy {
 pub struct ProjectRenameBody {
     /// The new name.
     pub name: String,
+}
+
+/// The export download result — the ZIP was STREAMED to disk (never
+/// buffered in a `Vec<u8>`, Pitfall 2) and this is what the response
+/// metadata said about it. Not serialized into envelopes (the file is
+/// the artifact; the command output model lives in the actions layer).
+#[derive(Debug, Clone)]
+pub struct ExportMeta {
+    /// Filename from `Content-Disposition`, when the header carries one
+    /// (the actions layer sanitizes it into the default output name;
+    /// `None` falls back to `<name>.zip`).
+    pub filename: Option<String>,
+    /// Bytes written to disk (counted chunk-by-chunk as they streamed).
+    pub bytes: u64,
+    /// Response `Content-Type` — sniffed, never assumed.
+    pub content_type: Option<String>,
+}
+
+/// The import result — OPAQUE-SUCCESS (the response body is
+/// unverified MEDIUM; the mcp pattern parses JSON when it can and
+/// falls back to `{"status":"success"}` otherwise — restart's literal
+/// `true` is the same family style).
+#[derive(Debug, Clone)]
+pub struct ImportOutcome {
+    /// The parsed response body when JSON, else the fallback success
+    /// object.
+    pub response: serde_json::Value,
 }
 
 #[cfg(test)]

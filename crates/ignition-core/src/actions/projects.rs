@@ -274,12 +274,33 @@ mod tests {
 
     /// A recording double: serves one record per find (create/copy/
     /// rename/set read-backs), remembers every create/modify body and
-    /// every deleted name.
+    /// every deleted name. 03-02 grows it into the export/import
+    /// double: find honors an `absent` switch (the collision
+    /// pre-check's both answers), export writes a fixture ZIP, import
+    /// records (name, bytes, overwrite) — the Task-2 action proofs key
+    /// off those recordings.
     #[derive(Default)]
     struct ProjectsRig {
         creates: Mutex<Vec<ProjectCreate>>,
         modifies: Mutex<Vec<(String, ProjectModify)>>,
         deletes: Mutex<Vec<String>>,
+        finds: Mutex<Vec<String>>,
+        exports: Mutex<Vec<String>>,
+        imports: Mutex<Vec<(String, usize, bool)>>,
+        /// Whether `find` answers 404-NotFound instead of Ok — the
+        /// collision pre-check's two outcomes (default: the project
+        /// exists, preserving the create/copy/rename/set read-backs).
+        absent: bool,
+    }
+
+    impl ProjectsRig {
+        /// A minimal valid-looking ZIP fixture (real magic bytes — the
+        /// action's import guard checks them).
+        fn zip_fixture() -> Vec<u8> {
+            let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
+            bytes.extend_from_slice(b"project-export-fixture");
+            bytes
+        }
     }
 
     fn record(name: &str) -> ProjectRecord {
@@ -425,8 +446,13 @@ mod tests {
         ) -> Result<ListEnvelope<ProjectRecord>, CoreError> {
             Ok(page(vec![record("PlantFloor"), record("Base")]))
         }
-        async fn project_find(&self, _name: &str) -> Result<ProjectRecord, CoreError> {
-            Ok(record("whatever-the-rig-is-asked-for"))
+        async fn project_find(&self, name: &str) -> Result<ProjectRecord, CoreError> {
+            self.finds.lock().unwrap().push(name.into());
+            if self.absent {
+                Err(CoreError::NotFound { endpoint: None })
+            } else {
+                Ok(record("whatever-the-rig-is-asked-for"))
+            }
         }
         async fn project_create(&self, body: &ProjectCreate) -> Result<(), CoreError> {
             self.creates.lock().unwrap().push(body.clone());
@@ -448,6 +474,35 @@ mod tests {
         async fn project_delete(&self, name: &str) -> Result<(), CoreError> {
             self.deletes.lock().unwrap().push(name.into());
             Ok(())
+        }
+        async fn project_export_to_file(
+            &self,
+            name: &str,
+            out: &std::path::Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            self.exports.lock().unwrap().push(name.into());
+            let fixture = Self::zip_fixture();
+            std::fs::write(out, &fixture)
+                .map_err(|err| CoreError::Internal(format!("rig export write: {err}")))?;
+            Ok(crate::client::projects::ExportMeta {
+                filename: Some("rig-export.zip".into()),
+                bytes: fixture.len() as u64,
+                content_type: Some("application/zip".into()),
+            })
+        }
+        async fn project_import(
+            &self,
+            name: &str,
+            zip: Vec<u8>,
+            overwrite: bool,
+        ) -> Result<crate::client::projects::ImportOutcome, CoreError> {
+            self.imports
+                .lock()
+                .unwrap()
+                .push((name.into(), zip.len(), overwrite));
+            Ok(crate::client::projects::ImportOutcome {
+                response: serde_json::json!({"status": "success"}),
+            })
         }
     }
 

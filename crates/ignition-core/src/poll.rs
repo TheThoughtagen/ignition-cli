@@ -215,7 +215,12 @@ mod tests {
         PollConfig {
             subject: "test wait".into(),
             interval: Duration::from_millis(1),
-            deadline: Duration::from_millis(500),
+            // Generous on purpose: the Network/Restarting steps build
+            // REAL transport errors (a TCP connect to a refused port),
+            // which can take tens of ms each under parallel test load —
+            // 500 ms flaked there. The fast path this config drives is
+            // the sleep/backoff, not the deadline.
+            deadline: Duration::from_millis(5_000),
             ..PollConfig::default()
         }
     }

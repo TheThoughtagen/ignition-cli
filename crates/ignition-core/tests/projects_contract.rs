@@ -15,6 +15,14 @@
 //! - the modify PUT body carries NO `name` key;
 //! - the DELETE carries `confirm=true` as a QUERY param with an EMPTY
 //!   body (Pitfall 8 — the server's own guard rides the query string).
+//!
+//! 03-02 appends the export/import half (PROJ-03/04):
+//! - export STREAMS the ZIP body byte-for-byte to disk with the
+//!   `Content-Disposition` filename + byte count in the meta
+//!   (`set_body_raw` — the set_body_string-forces-text/plain gotcha);
+//! - import's recorded request proves the exact encoded path, the
+//!   `overwrite=true`/`false` QUERY variants, the
+//!   `Content-Type: application/zip` header, and the body bytes.
 
 mod common;
 
@@ -414,6 +422,160 @@ async fn project_create_html_401_classifies_auth() {
             tag_provider: None,
             user_source: None,
         })
+        .await
+        .expect_err("401 must fail");
+    assert!(
+        matches!(&err, CoreError::Auth { status: 401, .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+}
+
+/// A deterministic ZIP fixture — real `PK\x03\x04` magic + a payload
+/// (a real export is binary; `set_body_raw` keeps it bytes — the
+/// set_body_string-forces-text/plain gotcha).
+fn zip_fixture() -> Vec<u8> {
+    let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
+    bytes.extend_from_slice(b"project-export-fixture");
+    bytes
+}
+
+/// THE streaming pin: the export ZIP lands on disk BYTE-FOR-BYTE
+/// (no buffering, no transformation) with the disposition filename +
+/// chunk-counted byte total in the meta — against the exact
+/// percent-encoded export path.
+#[tokio::test]
+async fn project_export_streams_fixture_byte_for_byte() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/My%20Proj",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(zip_fixture(), "application/zip")
+                .insert_header("Content-Disposition", "attachment; filename=\"MyProj.zip\""),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("download.zip");
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let meta = api
+        .project_export_to_file("My Proj", &out)
+        .await
+        .expect("export streams and classifies Ok");
+
+    let fixture = zip_fixture();
+    let on_disk = std::fs::read(&out).expect("file written");
+    assert_eq!(on_disk, fixture, "byte-for-byte, exactly as received");
+    assert_eq!(meta.bytes, fixture.len() as u64, "meta counts the chunks");
+    assert_eq!(meta.filename.as_deref(), Some("MyProj.zip"));
+    assert_eq!(meta.content_type.as_deref(), Some("application/zip"));
+
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.path(),
+        "/data/api/v1/projects/export/My%20Proj",
+        "the spaced name rode the wire percent-encoded"
+    );
+}
+
+/// THE import recorded-request pin: exact encoded path,
+/// `overwrite=true` AND `overwrite=false` QUERY variants, the
+/// `Content-Type: application/zip` header, and the body bytes — the
+/// known-Content-Length raw upload.
+#[tokio::test]
+async fn project_import_records_path_query_headers_and_body() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/My%20Proj",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status": "imported"})),
+        )
+        .expect(2)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    for overwrite in [true, false] {
+        let outcome = api
+            .project_import("My Proj", zip_fixture(), overwrite)
+            .await
+            .expect("import classifies Ok");
+        assert_eq!(
+            outcome.response,
+            serde_json::json!({"status": "imported"}),
+            "a JSON body parses through"
+        );
+    }
+
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 2, "one POST per overwrite variant");
+    let fixture = zip_fixture();
+    for (index, overwrite) in [true, false].into_iter().enumerate() {
+        let request = &requests[index];
+        assert_eq!(request.url.path(), "/data/api/v1/projects/import/My%20Proj");
+        let query = request.url.query().expect("query present");
+        assert_eq!(
+            query,
+            format!("overwrite={}", if overwrite { "true" } else { "false" }),
+            "the collision policy rides the QUERY string: {query}"
+        );
+        let content_type = request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .expect("content-type present");
+        assert_eq!(content_type, "application/zip");
+        assert_eq!(
+            request.body, fixture,
+            "the raw ZIP bytes are the body (known Content-Length)"
+        );
+        assert!(
+            request
+                .headers
+                .get("content-length")
+                .is_some_and(|value| value == &fixture.len().to_string()),
+            "Content-Length announces the full body up front"
+        );
+    }
+}
+
+/// The opaque-success fallback: a NON-JSON 2xx body (the restart
+/// `literal true` family) parses into `{"status":"success"}` instead
+/// of erroring.
+#[tokio::test]
+async fn project_import_non_json_body_falls_back_to_success() {
+    let mock = IgnitionMock::start().await;
+    mock.literal_true("POST", "/data/api/v1/projects/import/x")
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let outcome = api
+        .project_import("x", zip_fixture(), false)
+        .await
+        .expect("a literal-true body is still a success");
+    assert_eq!(outcome.response, serde_json::json!({"status": "success"}));
+}
+
+/// 401 Jetty HTML on the import POST → `Auth` (exit 5) — classify
+/// runs BEFORE any body consumption, streaming or otherwise.
+#[tokio::test]
+async fn project_import_html_401_classifies_auth() {
+    let mock = IgnitionMock::start().await;
+    mock.html_error("POST", "/data/api/v1/projects/import/x", 401)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let err = api
+        .project_import("x", zip_fixture(), false)
         .await
         .expect_err("401 must fail");
     assert!(
