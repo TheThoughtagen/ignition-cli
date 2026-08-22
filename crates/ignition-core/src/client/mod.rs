@@ -487,11 +487,8 @@ impl GatewayApi for ReqwestGatewayApi {
         // Per-request timeout override: the 30 s client default would
         // truncate large archives (per-class timeout WITHOUT a second
         // client — RequestBuilder::timeout, 02-RESEARCH §Architecture).
-        self.get_bytes(
-            logs::LOGS_DOWNLOAD_PATH,
-            Duration::from_secs(logs::LOGS_DOWNLOAD_TIMEOUT_SECS),
-        )
-        .await
+        self.get_bytes(logs::LOGS_DOWNLOAD_PATH, Duration::from_secs(120))
+            .await
     }
 
     async fn loggers(

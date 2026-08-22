@@ -47,11 +47,6 @@ pub(crate) fn logger_set_path(logger: &str) -> String {
 /// agents and terminals alike.
 pub const DEFAULT_LOG_LIMIT: i64 = 200;
 
-/// The per-request download timeout in seconds — a large archive must
-/// not be truncated by the 30s client default (per-class timeout via
-/// `RequestBuilder::timeout`, not a second client).
-pub const LOGS_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
-
 /// One item of `GET /data/api/v1/logs` — the shape of the live capture
 /// (camelCase keys, serde-renamed). `timestamp` is epoch **MILLISECONDS**
 /// and doubles as the tail cursor.
