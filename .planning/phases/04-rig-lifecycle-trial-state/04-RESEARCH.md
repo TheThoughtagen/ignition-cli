@@ -103,8 +103,10 @@ RigPlan {
 1. `--rig <name>` flag → look up `[rigs.<name>]` in config
 2. `IGNITION_RIG` env → same lookup
 3. cwd compose: `./docker/compose.yml`, `./docker/docker-compose.yml`, `./compose.yml`, `./compose.yaml`, `./docker-compose.yml`
-4. `~/Documents/whiskeyhouse/ignition-git-module/docker/` (docker-compose.yml; also docker-compose-automated.yml + test-rig/ subdir at ports 9188/9143)
-5. WHK-Global conventions → **live successor is `~/Documents/whiskeyhouse/whk-environment-orchestration/docker-compose.yml`** (service `ignition`, ports 9088/9043/62541, `restart: unless-stopped`, named vols `gw-data` + `gw-tag-definition`, file-based `ignition-api-token` secret)
+4. `ignition-git-module/docker/` (docker-compose.yml; also docker-compose-automated.yml + test-rig/ subdir at ports 9188/9143)
+5. WHK-Global conventions → **live successor is `whk-environment-orchestration/docker-compose.yml`** (service `ignition`, ports 9088/9043/62541, `restart: unless-stopped`, named vols `gw-data` + `gw-tag-definition`, file-based `ignition-api-token` secret)
+
+**Path-correction (plan-checker, 2026-08-22):** this machine's live copy of whk-environment-orchestration sits at `~/whiskeyhouse/whk-environment-orchestration/` — NOT under `~/Documents/whiskeyhouse/` as first recorded (both home roots exist; layouts differ per machine). Implementation MUST probe both roots (`~/Documents/whiskeyhouse/` first, then `~/whiskeyhouse/`) for BOTH level-4 and level-5 convention repos — never hard-code one root.
 
 Config surface (discretion — prescriptive):
 ```toml
