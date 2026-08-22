@@ -8,6 +8,8 @@
 //! - Flags-only, zero interactive prompts — ever (research anti-pattern:
 //!   "Prompting ever").
 
+use std::path::PathBuf;
+
 use clap::{ArgAction, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -83,6 +85,9 @@ pub enum Commands {
         r#type: Option<ConnectionType>,
     },
 
+    /// Query, tail, and download gateway logs; manage logger levels
+    Logs(LogsArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -128,6 +133,117 @@ pub enum SessionsCmd {
         #[arg(long)]
         message: Option<String>,
     },
+}
+
+/// Logs args: the query filters ride the TOP level so bare
+/// `ign logs [-f]` lists/tails (must-have truth #1) while `download`
+/// and the `loggers` subtree hang off the optional subcommand — the
+/// SessionsArgs precedent.
+#[derive(Debug, clap::Args)]
+pub struct LogsArgs {
+    /// Only entries from this logger (name prefix)
+    #[arg(long, value_name = "NAME")]
+    pub logger: Option<String>,
+    /// Minimum level to include (server-side filter)
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    pub min_level: Option<LogLevel>,
+    /// Start from an absolute EPOCH-MS or a relative span (500ms, 30s,
+    /// 5min, 2h) — parsed to epoch-ms at arg-parse time
+    #[arg(
+        long,
+        value_name = "EPOCH_MS|Nms|Ns|Nmin|Nh",
+        value_parser = parse_since_arg
+    )]
+    pub since: Option<i64>,
+    /// Max entries — the server default is UNLIMITED, never used here
+    #[arg(long, default_value_t = 200)]
+    pub limit: i64,
+    /// Follow: stream new entries as they occur (poll-based)
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+    /// Poll interval in seconds (follow mode)
+    #[arg(long, default_value_t = 2, value_name = "SECS")]
+    pub interval: u64,
+    /// Stop after this many seconds (follow mode; default: until Ctrl-C)
+    #[arg(long, value_name = "SECS")]
+    pub timeout: Option<u64>,
+    #[command(subcommand)]
+    pub command: Option<LogsCmd>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LogsCmd {
+    /// Download the log archive — a SQLite .idb, never a zip
+    Download {
+        /// Output file (default: the gateway's Content-Disposition
+        /// name, else <profile>-logs-<ts>.idb)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// List loggers / manage logger levels
+    Loggers(LoggersArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LoggersArgs {
+    /// Substring search over logger names
+    #[arg(long, value_name = "TEXT")]
+    pub search: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<LoggersCmd>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoggersCmd {
+    /// Set one logger's level — a mutation, refused without --yes
+    Set {
+        /// Logger name (see `ign logs loggers`)
+        name: String,
+        /// Level to set
+        #[arg(value_enum)]
+        level: LogLevel,
+    },
+    /// Reset ALL logger levels to defaults — refused without --yes
+    Reset,
+}
+
+/// The seven spec-documented log levels (TRACE..OFF), value-enum form
+/// for clap; [`LogLevel::wire`] yields the uppercase wire token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+    Off,
+}
+
+impl LogLevel {
+    /// The uppercase wire token the gateway expects.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+            Self::Fatal => "FATAL",
+            Self::Off => "OFF",
+        }
+    }
+}
+
+/// clap value parser delegating to the core `--since` grammar against
+/// the current time (a relative span resolves at parse time) — invalid
+/// specs are clap usage errors (exit 2) like any bad flag value.
+fn parse_since_arg(spec: &str) -> Result<i64, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_millis() as i64;
+    ignition_core::actions::logs::parse_since(spec, now_ms)
 }
 
 /// CLI value-enum mirrors of the core action enums (ignition-core stays

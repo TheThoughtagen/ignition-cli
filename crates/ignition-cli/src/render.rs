@@ -16,7 +16,12 @@
 
 use ignition_core::actions::connections::ConnectionsResult;
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
+use ignition_core::actions::logs::{
+    DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
+};
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
+use ignition_core::client::logs::LogEntry;
+use ignition_core::client::query::ListEnvelope;
 use ignition_core::error::CoreError;
 use ignition_core::output::render_failure;
 
@@ -59,6 +64,12 @@ pub fn render_ok(out: &ActionOutput, profile: Option<&str>, mode: RenderMode) {
     // must stay clean for sourcing.
     if let ActionOutput::Completions { shell } = out {
         print!("{}", crate::completions::completions(*shell));
+        return;
+    }
+    // The SECOND sanctioned stdout exception: a completed tail already
+    // streamed every entry to stdout as it arrived (human lines or
+    // NDJSON — README §Streaming); there is nothing left to render.
+    if matches!(out, ActionOutput::LogsTail(_)) {
         return;
     }
     match mode {
@@ -116,6 +127,14 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Sessions(result) => render_sessions_human(result),
         ActionOutput::SessionsTerminate(result) => render_terminate_human(result),
         ActionOutput::Connections(result) => render_connections_human(result),
+        ActionOutput::LogsList(result) => render_logs_list_human(result),
+        // Unreachable: render_ok intercepts LogsTail before mode
+        // dispatch (the streaming exception — entries already printed).
+        ActionOutput::LogsTail(result) => render_tail_human(result),
+        ActionOutput::LogsDownload(result) => render_download_human(result),
+        ActionOutput::LoggersList(result) => render_loggers_human(result),
+        ActionOutput::LoggerSet(result) => render_set_level_human(result),
+        ActionOutput::LoggerReset(result) => render_reset_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -329,6 +348,101 @@ fn render_connections_human(result: &ConnectionsResult) {
     }
 }
 
+/// One log entry as a human line — the SAME format the list and the
+/// live tail print: `ISO-UTC  LEVEL  logger  message`. Timestamps are
+/// UTC (rendered from epoch ms; the raw epoch-ms value is always in
+/// --json) — no timezone machinery, deterministic everywhere.
+pub fn render_log_entry_line(entry: &LogEntry) -> String {
+    format!(
+        "{}  {:>5}  {}  {}",
+        iso_utc(entry.timestamp),
+        entry.level,
+        entry.logger_name,
+        entry.message
+    )
+}
+
+/// `ign logs` human lines: one row per entry, newest first (the query
+/// sorts desc); the total from metadata grounds the limit note.
+fn render_logs_list_human(result: &LogPage) {
+    for entry in &result.items {
+        println!("{}", render_log_entry_line(entry));
+    }
+    if result.items.is_empty() {
+        println!("(no matching log entries)");
+    }
+}
+
+/// Unreachable-in-practice tail summary (render_ok intercepts the
+/// streaming output; kept for match totality and future reuse).
+fn render_tail_human(result: &TailResult) {
+    println!("({} entries streamed)", result.streamed);
+}
+
+/// `ign logs download` human line.
+fn render_download_human(result: &DownloadResult) {
+    println!("wrote {} ({} bytes)", result.file, result.bytes);
+}
+
+/// `ign logs loggers` human rows: `name  level  context`.
+fn render_loggers_human(result: &ListEnvelope<ignition_core::client::logs::LoggerInfo>) {
+    for logger in &result.items {
+        let level = logger.level.as_deref().unwrap_or("-");
+        let context = if logger.context.is_null() {
+            "-".to_string()
+        } else {
+            serde_json::to_string(&logger.context).unwrap_or_default()
+        };
+        println!("{}  {}  {}", logger.name, level, context);
+    }
+    if result.items.is_empty() {
+        println!("(no matching loggers)");
+    }
+}
+
+/// `ign logs loggers set` human line.
+fn render_set_level_human(result: &SetLevelResult) {
+    println!("set logger {} to {}", result.logger, result.level);
+}
+
+/// `ign logs loggers reset` human line.
+fn render_reset_human(result: &ResetResult) {
+    if result.reset {
+        println!("reset all logger levels to defaults");
+    }
+}
+
+/// Epoch milliseconds → an ISO-8601 UTC string
+/// (`2026-08-22T03:07:40.123Z`), zero timezone machinery: the
+/// civil-from-days algorithm (Howard Hinnant) over the well-known
+/// shift; deterministic across machines.
+fn iso_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Days since 1970-01-01 → (year, month, day) — Howard Hinnant's
+/// `civil_from_days`, the standard compact conversion.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // year of era
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index [0, 11] from March
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // day of month [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // month [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Milliseconds → compact human duration with the two most significant
 /// non-zero units ("3d 4h", "1h 56m", "5m 38s", "12s"); "0s" when empty.
 fn humanize_duration_ms(ms: i64) -> String {
@@ -364,5 +478,32 @@ fn human_bytes(bytes: i64) -> String {
         format!("{value:.0}{}", UNITS[unit])
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{civil_from_days, iso_utc};
+
+    /// Known instants: the epoch, a recent date, a pre-epoch value
+    /// (negative ms must still render, via euclidean division), and
+    /// leap-day handling.
+    #[test]
+    fn iso_utc_known_instants() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_utc(1_787_346_747_022), "2026-08-21T21:12:27.022Z");
+        assert_eq!(iso_utc(1_709_164_800_000), "2024-02-29T00:00:00.000Z");
+        assert_eq!(iso_utc(-1), "1969-12-31T23:59:59.999Z");
+        assert_eq!(iso_utc(951_782_400_000), "2000-02-29T00:00:00.000Z");
+    }
+
+    /// The epoch and a handful of dates round-trip through the civil
+    /// conversion.
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 }

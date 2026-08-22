@@ -29,8 +29,11 @@ use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::config::{self, AuthRef, Config, Credential, SecretStore};
 use ignition_core::error::CoreError;
 
-use crate::cli::{Cli, Commands, ProfileArgs, ProfileCmd, SessionsArgs, SessionsCmd};
-use crate::render::{RenderMode, render_error, render_ok};
+use crate::cli::{
+    Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, SessionsArgs,
+    SessionsCmd,
+};
+use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
 /// What a dispatched subcommand produced. One variant per command; grows in
 /// later plans. The payload serializes as the envelope's `data` (see
@@ -51,6 +54,20 @@ enum ActionOutput {
     SessionsTerminate(actions::sessions::TerminateResult),
     /// `ign connections` — DB/OPC connection status.
     Connections(actions::connections::ConnectionsResult),
+    /// `ign logs` — the queried page (newest first).
+    LogsList(actions::logs::LogPage),
+    /// `ign logs -f` — the tail ALREADY streamed to stdout line-by-line
+    /// (human) or as NDJSON (the second sanctioned stdout exception,
+    /// README-documented); render prints nothing further.
+    LogsTail(actions::logs::TailResult),
+    /// `ign logs download` — archive written, path + byte count.
+    LogsDownload(actions::logs::DownloadResult),
+    /// `ign logs loggers` — the logger registry.
+    LoggersList(actions::logs::LoggersEnvelope),
+    /// `ign logs loggers set` — one logger level changed.
+    LoggerSet(actions::logs::SetLevelResult),
+    /// `ign logs loggers reset` — all custom levels reset.
+    LoggerReset(actions::logs::ResetResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -81,6 +98,14 @@ impl ActionOutput {
             ActionOutput::Sessions(result) => render_success(profile, result, compact),
             ActionOutput::SessionsTerminate(result) => render_success(profile, result, compact),
             ActionOutput::Connections(result) => render_success(profile, result, compact),
+            ActionOutput::LogsList(result) => render_success(profile, result, compact),
+            // Unreachable in practice (render_ok intercepts LogsTail
+            // before mode dispatch — the entries already streamed).
+            ActionOutput::LogsTail(result) => render_success(profile, result, compact),
+            ActionOutput::LogsDownload(result) => render_success(profile, result, compact),
+            ActionOutput::LoggersList(result) => render_success(profile, result, compact),
+            ActionOutput::LoggerSet(result) => render_success(profile, result, compact),
+            ActionOutput::LoggerReset(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -109,7 +134,7 @@ fn main() -> ExitCode {
         .expect("failed to build async runtime");
     // dispatch resolves the profile context and returns it alongside the
     // result so BOTH the success and the error envelope echo it (CORE-01).
-    let (profile, result) = runtime.block_on(dispatch(cli));
+    let (profile, result) = runtime.block_on(dispatch(cli, mode));
     match result {
         Ok(out) => {
             render_ok(&out, profile.as_deref(), mode);
@@ -133,7 +158,7 @@ fn main() -> ExitCode {
 /// profile first. `version` and `profile list` tolerate no-selection (fresh
 /// install, exit 0, envelope `profile: null`); an unknown name is
 /// `profile_not_found` (exit 3) everywhere.
-async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>) {
+async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionOutput, CoreError>) {
     // Completions never touch config — shells source them at install
     // time, and a broken config.toml must not break `completions`.
     if let Commands::Completions { shell } = cli.command {
@@ -248,6 +273,129 @@ async fn dispatch(cli: Cli) -> (Option<String>, Result<ActionOutput, CoreError>)
             };
             (name, result)
         }
+        // Logs (02-04, HLTH-03/04). The list/tail arm STREAMS: tail
+        // entries print to stdout as they arrive — human lines or
+        // NDJSON, one compact entry per line with NO envelope (the
+        // streaming exception, README-documented; render_ok prints
+        // nothing further for LogsTail). The set/reset mutations are
+        // --yes-guarded BEFORE any API construction (the sessions
+        // terminate precedent: a refusal costs nothing).
+        Commands::Logs(LogsArgs {
+            logger,
+            min_level,
+            since,
+            limit,
+            follow,
+            interval,
+            timeout,
+            command,
+        }) => match command {
+            None => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) if follow => {
+                        let min_level = min_level.map(LogLevel::wire);
+                        let header = name.clone();
+                        let mut first = true;
+                        let sink: &mut dyn FnMut(&ignition_core::client::logs::LogEntry) =
+                            &mut |entry| match mode {
+                                RenderMode::Human => {
+                                    if first {
+                                        if let Some(name) = &header {
+                                            println!("[profile: {name}]");
+                                        }
+                                        first = false;
+                                    }
+                                    println!("{}", render_log_entry_line(entry));
+                                }
+                                // NDJSON — the streaming exception: one
+                                // compact entry object per line, no
+                                // envelope (README §Streaming).
+                                RenderMode::PrettyJson | RenderMode::CompactJson => {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string(entry)
+                                            .expect("a log entry serializes")
+                                    );
+                                }
+                            };
+                        actions::logs::tail(
+                            &api,
+                            logger.as_deref(),
+                            min_level,
+                            since,
+                            std::time::Duration::from_secs(interval),
+                            timeout.map(std::time::Duration::from_secs),
+                            sink,
+                        )
+                        .await
+                        .map(ActionOutput::LogsTail)
+                    }
+                    Ok(api) => {
+                        let min_level = min_level.map(LogLevel::wire);
+                        actions::logs::list_logs(&api, logger.as_deref(), min_level, since, limit)
+                            .await
+                            .map(ActionOutput::LogsList)
+                    }
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            Some(LogsCmd::Download { output }) => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => {
+                        let stem = name.as_deref().unwrap_or("gateway");
+                        actions::logs::download(&api, output.as_deref(), stem)
+                            .await
+                            .map(ActionOutput::LogsDownload)
+                    }
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            Some(LogsCmd::Loggers(loggers_args)) => match loggers_args.command {
+                None => {
+                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => actions::logs::loggers(&api, loggers_args.search.as_deref())
+                            .await
+                            .map(ActionOutput::LoggersList),
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                Some(LoggersCmd::Set {
+                    name: logger,
+                    level,
+                }) => {
+                    if let Err(err) = require_confirmation(cli.yes, "logs loggers set") {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => actions::logs::set_logger_level(&api, &logger, level.wire())
+                            .await
+                            .map(ActionOutput::LoggerSet),
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                Some(LoggersCmd::Reset) => {
+                    if let Err(err) = require_confirmation(cli.yes, "logs loggers reset") {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => actions::logs::reset_logger_levels(&api)
+                            .await
+                            .map(ActionOutput::LoggerReset),
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+            },
+        },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {

@@ -20,14 +20,180 @@
 //! entries already streamed through the sink).
 
 use std::cell::Cell;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
+// Public re-export: the list action's return type is the wire-faithful
+// page — callers (and ActionOutput) name it via the action module.
 use crate::client::GatewayApi;
-use crate::client::logs::{LogEntry, LogQuery};
+pub use crate::client::logs::LogPage;
+use crate::client::query::ListEnvelope;
 use crate::error::CoreError;
 use crate::poll::{self, PollConfig, PollState};
+
+/// `ign logs download` output model.
+#[derive(Debug, Serialize)]
+pub struct DownloadResult {
+    /// Path of the file written.
+    pub file: String,
+    /// Bytes written.
+    pub bytes: usize,
+    /// Response content type (`application/x-sqlite3` — verified).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+/// `ign logs loggers set` output model.
+#[derive(Debug, Serialize)]
+pub struct SetLevelResult {
+    /// The logger that was changed.
+    pub logger: String,
+    /// The level it now carries (uppercase wire form).
+    pub level: String,
+}
+
+/// `ign logs loggers reset` output model.
+#[derive(Debug, Serialize)]
+pub struct ResetResult {
+    /// Always `true` — the reset reset every custom level.
+    pub reset: bool,
+}
+
+/// The logger registry page (`ign logs loggers`).
+pub type LoggersEnvelope = ListEnvelope<LoggerInfo>;
+
+/// `ign logs` (no `--follow`): newest entries first. The query always
+/// sorts `desc(timestamp)` and carries an explicit `limit` — together
+/// they make "the recent log entries" (must-have truth #1) without a
+/// `--since` window guess: `--limit 200` = the NEWEST 200, not the
+/// oldest.
+pub async fn list_logs(
+    api: &dyn GatewayApi,
+    logger: Option<&str>,
+    min_level: Option<&str>,
+    since_ms: Option<i64>,
+    limit: i64,
+) -> Result<LogPage, CoreError> {
+    let query = LogQuery {
+        start_time: since_ms,
+        logger: logger.map(str::to_string),
+        min_level: min_level.map(str::to_string),
+        limit,
+        sort_by: Some("desc(timestamp)".to_string()),
+        ..LogQuery::default()
+    };
+    api.logs(&query).await
+}
+
+/// `ign logs loggers`: the logger registry, explicit `limit` (must-have
+/// truth #5 — even the registry never rides the unlimited default),
+/// optional substring `search`.
+pub async fn loggers(
+    api: &dyn GatewayApi,
+    search: Option<&str>,
+) -> Result<ListEnvelope<LoggerInfo>, CoreError> {
+    let query = crate::client::query::ListQuery {
+        limit: crate::client::logs::DEFAULT_LOG_LIMIT,
+        search: search.map(str::to_string),
+        ..Default::default()
+    };
+    api.loggers(&query).await
+}
+
+/// `ign logs loggers set <name> <LEVEL>`. Confirmation guarding belongs
+/// to the CALLER (the CLI refuses without `--yes` before any API
+/// construction) — the action is the obedient arm.
+pub async fn set_logger_level(
+    api: &dyn GatewayApi,
+    logger: &str,
+    level: &str,
+) -> Result<SetLevelResult, CoreError> {
+    api.set_logger_level(logger, level).await?;
+    Ok(SetLevelResult {
+        logger: logger.to_string(),
+        level: level.to_string(),
+    })
+}
+
+/// `ign logs loggers reset` — same guard contract as set.
+pub async fn reset_logger_levels(api: &dyn GatewayApi) -> Result<ResetResult, CoreError> {
+    api.reset_logger_levels().await?;
+    Ok(ResetResult { reset: true })
+}
+
+/// The download filename: `-o FILE` wins, then the gateway's
+/// `Content-Disposition` name, then `<stem>-logs-<unix_ts>.idb` — NEVER
+/// `.zip` (Pitfall 7: the archive is SQLite).
+fn download_filename(
+    output: Option<&Path>,
+    download: &LogDownload,
+    stem: &str,
+    now_secs: i64,
+) -> String {
+    if let Some(output) = output {
+        return output.display().to_string();
+    }
+    if let Some(filename) = download.filename.as_deref().filter(|name| !name.is_empty()) {
+        return filename.to_string();
+    }
+    format!("{stem}-logs-{now_secs}.idb")
+}
+
+/// `ign logs download` — fetch the `.idb` archive and write it EXACTLY
+/// as received (no transformation, no extraction). `stem` names the
+/// gateway for the fallback filename (the CLI passes the profile name).
+pub async fn download(
+    api: &dyn GatewayApi,
+    output: Option<&Path>,
+    fallback_stem: &str,
+) -> Result<DownloadResult, CoreError> {
+    let fetched = api.logs_download().await?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or_default();
+    let file = download_filename(output, &fetched, fallback_stem, now_secs);
+    std::fs::write(&file, &fetched.bytes)
+        .map_err(|err| CoreError::Internal(format!("cannot write log archive {file}: {err}")))?;
+    Ok(DownloadResult {
+        bytes: fetched.bytes.len(),
+        content_type: fetched.content_type,
+        file,
+    })
+}
+
+/// Parse `--since`: an absolute `EPOCH_MS` value or a relative span
+/// `Nms` / `Ns` / `Nmin` / `Nh` (resolved against `now_ms`). Returned
+/// as a plain `String` error so clap can surface it as a usage-class
+/// parse failure (exit 2) — validation happens at arg-parse time, not
+/// deep in dispatch.
+pub fn parse_since(spec: &str, now_ms: i64) -> Result<i64, String> {
+    let spec = spec.trim();
+    // Order matters: "ms" before bare "s"; "min" between them.
+    for (suffix, unit_ms) in [
+        ("ms", 1_i64),
+        ("min", 60_000),
+        ("h", 3_600_000),
+        ("s", 1_000),
+    ] {
+        if let Some(digits) = spec.strip_suffix(suffix)
+            && let Ok(count) = digits.parse::<i64>()
+            && count >= 0
+        {
+            return Ok(now_ms - count * unit_ms);
+        }
+    }
+    // Absolute epoch-ms (also covers "0" = the whole buffer).
+    match spec.parse::<i64>() {
+        Ok(epoch_ms) if epoch_ms >= 0 => Ok(epoch_ms),
+        _ => Err(format!(
+            "invalid --since {spec:?}: expected EPOCH-MS or a relative span like 500ms, 30s, 5min, 2h"
+        )),
+    }
+}
 
 /// `ign logs --follow` result — how much streamed before the tail
 /// ended. (Ctrl-C never reaches here: the process default kill emits
@@ -129,11 +295,68 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use super::tail;
+    use super::{download_filename, parse_since, tail};
     use crate::client::GatewayApi;
-    use crate::client::logs::{LogEntry, LogQuery};
+    use crate::client::logs::{LogDownload, LogEntry, LogQuery};
     use crate::client::query::{ListEnvelope, ListMetadata};
     use crate::error::CoreError;
+
+    /// `--since` accepts EPOCH-MS and every relative suffix, parsed
+    /// against a fixed now; junk is a usage-class String error.
+    #[test]
+    fn parse_since_accepts_epoch_and_relative_spans() {
+        const NOW: i64 = 1_787_346_747_022;
+        assert_eq!(parse_since("1787346747022", NOW), Ok(1787346747022));
+        assert_eq!(parse_since("0", NOW), Ok(0));
+        assert_eq!(parse_since("500ms", NOW), Ok(NOW - 500));
+        assert_eq!(parse_since("30s", NOW), Ok(NOW - 30_000));
+        assert_eq!(parse_since("5min", NOW), Ok(NOW - 300_000));
+        assert_eq!(parse_since("2h", NOW), Ok(NOW - 7_200_000));
+        // suffix order matters: "ms" before bare "s"
+        assert_eq!(parse_since("1s", NOW), Ok(NOW - 1_000));
+        assert!(parse_since("banana", NOW).is_err());
+        assert!(
+            parse_since("-5s", NOW).is_err(),
+            "negative spans are invalid"
+        );
+        assert!(parse_since("", NOW).is_err());
+    }
+
+    /// Filename precedence: `-o FILE` > Content-Disposition > the
+    /// `<stem>-logs-<ts>.idb` fallback — and NEVER a `.zip` (Pitfall 7).
+    #[test]
+    fn download_filename_precedence() {
+        let fetched = LogDownload {
+            bytes: Vec::new(),
+            filename: Some("GW_Ignition_logs_20260822-0307.idb".into()),
+            content_type: Some("application/x-sqlite3".into()),
+        };
+        assert_eq!(
+            download_filename(
+                Some(std::path::Path::new("/tmp/out.idb")),
+                &fetched,
+                "dev",
+                1000
+            ),
+            "/tmp/out.idb",
+            "-o wins"
+        );
+        assert_eq!(
+            download_filename(None, &fetched, "dev", 1000),
+            "GW_Ignition_logs_20260822-0307.idb",
+            "Content-Disposition name second"
+        );
+        let anonymous = LogDownload {
+            bytes: Vec::new(),
+            filename: None,
+            content_type: None,
+        };
+        assert_eq!(
+            download_filename(None, &anonymous, "dev", 1_787_346_747),
+            "dev-logs-1787346747.idb",
+            "fallback = <stem>-logs-<unix_ts>.idb — never .zip"
+        );
+    }
 
     /// A scripted double: serves `pages` in order (then empty pages
     /// forever) and records every query it saw.

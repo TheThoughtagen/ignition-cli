@@ -291,3 +291,80 @@ async fn live_connections() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 02-04 additions: logs (read-only by default; the level mutations
+// behind IGNITION_LIVE_MUTATIONS=1).
+// ---------------------------------------------------------------------------
+
+/// Read-only log checks against a live gateway: `logs?limit=1` parses
+/// the live entry shape (epoch-ms timestamps) and the logger registry
+/// answers (~1250 loggers on a fresh image; limit=200 explicit).
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN"]
+async fn live_logs_and_loggers() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    use ignition_core::client::logs::LogQuery;
+    let page = api
+        .logs(&LogQuery {
+            sort_by: Some("desc(timestamp)".into()),
+            ..LogQuery::default()
+        })
+        .await
+        .expect("live logs query must deserialize");
+    eprintln!(
+        "live logs: {} of {} total",
+        page.items.len(),
+        page.metadata.total
+    );
+    if let Some(newest) = page.items.first() {
+        assert!(
+            newest.timestamp > 0,
+            "epoch-ms timestamp: {}",
+            newest.timestamp
+        );
+        eprintln!(
+            "live newest: {} {} {}",
+            newest.timestamp, newest.level, newest.logger_name
+        );
+    }
+
+    let loggers = api
+        .loggers(&ignition_core::client::query::ListQuery {
+            limit: 200,
+            ..Default::default()
+        })
+        .await
+        .expect("live logger registry must deserialize");
+    assert!(!loggers.items.is_empty(), "a gateway ships loggers");
+    eprintln!("live loggers: first of {}", loggers.metadata.total);
+}
+
+/// The level mutations, double-opt-in (mutations are audit-logged
+/// server-side): set one logger to its current level, read it back,
+/// reset. Pick a harmless logger — the gateway's own GatewayManager.
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_logger_level_set_and_reset() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    if std::env::var("IGNITION_LIVE_MUTATIONS").as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_MUTATIONS=1 not set (mutations stay off)");
+        return;
+    }
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    api.set_logger_level("GatewayManager", "INFO")
+        .await
+        .expect("set-logger-level must succeed with a token (no CSRF)");
+    api.reset_logger_levels()
+        .await
+        .expect("levelreset must succeed");
+}

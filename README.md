@@ -89,19 +89,39 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign sessions [--type designer\|perspective\|vision]` | All three session families in one merged output (`designers (N)` / `perspective (N)` / `vision (N)` sections) | `--type` filters to one family; JSON always carries all three keys (filtered-out = `[]`); replaces the webpage's Sessions pages |
 | `ign sessions terminate --type <T> --id <ID> [--message MSG]` | Terminate a session (designer: prune / vision: close / perspective: terminate, `--message` shown to the user) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`; a nonexistent id exits 6 (`not_found`) |
 | `ign connections [--type database\|opc]` | Database/OPC connections: `name  enabled  healthchecks` | `healthchecks` is passthrough as the gateway reports it (populated detail LOW-confidence until captured live); replaces the webpage's Connections pages |
+| `ign logs [--logger L] [--min-level L] [--since SPAN] [--limit N]` | Recent log entries, newest first (`ISO-UTC  LEVEL  logger  message`) | `--limit` is ALWAYS explicit (default 200 — the server default is unlimited); `--since` takes EPOCH-MS or `500ms/30s/5min/2h`; sorts `desc(timestamp)` so you see the NEWEST entries, never the oldest 200 |
+| `ign logs -f [--interval S] [--timeout S]` | Live tail: entries stream to stdout as they occur | poll-based (no server push exists — `GET /logs?startTime=<cursor>` IS the tail); `--timeout` expiry ends cleanly (exit 0); without it, run until Ctrl-C (default process kill, no envelope); see the streaming exception below |
+| `ign logs download [-o FILE]` | Download the log archive — a SQLite `.idb`, never a zip | bytes written exactly as received; default filename from `Content-Disposition`, else `<profile>-logs-<ts>.idb`; `--json` data is `{file, bytes, content_type}` |
+| `ign logs loggers [--search S]` | Logger registry: `name  level  context` | explicit limit 200 (same unlimited-default guard) |
+| `ign logs loggers set <NAME> <LEVEL>` | Set one logger's level (TRACE..OFF) | **mutation**: exit 2 (`confirmation_required`) without `--yes`; audit-logged server-side |
+| `ign logs loggers reset` | Reset ALL custom logger levels to defaults | **mutation**: exit 2 without `--yes`; audit-logged server-side |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
 All gateway commands honor the envelope (`--json`/`--compact`) with the
 `[profile: NAME]` header in human mode. The inspection trio (`status`,
 `modules`, `metrics`) replaces the gateway webpage's Status Overview,
-Config > Modules, and Performance & Diagnostics pages; `sessions` and
-`connections` replace its Sessions and Connections pages.
+Config > Modules, and Performance & Diagnostics pages; `sessions`,
+`connections`, and the `logs` tree replace its Sessions, Connections,
+Logs console, and logger-config pages.
+
+### Streaming output (the second stdout exception)
+
+`ign logs -f` is a STREAM: entries print to stdout as they arrive, so
+there is no single result to wrap. In human mode that means live lines
+(`ISO-UTC  LEVEL  logger  message`, profile header first). Under
+`--json`/`--compact` the tail emits **NDJSON — one compact entry object
+per line, no envelope** — the second sanctioned stdout exception (after
+`completions`). Every other command still emits exactly one envelope.
+A `--timeout` expiry ends the tail cleanly with exit 0; without it the
+tail runs until Ctrl-C, which uses the process default kill (no
+envelope — plan for it in pipelines).
 
 ### Destructive operations
 
-Commands that change gateway state (`sessions terminate` today; `project
-delete` and `rig reset` in later phases) refuse without `--yes` (exit 2,
+Commands that change gateway state (`sessions terminate` and the
+`logs loggers set`/`reset` mutations today; `project delete` and `rig
+reset` in later phases) refuse without `--yes` (exit 2,
 `confirmation_required`, hint names both the flag and `IGNITION_YES=1`)
 — non-interactive by design, so scripts and agents pass `--yes` once
 and humans get a speed bump. The guard fires before any network
