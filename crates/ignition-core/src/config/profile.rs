@@ -20,6 +20,44 @@ pub struct Config {
     /// Named gateway profiles (`[profiles.NAME]` tables).
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Rig family defaults (`[rig]` table — just the default rig name
+    /// today; 04-01).
+    #[serde(default, skip_serializing_if = "rig_config_is_empty")]
+    pub rig: RigConfig,
+    /// Named compose rigs (`[rigs.NAME]` tables — 04-01). Omitted from
+    /// serialization when empty so profile-only configs keep their exact
+    /// on-disk shape (the save goldens).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rigs: BTreeMap<String, RigEntry>,
+}
+
+/// True when the `[rig]` block carries nothing worth serializing —
+/// keeps `[rig]` out of profile-only configs entirely.
+fn rig_config_is_empty(rig: &RigConfig) -> bool {
+    rig.default.is_none()
+}
+
+/// The `[rig]` table: rig-family defaults (04-01).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RigConfig {
+    /// Name of the `[rigs.*]` entry `ign rig` targets when no
+    /// `--rig`/`IGNITION_RIG` names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// One named compose rig (`[rigs.NAME]`, 04-01). References only —
+/// never secrets (the compose file itself owns those).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RigEntry {
+    /// Path to the rig's compose file (`~` and `${VAR}` expanded at use
+    /// time — manual expansion, no new dependency).
+    pub compose_file: String,
+    /// Explicit compose project name (`-p`). OPTIONAL — omit to honor
+    /// the rig's own `.env` `COMPOSE_PROJECT_NAME` (the identity truth,
+    /// research Pattern 1); set only to override it deliberately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
 }
 
 /// One gateway profile.

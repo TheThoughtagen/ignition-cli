@@ -15,7 +15,7 @@
 pub mod profile;
 pub mod secret;
 
-pub use profile::{AuthRef, Config, Profile};
+pub use profile::{AuthRef, Config, Profile, RigConfig, RigEntry};
 pub use secret::{
     BasicEnvStore, Credential, EnvStore, KeyringStore, Secret, SecretStore, resolve_secret,
 };
@@ -68,7 +68,7 @@ pub fn load(path: &Path) -> Result<Config, CoreError> {
     })
 }
 
-const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles"];
+const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles", "rig", "rigs"];
 const KNOWN_PROFILE_KEYS: &[&str] = &["url", "label", "ssl_verify", "auth"];
 const KNOWN_AUTH_KEYS: &[&str] = &["token_env", "keyring", "user_env", "password_env"];
 
