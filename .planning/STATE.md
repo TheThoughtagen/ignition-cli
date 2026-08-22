@@ -5,7 +5,7 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 3 complete (3/3) — surgical resource loop + e2e harness shipped; Phase 4 (rig) planning next
+**Current focus:** Phase 4 planned (4 plans, spike resolved) — ready for /gsd-execute-phase 4; trial-reset e2e needs rig creds (see 04-03 user_setup)
 
 ## Current Position
 
@@ -100,7 +100,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF) — resolve at Phase 4 planning
+- ~~Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF)~~ RESOLVED at Phase 4 planning by 04-RESEARCH.md (live-probed on ign-research 8.3.6): native Rust HTTP ladder — tier 0 token-auth POST /data/api/v1/trial (one live call decides), tier 1 mapped OIDC challenge flow (client/idp.rs), tier 2 Playwright README-documented fallback only. Playwright delegation rejected (Node+chromium runtime, broke across 8.3.3 UI rewrite, DOM-text verification).
 - Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
 - ~~Phase 2 gap: live-gateway auth verification (token header across /data + /webdev, Basic viability)~~ CLOSED by 02-01: claims verified empirically during research + wiremock-pinned; executable proof path = live_gateway.rs `-- --ignored` (needs IGNITION_LIVE_URL/IGNITION_LIVE_TOKEN per 02-USER-SETUP.md; research rig `ign-research` still up on port 18088 if a fresh token is created). /webdev half re-checks in Phase 5.
 - ~~Phase 1: smoke-test keyring 4.1 on headless Linux CI~~ CLOSED & CI-CONFIRMED: keyring-smoke job green on ubuntu headless (run 32517734178, 2026-08-21)

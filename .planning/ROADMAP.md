@@ -96,15 +96,15 @@ Plans:
   2. `rig reset` tears down cleanly (orphans + volumes removed, explicit compose project names) — no stale trial state survives a reset
   3. User can view rig logs (passthrough) and trial status (banners endpoint), and reset trial state via the spike-chosen mechanism verified against ≥2 gateway minor versions
   4. User can snapshot a rig (gwbk download + project/tag exports) and restore it to a repeatable state
-**Plans**: 4 plans (TBD)
+**Plans**: 4 plans (sequential waves 1→4 — the rig family grows the cli.rs/main.rs choke files + client/mod.rs trait block, the Phase 1–3 pattern; no parallelism is honest)
 
-**⚠ Spike required (at planning):** trial-reset mechanism — delegate to existing Playwright resetter vs native headless HTTP login+CSRF flow in Rust (researcher divergence; see research/SUMMARY.md).
+*Planner refinement:* the flagged trial-reset spike is RESOLVED by 04-RESEARCH.md with live evidence — native Rust HTTP wins (the Playwright resetter needs Node+chromium, broke across 8.3.3's UI rewrite, and verifies via DOM text; the 8.3.6 login flow is a mapped OIDC challenge ladder with pure-JSON endpoints and per-call token rotation). Implementation is a LADDER: tier 0 = token-auth `POST /data/api/v1/trial` (one live call decides), tier 1 = native OIDC+CSRF flow in client/idp.rs, tier 2 = Playwright documented in README only, never shipped. Trial status sources `GET /data/api/v1/trial` (unauthenticated, richer than banners) with banners as cross-check — correcting the sketch's banners-primary assumption. Snapshot composition is honest redundancy: gwbk (streamed, `type=roaming`) + per-project exports + manifest.json (tag-provider bulk export stays Phase 5; gwbk captures tag config). Docker-only rig verbs (up/down/status/reset/logs) carry `profile: null` — the first non-gateway commands.
 
 Plans:
-- [ ] 04-01: compose shell-out (v2 check, explicit `-p` names, `--remove-orphans`), 5-level rig discovery, up/down/status
-- [ ] 04-02: reset (volume teardown, port pre-flight, post-reset scan + wait) + logs passthrough
-- [ ] 04-03: trial status (banners) + trial-reset spike & implementation
-- [ ] 04-04: snapshot/restore (native gwbk API + project/tag exports)
+- [ ] 04-01-PLAN.md — compose engine (RigPlan resolve-then-act, ComposeRunner seam, LDJSON/array parsers, 5-level discovery, port pre-flight) + `rig up/down/status` with commissioned-wait (RIG-01 core)
+- [ ] 04-02-PLAN.md — `rig reset` (guarded `down -v --remove-orphans` cycle + volume preview) + `rig logs` passthrough streaming (RIG-01 completion, RIG-02 half)
+- [ ] 04-03-PLAN.md — `rig trial status|reset` (trial+banners wire, tier-0 spike then tier-1 OIDC ladder, ≥2-minor-version e2e gate) (RIG-02 half, RIG-03)
+- [ ] 04-04-PLAN.md — `rig snapshot|restore` (streaming gwbk + project exports + manifest; octet-stream restore + restart-wait + token-clobber warning; round-trip e2e) (RIG-04)
 
 ### Phase 5: WebDev Backend & Tag Operations
 **Goal:** A user can deploy the CLI's own versioned WebDev routes to a gateway and then operate the complete tag lifecycle — providers, browse, read/write values, config CRUD, UDTs, alarms, history, bulk transfer — reaching the ignition-mcp replacement bar.
