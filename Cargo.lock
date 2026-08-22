@@ -1150,6 +1150,7 @@ dependencies = [
  "ignition-core",
  "ignition-tui",
  "predicates",
+ "reqwest",
  "serde",
  "serde_json",
  "snapbox",
