@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod inspect;
 pub mod logs;
 pub mod profile;
+pub mod projects;
 pub mod restart;
 pub mod sessions;
 pub mod version;
