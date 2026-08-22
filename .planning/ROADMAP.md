@@ -82,7 +82,7 @@ Plans:
 *Planner refinement:* research validated the sketch with two adjustments — scope metadata (`includes`/`excludes`) moved into 03-02 (it is export/import output, not a resource concern), and `project set` (PUT modify; `--parent` = the inheritance move) made explicit in 03-01 since the roadmap's "move" maps to native rename/reparent. Locked decisions honored throughout: frozen envelope + additive-only slugs (`project_exists`, `invalid_import_file`, `resource_binary`), guard→resolve→action destructive dispatch (project delete, import-overwrite, and resource delete all fire `require_confirmation` BEFORE resolution), classify()-only error mapping, two-column wire-faithful/unit-explicit naming, serde-only actions, every new trait method stubbed into all inline test doubles, and the wiremock `set_body_raw`/MockGuard footguns.
 
 Plans:
-- [ ] 03-01-PLAN.md — project CRUD: list (inheritance info) / new / copy / rename / set (reparent) / delete (`--yes` + `confirm=true` at both guard layers) + post_json/put_json pipeline helpers (PROJ-01/02)
+- [x] 03-01-PLAN.md — project CRUD: list (inheritance info) / new / copy / rename / set (reparent) / delete (`--yes` + `confirm=true` at both guard layers) + post_json/put_json pipeline helpers (PROJ-01/02)
 - [ ] 03-02-PLAN.md — export (streaming ZIP to disk via reqwest stream + tokio fs, 120 s timeout) / import (file/stdin buffered, 300 s, application/zip) + `--collision-policy abort|overwrite` + scope metadata (PROJ-03/04)
 - [ ] 03-03-PLAN.md — resource list/get/put/delete surgical loop (binary refusal, MEDIUM-family wiremock-first + live-capture gate) + assert_cmd #[ignore] e2e harness skeleton (PROJ-05)
 

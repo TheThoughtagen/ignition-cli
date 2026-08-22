@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 2 complete (5/5 plans) — ready for verification/transition to Phase 3
+**Current focus:** Phase 3 in progress (1/3 plans) — project CRUD shipped; export/import next
 
 ## Current Position
 
-**Phase:** 2 of 7 (Gateway Health & Inspection)
-**Current Plan:** 5 of 5 (complete)
-**Total Plans in Phase:** 5
-**Status:** Phase 2 complete — all plans executed
+**Phase:** 3 of 7 (Project Operations)
+**Current Plan:** 1 of 3 (complete)
+**Total Plans in Phase:** 3
+**Status:** Phase 3 in progress — 03-01 executed
 **Last Activity:** 2026-08-22
 
-**Progress:** [██████████] 100%
+**Progress:** [████████░░] 83%
 
 ## Performance Metrics
 
@@ -37,6 +37,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase Phase 02 PP03 | 14min | 3 tasks | 15 files |
 | Phase 02 P04 | 35min | 3 tasks | 18 files |
 | Phase 02 P05 | 40min | 3 tasks | 20 files |
+| Phase 03 P01 | 21min | 3 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -78,6 +79,10 @@ Recent decisions affecting current work:
 - [Phase 02]: [Phase 02-05]: poll HRTB constraint pinned — a probe whose state carries no lifetime or whose Done payload is non-() does not typecheck; every wait probe uses S=&mut Cell<String> + PollState::<()> with the terminal state riding the outer Cell (the tail pattern generalized) — Empirically bisected: identical closure shapes compile/fail on exactly these two properties
 - [Phase 02]: [Phase 02-05]: wait gateway + wait restart dispatch HEADER-LESS (secret degrades to None — the unauth StatusPing anchor must work when auth is broken); wait module stays authed; doctor's credential degrades too, with a credential_present flag giving the honest 401 split (no-credential vs not-recognized)
 - [Phase 02]: [Phase 02-05]: RESTART_FLOOR is ONE shared from_secs(5) const (restart_and_wait sleeps it post-POST; wait_restart requires it elapsed before all-RUNNING success, witnessing non-RUNNING short-circuits it); doctor exits 0 whenever the diagnosis completes — failing checks are data; webdev_route_status bypasses classify (404-vs-present IS the answer)
+- [Phase 03-01]: ProjectModify.enabled is Option<bool> (skip-if-none): an always-sent enabled on modify would clobber the flag on single-field sets; the Task-2 unit pin ({"title":"T"} exactly) demanded it
+- [Phase 03-01]: ProjectSetResult carries fields-touched as serde(skip) Vec<String> — the human 'set <fields> on <name>' line without deviating the flat six-key agent JSON
+- [Phase 03-01]: Project action results keep ALL six keys present (null when absent) — stable agent shape; defaultDb/tagProvider/userSource passthrough stays at the client seam; encode_segment (NON_ALPHANUMERIC) is the one per-segment encoder 03-03 resource paths reuse keeping '/'
+- [Phase 03-01]: Destructive delete pin (Pitfall 8 both layers): CLI guard refuses pre-resolution (exit 2, profile null — sessions-terminate shape verbatim) AND the wire DELETE always carries confirm=true QUERY param with empty body — wiremock recorded-request proven at both client and binary level
 
 ### Pending Todos
 
@@ -92,6 +97,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-22T04:31:25.202Z
-**Stopped At:** Completed 02-05-PLAN.md (restart/wait/doctor — Phase 2 complete)
+**Last session:** 2026-08-22T13:21:02.148Z
+**Stopped At:** Completed 03-01-PLAN.md (project CRUD — list/new/copy/rename/set/delete)
 **Resume file:** None
