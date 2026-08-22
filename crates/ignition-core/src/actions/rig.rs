@@ -576,6 +576,30 @@ mod tests {
         ok("Docker Compose version v5.1.2\n")
     }
 
+    /// An OWN-PROJECT docker-ps occupant: preflight treats it as
+    /// recreate-safe AND — because the row set is non-empty — the
+    /// advisory lsof pass never runs, keeping these tests deterministic
+    /// on machines where a REAL rig publishes 9088/9443 (the fixture's
+    /// ports — live-verification found the lsof fallback observing the
+    /// host's own rig; the rig/mod.rs port-1 dodge, reconsidered).
+    const OWN_OCCUPANT: &str = r#"{"Names":"fixture-rig-ignition-1","Labels":"com.docker.compose.project=fixture-rig"}"#;
+
+    /// The scripted pre-flight answers for a two-port gw_plan(): both
+    /// ports held by THIS project (a recreate — the honest shape for
+    /// up/reset against an already-running rig).
+    fn free_ports_for_own_project() -> Vec<ComposeOutput> {
+        vec![ok(OWN_OCCUPANT), ok(OWN_OCCUPANT)]
+    }
+
+    /// The up cycle's queue: version → preflight × 2 (own project) →
+    /// the up itself.
+    fn up_cycle_outputs() -> Vec<ComposeOutput> {
+        let mut outputs = vec![version_ok()];
+        outputs.extend(free_ports_for_own_project());
+        outputs.push(ok(""));
+        outputs
+    }
+
     /// A one-service rig publishing the gateway ports (the
     /// gateway_url_from inputs).
     fn gw_plan() -> RigPlan {
@@ -680,7 +704,7 @@ mod tests {
         let server = status_ping_server("RUNNING").await;
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
-        let runner = FakeRunner::with(vec![version_ok(), ok(""), ok(""), ok("")]);
+        let runner = FakeRunner::with(up_cycle_outputs());
         let result = rig_up(&runner, &gw_plan(), 300, Some(&api))
             .await
             .expect("up succeeds");
@@ -709,7 +733,7 @@ mod tests {
         let server = uncommissioned_server().await;
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
-        let runner = FakeRunner::with(vec![version_ok(), ok(""), ok(""), ok("")]);
+        let runner = FakeRunner::with(up_cycle_outputs());
         let result = rig_up(&runner, &gw_plan(), 1, Some(&api))
             .await
             .expect("uncommissioned is exit-0 data");
@@ -731,7 +755,7 @@ mod tests {
         let server = status_ping_server("STARTING").await;
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
-        let runner = FakeRunner::with(vec![version_ok(), ok(""), ok(""), ok("")]);
+        let runner = FakeRunner::with(up_cycle_outputs());
         let err = rig_up(&runner, &gw_plan(), 1, Some(&api))
             .await
             .expect_err("still-STARTING deadline errors");
@@ -769,7 +793,7 @@ mod tests {
     /// and compose's own --wait stands as the readiness signal.
     #[tokio::test]
     async fn up_without_probe_skips_wait_with_warning() {
-        let runner = FakeRunner::with(vec![version_ok(), ok(""), ok(""), ok("")]);
+        let runner = FakeRunner::with(up_cycle_outputs());
         let result = rig_up(&runner, &gw_plan(), 300, None)
             .await
             .expect("up succeeds without a probe");
@@ -855,16 +879,13 @@ mod tests {
     );
 
     /// The full scripted cycle for a gw_plan() rig: preview (docker
-    /// volume ls) → version → down -v → preflight × 2 ports → up.
+    /// volume ls) → version → down -v → preflight × 2 ports (own
+    /// project — recreate) → up.
     fn reset_cycle_outputs() -> Vec<ComposeOutput> {
-        vec![
-            ok(RESET_VOLUME_STDOUT),
-            version_ok(),
-            ok(""),
-            ok(""),
-            ok(""),
-            ok(""),
-        ]
+        let mut outputs = vec![ok(RESET_VOLUME_STDOUT), version_ok(), ok("")];
+        outputs.extend(free_ports_for_own_project());
+        outputs.push(ok(""));
+        outputs
     }
 
     /// The happy cycle: preview content pinned (label-filtered names,
@@ -947,11 +968,11 @@ mod tests {
     async fn reset_port_regrabbed_midcycle_errors_and_never_ups() {
         let occupant = r#"{"Names":"other-gw-1","Labels":"com.docker.compose.project=other"}"#;
         let runner = FakeRunner::with(vec![
-            ok(""),       // volume ls: nothing to remove
+            ok(""),              // volume ls: nothing to remove
             version_ok(),
-            ok(""),       // down -v
-            ok(occupant), // preflight 9088: re-grabbed mid-cycle
-            ok(""),       // preflight 9443: free
+            ok(""),              // down -v
+            ok(occupant),        // preflight 9088: re-grabbed mid-cycle
+            ok(OWN_OCCUPANT),    // preflight 9443: own project
         ]);
         let err = rig_reset(&runner, &gw_plan(), 300, None)
             .await
