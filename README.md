@@ -28,11 +28,11 @@ output directly, so it is never JSON-wrapped.
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap) or destructive op without `--yes` | `confirmation_required`
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, or an invalid import file | `confirmation_required`, `invalid_import_file`
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`
 | 7    | rig           | docker/compose rig failure (reserved, Phase 4)     | `rig_error`
 
 The exit-code table lives in exactly two places — this README and

@@ -8,11 +8,11 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required` (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file` (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -33,6 +33,12 @@ pub enum CoreError {
     /// usage errors with its exit 2 — never hook clap).
     #[error("{operation} is destructive; rerun with --yes to confirm")]
     ConfirmationRequired { operation: String },
+
+    /// An import byte source the caller must fix (wrong file, too big,
+    /// unreadable). Exit 2 — usage class: it names what the CALLER must
+    /// change, like [`Self::ConfirmationRequired`] (03-02).
+    #[error("invalid import file: {reason}")]
+    InvalidImportFile { reason: String },
 
     /// Named profile absent from config. Exit 3.
     #[error("profile {name:?} not found (known profiles: {known:?})")]
@@ -113,6 +119,20 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// A project of this name already exists and the import's collision
+    /// policy is abort — the CLI-side pre-check refused BEFORE any
+    /// upload (the server's own answer remains the backstop). Exit 6 —
+    /// target state: the command is invalid for the gateway's current
+    /// state (03-02, the GatewayTooOld action-built-variant precedent:
+    /// constructed by the actions layer, not classify).
+    #[error("project {name} already exists on the gateway")]
+    ProjectExists {
+        /// The colliding project name.
+        name: String,
+        /// URL of the pre-check request, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -125,6 +145,7 @@ impl CoreError {
         match self {
             Self::Internal(_) => "internal",
             Self::ConfirmationRequired { .. } => "confirmation_required",
+            Self::InvalidImportFile { .. } => "invalid_import_file",
             Self::ProfileNotFound { .. } => "profile_not_found",
             Self::NoActiveProfile => "no_active_profile",
             Self::SecretUnavailable { .. } => "secret_unavailable",
@@ -135,6 +156,7 @@ impl CoreError {
             Self::GatewayNotCommissioned { .. } => "gateway_not_commissioned",
             Self::GatewayRestarting { .. } => "gateway_restarting",
             Self::NotFound { .. } => "not_found",
+            Self::ProjectExists { .. } => "project_exists",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -143,7 +165,7 @@ impl CoreError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Internal(_) => 1,
-            Self::ConfirmationRequired { .. } => 2,
+            Self::ConfirmationRequired { .. } | Self::InvalidImportFile { .. } => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -153,7 +175,8 @@ impl CoreError {
             Self::GatewayTooOld { .. }
             | Self::GatewayNotCommissioned { .. }
             | Self::GatewayRestarting { .. }
-            | Self::NotFound { .. } => 6,
+            | Self::NotFound { .. }
+            | Self::ProjectExists { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -168,7 +191,13 @@ impl CoreError {
             ),
             Self::ConfirmationRequired { .. } => Some(
                 "this operation is destructive; re-run with --yes or set \
-                  IGNITION_YES=1"
+                   IGNITION_YES=1"
+                    .to_string(),
+            ),
+            Self::InvalidImportFile { .. } => Some(
+                "import expects a project-export ZIP (PK\\x03\\x04 magic) of at \
+                  most 512 MB — pass a file produced by `ign project export` \
+                  via --file (or `-` to pipe one on stdin)"
                     .to_string(),
             ),
             Self::ProfileNotFound { known, .. } => Some(if known.is_empty() {
@@ -226,7 +255,14 @@ impl CoreError {
             ),
             Self::NotFound { .. } => Some(
                 "check the id/path; a 404 JSON 'No route match' body can also mean \
-                 a pre-8.3 gateway"
+                  a pre-8.3 gateway"
+                    .to_string(),
+            ),
+            Self::ProjectExists { .. } => Some(
+                "the default collision policy refuses to overwrite; re-run with \
+                  --collision-policy overwrite to replace it — overwrite \
+                  REPLACES the ENTIRE project (resources absent from the ZIP \
+                  are deleted; merge is Designer-only)"
                     .to_string(),
             ),
             Self::Rig(_) => Some(
@@ -246,7 +282,8 @@ impl CoreError {
             Self::GatewayTooOld { endpoint, .. }
             | Self::GatewayNotCommissioned { endpoint }
             | Self::GatewayRestarting { endpoint }
-            | Self::NotFound { endpoint } => endpoint.clone(),
+            | Self::NotFound { endpoint }
+            | Self::ProjectExists { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -332,6 +369,13 @@ mod tests {
                 "confirmation_required",
             ),
             (
+                CoreError::InvalidImportFile {
+                    reason: "missing ZIP magic".into(),
+                },
+                2,
+                "invalid_import_file",
+            ),
+            (
                 CoreError::ProfileNotFound {
                     name: "nope".into(),
                     known: vec!["dev".into()],
@@ -392,6 +436,14 @@ mod tests {
                 },
                 6,
                 "not_found",
+            ),
+            (
+                CoreError::ProjectExists {
+                    name: "PlantFloor".into(),
+                    endpoint: None,
+                },
+                6,
+                "project_exists",
             ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];

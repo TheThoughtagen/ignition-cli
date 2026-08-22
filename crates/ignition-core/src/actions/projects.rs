@@ -3,6 +3,13 @@
 //! printing (ARCHITECTURE.md layering: the Phase-6 TUI rides this same
 //! layer).
 //!
+//! 03-02 (PROJ-03/04) adds export/import: the export result carries
+//! the static scope metadata (what a project ZIP does and does not
+//! contain — roadmap criterion 4), and the import action owns the
+//! collision policy — the abort pre-check refuses via `project_find`
+//! BEFORE any upload; overwrite skips the pre-check (the server is
+//! the authority) and dispatch guards it as destructive.
+//!
 //! Two-column naming (LOCKED): client models stay wire-faithful; these
 //! action results re-expose the SELECTED fields under unit-explicit
 //! snake_case keys, ALL keys always present (null when absent) — the
@@ -17,12 +24,154 @@
 //! server is the reparent authority (cycle guard), and PROJ-01's
 //! inheritance info comes from the list items themselves.
 
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
 
 use crate::client::GatewayApi;
 use crate::client::projects::{ProjectCreate, ProjectModify, ProjectRecord};
 use crate::client::query::ListQuery;
 use crate::error::CoreError;
+
+/// What a project export INCLUDES — the static, documented-once
+/// arrays (HIGH confidence: verified from a real git-module-managed
+/// 8.3 export tree). Data, not prose — agents key off them (roadmap
+/// criterion 4).
+pub const EXPORT_INCLUDES: &[&str] = &[
+    "views",
+    "scripts",
+    "named-queries",
+    "vision-windows",
+    "perspective-themes-styles",
+    "reporting",
+    "alarm-notification-profiles",
+    "webdev-routes",
+    "translations",
+    "sfc-charts",
+];
+
+/// What a project export EXCLUDES — tag providers, tags, and UDTs are
+/// GATEWAY CONFIGURATION, not project resources (the git-module
+/// convention keeps a separate `tags/` tree precisely because of
+/// this).
+pub const EXPORT_EXCLUDES: &[&str] = &[
+    "tag-providers",
+    "tags",
+    "udts",
+    "gateway-config",
+    "database-connections",
+    "users-roles",
+    "alarm-journal",
+    "certificates",
+];
+
+/// The scope metadata carried in BOTH export and import JSON data —
+/// identical consts, so the statement "what this ZIP does and does
+/// not contain" never drifts between the two commands.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportScope {
+    /// Resource families present in a project ZIP.
+    pub includes: Vec<&'static str>,
+    /// Resource families that live in gateway config instead.
+    pub excludes: Vec<&'static str>,
+}
+
+impl ExportScope {
+    /// Build from the static consts (the single source).
+    pub fn new() -> Self {
+        Self {
+            includes: EXPORT_INCLUDES.to_vec(),
+            excludes: EXPORT_EXCLUDES.to_vec(),
+        }
+    }
+}
+
+impl Default for ExportScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Import sanity limit — 512 MB (a real project export is MB-scale;
+/// anything past this is a wrong file, not a project). Checked
+/// BEFORE any network I/O.
+pub const IMPORT_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// The local-file-header magic every ZIP carries (`PK\x03\x04`) —
+/// the cheap wrong-file guard (Don't-Hand-Roll table: the gateway
+/// validates imports; this catches the common mistake).
+const ZIP_MAGIC: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+
+/// The import collision policy. REST exposes exactly abort and
+/// overwrite — `merge` is the Designer import popup's vocabulary and
+/// is rejected at the CLI value-enum level (README documents it as
+/// Designer-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CollisionPolicy {
+    /// Refuse when the project already exists (default) — the find
+    /// pre-check fires BEFORE any upload.
+    Abort,
+    /// Replace the ENTIRE project: resources absent from the ZIP are
+    /// DELETED (replace, not merge — Pitfall 4). Destructive: the CLI
+    /// guards it with `--yes`.
+    Overwrite,
+}
+
+impl CollisionPolicy {
+    /// The stable agent-facing label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Abort => "abort",
+            Self::Overwrite => "overwrite",
+        }
+    }
+}
+
+/// The >512 MB refusal as a pure size check — testable without a
+/// half-gigabyte allocation.
+fn import_size_error(len: usize) -> Option<CoreError> {
+    (len > IMPORT_MAX_BYTES).then(|| CoreError::InvalidImportFile {
+        reason: format!(
+            "{len} bytes exceeds the {} MB sanity limit",
+            IMPORT_MAX_BYTES / (1024 * 1024)
+        ),
+    })
+}
+
+/// The cheap wrong-file guards, both usage-class (exit 2): the
+/// `PK\x03\x04` magic and the 512 MB sanity limit. Runs BEFORE any
+/// network I/O (the find pre-check included).
+fn validate_import(zip: &[u8]) -> Result<(), CoreError> {
+    if !zip.starts_with(&ZIP_MAGIC) {
+        return Err(CoreError::InvalidImportFile {
+            reason: "missing ZIP magic (PK\\x03\\x04) — not a project export archive".to_string(),
+        });
+    }
+    if let Some(err) = import_size_error(zip.len()) {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Strip any path components from a `Content-Disposition` basename —
+/// the gateway names exports well, but a disposition value is header
+/// input and never deserves path trust. `.`/`..`/empty refuse (the
+/// caller falls back to `<name>.zip`).
+fn sanitize_basename(raw: &str) -> Option<String> {
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// A filesystem-safe fallback stem for the default export name — a
+/// project name is a single segment on the wire, but defense-in-depth
+/// replaces any separator that somehow rides along.
+fn safe_fallback_stem(name: &str) -> String {
+    name.replace(['/', '\\'], "_")
+}
 
 /// One project row — the six fields PROJ-01 names.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -162,6 +311,39 @@ pub struct ProjectDeleteResult {
     pub deleted: String,
 }
 
+/// `ign project export` output model: `{project, file, bytes, scope}`
+/// — the FILE is the artifact; stdout stays data-only.
+#[derive(Debug, Serialize)]
+pub struct ExportResult {
+    /// The exported project's name.
+    pub project: String,
+    /// Path of the file written (the `-o` value, or the resolved
+    /// default name).
+    pub file: String,
+    /// Bytes streamed to disk (chunk-counted).
+    pub bytes: u64,
+    /// What the ZIP does and does not contain (roadmap criterion 4).
+    pub scope: ExportScope,
+}
+
+/// `ign project import` output model: `{name, collision_policy,
+/// bytes, scope, outcome}` — `outcome` is the opaque server answer
+/// (an object when JSON, else the success fallback).
+#[derive(Debug, Serialize)]
+pub struct ImportResult {
+    /// The name imported under.
+    pub name: String,
+    /// The policy that ran (`abort` | `overwrite`).
+    pub collision_policy: String,
+    /// Bytes uploaded.
+    pub bytes: usize,
+    /// What the ZIP does and does not contain — the SAME consts as
+    /// export's, so the pair never drifts.
+    pub scope: ExportScope,
+    /// The server's opaque answer.
+    pub outcome: serde_json::Value,
+}
+
 /// `ign project list` — every runnable project with inheritance info
 /// (the standard `limit=-1` UI convention).
 pub async fn projects(api: &dyn GatewayApi) -> Result<ProjectsResult, CoreError> {
@@ -259,6 +441,91 @@ pub async fn project_delete(
     api.project_delete(name).await?;
     Ok(ProjectDeleteResult {
         deleted: name.to_string(),
+    })
+}
+
+/// `ign project export` — stream the project ZIP to disk. With `-o`
+/// the bytes land at exactly that path; without one, the stream goes
+/// to `<name>.zip.part` in the working directory and atomically
+/// renames to the SANITIZED `Content-Disposition` basename (path
+/// components stripped) or the `<name>.zip` fallback — the `.part`
+/// is removed best-effort on error, so a failed export leaves no
+/// half-written impostor.
+pub async fn project_export(
+    api: &dyn GatewayApi,
+    name: &str,
+    output: Option<&Path>,
+) -> Result<ExportResult, CoreError> {
+    let scope = ExportScope::new();
+    if let Some(out) = output {
+        let meta = api.project_export_to_file(name, out).await?;
+        return Ok(ExportResult {
+            project: name.to_string(),
+            file: out.display().to_string(),
+            bytes: meta.bytes,
+            scope,
+        });
+    }
+
+    // Default naming: stream to <fallback>.part, then rename to the
+    // disposition basename (or the fallback) once the meta arrives.
+    let fallback = format!("{}.zip", safe_fallback_stem(name));
+    let part = PathBuf::from(format!("{fallback}.part"));
+    let meta = match api.project_export_to_file(name, &part).await {
+        Ok(meta) => meta,
+        Err(err) => {
+            let _ = std::fs::remove_file(&part); // best-effort
+            return Err(err);
+        }
+    };
+    let final_name = meta
+        .filename
+        .as_deref()
+        .and_then(sanitize_basename)
+        .unwrap_or(fallback);
+    if let Err(err) = std::fs::rename(&part, &final_name) {
+        let _ = std::fs::remove_file(&part); // best-effort
+        return Err(CoreError::Internal(format!(
+            "cannot finalize export {final_name}: {err}"
+        )));
+    }
+    Ok(ExportResult {
+        project: name.to_string(),
+        file: final_name,
+        bytes: meta.bytes,
+        scope,
+    })
+}
+
+/// `ign project import` — order is the contract: magic/size guards
+/// (exit 2, zero network) → abort-policy find pre-check (`Ok` →
+/// [`CoreError::ProjectExists`] BEFORE any upload) → the raw-body
+/// upload with the policy as the wire's `overwrite` query param.
+/// Overwrite runs NO pre-check — the server is the authority — and
+/// the CLI guards it as destructive upstream of this action.
+pub async fn project_import(
+    api: &dyn GatewayApi,
+    name: &str,
+    zip: Vec<u8>,
+    policy: CollisionPolicy,
+) -> Result<ImportResult, CoreError> {
+    let bytes = zip.len();
+    let scope = ExportScope::new();
+    validate_import(&zip)?;
+    if matches!(policy, CollisionPolicy::Abort) && api.project_find(name).await.is_ok() {
+        return Err(CoreError::ProjectExists {
+            name: name.to_string(),
+            endpoint: None,
+        });
+    }
+    let overwrite = matches!(policy, CollisionPolicy::Overwrite);
+    let outcome = api.project_import(name, zip, overwrite).await?;
+    Ok(ImportResult {
+        name: name.to_string(),
+        collision_policy: policy.label().to_string(),
+        bytes,
+        scope,
+        outcome: outcome.response,
     })
 }
 
@@ -651,5 +918,221 @@ mod tests {
         let result = super::project_delete(&rig, "gone").await.expect("delete");
         assert_eq!(result.deleted, "gone");
         assert_eq!(*rig.deletes.lock().unwrap(), vec!["gone".to_string()]);
+    }
+
+    /// THE magic-guard pin: a non-ZIP input refuses with exit 2
+    /// `invalid_import_file` BEFORE any network I/O — neither the find
+    /// pre-check nor the upload ever fires.
+    #[tokio::test]
+    async fn import_refuses_non_zip_before_any_network() {
+        let rig = ProjectsRig::default();
+        let err = super::project_import(
+            &rig,
+            "x",
+            b"definitely not a zip".to_vec(),
+            super::CollisionPolicy::Abort,
+        )
+        .await
+        .expect_err("the magic guard refuses");
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "usage class — the caller must fix the file"
+        );
+        assert_eq!(err.code(), "invalid_import_file");
+        assert!(
+            rig.finds.lock().unwrap().is_empty(),
+            "zero pre-check calls — the guard runs first"
+        );
+        assert!(rig.imports.lock().unwrap().is_empty(), "zero uploads");
+    }
+
+    /// The 512 MB sanity guard refuses with the same slug — checked
+    /// through the pure size helper (no half-gigabyte allocation in a
+    /// unit test); exactly-at-limit stays allowed.
+    #[test]
+    fn import_size_guard_refuses_over_512mb() {
+        let err = super::import_size_error(super::IMPORT_MAX_BYTES + 1)
+            .expect("one byte over the limit refuses");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_import_file");
+        let message = err.to_string();
+        assert!(
+            message.contains("512 MB"),
+            "the reason names the limit: {message}"
+        );
+        assert!(
+            super::import_size_error(super::IMPORT_MAX_BYTES).is_none(),
+            "exactly at the limit is fine"
+        );
+    }
+
+    /// THE collision pin: abort over an existing project (find → Ok)
+    /// refuses with `project_exists` (exit 6) BEFORE the upload, and
+    /// the hint names BOTH the overwrite flag and its replace-semantics
+    /// warning (Pitfall 4).
+    #[tokio::test]
+    async fn import_abort_over_existing_refuses_project_exists() {
+        let rig = ProjectsRig::default(); // find → Ok: the name exists
+        let err = super::project_import(
+            &rig,
+            "PlantFloor",
+            ProjectsRig::zip_fixture(),
+            super::CollisionPolicy::Abort,
+        )
+        .await
+        .expect_err("the collision pre-check refuses");
+        assert!(
+            matches!(&err, CoreError::ProjectExists { name, .. } if name == "PlantFloor"),
+            "wrong class: {err}"
+        );
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.code(), "project_exists");
+        let hint = err.hint().expect("hint required");
+        assert!(
+            hint.contains("--collision-policy overwrite"),
+            "hint names the flag: {hint}"
+        );
+        assert!(
+            hint.contains("ENTIRE project") && hint.contains("Designer-only"),
+            "hint warns replace-not-merge: {hint}"
+        );
+        assert!(
+            rig.imports.lock().unwrap().is_empty(),
+            "the refusal happened BEFORE any upload"
+        );
+        assert_eq!(*rig.finds.lock().unwrap(), vec!["PlantFloor".to_string()]);
+    }
+
+    /// Abort when the name is FREE: the pre-check passes (find → 404)
+    /// and the upload fires with `overwrite=false`.
+    #[tokio::test]
+    async fn import_abort_when_free_uploads_without_overwrite() {
+        let rig = ProjectsRig {
+            absent: true,
+            ..Default::default()
+        };
+        let result = super::project_import(
+            &rig,
+            "fresh",
+            ProjectsRig::zip_fixture(),
+            super::CollisionPolicy::Abort,
+        )
+        .await
+        .expect("free name imports");
+        assert_eq!(result.name, "fresh");
+        assert_eq!(result.collision_policy, "abort");
+        assert_eq!(result.bytes, ProjectsRig::zip_fixture().len());
+        assert_eq!(
+            result.scope,
+            super::ExportScope::new(),
+            "import carries the SAME scope consts as export"
+        );
+        assert_eq!(
+            *rig.imports.lock().unwrap(),
+            vec![("fresh".to_string(), ProjectsRig::zip_fixture().len(), false)]
+        );
+    }
+
+    /// Overwrite: NO pre-check (the server is the authority) — zero
+    /// find calls — and the upload fires with `overwrite=true`.
+    #[tokio::test]
+    async fn import_overwrite_skips_pre_check_and_uploads() {
+        let rig = ProjectsRig::default(); // find would answer Ok; it must not be asked
+        let result = super::project_import(
+            &rig,
+            "PlantFloor",
+            ProjectsRig::zip_fixture(),
+            super::CollisionPolicy::Overwrite,
+        )
+        .await
+        .expect("overwrite imports without a pre-check");
+        assert_eq!(result.collision_policy, "overwrite");
+        assert!(
+            rig.finds.lock().unwrap().is_empty(),
+            "overwrite performs ZERO pre-check calls"
+        );
+        assert_eq!(
+            *rig.imports.lock().unwrap(),
+            vec![(
+                "PlantFloor".to_string(),
+                ProjectsRig::zip_fixture().len(),
+                true
+            )]
+        );
+    }
+
+    /// Scope arrays are DATA (roadmap criterion 4): tag-providers sit
+    /// under excludes, and the serialized shape is the two-key object
+    /// agents key off.
+    #[test]
+    fn export_scope_arrays_are_data() {
+        assert!(
+            super::EXPORT_EXCLUDES.contains(&"tag-providers"),
+            "the headline exclusion (tags are gateway config, not project export)"
+        );
+        assert!(super::EXPORT_EXCLUDES.contains(&"tags"));
+        assert!(super::EXPORT_EXCLUDES.contains(&"udts"));
+        assert!(super::EXPORT_INCLUDES.contains(&"views"));
+        assert!(super::EXPORT_INCLUDES.contains(&"scripts"));
+        assert!(super::EXPORT_INCLUDES.contains(&"named-queries"));
+        let json = serde_json::to_value(super::ExportScope::new()).expect("scope serializes");
+        assert_eq!(
+            json["includes"]
+                .as_array()
+                .expect("includes is an array")
+                .len(),
+            super::EXPORT_INCLUDES.len()
+        );
+        assert_eq!(
+            json["excludes"][0], "tag-providers",
+            "declaration order is the agent-visible order"
+        );
+    }
+
+    /// Export with `-o`: the bytes land at exactly the given path and
+    /// the result carries file/bytes/scope.
+    #[tokio::test]
+    async fn export_to_explicit_path_streams_and_reports() {
+        let rig = ProjectsRig::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("proj.zip");
+        let result = super::project_export(&rig, "My Proj", Some(&out))
+            .await
+            .expect("export");
+        assert_eq!(result.project, "My Proj");
+        assert_eq!(result.file, out.display().to_string());
+        assert_eq!(result.bytes as usize, ProjectsRig::zip_fixture().len());
+        assert_eq!(
+            std::fs::read(&out).expect("file written"),
+            ProjectsRig::zip_fixture(),
+            "the fixture landed byte-for-byte"
+        );
+        assert_eq!(result.scope, super::ExportScope::new());
+        assert_eq!(*rig.exports.lock().unwrap(), vec!["My Proj".to_string()]);
+    }
+
+    /// Default-naming hygiene: a disposition basename is stripped to
+    /// its final component (`.`/`..`/empty refuse → the caller falls
+    /// back), and the `<name>.zip` fallback neutralizes separators.
+    #[test]
+    fn sanitize_basename_strips_path_components() {
+        assert_eq!(
+            super::sanitize_basename("MyProj-export.zip"),
+            Some("MyProj-export.zip".to_string())
+        );
+        assert_eq!(
+            super::sanitize_basename("../../etc/passwd"),
+            Some("passwd".to_string()),
+            "path components never survive"
+        );
+        assert_eq!(
+            super::sanitize_basename(r"..\..\win\evil.zip"),
+            Some("evil.zip".to_string())
+        );
+        assert_eq!(super::sanitize_basename(".."), None);
+        assert_eq!(super::sanitize_basename("."), None);
+        assert_eq!(super::sanitize_basename("   "), None);
+        assert_eq!(super::safe_fallback_stem("a/b\\c"), "a_b_c");
     }
 }
