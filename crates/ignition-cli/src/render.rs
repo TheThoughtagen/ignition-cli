@@ -26,6 +26,7 @@ use ignition_core::actions::projects::{
 use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
 };
+use ignition_core::actions::rig::{RigDownResult, RigStatusResult, RigUpResult};
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
@@ -179,6 +180,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ResourceGet(result) => render_resource_get_human(result),
         ActionOutput::ResourcePut(result) => render_resource_put_human(result),
         ActionOutput::ResourceDelete(result) => render_resource_delete_human(result),
+        ActionOutput::RigUp(result) => render_rig_up_human(result),
+        ActionOutput::RigDown(result) => render_rig_down_human(result),
+        ActionOutput::RigStatus(result) => render_rig_status_human(result),
     }
 }
 
@@ -613,6 +617,79 @@ fn render_resource_put_human(result: &ResourcePutResult) {
 /// `ign resource delete` human line.
 fn render_resource_delete_human(result: &ResourceDeleteResult) {
     println!("deleted {}", result.deleted);
+}
+
+/// `ign rig up` human line: the state-forward confirmation (RUNNING,
+/// uncommissioned-with-wizard, or compose-wait-satisfied when no
+/// gateway port was derivable); warnings follow as their own lines
+/// (data-level, never stderr).
+fn render_rig_up_human(result: &RigUpResult) {
+    match result.state.as_str() {
+        "uncommissioned" => {
+            let url = result.gateway_url.as_deref().unwrap_or("<gateway>");
+            println!("rig {} up — uncommissioned (open {url}/welcome)", result.rig);
+        }
+        _ => match result.gateway_url.as_deref() {
+            Some(url) => println!("rig {} up — gateway RUNNING ({url})", result.rig),
+            None => println!("rig {} up — compose --wait satisfied", result.rig),
+        },
+    }
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+/// `ign rig down` human line.
+fn render_rig_down_human(result: &RigDownResult) {
+    println!("rig {} down", result.rig);
+}
+
+/// `ign rig status` human table: identity header, one row per service
+/// (`service  state  health  published->target/proto`), volumes, and
+/// the ports occupancy line — a down rig prints its emptiness as data
+/// (exit 0).
+fn render_rig_status_human(result: &RigStatusResult) {
+    println!("rig {} ({})", result.rig, result.compose_file);
+    for service in &result.services {
+        let health = service.health.as_deref().unwrap_or("-");
+        let ports = if service.publishers.is_empty() {
+            "-".to_string()
+        } else {
+            service
+                .publishers
+                .iter()
+                .map(|publisher| {
+                    let protocol = publisher.protocol.as_deref().unwrap_or("tcp");
+                    match (publisher.published_port, publisher.target_port) {
+                        (Some(published), Some(target)) => {
+                            format!("{published}\u{2192}{target}/{protocol}")
+                        }
+                        (Some(published), None) => format!("{published}/{protocol}"),
+                        _ => "-".to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("{:<16} {:<8} {:<9} {}", service.name, service.state, health, ports);
+    }
+    if result.services.is_empty() {
+        println!("(no running services — rig is down)");
+    }
+    let volumes = if result.volumes.is_empty() {
+        "-".to_string()
+    } else {
+        result.volumes.join(", ")
+    };
+    println!("volumes: {volumes}");
+    println!(
+        "ports {}",
+        if result.ports_free {
+            "free"
+        } else {
+            "in use"
+        }
+    );
 }
 
 /// Epoch milliseconds → an ISO-8601 UTC string

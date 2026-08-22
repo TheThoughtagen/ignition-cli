@@ -31,7 +31,8 @@ use ignition_core::error::CoreError;
 
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
-    ProjectCommand, ResourceArgs, ResourceCommand, SessionsArgs, SessionsCmd, WaitArgs, WaitCmd,
+    ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
+    WaitArgs, WaitCmd,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -118,6 +119,13 @@ enum ActionOutput {
     ResourcePut(actions::resources::ResourcePutResult),
     /// `ign resource delete` — the surgical loop's destructive verb.
     ResourceDelete(actions::resources::ResourceDeleteResult),
+    /// `ign rig up` — compose up + commissioned wait; uncommissioned
+    /// arrives as DATA (exit 0, wizard hint in warnings).
+    RigUp(actions::rig::RigUpResult),
+    /// `ign rig down` — compose down (volumes kept).
+    RigDown(actions::rig::RigDownResult),
+    /// `ign rig status` — the allowlist status (docker-only family).
+    RigStatus(actions::rig::RigStatusResult),
 }
 
 impl ActionOutput {
@@ -166,6 +174,9 @@ impl ActionOutput {
             ActionOutput::ResourceGet(result) => render_success(profile, result, compact),
             ActionOutput::ResourcePut(result) => render_success(profile, result, compact),
             ActionOutput::ResourceDelete(result) => render_success(profile, result, compact),
+            ActionOutput::RigUp(result) => render_success(profile, result, compact),
+            ActionOutput::RigDown(result) => render_success(profile, result, compact),
+            ActionOutput::RigStatus(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -888,6 +899,62 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
         },
+        // Rig (04-01, RIG-01): the FIRST docker-only family — no
+        // profile, no secret, no gateway client is resolved for these
+        // verbs, and the envelope echoes `profile: null` on BOTH
+        // success and error (the documented contract nuance — the
+        // refusal-precedent shape). `--rig` already folded
+        // `IGNITION_RIG` in apply_env_defaults (one env→flag home);
+        // discovery then runs the LOCKED order: named → [rig].default
+        // → cwd candidates → WHK conventions (both home roots), always
+        // ending in the resolve-then-act config run whose `.name`
+        // becomes the explicit `-p` identity for every op.
+        Commands::Rig(RigArgs { rig, command }) => {
+            let runner = ignition_core::rig::DockerCompose;
+            let selection = match rig {
+                Some(name) => ignition_core::rig::RigSelection::Named(name),
+                None => ignition_core::rig::RigSelection::Auto,
+            };
+            let result = match ignition_core::rig::resolve_plan(&runner, selection, &config).await {
+                Ok(plan) => match command {
+                    RigCommand::Up { timeout } => {
+                        // The commissioned-wait probe: a HEADER-LESS
+                        // client pointed at the rig's OWN derived
+                        // gateway URL (never the profile's gateway) —
+                        // StatusPing answers unauthenticated, so the
+                        // wait works even with no credential at all.
+                        // ssl_verify=false: localhost probes against
+                        // self-signed rig https are the norm.
+                        let probe = actions::rig::gateway_url_from(&plan).and_then(|url| {
+                            let profile = config::Profile {
+                                url: url.parse().ok()?,
+                                label: None,
+                                ssl_verify: false,
+                                auth: AuthRef::default(),
+                            };
+                            ReqwestGatewayApi::new(&profile, None).ok()
+                        });
+                        let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> =
+                            probe.as_ref().map(|api| api as &dyn ignition_core::client::GatewayApi);
+                        actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
+                            .await
+                            .map(ActionOutput::RigUp)
+                    }
+                    RigCommand::Down => {
+                        actions::rig::rig_down(&runner, &plan)
+                            .await
+                            .map(ActionOutput::RigDown)
+                    }
+                    RigCommand::Status => {
+                        actions::rig::rig_status(&runner, &plan)
+                            .await
+                            .map(ActionOutput::RigStatus)
+                    }
+                },
+                Err(err) => Err(err),
+            };
+            (None, result)
+        }
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {
@@ -1105,6 +1172,16 @@ fn apply_env_defaults(cli: &mut Cli) {
     }
     if !cli.yes && std::env::var("IGNITION_YES").is_ok_and(|v| v == "1") {
         cli.yes = true;
+    }
+    // The rig family's env fold lives here too (one env→flag home):
+    // IGNITION_RIG fills a missing --rig exactly like IGNITION_PROFILE
+    // fills --profile — the nested arg is reachable via the command.
+    if let Commands::Rig(rig_args) = &mut cli.command
+        && rig_args.rig.is_none()
+        && let Ok(rig) = std::env::var("IGNITION_RIG")
+        && !rig.is_empty()
+    {
+        rig_args.rig = Some(rig);
     }
 }
 

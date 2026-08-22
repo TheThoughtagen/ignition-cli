@@ -33,7 +33,7 @@ output directly, so it is never JSON-wrapped.
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
 | 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary` |
-| 7    | rig           | docker/compose rig failure (reserved, Phase 4)     | `rig_error`
+| 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
 `CoreError::exit_code()` in `crates/ignition-core/src/error.rs` — kept in
@@ -140,6 +140,9 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign wait restart [--interval S --timeout S]` | Wait for a restart to complete | shares `restart --wait`'s semantics: a non-RUNNING state observed once → RUNNING completes immediately (witnessed restart, no floor wait); an all-RUNNING wait reports success only after the same 5 s floor — no false positive when run right after `ign restart` |
 | `ign wait module <ID> [--interval S --timeout S]` | Wait until a module reports ACTIVE | polls `modules/healthy?search=<id>` (authed); timeout names the id + last observed state |
 | `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route` probes `/system/webdev/<NAME>` (404 = absent, anything else = present); config errors (no profile) still exit 3 |
+| `ign rig [--rig NAME] up [--timeout S]` | Bring a Docker compose rig up (`compose up -d --wait`) and wait for the gateway | docker-only (`profile: null` envelope); `--timeout` is BOTH compose's `--wait-timeout` and the commissioned-probe deadline (default 300 s); a fresh-volume rig reports `"up, uncommissioned"` as DATA (exit 0, wizard URL in `warnings`) |
+| `ign rig [--rig NAME] down` | Stop the rig (`compose down --remove-orphans`; volumes KEPT) | docker-only; the volume-deleting teardown belongs to `rig reset` |
+| `ign rig [--rig NAME] status` | Structured rig status: services (state/health/ports), volumes, ports occupancy | docker-only; an ALLOWLIST only — never a compose-config passthrough (the resolved config contains gateway passwords); a down rig is exit-0 data |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -150,7 +153,90 @@ Config > Modules, and Performance & Diagnostics pages; `sessions`,
 `connections`, the `logs` tree, and the `project` tree replace its
 Sessions, Connections, Logs console, logger-config, and Projects pages.
 
+## Rigs (Docker compose lifecycle)
+
+`ign rig` manages a **compose rig** — a Docker compose project running
+an Ignition gateway plus its satellites. It shells out to
+`docker compose` (the v2 plugin line; **compose ≥ v2 required** — the
+legacy `docker-compose` v1 binary is not supported and a missing/old
+compose fails fast with exit 7 and an install hint). Every operation
+starts with a one-shot resolve run (`docker compose -f <file>
+--project-directory <dir> config --format json`); the resolved project
+`.name` — which honors the rig's own `.env` `COMPOSE_PROJECT_NAME` —
+is the identity truth, and every later op passes it as an explicit
+`-p <name>` (no implicit directory-name projects, ever).
+
+### Rig discovery (in this order)
+
+| Level | Source | Notes |
+|-------|--------|-------|
+| 1 | `--rig NAME` | looks up `[rigs.NAME]` in the config; unknown name → exit 7 with the known rigs listed |
+| 2 | `IGNITION_RIG` env | same lookup (folded into the flag — one env→flag home) |
+| 3 | `[rig].default` | the config's explicit preference — BEATS the cwd scan; a stale default is a loud exit 7 |
+| 4 | cwd compose files | `./docker/compose.yml`, `./docker/docker-compose.yml`, `./compose.yml`, `./compose.yaml`, `./docker-compose.yml` |
+| 5 | WHK conventions | `ignition-git-module/docker/docker-compose.yml`, then `whk-environment-orchestration/docker-compose.yml` — each probed under BOTH `~/Documents/whiskeyhouse/` and `~/whiskeyhouse/` (first hit wins) |
+
+Config surface:
+
+```toml
+[rig]
+default = "git-module"
+
+[rigs.git-module]
+compose_file = "~/Documents/whiskeyhouse/ignition-git-module/docker/docker-compose.yml"
+# project_name optional — omit to honor the rig's own .env
+```
+
+`compose_file` expands `~` and `${VAR}`. `IGNITION_RIG_ROOTS`
+(path-separated) overrides the convention home roots — for machines
+whose WHK checkouts live elsewhere (and for test isolation). Nothing
+found → exit 7 with the full search trail in the message.
+
+### The docker-only contract: `profile: null`
+
+Rig verbs are the first commands with **no gateway dependency**: no
+profile, secret, or client is resolved, and the envelope echoes
+`profile: null` on both success and error. `--profile` has no effect
+on `rig`.
+
+### `rig up` semantics
+
+1. compose version gate (fail fast, exit 7 + install hint);
+2. port pre-flight — a host port held by ANOTHER project's container
+   aborts before anything starts: `port 9088 in use by container X
+   (rig Y)` (same-project occupants are recreate-safe; a non-docker
+   host process is attributed via `lsof` when available);
+3. `up -d --wait --wait-timeout <N> --remove-orphans`;
+4. commissioned wait: the rig's own gateway port is derived from the
+   resolved mappings (first target 8088 → `http://localhost:<pub>`,
+   else target 443 → https) and its `/StatusPing` is polled
+   header-less until RUNNING — same budget as `--timeout`.
+
+**Uncommissioned is data, not failure.** A fresh-volume gateway
+terminally 302s to `/welcome` — there is no headless commissioning
+(verified: no commissioning endpoints exist). `rig up` then exits 0
+with `state: "uncommissioned"` and the wizard URL inside `warnings`
+(the version-command degradation precedent). A deadline reached while
+still STARTING is a real exit-7 failure.
+
+```json
+{"ok": true, "profile": null, "data": {"rig": "ignition-devops", "project": "ignition-devops",
+ "state": "uncommissioned", "gateway_url": "http://localhost:9088",
+ "warnings": ["gateway uncommissioned — open http://localhost:9088/welcome in a browser and complete the commissioning wizard (no headless commissioning exists)"]}}
+```
+
+### `rig status` is an allowlist
+
+Status NEVER passes through `docker compose config`/`inspect` output —
+the resolved config contains `GATEWAY_ADMIN_PASSWORD` and friends.
+The JSON data is exactly `{rig, project, compose_file, services[]:
+{name, state, health, exit_code, publishers[]: {published_port,
+target_port, protocol}}, volumes: [names], ports_free}` — all keys
+always present (empty arrays when none). A down rig is exit-0 data
+(`ports_free: true`, empty services).
+
 ### Project export/import specifics
+
 
 **Timeouts.** Long transfers are the classic default-timeout death, so
 both operations carry per-request budgets instead of the 30 s client

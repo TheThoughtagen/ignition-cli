@@ -131,6 +131,12 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Resource(ResourceArgs),
 
+    /// Manage a Docker compose rig: up/down/status (reset, logs,
+    /// trial, snapshot arrive in later plans) — docker-only, no
+    /// profile needed
+    #[command(arg_required_else_help = true)]
+    Rig(RigArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -344,6 +350,41 @@ pub enum ResourceCommand {
         /// Resource path
         path: String,
     },
+}
+
+/// Rig args (04-01, RIG-01): `--rig` rides the TOP level (the
+/// SessionsArgs `--type` precedent) so every rig verb shares it. The
+/// command enum carries ONLY the wired verbs — later plans extend it
+/// one variant at a time (the established extend-per-plan chore; no
+/// `unimplemented!()` stubs, every commit compiles clippy-clean).
+#[derive(Debug, clap::Args)]
+pub struct RigArgs {
+    /// Rig to operate on (default: IGNITION_RIG, then [rig].default,
+    /// then the cwd/convention scan)
+    #[arg(long, value_name = "NAME")]
+    pub rig: Option<String>,
+
+    #[command(subcommand)]
+    pub command: RigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RigCommand {
+    /// Bring the rig up (compose up -d --wait) and wait for the
+    /// gateway: RUNNING, or uncommissioned-as-data (exit 0 + wizard
+    /// hint in warnings)
+    Up {
+        /// Wait budget in seconds — BOTH compose's --wait-timeout and
+        /// the commissioned probe deadline (default 300)
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Stop the rig (compose down --remove-orphans; volumes KEPT —
+    /// `reset` owns the teardown half)
+    Down,
+    /// Structured status: services, ports, volumes (allowlist JSON;
+    /// a down rig is exit-0 data)
+    Status,
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand
