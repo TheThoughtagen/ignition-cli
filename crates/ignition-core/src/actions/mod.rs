@@ -12,5 +12,6 @@ pub mod profile;
 pub mod projects;
 pub mod resources;
 pub mod restart;
+pub mod rig;
 pub mod sessions;
 pub mod version;
