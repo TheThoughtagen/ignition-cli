@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 4 of 7 (Rig Lifecycle & Trial State)
-**Current Plan:** 2
+**Current Plan:** 3
 **Total Plans in Phase:** 4
-**Status:** Plan 04-01 complete (rig engine + lifecycle core) — next: 04-02
+**Status:** Ready to execute
 **Last Activity:** 2026-08-22
 
-**Progress:** [████████░░] 81%
+**Progress:** [█████████░] 88%
 
 ## Performance Metrics
 
@@ -41,6 +41,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 03 P02 | 29min | 3 tasks | 21 files |
 | Phase 03 P03 | 29min | 3 tasks | 12 files |
 | Phase 04 P01 | 42min | 3 tasks | 14 files |
+| Phase 04 P02 | 18min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -97,6 +98,9 @@ Recent decisions affecting current work:
 - [Phase 04-01]: Rig discovery order LOCKED: --rig > IGNITION_RIG > [rig].default > cwd candidates > git-module > WHK-Global (both home roots, first hit wins) — must-have truth overrode the plan's inverted test blurb; stale [rig].default is a loud exit-7, never a silent scan
 - [Phase 04-01]: Uncommissioned-as-data fires ONLY on the exact poll-deadline shape (Network{source:None}) + witnessed terminal-uncommissioned flag; still-STARTING at deadline stays rig_error. Research Open Question 4 RESOLVED live: --project-directory makes the rig's .env COMPOSE_PROJECT_NAME authoritative cwd-elsewhere
 - [Phase 04-01]: ComposeRunner seam carries TWO program shapes: run (docker compose) + run_docker (plain docker for volume ls / docker ps attribution); tokio process is the ONLY Phase 4 dep change; LDJSON parsing is line-based (StreamDeserializer halts at first bad line); IGNITION_RIG_ROOTS env overrides convention home roots for test isolation
+- [Phase 04]: [Phase 04-02]: rig reset cycle LOCKED: preview (volume-ls label + name-prefix filter) BEFORE version gate → down -v --remove-orphans → port preflight BETWEEN the halves (fresh eyes, torn-down-state hint) → up → commissioned_wait reused verbatim (poll.rs diff-empty); guard fires BEFORE discovery — binary-pinned by exit-2-not-exit-7 in a no-rig cwd (third destructive-verb instance)
+- [Phase 04]: [Phase 04-02]: rig logs is the THIRD sanctioned stdout exception — RAW compose lines in EVERY mode including --json (compose lines are not gateway JSON; no NDJSON transform attempted); run_streaming seam = piped stdout + CONCURRENT stderr drain (pipe-deadlock-proof); streaming sinks need explicit dyn for<'a> FnMut(&'a str) + Send (elided FnMut(&str) mismatches across async_trait desugaring)
+- [Phase 04]: [Phase 04-02]: LIVE-VERIFIED on ignition-devops — second reset previewed+removed ignition-devops_gateway_data exactly; preview's label-filter under-report on stale pre-label volumes is inherent (plan-LOCKED mechanism) and self-heals (compose-created volumes carry the label); test fixtures script OWN-PROJECT occupants so preflight tests never hit the advisory lsof path (determinism with a running rig — 04-01 machine-isolation lesson, lsof edition)
 
 ### Pending Todos
 
@@ -111,6 +115,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-22T19:36:13.067Z
-**Stopped At:** Completed 04-01-PLAN.md (rig engine + lifecycle core — ign rig up/down/status)
+**Last session:** 2026-08-22T19:59:55.189Z
+**Stopped At:** Completed 04-02-PLAN.md (rig reset + logs — RIG-01 complete, live-verified)
 **Resume file:** None
