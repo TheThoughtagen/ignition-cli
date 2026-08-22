@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 2 of 7 (Gateway Health & Inspection)
-**Current Plan:** 3
+**Current Plan:** 4
 **Total Plans in Phase:** 5
 **Status:** Ready to execute
-**Last Activity:** 2026-08-21
+**Last Activity:** 2026-08-22
 
-**Progress:** [████████░░] 78%
+**Progress:** [█████████░] 89%
 
 ## Performance Metrics
 
@@ -35,6 +35,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 02 P01 | 19min | 3 tasks | 14 files |
 | Phase 02 P02 | 12min | 3 tasks | 14 files |
 | Phase Phase 02 PP03 | 14min | 3 tasks | 15 files |
+| Phase 02 P04 | 35min | 3 tasks | 18 files |
 
 ## Accumulated Context
 
@@ -70,6 +71,9 @@ Recent decisions affecting current work:
 - [Phase Phase 02]: [Phase 02-03]: require_confirmation dead-code gate REMOVED in Phase 2/02-03 (sessions terminate = first destructive caller) — earlier than the logged 'until Phase 3'; the attribute's own reason string mandates removal at the first real caller. Guard fires BEFORE profile/secret/client resolution: refusal = exit 2 with null profile, zero config/network work; usage-class errors lead — Plan key_link + must_have truth #2; clippy -D warnings clean with the gate gone is the proof
 - [Phase Phase 02]: [Phase 02-03]: sessions --type rides the SessionsArgs top level and terminate's id is --id <ID> — LOCKED must_have truths overrode the plan's nested-List/positional-id sketch; JSON data always carries ALL family keys (filtered-out = [], endpoints never called) — the stable agent shape all filtered list commands inherit — must_haves are the user contract; agents must never key-hunt
 - [Phase Phase 02]: [Phase 02-03]: Perspective path discipline contract-pinned by recorded-request proofs — GET /data/perspective/api/v1/sessions/ EXACT trailing slash (Pitfall 8), DELETE no-trailing-slash with sessionId/message as QUERY params + empty body; connections ride resources/list/ignition/{database,opc}-connection with healthchecks RAW passthrough (LOW-confidence until live capture — live_connections hook + UAT open question) — Wire subtleties asserted on the REQUEST, not just response parsing
+- [Phase 02-04]: [Phase 02-04]: CoreError::Network.source → Option<reqwest::Error> — source:None marks a poll deadline expiry (same network_error slug/exit 4, NO new variant per plan); the deadline message rides url (subject + waited + last observation); Some-source Display byte-identical, no golden moved
+- [Phase 02-04]: [Phase 02-04]: poll.rs is THE wait engine (HRTB state-threading: for<'a> FnMut(&'a mut S) -> Probe<'a,T>) — ×1.5 backoff clamp [interval,30s], Network/GatewayRestarting retried, Auth never; 02-05's wait/restart --wait reuses it verbatim; tail maps the None-source deadline error to graceful Ok (exit 0)
+- [Phase 02-04]: [Phase 02-04]: 'ign logs' shows the NEWEST entries via sortBy=desc(timestamp) + explicit limit (gateway's own openapi asc()/desc() syntax) — 'recent' without inventing a since-window policy; EVERY logs command sends an explicit limit (default 200, loggers included — Pitfall 9); logs -f --json streams NDJSON (one compact entry per line, no envelope) — the SECOND sanctioned stdout exception, README-documented
 
 ### Pending Todos
 
@@ -84,6 +88,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-21T23:42:43.883Z
-**Stopped At:** Completed 02-03-PLAN.md (sessions/terminate + connections, first --yes caller)
+**Last session:** 2026-08-22T03:44:19.656Z
+**Stopped At:** Completed 02-04-PLAN.md (logs query/tail/download + logger levels + poll engine)
 **Resume file:** None
