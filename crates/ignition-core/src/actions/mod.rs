@@ -10,6 +10,7 @@ pub mod inspect;
 pub mod logs;
 pub mod profile;
 pub mod projects;
+pub mod resources;
 pub mod restart;
 pub mod sessions;
 pub mod version;

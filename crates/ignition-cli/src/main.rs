@@ -31,7 +31,7 @@ use ignition_core::error::CoreError;
 
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
-    ProjectCommand, SessionsArgs, SessionsCmd, WaitArgs, WaitCmd,
+    ProjectCommand, ResourceArgs, ResourceCommand, SessionsArgs, SessionsCmd, WaitArgs, WaitCmd,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -108,6 +108,16 @@ enum ActionOutput {
     /// `ign project import` — buffered upload with collision policy;
     /// data carries {name, collision_policy, bytes, scope, outcome}.
     ProjectImport(actions::projects::ImportResult),
+    /// `ign resource list` — a project's resources (passthrough
+    /// entries).
+    ResourcesList(actions::resources::ResourcesResult),
+    /// `ign resource get` — one resource's sniffed content
+    /// ({project, path, content_kind, content}).
+    ResourceGet(actions::resources::ResourceGetResult),
+    /// `ign resource put` — the surgical upsert.
+    ResourcePut(actions::resources::ResourcePutResult),
+    /// `ign resource delete` — the surgical loop's destructive verb.
+    ResourceDelete(actions::resources::ResourceDeleteResult),
 }
 
 impl ActionOutput {
@@ -152,6 +162,10 @@ impl ActionOutput {
             ActionOutput::ProjectDelete(result) => render_success(profile, result, compact),
             ActionOutput::ProjectExport(result) => render_success(profile, result, compact),
             ActionOutput::ProjectImport(result) => render_success(profile, result, compact),
+            ActionOutput::ResourcesList(result) => render_success(profile, result, compact),
+            ActionOutput::ResourceGet(result) => render_success(profile, result, compact),
+            ActionOutput::ResourcePut(result) => render_success(profile, result, compact),
+            ActionOutput::ResourceDelete(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -777,6 +791,98 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     )
                     .await
                     .map(ActionOutput::ProjectImport),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+        },
+        // Resources (03-03, PROJ-05): the surgical edit loop. All arms
+        // are authed (inspection-command rule: exit 3 without a
+        // credential). Delete is the family's destructive verb — the
+        // LOCKED guard shape (fires BEFORE resolve_gateway_api, so a
+        // refusal exits 2 with profile null and does ZERO work). Put
+        // is an upsert of ONE resource with explicit content — NOT in
+        // the --yes family (planner decision: the surgical edit loop
+        // stays friction-free); the dispatch layer owns the byte
+        // source (`--file PATH` via std::fs, `--file -` via tokio
+        // stdin), the action owns the sniff.
+        Commands::Resource(ResourceArgs { command }) => match command {
+            ResourceCommand::List { project, prefix } => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => {
+                        actions::resources::resources_list(&api, &project, prefix.as_deref())
+                            .await
+                            .map(ActionOutput::ResourcesList)
+                    }
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ResourceCommand::Get { project, path } => {
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::resources::resource_get(&api, &project, &path)
+                        .await
+                        .map(ActionOutput::ResourceGet),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ResourceCommand::Put {
+                project,
+                path,
+                file,
+            } => {
+                let input = if file == "-" {
+                    use tokio::io::AsyncReadExt;
+                    let mut buffer = Vec::new();
+                    match tokio::io::stdin().read_to_end(&mut buffer).await {
+                        Ok(_) => buffer,
+                        Err(err) => {
+                            return (
+                                None,
+                                Err(CoreError::InvalidInput {
+                                    reason: format!("cannot read stdin: {err}"),
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    match std::fs::read(&file) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            return (
+                                None,
+                                Err(CoreError::InvalidInput {
+                                    reason: format!("cannot read {file}: {err}"),
+                                }),
+                            );
+                        }
+                    }
+                };
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::resources::resource_put(&api, &project, &path, input)
+                        .await
+                        .map(ActionOutput::ResourcePut),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            ResourceCommand::Delete { project, path } => {
+                // The LOCKED destructive shape: the guard refuses
+                // (exit 2, confirmation_required, profile null)
+                // BEFORE any profile/secret/client resolution — a
+                // refusal costs nothing and never touches the gateway.
+                if let Err(err) = require_confirmation(cli.yes, "resource delete") {
+                    return (None, Err(err));
+                }
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::resources::resource_delete(&api, &project, &path)
+                        .await
+                        .map(ActionOutput::ResourceDelete),
                     Err(err) => Err(err),
                 };
                 (profile, result)

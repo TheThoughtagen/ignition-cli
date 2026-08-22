@@ -23,6 +23,9 @@ use ignition_core::actions::projects::{
     ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult, ProjectRenameResult,
     ProjectSetResult, ProjectsResult,
 };
+use ignition_core::actions::resources::{
+    ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
+};
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
@@ -172,6 +175,10 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ProjectDelete(result) => render_project_delete_human(result),
         ActionOutput::ProjectExport(result) => render_project_export_human(result),
         ActionOutput::ProjectImport(result) => render_project_import_human(result),
+        ActionOutput::ResourcesList(result) => render_resources_list_human(result),
+        ActionOutput::ResourceGet(result) => render_resource_get_human(result),
+        ActionOutput::ResourcePut(result) => render_resource_put_human(result),
+        ActionOutput::ResourceDelete(result) => render_resource_delete_human(result),
     }
 }
 
@@ -570,6 +577,42 @@ fn render_project_import_human(result: &ImportResult) {
         "imported {} ({} bytes, policy {})",
         result.name, result.bytes, result.collision_policy
     );
+}
+
+/// `ign resource list` human rows: one resource path per line — the
+/// surgical loop's inventory (pathless entries render as `-`).
+fn render_resources_list_human(result: &ResourcesResult) {
+    for entry in &result.resources {
+        println!("{}", entry.path.as_deref().unwrap_or("-"));
+    }
+    if result.resources.is_empty() {
+        println!("(no resources)");
+    }
+}
+
+/// `ign resource get` human output: pretty JSON when the sniff said
+/// json, the raw text otherwise — ready to redirect into a file and
+/// put back (the surgical edit loop).
+fn render_resource_get_human(result: &ResourceGetResult) {
+    if result.content_kind == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result.content).unwrap_or_default()
+        );
+    } else {
+        println!("{}", result.content.as_str().unwrap_or_default());
+    }
+}
+
+/// `ign resource put` human line: the path + the sniffed kind that
+/// rode the wire.
+fn render_resource_put_human(result: &ResourcePutResult) {
+    println!("put {} ({})", result.path, result.content_kind);
+}
+
+/// `ign resource delete` human line.
+fn render_resource_delete_human(result: &ResourceDeleteResult) {
+    println!("deleted {}", result.deleted);
 }
 
 /// Epoch milliseconds → an ISO-8601 UTC string

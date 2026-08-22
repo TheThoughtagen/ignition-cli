@@ -8,11 +8,11 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file` (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input` (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -39,6 +39,13 @@ pub enum CoreError {
     /// change, like [`Self::ConfirmationRequired`] (03-02).
     #[error("invalid import file: {reason}")]
     InvalidImportFile { reason: String },
+
+    /// A command input the caller must fix (unreadable `--file`, failed
+    /// stdin read). Exit 2 — usage class, the generic sibling of
+    /// [`Self::InvalidImportFile`] (03-03: `resource put`'s byte
+    /// source).
+    #[error("invalid input: {reason}")]
+    InvalidInput { reason: String },
 
     /// Named profile absent from config. Exit 3.
     #[error("profile {name:?} not found (known profiles: {known:?})")]
@@ -133,6 +140,19 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// A binary (data.bin-class) resource met the surgical JSON/text
+    /// loop — REFUSED rather than corrupted through it. Exit 6 —
+    /// target state: the command is invalid for that resource's
+    /// nature; the export/import family owns binary resources
+    /// (Pitfall 7).
+    #[error("resource {path:?} has binary content — not editable via the resource loop")]
+    ResourceBinary {
+        /// The resource path that was refused.
+        path: String,
+        /// URL of the request involved, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -146,6 +166,7 @@ impl CoreError {
             Self::Internal(_) => "internal",
             Self::ConfirmationRequired { .. } => "confirmation_required",
             Self::InvalidImportFile { .. } => "invalid_import_file",
+            Self::InvalidInput { .. } => "invalid_input",
             Self::ProfileNotFound { .. } => "profile_not_found",
             Self::NoActiveProfile => "no_active_profile",
             Self::SecretUnavailable { .. } => "secret_unavailable",
@@ -157,6 +178,7 @@ impl CoreError {
             Self::GatewayRestarting { .. } => "gateway_restarting",
             Self::NotFound { .. } => "not_found",
             Self::ProjectExists { .. } => "project_exists",
+            Self::ResourceBinary { .. } => "resource_binary",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -165,7 +187,9 @@ impl CoreError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Internal(_) => 1,
-            Self::ConfirmationRequired { .. } | Self::InvalidImportFile { .. } => 2,
+            Self::ConfirmationRequired { .. }
+            | Self::InvalidImportFile { .. }
+            | Self::InvalidInput { .. } => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -176,7 +200,8 @@ impl CoreError {
             | Self::GatewayNotCommissioned { .. }
             | Self::GatewayRestarting { .. }
             | Self::NotFound { .. }
-            | Self::ProjectExists { .. } => 6,
+            | Self::ProjectExists { .. }
+            | Self::ResourceBinary { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -196,8 +221,13 @@ impl CoreError {
             ),
             Self::InvalidImportFile { .. } => Some(
                 "import expects a project-export ZIP (PK\\x03\\x04 magic) of at \
-                  most 512 MB — pass a file produced by `ign project export` \
-                  via --file (or `-` to pipe one on stdin)"
+                   most 512 MB — pass a file produced by `ign project export` \
+                   via --file (or `-` to pipe one on stdin)"
+                    .to_string(),
+            ),
+            Self::InvalidInput { .. } => Some(
+                "fix the input source — a readable file path via --file, or `-` \
+                   to pipe the content on stdin"
                     .to_string(),
             ),
             Self::ProfileNotFound { known, .. } => Some(if known.is_empty() {
@@ -265,6 +295,11 @@ impl CoreError {
                   are deleted; merge is Designer-only)"
                     .to_string(),
             ),
+            Self::ResourceBinary { .. } => Some(
+                "resource content is binary — use `ign project export`/`import` \
+                  for data.bin-class resources"
+                    .to_string(),
+            ),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -283,7 +318,8 @@ impl CoreError {
             | Self::GatewayNotCommissioned { endpoint }
             | Self::GatewayRestarting { endpoint }
             | Self::NotFound { endpoint }
-            | Self::ProjectExists { endpoint, .. } => endpoint.clone(),
+            | Self::ProjectExists { endpoint, .. }
+            | Self::ResourceBinary { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -376,6 +412,13 @@ mod tests {
                 "invalid_import_file",
             ),
             (
+                CoreError::InvalidInput {
+                    reason: "cannot read put.json".into(),
+                },
+                2,
+                "invalid_input",
+            ),
+            (
                 CoreError::ProfileNotFound {
                     name: "nope".into(),
                     known: vec!["dev".into()],
@@ -444,6 +487,14 @@ mod tests {
                 },
                 6,
                 "project_exists",
+            ),
+            (
+                CoreError::ResourceBinary {
+                    path: "com.x/perspective/session-permissions".into(),
+                    endpoint: None,
+                },
+                6,
+                "resource_binary",
             ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];

@@ -1,0 +1,686 @@
+//! Golden-file contract tests for `ign resource` (03-03, PROJ-05) —
+//! wiremock fixtures shaped after the mcp-derived (MEDIUM) family,
+//! harness inherited from `contract_projects.rs` (03-01): isolated
+//! `IGNITION_CLI_CONFIG`, `stdout_for_golden`, programmatic envelopes
+//! where the `endpoint` embeds the random mock URI.
+//!
+//! The crown pins:
+//! - `resource delete` WITHOUT `--yes` exits 2 with the
+//!   `confirmation_required` envelope and profile null — the guard
+//!   fires BEFORE any resolution (no mock even exists);
+//! - a BINARY resource get refuses with exit 6 `resource_binary`
+//!   (never corrupted through the JSON loop — Pitfall 7) and a
+//!   binary put input refuses BEFORE any network I/O;
+//! - put from a file declares `application/json` with the EXACT file
+//!   bytes; put from stdin declares `text/plain; charset=utf-8`;
+//! - get renders PRETTY JSON in human mode (the surgical edit loop's
+//!   round-trip form).
+
+use std::path::{Path, PathBuf};
+
+use assert_cmd::Command;
+use serde_json::Value;
+
+/// Isolated config dir + the config path inside it (file need not exist).
+fn isolated_config() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    (dir, path)
+}
+
+/// Write the one-profile dev config whose URL points at `url` and whose
+/// token comes from `IGNITION_TOKEN`.
+fn write_profile_config(config: &Path, url: &str) {
+    std::fs::write(
+        config,
+        format!(
+            "active = \"dev\"\n\n[profiles.dev]\nurl = \"{url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
+        ),
+    )
+    .expect("write config");
+}
+
+/// Spawn `ign` with an isolated config, the mock token in the env, and args.
+fn ign(config: &Path, url: &str, args: &[&str]) -> std::process::Output {
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command
+        .env("IGNITION_CLI_CONFIG", config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_URL", url);
+    command.args(args).output().expect("spawn ign")
+}
+
+/// Spawn `ign` reading `stdin` fully (the `--file -` put path).
+fn ign_stdin(config: &Path, url: &str, args: &[&str], stdin: &[u8]) -> std::process::Output {
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command
+        .env("IGNITION_CLI_CONFIG", config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_URL", url);
+    command
+        .args(args)
+        .write_stdin(stdin)
+        .output()
+        .expect("spawn ign")
+}
+
+/// stdout minus the single trailing newline `println!` appends.
+fn stdout_for_golden(out: &std::process::Output) -> &str {
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8 stdout");
+    stdout.strip_suffix('\n').unwrap_or(stdout)
+}
+
+/// stderr's JSON envelope starting at the first `{` (log-tolerant parse).
+fn stderr_envelope(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let start = stderr.find('{').unwrap_or(0);
+    stderr[start..].to_string()
+}
+
+/// The list fixture: two plausible resources (a view and a script —
+/// the two families the surgical loop edits most).
+async fn mount_resources_list(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/PlantFloor/resources",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    {
+                        "path": "com.example/views/Dashboard",
+                        "scope": "A",
+                        "version": 1,
+                        "restricted": false
+                    },
+                    {
+                        "path": "ignition/script-python/e2e/scratch",
+                        "scope": "G"
+                    }
+                ],
+                "metadata": {"total": 2, "matching": 2, "limit": -1, "offset": 0}
+            })),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// `ign resource list` goldens in all three modes: one path per line
+/// (human), the pretty envelope, and compact — passthrough extras
+/// ride the JSON items (MEDIUM shape: `path` typed, everything else
+/// round-trips).
+#[tokio::test]
+async fn resource_list_render_modes_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_resources_list(&server).await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    // Pretty JSON: passthrough extras sorted after the typed path.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "list", "PlantFloor", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+{
+  "ok": true,
+  "profile": "dev",
+  "data": {
+    "resources": [
+      {
+        "path": "com.example/views/Dashboard",
+        "restricted": false,
+        "scope": "A",
+        "version": 1
+      },
+      {
+        "path": "ignition/script-python/e2e/scratch",
+        "scope": "G"
+      }
+    ]
+  }
+}
+"#]],
+    );
+
+    // Human: the surgical loop's inventory — one path per line.
+    let out = ign(&config, &server.uri(), &["resource", "list", "PlantFloor"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+com.example/views/Dashboard
+ignition/script-python/e2e/scratch
+"#]],
+    );
+
+    // Compact: one line, same shape.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "list", "PlantFloor", "--compact"],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"resources":[{"path":"com.example/views/Dashboard","restricted":false,"scope":"A","version":1},{"path":"ignition/script-python/e2e/scratch","scope":"G"}]}}"#]],
+    );
+}
+
+/// `resource get` on a JSON resource: PRETTY JSON in human mode (the
+/// round-trip form — redirect to a file, edit, put back) and the
+/// `{project, path, content_kind, content}` agent shape in compact.
+#[tokio::test]
+async fn resource_get_json_pretty_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/ignition/script%2Dpython/e2e/scratch",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+            br#"{"scope":"G","code":"print('hi')"}"#.to_vec(),
+            "application/json",
+        ))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "get", "p", "ignition/script-python/e2e/scratch"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+{
+  "code": "print('hi')",
+  "scope": "G"
+}
+"#]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "get",
+            "p",
+            "ignition/script-python/e2e/scratch",
+            "--compact",
+        ],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"ignition/script-python/e2e/scratch","content_kind":"json","content":{"code":"print('hi')","scope":"G"}}}"#]],
+    );
+}
+
+/// `resource get` on a TEXT resource: the raw text in human mode and
+/// the text-as-JSON-string agent shape.
+#[tokio::test]
+async fn resource_get_text_raw_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/notes/readme",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(b"just a text payload".to_vec(), "text/plain"),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "get", "p", "notes/readme"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+just a text payload
+"#]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "get", "p", "notes/readme", "--compact"],
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"notes/readme","content_kind":"text","content":"just a text payload"}}"#]],
+    );
+}
+
+/// THE binary-refusal golden: a `data.bin`-class resource get exits 6
+/// `resource_binary` with the export/import hint — the content is
+/// NEVER corrupted through the JSON loop (Pitfall 7).
+#[tokio::test]
+async fn resource_get_binary_refuses_exit_6_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/com%2Ex/perms/data%2Ebin",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+            vec![0x00, 0x01, 0x02, 0xFF, 0xFE],
+            "application/octet-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "get", "p", "com.x/perms/data.bin", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(6), "target-state class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":"dev","error":{"code":"resource_binary","message":"resource /"com.x/perms/data.bin/" has binary content — not editable via the resource loop","endpoint":null,"hint":"resource content is binary — use `ign project export`/`import` for data.bin-class resources"}}
+
+"#]],
+    );
+}
+
+/// `resource put --file F` with JSON content: the PUT mock's matchers
+/// only fire on the EXACT body bytes and `Content-Type:
+/// application/json` (the sniffer's JSON arm), and the human line
+/// names the path + kind.
+#[tokio::test]
+async fn resource_put_from_file_json_golden() {
+    let body = br#"{"scope":"G","code":"print('hi')"}"#.to_vec();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/ignition/script%2Dpython/e2e/scratch",
+        ))
+        .and(wiremock::matchers::body_bytes(body.clone()))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let file_dir = tempfile::tempdir().expect("filedir");
+    let file_path = file_dir.path().join("scratch.json");
+    std::fs::write(&file_path, &body).expect("write fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "put",
+            "p",
+            "ignition/script-python/e2e/scratch",
+            "--file",
+            file_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+put ignition/script-python/e2e/scratch (json)
+"#]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "put",
+            "p",
+            "ignition/script-python/e2e/scratch",
+            "--file",
+            file_path.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"ignition/script-python/e2e/scratch","content_kind":"json"}}"#]],
+    );
+}
+
+/// `resource put --file -` from stdin with NON-JSON text: the PUT
+/// declares `text/plain; charset=utf-8` (the sniffer's text arm) with
+/// the exact piped bytes.
+#[tokio::test]
+async fn resource_put_stdin_text_golden() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/notes/readme",
+        ))
+        .and(wiremock::matchers::body_bytes(
+            b"piped text content".to_vec(),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "put",
+            "p",
+            "notes/readme",
+            "--file",
+            "-",
+            "--compact",
+        ],
+        b"piped text content",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"notes/readme","content_kind":"text"}}"#]],
+    );
+
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8"),
+        "the sniffer's TEXT arm declared the wire content type"
+    );
+    assert_eq!(requests[0].body, b"piped text content".to_vec());
+}
+
+/// A BINARY put input refuses with exit 6 `resource_binary` BEFORE
+/// any network I/O — the config points at a DEAD URL and no mock
+/// exists; if any HTTP had been attempted the command would exit 4.
+#[tokio::test]
+async fn resource_put_binary_input_refuses_before_network_golden() {
+    let bad_dir = tempfile::tempdir().expect("bad dir");
+    let bad_path = bad_dir.path().join("blob.bin");
+    std::fs::write(&bad_path, [0x00, 0x50, 0x4B, 0x03, 0x04]).expect("write blob");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "resource",
+            "put",
+            "p",
+            "com.x/perms/data.bin",
+            "--file",
+            bad_path.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "target-state class, zero network"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":"dev","error":{"code":"resource_binary","message":"resource /"com.x/perms/data.bin/" has binary content — not editable via the resource loop","endpoint":null,"hint":"resource content is binary — use `ign project export`/`import` for data.bin-class resources"}}
+
+"#]],
+    );
+}
+
+/// A nonexistent `--file` on put exits 2 `invalid_input` — the
+/// caller's byte source, usage class, zero network.
+#[tokio::test]
+async fn resource_put_missing_file_exits_2_golden() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "resource",
+            "put",
+            "p",
+            "some/path",
+            "--file",
+            "/nonexistent/scratch.json",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class, zero network");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out))
+        .unwrap_or_else(|err| panic!("stderr envelope parses: {err}"));
+    assert_eq!(body["error"]["code"], Value::String("invalid_input".into()));
+    let hint = body["error"]["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("--file") && hint.contains("stdin"),
+        "hint names the fix: {hint}"
+    );
+}
+
+/// THE crown pin: `resource delete` WITHOUT `--yes` exits 2 with the
+/// `confirmation_required` envelope and profile NULL — fully static
+/// content (the guard fires before any API construction — no mock, no
+/// network, the config points at a dead URL and it does not matter).
+#[tokio::test]
+async fn resource_delete_without_yes_exits_2_golden() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &["resource", "delete", "p", "some/path", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"confirmation_required","message":"resource delete is destructive; rerun with --yes to confirm","endpoint":null,"hint":"this operation is destructive; re-run with --yes or set IGNITION_YES=1"}}
+
+"#]],
+    );
+
+    // Human mode: the message + hint on stderr.
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &["resource", "delete", "p", "x"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("resource delete"),
+        "human message names the operation: {stderr}"
+    );
+    assert!(stderr.contains("--yes"), "human hint names --yes: {stderr}");
+}
+
+/// Delete WITH `--yes`: the gateway-side DELETE fires against the
+/// exact per-segment-encoded path (authed, empty body) and the
+/// success line golden-pins.
+#[tokio::test]
+async fn resource_delete_with_yes_hits_exact_path() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/com%2Ex/views/My%20Folder/V1",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1..)
+        .mount_as_scoped(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "delete",
+            "p",
+            "com.x/views/My Folder/V1",
+            "--yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+deleted com.x/views/My Folder/V1
+"#]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "delete",
+            "p",
+            "com.x/views/My Folder/V1",
+            "--yes",
+            "--compact",
+        ],
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[
+            r#"{"ok":true,"profile":"dev","data":{"deleted":"com.x/views/My Folder/V1"}}"#
+        ]],
+    );
+
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 2, "one DELETE per invocation");
+    for request in &requests {
+        assert_eq!(
+            request.url.path(),
+            "/data/api/v1/projects/p/resources/com%2Ex/views/My%20Folder/V1",
+            "the per-segment-encoded path rode the wire"
+        );
+        assert!(request.body.is_empty(), "the DELETE carries no body");
+    }
+}
+
+/// A nonexistent resource: the gateway answers 404 → exit 6,
+/// `not_found` (endpoint embeds the dynamic mock URI — programmatic
+/// envelope assertions, the version_gateway_contract pattern).
+#[tokio::test]
+async fn resource_get_nonexistent_exits_6() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/p/resources/nope",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"message": "Resource not found"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["resource", "get", "p", "nope", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(6), "target-state class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+
+    let body: Value = serde_json::from_str(&stderr_envelope(&out))
+        .unwrap_or_else(|err| panic!("stderr envelope parses: {err}"));
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::String("dev".into()));
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("not_found".into()),
+        "full envelope: {}",
+        stderr_envelope(&out)
+    );
+    assert_eq!(
+        body["error"]["endpoint"],
+        Value::String(format!(
+            "{}/data/api/v1/projects/p/resources/nope",
+            server.uri()
+        ))
+    );
+}

@@ -125,6 +125,12 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Project(ProjectArgs),
 
+    /// Manage a project's individual resources: list, get, put,
+    /// delete — the surgical edit loop (change one view/script
+    /// without re-importing everything)
+    #[command(arg_required_else_help = true)]
+    Resource(ResourceArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -285,6 +291,58 @@ pub enum ProjectCommand {
         /// value; the README documents why)
         #[arg(long, value_enum, default_value_t = CollisionPolicy::Abort)]
         collision_policy: CollisionPolicy,
+    },
+}
+
+/// Resource subcommands (03-03, PROJ-05). `delete` is the family's
+/// destructive verb (`--yes`-guarded, exit 2 without — the
+/// sessions-terminate shape); `put` is an upsert (create-or-replace
+/// ONE resource with explicit content) and stays friction-free per
+/// the planner decision — agents pass exactly what they want written.
+#[derive(Debug, clap::Args)]
+pub struct ResourceArgs {
+    #[command(subcommand)]
+    pub command: ResourceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ResourceCommand {
+    /// List a project's resources (one path per line in human mode)
+    List {
+        /// Project name
+        project: String,
+        /// Only paths under this prefix (rides the wire as the
+        /// server-side `path` filter)
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+    /// Read one resource: JSON pretty-printed, text raw — binary
+    /// (data.bin-class) resources refuse with exit 6
+    Get {
+        /// Project name
+        project: String,
+        /// Resource path, slashes kept (e.g.
+        /// `ignition/script-python/e2e/scratch`)
+        path: String,
+    },
+    /// Write one resource (upsert: created if absent, replaced if
+    /// present) — JSON if parseable (application/json), else UTF-8
+    /// text (text/plain); binary-looking input refuses
+    Put {
+        /// Project name
+        project: String,
+        /// Resource path
+        path: String,
+        /// File to read the content from, or `-` for stdin
+        #[arg(long, value_name = "PATH")]
+        file: String,
+    },
+    /// Delete one resource — destructive, refused without --yes
+    Delete {
+        /// Project name
+        project: String,
+        /// Resource path
+        path: String,
     },
 }
 

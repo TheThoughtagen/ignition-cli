@@ -28,11 +28,11 @@ output directly, so it is never JSON-wrapped.
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, or an invalid import file | `confirmation_required`, `invalid_import_file`
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, an invalid import file, or an unreadable command input | `confirmation_required`, `invalid_import_file`, `invalid_input`
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary` |
 | 7    | rig           | docker/compose rig failure (reserved, Phase 4)     | `rig_error`
 
 The exit-code table lives in exactly two places — this README and
@@ -125,6 +125,10 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign project delete <NAME>` | Delete a project | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the wire DELETE always carries the server's own `confirm=true` query param (both guard layers); a nonexistent name exits 6 (`not_found`); audit-logged server-side |
 | `ign project export <NAME> [-o FILE]` | Export a project as a ZIP archive | the ZIP STREAMS to disk chunk-by-chunk (no memory buffering; 120 s per-request timeout); default filename from `Content-Disposition`, else `<name>.zip`; stdout stays data-only — JSON carries `{project, file, bytes, scope}` (see scope metadata below) |
 | `ign project import <NAME> --file PATH\|--file - [--collision-policy abort\|overwrite]` | Import a project from a ZIP (`-` reads stdin) | default policy **abort**: importing over an existing name exits 6 (`project_exists`) BEFORE any upload; **overwrite** is destructive — exit 2 without `--yes` and it REPLACES the entire project (resources absent from the ZIP are deleted; merge is Designer-only); a non-ZIP or >512 MB input exits 2 (`invalid_import_file`) before any network I/O; 300 s per-request timeout |
+| `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resources, one path per line | `--prefix` filters server-side (rides the wire as the `path` query param); JSON items are passthrough-shaped (`path` typed, every other key round-trips); ⚠ MEDIUM-confidence family — see the resource caveat below |
+| `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`); a binary (data.bin-class) resource refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
+| `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource (upsert: created if absent, replaced if present) | content is sniffed: JSON if parseable (`application/json`), else UTF-8 text (`text/plain; charset=utf-8`); binary-looking input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; NOT `--yes`-guarded (an explicit-content upsert, not a destructive op) |
+| `ign resource delete <PROJECT> <PATH>` | Delete ONE resource | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the surgical loop's destructive verb; a nonexistent path exits 6 (`not_found`) |
 | `ign logs [--logger L] [--min-level L] [--since SPAN] [--limit N]` | Recent log entries, newest first (`ISO-UTC  LEVEL  logger  message`) | `--limit` is ALWAYS explicit (default 200 — the server default is unlimited); `--since` takes EPOCH-MS or `500ms/30s/5min/2h`; sorts `desc(timestamp)` so you see the NEWEST entries, never the oldest 200 |
 | `ign logs -f [--interval S] [--timeout S]` | Live tail: entries stream to stdout as they occur | poll-based (no server push exists — `GET /logs?startTime=<cursor>` IS the tail); `--timeout` expiry ends cleanly (exit 0); without it, run until Ctrl-C (default process kill, no envelope); see the streaming exception below |
 | `ign logs download [-o FILE]` | Download the log archive — a SQLite `.idb`, never a zip | bytes written exactly as received; default filename from `Content-Disposition`, else `<profile>-logs-<ts>.idb`; `--json` data is `{file, bytes, content_type}` |
@@ -171,6 +175,37 @@ the ENTIRE project — resources absent from the ZIP are deleted).
 `merge` is the Designer import popup's mode and is not available via
 REST; the CLI rejects it at the flag level by simply not offering it.
 
+### Resource editing — the surgical loop (and its caveat)
+
+`ign resource` changes ONE view/script/query without re-importing the
+whole project — the get → edit → put loop:
+
+```bash
+ign resource get PlantFloor ignition/script-python/e2e/scratch > scratch.json
+# ...edit scratch.json...
+ign resource put PlantFloor ignition/script-python/e2e/scratch --file scratch.json
+ign resource delete PlantFloor com.example/views/OldView --yes
+```
+
+Paths keep their slashes and match the export tree
+(`{module}/{resource-type}/…/name`; the core module's folder is
+`ignition/`, not the `com.inductiveautomation.ignition` the old docs
+suggest). `put` sniffs its input: valid JSON rides as
+`application/json`, other UTF-8 as text — and BINARY content (a NUL
+byte near the head, `data.bin`-class resources like Perspective
+session-permissions) refuses with exit 6 `resource_binary` on BOTH
+get and put: binary resources belong to the export/import family,
+never the JSON loop.
+
+⚠ **MEDIUM-confidence caveat.** The resource endpoints exist only in
+a single third-party client (ignition-mcp) — they are absent from
+the official 83-api collection — so paths and envelope shapes here
+are wiremock-pinned but not yet live-verified. The verdict arrives
+the moment a gateway token exists: run the openapi-capture hook in
+`crates/ignition-cli/tests/e2e_projects.rs` (`-- --ignored`) and it
+writes an authoritative projects+resources extract into the phase
+dir; the same run drives the full e2e loop against a live gateway.
+
 ### Streaming output (the second stdout exception)
 
 `ign logs -f` is a STREAM: entries print to stdout as they arrive, so
@@ -187,7 +222,8 @@ envelope — plan for it in pipelines).
 
 Commands that change gateway state (`sessions terminate`,
 `logs loggers set`/`reset`, `project delete`, `project import
---collision-policy overwrite`, and `restart` — the big one: it takes
+--collision-policy overwrite`, `resource delete`, and `restart` —
+the big one: it takes
 the whole gateway down for ~1 min) refuse without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
@@ -198,7 +234,11 @@ activity: a refusal never touches the gateway. `project delete` and
 pair: besides the CLI refusal, delete's wire request always carries
 the gateway's own `confirm=true` query param, and overwrite REPLACES
 the entire project (abort-policy imports need no `--yes` — they fail
-safely server-side). Termination, restart, and project mutations are
+safely server-side). `resource put` is deliberately NOT in this
+family: it upserts ONE resource with explicit content (the surgical
+edit loop stays friction-free), while `resource delete` removes one
+and is guarded. Termination, restart, project mutations, and resource
+writes are
 audit-logged server-side by the gateway. Non-destructive project
 mutations (`copy`, `rename`, `set`, `export`) create, relabel, or read
 rather than destroy, so they carry no `--yes`.
