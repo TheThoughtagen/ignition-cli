@@ -444,6 +444,405 @@ deleted x
     }
 }
 
+/// Spawn `ign` with an isolated config, the mock token in the env, args,
+/// and a working directory (export's default naming writes to the CWD).
+fn ign_in(dir: &Path, config: &Path, url: &str, args: &[&str]) -> std::process::Output {
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command
+        .env("IGNITION_CLI_CONFIG", config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_URL", url)
+        .current_dir(dir);
+    command.args(args).output().expect("spawn ign")
+}
+
+/// Spawn `ign` reading `stdin` fully (the `--file -` import path).
+fn ign_stdin(config: &Path, url: &str, args: &[&str], stdin: &[u8]) -> std::process::Output {
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command
+        .env("IGNITION_CLI_CONFIG", config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_URL", url);
+    command
+        .args(args)
+        .write_stdin(stdin)
+        .output()
+        .expect("spawn ign")
+}
+
+/// The binary-level ZIP fixture — real magic bytes + a known payload
+/// (4 + 22 = 26 bytes, pinned in the goldens).
+fn zip_fixture() -> Vec<u8> {
+    let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
+    bytes.extend_from_slice(b"project-export-fixture");
+    bytes
+}
+
+/// `ign project export` goldens (PROJ-03): the ZIP streams to the
+/// CWD under the SANITIZED `Content-Disposition` name — human lines
+/// (artifact + scope summary) and the compact JSON carrying
+/// `{project, file, bytes, scope}` with BOTH scope arrays.
+#[tokio::test]
+async fn project_export_success_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/My%20Proj",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                // set_body_raw: set_body_string would force text/plain
+                .set_body_raw(zip_fixture(), "application/zip")
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"MyProj-export.zip\"",
+                ),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let workdir = tempfile::tempdir().expect("workdir");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    // Human: artifact line + the scope summary.
+    let out = ign_in(
+        workdir.path(),
+        &config,
+        &server.uri(),
+        &["project", "export", "My Proj"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+exported My Proj → MyProj-export.zip (26 bytes)
+scope: includes views/scripts/named-queries/vision-windows/perspective-themes-styles/reporting/alarm-notification-profiles/webdev-routes/translations/sfc-charts · excludes tag-providers/tags/udts/gateway-config/database-connections/users-roles/alarm-journal/certificates
+"#]],
+    );
+    // The artifact landed byte-for-byte under the disposition name.
+    assert_eq!(
+        std::fs::read(workdir.path().join("MyProj-export.zip")).expect("file written"),
+        zip_fixture()
+    );
+    // No .part remnant survived the atomic rename.
+    assert!(
+        !workdir.path().join("My Proj.zip.part").exists()
+            && !workdir.path().join("MyProj-export.zip.part").exists(),
+        "the .part temp is gone"
+    );
+
+    // Compact: the full agent shape incl. both scope arrays.
+    let out = ign_in(
+        workdir.path(),
+        &config,
+        &server.uri(),
+        &["project", "export", "My Proj", "--compact"],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"My Proj","file":"MyProj-export.zip","bytes":26,"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
+    );
+}
+
+/// `project export -o FILE`: the bytes land at EXACTLY the given path
+/// (no disposition renaming) and the data carries that path.
+#[tokio::test]
+async fn project_export_explicit_output_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/export/x"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(zip_fixture(), "application/zip")
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"ignored-by-o.zip\"",
+                ),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let workdir = tempfile::tempdir().expect("workdir");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign_in(
+        workdir.path(),
+        &config,
+        &server.uri(),
+        &["project", "export", "x", "-o", "out.zip", "--compact"],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"x","file":"out.zip","bytes":26,"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
+    );
+    assert_eq!(
+        std::fs::read(workdir.path().join("out.zip")).expect("file written"),
+        zip_fixture()
+    );
+    assert!(
+        !workdir.path().join("ignored-by-o.zip").exists(),
+        "-o wins over the disposition name"
+    );
+}
+
+/// THE collision golden: abort-policy import over an EXISTING project
+/// exits 6 `project_exists` with the overwrite-naming hint — and the
+/// import mock (expect 0) proves ZERO uploads reached the gateway.
+#[tokio::test]
+async fn project_import_abort_collision_exits_6_golden() {
+    let server = wiremock::MockServer::start().await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/x"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/find/x"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name": "x", "enabled": true})),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let zip_dir = tempfile::tempdir().expect("zipdir");
+    let zip_path = zip_dir.path().join("proj.zip");
+    std::fs::write(&zip_path, zip_fixture()).expect("write fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            zip_path.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "target-state class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":"dev","error":{"code":"project_exists","message":"project x already exists on the gateway","endpoint":null,"hint":"the default collision policy refuses to overwrite; re-run with --collision-policy overwrite to replace it — overwrite REPLACES the ENTIRE project (resources absent from the ZIP are deleted; merge is Designer-only)"}}
+
+"#]],
+    );
+    assert!(
+        import_guard.received_requests().await.is_empty(),
+        "the refusal happened BEFORE any upload"
+    );
+}
+
+/// THE guard golden: overwrite-policy import WITHOUT `--yes` exits 2
+/// with the `confirmation_required` envelope and profile NULL — the
+/// guard fires before any resolution (dead URL, no mocks, no matter).
+#[tokio::test]
+async fn project_import_overwrite_without_yes_exits_2_golden() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            "whatever.zip",
+            "--collision-policy",
+            "overwrite",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"confirmation_required","message":"project import --collision-policy overwrite is destructive; rerun with --yes to confirm","endpoint":null,"hint":"this operation is destructive; re-run with --yes or set IGNITION_YES=1"}}
+
+"#]],
+    );
+}
+
+/// Overwrite WITH `--yes`: the upload fires carrying
+/// `overwrite=true`, the exact ZIP bytes, and
+/// `Content-Type: application/zip` — and the find mock (expect 0)
+/// proves overwrite performs NO pre-check (the server is the
+/// authority).
+#[tokio::test]
+async fn project_import_overwrite_with_yes_uploads() {
+    let server = wiremock::MockServer::start().await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/x"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status": "imported"})),
+        )
+        .expect(1..)
+        .mount_as_scoped(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/find/x"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let zip_dir = tempfile::tempdir().expect("zipdir");
+    let zip_path = zip_dir.path().join("proj.zip");
+    std::fs::write(&zip_path, zip_fixture()).expect("write fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            zip_path.to_str().unwrap(),
+            "--collision-policy",
+            "overwrite",
+            "--yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+imported x (26 bytes, policy overwrite)
+"#]],
+    );
+
+    let requests = import_guard.received_requests().await;
+    assert!(!requests.is_empty(), "the upload fired");
+    for request in &requests {
+        let query = request.url.query().expect("query present");
+        assert_eq!(query, "overwrite=true", "the policy rode the wire: {query}");
+        assert_eq!(request.body, zip_fixture(), "the exact ZIP bytes");
+        assert_eq!(
+            request
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/zip")
+        );
+    }
+}
+
+/// Stdin import (`--file -`): piped bytes ride the same guards and
+/// the abort policy's find pre-check (404 = name free) precedes the
+/// `overwrite=false` upload.
+#[tokio::test]
+async fn project_import_stdin_golden() {
+    let server = wiremock::MockServer::start().await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/piped",
+        ))
+        .and(wiremock::matchers::query_param("overwrite", "false"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/find/piped"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"message": "Project not found"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &["project", "import", "piped", "--file", "-", "--compact"],
+        &zip_fixture(),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"name":"piped","collision_policy":"abort","bytes":26,"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]},"outcome":{"status":"success"}}}"#]],
+    );
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, zip_fixture(), "the piped bytes uploaded");
+}
+
+/// A non-ZIP file refuses with exit 2 `invalid_import_file` BEFORE
+/// any network I/O — the config points at a DEAD URL and no mock
+/// exists; if any HTTP had been attempted the command would exit 4.
+#[tokio::test]
+async fn project_import_non_zip_exits_2_golden() {
+    let bad_dir = tempfile::tempdir().expect("bad dir");
+    let bad_path = bad_dir.path().join("not-a-zip.txt");
+    std::fs::write(&bad_path, b"definitely not a zip").expect("write junk");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            bad_path.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class, zero network");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        // NOTE: snapbox's `str!` normalizes backslashes in the ACTUAL
+        // output to forward slashes (cross-platform path handling) —
+        // the wire text is `PK\\x03\\x04` (JSON-escaped literal
+        // backslash), which the golden spells `PK//x03//x04`.
+        snapbox::str![[r#"
+{"ok":false,"profile":"dev","error":{"code":"invalid_import_file","message":"invalid import file: missing ZIP magic (PK//x03//x04) — not a project export archive","endpoint":null,"hint":"import expects a project-export ZIP (PK//x03//x04 magic) of at most 512 MB — pass a file produced by `ign project export` via --file (or `-` to pipe one on stdin)"}}
+
+"#]],
+    );
+}
+
 /// Deleting a nonexistent project: the gateway answers 404 → exit 6,
 /// `not_found` (endpoint embeds the dynamic mock URI — programmatic
 /// envelope assertions, the version_gateway_contract pattern).

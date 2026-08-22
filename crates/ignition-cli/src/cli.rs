@@ -121,7 +121,7 @@ pub enum Commands {
     },
 
     /// Manage gateway projects: list with inheritance info, new, copy,
-    /// rename, set (reparent), delete
+    /// rename, set (reparent), delete, export/import (ZIP)
     #[command(arg_required_else_help = true)]
     Project(ProjectArgs),
 
@@ -262,6 +262,29 @@ pub enum ProjectCommand {
     Delete {
         /// Project name
         name: String,
+    },
+    /// Export a project as a ZIP archive (streams to disk)
+    Export {
+        /// Project name
+        name: String,
+        /// Output file (default: the gateway's Content-Disposition
+        /// name, else <name>.zip)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Import a project from a ZIP archive
+    Import {
+        /// Project name to import as
+        name: String,
+        /// ZIP file path, or - to read the archive from stdin
+        #[arg(long, value_name = "PATH")]
+        file: String,
+        /// Collision policy: abort refuses when the name exists
+        /// (default); overwrite REPLACES the entire project —
+        /// destructive, requires --yes. merge is Designer-only (not a
+        /// value; the README documents why)
+        #[arg(long, value_enum, default_value_t = CollisionPolicy::Abort)]
+        collision_policy: CollisionPolicy,
     },
 }
 
@@ -449,6 +472,29 @@ impl From<ConnectionType> for ignition_core::actions::connections::ConnectionTyp
         match value {
             ConnectionType::Database => Self::Database,
             ConnectionType::Opc => Self::Opc,
+        }
+    }
+}
+
+/// Import collision policy (03-02). Exactly the two values REST
+/// exposes — `merge` is the Designer import popup's vocabulary and is
+/// NOT a value: clap's invalid-value error lists the two real
+/// choices, and the README documents merge as Designer-only (the
+/// sanctioned rejection-with-hint shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CollisionPolicy {
+    /// Refuse when the project already exists (default)
+    Abort,
+    /// Replace the ENTIRE project (resources absent from the ZIP are
+    /// deleted) — destructive, requires --yes
+    Overwrite,
+}
+
+impl From<CollisionPolicy> for ignition_core::actions::projects::CollisionPolicy {
+    fn from(value: CollisionPolicy) -> Self {
+        match value {
+            CollisionPolicy::Abort => Self::Abort,
+            CollisionPolicy::Overwrite => Self::Overwrite,
         }
     }
 }

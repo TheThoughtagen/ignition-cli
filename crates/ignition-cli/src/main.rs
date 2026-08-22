@@ -102,6 +102,12 @@ enum ActionOutput {
     ProjectSet(actions::projects::ProjectSetResult),
     /// `ign project delete` — the family's destructive verb.
     ProjectDelete(actions::projects::ProjectDeleteResult),
+    /// `ign project export` — ZIP streamed to disk; data carries
+    /// {project, file, bytes, scope}.
+    ProjectExport(actions::projects::ExportResult),
+    /// `ign project import` — buffered upload with collision policy;
+    /// data carries {name, collision_policy, bytes, scope, outcome}.
+    ProjectImport(actions::projects::ImportResult),
 }
 
 impl ActionOutput {
@@ -144,6 +150,8 @@ impl ActionOutput {
             ActionOutput::ProjectRename(result) => render_success(profile, result, compact),
             ActionOutput::ProjectSet(result) => render_success(profile, result, compact),
             ActionOutput::ProjectDelete(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectExport(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectImport(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -686,6 +694,89 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(api) => actions::projects::project_delete(&api, &project_name)
                         .await
                         .map(ActionOutput::ProjectDelete),
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            // Export (03-02, PROJ-03): non-destructive — it writes a
+            // LOCAL file — so no --yes. The file is the artifact and
+            // stdout stays data-only (no stdout exception); human mode
+            // gets a one-line progress note on STDERR while the ZIP
+            // streams (stdout is reserved for the envelope).
+            ProjectCommand::Export {
+                name: project_name,
+                output,
+            } => {
+                if mode == RenderMode::Human {
+                    eprintln!("exporting {project_name} …");
+                }
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => {
+                        actions::projects::project_export(&api, &project_name, output.as_deref())
+                            .await
+                            .map(ActionOutput::ProjectExport)
+                    }
+                    Err(err) => Err(err),
+                };
+                (profile, result)
+            }
+            // Import (03-02, PROJ-04). Overwrite is DESTRUCTIVE (it
+            // replaces the entire project — Pitfall 4): the guard
+            // fires BEFORE resolve_gateway_api (exit 2, profile null,
+            // zero work — the LOCKED shape). Abort-policy imports skip
+            // the guard: they fail safely server-side. The dispatch
+            // layer owns the byte source — `--file PATH` via std::fs,
+            // `--file -` via tokio stdin — then the action owns the
+            // magic/size guards and the collision pre-check.
+            ProjectCommand::Import {
+                name: project_name,
+                file,
+                collision_policy,
+            } => {
+                if matches!(collision_policy, crate::cli::CollisionPolicy::Overwrite)
+                    && let Err(err) =
+                        require_confirmation(cli.yes, "project import --collision-policy overwrite")
+                {
+                    return (None, Err(err));
+                }
+                let zip = if file == "-" {
+                    use tokio::io::AsyncReadExt;
+                    let mut buffer = Vec::new();
+                    match tokio::io::stdin().read_to_end(&mut buffer).await {
+                        Ok(_) => buffer,
+                        Err(err) => {
+                            return (
+                                None,
+                                Err(CoreError::InvalidImportFile {
+                                    reason: format!("cannot read stdin: {err}"),
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    match std::fs::read(&file) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            return (
+                                None,
+                                Err(CoreError::InvalidImportFile {
+                                    reason: format!("cannot read {file}: {err}"),
+                                }),
+                            );
+                        }
+                    }
+                };
+                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::projects::project_import(
+                        &api,
+                        &project_name,
+                        zip,
+                        collision_policy.into(),
+                    )
+                    .await
+                    .map(ActionOutput::ProjectImport),
                     Err(err) => Err(err),
                 };
                 (profile, result)

@@ -459,3 +459,96 @@ async fn live_doctor_end_to_end() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 03-02 addition: export → import round-trip (MUTATION-gated — the
+// 02-04 IGNITION_LIVE_MUTATIONS precedent; also the preview of 03-03's
+// e2e loop). Optional live truth for the MEDIUM export/import response
+// bodies (research Open Question 3): what the import POST actually
+// answers prints to stderr.
+// ---------------------------------------------------------------------------
+
+/// Non-empty `IGNITION_LIVE_MUTATIONS=1`, when set — the opt-in gate
+/// for live tests that CHANGE gateway state.
+fn live_mutations_enabled() -> bool {
+    std::env::var("IGNITION_LIVE_MUTATIONS").ok().as_deref() == Some("1")
+}
+
+/// The full loop on a timestamped scratch project: create → export to
+/// a temp file (streaming) → abort-policy import over the existing
+/// name (must refuse `project_exists` BEFORE any upload) →
+/// overwrite-policy import (must succeed; the outcome prints) →
+/// delete cleanup (best-effort).
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_project_export_import_round_trip() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    if !live_mutations_enabled() {
+        skip("IGNITION_LIVE_MUTATIONS != 1 — mutation-gated");
+        return;
+    }
+    use ignition_core::actions::projects::{self, CollisionPolicy};
+    use ignition_core::client::projects::ProjectCreate;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let name = format!("ign-live-export-{ts}");
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+
+    // Create the scratch project (only name + enabled — the server
+    // tolerates the partial body).
+    api.project_create(&ProjectCreate {
+        name: name.clone(),
+        enabled: true,
+        title: None,
+        description: None,
+        parent: None,
+        inheritable: None,
+        default_db: None,
+        tag_provider: None,
+        user_source: None,
+    })
+    .await
+    .expect("scratch project created");
+
+    // Export streams to a temp file.
+    let out = std::env::temp_dir().join(format!("{name}.zip"));
+    let export = match api.project_export_to_file(&name, &out).await {
+        Ok(meta) => meta,
+        Err(err) => {
+            let _ = api.project_delete(&name).await; // cleanup
+            panic!("live export must stream: {err}");
+        }
+    };
+    eprintln!(
+        "live export: {} bytes, disposition {:?}, content-type {:?}",
+        export.bytes, export.filename, export.content_type
+    );
+    let zip = std::fs::read(&out).expect("export file readable");
+
+    // Abort-policy import over the existing name: the ACTION's find
+    // pre-check must refuse BEFORE any upload.
+    let err = projects::project_import(&api, &name, zip.clone(), CollisionPolicy::Abort)
+        .await
+        .expect_err("abort over existing must refuse");
+    assert!(
+        matches!(err, CoreError::ProjectExists { .. }),
+        "wrong class: {err}"
+    );
+
+    // Overwrite-policy import: must succeed; the opaque outcome prints
+    // (the live capture of the MEDIUM response body).
+    let result = projects::project_import(&api, &name, zip, CollisionPolicy::Overwrite)
+        .await
+        .expect("overwrite import succeeds");
+    eprintln!("live import outcome: {}", result.outcome);
+
+    // Cleanup (best-effort — failures leave forensic state).
+    let _ = api.project_delete(&name).await;
+    let _ = std::fs::remove_file(&out);
+}

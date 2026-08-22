@@ -20,7 +20,8 @@ use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
 };
 use ignition_core::actions::projects::{
-    ProjectCopyResult, ProjectDeleteResult, ProjectRenameResult, ProjectSetResult, ProjectsResult,
+    ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult, ProjectRenameResult,
+    ProjectSetResult, ProjectsResult,
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
@@ -169,6 +170,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ProjectRename(result) => render_project_rename_human(result),
         ActionOutput::ProjectSet(result) => render_project_set_human(result),
         ActionOutput::ProjectDelete(result) => render_project_delete_human(result),
+        ActionOutput::ProjectExport(result) => render_project_export_human(result),
+        ActionOutput::ProjectImport(result) => render_project_import_human(result),
     }
 }
 
@@ -543,6 +546,30 @@ fn render_project_set_human(result: &ProjectSetResult) {
 /// `ign project delete` human line.
 fn render_project_delete_human(result: &ProjectDeleteResult) {
     println!("deleted {}", result.deleted);
+}
+
+/// `ign project export` human lines: the artifact line + the scope
+/// summary — what the ZIP does and does not contain (roadmap
+/// criterion 4, in prose form for humans; agents read the arrays).
+fn render_project_export_human(result: &ExportResult) {
+    println!(
+        "exported {} \u{2192} {} ({} bytes)",
+        result.project, result.file, result.bytes
+    );
+    println!(
+        "scope: includes {} \u{b7} excludes {}",
+        result.scope.includes.join("/"),
+        result.scope.excludes.join("/")
+    );
+}
+
+/// `ign project import` human line: the byte count + the policy that
+/// ran (scope rides the JSON data; humans saw it at export time).
+fn render_project_import_human(result: &ImportResult) {
+    println!(
+        "imported {} ({} bytes, policy {})",
+        result.name, result.bytes, result.collision_policy
+    );
 }
 
 /// Epoch milliseconds → an ISO-8601 UTC string

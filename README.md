@@ -123,6 +123,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign project rename <OLD> <NEW>` | Rename a project (native rename, not copy+delete) | non-destructive relabel — no `--yes`; audit-logged server-side |
 | `ign project set <NAME> [--title --description --parent --set-enabled\|--disabled --inheritable BOOL]` | Set project fields — `--parent` IS the inheritance move (reparent) | only provided flags ride the modify body (absent = untouched); at least one field required; audit-logged server-side |
 | `ign project delete <NAME>` | Delete a project | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the wire DELETE always carries the server's own `confirm=true` query param (both guard layers); a nonexistent name exits 6 (`not_found`); audit-logged server-side |
+| `ign project export <NAME> [-o FILE]` | Export a project as a ZIP archive | the ZIP STREAMS to disk chunk-by-chunk (no memory buffering; 120 s per-request timeout); default filename from `Content-Disposition`, else `<name>.zip`; stdout stays data-only — JSON carries `{project, file, bytes, scope}` (see scope metadata below) |
+| `ign project import <NAME> --file PATH\|--file - [--collision-policy abort\|overwrite]` | Import a project from a ZIP (`-` reads stdin) | default policy **abort**: importing over an existing name exits 6 (`project_exists`) BEFORE any upload; **overwrite** is destructive — exit 2 without `--yes` and it REPLACES the entire project (resources absent from the ZIP are deleted; merge is Designer-only); a non-ZIP or >512 MB input exits 2 (`invalid_import_file`) before any network I/O; 300 s per-request timeout |
 | `ign logs [--logger L] [--min-level L] [--since SPAN] [--limit N]` | Recent log entries, newest first (`ISO-UTC  LEVEL  logger  message`) | `--limit` is ALWAYS explicit (default 200 — the server default is unlimited); `--since` takes EPOCH-MS or `500ms/30s/5min/2h`; sorts `desc(timestamp)` so you see the NEWEST entries, never the oldest 200 |
 | `ign logs -f [--interval S] [--timeout S]` | Live tail: entries stream to stdout as they occur | poll-based (no server push exists — `GET /logs?startTime=<cursor>` IS the tail); `--timeout` expiry ends cleanly (exit 0); without it, run until Ctrl-C (default process kill, no envelope); see the streaming exception below |
 | `ign logs download [-o FILE]` | Download the log archive — a SQLite `.idb`, never a zip | bytes written exactly as received; default filename from `Content-Disposition`, else `<profile>-logs-<ts>.idb`; `--json` data is `{file, bytes, content_type}` |
@@ -144,6 +146,31 @@ Config > Modules, and Performance & Diagnostics pages; `sessions`,
 `connections`, the `logs` tree, and the `project` tree replace its
 Sessions, Connections, Logs console, logger-config, and Projects pages.
 
+### Project export/import specifics
+
+**Timeouts.** Long transfers are the classic default-timeout death, so
+both operations carry per-request budgets instead of the 30 s client
+default: export 120 s, import 300 s. The import is synchronous (the
+gateway answers when it finishes — no job IDs). If an import times out
+or the connection drops mid-flight, the gateway state is unknown:
+**verify with `ign project list`** (and re-run) rather than assuming.
+
+**Scope metadata.** A project export contains views, scripts,
+named-queries, and the other module project-resources — it does NOT
+contain tag providers, tags, or UDTs: those are gateway configuration,
+not project resources (this is why git-module conventions keep a
+separate `tags/` tree). Both `project export` and `project import`
+carry the same static `scope: {includes, excludes}` arrays in their
+JSON data so agents and humans always know what a ZIP does and does
+not contain.
+
+**Collision policy.** REST exposes exactly two choices: `abort` (the
+default — the CLI pre-checks with `find` and refuses with
+`project_exists` before uploading anything) and `overwrite` (replaces
+the ENTIRE project — resources absent from the ZIP are deleted).
+`merge` is the Designer import popup's mode and is not available via
+REST; the CLI rejects it at the flag level by simply not offering it.
+
 ### Streaming output (the second stdout exception)
 
 `ign logs -f` is a STREAM: entries print to stdout as they arrive, so
@@ -159,15 +186,19 @@ envelope — plan for it in pipelines).
 ### Destructive operations
 
 Commands that change gateway state (`sessions terminate`,
-`logs loggers set`/`reset`, `project delete`, and `restart` — the big
-one: it takes the whole gateway down for ~1 min) refuse without `--yes`
+`logs loggers set`/`reset`, `project delete`, `project import
+--collision-policy overwrite`, and `restart` — the big one: it takes
+the whole gateway down for ~1 min) refuse without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
 pass `--yes` once and humans get a speed bump. `restart` is guarded in
 BOTH forms: plain and `--wait`. The guard fires before any network
-activity: a refusal never touches the gateway. `project delete` is
-doubly guarded — besides the CLI refusal, the wire DELETE always
-carries the gateway's own `confirm=true` query param. Termination,
-restart, and project mutations are audit-logged server-side by the
-gateway. Non-destructive project mutations (`copy`, `rename`, `set`)
-create or relabel rather than destroy, so they carry no `--yes`.
+activity: a refusal never touches the gateway. `project delete` and
+`project import --collision-policy overwrite` are the doubly-relevant
+pair: besides the CLI refusal, delete's wire request always carries
+the gateway's own `confirm=true` query param, and overwrite REPLACES
+the entire project (abort-policy imports need no `--yes` — they fail
+safely server-side). Termination, restart, and project mutations are
+audit-logged server-side by the gateway. Non-destructive project
+mutations (`copy`, `rename`, `set`, `export`) create, relabel, or read
+rather than destroy, so they carry no `--yes`.
