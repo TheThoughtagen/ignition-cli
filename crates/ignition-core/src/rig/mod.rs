@@ -420,6 +420,22 @@ mod tests {
         async fn run_docker(&self, args: &[String]) -> ComposeOutput {
             self.next("docker", args)
         }
+
+        async fn run_streaming(
+            &self,
+            args: &[String],
+            line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
+        ) -> ComposeOutput {
+            let output = self.next("docker compose", args);
+            for line in output.stdout.lines() {
+                line_sink(line);
+            }
+            ComposeOutput {
+                stdout: String::new(),
+                stderr: output.stderr,
+                code: output.code,
+            }
+        }
     }
 
     fn ok(stdout: &str) -> ComposeOutput {

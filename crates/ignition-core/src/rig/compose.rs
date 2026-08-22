@@ -11,7 +11,9 @@
 //! `tokio::process::Command` (the workspace `process` feature — the one
 //! Phase 4 dependency change). `run` prefixes the `compose` subcommand;
 //! `run_docker` spawns the PLAIN docker CLI (volume ls / port
-//! attribution — no `-p` prefix, those are not compose project ops).
+//! attribution — no `-p` prefix, those are not compose project ops);
+//! `run_streaming` pipes stdout and forwards lines as they arrive (the
+//! `logs -f` follow shape, 04-02).
 //!
 //! ## LOCKED invocation shapes (research §Compose invocation shapes)
 //!
@@ -68,6 +70,19 @@ pub trait ComposeRunner: Send + Sync {
     /// Run the PLAIN docker CLI (`docker <args…>`) — the volume-ls and
     /// port-attribution shapes that are NOT compose project ops.
     async fn run_docker(&self, args: &[String]) -> ComposeOutput;
+    /// Stream `docker compose <args…>`: stdout forwards to `line_sink`
+    /// LINE-BY-LINE as it arrives (piped stdout — `logs -f` follow
+    /// mode), stderr is captured for diagnostics (a failed invocation
+    /// carries its tail in the error; a successful one's diagnostics
+    /// go to OUR stderr via tracing — NEVER the data stream). The
+    /// returned [`ComposeOutput`] carries EMPTY stdout: the lines
+    /// already went to the sink (fakes replay a preloaded stdout
+    /// through the sink — the keep-it-simple contract).
+    async fn run_streaming(
+        &self,
+        args: &[String],
+        line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> ComposeOutput;
 }
 
 /// Production [`ComposeRunner`]: shells out to the real `docker` binary
@@ -102,6 +117,63 @@ impl DockerCompose {
             },
         }
     }
+
+    /// The STREAMING spawn (04-02): piped stdout read line-by-line
+    /// into `line_sink` until EOF, stderr drained CONCURRENTLY (a full
+    /// stderr pipe would deadlock the stdout reader), then the wait —
+    /// the child streams until it exits (Ctrl-C kills the whole
+    /// foreground process group, the `logs -f` precedent).
+    async fn spawn_streaming(
+        program: &str,
+        args: &[String],
+        line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> ComposeOutput {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let joined = std::iter::once(program.to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut child = match tokio::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                return ComposeOutput {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn `{joined}`: {err}"),
+                    code: 127,
+                };
+            }
+        };
+        let stdout = child.stdout.take().expect("stdout piped above");
+        let mut stderr = child.stderr.take().expect("stderr piped above");
+        // Concurrent stderr drain — the join only fails on task panic.
+        let stderr_task = tokio::spawn(async move {
+            let mut buffer = String::new();
+            let _ = stderr.read_to_string(&mut buffer).await;
+            buffer
+        });
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            line_sink(&line);
+        }
+        match child.wait().await {
+            Ok(status) => ComposeOutput {
+                stdout: String::new(),
+                stderr: stderr_task.await.unwrap_or_default(),
+                code: status.code().unwrap_or(-1),
+            },
+            Err(err) => ComposeOutput {
+                stdout: String::new(),
+                stderr: format!("failed to wait for `{joined}`: {err}"),
+                code: -1,
+            },
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -114,6 +186,16 @@ impl ComposeRunner for DockerCompose {
 
     async fn run_docker(&self, args: &[String]) -> ComposeOutput {
         Self::spawn("docker", args).await
+    }
+
+    async fn run_streaming(
+        &self,
+        args: &[String],
+        line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> ComposeOutput {
+        let mut full = vec!["compose".to_string()];
+        full.extend(args.iter().cloned());
+        Self::spawn_streaming("docker", &full, line_sink).await
     }
 }
 
@@ -261,8 +343,8 @@ pub fn ps_args(plan: &RigPlan) -> Vec<String> {
 }
 
 /// `logs` (human-form passthrough by design — the streaming exception
-/// when `--follow`; wired by 04-02). Declared + pinned now so the
-/// invocation shape is LOCKED from day one.
+/// when `--follow`; wired by 04-02's `rig_logs` via `run` one-shot /
+/// `run_streaming` follow). Invocation shape LOCKED from day one.
 pub fn logs_args(plan: &RigPlan, tail: u32, follow: bool, service: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "-p".into(),
@@ -872,6 +954,42 @@ mod tests {
             plan.name, "env-resolved-name",
             "the .env name wins over the directory-derived default"
         );
+    }
+
+    /// The STREAMING spawn (04-02): piped stdout forwarded line-by-line
+    /// to the sink, stderr drained, exit reported. Runs the REAL docker
+    /// CLI (`logs` on an absent project is exit 0 + empty output on
+    /// compose v2 — no daemon-side state needed) and skips quietly when
+    /// docker is absent (CI). Client-side proof of the follow seam.
+    #[tokio::test]
+    async fn run_streaming_forwards_lines_via_piped_stdout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let compose = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose,
+            "services:\n  sidecar:\n    image: alpine:latest\n",
+        )
+        .expect("write compose");
+
+        let runner = DockerCompose;
+        if runner.run(&["version".to_string()]).await.code != 0 {
+            eprintln!("skipping: docker compose unavailable");
+            return;
+        }
+        let plan = parse_config(
+            r#"{"name":"stream-fixture","services":{"sidecar":{"image":"alpine"}}}"#,
+            &compose,
+            dir.path(),
+        )
+        .expect("plan parses");
+        let mut streamed = 0usize;
+        let mut sink = |_: &str| streamed += 1;
+        let output = runner
+            .run_streaming(&logs_args(&plan, 5, false, None), &mut sink)
+            .await;
+        assert_eq!(output.code, 0, "compose logs on an absent project: {}", output.stderr);
+        assert_eq!(streamed, 0, "no containers → no lines, but the spawn/read/wait ran");
+        assert!(output.stdout.is_empty(), "streamed stdout never reports back");
     }
 
     // ----- LDJSON parsers (research Pitfall 1: BOTH conventions pinned) --

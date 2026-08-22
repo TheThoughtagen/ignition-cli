@@ -32,9 +32,9 @@ use serde::Serialize;
 
 use crate::client::GatewayApi;
 use crate::rig::compose::{
-    check_output, compose_version, down_args, docker_ps_publish_args, parse_docker_ps_ldjson,
-    parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview, up_args, volume_ls_args,
-    ComposeRunner,
+    check_output, compose_version, down_args, docker_ps_publish_args, logs_args,
+    parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
+    up_args, volume_ls_args, ComposeRunner,
 };
 use crate::error::CoreError;
 use crate::poll::{self, PollConfig, PollState};
@@ -368,6 +368,64 @@ pub async fn rig_reset(
     })
 }
 
+/// `ign rig logs` output model (04-02, RIG-02): only the count — the
+/// lines themselves already streamed through the sink (the third
+/// sanctioned stdout exception; the dispatch owns the printing, the
+/// `logs -f` precedent).
+#[derive(Debug, Serialize)]
+pub struct RigLogsResult {
+    /// Lines delivered to the sink.
+    pub streamed: usize,
+}
+
+/// `ign rig logs` (04-02, RIG-02): compose log PASSTHROUGH — a raw
+/// line stream through `sink`, never an envelope-wrapped body.
+/// Compose log lines are not gateway JSON objects; wrapping would
+/// corrupt them, so `rig logs --json` is the SAME passthrough in
+/// every render mode (contrast `logs -f --json`, whose entries ARE
+/// gateway NDJSON — the second exception). Follow mode rides the
+/// runner's STREAMING shape (piped stdout forwarded as it arrives
+/// until EOF/child exit; Ctrl-C kills the foreground process group —
+/// README §Streaming, the `logs -f` precedent). Compose stderr
+/// (diagnostics) goes to OUR stderr via tracing::warn — never the
+/// data sink.
+pub async fn rig_logs(
+    runner: &dyn ComposeRunner,
+    plan: &RigPlan,
+    tail: u32,
+    follow: bool,
+    service: Option<&str>,
+    sink: &mut (dyn FnMut(String) + Send),
+) -> Result<RigLogsResult, CoreError> {
+    let args = logs_args(plan, tail, follow, service);
+    let mut streamed = 0usize;
+    let output = if follow {
+        // Follow: streamed through the runner's piped-stdout shape;
+        // the returned stdout is empty (the lines already delivered).
+        let mut forwarder = |line: &str| {
+            streamed += 1;
+            sink(line.to_string());
+        };
+        runner.run_streaming(&args, &mut forwarder).await
+    } else {
+        runner.run(&args).await
+    };
+    if !output.stderr.trim().is_empty() {
+        tracing::warn!(
+            source = "docker compose logs",
+            stderr = %output.stderr.trim(),
+            "compose diagnostics (stderr passthrough — never the data sink)"
+        );
+    }
+    // One-shot: the captured stdout splits line-wise into the sink.
+    let stdout = check_output(&output, "docker compose logs")?;
+    for line in stdout.lines() {
+        sink(line.to_string());
+        streamed += 1;
+    }
+    Ok(RigLogsResult { streamed })
+}
+
 /// `ign rig status`: version gate → `ps` LDJSON → `volume ls` →
 /// port occupancy — serialized as an ALLOWLIST (services' state/health/
 /// publishers, volume names, identity). Exit 0 even when the rig is
@@ -435,10 +493,10 @@ mod tests {
 
     use super::{
         DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigResetResult, RigStatusResult, RigUpResult,
-        gateway_url_from, rig_down, rig_reset, rig_status, rig_up,
+        gateway_url_from, rig_down, rig_logs, rig_reset, rig_status, rig_up,
     };
     use crate::rig::compose::{
-        ComposeOutput, ComposeRunner, PortMapping, down_args, up_args, volume_ls_args,
+        ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
     };
     use crate::error::CoreError;
     use crate::rig::RigPlan;
@@ -478,6 +536,31 @@ mod tests {
         async fn run_docker(&self, args: &[String]) -> ComposeOutput {
             self.calls.lock().unwrap().push(("docker", args.to_vec()));
             self.outputs.lock().unwrap().pop_front().expect("outputs exhausted")
+        }
+
+        async fn run_streaming(
+            &self,
+            args: &[String],
+            line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
+        ) -> ComposeOutput {
+            self.calls.lock().unwrap().push(("docker compose", args.to_vec()));
+            let output = self
+                .outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("outputs exhausted");
+            // Preload contract: queued stdout lines replay to the sink
+            // in order; the returned stdout is emptied (lines already
+            // "streamed").
+            for line in output.stdout.lines() {
+                line_sink(line);
+            }
+            ComposeOutput {
+                stdout: String::new(),
+                stderr: output.stderr,
+                code: output.code,
+            }
         }
     }
 
@@ -908,6 +991,82 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("docker compose down failed (exit 1)"), "{message}");
         assert!(message.contains("in use"), "{message}");
+    }
+
+    // ---------------------------------------------------------------------
+    // rig_logs — passthrough streaming (04-02)
+    // ---------------------------------------------------------------------
+
+    /// Raw compose log lines (color codes stripped by fixtures; the
+    /// sink must receive them VERBATIM — no envelope, no reformat).
+    const LOGS_STDOUT: &str = concat!(
+        "ignition-1  | 22:01:01.001 INFO   Gateway - starting\n",
+        "ignition-1  | 22:01:02.002 INFO   Gateway - RUNNING\n",
+    );
+
+    /// One-shot: the captured stdout splits line-wise into the sink,
+    /// verbatim, via the plain `run` seam (exact args pinned).
+    #[tokio::test]
+    async fn logs_one_shot_sinks_lines_verbatim() {
+        let runner = FakeRunner::with(vec![ok(LOGS_STDOUT)]);
+        let mut received: Vec<String> = Vec::new();
+        let result = rig_logs(&runner, &gw_plan(), 200, false, None, &mut |line| {
+            received.push(line)
+        })
+        .await
+        .expect("logs succeeds");
+        assert_eq!(result.streamed, 2);
+        assert_eq!(
+            received,
+            vec![
+                "ignition-1  | 22:01:01.001 INFO   Gateway - starting",
+                "ignition-1  | 22:01:02.002 INFO   Gateway - RUNNING",
+            ],
+            "lines pass through verbatim — no envelope wrapping ever"
+        );
+        let calls = runner.calls();
+        assert_eq!(calls, vec![("docker compose", logs_args(&gw_plan(), 200, false, None))]);
+    }
+
+    /// Follow: rides the STREAMING seam (the fake replays its
+    /// preloaded stdout through the sink), service filter pinned.
+    #[tokio::test]
+    async fn logs_follow_streams_via_the_streaming_seam() {
+        let runner = FakeRunner::with(vec![ok(LOGS_STDOUT)]);
+        let mut received: Vec<String> = Vec::new();
+        let result = rig_logs(&runner, &gw_plan(), 50, true, Some("ignition"), &mut |line| {
+            received.push(line)
+        })
+        .await
+        .expect("follow logs succeeds");
+        assert_eq!(result.streamed, 2, "streamed lines counted in follow mode");
+        assert_eq!(received.len(), 2);
+        let calls = runner.calls();
+        assert_eq!(
+            calls,
+            vec![("docker compose", logs_args(&gw_plan(), 50, true, Some("ignition")))]
+        );
+    }
+
+    /// Failure: exit-mapped error with compose's stderr tail; the
+    /// diagnostics NEVER ride the data sink.
+    #[tokio::test]
+    async fn logs_failure_carries_stderr_tail_never_sink() {
+        let runner = FakeRunner::with(vec![ComposeOutput {
+            stdout: String::new(),
+            stderr: "no such service: nosvc".into(),
+            code: 1,
+        }]);
+        let mut received: Vec<String> = Vec::new();
+        let err = rig_logs(&runner, &gw_plan(), 200, false, Some("nosvc"), &mut |line| {
+            received.push(line)
+        })
+        .await
+        .expect_err("unknown service errors");
+        let message = err.to_string();
+        assert!(message.contains("docker compose logs failed (exit 1)"), "{message}");
+        assert!(message.contains("no such service"), "{message}");
+        assert!(received.is_empty(), "diagnostics never ride the data sink");
     }
 
     // ---------------------------------------------------------------------
