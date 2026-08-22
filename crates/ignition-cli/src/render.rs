@@ -26,7 +26,9 @@ use ignition_core::actions::projects::{
 use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
 };
-use ignition_core::actions::rig::{RigDownResult, RigStatusResult, RigUpResult};
+use ignition_core::actions::rig::{
+    RigDownResult, RigLogsResult, RigResetResult, RigStatusResult, RigUpResult,
+};
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
@@ -77,7 +79,9 @@ pub fn render_ok(out: &ActionOutput, profile: Option<&str>, mode: RenderMode) {
     // The SECOND sanctioned stdout exception: a completed tail already
     // streamed every entry to stdout as it arrived (human lines or
     // NDJSON — README §Streaming); there is nothing left to render.
-    if matches!(out, ActionOutput::LogsTail(_)) {
+    // The THIRD is its sibling: `rig logs` already streamed its raw
+    // compose lines in EVERY mode (passthrough — same exception).
+    if matches!(out, ActionOutput::LogsTail(_) | ActionOutput::RigLogs(_)) {
         return;
     }
     match mode {
@@ -182,7 +186,12 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ResourceDelete(result) => render_resource_delete_human(result),
         ActionOutput::RigUp(result) => render_rig_up_human(result),
         ActionOutput::RigDown(result) => render_rig_down_human(result),
+        ActionOutput::RigReset(result) => render_rig_reset_human(result),
         ActionOutput::RigStatus(result) => render_rig_status_human(result),
+        // Unreachable: render_ok intercepts RigLogs before mode
+        // dispatch (the third streaming exception — lines already
+        // printed during execution).
+        ActionOutput::RigLogs(result) => render_rig_logs_human(result),
     }
 }
 
@@ -642,6 +651,35 @@ fn render_rig_up_human(result: &RigUpResult) {
 /// `ign rig down` human line.
 fn render_rig_down_human(result: &RigDownResult) {
     println!("rig {} down", result.rig);
+}
+
+/// `ign rig reset` human lines: what the teardown removed (the volume
+/// preview, reported as it acted), then the state-forward confirmation
+/// — the fresh volume usually boots into the wizard (warnings carry
+/// the URL).
+fn render_rig_reset_human(result: &RigResetResult) {
+    if result.removed_volumes.is_empty() {
+        println!("rig {} reset — no named volumes found to remove", result.rig);
+    } else {
+        println!("rig {} reset — removed volumes:", result.rig);
+        for volume in &result.removed_volumes {
+            println!("  - {volume}");
+        }
+    }
+    match result.state.as_str() {
+        "uncommissioned" => println!("gateway up — uncommissioned (fresh volume)"),
+        _ => println!("gateway RUNNING"),
+    }
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+/// `ign rig logs` human tail — unreachable (the lines already streamed
+/// raw during execution; kept for match totality, the render_tail
+/// precedent).
+fn render_rig_logs_human(result: &RigLogsResult) {
+    println!("({} lines streamed)", result.streamed);
 }
 
 /// `ign rig status` human table: identity header, one row per service

@@ -131,9 +131,8 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Resource(ResourceArgs),
 
-    /// Manage a Docker compose rig: up/down/status (reset, logs,
-    /// trial, snapshot arrive in later plans) — docker-only, no
-    /// profile needed
+    /// Manage a Docker compose rig: up/down/reset/status/logs (trial,
+    /// snapshot arrive in later plans) — docker-only, no profile needed
     #[command(arg_required_else_help = true)]
     Rig(RigArgs),
 
@@ -382,9 +381,32 @@ pub enum RigCommand {
     /// Stop the rig (compose down --remove-orphans; volumes KEPT —
     /// `reset` owns the teardown half)
     Down,
+    /// Tear the rig down AND remove its volumes (down -v
+    /// --remove-orphans), then bring it back up fresh — destructive,
+    /// refused without --yes; no stale project/trial state survives
+    Reset {
+        /// Wait budget in seconds — BOTH compose's --wait-timeout and
+        /// the commissioned probe deadline (default 300)
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
     /// Structured status: services, ports, volumes (allowlist JSON;
     /// a down rig is exit-0 data)
     Status,
+    /// Stream the rig's container logs (compose logs passthrough —
+    /// raw lines, no envelope in any mode; the third streaming
+    /// exception, README-documented)
+    Logs {
+        /// Lines to show from the end of each service's logs
+        #[arg(long, default_value_t = 200, value_name = "N")]
+        tail: u32,
+        /// Follow: stream new lines as they occur (Ctrl-C stops —
+        /// default process kill, no envelope)
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// One service's logs only (see `ign rig status` for names)
+        service: Option<String>,
+    },
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

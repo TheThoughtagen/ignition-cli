@@ -124,8 +124,14 @@ enum ActionOutput {
     RigUp(actions::rig::RigUpResult),
     /// `ign rig down` — compose down (volumes kept).
     RigDown(actions::rig::RigDownResult),
+    /// `ign rig reset` — guarded volume teardown + fresh bring-up.
+    RigReset(actions::rig::RigResetResult),
     /// `ign rig status` — the allowlist status (docker-only family).
     RigStatus(actions::rig::RigStatusResult),
+    /// `ign rig logs` — the lines ALREADY streamed to stdout raw (the
+    /// third sanctioned stdout exception, README-documented); render
+    /// prints nothing further.
+    RigLogs(actions::rig::RigLogsResult),
 }
 
 impl ActionOutput {
@@ -176,7 +182,11 @@ impl ActionOutput {
             ActionOutput::ResourceDelete(result) => render_success(profile, result, compact),
             ActionOutput::RigUp(result) => render_success(profile, result, compact),
             ActionOutput::RigDown(result) => render_success(profile, result, compact),
+            ActionOutput::RigReset(result) => render_success(profile, result, compact),
             ActionOutput::RigStatus(result) => render_success(profile, result, compact),
+            // Unreachable in practice (render_ok intercepts RigLogs
+            // before mode dispatch — the lines already streamed).
+            ActionOutput::RigLogs(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -899,9 +909,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
         },
-        // Rig (04-01, RIG-01): the FIRST docker-only family — no
-        // profile, no secret, no gateway client is resolved for these
-        // verbs, and the envelope echoes `profile: null` on BOTH
+        // Rig (04-01/04-02, RIG-01/02): the FIRST docker-only family —
+        // no profile, no secret, no gateway client is resolved for
+        // these verbs, and the envelope echoes `profile: null` on BOTH
         // success and error (the documented contract nuance — the
         // refusal-precedent shape). `--rig` already folded
         // `IGNITION_RIG` in apply_env_defaults (one env→flag home);
@@ -909,7 +919,18 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // → cwd candidates → WHK conventions (both home roots), always
         // ending in the resolve-then-act config run whose `.name`
         // becomes the explicit `-p` identity for every op.
+        //
+        // `rig reset` is the family's destructive verb: its guard
+        // fires BEFORE the runner/discovery even exist (the
+        // sessions-terminate precedent) — a refusal is exit 2 with
+        // profile null and does ZERO discovery work (binary-pinned:
+        // exit 2 in a cwd with no rig discoverable at all).
         Commands::Rig(RigArgs { rig, command }) => {
+            if matches!(command, RigCommand::Reset { .. })
+                && let Err(err) = require_confirmation(cli.yes, "rig reset")
+            {
+                return (None, Err(err));
+            }
             let runner = ignition_core::rig::DockerCompose;
             let selection = match rig {
                 Some(name) => ignition_core::rig::RigSelection::Named(name),
@@ -917,28 +938,32 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             };
             let result = match ignition_core::rig::resolve_plan(&runner, selection, &config).await {
                 Ok(plan) => match command {
-                    RigCommand::Up { timeout } => {
+                    RigCommand::Up { .. } | RigCommand::Reset { .. } => {
                         // The commissioned-wait probe: a HEADER-LESS
                         // client pointed at the rig's OWN derived
                         // gateway URL (never the profile's gateway) —
                         // StatusPing answers unauthenticated, so the
                         // wait works even with no credential at all.
                         // ssl_verify=false: localhost probes against
-                        // self-signed rig https are the norm.
-                        let probe = actions::rig::gateway_url_from(&plan).and_then(|url| {
-                            let profile = config::Profile {
-                                url: url.parse().ok()?,
-                                label: None,
-                                ssl_verify: false,
-                                auth: AuthRef::default(),
-                            };
-                            ReqwestGatewayApi::new(&profile, None).ok()
-                        });
-                        let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> =
-                            probe.as_ref().map(|api| api as &dyn ignition_core::client::GatewayApi);
-                        actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
-                            .await
-                            .map(ActionOutput::RigUp)
+                        // self-signed rig https are the norm. Shared
+                        // by up and reset (both end in the wait).
+                        let probe = commissioned_probe(&plan);
+                        let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> = probe
+                            .as_ref()
+                            .map(|api| api as &dyn ignition_core::client::GatewayApi);
+                        match command {
+                            RigCommand::Up { timeout } => {
+                                actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
+                                    .await
+                                    .map(ActionOutput::RigUp)
+                            }
+                            RigCommand::Reset { timeout } => {
+                                actions::rig::rig_reset(&runner, &plan, timeout, probe_dyn)
+                                    .await
+                                    .map(ActionOutput::RigReset)
+                            }
+                            _ => unreachable!("guarded by the outer match arm"),
+                        }
                     }
                     RigCommand::Down => {
                         actions::rig::rig_down(&runner, &plan)
@@ -949,6 +974,30 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         actions::rig::rig_status(&runner, &plan)
                             .await
                             .map(ActionOutput::RigStatus)
+                    }
+                    // The THIRD sanctioned stdout exception (after
+                    // completions and `logs -f`): raw passthrough in
+                    // EVERY render mode — compose log lines are not
+                    // gateway JSON objects, and wrapping would corrupt
+                    // them (`rig logs --json` = same passthrough). The
+                    // dispatch owns the printing during execution; the
+                    // returned result only carries the count.
+                    RigCommand::Logs {
+                        tail,
+                        follow,
+                        service,
+                    } => {
+                        let mut sink = |line: String| println!("{line}");
+                        actions::rig::rig_logs(
+                            &runner,
+                            &plan,
+                            tail,
+                            follow,
+                            service.as_deref(),
+                            &mut sink,
+                        )
+                        .await
+                        .map(ActionOutput::RigLogs)
                     }
                 },
                 Err(err) => Err(err),
@@ -1108,6 +1157,24 @@ fn resolve_headerless_api(
         }
         Err(err) => (None, Err(err)),
     }
+}
+
+/// The rig family's commissioned-wait probe: a HEADER-LESS client
+/// pointed at the rig's OWN derived gateway URL (never the profile's
+/// gateway) — `/StatusPing` answers unauthenticated, so the up/reset
+/// waits work even with no credential at all. `ssl_verify=false`:
+/// localhost probes against self-signed rig https are the norm.
+/// Shared by `rig up` and `rig reset` (both end in the wait).
+fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<ReqwestGatewayApi> {
+    actions::rig::gateway_url_from(plan).and_then(|url| {
+        let profile = config::Profile {
+            url: url.parse().ok()?,
+            label: None,
+            ssl_verify: false,
+            auth: AuthRef::default(),
+        };
+        ReqwestGatewayApi::new(&profile, None).ok()
+    })
 }
 
 /// The LOCKED secret chain (env tokens → keyring → basic pair), built in

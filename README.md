@@ -142,7 +142,9 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route` probes `/system/webdev/<NAME>` (404 = absent, anything else = present); config errors (no profile) still exit 3 |
 | `ign rig [--rig NAME] up [--timeout S]` | Bring a Docker compose rig up (`compose up -d --wait`) and wait for the gateway | docker-only (`profile: null` envelope); `--timeout` is BOTH compose's `--wait-timeout` and the commissioned-probe deadline (default 300 s); a fresh-volume rig reports `"up, uncommissioned"` as DATA (exit 0, wizard URL in `warnings`) |
 | `ign rig [--rig NAME] down` | Stop the rig (`compose down --remove-orphans`; volumes KEPT) | docker-only; the volume-deleting teardown belongs to `rig reset` |
+| `ign rig [--rig NAME] reset [--timeout S]` | Tear the rig down AND remove its volumes, then bring it back up fresh (`down -v --remove-orphans` → pre-flight → `up --wait` → commissioned wait) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`, BEFORE any discovery runs; `removed_volumes` in the data reports exactly what `-v` took; no stale project/trial state survives (a fresh volume usually boots uncommissioned — exit 0, wizard URL in `warnings`) |
 | `ign rig [--rig NAME] status` | Structured rig status: services (state/health/ports), volumes, ports occupancy | docker-only; an ALLOWLIST only — never a compose-config passthrough (the resolved config contains gateway passwords); a down rig is exit-0 data |
+| `ign rig [--rig NAME] logs [--tail N] [-f] [SERVICE]` | Stream the rig's container logs (`compose logs` passthrough) | raw lines in EVERY mode — the third stdout exception (see §Streaming); `--tail` default 200; `-f` follows until Ctrl-C (default process kill); compose diagnostics go to stderr, never the data stream |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -235,6 +237,51 @@ target_port, protocol}}, volumes: [names], ports_free}` — all keys
 always present (empty arrays when none). A down rig is exit-0 data
 (`ports_free: true`, empty services).
 
+### `rig reset` semantics (the no-stale-state contract)
+
+`reset` is the phase's destructive verb: it refuses without `--yes`
+(exit 2, `confirmation_required`, hint names `--yes` and
+`IGNITION_YES=1`) and the guard fires BEFORE any discovery runs — a
+refusal costs nothing (no docker, no config scan; binary-pinned by
+exiting 2 in a directory with no rig discoverable at all).
+
+The cycle, in order:
+
+1. **preview** — `docker volume ls` label-filtered to the project:
+   the `removed_volumes` array in the result data reports exactly
+   what reset removes, as it acts;
+2. compose version gate (exit 7 + install hint when absent);
+3. `down -v --remove-orphans` — the LOCKED teardown: `-v` removes the
+   project's named AND anonymous volumes (gateway data, trial state,
+   everything), `--remove-orphans` kills renamed-service strays —
+   `down && up` without `-v` is the classic stale-state anti-pattern
+   reset exists to kill;
+4. port pre-flight with FRESH EYES — teardown frees the rig's own
+   ports first; if another rig grabbed one mid-cycle, reset aborts
+   with attribution and names the torn-down state in the hint;
+5. `up -d --wait` (the `rig up` invocation verbatim);
+6. commissioned wait — same semantics as `rig up`: a fresh volume
+   usually terminally reports the wizard, which is DATA (exit 0,
+   `state: "uncommissioned"`, wizard URL in `warnings`); still-STARTING
+   at the deadline is a real exit-7 failure.
+
+The result data is `{rig, project, removed_volumes, state, warnings}` —
+all keys always. No project, trial, or gateway state survives the
+volume deletion; commission from scratch or restore a backup (04-04)
+afterward.
+
+### `rig logs` is passthrough
+
+`rig logs` streams `docker compose logs` output RAW: one line per
+stdout line, no envelope in ANY mode — compose log lines are not
+gateway JSON objects, and wrapping would corrupt them (`rig logs
+--json` is the same passthrough; contrast `logs -f --json`, whose
+entries ARE gateway NDJSON). `--tail N` (default 200) bounds the
+history; `-f` follows until Ctrl-C (default process kill, no
+envelope); an optional SERVICE positional filters to one service.
+Compose's own stderr diagnostics go to `ign`'s stderr, never the
+data stream.
+
 ### Project export/import specifics
 
 
@@ -292,7 +339,7 @@ the moment a gateway token exists: run the openapi-capture hook in
 writes an authoritative projects+resources extract into the phase
 dir; the same run drives the full e2e loop against a live gateway.
 
-### Streaming output (the second stdout exception)
+### Streaming output (the stdout exceptions)
 
 `ign logs -f` is a STREAM: entries print to stdout as they arrive, so
 there is no single result to wrap. In human mode that means live lines
@@ -304,18 +351,27 @@ A `--timeout` expiry ends the tail cleanly with exit 0; without it the
 tail runs until Ctrl-C, which uses the process default kill (no
 envelope — plan for it in pipelines).
 
+`ign rig logs` is the THIRD exception: its output is raw compose log
+lines, NOT gateway JSON — so it streams verbatim in EVERY mode
+(`--json` changes nothing; there is no envelope to add and no NDJSON
+transformation to attempt). `-f` follows until Ctrl-C (default process
+kill, no envelope), exactly the `logs -f` pipeline caveat.
+
 ### Destructive operations
 
 Commands that change gateway state (`sessions terminate`,
 `logs loggers set`/`reset`, `project delete`, `project import
---collision-policy overwrite`, `resource delete`, and `restart` —
-the big one: it takes
-the whole gateway down for ~1 min) refuse without `--yes`
+--collision-policy overwrite`, `resource delete`, `restart` — the
+big one: it takes
+the whole gateway down for ~1 min — and `rig reset`, which deletes
+the rig's volumes) refuse without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
 pass `--yes` once and humans get a speed bump. `restart` is guarded in
 BOTH forms: plain and `--wait`. The guard fires before any network
-activity: a refusal never touches the gateway. `project delete` and
+activity: a refusal never touches the gateway. `rig reset`'s guard
+fires before even rig DISCOVERY (a refusal does zero work of any
+kind). `project delete` and
 `project import --collision-policy overwrite` are the doubly-relevant
 pair: besides the CLI refusal, delete's wire request always carries
 the gateway's own `confirm=true` query param, and overwrite REPLACES

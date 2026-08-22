@@ -216,7 +216,7 @@ fn discovery_precedence_config_default_beats_cwd() {
     );
 }
 
-/// The `--help` surface: the rig subtree is visible with all three
+/// The `--help` surface: the rig subtree is visible with all five
 /// verbs and the `--rig` flag (contains-assertions, not a golden —
 /// clap's help rendering churns across versions by design).
 #[test]
@@ -228,13 +228,94 @@ fn rig_help_shows_the_subtree() {
     let out = ign_rig(&config, &roots, cwd.path(), &["rig", "--help"]);
     assert!(out.status.success(), "help exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for expected in ["--rig <NAME>", "up", "down", "status"] {
+    for expected in ["--rig <NAME>", "up", "down", "reset", "status", "logs"] {
         assert!(stdout.contains(expected), "help mentions {expected}: {stdout}");
     }
 
     // Bare `ign rig` (no verb) is the friendly usage error, exit 2.
     let out = ign_rig(&config, &roots, cwd.path(), &["rig"]);
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// THE destructive-guard pin (04-02): `rig reset` without `--yes`
+/// refuses with exit 2 (`confirmation_required`), profile null, and
+/// the hint naming BOTH `--yes` and `IGNITION_YES=1` — and the ZERO
+/// WORK proof rides the environment: the cwd has NO compose file and
+/// the convention roots are empty, so if the guard did not fire
+/// BEFORE discovery the command would exit 7 (`no compose file
+/// discovered`). Exit 2 here pins the guard-before-resolution
+/// ordering at the binary level (the sessions-terminate precedent,
+/// docker-only edition).
+#[test]
+fn rig_reset_refuses_without_yes_before_any_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "reset", "--compact"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "guard exit 2 — NOT the exit 7 a discovery run would produce"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("confirmation_required".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("rig reset"), "names the operation: {message}");
+    let hint = body["error"]["hint"].as_str().expect("hint required");
+    assert!(
+        hint.contains("--yes") && hint.contains("IGNITION_YES"),
+        "hint names the flag and the env escape hatch: {hint}"
+    );
+}
+
+/// The other half of the guard story: WITH `--yes` (guard passed) the
+/// same no-rig environment fails CLEANLY at discovery — exit 7
+/// `rig_error` with the search trail. The guard pass-through is
+/// proven by the error class changing from 2 to 7.
+#[test]
+fn rig_reset_with_yes_in_no_rig_cwd_fails_cleanly_at_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "reset", "--yes", "--compact"]);
+    assert_eq!(out.status.code(), Some(7), "guard passed: discovery failure");
+    let body: Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["profile"], Value::Null);
+    assert_eq!(body["error"]["code"], Value::String("rig_error".into()));
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("no compose file discovered"),
+        "the discovery diagnosis leads: {message}"
+    );
+}
+
+/// The `rig logs` flag surface: --tail, -f/--follow, and the SERVICE
+/// positional are all visible in help (contains-assertions — clap's
+/// help rendering churns across versions by design).
+#[test]
+fn rig_logs_help_shows_tail_follow_service() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "logs", "--help"]);
+    assert!(out.status.success(), "help exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--tail"), "tail visible: {stdout}");
+    assert!(stdout.contains("--follow"), "follow visible: {stdout}");
+    assert!(stdout.contains("-f"), "the -f short form visible: {stdout}");
+    assert!(stdout.contains("[SERVICE]"), "the SERVICE positional visible: {stdout}");
 }
 
 /// `IGNITION_RIG` fills a missing `--rig` (the env→flag fold in
