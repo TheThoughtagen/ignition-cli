@@ -107,6 +107,15 @@ mod tests {
         async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn backup_download(
+            &self,
+            _out: &std::path::Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn backup_restore(&self, _gwbk: &std::path::Path) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
             match &self.0 {
                 FakeOutcome::Ok(info) => Ok(info.clone()),

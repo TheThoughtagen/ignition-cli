@@ -33,6 +33,7 @@ use std::path::Path;
 use std::time::Duration;
 
 mod classify;
+pub mod backup;
 pub mod connections;
 pub mod idp;
 pub mod logs;
@@ -293,6 +294,23 @@ pub trait GatewayApi: Send + Sync {
     /// gate): the gateway 403s resets on a NON-expired trial — the
     /// action layer pre-checks expiry.
     async fn trial_reset_wire(&self) -> Result<TrialWire, CoreError>;
+    /// GET `/data/api/v1/backup?type=roaming` (authed,
+    /// [`backup::BACKUP_TIMEOUT`] = 300 s, `Accept:
+    /// application/octet-stream`) — the portable gwbk STREAMED to
+    /// `out` chunk-by-chunk through the 03-02 `download_to_file`
+    /// pipeline (the ONE streaming body-consumption site — never a
+    /// `Vec<u8>`, Pitfall 2). Byte count + metadata ride out in
+    /// [`ExportMeta`] (04-04, RIG-04).
+    async fn backup_download(&self, out: &Path) -> Result<ExportMeta, CoreError>;
+    /// POST `/data/api/v1/backup` (authed, [`backup::BACKUP_TIMEOUT`]
+    /// = 300 s) — the RESTORE: the gwbk bytes as a RAW
+    /// `application/octet-stream` body (NOT multipart — the postman
+    /// collection's exact shape) with the four scope params EXPLICIT
+    /// on the query string. Synchronous AND followed by a gateway
+    /// restart (Pitfall 6): the 2xx means the restore was ACCEPTED —
+    /// the actions layer owns the post-restore RUNNING wait. The
+    /// upload direction buffers by design (the import precedent).
+    async fn backup_restore(&self, gwbk: &Path) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -431,17 +449,28 @@ impl ReqwestGatewayApi {
     /// chunk-counted byte total ride out in [`ExportMeta`]. Requires
     /// the workspace `reqwest` `stream` + `tokio` `fs` features (the
     /// research-flagged dep gap this plan closed).
+    ///
+    /// `accept` adds an OPTIONAL `Accept` header for the callers whose
+    /// server contract names one (04-04's gwbk download sends
+    /// `application/octet-stream`; the 03-02 export sends none) — a
+    /// minimal parameterization that keeps THIS the one streaming
+    /// site instead of forking a second copy of the chunk loop.
     async fn download_to_file(
         &self,
         path: &str,
         out: &Path,
         timeout: Duration,
+        accept: Option<&str>,
     ) -> Result<ExportMeta, CoreError> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
 
         let url = self.url_for(path);
-        let request = self.apply_auth(self.client.get(url.clone()).timeout(timeout));
+        let mut request = self.client.get(url.clone()).timeout(timeout);
+        if let Some(accept) = accept {
+            request = request.header(reqwest::header::ACCEPT, accept);
+        }
+        let request = self.apply_auth(request);
         let response = self.send_and_classify(request, &url).await?;
         let filename = response
             .headers()
@@ -898,11 +927,13 @@ impl GatewayApi for ReqwestGatewayApi {
     ) -> Result<ExportMeta, CoreError> {
         // The 120 s per-request override rides the RequestBuilder (the
         // logs-download precedent); the streaming itself lives in
-        // download_to_file (classify FIRST, then chunk loop).
+        // download_to_file (classify FIRST, then chunk loop). No
+        // `Accept` header — the export contract never named one.
         self.download_to_file(
             &projects::project_export_path(name),
             out,
             projects::PROJECT_EXPORT_TIMEOUT,
+            None,
         )
         .await
     }
@@ -1022,6 +1053,45 @@ impl GatewayApi for ReqwestGatewayApi {
                 "trial reset response did not match the trial shape: {err}"
             ))
         })
+    }
+
+    async fn backup_download(&self, out: &Path) -> Result<ExportMeta, CoreError> {
+        // Pure reuse: the roaming query rides the path constant, the
+        // Accept header rides the helper's optional param, and the
+        // 300 s class rides the RequestBuilder — the 03-02 chunk loop
+        // stays THE one streaming body-consumption site (04-04).
+        self.download_to_file(
+            backup::BACKUP_DOWNLOAD_PATH,
+            out,
+            backup::BACKUP_TIMEOUT,
+            Some(backup::BACKUP_ACCEPT),
+        )
+        .await
+    }
+
+    async fn backup_restore(&self, gwbk: &Path) -> Result<(), CoreError> {
+        // The upload direction buffers BY DESIGN (the import
+        // precedent: a known Content-Length raw body sidesteps the
+        // chunked-encoding question entirely). Token-auth POSTs need
+        // no CSRF (02-RESEARCH §Auth Model). Ok classification IS the
+        // acceptance contract — the actions layer owns the
+        // post-restore RUNNING wait (Pitfall 6: the gateway restarts
+        // after answering).
+        let body = tokio::fs::read(gwbk).await.map_err(|err| {
+            CoreError::InvalidInput {
+                reason: format!("cannot read {}: {err}", gwbk.display()),
+            }
+        })?;
+        let url = self.url_for(backup::BACKUP_PATH);
+        let request = self
+            .client
+            .post(url.clone())
+            .timeout(backup::BACKUP_TIMEOUT)
+            .query(&backup::restore_query())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body);
+        let request = self.apply_auth(request);
+        self.send_and_classify(request, &url).await.map(|_| ())
     }
 }
 

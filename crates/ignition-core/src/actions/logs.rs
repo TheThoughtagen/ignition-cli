@@ -390,6 +390,15 @@ mod tests {
         async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn backup_download(
+            &self,
+            _out: &std::path::Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn backup_restore(&self, _gwbk: &std::path::Path) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
             self.queries.lock().unwrap().push(filter.clone());
             let items = self.pages.lock().unwrap().pop_front().unwrap_or_default();
@@ -676,6 +685,15 @@ mod tests {
             unreachable!("not part of this action")
         }
         async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn backup_download(
+            &self,
+            _out: &std::path::Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn backup_restore(&self, _gwbk: &std::path::Path) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
             async fn logs(&self, _filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
