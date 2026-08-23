@@ -378,6 +378,117 @@ pub struct RigLogsResult {
     pub streamed: usize,
 }
 
+/// The banners cross-check block of [`TrialStatusResult`] (all keys
+/// always; a failed banners fetch degrades to nulls + a warning —
+/// the trial endpoint is the primary truth).
+#[derive(Debug, Serialize)]
+pub struct TrialBanners {
+    /// The trial banner's `severity` verbatim (`"info"` / `"warning"`);
+    /// `null` when no trial banner or the fetch failed.
+    pub severity: Option<String>,
+    /// The trial banner's `expireTime` in epoch **MILLISECONDS** —
+    /// `null` when expired/unknown (Pitfall 7).
+    pub expire_time_ms: Option<i64>,
+    /// The Pitfall-7 cross-check: `severity == "info"` AND
+    /// `expireTime > now_ms`. NEVER the primary active signal —
+    /// [`TrialStatusResult::expired`] is.
+    pub active: bool,
+}
+
+/// `ign rig trial status` output model (04-03, RIG-02): the trial
+/// endpoint re-exposed under unit-explicit keys (the two-layer naming
+/// LOCK) + the banners cross-check. All keys always present.
+#[derive(Debug, Serialize)]
+pub struct TrialStatusResult {
+    /// `licenseMode` verbatim (`"Trial"` / …).
+    pub license_mode: String,
+    /// `trialState` verbatim (`AllInDemo` / `SomeInDemo` /
+    /// `NoneInDemo`).
+    pub trial_state: String,
+    /// `trialSecondsLeft` — epoch **SECONDS** (the `_s` suffix is the
+    /// unit contract).
+    pub trial_remaining_s: i64,
+    /// The primary expiry truth (never derived from banners).
+    pub expired: bool,
+    /// Emergency-license flag.
+    pub emergency: bool,
+    /// `emergencySecondsLeft` — epoch **SECONDS**.
+    pub emergency_remaining_s: i64,
+    /// Development-license flag.
+    pub development: bool,
+    /// The banners cross-check block.
+    pub banners: TrialBanners,
+    /// Data-level warnings (banners fetch failed, …) — exit 0 carries
+    /// them here, never on stderr.
+    pub warnings: Vec<String>,
+}
+
+/// Wall-clock epoch milliseconds (the banners `expireTime` unit).
+fn epoch_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_millis() as i64
+}
+
+/// `ign rig trial status` (04-03, RIG-02): the trial endpoint is the
+/// PRIMARY truth; the trial banner (`type: "trial"`) is the
+/// cross-check, its `active` flag computed per Pitfall 7
+/// (`severity=="info" && expireTime>now_ms` — never the reverse
+/// derivation). A failed banners fetch degrades to nulls + a warning
+/// (the trial endpoint already answered; the cross-check is
+/// advisory). `gateway` is a client pointed at the RIG's URL — these
+/// endpoints answer unauthenticated (live-verified both rigs), so a
+/// fresh rig with no token reports its trial state fine.
+pub async fn trial_status(gateway: &dyn GatewayApi) -> Result<TrialStatusResult, CoreError> {
+    let wire = gateway.trial_status_wire().await?;
+    let mut warnings = Vec::new();
+    let banners = match gateway.banners().await {
+        Ok(set) => {
+            let trial_banner = set.banners.iter().find(|banner| banner.r#type == "trial");
+            match trial_banner {
+                Some(banner) => {
+                    let active = banner.data.severity == "info"
+                        && banner.data.expire_time_ms.is_some_and(|ms| ms > epoch_ms_now());
+                    TrialBanners {
+                        severity: Some(banner.data.severity.clone()),
+                        expire_time_ms: banner.data.expire_time_ms,
+                        active,
+                    }
+                }
+                None => TrialBanners {
+                    severity: None,
+                    expire_time_ms: None,
+                    active: false,
+                },
+            }
+        }
+        Err(err) => {
+            warnings.push(format!(
+                "banners cross-check unavailable ({}); the trial endpoint's \
+                 expired flag is the truth",
+                err
+            ));
+            TrialBanners {
+                severity: None,
+                expire_time_ms: None,
+                active: false,
+            }
+        }
+    };
+    Ok(TrialStatusResult {
+        license_mode: wire.license_mode,
+        trial_state: wire.trial_state,
+        trial_remaining_s: wire.trial_seconds_left,
+        expired: wire.expired,
+        emergency: wire.emergency,
+        emergency_remaining_s: wire.emergency_seconds_left,
+        development: wire.development,
+        banners,
+        warnings,
+    })
+}
+
 /// `ign rig logs` (04-02, RIG-02): compose log PASSTHROUGH — a raw
 /// line stream through `sink`, never an envelope-wrapped body.
 /// Compose log lines are not gateway JSON objects; wrapping would
@@ -493,7 +604,7 @@ mod tests {
 
     use super::{
         DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigResetResult, RigStatusResult, RigUpResult,
-        gateway_url_from, rig_down, rig_logs, rig_reset, rig_status, rig_up,
+        gateway_url_from, rig_down, rig_logs, rig_reset, rig_status, rig_up, trial_status,
     };
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
@@ -1088,6 +1199,159 @@ mod tests {
         assert!(message.contains("docker compose logs failed (exit 1)"), "{message}");
         assert!(message.contains("no such service"), "{message}");
         assert!(received.is_empty(), "diagnostics never ride the data sink");
+    }
+
+    // ---------------------------------------------------------------------
+    // trial_status — the trial endpoint + banners cross-check (04-03)
+    // ---------------------------------------------------------------------
+
+    /// Mount the EXPIRED live captures (ign-research 8.3.6): trial
+    /// AllInDemo/0s/expired + banners warning/null.
+    async fn expired_trial_server() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/trial"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "licenseMode": "Trial", "trialState": "AllInDemo",
+                    "trialSecondsLeft": 0, "expired": true,
+                    "emergency": false, "emergencySecondsLeft": 0,
+                    "development": false, "developmentSecondsLeft": 0
+                }),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/overview/banners"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "banners": [{
+                        "order": 0, "type": "trial",
+                        "data": { "severity": "warning", "expireTime": null,
+                                  "toolTips": [], "actions": [] }
+                    }]
+                }),
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The expired rig's exact output shape (all keys always; the
+    /// banners cross-check rides severity/expire_time_ms/active).
+    #[tokio::test]
+    async fn trial_status_expired_shape_is_exact() {
+        let server = expired_trial_server().await;
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let result = trial_status(&api).await.expect("expired status parses");
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({
+                "license_mode": "Trial",
+                "trial_state": "AllInDemo",
+                "trial_remaining_s": 0,
+                "expired": true,
+                "emergency": false,
+                "emergency_remaining_s": 0,
+                "development": false,
+                "banners": {
+                    "severity": "warning",
+                    "expire_time_ms": null,
+                    "active": false
+                },
+                "warnings": []
+            }),
+            "EXACT shape comparison — the unit-explicit keys + the \
+             banners cross-check block, no unknown keys"
+        );
+    }
+
+    /// The ACTIVE cross-check: severity info + a far-FUTURE epoch-ms
+    /// expireTime → active true; the SAME severity with a far-PAST
+    /// expireTime → active false (the Pitfall-7 pin: expiry time is
+    /// part of the active derivation, severity alone never is).
+    #[tokio::test]
+    async fn trial_status_banner_active_requires_future_expire_time() {
+        for (expire_time, active) in [(9_999_999_999_999_999i64, true), (1i64, false)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/data/api/v1/trial"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "licenseMode": "Trial", "trialState": "AllInDemo",
+                        "trialSecondsLeft": 6590, "expired": false,
+                        "emergency": false, "emergencySecondsLeft": 0,
+                        "development": false, "developmentSecondsLeft": 0
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/data/api/v1/overview/banners"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "banners": [{
+                            "order": 5, "type": "trial",
+                            "data": { "severity": "info",
+                                      "expireTime": expire_time,
+                                      "toolTips": [], "actions": [] }
+                        }]
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+            let result = trial_status(&api).await.expect("active status parses");
+            assert!(!result.expired, "primary truth from the trial endpoint");
+            assert_eq!(result.trial_remaining_s, 6590);
+            assert_eq!(
+                result.banners.severity.as_deref(),
+                Some("info"),
+                "the trial banner surfaced (8.3.3 serves order 5 — not an index)"
+            );
+            assert_eq!(
+                result.banners.active, active,
+                "info severity + expireTime {expire_time} → active {active} (Pitfall 7)"
+            );
+        }
+    }
+
+    /// A failed banners fetch degrades to nulls + a data-level
+    /// warning — the trial endpoint's expired flag stays the truth.
+    #[tokio::test]
+    async fn trial_status_banners_failure_degrades_with_warning() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/trial"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "licenseMode": "Trial", "trialState": "AllInDemo",
+                    "trialSecondsLeft": 0, "expired": true,
+                    "emergency": false, "emergencySecondsLeft": 0,
+                    "development": false, "developmentSecondsLeft": 0
+                }),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/overview/banners"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let result = trial_status(&api).await.expect("primary endpoint answered");
+        assert!(result.expired, "primary truth survives the cross-check failure");
+        assert_eq!(result.banners.severity, None);
+        assert_eq!(result.banners.expire_time_ms, None);
+        assert!(!result.banners.active);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("banners cross-check unavailable")),
+            "the degradation is visible data: {:?}",
+            result.warnings
+        );
     }
 
     // ---------------------------------------------------------------------

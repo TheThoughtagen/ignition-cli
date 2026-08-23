@@ -547,6 +547,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for DoctorRig {
+
+        async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn banners(&self) -> Result<crate::client::trial::BannerSet, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
             (self.info)()
         }

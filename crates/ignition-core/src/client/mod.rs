@@ -42,6 +42,7 @@ pub mod resources;
 pub mod restart;
 pub mod sessions;
 pub mod status;
+pub mod trial;
 pub mod version;
 
 use crate::client::connections::GatewayConnection;
@@ -56,6 +57,7 @@ use crate::client::resources::{ResourceContent, ResourceEntry};
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
+use crate::client::trial::{BannerSet, TrialWire};
 use crate::client::version::GatewayInfo;
 use crate::config::{Credential, Profile};
 use crate::error::CoreError;
@@ -272,6 +274,24 @@ pub trait GatewayApi: Send + Sync {
     /// {resourcePath}` (authed) — the surgical loop's destructive
     /// verb. Audit-logged server-side.
     async fn project_resource_delete(&self, project: &str, path: &str) -> Result<(), CoreError>;
+    /// GET `/data/api/v1/trial` — the trial state, live-verified
+    /// UNAUTHENTICATED on 8.3.3 + 8.3.6 (both trial states): auth
+    /// headers ride ONLY when the client carries a credential (fresh
+    /// rigs have none — the version-command degradation precedent,
+    /// rig-family edition).
+    async fn trial_status_wire(&self) -> Result<TrialWire, CoreError>;
+    /// GET `/data/api/v1/overview/banners` — the trial cross-check
+    /// (severity/expireTime semantics, Pitfall 7). Same conditional
+    /// auth as [`Self::trial_status_wire`].
+    async fn banners(&self) -> Result<BannerSet, CoreError>;
+    /// POST `/data/api/v1/trial` (authed, empty body) — the trial
+    /// RESET, tier 0 of the ladder: a token credential plausibly
+    /// satisfies it without CSRF (token mutations need none — the
+    /// restart/set-logger precedent). The 2xx body IS the fresh
+    /// [`TrialWire`] (live-observed). NOTE (live-discovered state
+    /// gate): the gateway 403s resets on a NON-expired trial — the
+    /// action layer pre-checks expiry.
+    async fn trial_reset_wire(&self) -> Result<TrialWire, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -972,6 +992,35 @@ impl GatewayApi for ReqwestGatewayApi {
     async fn project_resource_delete(&self, project: &str, path: &str) -> Result<(), CoreError> {
         self.delete_with_query(&resources::resource_path(project, path), &[])
             .await
+    }
+
+    async fn trial_status_wire(&self) -> Result<TrialWire, CoreError> {
+        // Conditional auth: the endpoints answer unauthenticated
+        // (live-verified both rigs), so a header-less client degrades
+        // cleanly — but a carried credential rides along harmlessly
+        // (future-proofing if a gateway version starts gating them).
+        let auth = self.credential.is_some();
+        self.get_json(trial::TRIAL_PATH, None, auth).await
+    }
+
+    async fn banners(&self) -> Result<BannerSet, CoreError> {
+        let auth = self.credential.is_some();
+        self.get_json(trial::BANNERS_PATH, None, auth).await
+    }
+
+    async fn trial_reset_wire(&self) -> Result<TrialWire, CoreError> {
+        // Empty body, authed POST (the UI mutation's exact shape —
+        // decompiled ia-gateway.js: {method:"POST",
+        // url:"/data/api/v1/trial"}). Token-auth POSTs need no CSRF
+        // (02-RESEARCH §Auth Model); on 403 the tier-1 session+CSRF
+        // flow takes over (actions layer owns the ladder).
+        let response = self.post_empty(trial::TRIAL_PATH, &[], true).await?;
+        let body = response.text().await.unwrap_or_default();
+        serde_json::from_str(&body).map_err(|err| {
+            CoreError::Internal(format!(
+                "trial reset response did not match the trial shape: {err}"
+            ))
+        })
     }
 }
 

@@ -380,6 +380,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for TailRig {
+
+        async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn banners(&self) -> Result<crate::client::trial::BannerSet, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
             self.queries.lock().unwrap().push(filter.clone());
             let items = self.pages.lock().unwrap().pop_front().unwrap_or_default();
@@ -658,6 +668,16 @@ mod tests {
         struct AuthRig;
         #[async_trait::async_trait]
         impl GatewayApi for AuthRig {
+
+        async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn banners(&self) -> Result<crate::client::trial::BannerSet, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
             async fn logs(&self, _filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
                 Err(CoreError::Auth {
                     status: 401,

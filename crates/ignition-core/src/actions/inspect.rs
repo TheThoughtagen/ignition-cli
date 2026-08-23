@@ -236,6 +236,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for HealthyRig {
+
+        async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn banners(&self) -> Result<crate::client::trial::BannerSet, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
             Ok(GatewayInfo {
                 name: Some("ign-mock".into()),
@@ -514,6 +524,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for BrokenOverview {
+
+        async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn banners(&self) -> Result<crate::client::trial::BannerSet, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
             Ok(GatewayInfo {
                 name: None,
