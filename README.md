@@ -32,7 +32,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -145,6 +145,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign rig [--rig NAME] reset [--timeout S]` | Tear the rig down AND remove its volumes, then bring it back up fresh (`down -v --remove-orphans` → pre-flight → `up --wait` → commissioned wait) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`, BEFORE any discovery runs; `removed_volumes` in the data reports exactly what `-v` took; no stale project/trial state survives (a fresh volume usually boots uncommissioned — exit 0, wizard URL in `warnings`) |
 | `ign rig [--rig NAME] status` | Structured rig status: services (state/health/ports), volumes, ports occupancy | docker-only; an ALLOWLIST only — never a compose-config passthrough (the resolved config contains gateway passwords); a down rig is exit-0 data |
 | `ign rig [--rig NAME] logs [--tail N] [-f] [SERVICE]` | Stream the rig's container logs (`compose logs` passthrough) | raw lines in EVERY mode — the third stdout exception (see §Streaming); `--tail` default 200; `-f` follows until Ctrl-C (default process kill); compose diagnostics go to stderr, never the data stream |
+| `ign rig [--rig NAME] trial status` | Show the rig gateway's trial state: licenseMode, trialState, seconds left, expired — plus the banners cross-check | **credential-free** (the trial/banners endpoints answer unauthenticated — verified live on 8.3.3 AND 8.3.6; a fresh rig with no token reports fine); addresses the RIG's derived gateway URL (never the profile's); data `{license_mode, trial_state, trial_remaining_s, expired, emergency, emergency_remaining_s, development, banners: {severity, expire_time_ms, active}, warnings}` — `banners.active` is the Pitfall-7 cross-check (`severity=="info"` AND `expireTime>now_ms`), never the primary truth (`expired` is) |
+| `ign rig [--rig NAME] trial reset [--user NAME]` | Reset an EXPIRED trial to a fresh ~2 h window via the mechanism ladder | **destructive**: exit 2 (`confirmation_required`) without `--yes`, BEFORE any discovery; ladder = tier 0 `POST /data/api/v1/trial` with `X-Ignition-API-Token` (token from `IGNITION_TOKEN`) → tier 1 native gateway login (internal-IdP OIDC challenge dance → session cookie + CSRF header), creds `--user`/`IGNITION_USER` + `IGNITION_PASSWORD` (password NEVER a flag); success REQUIRES the read-back flip (`expired` false on re-fetch — a bare 2xx never suffices); a NON-expired trial refuses exit 6 `trial_not_expired` (the gateway 403s resets while active — live-verified); no creds at all → exit 3 |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -282,6 +284,62 @@ envelope); an optional SERVICE positional filters to one service.
 Compose's own stderr diagnostics go to `ign`'s stderr, never the
 data stream.
 
+### `rig trial` — state, and the reset ladder
+
+`rig trial status` is **credential-free truth**: both
+`GET /data/api/v1/trial` and `GET /data/api/v1/overview/banners`
+answer unauthenticated (live-verified on 8.3.3 and 8.3.6, expired AND
+active states), so a fresh rig with no provisioned token reports its
+trial state fine. The trial endpoint is the PRIMARY source
+(`trialState ∈ {AllInDemo, SomeInDemo, NoneInDemo}`,
+`trialSecondsLeft` in seconds, the `expired` flag); the trial banner
+is the cross-check — `expireTime` is epoch **milliseconds** or
+`null`, and an EXPIRED trial shows `severity:"warning"` + `null`
+(code expecting a future timestamp misreads expired as active), so
+`banners.active` is computed as `severity=="info"` AND
+`expireTime>now_ms` and never the reverse derivation.
+
+`rig trial reset` runs the **mechanism ladder** (the spike-resolved
+native approach — browser delegation rejected: it needs
+Node+chromium, broke across 8.3.3's UI rewrite, and verifies via DOM
+text):
+
+1. **tier 0 — token-auth POST** `POST /data/api/v1/trial` with
+   `X-Ignition-API-Token` (token from `IGNITION_TOKEN`; token
+   mutations need no CSRF). One cheap call; on 2xx it wins.
+2. **tier 1 — native gateway login** (the live-verified mechanism,
+   end-to-end on 8.3.3: `expired:true → false`, `0 → 7199s`): the
+   internal IdP's OIDC challenge dance (rotating tokens, ~4 captured
+   cookies replayed by hand, `webui-sid-<id>` session cookie,
+   `csrfToken` from `/data/app/session`) → the reset POST with the
+   session cookie + `X-CSRF-Token`. Credentials: `--user` (or
+   `IGNITION_USER`) + `IGNITION_PASSWORD` — the password NEVER rides
+   a flag, env only.
+
+Success REQUIRES the read-back flip: after a 2xx the trial is
+re-fetched and `expired` must be false — a bare 2xx never suffices
+(the mutation-reads-back discipline). The result data is
+`{rig_url, mechanism: "token"|"login", expired_before,
+expired_after, trial_remaining_s}`.
+
+**State gate (live-discovered):** the gateway answers 403 to reset
+attempts on a NON-expired trial (verified from the browser page with
+the exact UI headers) — `ign` surfaces this honestly as exit 6
+`trial_not_expired` naming the seconds left, instead of a misleading
+auth error. Wait for expiry (watch `rig trial status`) or `rig reset
+--yes` for a completely fresh trial volume.
+
+**Verification note:** the reset path is verified end-to-end against
+8.3.3 (the git-module rig, by hand during 04-03) and the
+login-flow machinery against 8.3.6 (ign-research; steps 1–5 +
+bad-credential shapes). Repeatable live gates ship as `#[ignore]`
+tests (`cargo test -p ignition-core --test trial_contract --
+--ignored` with `IGNITION_LIVE_URL` + credentials +
+`IGNITION_LIVE_MUTATIONS=1` against an expired rig). A tier-2
+Playwright fallback exists ONLY as this documented env contract —
+`ignition-trial-resetter` / WHK-Global's `e2e/reset_trial.mjs` — and
+is never shipped as `ign`'s mechanism.
+
 ### Project export/import specifics
 
 
@@ -364,13 +422,15 @@ Commands that change gateway state (`sessions terminate`,
 --collision-policy overwrite`, `resource delete`, `restart` — the
 big one: it takes
 the whole gateway down for ~1 min — and `rig reset`, which deletes
-the rig's volumes) refuse without `--yes`
+the rig's volumes, plus `rig trial reset`, which restarts the trial
+window) refuse without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
 pass `--yes` once and humans get a speed bump. `restart` is guarded in
 BOTH forms: plain and `--wait`. The guard fires before any network
-activity: a refusal never touches the gateway. `rig reset`'s guard
-fires before even rig DISCOVERY (a refusal does zero work of any
+activity: a refusal never touches the gateway. The rig guards
+(`rig reset`, `rig trial reset`) fire before even rig DISCOVERY
+(a refusal does zero work of any
 kind). `project delete` and
 `project import --collision-policy overwrite` are the doubly-relevant
 pair: besides the CLI refusal, delete's wire request always carries

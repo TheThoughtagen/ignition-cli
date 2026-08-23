@@ -131,8 +131,9 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Resource(ResourceArgs),
 
-    /// Manage a Docker compose rig: up/down/reset/status/logs (trial,
-    /// snapshot arrive in later plans) — docker-only, no profile needed
+    /// Manage a Docker compose rig: up/down/reset/status/logs/trial
+    /// (snapshot arrives in a later plan) — docker-only, no profile
+    /// needed
     #[command(arg_required_else_help = true)]
     Rig(RigArgs),
 
@@ -406,6 +407,40 @@ pub enum RigCommand {
         follow: bool,
         /// One service's logs only (see `ign rig status` for names)
         service: Option<String>,
+    },
+    /// Trial-license state: status is credential-free truth; reset
+    /// (guarded) restarts an EXPIRED trial via the mechanism ladder
+    /// (token-auth POST, else native gateway login)
+    Trial(TrialArgs),
+}
+
+/// Trial subcommands (04-03, RIG-02/03). `status` reads the
+/// unauthenticated trial endpoint + banners cross-check. `reset` is
+/// the family's destructive verb (`--yes`-guarded, exit 2 without —
+/// the reset precedent); the password NEVER rides a flag (env/secret
+/// only — redaction discipline).
+#[derive(Debug, clap::Args)]
+pub struct TrialArgs {
+    #[command(subcommand)]
+    pub command: TrialCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TrialCommand {
+    /// Show the trial state: licenseMode, trialState, seconds left,
+    /// expired — plus the banners cross-check. No credential needed
+    /// (the endpoints answer unauthenticated — fresh-rig friendly)
+    Status,
+    /// Reset an EXPIRED trial to a fresh window — destructive,
+    /// refused without --yes. Mechanism ladder: API-token POST
+    /// (IGNITION_TOKEN) → native gateway login (--user /
+    /// IGNITION_USER + IGNITION_PASSWORD). Non-expired trials refuse
+    /// (trial_not_expired)
+    Reset {
+        /// Gateway admin username for the login rung (password comes
+        /// from IGNITION_PASSWORD — never a flag)
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
     },
 }
 

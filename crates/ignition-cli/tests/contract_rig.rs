@@ -350,3 +350,74 @@ fn ignition_rig_env_folds_into_selection() {
         "the env-provided name drove the lookup: {message}"
     );
 }
+
+/// THE destructive-guard pin (04-03): `rig trial reset` without
+/// `--yes` refuses with exit 2 (`confirmation_required`), profile
+/// null — and the ZERO WORK proof rides the same no-rig environment
+/// as `rig reset` (the cwd has NO compose file; un-guarded execution
+/// would exit 7 at discovery). The guard-before-resolution ordering,
+/// fourth destructive-verb instance.
+#[test]
+fn rig_trial_reset_refuses_without_yes_before_any_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial", "reset", "--compact"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "guard exit 2 — NOT the exit 7 a discovery run would produce"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "refusal: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("confirmation_required".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("rig trial reset"),
+        "names the operation: {message}"
+    );
+}
+
+/// The `rig trial` help surface: both verbs + `--user`; a PASSWORD
+/// flag must NOT exist (env-only redaction discipline — pinned by
+/// this absence in the same golden as the presence checks).
+/// A status-path binary golden is NOT testable without a gateway —
+/// the status contract lives at the unit/wiremock layer
+/// (crates/ignition-core/tests/trial_contract.rs + actions tests).
+#[test]
+fn rig_trial_help_shows_verbs_and_no_password_flag() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial", "--help"]);
+    assert!(out.status.success(), "help exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in ["status", "reset"] {
+        assert!(stdout.contains(expected), "help mentions {expected}: {stdout}");
+    }
+
+    // The reset verb's own help carries --user; a PASSWORD flag must
+    // NOT exist anywhere (env-only redaction discipline — pinned by
+    // this absence in the same golden as the presence checks).
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial", "reset", "--help"]);
+    assert!(out.status.success(), "reset help exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--user <NAME>"), "--user visible: {stdout}");
+    assert!(
+        !stdout.to_lowercase().contains("--password"),
+        "password NEVER rides a flag: {stdout}"
+    );
+
+    // Bare `ign rig trial` (no verb) is the friendly usage error.
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial"]);
+    assert_eq!(out.status.code(), Some(2));
+}

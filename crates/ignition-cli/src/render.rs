@@ -28,6 +28,7 @@ use ignition_core::actions::resources::{
 };
 use ignition_core::actions::rig::{
     RigDownResult, RigLogsResult, RigResetResult, RigStatusResult, RigUpResult,
+    TrialResetResult, TrialStatusResult,
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
@@ -192,6 +193,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         // dispatch (the third streaming exception — lines already
         // printed during execution).
         ActionOutput::RigLogs(result) => render_rig_logs_human(result),
+        ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
+        ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
     }
 }
 
@@ -680,6 +683,54 @@ fn render_rig_reset_human(result: &RigResetResult) {
 /// precedent).
 fn render_rig_logs_human(result: &RigLogsResult) {
     println!("({} lines streamed)", result.streamed);
+}
+
+/// `ign rig trial status` human lines: the license banner first (the
+/// `ign status` banner style — mode + countdown), then the cross-check
+/// line, warnings last. An expired trial leads with EXPIRED.
+fn render_trial_status_human(result: &TrialStatusResult) {
+    let banner = if result.expired {
+        "trial EXPIRED".to_string()
+    } else {
+        format!(
+            "trial active, {} remaining",
+            humanize_duration_ms(result.trial_remaining_s * 1000)
+        )
+    };
+    println!(
+        "license: {} ({}), {}",
+        result.license_mode, result.trial_state, banner
+    );
+    let expire = match result.banners.expire_time_ms {
+        Some(ms) => iso_utc(ms),
+        None => "-".to_string(),
+    };
+    println!(
+        "banners: severity {}, expires {}, cross-check {}",
+        result.banners.severity.as_deref().unwrap_or("-"),
+        expire,
+        if result.banners.active {
+            "active"
+        } else {
+            "inactive"
+        }
+    );
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+/// `ign rig trial reset` human line: the mechanism that landed + the
+/// before/after flip + the fresh countdown.
+fn render_trial_reset_human(result: &TrialResetResult) {
+    println!(
+        "trial reset via {} — expired {} → {}, {} remaining ({})",
+        result.mechanism,
+        result.expired_before,
+        result.expired_after,
+        humanize_duration_ms(result.trial_remaining_s * 1000),
+        result.rig_url
+    );
 }
 
 /// `ign rig status` human table: identity header, one row per service

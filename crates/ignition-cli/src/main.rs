@@ -132,6 +132,12 @@ enum ActionOutput {
     /// third sanctioned stdout exception, README-documented); render
     /// prints nothing further.
     RigLogs(actions::rig::RigLogsResult),
+    /// `ign rig trial status` — the credential-free trial truth +
+    /// banners cross-check (04-03).
+    RigTrialStatus(actions::rig::TrialStatusResult),
+    /// `ign rig trial reset` — the ladder's outcome: mechanism +
+    /// before/after flip (04-03).
+    RigTrialReset(actions::rig::TrialResetResult),
 }
 
 impl ActionOutput {
@@ -187,6 +193,8 @@ impl ActionOutput {
             // Unreachable in practice (render_ok intercepts RigLogs
             // before mode dispatch — the lines already streamed).
             ActionOutput::RigLogs(result) => render_success(profile, result, compact),
+            ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
+            ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -909,25 +917,28 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
         },
-        // Rig (04-01/04-02, RIG-01/02): the FIRST docker-only family —
-        // no profile, no secret, no gateway client is resolved for
-        // these verbs, and the envelope echoes `profile: null` on BOTH
-        // success and error (the documented contract nuance — the
-        // refusal-precedent shape). `--rig` already folded
-        // `IGNITION_RIG` in apply_env_defaults (one env→flag home);
-        // discovery then runs the LOCKED order: named → [rig].default
-        // → cwd candidates → WHK conventions (both home roots), always
-        // ending in the resolve-then-act config run whose `.name`
-        // becomes the explicit `-p` identity for every op.
-        //
-        // `rig reset` is the family's destructive verb: its guard
-        // fires BEFORE the runner/discovery even exist (the
-        // sessions-terminate precedent) — a refusal is exit 2 with
-        // profile null and does ZERO discovery work (binary-pinned:
-        // exit 2 in a cwd with no rig discoverable at all).
+        // `rig reset` and `rig trial reset` are the family's
+        // destructive verbs: their guards fire BEFORE the
+        // runner/discovery even exist (the sessions-terminate
+        // precedent) — a refusal is exit 2 with profile null and does
+        // ZERO discovery work (binary-pinned: exit 2 in a cwd with no
+        // rig discoverable at all).
         Commands::Rig(RigArgs { rig, command }) => {
-            if matches!(command, RigCommand::Reset { .. })
-                && let Err(err) = require_confirmation(cli.yes, "rig reset")
+            // Guard BEFORE the runner/discovery even exist (the
+            // sessions-terminate precedent) — a refusal is exit 2
+            // with profile null and does ZERO discovery work
+            // (binary-pinned: exit 2 in a cwd with no rig
+            // discoverable at all). The message names the ACTUAL verb.
+            let guarded_operation = match &command {
+                RigCommand::Reset { .. } => Some("rig reset"),
+                RigCommand::Trial(trial_args) => match trial_args.command {
+                    crate::cli::TrialCommand::Reset { .. } => Some("rig trial reset"),
+                    crate::cli::TrialCommand::Status => None,
+                },
+                _ => None,
+            };
+            if let Some(operation) = guarded_operation
+                && let Err(err) = require_confirmation(cli.yes, operation)
             {
                 return (None, Err(err));
             }
@@ -936,6 +947,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 Some(name) => ignition_core::rig::RigSelection::Named(name),
                 None => ignition_core::rig::RigSelection::Auto,
             };
+            // The trial verbs echo the CONFIG's active profile name as
+            // context when one exists (they address the RIG, not the
+            // profile — docker verbs stay profile:null; documented).
+            let trial_profile_echo = config.active.clone();
+            let is_trial_verb = matches!(command, RigCommand::Trial(_));
             let result = match ignition_core::rig::resolve_plan(&runner, selection, &config).await {
                 Ok(plan) => match command {
                     RigCommand::Up { .. } | RigCommand::Reset { .. } => {
@@ -999,10 +1015,85 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         .await
                         .map(ActionOutput::RigLogs)
                     }
+                    // Trial (04-03, RIG-02/03): BOTH verbs address the
+                    // RIG's derived gateway URL (never the profile's)
+                    // — status header-less (the endpoints answer
+                    // unauthenticated; fresh-rig friendly), reset with
+                    // the tier-0 token when IGNITION_TOKEN is set (the
+                    // client carries it; the action's ladder decides
+                    // which rung lands) and/or the tier-1 pair
+                    // (--user / IGNITION_USER + IGNITION_PASSWORD).
+                    RigCommand::Trial(ref trial_args) => match trial_args.command.clone() {
+                        crate::cli::TrialCommand::Status => {
+                            match rig_gateway_client(&plan, None) {
+                                Some(api) => actions::rig::trial_status(&api)
+                                    .await
+                                    .map(ActionOutput::RigTrialStatus),
+                                None => Err(trial_no_gateway(&plan)),
+                            }
+                        }
+                        crate::cli::TrialCommand::Reset { user } => {
+                            // Cred sourcing (rig family — no profile
+                            // chain): tier-0 token = IGNITION_TOKEN;
+                            // tier-1 pair = --user flag or IGNITION_USER
+                            // + IGNITION_PASSWORD (password env-only,
+                            // NEVER a flag).
+                            let token = std::env::var("IGNITION_TOKEN")
+                                .ok()
+                                .filter(|value| !value.is_empty());
+                            let username = user
+                                .clone()
+                                .or_else(|| env_non_empty("IGNITION_USER"));
+                            let password = env_non_empty("IGNITION_PASSWORD");
+                            let basic = username.zip(password).map(|(user, password)| {
+                                (user, ignition_core::config::Secret::new(password))
+                            });
+                            if token.is_none() && basic.is_none() {
+                                // The both-absent refusal: exit 3, the
+                                // hint names both credential paths.
+                                return (
+                                    trial_profile_echo,
+                                    Err(CoreError::SecretUnavailable {
+                                        profile: plan.name.clone(),
+                                    }),
+                                );
+                            }
+                            let credential =
+                                token.map(|token| Credential::Token(config::Secret::new(token)));
+                            let token_available = credential.is_some();
+                            match rig_gateway_client(&plan, credential) {
+                                Some(api) => {
+                                    let rig_url =
+                                        actions::rig::gateway_url_from(&plan).expect(
+                                            "rig_gateway_client derived it or returned None",
+                                        );
+                                    let basic_ref = basic
+                                        .as_ref()
+                                        .map(|(user, password)| (user.as_str(), password));
+                                    actions::rig::trial_reset(
+                                        &api,
+                                        &rig_url,
+                                        token_available,
+                                        basic_ref,
+                                    )
+                                    .await
+                                    .map(ActionOutput::RigTrialReset)
+                                }
+                                None => Err(trial_no_gateway(&plan)),
+                            }
+                        }
+                    },
                 },
                 Err(err) => Err(err),
             };
-            (None, result)
+            // The trial verbs echo the active profile as context; the
+            // docker verbs keep the family's profile:null contract.
+            let echo = if is_trial_verb {
+                trial_profile_echo
+            } else {
+                None
+            };
+            (echo, result)
         }
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
@@ -1166,6 +1257,18 @@ fn resolve_headerless_api(
 /// localhost probes against self-signed rig https are the norm.
 /// Shared by `rig up` and `rig reset` (both end in the wait).
 fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<ReqwestGatewayApi> {
+    rig_gateway_client(plan, None)
+}
+
+/// A client pointed at the rig's OWN derived gateway URL (the
+/// `commissioned_probe` generalized for the trial verbs: an optional
+/// credential rides along — tier 0's token when `IGNITION_TOKEN` is
+/// set; the trial endpoints tolerate headers either way,
+/// live-verified). `None` when no gateway port is derivable.
+fn rig_gateway_client(
+    plan: &ignition_core::rig::RigPlan,
+    credential: Option<Credential>,
+) -> Option<ReqwestGatewayApi> {
     actions::rig::gateway_url_from(plan).and_then(|url| {
         let profile = config::Profile {
             url: url.parse().ok()?,
@@ -1173,8 +1276,23 @@ fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<ReqwestGatew
             ssl_verify: false,
             auth: AuthRef::default(),
         };
-        ReqwestGatewayApi::new(&profile, None).ok()
+        ReqwestGatewayApi::new(&profile, credential).ok()
     })
+}
+
+/// The trial verbs' no-gateway refusal: a rig with no 8088/443 port
+/// mapping has no gateway to ask.
+fn trial_no_gateway(plan: &ignition_core::rig::RigPlan) -> CoreError {
+    CoreError::Rig(format!(
+        "rig {} publishes no gateway port (target 8088/443) — trial \
+         commands address the rig's gateway",
+        plan.name
+    ))
+}
+
+/// A non-empty env var, when set.
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// The LOCKED secret chain (env tokens → keyring → basic pair), built in
