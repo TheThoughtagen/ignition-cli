@@ -402,9 +402,13 @@ cargo test -p ignition-cli --test e2e_rig -- --ignored
 ```
 
 (the rig must be discoverable — run from the rig's checkout, set
-`IGNITION_RIG`, or configure `[rig].default`; the gate snapshots a
+`IGNITION_RIG`, or configure `[rig].default`; **verify with `ign rig
+status` first that the intended rig is the one UP** — the gateway
+verbs address the derived `localhost:<port>` URL, and a port
+collision with another stack would silently point them at the WRONG
+gateway). The gate snapshots a
 pre-witness project, creates a post-snapshot marker, restores, and
-asserts BOTH halves: witness SURVIVED, marker GONE).
+asserts BOTH halves: witness SURVIVED, marker GONE.
 
 ### Project export/import specifics
 
