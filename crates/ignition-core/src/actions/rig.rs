@@ -1,5 +1,7 @@
 //! Rig lifecycle actions (04-01, RIG-01): `up` / `down` / `status` —
 //! serde models OUT, no printing (the TUI rides this layer in Phase 6).
+//! Extended by 04-02 (reset/logs), 04-03 (trial), 04-04
+//! (snapshot/restore, RIG-04).
 //!
 //! Every action takes [`&dyn ComposeRunner`] (the Task-1 seam) so the
 //! full decision tree is unit-testable without docker. `rig_up`
@@ -26,6 +28,7 @@
 //! retry; Auth can't fire (the probe is header-less).
 
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -651,6 +654,266 @@ pub async fn rig_logs(
     Ok(RigLogsResult { streamed })
 }
 
+// -------------------------------------------------------------------------
+// snapshot + restore (04-04, RIG-04) — repeatable state
+// -------------------------------------------------------------------------
+
+/// The restore wait FLOOR: the gateway RESTARTS after a restore
+/// (Pitfall 6), so the post-restore RUNNING wait never gets a shorter
+/// deadline than this — an explicit `--timeout 30` cannot buy an
+/// unknown-state mid-restart report (the RESTART_FLOOR precedent,
+/// restore edition).
+pub const RESTORE_WAIT_FLOOR_S: u64 = 300;
+
+/// The token-clobber warning (Pitfall 5, 83-api primary source):
+/// tokens stored under CORE config are "modified/cleared often by gwbk
+/// restores" — post-restore, stored profiles 401. It rides DATA
+/// (agents must see it), never stderr-only.
+pub const RESTORE_TOKEN_WARNING: &str = "API tokens may have been reset by restore \
+— re-provision via gateway UI, then ign doctor";
+
+/// The manifest's honesty notes — BOTH composition exclusions, verbatim
+/// (the roadmap criterion-4 scope-explicitity precedent from 03-02:
+/// the tag-export deferral rides the manifest itself so no reader can
+/// mistake it for a silent drop).
+const MANIFEST_NOTES: [&str; 2] = [
+    "trial clock state is NOT captured by gwbk (unknown behavior — reset \
+     separately via rig trial reset)",
+    "tag-provider bulk export is Phase 5 scope (TAGS-09); gwbk captures tag \
+     config via gateway data",
+];
+
+/// `ign rig snapshot` output model (04-04, RIG-04) — all keys always.
+#[derive(Debug, Serialize)]
+pub struct SnapshotResult {
+    /// The snapshot directory (as resolved: the `-o` override or the
+    /// `./ign-rig-snapshots/<rig>-<stamp>/` default).
+    pub dir: String,
+    /// The gwbk's size in bytes (chunk-counted by the streaming
+    /// download — never a buffered length).
+    pub gwbk_bytes: u64,
+    /// The projects exported, in list order.
+    pub projects: Vec<String>,
+    /// The manifest's path inside the dir.
+    pub manifest_path: String,
+}
+
+/// `ign rig restore` output model (04-04, RIG-04) — all keys always.
+#[derive(Debug, Serialize)]
+pub struct RestoreResult {
+    /// The gwbk restored from (as given).
+    pub restored_from: String,
+    /// The post-restore state WITNESSED by the RUNNING wait —
+    /// `"running"` | `"uncommissioned"` (a bare 2xx never suffices;
+    /// Pitfall 6).
+    pub state: String,
+    /// Data-level warnings — ALWAYS carries
+    /// [`RESTORE_TOKEN_WARNING`] (Pitfall 5) plus any wait warnings.
+    pub warnings: Vec<String>,
+}
+
+/// Days since 1970-01-01 → (year, month, day) — Howard Hinnant's
+/// `civil_from_days` (the CLI renderer's iso_utc algorithm, core
+/// edition — std-only, NO chrono: the research's dependency-free
+/// naming rule).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // year of era
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index [0, 11] from March
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // day of month [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // month [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Epoch seconds → the UTC `yyyyMMdd-HHmmss` directory-stamp segment.
+fn stamp_from_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+/// `ign rig snapshot` (04-04, RIG-04): repeatable state, composed
+/// HONESTLY —
+///
+/// 1. the directory: `-o` override, else
+///    `./ign-rig-snapshots/<rig>-<yyyyMMdd-HHmmss>/` (std-only stamp,
+///    no new dependency);
+/// 2. the gwbk FIRST (`GET /backup?type=roaming`, streamed to
+///    `<rig>.gwbk` — the primary artifact);
+/// 3. per-project exports via the 03-02 machinery (`projects` list →
+///    `project_export_to_file` per name into `projects/<enc>.zip`;
+///    the percent-encoded name is INJECTIVE and filesystem-safe). The
+///    gwbk *should* already include projects (postman semantics,
+///    MEDIUM confidence — research flags this); the explicit exports
+///    are the honest redundancy that makes the manifest truthful
+///    either way;
+/// 4. `manifest.json` recording the composition — including BOTH
+///    exclusion notes verbatim (trial clock; tag-provider bulk export
+///    deferred to Phase 5). `ignition.version` degrades to `null`
+///    when gateway-info fails (the snapshot itself already
+///    succeeded — the manifest carries the gap visibly).
+///
+/// `gateway` is a client pointed at the RIG's URL (the trial-verb
+/// precedent). Any leg failing fails the snapshot — a partial
+/// snapshot is a corrupt state promise, never silent.
+pub async fn rig_snapshot(
+    gateway: &dyn GatewayApi,
+    rig_name: &str,
+    out_dir: Option<&Path>,
+) -> Result<SnapshotResult, CoreError> {
+    // 1. The directory (std-only stamp — chrono-free by design).
+    let epoch_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_secs() as i64;
+    let dir: PathBuf = match out_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            PathBuf::from("ign-rig-snapshots").join(format!("{}-{}", rig_name, stamp_from_secs(epoch_s)))
+        }
+    };
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| CoreError::Internal(format!("cannot create {}: {err}", dir.display())))?;
+
+    // 2. The gwbk FIRST — the primary artifact, streamed to disk.
+    let gwbk_name = format!("{rig_name}.gwbk");
+    let meta = gateway.backup_download(&dir.join(&gwbk_name)).await?;
+
+    // 3. Per-project exports (the 03-02 machinery reused verbatim).
+    let page = gateway
+        .projects(&crate::client::query::ListQuery::default())
+        .await?;
+    let projects_dir = dir.join("projects");
+    let mut exported: Vec<(String, String)> = Vec::new();
+    for record in &page.items {
+        if exported.is_empty() {
+            tokio::fs::create_dir_all(&projects_dir)
+                .await
+                .map_err(|err| {
+                    CoreError::Internal(format!(
+                        "cannot create {}: {err}",
+                        projects_dir.display()
+                    ))
+                })?;
+        }
+        let file = format!("projects/{}.zip", crate::client::projects::encode_segment(&record.name));
+        gateway.project_export_to_file(&record.name, &dir.join(&file)).await?;
+        exported.push((record.name.clone(), file));
+    }
+
+    // 4. The manifest — the honest composition contract.
+    let version = gateway
+        .gateway_info()
+        .await
+        .ok()
+        .map(|info| info.ignition_version);
+    let manifest = serde_json::json!({
+        "rig": rig_name,
+        "taken_at": epoch_s,
+        "ignition": { "version": version },
+        "gwbk": gwbk_name,
+        "projects": exported
+            .iter()
+            .map(|(name, file)| serde_json::json!({ "name": name, "file": file }))
+            .collect::<Vec<_>>(),
+        "notes": MANIFEST_NOTES,
+    });
+    let manifest_path = dir.join("manifest.json");
+    tokio::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).map_err(|err| {
+        CoreError::Internal(format!("manifest serialization failed: {err}"))
+    })?)
+    .await
+    .map_err(|err| {
+        CoreError::Internal(format!("cannot write {}: {err}", manifest_path.display()))
+    })?;
+
+    Ok(SnapshotResult {
+        dir: dir.display().to_string(),
+        gwbk_bytes: meta.bytes,
+        projects: exported.into_iter().map(|(name, _)| name).collect(),
+        manifest_path: manifest_path.display().to_string(),
+    })
+}
+
+/// The restore wait deadline: the requested budget, floored at
+/// [`RESTORE_WAIT_FLOOR_S`] (Pitfall 6 — a short explicit `--timeout`
+/// cannot buy an unknown-state mid-restart report; the RESTART_FLOOR
+/// precedent, restore edition).
+fn restore_deadline(wait_timeout_s: u64) -> u64 {
+    wait_timeout_s.max(RESTORE_WAIT_FLOOR_S)
+}
+
+/// `ign rig restore` (04-04, RIG-04): the guarded inverse —
+///
+/// 1. file pre-checks (exists + non-empty + readable) →
+///    [`CoreError::InvalidInput`] exit 2, the 03-03 lesson (no new
+///    slug), BEFORE any network work;
+/// 2. `backup_restore(gwbk)` — the raw octet-stream POST; a 2xx means
+///    the restore was ACCEPTED, nothing more;
+/// 3. the post-restore wait: the gateway RESTARTS after a restore
+///    (Pitfall 6), so success is a WITNESSED StatusPing→RUNNING via
+///    the 04-01 shared [`commissioned_wait`] — never a bare 2xx. The
+///    deadline floors at [`RESTORE_WAIT_FLOOR_S`] (300 s): an
+///    explicit short `--timeout` cannot buy an unknown-state report;
+/// 4. the token-clobber warning rides DATA ([`RESTORE_TOKEN_WARNING`],
+///    Pitfall 5) — agents must see it in every render mode.
+///
+/// `gateway` is a client pointed at the rig's URL; `rig_url` is that
+/// URL (the [`trial_reset`] signature precedent — the wait's subject
+/// message needs it).
+pub async fn rig_restore(
+    gateway: &dyn GatewayApi,
+    rig_url: &str,
+    gwbk: &Path,
+    wait_timeout_s: u64,
+) -> Result<RestoreResult, CoreError> {
+    // 1. Pre-checks — usage-class refusals BEFORE any network work.
+    //    `is_file()` (not a File::open probe): opening a directory
+    //    SUCCEEDS on some platforms (macOS) — only the read fails,
+    //    which would be mid-network. The regular-file check is the
+    //    portable honest gate.
+    let meta = std::fs::metadata(gwbk).map_err(|_| CoreError::InvalidInput {
+        reason: format!("gwbk file {} not found", gwbk.display()),
+    })?;
+    if !meta.is_file() {
+        return Err(CoreError::InvalidInput {
+            reason: format!("gwbk file {} is not a regular file", gwbk.display()),
+        });
+    }
+    if meta.len() == 0 {
+        return Err(CoreError::InvalidInput {
+            reason: format!("gwbk file {} is empty", gwbk.display()),
+        });
+    }
+
+    // 2. The POST — 2xx = accepted (the synchronous restore completed
+    //    server-side by the time the answer arrives).
+    gateway.backup_restore(gwbk).await?;
+
+    // 3. The witnessed RUNNING wait (the shared probe; deadline floored).
+    let deadline_s = restore_deadline(wait_timeout_s);
+    let mut warnings = Vec::new();
+    let state = commissioned_wait(gateway, rig_url, deadline_s, &mut warnings).await?;
+
+    // 4. The token warning FIRST in data (Pitfall 5).
+    warnings.insert(0, RESTORE_TOKEN_WARNING.to_string());
+
+    Ok(RestoreResult {
+        restored_from: gwbk.display().to_string(),
+        state,
+        warnings,
+    })
+}
+
 /// `ign rig status`: version gate → `ps` LDJSON → `volume ls` →
 /// port occupancy — serialized as an ALLOWLIST (services' state/health/
 /// publishers, volume names, identity). Exit 0 even when the rig is
@@ -714,13 +977,15 @@ pub async fn rig_status(runner: &dyn ComposeRunner, plan: &RigPlan) -> Result<Ri
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use super::{
         DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigResetResult, RigStatusResult, RigUpResult,
-        gateway_url_from, rig_down, rig_logs, rig_reset, rig_status, rig_up, trial_reset,
-        trial_status,
+        gateway_url_from, rig_down, rig_logs, rig_reset, rig_restore, rig_snapshot, rig_status,
+        rig_up, trial_reset, trial_status,
     };
+    use crate::client::GatewayApi;
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
     };
@@ -1737,6 +2002,626 @@ mod tests {
             .expect("login-only reset works");
         assert_eq!(result.mechanism, "login");
         assert!(!result.expired_after);
+    }
+
+    // ---------------------------------------------------------------------
+    // snapshot + restore (04-04) — composition + pre-checks + warning
+    // ---------------------------------------------------------------------
+
+    /// Fake gateway scripting the snapshot/restore flow (the
+    /// ProjectsRig precedent): records every capability call by name,
+    /// writes REAL bytes for the gwbk download and each project
+    /// export, and serves a configurable StatusPing state.
+    struct SnapshotRig {
+        calls: Mutex<Vec<String>>,
+        /// The project names `projects` lists.
+        project_names: Vec<String>,
+        /// `gateway_info`'s ignitionVersion.
+        version: String,
+        /// The StatusPing state to serve. Default (via the explicit
+        /// `Default` impl below) is RUNNING — a derived default of `""`
+        /// would never satisfy the wait and hang tests for the full
+        /// 300 s restore floor.
+        ping_state: &'static str,
+        /// When set, status_ping ERRORS non-retryably (the wait's
+        /// abort path — a real deadline-expiry test would floor at
+        /// 300 s, so the immediate-abort shape proves the mapping).
+        ping_fail: bool,
+    }
+
+    impl Default for SnapshotRig {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                project_names: Vec::new(),
+                version: String::new(),
+                ping_state: "RUNNING",
+                ping_fail: false,
+            }
+        }
+    }
+
+    impl SnapshotRig {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// The fixture bytes every download/export writes.
+        fn fixture_bytes() -> Vec<u8> {
+            let mut bytes: Vec<u8> = vec![0x50, 0x4B, 0x03, 0x04];
+            bytes.extend_from_slice(b"snapshot-fixture");
+            bytes
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn serve_download(out: &Path, fixture_len: u64) -> crate::client::projects::ExportMeta {
+            std::fs::write(out, Self::fixture_bytes()).expect("write fixture file");
+            crate::client::projects::ExportMeta {
+                filename: None,
+                bytes: fixture_len,
+                content_type: Some("application/octet-stream".into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GatewayApi for SnapshotRig {
+        async fn backup_download(
+            &self,
+            out: &Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            self.record("backup_download".into());
+            Ok(Self::serve_download(out, Self::fixture_bytes().len() as u64))
+        }
+        async fn backup_restore(&self, _gwbk: &Path) -> Result<(), CoreError> {
+            self.record("backup_restore".into());
+            Ok(())
+        }
+        async fn projects(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::projects::ProjectRecord>, CoreError>
+        {
+            self.record("projects".into());
+            let items: Vec<crate::client::projects::ProjectRecord> = self
+                .project_names
+                .iter()
+                .map(|name| crate::client::projects::ProjectRecord {
+                    name: name.clone(),
+                    title: None,
+                    description: None,
+                    enabled: true,
+                    parent: None,
+                    inheritable: None,
+                    default_db: None,
+                    tag_provider: None,
+                    user_source: None,
+                    extra: Default::default(),
+                })
+                .collect();
+            let total = items.len() as i64;
+            Ok(crate::client::query::ListEnvelope {
+                items,
+                metadata: crate::client::query::ListMetadata {
+                    total,
+                    matching: total,
+                    limit: -1,
+                    offset: 0,
+                },
+            })
+        }
+        async fn project_export_to_file(
+            &self,
+            name: &str,
+            out: &Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            self.record(format!("export:{name}"));
+            Ok(Self::serve_download(out, Self::fixture_bytes().len() as u64))
+        }
+        async fn gateway_info(&self) -> Result<crate::client::version::GatewayInfo, CoreError> {
+            self.record("gateway_info".into());
+            Ok(crate::client::version::GatewayInfo {
+                name: None,
+                redundancy_role: None,
+                edition: None,
+                ignition_version: self.version.clone(),
+                jvm_version: None,
+                license: None,
+                endpoint: None,
+            })
+        }
+        async fn status_ping(&self) -> Result<crate::client::status::StatusPing, CoreError> {
+            if self.ping_fail {
+                // A non-retryable probe error: poll aborts immediately
+                // (its retry set is LOCKED) and the restore wait maps
+                // it to a Rig error — the deadline-expiry variant is
+                // the same mapping, pinned by the up-cycle tests.
+                return Err(CoreError::Internal("probe fixture failure".into()));
+            }
+            Ok(crate::client::status::StatusPing {
+                state: self.ping_state.to_string(),
+            })
+        }
+
+        // The unreachable chore (the ProjectsRig pattern).
+        async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn banners(&self) -> Result<crate::client::trial::BannerSet, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn trial_reset_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn overview(&self) -> Result<crate::client::status::Overview, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn modules(
+            &self,
+            _quarantined: bool,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::status::ModuleInfo>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn metrics_current(
+            &self,
+        ) -> Result<crate::client::metrics::CurrentGauges, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn metrics_historic(
+            &self,
+        ) -> Result<crate::client::metrics::PerformanceCharts, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn metrics_threads(&self) -> Result<crate::client::metrics::ThreadCounts, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn designers(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::sessions::DesignerInfo>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn perspective_sessions(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::sessions::PerspectiveSession>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn vision_clients(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::sessions::VisionClient>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn terminate_perspective_session(
+            &self,
+            _id: &str,
+            _message: Option<&str>,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn terminate_vision_client(&self, _id: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn prune_designer(&self, _id: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn database_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn opc_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::client::logs::LogQuery,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::logs::LogEntry>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn logs_download(&self) -> Result<crate::client::logs::LogDownload, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn loggers(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::logs::LoggerInfo>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn set_logger_level(&self, _logger: &str, _level: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn reset_logger_levels(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn restart(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn scan_projects(&self) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn security_properties(
+            &self,
+        ) -> Result<crate::client::restart::SecurityProperties, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn webdev_route_status(&self, _route: &str) -> Result<u16, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_find(
+            &self,
+            _name: &str,
+        ) -> Result<crate::client::projects::ProjectRecord, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_create(
+            &self,
+            _body: &crate::client::projects::ProjectCreate,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_copy(&self, _from: &str, _to: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_rename(&self, _name: &str, _new_name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_modify(
+            &self,
+            _name: &str,
+            _body: &crate::client::projects::ProjectModify,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_delete(&self, _name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_import(
+            &self,
+            _name: &str,
+            _zip: Vec<u8>,
+            _overwrite: bool,
+        ) -> Result<crate::client::projects::ImportOutcome, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_resources(
+            &self,
+            _project: &str,
+            _prefix: Option<&str>,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::resources::ResourceEntry>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn project_resource_get(
+            &self,
+            _project: &str,
+            _path: &str,
+        ) -> Result<crate::client::resources::ResourceContent, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_resource_put(
+            &self,
+            _project: &str,
+            _path: &str,
+            _body: Vec<u8>,
+            _content_type: &str,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn project_resource_delete(
+            &self,
+            _project: &str,
+            _path: &str,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+    }
+
+    /// THE composition pin: gwbk first, every project exported (the
+    /// spaced name percent-encodes INJECTIVELY into its file name),
+    /// the manifest EXACT (both exclusion notes verbatim, version from
+    /// gateway_info), and the call order pinned on the fake's log.
+    #[tokio::test]
+    async fn snapshot_composes_gwbk_exports_and_exact_manifest() {
+        let out_dir = tempfile::tempdir().expect("tempdir");
+        let rig = SnapshotRig {
+            project_names: vec!["alpha".into(), "My Project".into()],
+            version: "8.3.3 (b1)".into(),
+            ping_state: "RUNNING",
+            ..SnapshotRig::default()
+        };
+
+        let result = rig_snapshot(&rig, "fixture-rig", Some(out_dir.path()))
+            .await
+            .expect("snapshot composes");
+        let fixture_len = SnapshotRig::fixture_bytes().len() as u64;
+        assert_eq!(result.gwbk_bytes, fixture_len);
+        assert_eq!(result.projects, vec!["alpha".to_string(), "My Project".to_string()]);
+        assert_eq!(result.dir, out_dir.path().display().to_string());
+
+        // The gwbk landed with the fixture bytes (the primary artifact).
+        let on_disk = std::fs::read(out_dir.path().join("fixture-rig.gwbk")).expect("gwbk exists");
+        assert_eq!(on_disk, SnapshotRig::fixture_bytes());
+        // The spaced project exported under its INJECTIVE encoded name.
+        assert!(out_dir.path().join("projects/alpha.zip").exists());
+        assert!(out_dir.path().join("projects/My%20Project.zip").exists());
+
+        // The manifest — EXACT (taken_at read back and range-checked,
+        // every other key byte-pinned including BOTH exclusion notes).
+        let manifest_path = out_dir.path().join("manifest.json");
+        assert_eq!(result.manifest_path, manifest_path.display().to_string());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest read"))
+                .expect("manifest parses");
+        let taken_at = manifest["taken_at"].as_i64().expect("taken_at epoch s");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (now - 5..=now + 5).contains(&taken_at),
+            "taken_at is epoch seconds near now: {taken_at}"
+        );
+        assert_eq!(
+            manifest,
+            serde_json::json!({
+                "rig": "fixture-rig",
+                "taken_at": taken_at,
+                "ignition": { "version": "8.3.3 (b1)" },
+                "gwbk": "fixture-rig.gwbk",
+                "projects": [
+                    { "name": "alpha", "file": "projects/alpha.zip" },
+                    { "name": "My Project", "file": "projects/My%20Project.zip" }
+                ],
+                "notes": [
+                    "trial clock state is NOT captured by gwbk (unknown behavior — reset \
+                     separately via rig trial reset)",
+                    "tag-provider bulk export is Phase 5 scope (TAGS-09); gwbk captures tag \
+                     config via gateway data"
+                ]
+            }),
+            "EXACT manifest shape — the honest composition contract"
+        );
+
+        // The call order: gwbk FIRST, then list, then per-project
+        // exports, then gateway_info (for the manifest).
+        assert_eq!(
+            rig.calls(),
+            vec![
+                "backup_download".to_string(),
+                "projects".to_string(),
+                "export:alpha".to_string(),
+                "export:My Project".to_string(),
+                "gateway_info".to_string(),
+            ]
+        );
+    }
+
+    /// An empty gateway still snapshots: gwbk + manifest with an EMPTY
+    /// projects array (all keys always) and no projects/ dir created.
+    #[tokio::test]
+    async fn snapshot_of_empty_gateway_carries_empty_projects_key() {
+        let out_dir = tempfile::tempdir().expect("tempdir");
+        let rig = SnapshotRig {
+            version: "8.3.6".into(),
+            ping_state: "RUNNING",
+            ..SnapshotRig::default()
+        };
+        let result = rig_snapshot(&rig, "fixture-rig", Some(out_dir.path()))
+            .await
+            .expect("empty snapshot composes");
+        assert_eq!(result.projects, Vec::<String>::new());
+        assert!(!out_dir.path().join("projects").exists(), "no empty dir");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("read"),
+        )
+        .expect("parses");
+        assert_eq!(
+            manifest["projects"],
+            serde_json::json!([]),
+            "the key is present and empty — agents never key-hunt"
+        );
+    }
+
+    /// A failed gateway_info degrades HONESTLY: the manifest carries
+    /// `ignition.version: null` (the snapshot itself succeeded — the
+    /// gap rides the artifact visibly). gateway_info is the LAST call,
+    /// so the gwbk + exports already landed.
+    #[tokio::test]
+    async fn snapshot_survives_gateway_info_failure_with_null_version() {
+        // A rig whose gateway_info errors: reuse SnapshotRig for the
+        // good legs but intercept via a thin wrapper — simpler: point
+        // version at "" and assert the manifest verbatim? No — the
+        // honest shape needs a REAL failure. Wiremock does it: serve
+        // /backup + /projects + /StatusPing, 500 the gateway-info.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/backup"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(vec![0x50, 0x4B, 0x03, 0x04], "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/projects/list"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "items": [], "metadata": {
+                    "total": 0, "matching": 0, "limit": -1, "offset": 0 } }),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/gateway-info"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+        let out_dir = tempfile::tempdir().expect("tempdir");
+        let result = rig_snapshot(&api, "fixture-rig", Some(out_dir.path()))
+            .await
+            .expect("the snapshot survives the metadata failure");
+        assert_eq!(result.gwbk_bytes, 4);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("read"),
+        )
+        .expect("parses");
+        assert_eq!(manifest["ignition"]["version"], serde_json::Value::Null);
+    }
+
+    /// THE restore pin: pre-checks pass → POST → the witnessed RUNNING
+    /// wait → the token warning FIRST in data. Exact serialized shape.
+    #[tokio::test]
+    async fn restore_posts_waits_and_warns() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let gwbk = work.path().join("snapshot.gwbk");
+        std::fs::write(&gwbk, b"PK\x03\x04restore-fixture").expect("write gwbk");
+        let rig = SnapshotRig {
+            ping_state: "RUNNING",
+            ..SnapshotRig::default()
+        };
+
+        let result = rig_restore(&rig, "http://localhost:9088", &gwbk, 300)
+            .await
+            .expect("restore completes");
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({
+                "restored_from": gwbk.display().to_string(),
+                "state": "running",
+                "warnings": [
+                    "API tokens may have been reset by restore — re-provision via \
+                     gateway UI, then ign doctor"
+                ],
+            }),
+            "EXACT shape — state witnessed (never a bare 2xx), token warning first"
+        );
+        assert_eq!(
+            rig.calls(),
+            vec!["backup_restore".to_string()],
+            "the POST fired once (the wait's status_ping probes aren't \
+             recorded — the fake serves the state directly)"
+        );
+    }
+
+    /// Pre-check failures are usage-class (exit 2, `invalid_input`)
+    /// and do ZERO network work — the missing, empty, and unreadable
+    /// shapes (03-03's lesson; the 03-03 put's --file precedent).
+    #[tokio::test]
+    async fn restore_prechecks_fail_before_any_network() {
+        let rig = SnapshotRig::default();
+
+        // Missing file.
+        let missing = PathBuf::from("/nonexistent/snap.gwbk");
+        let err = rig_restore(&rig, "http://localhost:9088", &missing, 300)
+            .await
+            .expect_err("missing file refuses");
+        assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_input");
+        let message = err.to_string();
+        assert!(message.contains("not found"), "{message}");
+
+        // Empty file.
+        let work = tempfile::tempdir().expect("tempdir");
+        let empty = work.path().join("empty.gwbk");
+        std::fs::write(&empty, b"").expect("write empty");
+        let err = rig_restore(&rig, "http://localhost:9088", &empty, 300)
+            .await
+            .expect_err("empty file refuses");
+        assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("empty"), "{}", err);
+
+        // Zero network work across all three refusals (one unreadable
+        // shape completes the set: a DIRECTORY is not a regular file
+        // — File::open on a dir succeeds on macOS, so the portable
+        // is_file() gate is the one that must fire).
+        let unreadable = work.path(); // a directory
+        let err = rig_restore(&rig, "http://localhost:9088", unreadable, 300)
+            .await
+            .expect_err("directory is not a restorable file");
+        assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+        assert!(
+            rig.calls().is_empty(),
+            "pre-check refusals never touch the gateway: {:?}",
+            rig.calls()
+        );
+    }
+
+    /// A failed post-restore wait is a Rig error (exit 7): a
+    /// non-retryable probe failure aborts the wait and the mapping
+    /// wraps it as "did not reach RUNNING" — the deadline-expiry
+    /// variant is the same mapping (pinned by the up-cycle tests at a
+    /// 1 s deadline; restore's own deadline floors at 300 s, too long
+    /// to sit out in a unit test).
+    #[tokio::test]
+    async fn restore_wait_failure_is_a_rig_error() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let gwbk = work.path().join("snapshot.gwbk");
+        std::fs::write(&gwbk, b"PK\x03\x04fixture").expect("write gwbk");
+        let rig = SnapshotRig {
+            ping_fail: true,
+            ..SnapshotRig::default()
+        };
+        let err = rig_restore(&rig, "http://localhost:9088", &gwbk, 300)
+            .await
+            .expect_err("a failed wait errors the restore");
+        assert!(matches!(err, CoreError::Rig(_)), "{err}");
+        assert_eq!(err.exit_code(), 7);
+        let message = err.to_string();
+        assert!(message.contains("did not reach RUNNING"), "{message}");
+        assert!(
+            rig.calls().contains(&"backup_restore".to_string()),
+            "the POST fired before the wait: {:?}",
+            rig.calls()
+        );
+    }
+
+    /// The floor pins: 300 s (the Pitfall-6 class) and the clamp — an
+    /// explicit short budget is raised to the floor, a longer one
+    /// passes through (an explicit `--timeout 30` cannot buy an
+    /// unknown-state mid-restart report).
+    #[test]
+    fn restore_wait_floor_is_300s_and_clamps() {
+        assert_eq!(super::RESTORE_WAIT_FLOOR_S, 300);
+        assert_eq!(super::restore_deadline(1), 300, "short budgets floor up");
+        assert_eq!(super::restore_deadline(300), 300);
+        assert_eq!(super::restore_deadline(600), 600, "longer budgets pass through");
+    }
+
+    /// The std-only stamp: known instants render the documented
+    /// `yyyyMMdd-HHmmss` shape (civil_from_days pinned at the epoch
+    /// and a known recent instant).
+    #[test]
+    fn stamp_renders_utc_compact() {
+        assert_eq!(super::stamp_from_secs(0), "19700101-000000");
+        assert_eq!(super::stamp_from_secs(1_787_346_747), "20260821-211227");
+        assert_eq!(super::civil_from_days(0), (1970, 1, 1));
+        assert_eq!(super::civil_from_days(19_723), (2024, 1, 1));
     }
 
     // ---------------------------------------------------------------------
