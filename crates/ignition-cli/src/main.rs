@@ -132,6 +132,8 @@ enum ActionOutput {
     /// third sanctioned stdout exception, README-documented); render
     /// prints nothing further.
     RigLogs(actions::rig::RigLogsResult),
+    RigSnapshot(actions::rig::SnapshotResult),
+    RigRestore(actions::rig::RestoreResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -193,6 +195,8 @@ impl ActionOutput {
             // Unreachable in practice (render_ok intercepts RigLogs
             // before mode dispatch — the lines already streamed).
             ActionOutput::RigLogs(result) => render_success(profile, result, compact),
+            ActionOutput::RigSnapshot(result) => render_success(profile, result, compact),
+            ActionOutput::RigRestore(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
         }
@@ -917,8 +921,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
         },
-        // `rig reset` and `rig trial reset` are the family's
-        // destructive verbs: their guards fire BEFORE the
+        // `rig reset`, `rig trial reset`, and `rig restore` are the
+        // family's destructive verbs: their guards fire BEFORE the
         // runner/discovery even exist (the sessions-terminate
         // precedent) — a refusal is exit 2 with profile null and does
         // ZERO discovery work (binary-pinned: exit 2 in a cwd with no
@@ -931,6 +935,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // discoverable at all). The message names the ACTUAL verb.
             let guarded_operation = match &command {
                 RigCommand::Reset { .. } => Some("rig reset"),
+                RigCommand::Restore { .. } => Some("rig restore"),
                 RigCommand::Trial(trial_args) => match trial_args.command {
                     crate::cli::TrialCommand::Reset { .. } => Some("rig trial reset"),
                     crate::cli::TrialCommand::Status => None,
@@ -947,11 +952,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 Some(name) => ignition_core::rig::RigSelection::Named(name),
                 None => ignition_core::rig::RigSelection::Auto,
             };
-            // The trial verbs echo the CONFIG's active profile name as
-            // context when one exists (they address the RIG, not the
-            // profile — docker verbs stay profile:null; documented).
-            let trial_profile_echo = config.active.clone();
-            let is_trial_verb = matches!(command, RigCommand::Trial(_));
+            // The GATEWAY verbs (trial, snapshot, restore — they
+            // address the rig's gateway, not the profile's) echo the
+            // CONFIG's active profile name as context when one
+            // exists; docker verbs stay profile:null (documented).
+            let gateway_verb_echo = config.active.clone();
+            let is_gateway_verb = matches!(
+                command,
+                RigCommand::Trial(_) | RigCommand::Snapshot { .. } | RigCommand::Restore { .. }
+            );
             let result = match ignition_core::rig::resolve_plan(&runner, selection, &config).await {
                 Ok(plan) => match command {
                     RigCommand::Up { .. } | RigCommand::Reset { .. } => {
@@ -1052,7 +1061,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 // The both-absent refusal: exit 3, the
                                 // hint names both credential paths.
                                 return (
-                                    trial_profile_echo,
+                                    gateway_verb_echo,
                                     Err(CoreError::SecretUnavailable {
                                         profile: plan.name.clone(),
                                     }),
@@ -1083,13 +1092,65 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             }
                         }
                     },
+                    // Snapshot (04-04, RIG-04): the backup endpoints
+                    // REQUIRE a token (401 HTML unauth — live-verified
+                    // shape), so the rig-family cred sourcing (no
+                    // profile chain) has exactly one rung: IGNITION_TOKEN.
+                    RigCommand::Snapshot { output } => {
+                        let Some(token) = env_non_empty("IGNITION_TOKEN") else {
+                            return (
+                                gateway_verb_echo,
+                                Err(CoreError::SecretUnavailable {
+                                    profile: plan.name.clone(),
+                                }),
+                            );
+                        };
+                        let credential = Some(Credential::Token(config::Secret::new(token)));
+                        match rig_gateway_client(&plan, credential) {
+                            Some(api) => actions::rig::rig_snapshot(
+                                &api,
+                                &plan.name,
+                                output.as_deref(),
+                            )
+                            .await
+                            .map(ActionOutput::RigSnapshot),
+                            None => Err(trial_no_gateway(&plan)),
+                        }
+                    }
+                    // Restore (04-04, RIG-04): guarded above (BEFORE
+                    // discovery — the binary pin), token-sourced like
+                    // snapshot, and the action owns the witnessed
+                    // post-restore RUNNING wait.
+                    RigCommand::Restore { file, timeout } => {
+                        let Some(token) = env_non_empty("IGNITION_TOKEN") else {
+                            return (
+                                gateway_verb_echo,
+                                Err(CoreError::SecretUnavailable {
+                                    profile: plan.name.clone(),
+                                }),
+                            );
+                        };
+                        let credential = Some(Credential::Token(config::Secret::new(token)));
+                        match rig_gateway_client(&plan, credential) {
+                            Some(api) => {
+                                let rig_url = actions::rig::gateway_url_from(&plan).expect(
+                                    "rig_gateway_client derived it or returned None",
+                                );
+                                actions::rig::rig_restore(&api, &rig_url, &file, timeout)
+                                    .await
+                                    .map(ActionOutput::RigRestore)
+                            }
+                            None => Err(trial_no_gateway(&plan)),
+                        }
+                    }
                 },
                 Err(err) => Err(err),
             };
-            // The trial verbs echo the active profile as context; the
-            // docker verbs keep the family's profile:null contract.
-            let echo = if is_trial_verb {
-                trial_profile_echo
+            // The gateway verbs (trial, snapshot, restore) echo the
+            // active profile as context; the docker verbs keep the
+            // family's profile:null contract.
+            let echo = if is_gateway_verb {
+                gateway_verb_echo
             } else {
                 None
             };

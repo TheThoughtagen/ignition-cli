@@ -412,6 +412,27 @@ pub enum RigCommand {
     /// (guarded) restarts an EXPIRED trial via the mechanism ladder
     /// (token-auth POST, else native gateway login)
     Trial(TrialArgs),
+    /// Snapshot the rig's gateway: native gwbk (roaming backup,
+    /// streamed) + per-project exports + manifest.json, composed in a
+    /// timestamped directory — repeatable state
+    Snapshot {
+        /// Output directory (default:
+        /// ./ign-rig-snapshots/<rig>-<yyyyMMdd-HHmmss>/)
+        #[arg(short = 'o', long, value_name = "DIR")]
+        output: Option<PathBuf>,
+    },
+    /// Restore a gwbk onto the rig's gateway — destructive, refused
+    /// without --yes; synchronous restore + restart, then a witnessed
+    /// RUNNING wait
+    Restore {
+        /// The gwbk file to restore (from `ign rig snapshot`)
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Post-restore RUNNING wait budget in seconds (floored at
+        /// 300 — the gateway restarts after a restore)
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
 }
 
 /// Trial subcommands (04-03, RIG-02/03). `status` reads the

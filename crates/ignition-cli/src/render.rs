@@ -27,8 +27,8 @@ use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
 };
 use ignition_core::actions::rig::{
-    RigDownResult, RigLogsResult, RigResetResult, RigStatusResult, RigUpResult,
-    TrialResetResult, TrialStatusResult,
+    RestoreResult, RigDownResult, RigLogsResult, RigResetResult, RigStatusResult, RigUpResult,
+    SnapshotResult, TrialResetResult, TrialStatusResult,
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::client::logs::LogEntry;
@@ -193,6 +193,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         // dispatch (the third streaming exception — lines already
         // printed during execution).
         ActionOutput::RigLogs(result) => render_rig_logs_human(result),
+        ActionOutput::RigSnapshot(result) => render_rig_snapshot_human(result),
+        ActionOutput::RigRestore(result) => render_rig_restore_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
     }
@@ -683,6 +685,39 @@ fn render_rig_reset_human(result: &RigResetResult) {
 /// precedent).
 fn render_rig_logs_human(result: &RigLogsResult) {
     println!("({} lines streamed)", result.streamed);
+}
+
+/// `ign rig snapshot` human lines: the directory + gwbk size, the
+/// exported projects, and the manifest — the composition at a glance.
+fn render_rig_snapshot_human(result: &SnapshotResult) {
+    println!(
+        "snapshot {} — gwbk {} ({} bytes)",
+        result.dir,
+        human_bytes(result.gwbk_bytes as i64),
+        result.gwbk_bytes
+    );
+    if result.projects.is_empty() {
+        println!("projects: (none on the gateway)");
+    } else {
+        println!("projects:");
+        for project in &result.projects {
+            println!("  - {project}");
+        }
+    }
+    println!("manifest: {}", result.manifest_path);
+}
+
+/// `ign rig restore` human lines: restored-from + the WITNESSED state,
+/// then the warnings — the token-clobber warning (Pitfall 5) is
+/// always first and must be VISIBLE to humans, not buried in data.
+fn render_rig_restore_human(result: &RestoreResult) {
+    println!(
+        "restored from {} — gateway {}",
+        result.restored_from, result.state
+    );
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 /// `ign rig trial status` human lines: the license banner first (the

@@ -421,3 +421,114 @@ fn rig_trial_help_shows_verbs_and_no_password_flag() {
     let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// THE destructive-guard pin (04-04): `rig restore` without `--yes`
+/// refuses with exit 2 (`confirmation_required`), profile null — the
+/// ZERO WORK proof rides the same no-rig environment as `rig reset`
+/// (the cwd has NO compose file; un-guarded execution would exit 7 at
+/// discovery). Fifth destructive-verb instance (sessions terminate →
+/// project delete → rig reset → rig trial reset → rig restore).
+#[test]
+fn rig_restore_refuses_without_yes_before_any_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "restore",
+            "--file",
+            "/nonexistent/snap.gwbk",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "guard exit 2 — NOT the exit 7 a discovery run would produce"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "refusal: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("confirmation_required".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("rig restore"),
+        "names the operation: {message}"
+    );
+}
+
+/// The guard's other half: WITH `--yes` and no IGNITION_TOKEN, the
+/// same no-rig environment fails at DISCOVERY (exit 7) — never at the
+/// token check — proving the guard fired first and discovery owns the
+/// next failure. (On a machine where discovery WOULD find a rig, the
+/// token check is next: exit 3.)
+#[test]
+fn rig_restore_with_yes_in_no_rig_cwd_fails_cleanly_at_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "restore",
+            "--file",
+            "/nonexistent/snap.gwbk",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(7), "guard passed: discovery failure");
+    let body: Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["profile"], Value::Null);
+    assert_eq!(body["error"]["code"], Value::String("rig_error".into()));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("no compose file discovered"),
+        "the discovery diagnosis leads"
+    );
+}
+
+/// The snapshot/restore help surfaces (contains-assertions — clap's
+/// help rendering churns across versions by design): snapshot shows
+/// `-o/--output <DIR>`; restore shows `--file <PATH>` +
+/// `--timeout <SECS>` and names `--yes` in its destructive doc.
+#[test]
+fn rig_snapshot_restore_help_surfaces() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "snapshot", "--help"]);
+    assert!(out.status.success(), "snapshot help exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--output <DIR>"), "output visible: {stdout}");
+    assert!(stdout.contains("-o"), "the -o short form visible: {stdout}");
+
+    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "restore", "--help"]);
+    assert!(out.status.success(), "restore help exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--file <PATH>"), "file visible: {stdout}");
+    assert!(stdout.contains("--timeout <SECS>"), "timeout visible: {stdout}");
+    assert!(
+        stdout.contains("--yes"),
+        "the destructive guard is documented in the verb's help: {stdout}"
+    );
+}

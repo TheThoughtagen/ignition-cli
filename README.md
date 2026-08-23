@@ -147,6 +147,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign rig [--rig NAME] logs [--tail N] [-f] [SERVICE]` | Stream the rig's container logs (`compose logs` passthrough) | raw lines in EVERY mode — the third stdout exception (see §Streaming); `--tail` default 200; `-f` follows until Ctrl-C (default process kill); compose diagnostics go to stderr, never the data stream |
 | `ign rig [--rig NAME] trial status` | Show the rig gateway's trial state: licenseMode, trialState, seconds left, expired — plus the banners cross-check | **credential-free** (the trial/banners endpoints answer unauthenticated — verified live on 8.3.3 AND 8.3.6; a fresh rig with no token reports fine); addresses the RIG's derived gateway URL (never the profile's); data `{license_mode, trial_state, trial_remaining_s, expired, emergency, emergency_remaining_s, development, banners: {severity, expire_time_ms, active}, warnings}` — `banners.active` is the Pitfall-7 cross-check (`severity=="info"` AND `expireTime>now_ms`), never the primary truth (`expired` is) |
 | `ign rig [--rig NAME] trial reset [--user NAME]` | Reset an EXPIRED trial to a fresh ~2 h window via the mechanism ladder | **destructive**: exit 2 (`confirmation_required`) without `--yes`, BEFORE any discovery; ladder = tier 0 `POST /data/api/v1/trial` with `X-Ignition-API-Token` (token from `IGNITION_TOKEN`) → tier 1 native gateway login (internal-IdP OIDC challenge dance → session cookie + CSRF header), creds `--user`/`IGNITION_USER` + `IGNITION_PASSWORD` (password NEVER a flag); success REQUIRES the read-back flip (`expired` false on re-fetch — a bare 2xx never suffices); a NON-expired trial refuses exit 6 `trial_not_expired` (the gateway 403s resets while active — live-verified); no creds at all → exit 3 |
+| `ign rig [--rig NAME] snapshot [-o DIR]` | Snapshot the rig's gateway: native gwbk (`GET /backup?type=roaming`, STREAMED to disk) + per-project exports + `manifest.json` — composed in a timestamped dir | addresses the rig's derived gateway URL; requires `IGNITION_TOKEN` (the backup route 401s unauthenticated — live-verified shape); default dir `./ign-rig-snapshots/<rig>-<yyyyMMdd-HHmmss>/`; data `{dir, gwbk_bytes, projects, manifest_path}` — the manifest names BOTH composition exclusions (see §rig snapshot/restore) |
+| `ign rig [--rig NAME] restore --file PATH [--timeout S]` | Restore a gwbk onto the rig's gateway (raw octet-stream POST), wait for the witnessed post-restore RUNNING | **destructive**: exit 2 without `--yes`, BEFORE any discovery; the restore is synchronous and the gateway RESTARTS after — success is a WITNESSED StatusPing→RUNNING (deadline floored at 300 s), never a bare 2xx; data always carries the token-clobber warning (`API tokens may have been reset by restore…`, see §rig snapshot/restore); requires `IGNITION_TOKEN` |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -340,6 +342,70 @@ Playwright fallback exists ONLY as this documented env contract —
 `ignition-trial-resetter` / WHK-Global's `e2e/reset_trial.mjs` — and
 is never shipped as `ign`'s mechanism.
 
+### `rig snapshot` / `rig restore` — repeatable state
+
+`rig snapshot` composes a rig's gateway state HONESTLY into one
+directory (default `./ign-rig-snapshots/<rig>-<yyyyMMdd-HHmmss>/`,
+`-o` overrides; the stamp is std-only, no clock dependency):
+
+- **`<rig>.gwbk`** — the native roaming backup (`GET
+  /data/api/v1/backup?type=roaming`, `Accept:
+  application/octet-stream`), STREAMED to disk chunk-by-chunk (never
+  buffered in memory — gwbks are tens of MB);
+- **`projects/<name>.zip`** — one export per runnable project (the
+  `project export` machinery reused; file names percent-encode the
+  project name injectively, so `My Project` → `My%20Project.zip`).
+  The gwbk *should* already contain projects (postman semantics,
+  MEDIUM confidence), but the explicit exports are the honest
+  redundancy that makes the manifest truthful either way;
+- **`manifest.json`** — the composition record: `{rig, taken_at
+  (epoch s), ignition: {version}, gwbk, projects: [{name, file}],
+  notes}`. The notes name BOTH exclusions explicitly, verbatim:
+  **the trial clock is NOT captured by gwbk** (its restore behavior
+  is unknown — reset separately via `rig trial reset`), and
+  **tag-provider bulk export is Phase 5 scope** (gwbk captures tag
+  *config* via gateway data). No reader can mistake either for a
+  silent drop.
+
+`rig restore --file <path.gwbk>` is the guarded inverse
+(`--yes`-refusal exit 2 before any discovery, the fifth destructive
+verb). The POST is a RAW `application/octet-stream` body — NOT
+multipart — with the four scope params (`restoreDisabled`,
+`disableTempProjectBackup`, `renameEnabled`, `restoreLocal`) sent
+explicitly as `false`. Restore is synchronous AND the gateway
+restarts afterward, so BOTH wire directions ride a 300 s per-request
+budget and success is a **witnessed** post-restore
+StatusPing→RUNNING (the `--timeout` budget floors at 300 s — a short
+explicit timeout cannot buy an unknown-state mid-restart report).
+A bare 2xx never suffices.
+
+⚠ **API tokens may be clobbered (Pitfall 5).** Tokens stored under
+CORE config (`data/config/CORE/ignition/api-token`) are
+"modified/cleared often by gwbk restores" (83-api) — after a
+restore, stored profiles may 401. The restore data ALWAYS carries
+`"API tokens may have been reset by restore — re-provision via
+gateway UI, then ign doctor"` as its first warning, in every render
+mode. 83-api's recommendation: keep durable tokens in an EXTERNAL
+location, not CORE config.
+
+Both verbs address the rig's derived gateway URL and source their
+credential from `IGNITION_TOKEN` (the rig-family chain — the backup
+route 401s unauthenticated, unlike the trial endpoints; a missing
+token is exit 3). The round-trip is pinned live by the opt-in e2e
+gate:
+
+```bash
+IGNITION_LIVE_URL=http://localhost:9088 \
+IGNITION_LIVE_TOKEN='name:key' \
+IGNITION_LIVE_MUTATIONS=1 \
+cargo test -p ignition-cli --test e2e_rig -- --ignored
+```
+
+(the rig must be discoverable — run from the rig's checkout, set
+`IGNITION_RIG`, or configure `[rig].default`; the gate snapshots a
+pre-witness project, creates a post-snapshot marker, restores, and
+asserts BOTH halves: witness SURVIVED, marker GONE).
+
 ### Project export/import specifics
 
 
@@ -423,14 +489,15 @@ Commands that change gateway state (`sessions terminate`,
 big one: it takes
 the whole gateway down for ~1 min — and `rig reset`, which deletes
 the rig's volumes, plus `rig trial reset`, which restarts the trial
-window) refuse without `--yes`
+window, and `rig restore`, which REPLACES the gateway's state with a
+gwbk) refuse without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
 pass `--yes` once and humans get a speed bump. `restart` is guarded in
 BOTH forms: plain and `--wait`. The guard fires before any network
 activity: a refusal never touches the gateway. The rig guards
-(`rig reset`, `rig trial reset`) fire before even rig DISCOVERY
-(a refusal does zero work of any
+(`rig reset`, `rig trial reset`, `rig restore`) fire before even rig
+DISCOVERY (a refusal does zero work of any
 kind). `project delete` and
 `project import --collision-policy overwrite` are the doubly-relevant
 pair: besides the CLI refusal, delete's wire request always carries
