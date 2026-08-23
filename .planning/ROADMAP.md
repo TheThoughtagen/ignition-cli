@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Foundation & Agentic Contracts** - The `ign` binary with profiles, auth, JSON output, error envelopes, exit codes — the contract every later command inherits
 - [x] **Phase 2: Gateway Health & Inspection** - Read-only gateway operations against any 8.3 gateway: status, modules, logs, connections, metrics, sessions, restart, doctor, wait
 - [x] **Phase 3: Project Operations** - Full project CRUD, export/import, and surgical resource editing — the gateway webpage's project pages replaced
-- [ ] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore
+- [x] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore (2026-08-23)
 - [ ] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar
 - [ ] **Phase 6: TUI Cockpit** - Ratatui cockpit exposing every CLI action: dashboard, log tail, tag browser with live watch, alarm panel, project browser, profile switcher
 - [ ] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows
@@ -101,10 +101,10 @@ Plans:
 *Planner refinement:* the flagged trial-reset spike is RESOLVED by 04-RESEARCH.md with live evidence — native Rust HTTP wins (the Playwright resetter needs Node+chromium, broke across 8.3.3's UI rewrite, and verifies via DOM text; the 8.3.6 login flow is a mapped OIDC challenge ladder with pure-JSON endpoints and per-call token rotation). Implementation is a LADDER: tier 0 = token-auth `POST /data/api/v1/trial` (one live call decides), tier 1 = native OIDC+CSRF flow in client/idp.rs, tier 2 = Playwright documented in README only, never shipped. Trial status sources `GET /data/api/v1/trial` (unauthenticated, richer than banners) with banners as cross-check — correcting the sketch's banners-primary assumption. Snapshot composition is honest redundancy: gwbk (streamed, `type=roaming`) + per-project exports + manifest.json (tag-provider bulk export stays Phase 5; gwbk captures tag config). Docker-only rig verbs (up/down/status/reset/logs) carry `profile: null` — the first non-gateway commands.
 
 Plans:
-- [ ] 04-01-PLAN.md — compose engine (RigPlan resolve-then-act, ComposeRunner seam, LDJSON/array parsers, 5-level discovery, port pre-flight) + `rig up/down/status` with commissioned-wait (RIG-01 core)
-- [ ] 04-02-PLAN.md — `rig reset` (guarded `down -v --remove-orphans` cycle + volume preview) + `rig logs` passthrough streaming (RIG-01 completion, RIG-02 half)
-- [ ] 04-03-PLAN.md — `rig trial status|reset` (trial+banners wire, tier-0 spike then tier-1 OIDC ladder, ≥2-minor-version e2e gate) (RIG-02 half, RIG-03)
-- [ ] 04-04-PLAN.md — `rig snapshot|restore` (streaming gwbk + project exports + manifest; octet-stream restore + restart-wait + token-clobber warning; round-trip e2e) (RIG-04)
+- [x] 04-01-PLAN.md — compose engine (RigPlan resolve-then-act, ComposeRunner seam, LDJSON/array parsers, 5-level discovery, port pre-flight) + `rig up/down/status` with commissioned-wait (RIG-01 core)
+- [x] 04-02-PLAN.md — `rig reset` (guarded `down -v --remove-orphans` cycle + volume preview) + `rig logs` passthrough streaming (RIG-01 completion, RIG-02 half)
+- [x] 04-03-PLAN.md — `rig trial status|reset` (trial+banners wire, tier-0 spike then tier-1 OIDC ladder, ≥2-minor-version e2e gate) (RIG-02 half, RIG-03)
+- [x] 04-04-PLAN.md — `rig snapshot|restore` (streaming gwbk + project exports + manifest; octet-stream restore + restart-wait + token-clobber warning; round-trip e2e) (RIG-04)
 
 ### Phase 5: WebDev Backend & Tag Operations
 **Goal:** A user can deploy the CLI's own versioned WebDev routes to a gateway and then operate the complete tag lifecycle — providers, browse, read/write values, config CRUD, UDTs, alarms, history, bulk transfer — reaching the ignition-mcp replacement bar.

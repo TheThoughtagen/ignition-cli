@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 4 plans 1-3 done (RIG-01/02/03 complete; trial reset tier-1 LIVE-VERIFIED on 8.3.3) — 04-04 snapshot/restore remains; ign-research token provisioning is the one open human task (04-USER-SETUP.md)
+**Current focus:** Phase 4 COMPLETE (RIG-01..04: up/down/status, reset/logs, trial status+reset tier-1 live-verified, snapshot/restore wire-pinned + two-sided e2e gate) — 04-04's live round-trip gate deferred (rig down; ports held by the active whk-services stack) and ign-research token provisioning remains the one open human task (04-USER-SETUP.md)
 
 ## Current Position
 
 **Phase:** 4 of 7 (Rig Lifecycle & Trial State)
 **Current Plan:** 4
 **Total Plans in Phase:** 4
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-23
 
-**Progress:** [█████████░] 94%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -43,6 +43,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 04 P01 | 42min | 3 tasks | 14 files |
 | Phase 04 P02 | 18min | 3 tasks | 8 files |
 | Phase 04 P03 | 406min | 3 tasks | 14 files |
+| Phase 04 PP04 | 37min | 3 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -105,6 +106,10 @@ Recent decisions affecting current work:
 - [Phase 04-03]: Trial-reset spike resolved LIVE: tier 1 (native OIDC login) is the mechanism — full flip on the expired 8.3.3 rig (expired:true→false, 0→7199s); session cookie = webui-sid-<gatewayId>, CSRF field = csrfToken from /data/app/session (both research LOW-confidence items). Tier 0 ships as the ladder's first rung — formally open pending a provisioned token (no headless path; the api-token create's collection value is undiscovered)
 - [Phase 04-03]: LIVE-DISCOVERED state gate: gateway 403s trial resets on NON-expired trials (proven from the browser page with exact UI headers) → additive slug trial_not_expired (exit 6) + the action's expiry pre-check — the honest target-state refusal over a misleading auth_rejected
 - [Phase 04-03]: 8.3.3 rig creds discovered + verified (admin/password, resetter tst1.env); ign-research does NOT accept them. Trial endpoints verified unauth on BOTH minor versions → conditional-auth trait methods (cred rides when present, header-less otherwise). Trial verbs echo config.active as context; docker verbs stay profile:null
+- [Phase 04-04]: Restore wait deadline MAX-clamps at 300s (Pitfall 6): an explicit short --timeout cannot buy an unknown-state mid-restart report — restore_deadline is the tested pure fn
+- [Phase 04-04]: backup download rides download_to_file via ONE optional Accept param (not a forked chunk loop — the single streaming body-consumption site holds); roaming query rides the path constant; restore POST = raw octet-stream with 4 explicit-false params, NOT multipart
+- [Phase 04-04]: Snapshot manifest is the honest composition contract: BOTH exclusion notes verbatim (trial clock NOT captured by gwbk; tag-provider bulk export = Phase 5); gateway_info failure degrades to ignition.version null in the artifact; project file names percent-encode injectively
+- [Phase 04-04]: snapshot/restore creds = IGNITION_TOKEN only (backup route 401s unauth; Basic dead on 8.3 /data — no second rung), missing token = exit 3; restore is the 5th guarded destructive verb (binary-pinned before discovery)
 
 ### Pending Todos
 
@@ -112,6 +117,7 @@ None yet.
 
 ### Blockers/Concerns
 
+- ~~04-04 live round-trip e2e~~ DEFERRED (not blocking — the gate ships #[ignore]/env-gated per convention): at execution time the ignition-devops rig was DOWN and its ports (9088/9043) were held by the actively-used whk-services compose stack — stopping another stack is a human decision. To run later: bring the rig up with ports free, provision a token, then `IGNITION_LIVE_URL+TOKEN+MUTATIONS=1 cargo test -p ignition-cli --test e2e_rig -- --ignored` (README §rig snapshot/restore documents the port-collision hazard: verify with `rig status` first).
 - ~~Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF)~~ RESOLVED at Phase 4 planning by 04-RESEARCH.md (live-probed on ign-research 8.3.6): native Rust HTTP ladder — tier 0 token-auth POST /data/api/v1/trial (one live call decides), tier 1 mapped OIDC challenge flow (client/idp.rs), tier 2 Playwright README-documented fallback only. Playwright delegation rejected (Node+chromium runtime, broke across 8.3.3 UI rewrite, DOM-text verification).
 - Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
 - ~~Phase 4 trial-reset e2e needs rig creds~~ MOSTLY CLOSED by 04-03: 8.3.3 creds discovered+verified (admin/password), tier-1 flip LIVE-VERIFIED; remaining = ign-research (8.3.6) token provisioning for the tier-0 probe + 8.3.6-line reset e2e (04-USER-SETUP.md — gateway web UI manual step; no headless token creation exists)
@@ -120,6 +126,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-23T02:50:08.504Z
-**Stopped At:** Completed 04-03-PLAN.md (trial state — RIG-02/RIG-03 complete, tier-1 live-verified)
+**Last session:** 2026-08-23T03:30:55.333Z
+**Stopped At:** Completed 04-04-PLAN.md (Phase 4 complete — snapshot/restore shipped, RIG-01..04 all stand)
 **Resume file:** None
