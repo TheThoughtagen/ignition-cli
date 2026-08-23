@@ -34,6 +34,7 @@ use std::time::Duration;
 
 mod classify;
 pub mod connections;
+pub mod idp;
 pub mod logs;
 pub mod metrics;
 pub mod projects;

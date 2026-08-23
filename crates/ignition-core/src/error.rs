@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -153,6 +153,22 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// The gateway refuses trial resets while the trial is still
+    /// active — live-discovered on 8.3.3 during 04-03's spike: the
+    /// reset POST answers 403 on a NON-expired trial (verified from
+    /// the browser page itself with the exact UI headers), and 200 +
+    /// the flip on an expired one. The action layer's expiry pre-check
+    /// turns that misleading auth-shaped 403 into the honest
+    /// target-state refusal. Exit 6 (the ProjectExists precedent:
+    /// action-constructed, not classify).
+    #[error("trial is not expired ({remaining_s}s left) — the gateway only honors resets once the trial expires")]
+    TrialNotExpired {
+        /// Seconds left on the active trial.
+        remaining_s: i64,
+        /// URL of the rig's trial endpoint, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -179,6 +195,7 @@ impl CoreError {
             Self::NotFound { .. } => "not_found",
             Self::ProjectExists { .. } => "project_exists",
             Self::ResourceBinary { .. } => "resource_binary",
+            Self::TrialNotExpired { .. } => "trial_not_expired",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -201,7 +218,8 @@ impl CoreError {
             | Self::GatewayRestarting { .. }
             | Self::NotFound { .. }
             | Self::ProjectExists { .. }
-            | Self::ResourceBinary { .. } => 6,
+            | Self::ResourceBinary { .. }
+            | Self::TrialNotExpired { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -300,6 +318,11 @@ impl CoreError {
                   for data.bin-class resources"
                     .to_string(),
             ),
+            Self::TrialNotExpired { .. } => Some(
+                "wait for the trial to expire (watch `ign rig trial status`), or \
+                  run `ign rig reset --yes` for a completely fresh trial volume"
+                    .to_string(),
+            ),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -319,7 +342,8 @@ impl CoreError {
             | Self::GatewayRestarting { endpoint }
             | Self::NotFound { endpoint }
             | Self::ProjectExists { endpoint, .. }
-            | Self::ResourceBinary { endpoint, .. } => endpoint.clone(),
+            | Self::ResourceBinary { endpoint, .. }
+            | Self::TrialNotExpired { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -495,6 +519,14 @@ mod tests {
                 },
                 6,
                 "resource_binary",
+            ),
+            (
+                CoreError::TrialNotExpired {
+                    remaining_s: 6590,
+                    endpoint: Some("http://localhost:9088/data/api/v1/trial".into()),
+                },
+                6,
+                "trial_not_expired",
             ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];

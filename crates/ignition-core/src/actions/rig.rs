@@ -489,6 +489,120 @@ pub async fn trial_status(gateway: &dyn GatewayApi) -> Result<TrialStatusResult,
     })
 }
 
+/// `ign rig trial reset` output model (04-03, RIG-03): the ladder's
+/// outcome — which rung landed, and the before/after flip (the flip
+/// is REQUIRED for success; a bare 2xx never suffices).
+#[derive(Debug, Serialize)]
+pub struct TrialResetResult {
+    /// The rig's gateway URL the ladder ran against.
+    pub rig_url: String,
+    /// `"token"` (tier 0 — token-auth POST through the client
+    /// pipeline) | `"login"` (tier 1 — the native OIDC session+CSRF
+    /// flow).
+    pub mechanism: String,
+    /// The pre-reset `expired` flag (always true on the success path —
+    /// the action refuses non-expired trials up front).
+    pub expired_before: bool,
+    /// The post-reset `expired` flag (false — verified by READ-BACK,
+    /// never trusted from the POST alone).
+    pub expired_after: bool,
+    /// The fresh countdown in epoch **SECONDS** (≈7200 = a full new
+    /// trial window).
+    pub trial_remaining_s: i64,
+}
+
+/// `ign rig trial reset` (04-03, RIG-03): the evidence-chosen LADDER —
+/// tier 0 (token-auth `POST /trial` through the existing client, one
+/// cheap call) falls through to tier 1 (the native OIDC login →
+/// session+CSRF POST, [`crate::client::idp`], live-verified
+/// end-to-end on 8.3.3 with the `expired:true → false` flip).
+///
+/// **State gate (live-discovered):** the gateway 403s resets on a
+/// NON-expired trial — verified from the browser page itself with the
+/// exact UI headers. The pre-check refuses those up front
+/// ([`CoreError::TrialNotExpired`]) so the refusal stays an honest
+/// target-state error instead of a misleading auth-shaped 403.
+///
+/// Success REQUIRES the read-back flip: after a 2xx the trial is
+/// re-fetched and `expired` must be false (mutations read back — the
+/// 03-01 find precedent; no trusting the POST's word alone).
+///
+/// `gateway` is a client pointed at the rig's URL (carrying the tier-0
+/// token when one resolved); `basic` is the tier-1 credential pair
+/// (`--user`/`IGNITION_USER` + `IGNITION_PASSWORD` — the secret
+/// chain's basic tail). At least one rung must have its credential.
+pub async fn trial_reset(
+    gateway: &dyn GatewayApi,
+    rig_url: &str,
+    token_available: bool,
+    basic: Option<(&str, &crate::config::Secret)>,
+) -> Result<TrialResetResult, CoreError> {
+    // 1. The state pre-check: the honest refusal for non-expired
+    //    trials (the live-discovered 403 state gate).
+    let before = gateway.trial_status_wire().await?;
+    if !before.expired {
+        return Err(CoreError::TrialNotExpired {
+            remaining_s: before.trial_seconds_left,
+            endpoint: Some(format!("{rig_url}/data/api/v1/trial")),
+        });
+    }
+
+    // 2. Tier 0 — token-auth POST (only when the dispatch resolved a
+    //    token credential into the client). ANY failure falls through
+    //    to tier 1 (the 403 state gate is pre-checked away; a failure
+    //    here means the token was refused — the login rung decides).
+    if token_available {
+        match gateway.trial_reset_wire().await {
+            Ok(_fresh) => {
+                let after = gateway.trial_status_wire().await?;
+                return finish(rig_url, "token", after);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "trial-reset tier 0 (token-auth POST) failed — falling through to the login rung"
+                );
+            }
+        }
+    }
+
+    // 3. Tier 1 — the native OIDC session+CSRF flow (the
+    //    live-verified mechanism).
+    let Some((username, password)) = basic else {
+        // No token that worked AND no login pair: if tier 0 was even
+        // attempted, surface ITS error (the token was the only rung);
+        // otherwise the dispatch should have refused up front — this
+        // is the defensive tail.
+        return Err(CoreError::SecretUnavailable {
+            profile: rig_url.to_string(),
+        });
+    };
+    let flow = crate::client::idp::IdpLoginFlow::new(rig_url)?;
+    let (flow, session) = crate::client::idp::login(flow, username, password).await?;
+    crate::client::idp::trial_reset_via_session(&flow, &session).await?;
+    // The read-back flip through the normal pipeline (step 10).
+    let after = gateway.trial_status_wire().await?;
+    finish(rig_url, "login", after)
+}
+
+/// The shared success tail: the flip check + result assembly.
+fn finish(rig_url: &str, mechanism: &str, after: crate::client::trial::TrialWire) -> Result<TrialResetResult, CoreError> {
+    if after.expired {
+        return Err(CoreError::Internal(format!(
+            "trial reset was accepted but the read-back still reports expired \
+             ({}s left) — re-run `rig trial status` to see the gateway's answer",
+            after.trial_seconds_left
+        )));
+    }
+    Ok(TrialResetResult {
+        rig_url: rig_url.to_string(),
+        mechanism: mechanism.to_string(),
+        expired_before: true,
+        expired_after: after.expired,
+        trial_remaining_s: after.trial_seconds_left,
+    })
+}
+
 /// `ign rig logs` (04-02, RIG-02): compose log PASSTHROUGH — a raw
 /// line stream through `sink`, never an envelope-wrapped body.
 /// Compose log lines are not gateway JSON objects; wrapping would
@@ -604,7 +718,8 @@ mod tests {
 
     use super::{
         DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigResetResult, RigStatusResult, RigUpResult,
-        gateway_url_from, rig_down, rig_logs, rig_reset, rig_status, rig_up, trial_status,
+        gateway_url_from, rig_down, rig_logs, rig_reset, rig_status, rig_up, trial_reset,
+        trial_status,
     };
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
@@ -1352,6 +1467,276 @@ mod tests {
             "the degradation is visible data: {:?}",
             result.warnings
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // trial_reset — the ladder (04-03)
+    // ---------------------------------------------------------------------
+
+    /// The trial JSON body for a given state.
+    fn trial_body(expired: bool, seconds_left: i64) -> serde_json::Value {
+        serde_json::json!({
+            "licenseMode": "Trial", "trialState": "AllInDemo",
+            "trialSecondsLeft": seconds_left, "expired": expired,
+            "emergency": false, "emergencySecondsLeft": 0,
+            "development": false, "developmentSecondsLeft": 0
+        })
+    }
+
+    /// A stateful trial GET/POST script: GET answers EXPIRED until the
+    /// successful reset POST lands, then FRESH forever (the flip the
+    /// read-back verifies). `post_status` controls the POST's answer
+    /// (200 = reset lands and flips the flag; anything else refuses
+    /// WITHOUT flipping — the state-gate/credential-refusal shapes).
+    #[derive(Clone)]
+    struct TrialFlipScript {
+        reset_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        post_status: u16,
+    }
+
+    impl wiremock::Respond for TrialFlipScript {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            if request.method.as_str() == "POST" {
+                if self.post_status == 200 {
+                    self.reset_done
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return wiremock::ResponseTemplate::new(200)
+                        .set_body_json(trial_body(false, 7199));
+                }
+                return wiremock::ResponseTemplate::new(self.post_status);
+            }
+            let expired = !self.reset_done.load(std::sync::atomic::Ordering::SeqCst);
+            wiremock::ResponseTemplate::new(200).set_body_json(trial_body(expired, if expired { 0 } else { 7199 }))
+        }
+    }
+
+    /// Mount GET + POST /trial on one script (the read-back sees the
+    /// flip when the POST succeeded).
+    async fn trial_reset_server(post_status: u16) -> (wiremock::MockServer, TrialFlipScript) {
+        let server = wiremock::MockServer::start().await;
+        let script = TrialFlipScript {
+            reset_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            post_status,
+        };
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/trial"))
+            .respond_with(script.clone())
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/data/api/v1/trial"))
+            .respond_with(script.clone())
+            .mount(&server)
+            .await;
+        (server, script)
+    }
+
+    /// The pre-check refusal: an ACTIVE trial errors TrialNotExpired
+    /// (exit 6) naming the seconds left — the live-discovered state
+    /// gate surfaced honestly, and the POST NEVER fires.
+    #[tokio::test]
+    async fn trial_reset_refuses_active_trial_up_front() {
+        let (server, script) = trial_reset_server(200).await;
+        // Force the "active" starting state (the script's flag starts
+        // un-flipped = expired; flip it up front for this test).
+        script
+            .reset_done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let err = trial_reset(&api, &server.uri(), false, None)
+            .await
+            .expect_err("an active trial is refused before any POST");
+        assert!(matches!(err, CoreError::TrialNotExpired { .. }), "{err}");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.code(), "trial_not_expired");
+        let message = err.to_string();
+        assert!(
+            message.contains("7199s left"),
+            "the message names the countdown: {message}"
+        );
+    }
+
+    /// Tier 0 lands: token-auth POST through the client pipeline, the
+    /// read-back flip verified, mechanism "token".
+    #[tokio::test]
+    async fn trial_reset_tier0_lands_with_read_back_flip() {
+        let (server, _script) = trial_reset_server(200).await;
+        let credential = crate::config::Credential::Token(crate::config::Secret::new(
+            "spike:tokengeneratedlive",
+        ));
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), Some(credential));
+        let result = trial_reset(&api, &server.uri(), true, None)
+            .await
+            .expect("tier 0 resets the expired trial");
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({
+                "rig_url": server.uri(),
+                "mechanism": "token",
+                "expired_before": true,
+                "expired_after": false,
+                "trial_remaining_s": 7199
+            }),
+            "EXACT shape — which rung landed + the before/after flip"
+        );
+    }
+
+    /// Tier 0 refused (401) with NO login pair: the token rung's error
+    /// propagates as the credential-less tail (SecretUnavailable,
+    /// exit 3).
+    #[tokio::test]
+    async fn trial_reset_token_refused_without_login_errors() {
+        let (server, _script) = trial_reset_server(401).await;
+        let credential = crate::config::Credential::Token(crate::config::Secret::new(
+            "spike:wrongtoken",
+        ));
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), Some(credential));
+        let err = trial_reset(&api, &server.uri(), true, None)
+            .await
+            .expect_err("the refused token rung has no fallback");
+        assert!(matches!(err, CoreError::SecretUnavailable { .. }), "{err}");
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    /// The minimal tier-1 dance mount (the full request-chain pins
+    /// live in tests/trial_contract.rs; this is the ACTION-level proof
+    /// that the ladder wires the flow at the rig URL). The session
+    /// POST rides PRIORITY 1 so wiremock checks it before the
+    /// script's catch-all (stable order would otherwise let the
+    /// earlier-mounted plain-POST mock steal the CSRF-carrying
+    /// request), and its landing flips the same read-back flag.
+    async fn login_dance_server() -> (wiremock::MockServer, TrialFlipScript) {
+        let (server, script) = trial_reset_server(401).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/app/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302).insert_header(
+                    "Location",
+                    "/idp/default/oidc/auth?app=gateway&state=st&nonce=nc",
+                ),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+            .and(wiremock::matchers::query_param_is_missing("token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302).insert_header(
+                    "Location",
+                    "/idp/default/authn/login?app=gateway&token=TT0",
+                ),
+            )
+            .mount(&server)
+            .await;
+        for (body_token, answer) in [
+            ("TT0", r#"{"complete":false,"nextChallenge":[{"type":"basic"}],"token":"TT1"}"#),
+            ("TT2", r#"{"complete":true,"token":"TT3"}"#),
+        ] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/idp/default/authn/next-challenge"))
+                .and(wiremock::matchers::body_json(serde_json::json!({ "token": body_token })))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_string(answer)
+                        .insert_header("Content-Type", "application/json"),
+                )
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/idp/default/authn/submit-challenge/basic"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"success":true,"token":"TT2"}"#)
+                    .insert_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+            .and(wiremock::matchers::query_param("token", "TT3"))
+            .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+                "Location",
+                "/data/federate/callback/internal?code=c&state=st",
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/federate/callback/internal"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", "/app")
+                    .append_header("Set-Cookie", "webui-sid-1=sess; Path=/; HttpOnly"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/app/session"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"userPayload":{},"csrfToken":"csrf1"}"#)
+                    .insert_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/data/api/v1/trial"))
+            .and(wiremock::matchers::header("X-CSRF-Token", "csrf1"))
+            .respond_with(SessionResetFlip {
+                reset_done: script.reset_done.clone(),
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        (server, script)
+    }
+
+    /// The session-POST responder: flips the shared read-back flag and
+    /// answers the fresh trial.
+    struct SessionResetFlip {
+        reset_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl wiremock::Respond for SessionResetFlip {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.reset_done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wiremock::ResponseTemplate::new(200).set_body_json(trial_body(false, 7199))
+        }
+    }
+
+    /// The full ladder: the token rung 401s → the login rung runs the
+    /// dance at the RIG URL → reset → read-back flip; mechanism
+    /// "login".
+    #[tokio::test]
+    async fn trial_reset_falls_through_to_the_login_rung() {
+        let (server, _script) = login_dance_server().await;
+        let credential = crate::config::Credential::Token(crate::config::Secret::new(
+            "spike:rejectedtoken",
+        ));
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), Some(credential));
+        let password = crate::config::Secret::new("rig-password");
+        let result = trial_reset(&api, &server.uri(), true, Some(("admin", &password)))
+            .await
+            .expect("the login rung carries the reset");
+        assert_eq!(result.mechanism, "login");
+        assert!(result.expired_before);
+        assert!(!result.expired_after);
+        assert_eq!(result.trial_remaining_s, 7199);
+    }
+
+    /// Tier 1 alone (no token at all): the dance + flip, mechanism
+    /// "login".
+    #[tokio::test]
+    async fn trial_reset_login_rung_alone() {
+        let (server, _script) = login_dance_server().await;
+        let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let password = crate::config::Secret::new("rig-password");
+        let result = trial_reset(&api, &server.uri(), false, Some(("admin", &password)))
+            .await
+            .expect("login-only reset works");
+        assert_eq!(result.mechanism, "login");
+        assert!(!result.expired_after);
     }
 
     // ---------------------------------------------------------------------
