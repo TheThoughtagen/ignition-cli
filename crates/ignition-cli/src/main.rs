@@ -1354,6 +1354,7 @@ fn rig_gateway_client(
             label: None,
             ssl_verify: false,
             auth: AuthRef::default(),
+            webdev_secret: None,
         };
         ReqwestGatewayApi::new(&profile, credential).ok()
     })

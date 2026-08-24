@@ -13,7 +13,10 @@
 //! - 401 = token not recognized (the `name:key` format failure);
 //!   403 = recognized but under-permitted (the three-part setup);
 //! - `scan/projects` is igw-cli's harmless rescan write probe;
-//! - `/system/webdev/<route>`: 404 = absent, anything else = present.
+//! - `/system/webdev`: the version-action probe answers 405 = absent
+//!   (the live-proven 8.3 marker — the Phase-2 404 assumption was
+//!   research-Pitfall-1 wrong, re-pinned 05-03), 402 = module
+//!   unlicensed, 200 = present.
 //!
 //! EXIT CONTRACT (planner decision, README-documented): the doctor
 //! exits 0 whenever the diagnosis COMPLETES — failing checks are the
@@ -27,6 +30,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::client::GatewayApi;
+use crate::client::webdev::RouteProbe;
 use crate::error::CoreError;
 
 /// TCP dial timeout for the url check (separates DNS/firewall from
@@ -420,10 +424,13 @@ async fn check_write(api: &dyn GatewayApi, opts: &DoctorOptions) -> CheckResult 
     }
 }
 
-/// 7. webdev route presence (only with --webdev-route NAME):
-///    `/system/webdev/<route>` — 404 = route absent, 200/401/403 = route
-///    exists (permission varies by route). Doctor just probes; Phase 5
-///    owns the routes themselves.
+/// 7. webdev route presence (only with --webdev-route NAME): the
+///    05-03 re-pin — probe the route's `version` action inside the
+///    CLI's ign-cli project via `webdev_route_probe`. **405 = absent**
+///    (the live-proven 8.3 marker; the Phase-2 404 assumption was
+///    research-Pitfall-1 WRONG), 402 = module unlicensed,
+///    200 = present (+ handshake version). The status code IS the
+///    answer — never classified.
 async fn check_webdev(api: &dyn GatewayApi, opts: &DoctorOptions) -> CheckResult {
     let Some(route) = opts.webdev_route.as_deref() else {
         return row(
@@ -433,17 +440,48 @@ async fn check_webdev(api: &dyn GatewayApi, opts: &DoctorOptions) -> CheckResult
             None,
         );
     };
-    match api.webdev_route_status(route).await {
-        Ok(404) => row(
-            "webdev",
-            CheckStatus::Warn,
-            format!("route {route:?} absent (HTTP 404)"),
-            Some("create the WebDev route on the gateway (or check its name)".to_string()),
-        ),
-        Ok(status) => row(
+    match api
+        .webdev_route_probe(crate::client::webdev::DEFAULT_PROJECT, route, &[])
+        .await
+    {
+        Ok(RouteProbe::Present { route_version }) => row(
             "webdev",
             CheckStatus::Ok,
-            format!("route {route:?} exists (HTTP {status}; permission varies by route)"),
+            format!("route {route:?} present (version {route_version})"),
+            None,
+        ),
+        Ok(RouteProbe::Absent) => row(
+            "webdev",
+            CheckStatus::Warn,
+            format!("route {route:?} absent (HTTP 405 — the 8.3 absent marker)"),
+            Some(
+                "run `ign webdev deploy` to install the CLI's routes (or check the \
+                  route name)"
+                    .to_string(),
+            ),
+        ),
+        Ok(RouteProbe::Unlicensed) => row(
+            "webdev",
+            CheckStatus::Warn,
+            "WebDev module unlicensed (HTTP 402 — trial-expired rigs cannot \
+              serve /system/webdev routes)"
+                .to_string(),
+            Some(
+                "license the gateway; on a rig, `ign rig trial reset --yes` restarts \
+                  an expired trial"
+                    .to_string(),
+            ),
+        ),
+        Ok(RouteProbe::AuthGated) => row(
+            "webdev",
+            CheckStatus::Ok,
+            format!("route {route:?} present (auth-gated — HTTP 401/403)"),
+            None,
+        ),
+        Ok(RouteProbe::Denied { code, .. }) => row(
+            "webdev",
+            CheckStatus::Ok,
+            format!("route {route:?} present (denied: {code})"),
             None,
         ),
         Err(err) => row(
@@ -492,6 +530,21 @@ mod tests {
         ping: fn() -> Result<StatusPing, CoreError>,
         info: fn() -> Result<GatewayInfo, CoreError>,
         props: fn() -> Result<SecurityProperties, CoreError>,
+        webdev_probe: fn() -> Result<crate::client::webdev::RouteProbe, CoreError>,
+    }
+
+    fn tags_present() -> Result<crate::client::webdev::RouteProbe, CoreError> {
+        Ok(crate::client::webdev::RouteProbe::Present {
+            route_version: crate::webdev::ROUTE_BUNDLE_VERSION.to_string(),
+        })
+    }
+
+    fn tags_absent() -> Result<crate::client::webdev::RouteProbe, CoreError> {
+        Ok(crate::client::webdev::RouteProbe::Absent)
+    }
+
+    fn webdev_unlicensed() -> Result<crate::client::webdev::RouteProbe, CoreError> {
+        Ok(crate::client::webdev::RouteProbe::Unlicensed)
     }
 
     fn running() -> Result<StatusPing, CoreError> {
@@ -688,7 +741,7 @@ mod tests {
             _route: &str,
             _extra_headers: &[(&str, &str)],
         ) -> Result<crate::client::webdev::RouteProbe, CoreError> {
-            unreachable!("not part of this action")
+            (self.webdev_probe)()
         }
         async fn projects(
             &self,
@@ -749,6 +802,7 @@ mod tests {
             ping: running,
             info: ok_info,
             props: ok_props,
+            webdev_probe: tags_present,
         }
     }
 
@@ -831,6 +885,7 @@ mod tests {
             ping: running,
             info: info_403,
             props: props_403,
+            webdev_probe: tags_present,
         };
         let result =
             super::doctor(&rig, "http://127.0.0.1:1", true, &DoctorOptions::default()).await;
@@ -861,6 +916,7 @@ mod tests {
             ping: running,
             info: info_401,
             props: props_401,
+            webdev_probe: tags_present,
         };
         let result =
             super::doctor(&rig, "http://127.0.0.1:1", false, &DoctorOptions::default()).await;
@@ -890,6 +946,7 @@ mod tests {
             ping: running,
             info: info_401,
             props: props_401,
+            webdev_probe: tags_present,
         };
         let result =
             super::doctor(&rig, "http://127.0.0.1:1", true, &DoctorOptions::default()).await;
@@ -939,6 +996,84 @@ mod tests {
             write.detail
         );
     }
+
+    /// THE 05-03 re-pin: a 405 answer is ABSENT (warn + `ign webdev
+    /// deploy` hint) — replacing the documented-but-wrong Phase-2 404
+    /// assumption (research Pitfall 1).
+    #[tokio::test]
+    async fn webdev_405_means_absent_with_a_deploy_hint() {
+        let rig = DoctorRig {
+            webdev_probe: tags_absent,
+            ..healthy_rig()
+        };
+        let result = super::doctor(
+            &rig,
+            "http://127.0.0.1:1",
+            true,
+            &DoctorOptions {
+                check_write: false,
+                webdev_route: Some("tags".into()),
+            },
+        )
+        .await;
+        let webdev = result.checks.iter().find(|c| c.name == "webdev").unwrap();
+        assert_eq!(webdev.status, CheckStatus::Warn);
+        assert!(
+            webdev.detail.contains("405"),
+            "the 405 marker surfaces: {}",
+            webdev.detail
+        );
+        assert!(
+            webdev.hint.as_deref().unwrap().contains("ign webdev deploy"),
+            "hint names the fix"
+        );
+    }
+
+    /// A present route answers ok with its handshake version; a 402
+    /// rig warns "module unlicensed" (the trial-expired state).
+    #[tokio::test]
+    async fn webdev_present_ok_and_402_unlicensed() {
+        let result = super::doctor(
+            &healthy_rig(),
+            "http://127.0.0.1:1",
+            true,
+            &DoctorOptions {
+                check_write: false,
+                webdev_route: Some("tags".into()),
+            },
+        )
+        .await;
+        let webdev = result.checks.iter().find(|c| c.name == "webdev").unwrap();
+        assert_eq!(webdev.status, CheckStatus::Ok);
+        assert!(
+            webdev.detail.contains("present (version"),
+            "detail carries the handshake version: {}",
+            webdev.detail
+        );
+
+        let rig = DoctorRig {
+            webdev_probe: webdev_unlicensed,
+            ..healthy_rig()
+        };
+        let result = super::doctor(
+            &rig,
+            "http://127.0.0.1:1",
+            true,
+            &DoctorOptions {
+                check_write: false,
+                webdev_route: Some("tags".into()),
+            },
+        )
+        .await;
+        let webdev = result.checks.iter().find(|c| c.name == "webdev").unwrap();
+        assert_eq!(webdev.status, CheckStatus::Warn);
+        assert!(
+            webdev.detail.contains("unlicensed"),
+            "detail: {}",
+            webdev.detail
+        );
+    }
+
 
     /// Serialization pins: statuses are lowercase; the checks[] keys
     /// are exactly {name, status, detail, hint} with hint null-able.

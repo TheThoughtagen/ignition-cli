@@ -81,6 +81,7 @@ pub fn add(
                 label: label.map(str::to_string),
                 ssl_verify: true,
                 auth: auth.clone(),
+                webdev_secret: None,
             },
         )
         .is_some()

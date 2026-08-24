@@ -75,6 +75,16 @@ pub struct Profile {
     /// HOW to find the credential — a reference, never a value.
     #[serde(default)]
     pub auth: AuthRef,
+    /// The CLI-GENERATED webdev scriptExec shared secret (05-03) — the
+    /// ONE deliberate value-carrying exception to the references-only
+    /// rule: this secret is not a user credential but a token the CLI
+    /// itself mints at deploy time, must round-trip verbatim (the
+    /// deployed route compares it byte-for-byte), and cannot live in
+    /// an env var another tool owns. It rides ONLY in this 0600 config
+    /// store and the baked route zip member — never in any action
+    /// result, log, or JSON envelope (the redaction discipline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webdev_secret: Option<String>,
 }
 
 fn default_ssl_verify() -> bool {

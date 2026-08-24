@@ -69,7 +69,7 @@ pub fn load(path: &Path) -> Result<Config, CoreError> {
 }
 
 const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles", "rig", "rigs"];
-const KNOWN_PROFILE_KEYS: &[&str] = &["url", "label", "ssl_verify", "auth"];
+const KNOWN_PROFILE_KEYS: &[&str] = &["url", "label", "ssl_verify", "auth", "webdev_secret"];
 const KNOWN_AUTH_KEYS: &[&str] = &["token_env", "keyring", "user_env", "password_env"];
 
 /// Warn (never fail) about config keys a future CLI version might
@@ -220,6 +220,7 @@ mod tests {
                 auth: AuthRef::TokenEnv {
                     token_env: "IGNITION_TOKEN".into(),
                 },
+                webdev_secret: None,
             },
         );
         config.profiles.insert(
@@ -231,6 +232,7 @@ mod tests {
                 auth: AuthRef::Keyring {
                     keyring: "profile:prod".into(),
                 },
+                webdev_secret: None,
             },
         );
         config

@@ -20,7 +20,6 @@
 use ignition_core::client::GatewayApi;
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::client::webdev::{RouteProbe, build_deploy_zip};
-use ignition_core::error::CoreError;
 use ignition_core::webdev::ROUTE_FILES;
 
 /// The version-action 200-ok body every Present fixture answers.
@@ -361,4 +360,93 @@ fn deploy_zip_retitles_only_on_project_override() {
         "ign CLI WebDev routes (deployed by `ign webdev deploy` — do not edit)"
     );
     assert_eq!(manifest["enabled"], true);
+}
+
+// ---- The deploy ACTION's import pin (05-03 Task 2) ----
+
+/// THE deploy pin: `webdev_deploy` POSTs the built zip to the 03-02
+/// import machinery — `/data/api/v1/projects/import/ign-cli` with
+/// `overwrite=true` + `application/zip` — and the recorded body IS
+/// the manifest (+scriptExec when flagged) with the SUBSTITUTED
+/// secret; the persisted profile secret stays out of every envelope.
+#[tokio::test]
+async fn deploy_action_posts_the_zip_through_the_import_machinery() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        // The Phase-3 per-segment encoder over-encodes `-` → `%2D`
+        // (safe: the server decodes before matching) — the matcher
+        // rides the SAME encoded path the wire sees.
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/ign%2Dcli",
+        ))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .and(wiremock::matchers::header("content-type", "application/zip"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    // An isolated profile config (the action re-loads it for the
+    // secret lifecycle — no credential involved).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "active = \"dev\"\n\n[profiles.dev]\nurl = \"http://localhost:9088/\"\n",
+    )
+    .expect("write config");
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = ignition_core::actions::webdev::webdev_deploy(
+        &api,
+        "ign-cli",
+        true,
+        false,
+        &config_path,
+        "dev",
+    )
+    .await
+    .expect("deploy imports");
+
+    // Result shape: 5 routes, scriptExec shipped, secret ROTATED
+    // (generated), the import answer passed through.
+    assert_eq!(
+        result.routes,
+        vec!["tags", "tagConfig", "alarms", "tagHistory", "scriptExec"]
+    );
+    assert!(result.script_exec);
+    assert!(result.secret_rotated);
+    assert_eq!(result.import["success"], true);
+
+    // The recorded request body: the zip unpacks to manifest + 3, and
+    // scriptExec's doPost.py carries a SUBSTITUTED hex secret — never
+    // the placeholder.
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import POST");
+    let names = member_names(&requests[0].body);
+    assert_eq!(names.len(), ROUTE_FILES.len() + 3);
+    let do_post = member(
+        &requests[0].body,
+        "com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py",
+    );
+    let do_post = String::from_utf8(do_post).expect("doPost.py is utf-8");
+    assert!(!do_post.contains("__IGN_CLI_SECRET__"));
+    assert!(do_post.contains("SECRET = None or '"));
+
+    // The persisted secret exists (64 hex), the file is 0600, and it
+    // appears NOWHERE in the serialized result (redaction).
+    let stored = ignition_core::config::load(&config_path)
+        .expect("config reloads")
+        .profiles
+        .get("dev")
+        .and_then(|profile| profile.webdev_secret.clone())
+        .expect("secret persisted");
+    assert_eq!(stored.len(), 64);
+    assert!(do_post.contains(&stored), "the stored secret IS the baked one");
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(!serialized.contains(&stored), "redaction: {serialized}");
+    let _ = dir;
 }
