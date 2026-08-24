@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 4 COMPLETE + VERIFIED 18/18 (status: passed — live gates executed autonomously via docker compose: tier-1 trial reset live-proven on 8.3.6, snapshot→mutate→restore two-sided PASS via real CLI verbs) — ready for Phase 5 discuss/plan, which INHERITS one agenda item: the Phase 3 resource-route defect (see Blockers)
+**Current focus:** Phase 5 EXECUTING (wave 1, parallel tree): 05-01 route sources + embedded bundle COMPLETE; 05-02 resource-family re-point COMPLETE — the inherited Phase 3 resource-route defect is CLOSED (see Blockers). Next: remaining wave plans (05-03..05-06)
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
-**Current Plan:** 1
+**Current Plan:** 2
 **Total Plans in Phase:** 6
-**Status:** Phase 5 executing — 05-01 complete (route sources + embedded bundle); wave-1 sibling plans (05-02..) running in parallel in this tree
+**Status:** Phase 5 executing — 05-01 (route sources + embedded bundle) + 05-02 (resource family re-point, Phase 3 blocker CLOSED) complete; wave-1 sibling plans running in parallel in this tree
 **Last Activity:** 2026-08-24
 
-**Progress:** [████████░░] 77%
+**Progress:** [████████░░] 82%
 
 ## Performance Metrics
 
@@ -45,6 +45,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 04 P03 | 406min | 3 tasks | 14 files |
 | Phase 04 PP04 | 37min | 3 tasks | 17 files |
 | Phase 05 P01 | 24min | 3 tasks | 19 files |
+| Phase 05 P02 | 38min | 3 tasks | 16 files |
 
 ## Accumulated Context
 
@@ -115,6 +116,9 @@ Recent decisions affecting current work:
 - [Phase 05]: [Phase 05-01]: scriptExec config.json stays require-auth FALSE / user-source '' — secret-only posture (API tokens 401 on WebDev require-auth, a Basic layer would lock the CLI's own token-authed calls out; research OQ3 resolved)
 - [Phase 05]: [Phase 05-01]: route body envelope LOCKED — {ok,data}/{ok,error{code,message,traceback?}} at HTTP 200 (WebDev ignores 'status'); machine codes are the stable route contract: no_alarm_journal (structured journal-missing denial), secret_required, secret_mismatch, unknown_action, not_found, route_error
 - [Phase 05]: [Phase 05-01]: route folders are SELF-CONTAINED by design (no cross-resource imports) — the ~25-line shared core (unicode re-parse, jv() depth-12 walker, bare-except traceback envelope) is duplicated across all five routes deliberately; ignition-core::webdev is pure data (include_str!), deploy orchestration lives in the actions layer (05-03)
+- [Phase 05-02]: [Phase 05-02]: Resource family re-pointed onto export-zip surgery (zip 8.6, the only new dep) — UX contract unchanged, transport = export → pure member surgery (client/resources.rs helpers, unit-pinned) → import(overwrite=true); Phase 3 cross-phase blocker CLOSED — No per-resource REST routes exist on real 8.3 gateways (triple-verified: live openapi 575 paths + committed extract + EAM probe); export/import round-trip is native and the machinery shipped in 03-02
+- [Phase 05-02]: [Phase 05-02]: resource put JOINED the --yes-guarded set (member surgery implicitly overwrite-imports the whole project; 03-03's unguarded put superseded) — put/delete refusal MESSAGES name the consequence via the operation string while the shared ConfirmationRequired hint stays frozen (no other verb's golden moved); prefix filter went client-side (starts_with on member paths) — Replace-not-merge wipes concurrent Designer edits — the plan's accepted-tradeoff language; consequence-at-refusal over generic hints
+- [Phase 05-02]: [Phase 05-02]: Surgery contract pins — request-SEQUENCE wiremock proofs (reads = exactly one export GET + zero imports; writes = export then overwrite-import with content-type application/zip) asserted at MEMBER level by round-tripping the received import body through the same public helpers; missing member = not_found with endpoint:null (there was no 404 URL, there was a missing zip member); tempfile promoted from dev (already in workspace graph) for the temp export — Byte-exact zip equality is not deterministic across writers; member-level honesty is the contract
 
 ### Pending Todos
 
@@ -122,7 +126,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- **[CROSS-PHASE — routed to Phase 5 planning]** Phase 3 `resource` family defect: `ign resource` (client/resources.rs + cli arm + e2e witnesses) targets `/data/api/v1/projects/{name}/resources/**` routes that DO NOT EXIST on real 8.3 gateways — openapi-evidenced against 8.3.3 (extract committed as `04-*-openapi-8.3.6-phase3-extract.json`, `captured_from` records truth; 575 paths, zero matches). Phase 3's Open Question 1 settled NEGATIVELY. Phase 5 planning must decide: re-point resource ops to export/import machinery or drop the family, then re-point the e2e witness approach. NONE counted against Phase 4 (snapshot manifest is project-granular).
+- ~~**[CROSS-PHASE — routed to Phase 5 planning]** Phase 3 `resource` family defect: `ign resource` (client/resources.rs + cli arm + e2e witnesses) targets `/data/api/v1/projects/{name}/resources/**` routes that DO NOT EXIST on real 8.3 gateways~~ CLOSED by 05-02: the family re-pointed onto project-export ZIP surgery (export → pure member surgery → import overwrite=true; zip 8.6 the only new dep). UX contract unchanged, put/delete now --yes-guarded with consequence-naming refusals, prefix filter client-side, binary fence survives (member-bytes sniff), e2e witnesses live-runnable for the first time since Phase 3 (e2e_projects loop + e2e_rig pre-witness both re-pinned). See 05-02-SUMMARY.md.
 - ~~Phase 4 live gates~~ CLOSED AUTONOMOUSLY post-verification (04-VERIFICATION.md addendum, commits bf51760/3d075ee): tier-1 trial reset live-proven on fresh 8.3.6 rig (0/expired → 7187s/active); snapshot→mutate→restore two-sided PASS via real CLI verbs on an 8.3.3 clone; lifecycle smoke passed. HEADLESS TOKEN PROVISIONING SOLVED (version-agnostic, proven both lines): OIDC login → `POST api-token/generate` → `POST resources/ignition/api-token` with `collection:"core"` → patch `security-properties` read/writePermissions to `AnyOf [Authenticated]` — full recipe in the addendum. Bonus findings: trial clock RIDES the restore (snapshot taken mid-trial restores the remaining clock); tokens+permissions inside a snapshot survive restore (Pitfall-5 warning not observed live). Tier-0-on-8.3.6 probe remains one natural-expiry away (non-blocking curiosity; tier-1 is the shipped mechanism). e2e_rig gate's resource-witness step blocked by the Phase 3 defect above.
 - ~~Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF)~~ RESOLVED at Phase 4 planning by 04-RESEARCH.md (live-probed on ign-research 8.3.6): native Rust HTTP ladder — tier 0 token-auth POST /data/api/v1/trial (one live call decides), tier 1 mapped OIDC challenge flow (client/idp.rs), tier 2 Playwright README-documented fallback only. Playwright delegation rejected (Node+chromium runtime, broke across 8.3.3 UI rewrite, DOM-text verification).
 - Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
@@ -131,6 +135,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-24T14:51:55.653Z
-**Stopped At:** Completed 05-01-PLAN.md (WebDev route sources + embedded bundle; wave-1 siblings 05-02+ running concurrently)
+**Last session:** 2026-08-24T15:05:50.569Z
+**Stopped At:** Completed 05-02-PLAN.md (resource family re-point — Phase 3 blocker CLOSED)
 **Resume file:** None
