@@ -1,44 +1,36 @@
 ---
 phase: 04-rig-lifecycle-trial-state
-verified: 2026-08-23T03:40:48Z
-status: gates_executed_automatically (see "Live Gates — Automated Execution (addendum)" below — 2026-08-24)
-addendum_outcome:
-  criterion3_second_version: "CLOSED — tier-1 trial-reset flip live-verified on a fresh 8.3.6 rig (expired:true→false, read-back asserted, corroborated at 7187s)"
-  criterion4_e2e_leg: "two-sided PASS via real CLI verbs (pre-witness survived, post-marker gone); the SHIPPED e2e_rig gate is blocked by a real product finding — the phase-03 resource family targets nonexistent /projects/{name}/resources routes (openapi-verified)"
-  optional_lifecycle_smoke: "PASS — status/up/logs/reset/down from a bare cwd via IGNITION_RIG_ROOTS"
-  token_provisioning: "SOLVED headlessly, version-agnostic (8.3.3 + 8.3.6) — full script in the addendum"
-score: 17/18 must-haves verified (truth 13's 8.3.6 leg closed by the addendum; truth 17's live leg executed via CLI-equivalent per the addendum)
-human_verification:
-  - test: "Run the 8.3.6 trial-reset live e2e (criterion 3's second minor version)"
-    status: EXECUTED 2026-08-24 (see addendum; result: PASS — criterion 3 closed)
-    steps:
-      - "Provision an API token on ign-research (8.3.6) per 04-USER-SETUP.md: gateway web UI → Config → Security → API Tokens"
-      - "IGNITION_LIVE_URL=http://localhost:18088 IGNITION_LIVE_TOKEN='name:key' IGNITION_LIVE_MUTATIONS=1 cargo test -p ignition-core --test trial_contract -- --ignored (tier-0 probe)"
-      - "With rig admin creds (or after expiry): the tier-1 gate on the same URL"
-    expected: "trial_reset_tier0_probe prints TIER 0 WORKS or TIER 0 REJECTED (settles tier 0 on 8.3.6); the tier-1 gate (if trial expired) completes the login dance + read-back flip on 8.3.6 — closing the ≥2-version criterion"
-    why_human: "Requires gateway web-UI access to provision a token and rig admin credentials that only the user holds; mutation e2e against a live rig is explicitly opt-in (IGNITION_LIVE_MUTATIONS)"
-  - test: "Run the snapshot→mutate→restore live round-trip (criterion 4's e2e leg)"
-    status: EXECUTED 2026-08-24 (see addendum; shipped gate blocked by the resource-family finding — equivalent two-sided round-trip PASSED via real CLI verbs on a port-overridden 8.3.3 clone)
-    steps:
-      - "Free the rig's port pair (9088/9043 currently held by the whk-services stack — a human scheduling decision) and bring the ignition-devops rig up"
-      - "Provision IGNITION_TOKEN on the rig (04-USER-SETUP.md task 2)"
-      - "IGNITION_LIVE_URL=http://localhost:9088 IGNITION_LIVE_TOKEN='name:key' IGNITION_LIVE_MUTATIONS=1 cargo test -p ignition-cli --test e2e_rig -- --ignored"
-    expected: "Two-sided pass: the pre-snapshot witness project/resource survives the restore AND the post-snapshot marker project is absent afterwards (both asserted by the gate)"
-    why_human: "The gate is #[ignore]/env-gated by design; running it requires stopping another actively-used compose stack holding the rig's ports and a provisioned token — both human decisions/access"
-  - test: "Optional: fresh-shell rig lifecycle smoke"
-    status: EXECUTED 2026-08-24 (see addendum; result: PASS)
-    steps:
-      - "From /tmp: ign rig status && ign rig up && ign rig logs --tail 20 && ign rig reset --yes && ign rig down"
-    expected: "Discovery finds the git-module convention rig; up reaches RUNNING (or uncommissioned-as-data exit 0); logs stream raw; reset reports removed volume names and returns to running; down stops the project"
-    why_human: "Live Docker + gateway behavior against the real rig; automated coverage exists (unit fakes + gated live tests) but a human end-to-end pass on the target machine confirms the full user journey"
+verified: 2026-08-24T03:54:18Z
+status: passed
+score: 18/18 must-haves verified
+re_verification:
+  previous_status: human_needed
+  previous_score: 17/18
+  trigger: "Delta re-verification after autonomous live-gate execution (addendum below, commit bf51760)"
+  gaps_closed:
+    - "Truth 13 — 8.3.6 trial-reset e2e: tier-1 gate run live on a fresh 8.3.6 rig (expired:true→false with the gate's required read-back; corroborated 0s/expired → 7187s/active); with 04-03's 8.3.3 flip, criterion 3's ≥2-minor-version requirement is MET via the spike-chosen tier-1 mechanism"
+    - "Truth 17 live leg — snapshot→mutate→restore round-trip executed two-sided via real CLI verbs on an 8.3.3 rig (pre-witness project survived restore, post-snapshot marker absent, 20.4s restore witnessed RUNNING, token-reset warning emitted)"
+    - "Optional lifecycle smoke — status/up/logs/reset/down from a bare cwd via IGNITION_RIG_ROOTS (reset removed ign-gate2-833_gateway_data; fresh trial 7172s proves clean slate)"
+  gaps_remaining: []
+  regressions: []
+cross_phase_findings:
+  - id: PROJ-05-resource-routes
+    owner_phase: 3
+    finding: "The phase-03 resource client family (crates/ignition-core/src/client/resources.rs, the ign resource CLI arm, and the e2e_rig/e2e_projects witness approach) targets /data/api/v1/projects/{name}/resources/** routes that DO NOT EXIST on real 8.3 gateways. Openapi-evidenced: the committed 10.7 MB extract contains ZERO such paths; the projects family exposes only /projects, copy, export/{name}, find/{name}, import/{name}, list, names, parents*, rename/{name}. Per-project resource access exists only via projects/export|import."
+    phase4_impact: "NONE counted against Phase 4 — Phase 4's truths never depended on resource routes (snapshot manifest = gwbk + project exports); the shipped e2e_rig gate cannot pass until this is resolved, but the two-sided outcome it was designed to prove has been demonstrated by equivalent real-CLI-verb evidence (see addendum Gate 2)."
+    routing: "Phase 5 planning must decide: re-point the resource family to export/import or drop it; then re-point the e2e witness approach."
+  - id: gate-hygiene-nits
+    finding: "openapi-capture gate's path.contains('/resources') matcher false-positives on the config-resources family (/data/api/v1/resources/{module}/{type} — real routes); extract filename says 8.3.6 but captured_from records the 8.3.3 rig (port 19188). Both disclosed by the executor; both verified here against the artifact."
+  - id: tier0-on-836-curiosity
+    finding: "The tier-0 token-probe on 8.3.6 remains formally unsettled (unrunnable after the tier-1 reset due to the live-verified trial-not-expired state gate; would need another ~2h expiry cycle). NOT a phase criterion — tier-1 is the spike-chosen mechanism per 04-RESEARCH.md and is now live-proven on both versions. The headless token recipe is solved, so a future run is one expiry-wait away."
 ---
 
 # Phase 4: Rig Lifecycle & Trial State Verification Report
 
 **Phase Goal:** A user can run a complete Docker test rig from the CLI — up/down/status/reset with compose discovery, logs, trial state management, and snapshot/restore — giving the project (and CI) a self-managed gateway fixture.
-**Verified:** 2026-08-23T03:40:48Z
-**Status:** human_needed — all automated checks pass; two live-e2e legs (8.3.6 trial reset, snapshot round-trip) await human-run env-gated gates
-**Re-verification:** No — initial verification
+**Verified:** 2026-08-24T03:54:18Z (delta re-verification after automated live-gate execution)
+**Status:** passed — 18/18 truths verified; all three previously-deferred live items executed with evidence (see "Delta Re-Verification" section and the addendum below)
+**Re-verification:** Yes — prior status `human_needed` (17/18); all deferred items executed autonomously via docker compose (commit bf51760) and spot-checked here
 
 ## Verification Method
 
@@ -84,7 +76,7 @@ Goal-backward verification against the phase's 4 success criteria and the 18 mus
 | --- | ----- | ------ | -------- |
 | 11 | `rig trial status` shows licenseMode/trialState/seconds/expired — no credential required | ✓ VERIFIED | `trial_status` (actions/rig.rs:446): trial endpoint primary, conditional-auth client (headers ride only when present); wiremock header-absence proof in trial_contract.rs; `TrialStatusResult` carries all unit-explicit keys. Live on BOTH rigs per summary. |
 | 12 | `rig trial reset` (guarded) flips expired:true→false via spike-chosen mechanism | ✓ VERIFIED | `trial_reset` (actions/rig.rs:537): expiry pre-check (`TrialNotExpired` exit 6 for the live-discovered 403 state gate) → tier-0 token POST → tier-1 native OIDC (idp.rs) → REQUIRED read-back flip (`finish` refuses a non-flipped read-back). Guard binary-pinned (`rig_trial_reset_refuses_without_yes_before_any_discovery`). **Live flip on 8.3.3 recorded in summary (expired:true→false, 7199s)**; wiremock pins assert the full request chain (token threading, cookie replay, CSRF header). |
-| 13 | Reset mechanism verified e2e on 8.3.3 AND 8.3.6 | ◐ PARTIAL — human needed | **8.3.3: verified live** (summary-recorded evidence: full tier-1 ladder + flip). **8.3.6: NOT verified e2e** — only read endpoints + bad-credential shape; the reset leg awaits API-token provisioning/creds (04-USER-SETUP.md documents the exact manual step + env + command). The version-agnostic harness EXISTS (`trial_reset_tier0_probe` + `trial_reset_tier1_live`, `#[ignore]`, `IGNITION_LIVE_URL`-driven, quiet-skip) — running it against 18088 closes the gate. Per verification-honesty instruction: judged partial, not passed. |
+| 13 | Reset mechanism verified e2e on 8.3.3 AND 8.3.6 | ✓ VERIFIED | **8.3.3: live flip** (04-03 summary: full tier-1 ladder, expired:true→false, 7199s). **8.3.6: live flip** (addendum Gate 1: fresh rig, trial expired naturally to 0s/expired:true → `trial_reset_tier1_live ... ok` with the gate's REQUIRED read-back flip → corroborated by post-test curl `{"trialSecondsLeft":7187,"expired":false}`). Spike-chosen tier-1 mechanism proven on both minor versions — criterion 3's ≥2-version requirement MET. (Tier-0-on-8.3.6 probe remains a non-criterion curiosity — see cross_phase_findings.) |
 | 14 | Banners cross-check rides the same command output | ✓ VERIFIED | `TrialBanners` block in `TrialStatusResult`; Pitfall-7 derivation (`severity=="info" && expireTime>now_ms`); failed fetch degrades to nulls + data warning. Fixtures from BOTH versions' live captures. |
 
 **Criterion 4 — snapshot/restore to repeatable state**
@@ -93,10 +85,10 @@ Goal-backward verification against the phase's 4 success criteria and the 18 mus
 | --- | ----- | ------ | -------- |
 | 15 | `rig snapshot` writes streamed .gwbk + project exports + manifest.json into timestamped dir | ✓ VERIFIED | `rig_snapshot` (actions/rig.rs:767): std-only `yyyyMMdd-HHmmss` stamp (civil_from_days, no chrono), gwbk FIRST via `backup_download`, per-project exports with injective `encode_segment` names, manifest asserted exactly in tests with BOTH exclusion notes verbatim. |
 | 16 | `rig restore --file` (guarded) POSTs, waits RUNNING, warns tokens may be reset | ✓ VERIFIED | `rig_restore` (actions/rig.rs:873): `is_file()`+non-empty pre-checks (exit 2) → octet-stream POST → witnessed RUNNING via shared `commissioned_wait` with `restore_deadline` max-clamped at 300s → `RESTORE_TOKEN_WARNING` inserted FIRST in data. Guard binary-pinned (`rig_restore_refuses_without_yes_before_any_discovery` + `--yes` fallthrough). |
-| 17 | Round-trip e2e gate two-sided (snapshot→mutate→restore→prior state back) | ✓ VERIFIED (gate exists; live run pending) | `e2e_rig.rs::snapshot_mutate_restore_round_trip` — `#[ignore]`, env-gated, quiet-skip; asserts BOTH sides: pre-witness project+resource survive AND post-snapshot marker absent (`!names.contains(post_name)`, `names.contains(pre_name)`). **Live execution deferred** — rig ports (9088/9043) held by another actively-used stack; README runbook documents the precondition + the port-collision hazard. Wire-level behavior is contract-test-pinned (backup_contract.rs). |
+| 17 | Round-trip e2e gate two-sided (snapshot→mutate→restore→prior state back) | ✓ VERIFIED (live round-trip executed) | Gate `e2e_rig.rs::snapshot_mutate_restore_round_trip` asserts BOTH sides (lines 339/343: post-marker absent, pre-witness present). **Live round-trip EXECUTED two-sided via the real CLI verbs** (addendum Gate 2, 8.3.3 rig): `project new` pre-witness → `rig snapshot` (gwbk + 4-project manifest) → `project new` marker → `rig restore --yes` (20.4s, witnessed RUNNING, token-reset warning) → post-restore list: pre-witness SURVIVED, marker GONE. The literal shipped gate binary is blocked at its `resource get` step (line 314) by the **Phase 3** resource-family defect (nonexistent routes — see cross_phase_findings PROJ-05-resource-routes); Phase 4's own paths never touch resource routes, so this is NOT counted against this phase. |
 | 18 | gwbk download streams to disk (never Vec\<u8\>) | ✓ VERIFIED | `download_to_file` (client/mod.rs:458): classify-first, then `bytes_stream()` chunk → `write_all` with `u64` counter — no buffering. `backup_download` rides it (mod.rs:1063) with `Accept: application/octet-stream`; read-back byte-identity pinned. (Upload-direction buffering is documented-by-design for Content-Length; the truth concerns the download.) |
 
-**Score:** 17/18 truths verified; 1 partial (truth 13 — 8.3.6 leg pending human). No failures.
+**Score:** 18/18 truths verified. No partials, no failures.
 
 ### Required Artifacts
 
@@ -135,8 +127,8 @@ Goal-backward verification against the phase's 4 success criteria and the 18 mus
 | ----------- | ------ | -------------- |
 | RIG-01 — up/down/status/reset lifecycle, clean reset | ✓ SATISFIED | None (live-verified per 04-01/04-02 summaries; code+tests re-verified here) |
 | RIG-02 — logs passthrough + trial status | ✓ SATISFIED | None |
-| RIG-03 — trial reset via spike-chosen mechanism, ≥2 minor versions | ✓ SATISFIED (code) / ◐ 1 pending live leg | 8.3.6 reset e2e needs API token provisioning (human) — harness ready |
-| RIG-04 — snapshot/restore repeatable state | ✓ SATISFIED (code) / ◐ live round-trip deferred | e2e gate env-gated; rig ports held by another stack (human scheduling) + token provisioning |
+| RIG-03 — trial reset via spike-chosen mechanism, ≥2 minor versions | ✓ SATISFIED | None — tier-1 live-proven on 8.3.3 (04-03) AND 8.3.6 (addendum Gate 1) |
+| RIG-04 — snapshot/restore repeatable state | ✓ SATISFIED | None — two-sided round-trip executed via real CLI verbs (addendum Gate 2); bonus live observations: trial clock rides the restore; token inside snapshot survives restore (Pitfall 5 not observed) |
 
 ### Anti-Patterns Found
 
@@ -148,17 +140,15 @@ Notable positive discipline observed: status allowlist (no compose-config passth
 
 ### Human Verification Required
 
-Three items (detailed in frontmatter): (1) the 8.3.6 trial-reset live gates — the single remaining leg of criterion 3's ≥2-minor-version requirement, unblocked by provisioning an API token on ign-research per 04-USER-SETUP.md; (2) the live snapshot round-trip gate — requires freeing the rig's ports from the whk-services stack and a provisioned token (README runbook documents the port-collision hazard); (3) optional full user-journey smoke from a bare cwd.
+None remaining. All three items from the initial verification were executed autonomously via docker compose (per the user's confirmation) and evidenced in the addendum below: (1) 8.3.6 trial-reset tier-1 gate — PASS, criterion 3 closed; (2) snapshot→mutate→restore round-trip — two-sided PASS via real CLI verbs (the shipped e2e gate binary itself is blocked by the Phase 3 resource-route defect — cross-phase finding, not a Phase 4 criterion); (3) fresh-shell lifecycle smoke — PASS. 04-USER-SETUP.md is marked superseded; the headless token-provisioning recipe (collection:"core" + security-properties permissions patch) makes future live gates fully automatable.
 
 ### Gaps Summary
 
-No code gaps. Every artifact exists, is substantive (935–2762 lines for the core modules), and is wired end-to-end; all 10 key links verified; all 14 commits present; workspace 371/371 green with clippy `-D warnings` clean; LOCKED invariants held (poll.rs untouched, envelope/taxonomy additive-only, single streaming site, no new dependencies).
+No code gaps. Every artifact exists, is substantive (935–2762 lines for the core modules), and is wired end-to-end; all 10 key links verified; all 14 phase commits present plus the gates commit (bf51760); workspace 371/371 green with clippy `-D warnings` clean; LOCKED invariants held (poll.rs untouched, envelope/taxonomy additive-only, single streaming site, no new dependencies; `crates/` diff across bf51760 verified empty here).
 
-The honest residual is two env-gated live executions, both blocked on human-held access rather than code:
-1. **8.3.6 trial-reset e2e** (truth 13) — the ≥2-minor-version criterion is 1/2 live-closed; the harness is ready and the exact provisioning step is documented in 04-USER-SETUP.md.
-2. **Live snapshot round-trip** (truth 17's live leg) — two-sided gate shipped and contract-pinned at the wire level; executing it needs the rig's ports back and a token.
+The two previously-deferred live legs and the optional smoke have all been executed with verbatim evidence (see addendum) and spot-checked against real artifacts (see Delta Re-Verification section). Criterion 3's ≥2-minor-version requirement is met by the spike-chosen tier-1 mechanism on 8.3.3 + 8.3.6. Criterion 4's round-trip is two-sided-proven at project granularity — the granularity Phase 4's snapshot manifest actually uses.
 
-Both are recorded as `human_verification` items rather than failures: the code paths are proven by unit/wiremock/binary tests, and the live gates quiet-skip by design until the human unlocks them.
+**Cross-phase item (explicit, NOT counted against Phase 4):** the Phase 3 resource client family targets `/data/api/v1/projects/{name}/resources/**` routes absent from real 8.3 gateways — openapi-evidenced by the committed extract (0 matching paths; only `projects/export|import` exist). This blocks the shipped `e2e_rig` gate's resource step and the `ign resource` arm generally. Routed to Phase 5 planning (re-point to export/import, or drop the family, then re-point the e2e witness approach). Details in frontmatter `cross_phase_findings`.
 
 ---
 
@@ -312,3 +302,35 @@ At ~02:45 UTC — during an idle window with no docker commands from this sessio
 Both disposable rigs fully removed (container `ign-gate1-836` removed; compose project `ign-gate2-833` `down -v --remove-orphans` — volume `ign-gate2-833_gateway_data` deleted); temp rig dirs and scratch files removed; no disposable stacks left running. Repo working tree: only `.planning/` doc changes + the openapi extract artifact; `crates/` diff empty.
 
 _Addendum executed: 2026-08-24, autonomous docker-compose run (executor: Claude, GSD live-gate closure)._
+
+---
+
+## Delta Re-Verification (2026-08-24T03:54:18Z)
+
+Independent spot-check of the addendum's claims by the verifier (gates were NOT re-run — rigs are disposed and a re-run needs another ~2h trial expiry; claims were checked against committed artifacts, git, docker state, and source code).
+
+| Claim (addendum) | Check performed | Result |
+| ---------------- | --------------- | ------ |
+| Gates commit bf51760 (docs only, no product code) | `git show bf51760 --stat`; `git diff ab76020..bf51760 --stat -- crates/` | ✅ exactly 3 files: openapi extract (+203,046 lines), 04-USER-SETUP.md (+30/−5), 04-VERIFICATION.md (+314); crates/ diff EMPTY |
+| Openapi extract committed with the resource-route evidence | File present (10.7 MB) in `.planning/phases/03-project-operations/`; enumerated all `/data/api/v1/projects/*` and `*resources*` paths | ✅ `captured_from: http://localhost:19188` (the 8.3.3 rig — matches the executor's filename-misnomer disclosure); **ZERO** `/projects/{name}/resources` paths; projects family = copy/export/find/import/list/names/parents/rename only; the `resources` family that exists is config-resources (`/data/api/v1/resources/{module}/{type}`) — which also explains the gate-matcher false-positive exactly as disclosed |
+| 04-USER-SETUP.md updated to superseded | Read in full | ✅ "Status: superseded (no human action required)", both tasks struck obsolete, points at the addendum recipe |
+| Disposable rigs cleaned up (`ign-gate*` gone) | `docker ps -a` + `docker compose ls -a` | ✅ zero `ign-gate` containers/projects anywhere (not even exited) |
+| Guarded stacks untouched | `docker ps -a`, `docker compose ls` | ✅ cask-agents `running(1)` (cask-postgres Up 14h — predates the run); t3code `running(2)`; whk-mes partially up with rabbitmq exit predating the run (14h) and db restart consistent with the disclosed OrbStack VM restart (~02:45 UTC); whk-services `exited(6)` as before (its ignition-1 re-exit 137 during the OrbStack restart, exactly as disclosed); ign-research untouched (Up, healthy, 18088). The also-disclosed surprise — `ignition-devops-gateway-1` back Up/healthy on 9088/9043 after the OrbStack restart — verified present. No evidence of any session command touching these stacks |
+| Trial flip physics (8.3.6: 0s/expired → 7187s/active) | Arithmetic + harness source | ✅ 7200−7187=13s elapsed-to-curl, consistent with a flip moments before; `trial_reset_tier1_live` exists (trial_contract.rs:640) and my initial verification confirmed the gate refuses to pass without the read-back flip |
+| e2e gate blocked at resource step, not snapshot paths | e2e_rig.rs source | ✅ blocked step is `resource get` (line 314) = Phase 3 client family; the round-trip asserts are project-granular (lines 339/343) and were satisfied by the CLI-verb run |
+| Token recipe (collection:"core" + security-properties patch) | Recipe reviewed against phase-02 research prediction + 04-USER-SETUP.md corroboration | ✅ internally consistent; verified working on both rigs per addendum output; version-agnostic claim supported by two independent rigs |
+
+**Credence note:** the executor demonstrably reports adverse findings faithfully (gate-matcher false-positive, filename misnomer, OrbStack restart, tier-0 skip) — every disclosed negative spot-checked here is accurate, which raises confidence in the reported positives.
+
+### Judgment
+
+- **Criterion 3 → CLOSED.** The ≥2-minor-version requirement asked for the reset mechanism verified e2e on two minor versions. The spike-chosen mechanism (tier-1 native OIDC + required read-back flip, per 04-RESEARCH.md) is now live-proven on 8.3.3 and 8.3.6. Tier-0 on 8.3.6 was never a criterion (it is a fallback probe, and the live-verified state gate makes it unrunnable post-reset).
+- **Criterion 4 → CLOSED.** The round-trip is two-sided-proven via real CLI verbs (snapshot → mutate → restore → witness survives + marker gone) at project granularity — the granularity the snapshot manifest itself uses (gwbk + project exports). The shipped `e2e_rig` binary's failure is attributable line-by-line to the **Phase 3** resource-family defect (nonexistent routes, openapi-evidenced), not to any Phase 4 code path; recorded as cross-phase finding PROJ-05-resource-routes and routed to Phase 5 planning.
+- **Goal → achieved.** A user (or agent) can run the complete rig lifecycle from the CLI on real gateways of both supported minor versions — including trial management and repeatable-state snapshot/restore — as demonstrated end-to-end on live rigs, plus the bonus discovery that the headless token recipe makes the whole fixture self-managed with zero human-held secrets beyond admin creds.
+
+**Final: status `passed`, 18/18 truths.** Open cross-phase item for Phase 5 planning: the Phase 3 resource-route defect (and the two disclosed gate-hygiene nits).
+
+---
+
+_Verified: 2026-08-24T03:54:18Z (delta re-verification; initial: 2026-08-23T03:40:48Z)_
+_Verifier: Claude (gsd-verifier)_
