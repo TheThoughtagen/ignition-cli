@@ -1,0 +1,5198 @@
+{
+ "captured_from": "http://localhost:28088/openapi.json (ign-p5-research, 8.3.3, 2026-08-24)",
+ "total_paths": 575,
+ "paths": {
+  "/data/alarm-notification/api/v1/pipeline": {
+   "get": {
+    "summary": "Alarm Pipeline Detail",
+    "tags": [
+     "pipeline-status"
+    ]
+   },
+   "delete": {
+    "summary": "Cancel Alarming Pipeline",
+    "tags": [
+     "pipeline-status"
+    ]
+   }
+  },
+  "/data/alarm-notification/api/v1/pipelines": {
+   "get": {
+    "summary": "Alarm Pipeline Overview",
+    "tags": [
+     "pipeline-status"
+    ]
+   }
+  },
+  "/data/api/v1/activation/activate/{key}": {
+   "put": {
+    "summary": "Activate License",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/activation/is-online": {
+   "get": {
+    "summary": "Check Gateway Online Status",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/activation/offline/activate": {
+   "post": {
+    "summary": "Submit Offline Activation",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/activation/offline/activate-request/{key}": {
+   "get": {
+    "summary": "Generate Offline Activation Request",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/activation/offline/unactivate/{key}": {
+   "post": {
+    "summary": "Unactivate License (Offline)",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/activation/reactivate/{key}": {
+   "put": {
+    "summary": "Re-Activate License",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/activation/unactivate/{key}": {
+   "post": {
+    "summary": "Unactivate License",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/api-token/generate": {
+   "post": {
+    "summary": "Generate API Token",
+    "tags": [
+     "api-token"
+    ]
+   }
+  },
+  "/data/api/v1/audit/log/{name}": {
+   "get": {
+    "summary": "Audit Log",
+    "tags": [
+     "audit"
+    ]
+   }
+  },
+  "/data/api/v1/audit/remote-profiles/{serverId}": {
+   "get": {
+    "summary": "Get Remote Audit Profile Names",
+    "tags": [
+     "audit"
+    ]
+   }
+  },
+  "/data/api/v1/backup": {
+   "get": {
+    "summary": "Get Gateway Backup",
+    "tags": [
+     "gateway-backups"
+    ]
+   },
+   "post": {
+    "summary": "Restore Gateway Backup",
+    "tags": [
+     "gateway-backups"
+    ]
+   }
+  },
+  "/data/api/v1/designer/{id}": {
+   "get": {
+    "summary": "Designer Session Details",
+    "tags": [
+     "designer-sessions"
+    ]
+   },
+   "delete": {
+    "summary": "Prune Designer Session",
+    "tags": [
+     "designer-sessions"
+    ]
+   }
+  },
+  "/data/api/v1/designers": {
+   "get": {
+    "summary": "Designer Sessions",
+    "tags": [
+     "designer-sessions"
+    ]
+   }
+  },
+  "/data/api/v1/diagnostics/bundle/download": {
+   "get": {
+    "summary": "Download Diagnostics Bundle",
+    "tags": [
+     "thread-diagnostics"
+    ]
+   }
+  },
+  "/data/api/v1/diagnostics/bundle/generate": {
+   "post": {
+    "summary": "Diagnostics Generate Bundle",
+    "tags": [
+     "thread-diagnostics"
+    ]
+   }
+  },
+  "/data/api/v1/diagnostics/bundle/status": {
+   "get": {
+    "summary": "Diagnostics Bundle Status",
+    "tags": [
+     "thread-diagnostics"
+    ]
+   }
+  },
+  "/data/api/v1/diagnostics/threads/deadlocks": {
+   "get": {
+    "summary": "Deadlocked Threads",
+    "tags": [
+     "thread-diagnostics"
+    ]
+   }
+  },
+  "/data/api/v1/diagnostics/threads/dump/formatted": {
+   "get": {
+    "summary": "Thread Dump (Formatted)",
+    "tags": [
+     "thread-diagnostics"
+    ]
+   }
+  },
+  "/data/api/v1/diagnostics/threads/threaddump": {
+   "get": {
+    "summary": "Thread Dump",
+    "tags": [
+     "thread-diagnostics"
+    ]
+   }
+  },
+  "/data/api/v1/encryption/encrypt": {
+   "post": {
+    "summary": "Encrypt arbitrary bytes",
+    "tags": [
+     "encryption"
+    ]
+   }
+  },
+  "/data/api/v1/entity/browse": {
+   "get": {
+    "summary": "Browse Entities",
+    "tags": [
+     "entity"
+    ]
+   }
+  },
+  "/data/api/v1/entity/enabled": {
+   "post": {
+    "summary": "Set Entity Enabled",
+    "tags": [
+     "entity"
+    ]
+   }
+  },
+  "/data/api/v1/entity/section/{section}": {
+   "get": {
+    "summary": "Entities by Section",
+    "tags": [
+     "entity"
+    ]
+   }
+  },
+  "/data/api/v1/executors/private": {
+   "get": {
+    "summary": "Private",
+    "tags": [
+     "executors"
+    ]
+   }
+  },
+  "/data/api/v1/executors/shared": {
+   "get": {
+    "summary": "Shared",
+    "tags": [
+     "executors"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-info": {
+   "get": {
+    "summary": "Gateway Info",
+    "tags": [
+     "gateway-info"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network-incoming/reset/{resourceName}": {
+   "put": {
+    "summary": "Reset Incoming Connection",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network-incoming/toggleApproval/{remoteId}/{approve}": {
+   "put": {
+    "summary": "Toggle Approval",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network-outgoing/reset/{resourceName}": {
+   "put": {
+    "summary": "Reset Outgoing Connection",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/cancelQueueTasks/{serverId}/{queueId}": {
+   "delete": {
+    "summary": "Cancel Task Queue",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/crawler": {
+   "get": {
+    "summary": "Gateway Network Crawler",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/diagnostics/getRemoteServerIds": {
+   "get": {
+    "summary": "Get Remote Server Names",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/diagnostics/testConnectionToServer/{serverId}": {
+   "post": {
+    "summary": "Diagnostic Ping",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/gatewayDetail/{serverId}": {
+   "get": {
+    "summary": "Gateway Detail",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/gateways": {
+   "get": {
+    "summary": "Gateways",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/livediagram": {
+   "get": {
+    "summary": "Gateway Network Live Diagram",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/pauseQueue/{serverId}/{queueId}": {
+   "put": {
+    "summary": "Pause Task Queue",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/remote-tag-providers/{serverId}": {
+   "get": {
+    "summary": "Remote Tag Providers",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/gateway-network/resumeQueue/{serverId}/{queueId}": {
+   "put": {
+    "summary": "Resume Task Queue",
+    "tags": [
+     "gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/homepage-notes": {
+   "get": {
+    "summary": "Get Homepage Notes",
+    "tags": [
+     "config-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/launcher/download/{type}/{os}/{arch}": {
+   "get": {
+    "summary": "Download Launcher",
+    "tags": [
+     "launcher"
+    ]
+   }
+  },
+  "/data/api/v1/launcher/info/{type}/{os}/{arch}": {
+   "get": {
+    "summary": "Retrieve Launcher information",
+    "tags": [
+     "launcher"
+    ]
+   }
+  },
+  "/data/api/v1/launcher/list": {
+   "get": {
+    "summary": "List all launchers",
+    "tags": [
+     "launcher"
+    ]
+   }
+  },
+  "/data/api/v1/leased-activation/activate": {
+   "post": {
+    "summary": "Leased Activation",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/leased-activation/test-leased-license-server": {
+   "get": {
+    "summary": "Test Leased License Service",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/leased-activation/unactivate/{key}": {
+   "post": {
+    "summary": "Leased Unactivation",
+    "tags": [
+     "license-activation"
+    ]
+   }
+  },
+  "/data/api/v1/licenses": {
+   "get": {
+    "summary": "Licensing Information",
+    "tags": [
+     "license-status"
+    ]
+   }
+  },
+  "/data/api/v1/locales": {
+   "get": {
+    "summary": "Get All Available Locales",
+    "tags": [
+     "overview"
+    ]
+   }
+  },
+  "/data/api/v1/logs": {
+   "get": {
+    "summary": "Logs",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/download": {
+   "get": {
+    "summary": "Download Logs",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/levelreset": {
+   "post": {
+    "summary": "Reset Logger Levels",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/loggers": {
+   "get": {
+    "summary": "Loggers",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/loggers/{loggerName}": {
+   "post": {
+    "summary": "Set Logger Level",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/monitoring-session": {
+   "post": {
+    "summary": "Monitoring Session Logs",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/properties": {
+   "post": {
+    "summary": "Modify Logger Context Properties (Bulk)",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/properties/applied": {
+   "get": {
+    "summary": "Applied Logger Context Properties",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/properties/registered": {
+   "get": {
+    "summary": "Registered Logger Context Properties",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/logs/properties/{key}": {
+   "post": {
+    "summary": "Add Logger Context Property",
+    "tags": [
+     "logging"
+    ]
+   },
+   "delete": {
+    "summary": "Remove Logger Context Property",
+    "tags": [
+     "logging"
+    ]
+   }
+  },
+  "/data/api/v1/managed-tag-provider": {
+   "put": {
+    "summary": "Managed Tag Provider",
+    "tags": [
+     "managed-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/mode": {
+   "get": {
+    "summary": "Deployment Modes",
+    "tags": [
+     "config-management"
+    ]
+   },
+   "post": {
+    "summary": "Create Deployment Mode",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/mode/{name}": {
+   "put": {
+    "summary": "Update Deployment Mode",
+    "tags": [
+     "config-management"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Deployment Mode",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/modules/certificate": {
+   "get": {
+    "summary": "View Certificate Information",
+    "tags": [
+     "modules"
+    ]
+   },
+   "post": {
+    "summary": "Accept Certificate",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/eula": {
+   "get": {
+    "summary": "View EULA",
+    "tags": [
+     "modules"
+    ]
+   },
+   "post": {
+    "summary": "Accept EULA",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/healthy": {
+   "get": {
+    "summary": "All Healthy Modules",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/install": {
+   "post": {
+    "summary": "Install Module",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/quarantined": {
+   "get": {
+    "summary": "Quarantined Modules",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/toggle-state": {
+   "put": {
+    "summary": "Toggle Module State",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/uninstall": {
+   "delete": {
+    "summary": "Uninstall Module[s]",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/modules/upload": {
+   "post": {
+    "summary": "Upload Module",
+    "tags": [
+     "modules"
+    ]
+   }
+  },
+  "/data/api/v1/overview": {
+   "get": {
+    "summary": "Gateway Overview",
+    "tags": [
+     "overview"
+    ]
+   }
+  },
+  "/data/api/v1/overview/connections": {
+   "get": {
+    "summary": "Connections Overview",
+    "tags": [
+     "overview"
+    ]
+   }
+  },
+  "/data/api/v1/overview/gan": {
+   "get": {
+    "summary": "Gateway Network",
+    "tags": [
+     "overview"
+    ]
+   }
+  },
+  "/data/api/v1/overview/name": {
+   "get": {
+    "summary": "Gateway Name",
+    "tags": [
+     "overview"
+    ]
+   }
+  },
+  "/data/api/v1/overview/problems": {
+   "get": {
+    "summary": "Problems Overview",
+    "tags": [
+     "overview"
+    ]
+   }
+  },
+  "/data/api/v1/projects": {
+   "post": {
+    "summary": "Create Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/copy": {
+   "post": {
+    "summary": "Copy Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/export/{name}": {
+   "get": {
+    "summary": "Export Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/find/{name}": {
+   "get": {
+    "summary": "Project Details",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/import/{name}": {
+   "post": {
+    "summary": "Import Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/list": {
+   "get": {
+    "summary": "List All Projects",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/names": {
+   "get": {
+    "summary": "List All Project Names",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/parents": {
+   "get": {
+    "summary": "List All Valid Parent Projects",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/parents/{name}": {
+   "get": {
+    "summary": "List Valid Parent Project Names For Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/rename/{name}": {
+   "post": {
+    "summary": "Rename Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/projects/{name}": {
+   "put": {
+    "summary": "Modify Project",
+    "tags": [
+     "projects"
+    ]
+   },
+   "delete": {
+    "summary": "Delete an Ignition Project",
+    "tags": [
+     "projects"
+    ]
+   }
+  },
+  "/data/api/v1/redundancy": {
+   "get": {
+    "summary": "Status",
+    "tags": [
+     "redundancy"
+    ]
+   }
+  },
+  "/data/api/v1/redundancy/config": {
+   "get": {
+    "summary": "Get Redundancy Config",
+    "tags": [
+     "redundancy"
+    ]
+   },
+   "put": {
+    "summary": "Update Redundancy Config",
+    "tags": [
+     "redundancy"
+    ]
+   }
+  },
+  "/data/api/v1/redundancy/events": {
+   "get": {
+    "summary": "Log Events",
+    "tags": [
+     "redundancy"
+    ]
+   }
+  },
+  "/data/api/v1/redundancy/gwaction/failover": {
+   "post": {
+    "summary": "Force Failover",
+    "tags": [
+     "redundancy"
+    ]
+   }
+  },
+  "/data/api/v1/redundancy/gwaction/resync": {
+   "post": {
+    "summary": "Re-Sync Configuration",
+    "tags": [
+     "redundancy"
+    ]
+   }
+  },
+  "/data/api/v1/redundancy/providers": {
+   "get": {
+    "summary": "Redundancy Provider Metrics",
+    "tags": [
+     "redundancy"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.alarm-notification/alarm-notification-profile": {
+   "put": {
+    "summary": "Modify Alarm Notification Profiles",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   },
+   "post": {
+    "summary": "Create Alarm Notification Profiles",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.alarm-notification/alarm-notification-profile/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Alarm Notification Profiles",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/agent-group": {
+   "put": {
+    "summary": "Modify Agent Groups",
+    "tags": [
+     "agent-group"
+    ]
+   },
+   "post": {
+    "summary": "Create Agent Groups",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/agent-group/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Agent Groups",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/agent-management": {
+   "put": {
+    "summary": "Modify Agent Management",
+    "tags": [
+     "agent-management"
+    ]
+   },
+   "post": {
+    "summary": "Create Agent Management",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/agent-management/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Agent Management",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks": {
+   "put": {
+    "summary": "Modify EAM Agent Task",
+    "tags": [
+     "eam-tasks"
+    ]
+   },
+   "post": {
+    "summary": "Create EAM Agent Task",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete EAM Agent Task",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/event-thresholds": {
+   "put": {
+    "summary": "Modify Event Thresholds",
+    "tags": [
+     "event-thresholds"
+    ]
+   },
+   "post": {
+    "summary": "Create Event Thresholds",
+    "tags": [
+     "event-thresholds"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/event-thresholds/{signature}": {
+   "delete": {
+    "summary": "Delete Event Thresholds",
+    "tags": [
+     "event-thresholds"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/hw-license-management": {
+   "put": {
+    "summary": "Modify Hardware License",
+    "tags": [
+     "license-management"
+    ]
+   },
+   "post": {
+    "summary": "Create Hardware License",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/hw-license-management/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Hardware License",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/leased-license-management": {
+   "put": {
+    "summary": "Modify Leased License",
+    "tags": [
+     "license-management"
+    ]
+   },
+   "post": {
+    "summary": "Create Leased License",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/leased-license-management/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Leased License",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/module-certificates": {
+   "put": {
+    "summary": "Modify Module Certificate",
+    "tags": [
+     "module-certificate"
+    ]
+   },
+   "post": {
+    "summary": "Create Module Certificate",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/module-certificates/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Module Certificate",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/module-eulas": {
+   "put": {
+    "summary": "Modify Module EULA",
+    "tags": [
+     "module-eula"
+    ]
+   },
+   "post": {
+    "summary": "Create Module EULA",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/module-eulas/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Module EULA",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/module-settings": {
+   "put": {
+    "summary": "Modify Module Settings",
+    "tags": [
+     "module-settings"
+    ]
+   },
+   "post": {
+    "summary": "Create Module Settings",
+    "tags": [
+     "module-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/module-settings/{signature}": {
+   "delete": {
+    "summary": "Delete Module Settings",
+    "tags": [
+     "module-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/remote-upgrade": {
+   "put": {
+    "summary": "Modify Remote Upgrade",
+    "tags": [
+     "remote-upgrade"
+    ]
+   },
+   "post": {
+    "summary": "Create Remote Upgrade",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.eam/remote-upgrade/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Remote Upgrade",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.historian/historian-provider": {
+   "put": {
+    "summary": "Modify Historian",
+    "tags": [
+     "historian-config"
+    ]
+   },
+   "post": {
+    "summary": "Create Historian",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.historian/historian-provider/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Historian",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig": {
+   "put": {
+    "summary": "Modify Local Devices",
+    "tags": [
+     "local-devices"
+    ]
+   },
+   "post": {
+    "summary": "Create Local Devices",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Local Devices",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua/access-control": {
+   "put": {
+    "summary": "Modify OPC UA Access Control Config",
+    "tags": [
+     "access-control"
+    ]
+   },
+   "post": {
+    "summary": "Create OPC UA Access Control Config",
+    "tags": [
+     "access-control"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua/access-control/{signature}": {
+   "delete": {
+    "summary": "Delete OPC UA Access Control Config",
+    "tags": [
+     "access-control"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua/device": {
+   "put": {
+    "summary": "Modify Devices",
+    "tags": [
+     "device"
+    ]
+   },
+   "post": {
+    "summary": "Create Devices",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua/device/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Devices",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua/server-config": {
+   "put": {
+    "summary": "Modify OPC UA Server Config",
+    "tags": [
+     "server"
+    ]
+   },
+   "post": {
+    "summary": "Create OPC UA Server Config",
+    "tags": [
+     "server"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.opcua/server-config/{signature}": {
+   "delete": {
+    "summary": "Delete OPC UA Server Config",
+    "tags": [
+     "server"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.perspective/fonts": {
+   "put": {
+    "summary": "Modify Fonts",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   },
+   "post": {
+    "summary": "Create Fonts",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.perspective/fonts/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Fonts",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.perspective/icons": {
+   "put": {
+    "summary": "Modify Icons",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   },
+   "post": {
+    "summary": "Create Icons",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.perspective/icons/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Icons",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.perspective/themes": {
+   "put": {
+    "summary": "Modify Themes",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   },
+   "post": {
+    "summary": "Create Themes",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.perspective/themes/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Themes",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.sfc/chart-settings": {
+   "put": {
+    "summary": "Modify SFC Settings",
+    "tags": [
+     "sfc-config"
+    ]
+   },
+   "post": {
+    "summary": "Create SFC Settings",
+    "tags": [
+     "sfc-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/com.inductiveautomation.sfc/chart-settings/{signature}": {
+   "delete": {
+    "summary": "Delete SFC Settings",
+    "tags": [
+     "sfc-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/copy": {
+   "post": {
+    "summary": "Copy a Resource",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.opcua/device/{name}": {
+   "put": {
+    "summary": "Update Multiple Devices Data Files",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.opcua/device/{name}/{filename}": {
+   "get": {
+    "summary": "Get Devices Data File",
+    "tags": [
+     "device"
+    ]
+   },
+   "put": {
+    "summary": "Update Devices Data File",
+    "tags": [
+     "device"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Devices Data File",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.perspective/fonts/{name}": {
+   "put": {
+    "summary": "Update Multiple Fonts Data Files",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.perspective/fonts/{name}/{filename}": {
+   "get": {
+    "summary": "Get Fonts Data File",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   },
+   "put": {
+    "summary": "Update Fonts Data File",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Fonts Data File",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.perspective/icons/{name}": {
+   "put": {
+    "summary": "Update Multiple Icons Data Files",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.perspective/icons/{name}/{filename}": {
+   "get": {
+    "summary": "Get Icons Data File",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   },
+   "put": {
+    "summary": "Update Icons Data File",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Icons Data File",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.perspective/themes/{name}": {
+   "put": {
+    "summary": "Update Multiple Themes Data Files",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/com.inductiveautomation.perspective/themes/{name}/{filename}": {
+   "get": {
+    "summary": "Get Themes Data File",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   },
+   "put": {
+    "summary": "Update Themes Data File",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Themes Data File",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/ignition/database-driver/{name}": {
+   "put": {
+    "summary": "Update Multiple JDBC Driver Data Files",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/ignition/database-driver/{name}/{filename}": {
+   "get": {
+    "summary": "Get JDBC Driver Data File",
+    "tags": [
+     "config-databases"
+    ]
+   },
+   "put": {
+    "summary": "Update JDBC Driver Data File",
+    "tags": [
+     "config-databases"
+    ]
+   },
+   "delete": {
+    "summary": "Delete JDBC Driver Data File",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/ignition/service-connector/{name}": {
+   "put": {
+    "summary": "Update Multiple Service Connectors Data Files",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/ignition/service-connector/{name}/{filename}": {
+   "get": {
+    "summary": "Get Service Connectors Data File",
+    "tags": [
+     "service-connectors"
+    ]
+   },
+   "put": {
+    "summary": "Update Service Connectors Data File",
+    "tags": [
+     "service-connectors"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Service Connectors Data File",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/ignition/translations": {
+   "put": {
+    "summary": "Update Multiple Translations Data Files",
+    "tags": [
+     "config-translations"
+    ]
+   }
+  },
+  "/data/api/v1/resources/datafile/ignition/translations/{filename}": {
+   "get": {
+    "summary": "Get Translations Data File",
+    "tags": [
+     "config-translations"
+    ]
+   },
+   "put": {
+    "summary": "Update Translations Data File",
+    "tags": [
+     "config-translations"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Translations Data File",
+    "tags": [
+     "config-translations"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.alarm-notification/alarm-notification-profile": {
+   "post": {
+    "summary": "Delete Alarm Notification Profiles (multiple)",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/agent-group": {
+   "post": {
+    "summary": "Delete Agent Groups (multiple)",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/agent-management": {
+   "post": {
+    "summary": "Delete Agent Management (multiple)",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/eam-tasks": {
+   "post": {
+    "summary": "Delete EAM Agent Task (multiple)",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/hw-license-management": {
+   "post": {
+    "summary": "Delete Hardware License (multiple)",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/leased-license-management": {
+   "post": {
+    "summary": "Delete Leased License (multiple)",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/module-certificates": {
+   "post": {
+    "summary": "Delete Module Certificate (multiple)",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/module-eulas": {
+   "post": {
+    "summary": "Delete Module EULA (multiple)",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.eam/remote-upgrade": {
+   "post": {
+    "summary": "Delete Remote Upgrade (multiple)",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.historian/historian-provider": {
+   "post": {
+    "summary": "Delete Historian (multiple)",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig": {
+   "post": {
+    "summary": "Delete Local Devices (multiple)",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.opcua/device": {
+   "post": {
+    "summary": "Delete Devices (multiple)",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.perspective/fonts": {
+   "post": {
+    "summary": "Delete Fonts (multiple)",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.perspective/icons": {
+   "post": {
+    "summary": "Delete Icons (multiple)",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/com.inductiveautomation.perspective/themes": {
+   "post": {
+    "summary": "Delete Themes (multiple)",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/alarm-journal": {
+   "post": {
+    "summary": "Delete Alarm Journal Settings (multiple)",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/api-token": {
+   "post": {
+    "summary": "Delete API Token (multiple)",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/audit-profile": {
+   "post": {
+    "summary": "Delete Audit Profiles (multiple)",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/database-connection": {
+   "post": {
+    "summary": "Delete Database Connection (multiple)",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/database-driver": {
+   "post": {
+    "summary": "Delete JDBC Driver (multiple)",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/database-translator": {
+   "post": {
+    "summary": "Delete Database Translator (multiple)",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/email-profile": {
+   "post": {
+    "summary": "Delete Email Profile Settings (multiple)",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/gateway-network-incoming": {
+   "post": {
+    "summary": "Delete Incoming Connection Settings (multiple)",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/gateway-network-outgoing": {
+   "post": {
+    "summary": "Delete Outgoing Connection Settings (multiple)",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/holiday": {
+   "post": {
+    "summary": "Delete Holiday (multiple)",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/identity-provider": {
+   "post": {
+    "summary": "Delete Identity Provider (multiple)",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/keyboard_layout": {
+   "post": {
+    "summary": "Delete Keyboard Layouts (multiple)",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/metrics-dashboard": {
+   "post": {
+    "summary": "Delete Metrics Dashboard (multiple)",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/oauth2-client": {
+   "post": {
+    "summary": "Delete OAuth2 Client (multiple)",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/opc-connection": {
+   "post": {
+    "summary": "Delete OPC Connections (multiple)",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/roster-config": {
+   "post": {
+    "summary": "Delete Rosters (multiple)",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/schedule": {
+   "post": {
+    "summary": "Delete Schedule (multiple)",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/secret-provider": {
+   "post": {
+    "summary": "Delete Secret Provider (multiple)",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/security-zone": {
+   "post": {
+    "summary": "Delete Security Zones (multiple)",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/service-connector": {
+   "post": {
+    "summary": "Delete Service Connectors (multiple)",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/store-and-forward-engine": {
+   "post": {
+    "summary": "Delete Store and Forward Engine (multiple)",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/tag-provider": {
+   "post": {
+    "summary": "Delete Tag Providers (multiple)",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/delete/ignition/user-source": {
+   "post": {
+    "summary": "Delete User Sources (multiple)",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.alarm-notification/alarm-notification-profile/{name}": {
+   "get": {
+    "summary": "Get Alarm Notification Profiles Config",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/agent-group/{name}": {
+   "get": {
+    "summary": "Get Agent Groups Config",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/agent-management/{name}": {
+   "get": {
+    "summary": "Get Agent Management Config",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/{name}": {
+   "get": {
+    "summary": "Get EAM Agent Task Config",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/hw-license-management/{name}": {
+   "get": {
+    "summary": "Get Hardware License Config",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/leased-license-management/{name}": {
+   "get": {
+    "summary": "Get Leased License Config",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/module-certificates/{name}": {
+   "get": {
+    "summary": "Get Module Certificate Config",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/module-eulas/{name}": {
+   "get": {
+    "summary": "Get Module EULA Config",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.eam/remote-upgrade/{name}": {
+   "get": {
+    "summary": "Get Remote Upgrade Config",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.historian/historian-provider/{name}": {
+   "get": {
+    "summary": "Get Historian Config",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig/{name}": {
+   "get": {
+    "summary": "Get Local Devices Config",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.opcua/device/{name}": {
+   "get": {
+    "summary": "Get Devices Config",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.perspective/fonts/{name}": {
+   "get": {
+    "summary": "Get Fonts Config",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.perspective/icons/{name}": {
+   "get": {
+    "summary": "Get Icons Config",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/com.inductiveautomation.perspective/themes/{name}": {
+   "get": {
+    "summary": "Get Themes Config",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/alarm-journal/{name}": {
+   "get": {
+    "summary": "Get Alarm Journal Settings Config",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/api-token/{name}": {
+   "get": {
+    "summary": "Get API Token Config",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/audit-profile/{name}": {
+   "get": {
+    "summary": "Get Audit Profiles Config",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/database-connection/{name}": {
+   "get": {
+    "summary": "Get Database Connection Config",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/database-driver/{name}": {
+   "get": {
+    "summary": "Get JDBC Driver Config",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/database-translator/{name}": {
+   "get": {
+    "summary": "Get Database Translator Config",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/email-profile/{name}": {
+   "get": {
+    "summary": "Get Email Profile Settings Config",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/gateway-network-incoming/{name}": {
+   "get": {
+    "summary": "Get Incoming Connection Settings Config",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/gateway-network-outgoing/{name}": {
+   "get": {
+    "summary": "Get Outgoing Connection Settings Config",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/holiday/{name}": {
+   "get": {
+    "summary": "Get Holiday Config",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/identity-provider/{name}": {
+   "get": {
+    "summary": "Get Identity Provider Config",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/keyboard_layout/{name}": {
+   "get": {
+    "summary": "Get Keyboard Layouts Config",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/metrics-dashboard/{name}": {
+   "get": {
+    "summary": "Get Metrics Dashboard Config",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/oauth2-client/{name}": {
+   "get": {
+    "summary": "Get OAuth2 Client Config",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/opc-connection/{name}": {
+   "get": {
+    "summary": "Get OPC Connections Config",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/roster-config/{name}": {
+   "get": {
+    "summary": "Get Rosters Config",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/schedule/{name}": {
+   "get": {
+    "summary": "Get Schedule Config",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/secret-provider/{name}": {
+   "get": {
+    "summary": "Get Secret Provider Config",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/security-zone/{name}": {
+   "get": {
+    "summary": "Get Security Zones Config",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/service-connector/{name}": {
+   "get": {
+    "summary": "Get Service Connectors Config",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/store-and-forward-engine/{name}": {
+   "get": {
+    "summary": "Get Store and Forward Engine Config",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/tag-provider/{name}": {
+   "get": {
+    "summary": "Get Tag Providers Config",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/find/ignition/user-source/{name}": {
+   "get": {
+    "summary": "Get User Sources Config",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/alarm-journal": {
+   "put": {
+    "summary": "Modify Alarm Journal Settings",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   },
+   "post": {
+    "summary": "Create Alarm Journal Settings",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/alarm-journal/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Alarm Journal Settings",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/api-token": {
+   "put": {
+    "summary": "Modify API Token",
+    "tags": [
+     "config-api-token"
+    ]
+   },
+   "post": {
+    "summary": "Create API Token",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/api-token/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete API Token",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/audit-profile": {
+   "put": {
+    "summary": "Modify Audit Profiles",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   },
+   "post": {
+    "summary": "Create Audit Profiles",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/audit-profile/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Audit Profiles",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/cobranding": {
+   "put": {
+    "summary": "Modify Brand Customization",
+    "tags": [
+     "config-perspective-branding"
+    ]
+   },
+   "post": {
+    "summary": "Create Brand Customization",
+    "tags": [
+     "config-perspective-branding"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/cobranding/{signature}": {
+   "delete": {
+    "summary": "Delete Brand Customization",
+    "tags": [
+     "config-perspective-branding"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/database-connection": {
+   "put": {
+    "summary": "Modify Database Connection",
+    "tags": [
+     "config-databases"
+    ]
+   },
+   "post": {
+    "summary": "Create Database Connection",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/database-connection/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Database Connection",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/database-driver": {
+   "put": {
+    "summary": "Modify JDBC Driver",
+    "tags": [
+     "config-databases"
+    ]
+   },
+   "post": {
+    "summary": "Create JDBC Driver",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/database-driver/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete JDBC Driver",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/database-translator": {
+   "put": {
+    "summary": "Modify Database Translator",
+    "tags": [
+     "config-databases"
+    ]
+   },
+   "post": {
+    "summary": "Create Database Translator",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/database-translator/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Database Translator",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/edge-system-properties": {
+   "put": {
+    "summary": "Modify Edge System Properties",
+    "tags": [
+     "config-edge-system-properties"
+    ]
+   },
+   "post": {
+    "summary": "Create Edge System Properties",
+    "tags": [
+     "config-edge-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/edge-system-properties/{signature}": {
+   "delete": {
+    "summary": "Delete Edge System Properties",
+    "tags": [
+     "config-edge-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/email-profile": {
+   "put": {
+    "summary": "Modify Email Profile Settings",
+    "tags": [
+     "config-email-profile"
+    ]
+   },
+   "post": {
+    "summary": "Create Email Profile Settings",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/email-profile/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Email Profile Settings",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-incoming/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Incoming Connection Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-outgoing": {
+   "put": {
+    "summary": "Modify Outgoing Connection Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   },
+   "post": {
+    "summary": "Create Outgoing Connection Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-outgoing/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Outgoing Connection Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-proxy-rules": {
+   "put": {
+    "summary": "Modify Proxy Rules",
+    "tags": [
+     "config-gateway-network"
+    ]
+   },
+   "post": {
+    "summary": "Create Proxy Rules",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-proxy-rules/{signature}": {
+   "delete": {
+    "summary": "Delete Proxy Rules",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-queue-settings": {
+   "put": {
+    "summary": "Modify Queue Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   },
+   "post": {
+    "summary": "Create Queue Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-queue-settings/{signature}": {
+   "delete": {
+    "summary": "Delete Queue Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-settings": {
+   "put": {
+    "summary": "Modify General Gateway Network Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   },
+   "post": {
+    "summary": "Create General Gateway Network Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/gateway-network-settings/{signature}": {
+   "delete": {
+    "summary": "Delete General Gateway Network Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/general-alarm-settings": {
+   "put": {
+    "summary": "Modify General Alarm Settings",
+    "tags": [
+     "general-alarm-settings"
+    ]
+   },
+   "post": {
+    "summary": "Create General Alarm Settings",
+    "tags": [
+     "general-alarm-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/general-alarm-settings/{signature}": {
+   "delete": {
+    "summary": "Delete General Alarm Settings",
+    "tags": [
+     "general-alarm-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/holiday": {
+   "put": {
+    "summary": "Modify Holiday",
+    "tags": [
+     "config-alarm"
+    ]
+   },
+   "post": {
+    "summary": "Create Holiday",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/holiday/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Holiday",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/identity-provider": {
+   "put": {
+    "summary": "Modify Identity Provider",
+    "tags": [
+     "config-identity-provider"
+    ]
+   },
+   "post": {
+    "summary": "Create Identity Provider",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/identity-provider/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Identity Provider",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/keyboard_layout": {
+   "put": {
+    "summary": "Modify Keyboard Layouts",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   },
+   "post": {
+    "summary": "Create Keyboard Layouts",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/keyboard_layout/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Keyboard Layouts",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/local-system-properties": {
+   "put": {
+    "summary": "Modify Local System Properties",
+    "tags": [
+     "config-local-system-properties"
+    ]
+   },
+   "post": {
+    "summary": "Create Local System Properties",
+    "tags": [
+     "config-local-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/local-system-properties/{signature}": {
+   "delete": {
+    "summary": "Delete Local System Properties",
+    "tags": [
+     "config-local-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/metrics-dashboard": {
+   "put": {
+    "summary": "Modify Metrics Dashboard",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   },
+   "post": {
+    "summary": "Create Metrics Dashboard",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/metrics-dashboard/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Metrics Dashboard",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/oauth2-client": {
+   "put": {
+    "summary": "Modify OAuth2 Client",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   },
+   "post": {
+    "summary": "Create OAuth2 Client",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/oauth2-client/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete OAuth2 Client",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/opc-connection": {
+   "put": {
+    "summary": "Modify OPC Connections",
+    "tags": [
+     "opc-connection"
+    ]
+   },
+   "post": {
+    "summary": "Create OPC Connections",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/opc-connection/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete OPC Connections",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/quickstart": {
+   "put": {
+    "summary": "Modify Quick Start Configuration",
+    "tags": [
+     "quickstart"
+    ]
+   },
+   "post": {
+    "summary": "Create Quick Start Configuration",
+    "tags": [
+     "quickstart"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/quickstart/{signature}": {
+   "delete": {
+    "summary": "Delete Quick Start Configuration",
+    "tags": [
+     "quickstart"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/roster-config": {
+   "put": {
+    "summary": "Modify Rosters",
+    "tags": [
+     "roster-config"
+    ]
+   },
+   "post": {
+    "summary": "Create Rosters",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/roster-config/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Rosters",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/schedule": {
+   "put": {
+    "summary": "Modify Schedule",
+    "tags": [
+     "config-alarm"
+    ]
+   },
+   "post": {
+    "summary": "Create Schedule",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/schedule/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Schedule",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/secret-provider": {
+   "put": {
+    "summary": "Modify Secret Provider",
+    "tags": [
+     "config-secret-provider"
+    ]
+   },
+   "post": {
+    "summary": "Create Secret Provider",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/secret-provider/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Secret Provider",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/security-levels": {
+   "put": {
+    "summary": "Modify Security Levels",
+    "tags": [
+     "config-security-levels"
+    ]
+   },
+   "post": {
+    "summary": "Create Security Levels",
+    "tags": [
+     "config-security-levels"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/security-levels/{signature}": {
+   "delete": {
+    "summary": "Delete Security Levels",
+    "tags": [
+     "config-security-levels"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/security-properties": {
+   "put": {
+    "summary": "Modify Security Properties",
+    "tags": [
+     "config-security-properties"
+    ]
+   },
+   "post": {
+    "summary": "Create Security Properties",
+    "tags": [
+     "config-security-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/security-properties/{signature}": {
+   "delete": {
+    "summary": "Delete Security Properties",
+    "tags": [
+     "config-security-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/security-zone": {
+   "put": {
+    "summary": "Modify Security Zones",
+    "tags": [
+     "config-security-zone"
+    ]
+   },
+   "post": {
+    "summary": "Create Security Zones",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/security-zone/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Security Zones",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/service-connector": {
+   "put": {
+    "summary": "Modify Service Connectors",
+    "tags": [
+     "service-connectors"
+    ]
+   },
+   "post": {
+    "summary": "Create Service Connectors",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/service-connector/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Service Connectors",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/store-and-forward-engine": {
+   "put": {
+    "summary": "Modify Store and Forward Engine",
+    "tags": [
+     "config-store-forward"
+    ]
+   },
+   "post": {
+    "summary": "Create Store and Forward Engine",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/store-and-forward-engine/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Store and Forward Engine",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/system-properties": {
+   "put": {
+    "summary": "Modify System Properties",
+    "tags": [
+     "config-system-properties"
+    ]
+   },
+   "post": {
+    "summary": "Create System Properties",
+    "tags": [
+     "config-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/system-properties/{signature}": {
+   "delete": {
+    "summary": "Delete System Properties",
+    "tags": [
+     "config-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/tag-provider": {
+   "put": {
+    "summary": "Modify Tag Providers",
+    "tags": [
+     "config-tag-provider"
+    ]
+   },
+   "post": {
+    "summary": "Create Tag Providers",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/tag-provider/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete Tag Providers",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/translations": {
+   "put": {
+    "summary": "Modify Translations",
+    "tags": [
+     "config-translations"
+    ]
+   },
+   "post": {
+    "summary": "Create Translations",
+    "tags": [
+     "config-translations"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/translations/{signature}": {
+   "delete": {
+    "summary": "Delete Translations",
+    "tags": [
+     "config-translations"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/user-source": {
+   "put": {
+    "summary": "Modify User Sources",
+    "tags": [
+     "config-user-source"
+    ]
+   },
+   "post": {
+    "summary": "Create User Sources",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/ignition/user-source/{name}/{signature}": {
+   "delete": {
+    "summary": "Delete User Sources",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.alarm-notification/alarm-notification-profile": {
+   "get": {
+    "summary": "List Alarm Notification Profiles Resources",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/agent-group": {
+   "get": {
+    "summary": "List Agent Groups Resources",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/agent-management": {
+   "get": {
+    "summary": "List Agent Management Resources",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/eam-tasks": {
+   "get": {
+    "summary": "List EAM Agent Task Resources",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/hw-license-management": {
+   "get": {
+    "summary": "List Hardware License Resources",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/leased-license-management": {
+   "get": {
+    "summary": "List Leased License Resources",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/module-certificates": {
+   "get": {
+    "summary": "List Module Certificate Resources",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/module-eulas": {
+   "get": {
+    "summary": "List Module EULA Resources",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.eam/remote-upgrade": {
+   "get": {
+    "summary": "List Remote Upgrade Resources",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.historian/historian-provider": {
+   "get": {
+    "summary": "List Historian Resources",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig": {
+   "get": {
+    "summary": "List Local Devices Resources",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.opcua/device": {
+   "get": {
+    "summary": "List Devices Resources",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.perspective/fonts": {
+   "get": {
+    "summary": "List Fonts Resources",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.perspective/icons": {
+   "get": {
+    "summary": "List Icons Resources",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/com.inductiveautomation.perspective/themes": {
+   "get": {
+    "summary": "List Themes Resources",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/alarm-journal": {
+   "get": {
+    "summary": "List Alarm Journal Settings Resources",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/api-token": {
+   "get": {
+    "summary": "List API Token Resources",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/audit-profile": {
+   "get": {
+    "summary": "List Audit Profiles Resources",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/database-connection": {
+   "get": {
+    "summary": "List Database Connection Resources",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/database-driver": {
+   "get": {
+    "summary": "List JDBC Driver Resources",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/database-translator": {
+   "get": {
+    "summary": "List Database Translator Resources",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/email-profile": {
+   "get": {
+    "summary": "List Email Profile Settings Resources",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/gateway-network-incoming": {
+   "get": {
+    "summary": "List Incoming Connection Settings Resources",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/gateway-network-outgoing": {
+   "get": {
+    "summary": "List Outgoing Connection Settings Resources",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/holiday": {
+   "get": {
+    "summary": "List Holiday Resources",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/identity-provider": {
+   "get": {
+    "summary": "List Identity Provider Resources",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/keyboard_layout": {
+   "get": {
+    "summary": "List Keyboard Layouts Resources",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/metrics-dashboard": {
+   "get": {
+    "summary": "List Metrics Dashboard Resources",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/oauth2-client": {
+   "get": {
+    "summary": "List OAuth2 Client Resources",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/opc-connection": {
+   "get": {
+    "summary": "List OPC Connections Resources",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/roster-config": {
+   "get": {
+    "summary": "List Rosters Resources",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/schedule": {
+   "get": {
+    "summary": "List Schedule Resources",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/secret-provider": {
+   "get": {
+    "summary": "List Secret Provider Resources",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/security-zone": {
+   "get": {
+    "summary": "List Security Zones Resources",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/service-connector": {
+   "get": {
+    "summary": "List Service Connectors Resources",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/store-and-forward-engine": {
+   "get": {
+    "summary": "List Store and Forward Engine Resources",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/tag-provider": {
+   "get": {
+    "summary": "List Tag Providers Resources",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/list/ignition/user-source": {
+   "get": {
+    "summary": "List User Sources Resources",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/move": {
+   "post": {
+    "summary": "Move a Resource",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.alarm-notification/alarm-notification-profile": {
+   "get": {
+    "summary": "Get Alarm Notification Profiles Names",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/agent-group": {
+   "get": {
+    "summary": "Get Agent Groups Names",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/agent-management": {
+   "get": {
+    "summary": "Get Agent Management Names",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/eam-tasks": {
+   "get": {
+    "summary": "Get EAM Agent Task Names",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/hw-license-management": {
+   "get": {
+    "summary": "Get Hardware License Names",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/leased-license-management": {
+   "get": {
+    "summary": "Get Leased License Names",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/module-certificates": {
+   "get": {
+    "summary": "Get Module Certificate Names",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/module-eulas": {
+   "get": {
+    "summary": "Get Module EULA Names",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.eam/remote-upgrade": {
+   "get": {
+    "summary": "Get Remote Upgrade Names",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.historian/historian-provider": {
+   "get": {
+    "summary": "Get Historian Names",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig": {
+   "get": {
+    "summary": "Get Local Devices Names",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.opcua/device": {
+   "get": {
+    "summary": "Get Devices Names",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.perspective/fonts": {
+   "get": {
+    "summary": "Get Fonts Names",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.perspective/icons": {
+   "get": {
+    "summary": "Get Icons Names",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/com.inductiveautomation.perspective/themes": {
+   "get": {
+    "summary": "Get Themes Names",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/alarm-journal": {
+   "get": {
+    "summary": "Get Alarm Journal Settings Names",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/api-token": {
+   "get": {
+    "summary": "Get API Token Names",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/audit-profile": {
+   "get": {
+    "summary": "Get Audit Profiles Names",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/database-connection": {
+   "get": {
+    "summary": "Get Database Connection Names",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/database-driver": {
+   "get": {
+    "summary": "Get JDBC Driver Names",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/database-translator": {
+   "get": {
+    "summary": "Get Database Translator Names",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/email-profile": {
+   "get": {
+    "summary": "Get Email Profile Settings Names",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/gateway-network-incoming": {
+   "get": {
+    "summary": "Get Incoming Connection Settings Names",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/gateway-network-outgoing": {
+   "get": {
+    "summary": "Get Outgoing Connection Settings Names",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/holiday": {
+   "get": {
+    "summary": "Get Holiday Names",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/identity-provider": {
+   "get": {
+    "summary": "Get Identity Provider Names",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/keyboard_layout": {
+   "get": {
+    "summary": "Get Keyboard Layouts Names",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/metrics-dashboard": {
+   "get": {
+    "summary": "Get Metrics Dashboard Names",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/oauth2-client": {
+   "get": {
+    "summary": "Get OAuth2 Client Names",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/opc-connection": {
+   "get": {
+    "summary": "Get OPC Connections Names",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/roster-config": {
+   "get": {
+    "summary": "Get Rosters Names",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/schedule": {
+   "get": {
+    "summary": "Get Schedule Names",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/secret-provider": {
+   "get": {
+    "summary": "Get Secret Provider Names",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/security-zone": {
+   "get": {
+    "summary": "Get Security Zones Names",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/service-connector": {
+   "get": {
+    "summary": "Get Service Connectors Names",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/store-and-forward-engine": {
+   "get": {
+    "summary": "Get Store and Forward Engine Names",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/tag-provider": {
+   "get": {
+    "summary": "Get Tag Providers Names",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/names/ignition/user-source": {
+   "get": {
+    "summary": "Get User Sources Names",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.alarm-notification/alarm-notification-profile/{name}": {
+   "post": {
+    "summary": "Rename Alarm Notification Profiles",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/agent-group/{name}": {
+   "post": {
+    "summary": "Rename Agent Groups",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/agent-management/{name}": {
+   "post": {
+    "summary": "Rename Agent Management",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/eam-tasks/{name}": {
+   "post": {
+    "summary": "Rename EAM Agent Task",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/hw-license-management/{name}": {
+   "post": {
+    "summary": "Rename Hardware License",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/leased-license-management/{name}": {
+   "post": {
+    "summary": "Rename Leased License",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/module-certificates/{name}": {
+   "post": {
+    "summary": "Rename Module Certificate",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/module-eulas/{name}": {
+   "post": {
+    "summary": "Rename Module EULA",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.eam/remote-upgrade/{name}": {
+   "post": {
+    "summary": "Rename Remote Upgrade",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.historian/historian-provider/{name}": {
+   "post": {
+    "summary": "Rename Historian",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig/{name}": {
+   "post": {
+    "summary": "Rename Local Devices",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.opcua/device/{name}": {
+   "post": {
+    "summary": "Rename Devices",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.perspective/fonts/{name}": {
+   "post": {
+    "summary": "Rename Fonts",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.perspective/icons/{name}": {
+   "post": {
+    "summary": "Rename Icons",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/com.inductiveautomation.perspective/themes/{name}": {
+   "post": {
+    "summary": "Rename Themes",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/alarm-journal/{name}": {
+   "post": {
+    "summary": "Rename Alarm Journal Settings",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/api-token/{name}": {
+   "post": {
+    "summary": "Rename API Token",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/audit-profile/{name}": {
+   "post": {
+    "summary": "Rename Audit Profiles",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/database-connection/{name}": {
+   "post": {
+    "summary": "Rename Database Connection",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/database-driver/{name}": {
+   "post": {
+    "summary": "Rename JDBC Driver",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/database-translator/{name}": {
+   "post": {
+    "summary": "Rename Database Translator",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/email-profile/{name}": {
+   "post": {
+    "summary": "Rename Email Profile Settings",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/gateway-network-outgoing/{name}": {
+   "post": {
+    "summary": "Rename Outgoing Connection Settings",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/holiday/{name}": {
+   "post": {
+    "summary": "Rename Holiday",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/identity-provider/{name}": {
+   "post": {
+    "summary": "Rename Identity Provider",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/keyboard_layout/{name}": {
+   "post": {
+    "summary": "Rename Keyboard Layouts",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/metrics-dashboard/{name}": {
+   "post": {
+    "summary": "Rename Metrics Dashboard",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/oauth2-client/{name}": {
+   "post": {
+    "summary": "Rename OAuth2 Client",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/opc-connection/{name}": {
+   "post": {
+    "summary": "Rename OPC Connections",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/roster-config/{name}": {
+   "post": {
+    "summary": "Rename Rosters",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/schedule/{name}": {
+   "post": {
+    "summary": "Rename Schedule",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/secret-provider/{name}": {
+   "post": {
+    "summary": "Rename Secret Provider",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/security-zone/{name}": {
+   "post": {
+    "summary": "Rename Security Zones",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/service-connector/{name}": {
+   "post": {
+    "summary": "Rename Service Connectors",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/store-and-forward-engine/{name}": {
+   "post": {
+    "summary": "Rename Store and Forward Engine",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/tag-provider/{name}": {
+   "post": {
+    "summary": "Rename Tag Providers",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/rename/ignition/user-source/{name}": {
+   "post": {
+    "summary": "Rename User Sources",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/com.inductiveautomation.eam/event-thresholds": {
+   "get": {
+    "summary": "Get Event Thresholds Config",
+    "tags": [
+     "event-thresholds"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/com.inductiveautomation.eam/module-settings": {
+   "get": {
+    "summary": "Get Module Settings Config",
+    "tags": [
+     "module-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/com.inductiveautomation.opcua/access-control": {
+   "get": {
+    "summary": "Get OPC UA Access Control Config Config",
+    "tags": [
+     "access-control"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/com.inductiveautomation.opcua/server-config": {
+   "get": {
+    "summary": "Get OPC UA Server Config Config",
+    "tags": [
+     "server"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/com.inductiveautomation.sfc/chart-settings": {
+   "get": {
+    "summary": "Get SFC Settings Config",
+    "tags": [
+     "sfc-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/cobranding": {
+   "get": {
+    "summary": "Get Brand Customization Config",
+    "tags": [
+     "config-perspective-branding"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/edge-system-properties": {
+   "get": {
+    "summary": "Get Edge System Properties Config",
+    "tags": [
+     "config-edge-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/gateway-network-proxy-rules": {
+   "get": {
+    "summary": "Get Proxy Rules Config",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/gateway-network-queue-settings": {
+   "get": {
+    "summary": "Get Queue Settings Config",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/gateway-network-settings": {
+   "get": {
+    "summary": "Get General Gateway Network Settings Config",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/general-alarm-settings": {
+   "get": {
+    "summary": "Get General Alarm Settings Config",
+    "tags": [
+     "general-alarm-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/local-system-properties": {
+   "get": {
+    "summary": "Get Local System Properties Config",
+    "tags": [
+     "config-local-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/quickstart": {
+   "get": {
+    "summary": "Get Quick Start Configuration Config",
+    "tags": [
+     "quickstart"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/security-levels": {
+   "get": {
+    "summary": "Get Security Levels Config",
+    "tags": [
+     "config-security-levels"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/security-properties": {
+   "get": {
+    "summary": "Get Security Properties Config",
+    "tags": [
+     "config-security-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/system-properties": {
+   "get": {
+    "summary": "Get System Properties Config",
+    "tags": [
+     "config-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/singleton/ignition/translations": {
+   "get": {
+    "summary": "Get Translations Config",
+    "tags": [
+     "config-translations"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.alarm-notification/alarm-notification-profile": {
+   "get": {
+    "summary": "Describe Alarm Notification Profiles Resource Type",
+    "tags": [
+     "alarm-notification-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/agent-group": {
+   "get": {
+    "summary": "Describe Agent Groups Resource Type",
+    "tags": [
+     "agent-group"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/agent-management": {
+   "get": {
+    "summary": "Describe Agent Management Resource Type",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/eam-tasks": {
+   "get": {
+    "summary": "Describe EAM Agent Task Resource Type",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/event-thresholds": {
+   "get": {
+    "summary": "Describe Event Thresholds Resource Type",
+    "tags": [
+     "event-thresholds"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/hw-license-management": {
+   "get": {
+    "summary": "Describe Hardware License Resource Type",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/leased-license-management": {
+   "get": {
+    "summary": "Describe Leased License Resource Type",
+    "tags": [
+     "license-management"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/module-certificates": {
+   "get": {
+    "summary": "Describe Module Certificate Resource Type",
+    "tags": [
+     "module-certificate"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/module-eulas": {
+   "get": {
+    "summary": "Describe Module EULA Resource Type",
+    "tags": [
+     "module-eula"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/module-settings": {
+   "get": {
+    "summary": "Describe Module Settings Resource Type",
+    "tags": [
+     "module-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.eam/remote-upgrade": {
+   "get": {
+    "summary": "Describe Remote Upgrade Resource Type",
+    "tags": [
+     "remote-upgrade"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.historian/historian-provider": {
+   "get": {
+    "summary": "Describe Historian Resource Type",
+    "tags": [
+     "historian-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.opcua.drivers.bacnet/BacnetIpLocalDeviceConfig": {
+   "get": {
+    "summary": "Describe Local Devices Resource Type",
+    "tags": [
+     "local-devices"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.opcua/access-control": {
+   "get": {
+    "summary": "Describe OPC UA Access Control Config Resource Type",
+    "tags": [
+     "access-control"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.opcua/device": {
+   "get": {
+    "summary": "Describe Devices Resource Type",
+    "tags": [
+     "device"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.opcua/server-config": {
+   "get": {
+    "summary": "Describe OPC UA Server Config Resource Type",
+    "tags": [
+     "server"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.perspective/fonts": {
+   "get": {
+    "summary": "Describe Fonts Resource Type",
+    "tags": [
+     "config-perspective-fonts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.perspective/icons": {
+   "get": {
+    "summary": "Describe Icons Resource Type",
+    "tags": [
+     "config-perspective-icons"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.perspective/themes": {
+   "get": {
+    "summary": "Describe Themes Resource Type",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/com.inductiveautomation.sfc/chart-settings": {
+   "get": {
+    "summary": "Describe SFC Settings Resource Type",
+    "tags": [
+     "sfc-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/alarm-journal": {
+   "get": {
+    "summary": "Describe Alarm Journal Settings Resource Type",
+    "tags": [
+     "alarm-journal-resources"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/api-token": {
+   "get": {
+    "summary": "Describe API Token Resource Type",
+    "tags": [
+     "config-api-token"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/audit-profile": {
+   "get": {
+    "summary": "Describe Audit Profiles Resource Type",
+    "tags": [
+     "config-audit-profiles"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/cobranding": {
+   "get": {
+    "summary": "Describe Brand Customization Resource Type",
+    "tags": [
+     "config-perspective-branding"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/database-connection": {
+   "get": {
+    "summary": "Describe Database Connection Resource Type",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/database-driver": {
+   "get": {
+    "summary": "Describe JDBC Driver Resource Type",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/database-translator": {
+   "get": {
+    "summary": "Describe Database Translator Resource Type",
+    "tags": [
+     "config-databases"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/edge-system-properties": {
+   "get": {
+    "summary": "Describe Edge System Properties Resource Type",
+    "tags": [
+     "config-edge-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/email-profile": {
+   "get": {
+    "summary": "Describe Email Profile Settings Resource Type",
+    "tags": [
+     "config-email-profile"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/gateway-network-incoming": {
+   "get": {
+    "summary": "Describe Incoming Connection Settings Resource Type",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/gateway-network-outgoing": {
+   "get": {
+    "summary": "Describe Outgoing Connection Settings Resource Type",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/gateway-network-proxy-rules": {
+   "get": {
+    "summary": "Describe Proxy Rules Resource Type",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/gateway-network-queue-settings": {
+   "get": {
+    "summary": "Describe Queue Settings Resource Type",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/gateway-network-settings": {
+   "get": {
+    "summary": "Describe General Gateway Network Settings Resource Type",
+    "tags": [
+     "config-gateway-network"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/general-alarm-settings": {
+   "get": {
+    "summary": "Describe General Alarm Settings Resource Type",
+    "tags": [
+     "general-alarm-settings"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/holiday": {
+   "get": {
+    "summary": "Describe Holiday Resource Type",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/identity-provider": {
+   "get": {
+    "summary": "Describe Identity Provider Resource Type",
+    "tags": [
+     "config-identity-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/keyboard_layout": {
+   "get": {
+    "summary": "Describe Keyboard Layouts Resource Type",
+    "tags": [
+     "config-keyboard-layouts"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/local-system-properties": {
+   "get": {
+    "summary": "Describe Local System Properties Resource Type",
+    "tags": [
+     "config-local-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/metrics-dashboard": {
+   "get": {
+    "summary": "Describe Metrics Dashboard Resource Type",
+    "tags": [
+     "config-metrics-dashboard"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/oauth2-client": {
+   "get": {
+    "summary": "Describe OAuth2 Client Resource Type",
+    "tags": [
+     "config-oauth2-client"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/opc-connection": {
+   "get": {
+    "summary": "Describe OPC Connections Resource Type",
+    "tags": [
+     "opc-connection"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/quickstart": {
+   "get": {
+    "summary": "Describe Quick Start Configuration Resource Type",
+    "tags": [
+     "quickstart"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/roster-config": {
+   "get": {
+    "summary": "Describe Rosters Resource Type",
+    "tags": [
+     "roster-config"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/schedule": {
+   "get": {
+    "summary": "Describe Schedule Resource Type",
+    "tags": [
+     "config-alarm"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/secret-provider": {
+   "get": {
+    "summary": "Describe Secret Provider Resource Type",
+    "tags": [
+     "config-secret-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/security-levels": {
+   "get": {
+    "summary": "Describe Security Levels Resource Type",
+    "tags": [
+     "config-security-levels"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/security-properties": {
+   "get": {
+    "summary": "Describe Security Properties Resource Type",
+    "tags": [
+     "config-security-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/security-zone": {
+   "get": {
+    "summary": "Describe Security Zones Resource Type",
+    "tags": [
+     "config-security-zone"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/service-connector": {
+   "get": {
+    "summary": "Describe Service Connectors Resource Type",
+    "tags": [
+     "service-connectors"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/store-and-forward-engine": {
+   "get": {
+    "summary": "Describe Store and Forward Engine Resource Type",
+    "tags": [
+     "config-store-forward"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/system-properties": {
+   "get": {
+    "summary": "Describe System Properties Resource Type",
+    "tags": [
+     "config-system-properties"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/tag-provider": {
+   "get": {
+    "summary": "Describe Tag Providers Resource Type",
+    "tags": [
+     "config-tag-provider"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/translations": {
+   "get": {
+    "summary": "Describe Translations Resource Type",
+    "tags": [
+     "config-translations"
+    ]
+   }
+  },
+  "/data/api/v1/resources/type/ignition/user-source": {
+   "get": {
+    "summary": "Describe User Sources Resource Type",
+    "tags": [
+     "config-user-source"
+    ]
+   }
+  },
+  "/data/api/v1/restart-tasks/pending": {
+   "get": {
+    "summary": "Get all required restart tasks",
+    "tags": [
+     "restart-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/restart-tasks/restart": {
+   "post": {
+    "summary": "Restart the Gateway",
+    "tags": [
+     "restart-tasks"
+    ]
+   }
+  },
+  "/data/api/v1/scan-lock/config": {
+   "get": {
+    "summary": "Configuration Scan Lock Info",
+    "tags": [
+     "config-management"
+    ]
+   },
+   "post": {
+    "summary": "Acquire Configuration Scan Lock",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/scan-lock/projects": {
+   "get": {
+    "summary": "Project Scan Lock Info",
+    "tags": [
+     "config-management"
+    ]
+   },
+   "post": {
+    "summary": "Acquire Project Scan Lock",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/scan/config": {
+   "get": {
+    "summary": "Configuration Scan Status",
+    "tags": [
+     "config-management"
+    ]
+   },
+   "post": {
+    "summary": "Request Configuration Scan",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/scan/projects": {
+   "get": {
+    "summary": "Project Scan Status",
+    "tags": [
+     "config-management"
+    ]
+   },
+   "post": {
+    "summary": "Request Project Scan",
+    "tags": [
+     "config-management"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/Groups": {
+   "get": {
+    "summary": "List Group Resources",
+    "tags": [
+     "user-management-scim"
+    ]
+   },
+   "post": {
+    "summary": "Create Group Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/Groups/{group-id}": {
+   "get": {
+    "summary": "Get Group Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   },
+   "put": {
+    "summary": "Modify Group Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Group Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/ResourceTypes": {
+   "get": {
+    "summary": "List Resource Types",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/ResourceTypes/{type-id}": {
+   "get": {
+    "summary": "Get Resource Type",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/Schemas": {
+   "get": {
+    "summary": "List Schemas",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/Schemas/{schema-id}": {
+   "get": {
+    "summary": "Get Schema",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/ServiceProviderConfig": {
+   "get": {
+    "summary": "Get Service Provider Configuration",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/Users": {
+   "get": {
+    "summary": "List User Resources",
+    "tags": [
+     "user-management-scim"
+    ]
+   },
+   "post": {
+    "summary": "Create User Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scim/{profile-name}/{scim-version}/Users/{user-id}": {
+   "get": {
+    "summary": "Get User Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   },
+   "put": {
+    "summary": "Modify User Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   },
+   "delete": {
+    "summary": "Delete User Resource",
+    "tags": [
+     "user-management-scim"
+    ]
+   }
+  },
+  "/data/api/v1/scripts": {
+   "get": {
+    "summary": "Running Scripts",
+    "tags": [
+     "running-scripts"
+    ]
+   }
+  },
+  "/data/api/v1/scripts/cancel-script/{id}": {
+   "delete": {
+    "summary": "Cancel Script",
+    "tags": [
+     "running-scripts"
+    ]
+   }
+  },
+  "/data/api/v1/scripts/diagnostics/{type}": {
+   "get": {
+    "summary": "Gateway Script Diagnostics",
+    "tags": [
+     "gateway-scripts"
+    ]
+   }
+  },
+  "/data/api/v1/secret-providers/{provider-name}/secrets": {
+   "get": {
+    "summary": "List Provider Secrets",
+    "tags": [
+     "secret-providers"
+    ]
+   }
+  },
+  "/data/api/v1/sync/items": {
+   "get": {
+    "summary": "Get Syncable Items",
+    "tags": [
+     "data-syncs"
+    ]
+   }
+  },
+  "/data/api/v1/sync/reset": {
+   "post": {
+    "summary": "Data Syncs Reset",
+    "tags": [
+     "data-syncs"
+    ]
+   }
+  },
+  "/data/api/v1/systemPerformance/charts": {
+   "get": {
+    "summary": "Historic Performance Data",
+    "tags": [
+     "system-performance"
+    ]
+   }
+  },
+  "/data/api/v1/systemPerformance/currentGauges": {
+   "get": {
+    "summary": "Current Performance Data",
+    "tags": [
+     "system-performance"
+    ]
+   }
+  },
+  "/data/api/v1/systemPerformance/driftEvents": {
+   "get": {
+    "summary": "System Clock Drift Events",
+    "tags": [
+     "system-performance"
+    ]
+   }
+  },
+  "/data/api/v1/systemPerformance/driftGauge": {
+   "get": {
+    "summary": "Current System Clock Drift",
+    "tags": [
+     "system-performance"
+    ]
+   }
+  },
+  "/data/api/v1/systemPerformance/threads": {
+   "get": {
+    "summary": "Thread Execution Data",
+    "tags": [
+     "system-performance"
+    ]
+   }
+  },
+  "/data/api/v1/tags/export": {
+   "get": {
+    "summary": "Download Tag Export",
+    "tags": [
+     "tags"
+    ]
+   }
+  },
+  "/data/api/v1/tags/import": {
+   "post": {
+    "summary": "Import Tags",
+    "tags": [
+     "tags"
+    ]
+   }
+  },
+  "/data/api/v1/trial": {
+   "get": {
+    "summary": "Trial Information",
+    "tags": [
+     "license-status"
+    ]
+   }
+  },
+  "/data/config/journal/getRemoteJournalNames": {
+   "get": {
+    "summary": "",
+    "tags": []
+   }
+  },
+  "/data/eam/api/v1/agent-approval-status/{controllerId}/{localServerId}": {
+   "get": {
+    "summary": "Agent Approval Status",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agent-details/{serverid}": {
+   "get": {
+    "summary": "EAM Agent Details Overview",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agent-licenses/{serverid}": {
+   "get": {
+    "summary": "EAM Agent License Keys",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agent-management/modules": {
+   "get": {
+    "summary": "Retrieve agent modules",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agent-management/project-resources": {
+   "get": {
+    "summary": "Retrieve project resources",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agent-management/projects": {
+   "get": {
+    "summary": "Retrieve projects names",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agent-management/upgrade-info": {
+   "get": {
+    "summary": "Retrieve agent info for upgrade",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agents": {
+   "get": {
+    "summary": "EAM Agents Status",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/agents-by-group": {
+   "get": {
+    "summary": "EAM Agents by Agent Group",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/approve-agent/{serverid}": {
+   "post": {
+    "summary": "Approve agent",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/cancel/{name}": {
+   "post": {
+    "summary": "Cancel task",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/clear-retry/{name}": {
+   "delete": {
+    "summary": "Clear retry task data",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/delete-temp-folder": {
+   "delete": {
+    "summary": "Delete temp folder",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/force/{owner}/{name}": {
+   "post": {
+    "summary": "Force task execution",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/history": {
+   "get": {
+    "summary": "Task History",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/module-cert": {
+   "get": {
+    "summary": "Retrieve module certificate",
+    "tags": [
+     "storage"
+    ]
+   },
+   "post": {
+    "summary": "Accept module certificate",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/module-eula": {
+   "get": {
+    "summary": "Retrieve module EULA",
+    "tags": [
+     "storage"
+    ]
+   },
+   "post": {
+    "summary": "Accept module EULA",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/resume/{name}": {
+   "post": {
+    "summary": "Resume task",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/retry": {
+   "get": {
+    "summary": "Get retry tasks",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/scheduled/{running}": {
+   "get": {
+    "summary": "Running or Scheduled Tasks",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/store-gwbk": {
+   "post": {
+    "summary": "Upload .gwbk file",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/store-module": {
+   "post": {
+    "summary": "Upload .modl file",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/store-module-from-archive": {
+   "post": {
+    "summary": "Store module file from archive",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/store-upgrade-zip": {
+   "post": {
+    "summary": "Upload upgrade zip",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/eam-tasks/suspend/{name}": {
+   "post": {
+    "summary": "Suspend task",
+    "tags": [
+     "eam-tasks"
+    ]
+   }
+  },
+  "/data/eam/api/v1/quarantined-agents": {
+   "get": {
+    "summary": "Quarantined agents",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/quarantined-agents/{serverid}": {
+   "delete": {
+    "summary": "Delete quarantined agent",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/eam/api/v1/storage/archived-backups": {
+   "get": {
+    "summary": "Retrieve archived backups",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/storage/archived-modules": {
+   "get": {
+    "summary": "Retrieve archived modules",
+    "tags": [
+     "storage"
+    ]
+   }
+  },
+  "/data/eam/api/v1/upgrade-agent/{groupName}/{serverid}": {
+   "post": {
+    "summary": "Upgrade Agent",
+    "tags": [
+     "agent-management"
+    ]
+   }
+  },
+  "/data/event-stream/api/v1/streams/details/{project}": {
+   "get": {
+    "summary": "Get event stream details",
+    "tags": [
+     "streams-info"
+    ]
+   }
+  },
+  "/data/event-stream/api/v1/streams/status": {
+   "get": {
+    "summary": "Get general event stream status",
+    "tags": [
+     "streams-info"
+    ]
+   }
+  },
+  "/data/fsql/api/v1/status/project/{name}": {
+   "get": {
+    "summary": "Get transaction groups status for a specific project",
+    "tags": [
+     "groups-info"
+    ]
+   }
+  },
+  "/data/fsql/api/v1/status/projects": {
+   "get": {
+    "summary": "Get transaction group status for each project",
+    "tags": [
+     "groups-info"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/client/pki/certificate/trust": {
+   "post": {
+    "summary": "Trust Endpoint Certificate",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/client/pki/certificates/rejected": {
+   "get": {
+    "summary": "Get Rejected Client Certificates",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/client/pki/certificates/rejected/{signature}": {
+   "get": {
+    "summary": "Download Rejected Client Certificate",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Rejected Client Certificate",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/client/pki/certificates/trusted": {
+   "get": {
+    "summary": "Get Trusted Client Certificates",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   },
+   "post": {
+    "summary": "Upload Trusted Client Certificates",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/client/pki/certificates/trusted/{signature}": {
+   "get": {
+    "summary": "Download Trusted Client Certificate",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   },
+   "post": {
+    "summary": "Trust Rejected Client Certificate",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Trusted Client Certificate",
+    "tags": [
+     "client-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/server/pki/certificates/rejected": {
+   "get": {
+    "summary": "Get Rejected Server Certificates",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/server/pki/certificates/rejected/{signature}": {
+   "get": {
+    "summary": "Download Rejected Server Certificate",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Rejected Server Certificate",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/server/pki/certificates/trusted": {
+   "get": {
+    "summary": "Get Trusted Server Certificates",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   },
+   "post": {
+    "summary": "Upload Trusted Server Certificates",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/server/pki/certificates/trusted/{signature}": {
+   "get": {
+    "summary": "Download Trusted Server Certificate",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   },
+   "post": {
+    "summary": "Trust Rejected Server Certificate",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   },
+   "delete": {
+    "summary": "Delete Trusted Server Certificate",
+    "tags": [
+     "server-pki-certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/{routeType}/certificate": {
+   "get": {
+    "summary": "Get Certificate",
+    "tags": [
+     "certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/{routeType}/certificate/download": {
+   "get": {
+    "summary": "Download Certificate",
+    "tags": [
+     "certificate-management"
+    ]
+   }
+  },
+  "/data/opc-ua/api/v1/{routeType}/certificate/regenerate": {
+   "post": {
+    "summary": "Regenerate Certificate",
+    "tags": [
+     "certificate-management"
+    ]
+   }
+  },
+  "/data/perspective/api/v1/session/{sessionId}": {
+   "get": {
+    "summary": "Perspective Session Detail",
+    "tags": [
+     "perspective-sessions"
+    ]
+   }
+  },
+  "/data/perspective/api/v1/session/{sessionId}/page/{pageId}/views": {
+   "get": {
+    "summary": "Perspective Views",
+    "tags": [
+     "perspective-sessions"
+    ]
+   }
+  },
+  "/data/perspective/api/v1/session/{sessionId}/pages": {
+   "get": {
+    "summary": "Perspective Pages",
+    "tags": [
+     "perspective-sessions"
+    ]
+   }
+  },
+  "/data/perspective/api/v1/sessions": {
+   "delete": {
+    "summary": "Terminate Perspective Session(s)",
+    "tags": [
+     "perspective-sessions"
+    ]
+   }
+  },
+  "/data/perspective/api/v1/sessions/": {
+   "get": {
+    "summary": "Perspective Sessions",
+    "tags": [
+     "perspective-sessions"
+    ]
+   }
+  },
+  "/data/perspective/api/v1/themes/copy-base-themes": {
+   "post": {
+    "summary": "Copy Base Themes",
+    "tags": [
+     "config-perspective-themes"
+    ]
+   }
+  },
+  "/data/reporting/api/v1/cancel/{project}": {
+   "delete": {
+    "summary": "Cancel A Report",
+    "tags": [
+     "reports-info"
+    ]
+   }
+  },
+  "/data/reporting/api/v1/reports/completed": {
+   "get": {
+    "summary": "Completed Reports",
+    "tags": [
+     "reports-info"
+    ]
+   }
+  },
+  "/data/reporting/api/v1/reports/current": {
+   "get": {
+    "summary": "Currently Executing Reports",
+    "tags": [
+     "reports-info"
+    ]
+   }
+  },
+  "/data/reporting/api/v1/reports/published": {
+   "get": {
+    "summary": "Published Reports",
+    "tags": [
+     "reports-info"
+    ]
+   }
+  },
+  "/data/reporting/api/v1/reports/totals": {
+   "get": {
+    "summary": "Report Totals",
+    "tags": [
+     "reports-info"
+    ]
+   }
+  },
+  "/data/reporting/api/v1/reports/upcoming": {
+   "get": {
+    "summary": "Upcoming Reports",
+    "tags": [
+     "reports-info"
+    ]
+   }
+  },
+  "/data/sfc/api/v1/charts/status": {
+   "get": {
+    "summary": "Get general chart status",
+    "tags": [
+     "charts-info"
+    ]
+   }
+  },
+  "/data/sfc/api/v1/charts/totals": {
+   "get": {
+    "summary": "Get chart totals",
+    "tags": [
+     "charts-info"
+    ]
+   }
+  },
+  "/data/sfc/api/v1/charts/{projectName}/{chartPath}": {
+   "get": {
+    "summary": "Get chart detail",
+    "tags": [
+     "charts-info"
+    ]
+   }
+  },
+  "/data/sfc/api/v1/charts/{uuid}/cancel": {
+   "delete": {
+    "summary": "Cancel chart",
+    "tags": [
+     "charts-info"
+    ]
+   }
+  },
+  "/data/sfc/api/v1/charts/{uuid}/pause": {
+   "post": {
+    "summary": "Pause chart",
+    "tags": [
+     "charts-info"
+    ]
+   }
+  },
+  "/data/sfc/api/v1/charts/{uuid}/resume": {
+   "post": {
+    "summary": "Resume chart",
+    "tags": [
+     "charts-info"
+    ]
+   }
+  },
+  "/data/vision/api/v1/client/{id}": {
+   "get": {
+    "summary": "Session Details",
+    "tags": [
+     "vision-sessions"
+    ]
+   },
+   "delete": {
+    "summary": "Terminate Session",
+    "tags": [
+     "vision-sessions"
+    ]
+   }
+  },
+  "/data/vision/api/v1/clients": {
+   "get": {
+    "summary": "Client Sessions",
+    "tags": [
+     "vision-sessions"
+    ]
+   }
+  }
+ }
+}

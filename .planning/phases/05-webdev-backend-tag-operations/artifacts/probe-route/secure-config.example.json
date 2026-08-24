@@ -1,0 +1,1 @@
+{"resource-type": "python-resource", "doPost": {"enabled": true, "max-retry-attempts": 3, "require-auth": true, "require-https": false, "required-roles": "Administrator", "user-source": "default"}}
