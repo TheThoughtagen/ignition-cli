@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 EXECUTING (wave 1, parallel tree): 05-01 route sources + embedded bundle COMPLETE; 05-02 resource-family re-point COMPLETE — the inherited Phase 3 resource-route defect is CLOSED (see Blockers). Next: remaining wave plans (05-03..05-06)
+**Current focus:** Phase 5 EXECUTING: 05-01 route sources + embedded bundle, 05-02 resource-family re-point (Phase 3 blocker CLOSED), and 05-03 webdev client seam + deploy/status COMPLETE — the hinge seam every tag command rides. Next: 05-04..05-06 (tags family rides webdev_precondition + webdev_route_call)
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
-**Current Plan:** 2
+**Current Plan:** 4
 **Total Plans in Phase:** 6
-**Status:** Phase 5 executing — 05-01 (route sources + embedded bundle) + 05-02 (resource family re-point, Phase 3 blocker CLOSED) complete; wave-1 sibling plans running in parallel in this tree
+**Status:** Ready to execute
 **Last Activity:** 2026-08-24
 
-**Progress:** [████████░░] 82%
+**Progress:** [█████████░] 86%
 
 ## Performance Metrics
 
@@ -46,6 +46,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 04 PP04 | 37min | 3 tasks | 17 files |
 | Phase 05 P01 | 24min | 3 tasks | 19 files |
 | Phase 05 P02 | 38min | 3 tasks | 16 files |
+| Phase 05 P03 | ~400min (2 sessions) | 3 tasks | 35 files |
 
 ## Accumulated Context
 
@@ -119,6 +120,9 @@ Recent decisions affecting current work:
 - [Phase 05-02]: [Phase 05-02]: Resource family re-pointed onto export-zip surgery (zip 8.6, the only new dep) — UX contract unchanged, transport = export → pure member surgery (client/resources.rs helpers, unit-pinned) → import(overwrite=true); Phase 3 cross-phase blocker CLOSED — No per-resource REST routes exist on real 8.3 gateways (triple-verified: live openapi 575 paths + committed extract + EAM probe); export/import round-trip is native and the machinery shipped in 03-02
 - [Phase 05-02]: [Phase 05-02]: resource put JOINED the --yes-guarded set (member surgery implicitly overwrite-imports the whole project; 03-03's unguarded put superseded) — put/delete refusal MESSAGES name the consequence via the operation string while the shared ConfirmationRequired hint stays frozen (no other verb's golden moved); prefix filter went client-side (starts_with on member paths) — Replace-not-merge wipes concurrent Designer edits — the plan's accepted-tradeoff language; consequence-at-refusal over generic hints
 - [Phase 05-02]: [Phase 05-02]: Surgery contract pins — request-SEQUENCE wiremock proofs (reads = exactly one export GET + zero imports; writes = export then overwrite-import with content-type application/zip) asserted at MEMBER level by round-tripping the received import body through the same public helpers; missing member = not_found with endpoint:null (there was no 404 URL, there was a missing zip member); tempfile promoted from dev (already in workspace graph) for the temp export — Byte-exact zip equality is not deterministic across writers; member-level honesty is the contract
+- [Phase 05-03]: WebDev seam LOCKED: POST /system/webdev/{project}/cli/{route} with the 200-BODY envelope as the only success oracle (denials ride 200); probe matrix 405=Absent (not 404), 402=Unlicensed, 401/403=AuthGated — doctor re-pinned at every layer incl. its CLI golden
+- [Phase 05-03]: webdev deploy NOT --yes-guarded: the dedicated ign-cli project is CLI-OWNED (born from the deploy zip, overwrite-replaced every deploy — replace-not-merge IS the contract; user projects never touched); no pre-flight project create (Pitfall 10); status is a READ (exit 0 whenever the sweep completes, degradation is data — the exit-6 refusal matrix belongs to WebDev-DEPENDENT commands via webdev_precondition)
+- [Phase 05-03]: scriptExec LOCKED posture shipped: /dev/urandom 32-byte hex secret persisted 0600 in the profile BEFORE upload and substituted into the template (placeholder excluded from the plain manifest — unsubstituted deploy impossible by construction); route fail-closes on every action incl. version; secret appears in exactly one place (the baked zip member) — redaction proven at action AND binary level; README documents the shared-secret threat-model honesty note
 
 ### Pending Todos
 
@@ -129,12 +133,12 @@ None yet.
 - ~~**[CROSS-PHASE — routed to Phase 5 planning]** Phase 3 `resource` family defect: `ign resource` (client/resources.rs + cli arm + e2e witnesses) targets `/data/api/v1/projects/{name}/resources/**` routes that DO NOT EXIST on real 8.3 gateways~~ CLOSED by 05-02: the family re-pointed onto project-export ZIP surgery (export → pure member surgery → import overwrite=true; zip 8.6 the only new dep). UX contract unchanged, put/delete now --yes-guarded with consequence-naming refusals, prefix filter client-side, binary fence survives (member-bytes sniff), e2e witnesses live-runnable for the first time since Phase 3 (e2e_projects loop + e2e_rig pre-witness both re-pinned). See 05-02-SUMMARY.md.
 - ~~Phase 4 live gates~~ CLOSED AUTONOMOUSLY post-verification (04-VERIFICATION.md addendum, commits bf51760/3d075ee): tier-1 trial reset live-proven on fresh 8.3.6 rig (0/expired → 7187s/active); snapshot→mutate→restore two-sided PASS via real CLI verbs on an 8.3.3 clone; lifecycle smoke passed. HEADLESS TOKEN PROVISIONING SOLVED (version-agnostic, proven both lines): OIDC login → `POST api-token/generate` → `POST resources/ignition/api-token` with `collection:"core"` → patch `security-properties` read/writePermissions to `AnyOf [Authenticated]` — full recipe in the addendum. Bonus findings: trial clock RIDES the restore (snapshot taken mid-trial restores the remaining clock); tokens+permissions inside a snapshot survive restore (Pitfall-5 warning not observed live). Tier-0-on-8.3.6 probe remains one natural-expiry away (non-blocking curiosity; tier-1 is the shipped mechanism). e2e_rig gate's resource-witness step blocked by the Phase 3 defect above.
 - ~~Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF)~~ RESOLVED at Phase 4 planning by 04-RESEARCH.md (live-probed on ign-research 8.3.6): native Rust HTTP ladder — tier 0 token-auth POST /data/api/v1/trial (one live call decides), tier 1 mapped OIDC challenge flow (client/idp.rs), tier 2 Playwright README-documented fallback only. Playwright delegation rejected (Node+chromium runtime, broke across 8.3.3 UI rewrite, DOM-text verification).
-- Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
+- ~~Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs~~ RESOLVED by 05-RESEARCH + 05-01/05-03: deploy = project-zip import overwrite=true into the CLI-owned ign-cli project; script-exec posture LOCKED (deploy-on-request, /dev/urandom secret 0600-in-profile, fail-closed route, redaction proven); tag-history availability rides the live e2e gate (opt-in)
 - ~~Phase 2 gap: live-gateway auth verification (token header across /data + /webdev, Basic viability)~~ CLOSED by 02-01: claims verified empirically during research + wiremock-pinned; executable proof path = live_gateway.rs `-- --ignored` (needs IGNITION_LIVE_URL/IGNITION_LIVE_TOKEN per 02-USER-SETUP.md; research rig `ign-research` still up on port 18088 if a fresh token is created). /webdev half re-checks in Phase 5.
 - ~~Phase 1: smoke-test keyring 4.1 on headless Linux CI~~ CLOSED & CI-CONFIRMED: keyring-smoke job green on ubuntu headless (run 32517734178, 2026-08-21)
 
 ## Session Continuity
 
-**Last session:** 2026-08-24T15:05:50.569Z
-**Stopped At:** Completed 05-02-PLAN.md (resource family re-point — Phase 3 blocker CLOSED)
+**Last session:** 2026-08-24T16:10:10.900Z
+**Stopped At:** Completed 05-03-PLAN.md (webdev client seam + deploy/status; recovered from rate-limited prior session and finished Task 3)
 **Resume file:** None
