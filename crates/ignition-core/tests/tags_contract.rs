@@ -19,10 +19,27 @@
 //! Task 2 pins (the deployed-route half: precondition refusal
 //! matrix, browse/read/write shapes) extend this file below.
 
+//! Task 2 pins (the deployed-route half, TAGS-02/03/04): the
+//! precondition refusal matrix at the ACTION level through the real
+//! client (405 → `routes_not_deployed` exit 6 with the
+//! `ign webdev deploy` hint; version mismatch →
+//! `route_version_mismatch`), and the browse/read/write route-call
+//! shapes (read passthrough, the write body pin) riding
+//! `/system/webdev/{project}/cli/tags`.
+
+use ignition_core::actions::tags::{tags_browse, tags_read, tags_write};
 use ignition_core::client::GatewayApi;
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::client::query::ListQuery;
 use ignition_core::client::tags::TagProviderCreate;
+
+/// The version-action 200-ok body every Present fixture answers.
+fn version_body(route_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "data": {"routeVersion": route_version, "minCli": "1.0"},
+    })
+}
 
 /// The provider list parses through the passthrough model with the
 /// UI's `limit=-1` convention on the query (matcher-pinned — the
@@ -153,4 +170,180 @@ async fn provider_delete_embeds_name_and_signature_on_the_path() {
     api.tag_provider_delete("p-5e2e", "1700000000000")
         .await
         .expect("delete-by-signature posts");
+}
+
+// ---- Task 2: the deployed-route half (TAGS-02/03/04) ----
+
+/// THE refusal pin: an UNDEPLOYED gateway (405 on the tags probe)
+/// refuses `routes_not_deployed` (exit 6) with the hint naming
+/// `ign webdev deploy` — and ZERO route calls run past it.
+#[tokio::test]
+async fn browse_refuses_routes_not_deployed_with_deploy_hint() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "version"}),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(405))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_browse(&api, "ign-cli", "", None, false)
+        .await
+        .expect_err("absent routes refuse pre-deploy");
+    assert_eq!(err.code(), "routes_not_deployed");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.hint().unwrap().contains("ign webdev deploy"),
+        "hint names the fix: {err}"
+    );
+    // Only the VERSION probe hit the wire — the browse never ran.
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// A version-MISMATCHED route refuses `route_version_mismatch`
+/// (exit 6) carrying both versions — redeploy or update ign.
+#[tokio::test]
+async fn browse_refuses_on_route_version_mismatch() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(version_body("0.9.0")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_browse(&api, "ign-cli", "", None, false)
+        .await
+        .expect_err("mismatched version refuses");
+    assert_eq!(err.code(), "route_version_mismatch");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.to_string().contains("0.9.0"),
+        "deployed version rides the message: {err}"
+    );
+}
+
+/// Mount the matching version probe (the precondition's pass) on
+/// the tags route.
+async fn mount_precondition_ok(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "version"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(version_body(ignition_core::webdev::ROUTE_BUNDLE_VERSION)),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// browse through the REAL client: precondition passes, the browse
+/// action dispatches with the path on the body, entries parse +
+/// filter (Property children dropped by default).
+#[tokio::test]
+async fn browse_dispatches_and_filters_properties() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": ""}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"fullPath": "[default]", "name": "default", "tagType": "Provider", "hasChildren": true, "dataType": null},
+                    {"fullPath": "[default]T1.value", "name": "value", "tagType": "Property", "hasChildren": false, "dataType": "Float8"}
+                ]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_browse(&api, "ign-cli", "", None, false)
+        .await
+        .expect("browse through the real client");
+    assert_eq!(result.entries.len(), 1, "Property filtered by default");
+    assert_eq!(result.entries[0].path, "[default]");
+    assert_eq!(result.entries[0].tag_type, "Provider");
+}
+
+/// read through the REAL client: batch body pinned, rows passed
+/// through VERBATIM (value raw, quality string never parsed).
+#[tokio::test]
+async fn read_passes_rows_through_the_real_client() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "action": "read",
+            "paths": ["[default]T1", "[default]Ghost"]
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"path": "[default]T1", "value": 7, "quality": "Good", "timestamp": "Mon Aug 24 00:00:00 UTC 2026"},
+                    {"path": "[default]Ghost", "value": null, "quality": "Bad_NotFound", "timestamp": "Mon Aug 24 00:00:00 UTC 2026"}
+                ]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_read(
+        &api,
+        "ign-cli",
+        &["[default]T1".to_string(), "[default]Ghost".to_string()],
+    )
+    .await
+    .expect("read through the real client");
+    assert_eq!(result.results.len(), 2);
+    assert_eq!(result.results[0].value, 7);
+    assert_eq!(result.results[1].quality, "Bad_NotFound");
+}
+
+/// THE write body pin through the REAL client: `{action, path,
+/// value}` EXACTLY — the scalar riding untyped.
+#[tokio::test]
+async fn write_body_pins_path_and_value_through_the_real_client() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "write",
+            "path": "[default]T1",
+            "value": 42
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [{"path": "[default]T1", "quality": "Good"}]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_write(&api, "ign-cli", "[default]T1", serde_json::json!(42))
+        .await
+        .expect("write through the real client");
+    assert_eq!(result.quality, "Good");
+    assert_eq!(guard.received_requests().await.len(), 1);
 }

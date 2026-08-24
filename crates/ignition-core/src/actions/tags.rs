@@ -11,11 +11,14 @@
 //!   (`--yes`, pre-resolution — the LOCKED shape).
 //! - **browse/read/write** (TAGS-02/03/04) ride the deployed
 //!   `tags` WebDev route through the 05-03 generic
-//!   [`GatewayApi::webdev_route_call`] — every one runs the
-//!   version precondition first (the 05-03 `webdev_precondition`):
-//!   absent/mismatched routes refuse exit 6 naming
-//!   `ign webdev deploy`. (Lands with the webdev seam half of this
-//!   plan.)
+//!   [`GatewayApi::webdev_route_call`] — every one runs
+//!   [`webdev_precondition`] first (the 05-03 shared helper, this
+//!   plan's `require_routes` verbatim: probe the tags route's
+//!   version handshake; absent → `routes_not_deployed`, unlicensed
+//!   → `webdev_unlicensed`, mismatch → `route_version_mismatch`,
+//!   all exit 6 with hints naming `ign webdev deploy`). One extra
+//!   round trip per command, correctness over latency — no caching
+//!   this phase (documented).
 //!
 //! Two-layer naming: the client models stay wire-faithful; the
 //! action results re-expose selected fields under unit-explicit
@@ -23,9 +26,10 @@
 
 use serde::Serialize;
 
+use crate::actions::webdev::webdev_precondition;
 use crate::client::GatewayApi;
 use crate::client::query::ListQuery;
-use crate::client::tags::{TagProviderCreate, TagProviderRecord};
+use crate::client::tags::{BrowseEntry, TagProviderCreate, TagProviderRecord};
 use crate::error::CoreError;
 
 /// `ign tags provider list` row — unit-explicit keys, ALL keys
@@ -145,6 +149,223 @@ pub async fn tag_provider_delete(
     })
 }
 
+/// One browse row — unit-explicit keys (two-layer naming over the
+/// wire-faithful [`BrowseEntry`]). `path` carries the bracketed
+/// `fullPath` (`[default]P5/T1`) so tree NESTING is derivable at the
+/// render layer without another round trip.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BrowseRow {
+    /// Bracket-qualified fullPath (nesting-derivable).
+    pub path: String,
+    /// Leaf name.
+    pub name: String,
+    /// Wire `tagType` token verbatim (Provider/Folder/AtomicTag/
+    /// UdtType/UdtInstance/Property).
+    pub tag_type: String,
+    /// Whether the entry has children (browse-deeper hint).
+    pub has_children: bool,
+    /// `dataType` for entries that carry one, else null.
+    pub data_type: Option<String>,
+}
+
+/// `ign tags browse` result — the flat ordered list (JSON mode's
+/// stable agent shape; tree RENDERING from `path` nesting is
+/// render.rs's job).
+#[derive(Debug, Serialize)]
+pub struct TagsBrowseResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The browse path sent (root = `""`).
+    pub path: String,
+    /// The substring filter applied, when one was.
+    pub filter: Option<String>,
+    /// Whether Property children were included (display default:
+    /// filtered out).
+    pub include_properties: bool,
+    /// Filtered, gateway-ordered entries.
+    pub entries: Vec<BrowseRow>,
+}
+
+/// One read row — VERBATIM from the route envelope: quality strings
+/// carry embedded detail (`Good`, `Bad_NotFound`, …) and are never
+/// parsed further (quality IS data).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TagReadRow {
+    /// The tag path read.
+    pub path: String,
+    /// The value, raw JSON passthrough.
+    pub value: serde_json::Value,
+    /// Quality string verbatim (never parsed further).
+    pub quality: String,
+    /// Timestamp string verbatim.
+    pub timestamp: String,
+}
+
+/// `ign tags read` result — single path = one-element vec (the route
+/// is always batch).
+#[derive(Debug, Serialize)]
+pub struct TagsReadResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// Per-path rows, request order.
+    pub results: Vec<TagReadRow>,
+}
+
+/// `ign tags write` result.
+#[derive(Debug, Serialize)]
+pub struct TagsWriteResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The tag path written.
+    pub path: String,
+    /// Post-write quality string verbatim (`Good` on success —
+    /// quality IS data, the e2e gate's honest oracle).
+    pub quality: String,
+}
+
+/// The route's tags folder name (the precondition's canonical
+/// probe target too — one constant, never drift).
+const TAGS_ROUTE: &str = "tags";
+
+/// The display filter: Property children dropped UNLESS included
+/// (research display default), then the case-insensitive substring
+/// on name+fullPath when one was provided. Pure — unit-pinned.
+fn filter_entries(
+    entries: Vec<BrowseEntry>,
+    filter: Option<&str>,
+    include_properties: bool,
+) -> Vec<BrowseRow> {
+    entries
+        .into_iter()
+        .filter(|entry| include_properties || entry.tag_type != "Property")
+        .filter(|entry| {
+            let Some(needle) = filter else {
+                return true;
+            };
+            let needle = needle.to_lowercase();
+            entry.name.to_lowercase().contains(&needle)
+                || entry.full_path.to_lowercase().contains(&needle)
+        })
+        .map(|entry| BrowseRow {
+            path: entry.full_path,
+            name: entry.name,
+            tag_type: entry.tag_type,
+            has_children: entry.has_children,
+            data_type: entry.data_type,
+        })
+        .collect()
+}
+
+/// Deserialize the route's `{results: [...]}` payload rows as
+/// [`BrowseEntry`]s (the wire-faithful half of two-layer naming).
+fn parse_results<T: serde::de::DeserializeOwned>(
+    data: &serde_json::Value,
+    context: &str,
+) -> Result<Vec<T>, CoreError> {
+    serde_json::from_value(data["results"].clone()).map_err(|err| {
+        CoreError::Internal(format!(
+            "tags route {context} returned an unexpected shape \
+             (missing/invalid `results`: {err})"
+        ))
+    })
+}
+
+/// `ign tags browse [PATH]` — route action `browse` → the filtered
+/// flat list. Runs the version precondition first (every
+/// webdev-dependent command's LOCKED refusal matrix).
+pub async fn tags_browse(
+    api: &dyn GatewayApi,
+    project: &str,
+    path: &str,
+    filter: Option<&str>,
+    include_properties: bool,
+) -> Result<TagsBrowseResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAGS_ROUTE,
+            &serde_json::json!({"action": "browse", "path": path}),
+            &[],
+        )
+        .await?;
+    let entries: Vec<BrowseEntry> = parse_results(&data, "browse")?;
+    Ok(TagsBrowseResult {
+        project: project.to_string(),
+        path: path.to_string(),
+        filter: filter.map(str::to_string),
+        include_properties,
+        entries: filter_entries(entries, filter, include_properties),
+    })
+}
+
+/// `ign tags read PATH...` — route action `read` (the route is
+/// always batch; a single path is a one-element vec). Rows ride
+/// VERBATIM from the envelope.
+pub async fn tags_read(
+    api: &dyn GatewayApi,
+    project: &str,
+    paths: &[String],
+) -> Result<TagsReadResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAGS_ROUTE,
+            &serde_json::json!({"action": "read", "paths": paths}),
+            &[],
+        )
+        .await?;
+    let wire_rows: Vec<serde_json::Value> = parse_results(&data, "read")?;
+    let results = wire_rows
+        .into_iter()
+        .map(|row| TagReadRow {
+            path: row["path"].as_str().unwrap_or_default().to_string(),
+            value: row["value"].clone(),
+            quality: row["quality"].as_str().unwrap_or_default().to_string(),
+            timestamp: row["timestamp"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect();
+    Ok(TagsReadResult {
+        project: project.to_string(),
+        results,
+    })
+}
+
+/// `ign tags write PATH --value V` — route action `write`; the value
+/// is a JSON scalar the CLI passes through untyped (the
+/// write-scalar-is-JSON rule, README-documented).
+pub async fn tags_write(
+    api: &dyn GatewayApi,
+    project: &str,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<TagsWriteResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAGS_ROUTE,
+            &serde_json::json!({"action": "write", "path": path, "value": value}),
+            &[],
+        )
+        .await?;
+    let mut rows: Vec<serde_json::Value> = parse_results(&data, "write")?;
+    let row = if rows.len() == 1 {
+        rows.remove(0)
+    } else {
+        return Err(CoreError::Internal(format!(
+            "tags route write returned {} result rows (expected exactly 1)",
+            rows.len()
+        )));
+    };
+    Ok(TagsWriteResult {
+        project: project.to_string(),
+        path: row["path"].as_str().unwrap_or_default().to_string(),
+        quality: row["quality"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -158,14 +379,22 @@ mod tests {
 
     use std::sync::Mutex;
 
-    /// A scripted double: the provider methods answer from fixtures
-    /// (recorded so the chain can be asserted). Everything else is
-    /// unreachable (the established action-double shape).
+    /// A scripted double: the provider methods AND the webdev seam
+    /// answer from fixtures (recorded so the chain can be
+    /// asserted). Everything else is unreachable (the established
+    /// action-double shape).
     struct TagsRig {
         providers: Vec<TagProviderRecord>,
         found: Mutex<Vec<String>>,
         deleted: Mutex<Vec<(String, String)>>,
         created: Mutex<Vec<serde_json::Value>>,
+        /// The scripted probe answer (default: a matching Present —
+        /// the precondition passes).
+        probe: crate::client::webdev::RouteProbe,
+        /// Recorded route-call bodies (the write body pin's oracle).
+        calls: Mutex<Vec<serde_json::Value>>,
+        /// The scripted route-call `data` payload.
+        route_data: serde_json::Value,
     }
 
     impl TagsRig {
@@ -175,7 +404,23 @@ mod tests {
                 found: Mutex::new(Vec::new()),
                 deleted: Mutex::new(Vec::new()),
                 created: Mutex::new(Vec::new()),
+                probe: crate::client::webdev::RouteProbe::Present {
+                    route_version: crate::webdev::ROUTE_BUNDLE_VERSION.to_string(),
+                },
+                calls: Mutex::new(Vec::new()),
+                route_data: serde_json::json!({"results": []}),
             }
+        }
+
+        /// Script the probe answer + the route-call payload.
+        fn route(
+            mut self,
+            probe: crate::client::webdev::RouteProbe,
+            route_data: serde_json::Value,
+        ) -> Self {
+            self.probe = probe;
+            self.route_data = route_data;
+            self
         }
     }
 
@@ -351,10 +596,11 @@ mod tests {
             &self,
             _project: &str,
             _route: &str,
-            _body: &serde_json::Value,
+            body: &serde_json::Value,
             _extra_headers: &[(&str, &str)],
         ) -> Result<serde_json::Value, CoreError> {
-            unreachable!("not part of this action")
+            self.calls.lock().unwrap().push(body.clone());
+            Ok(self.route_data.clone())
         }
         async fn webdev_route_probe(
             &self,
@@ -362,7 +608,7 @@ mod tests {
             _route: &str,
             _extra_headers: &[(&str, &str)],
         ) -> Result<crate::client::webdev::RouteProbe, CoreError> {
-            unreachable!("not part of this action")
+            Ok(self.probe.clone())
         }
         async fn projects(
             &self,
@@ -513,5 +759,204 @@ mod tests {
         assert_eq!(result.providers.len(), 2);
         assert_eq!(result.providers[1].name, "System");
         assert!(result.providers[1].managed);
+    }
+
+    // ---- browse/read/write (TAGS-02/03/04) ----
+
+    use super::{BrowseRow, filter_entries, tags_browse, tags_read, tags_write};
+    use crate::client::tags::BrowseEntry;
+    use crate::client::webdev::RouteProbe;
+    use crate::webdev::ROUTE_BUNDLE_VERSION as BUNDLE_VERSION;
+
+    fn entry(full_path: &str, name: &str, tag_type: &str) -> BrowseEntry {
+        BrowseEntry {
+            full_path: full_path.to_string(),
+            name: name.to_string(),
+            tag_type: tag_type.to_string(),
+            has_children: false,
+            data_type: None,
+        }
+    }
+
+    /// THE display default: Property children are dropped UNLESS
+    /// explicitly included (research display default).
+    #[test]
+    fn browse_filter_drops_properties_unless_included() {
+        let entries = vec![
+            entry("[default]", "default", "Provider"),
+            entry("[default]T1", "T1", "AtomicTag"),
+            entry("[default]T1.valueSource", "valueSource", "Property"),
+        ];
+        let rows = filter_entries(entries.clone(), None, false);
+        assert_eq!(rows.len(), 2, "Property dropped by default");
+        assert!(rows.iter().all(|row| row.tag_type != "Property"));
+
+        let rows = filter_entries(entries, None, true);
+        assert_eq!(rows.len(), 3, "--include-properties keeps them");
+    }
+
+    /// The substring filter is case-insensitive and matches EITHER
+    /// the leaf name OR the full path.
+    #[test]
+    fn browse_filter_substring_matches_name_or_path_case_insensitively() {
+        let entries = vec![
+            entry("[default]Pump1", "Pump1", "AtomicTag"),
+            entry("[default]PUMP2", "PUMP2", "AtomicTag"),
+            entry("[default]Motor1", "Motor1", "AtomicTag"),
+            entry("[default]Area/Pump3", "Pump3", "AtomicTag"),
+        ];
+        // Name match, case-insensitive both directions.
+        let rows = filter_entries(entries.clone(), Some("pump"), false);
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec!["[default]Pump1", "[default]PUMP2", "[default]Area/Pump3"]
+        );
+        // Path-only match (needle hits the folder, not the leaf).
+        let rows = filter_entries(entries, Some("area/"), false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "[default]Area/Pump3");
+    }
+
+    /// Rows carry the unit-explicit keys with fullPath as `path`
+    /// (nesting-derivable).
+    #[test]
+    fn browse_rows_map_unit_explicit_keys() {
+        let mut tag = entry("[default]T1", "T1", "AtomicTag");
+        tag.has_children = true;
+        tag.data_type = Some("Int4".into());
+        let rows = filter_entries(vec![tag], None, false);
+        assert_eq!(
+            rows[0],
+            BrowseRow {
+                path: "[default]T1".into(),
+                name: "T1".into(),
+                tag_type: "AtomicTag".into(),
+                has_children: true,
+                data_type: Some("Int4".into()),
+            }
+        );
+    }
+
+    /// browse rides the precondition + the route action and filters
+    /// the payload's entries.
+    #[tokio::test]
+    async fn browse_probes_then_calls_and_filters() {
+        let rig = TagsRig::with(Vec::new()).route(
+            RouteProbe::Present {
+                route_version: BUNDLE_VERSION.to_string(),
+            },
+            serde_json::json!({"results": [
+                {"fullPath": "[default]", "name": "default", "tagType": "Provider", "hasChildren": true, "dataType": null},
+                {"fullPath": "[default]T1.value", "name": "value", "tagType": "Property", "hasChildren": false, "dataType": "Float8"}
+            ]}),
+        );
+        let result = tags_browse(&rig, "ign-cli", "", None, false)
+            .await
+            .expect("browse filters");
+        assert_eq!(result.entries.len(), 1, "Property filtered by default");
+        assert_eq!(result.entries[0].tag_type, "Provider");
+        assert_eq!(result.project, "ign-cli");
+        // The recorded call: precondition passed, browse dispatched.
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "browse");
+        assert_eq!(calls[0]["path"], "");
+    }
+
+    /// THE refusal inheritance: an absent route (405 probe) refuses
+    /// `routes_not_deployed` (exit 6) BEFORE any route call — the
+    /// precondition every webdev-dependent command runs.
+    #[tokio::test]
+    async fn browse_refuses_when_routes_absent() {
+        let rig = TagsRig::with(Vec::new()).route(RouteProbe::Absent, serde_json::json!({}));
+        let err = tags_browse(&rig, "ign-cli", "", None, false)
+            .await
+            .expect_err("absent routes refuse");
+        assert_eq!(err.code(), "routes_not_deployed");
+        assert_eq!(err.exit_code(), 6);
+        assert!(
+            rig.calls.lock().unwrap().is_empty(),
+            "zero route calls ran past the refusal"
+        );
+    }
+
+    /// A version-mismatched route refuses `route_version_mismatch`
+    /// (the redeploy-or-update hint is the error's own).
+    #[tokio::test]
+    async fn browse_refuses_on_version_mismatch() {
+        let rig = TagsRig::with(Vec::new()).route(
+            RouteProbe::Present {
+                route_version: "0.9.0".to_string(),
+            },
+            serde_json::json!({}),
+        );
+        let err = tags_browse(&rig, "ign-cli", "", None, false)
+            .await
+            .expect_err("mismatched version refuses");
+        assert_eq!(err.code(), "route_version_mismatch");
+        assert_eq!(err.exit_code(), 6);
+    }
+
+    /// read passes rows through VERBATIM (value raw JSON, quality/
+    /// timestamp strings never parsed further) and always rides the
+    /// batch shape.
+    #[tokio::test]
+    async fn read_passes_rows_through_verbatim() {
+        let rig = TagsRig::with(Vec::new()).route(
+            RouteProbe::Present {
+                route_version: BUNDLE_VERSION.to_string(),
+            },
+            serde_json::json!({"results": [
+                {"path": "[default]T1", "value": 7, "quality": "Good", "timestamp": "Mon Aug 24 00:00:00 UTC 2026"},
+                {"path": "[default]Ghost", "value": null, "quality": "Bad_NotFound", "timestamp": "Mon Aug 24 00:00:00 UTC 2026"}
+            ]}),
+        );
+        let result = tags_read(&rig, "ign-cli", &["[default]T1".into(), "[default]Ghost".into()])
+            .await
+            .expect("read parses");
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].value, 7);
+        assert_eq!(result.results[1].quality, "Bad_NotFound");
+        // The wire body pinned: batch paths array, request order.
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0]["paths"],
+            serde_json::json!(["[default]T1", "[default]Ghost"])
+        );
+    }
+
+    /// THE write body pin: `{action, path, value}` — value riding
+    /// EXACTLY as passed (a JSON scalar, untyped at this layer).
+    #[tokio::test]
+    async fn write_body_pins_path_and_value_exactly() {
+        let rig = TagsRig::with(Vec::new()).route(
+            RouteProbe::Present {
+                route_version: BUNDLE_VERSION.to_string(),
+            },
+            serde_json::json!({"results": [{"path": "[default]T1", "quality": "Good"}]}),
+        );
+        let result = tags_write(&rig, "ign-cli", "[default]T1", serde_json::json!(42))
+            .await
+            .expect("write parses");
+        assert_eq!(result.quality, "Good");
+        assert_eq!(result.path, "[default]T1");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "write", "path": "[default]T1", "value": 42}),
+            "the write body is exactly action+path+value"
+        );
+    }
+
+    /// Write inherits the precondition too (the refusal matrix is
+    /// every webdev-dependent verb's, not just browse's).
+    #[tokio::test]
+    async fn write_refuses_when_routes_absent() {
+        let rig = TagsRig::with(Vec::new()).route(RouteProbe::Absent, serde_json::json!({}));
+        let err = tags_write(&rig, "ign-cli", "[default]T1", serde_json::json!(1))
+            .await
+            .expect_err("absent routes refuse");
+        assert_eq!(err.code(), "routes_not_deployed");
+        assert!(rig.calls.lock().unwrap().is_empty());
     }
 }
