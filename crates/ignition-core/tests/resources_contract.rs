@@ -1,284 +1,420 @@
-//! Wiremock contract tests for the project-resource family (03-03,
-//! PROJ-05) — ⚠ THE MEDIUM-confidence family: these paths exist only
-//! in ignition-mcp (single source; absent from the official 83-api
-//! collection — Phase 2 caught that client inventing paths), so every
-//! fixture here is mcp-derived and the live-capture gate lives in
-//! `crates/ignition-cli/tests/e2e_projects.rs` (openapi extract).
+//! Wiremock contract tests for the resource family re-point (05-02,
+//! closing the Phase 3 cross-phase defect): every op orchestrates
+//! export → zip-member surgery → import(overwrite) over the REAL
+//! client — no `/projects/{p}/resources/**` request ever rides the
+//! wire (those routes do not exist on real 8.3 gateways;
+//! openapi-evidenced, 575 paths, zero matches).
 //!
-//! The crown pins are RECORDED-REQUEST proofs, per the family rules:
-//! - the `path=<prefix>` QUERY filter rides the request ONLY when a
-//!   prefix is given (mcp's `params={"path": …}`) — no prefix, no
-//!   param at all;
-//! - a SPACED resource path hits the exact per-segment-encoded path
-//!   with `/` separators intact (`…/resources/com%2Ex/views/
-//!   My%20Folder/V1` — over-encoding the `.` is safe, the server
-//!   decodes before matching);
-//! - put carries the EXACT body bytes + the declared Content-Type;
-//! - delete hits the exact path;
-//! - 404 get → `not_found`; 401 Jetty HTML → `Auth` (the family
-//!   classifies like every other).
+//! THE crown pins are REQUEST-SEQUENCE proofs at the actions layer
+//! (the orchestration's home since the re-point):
+//! - list/get fire EXACTLY ONE export GET and ZERO import POSTs
+//!   (reads never mutate — an import would replace the project);
+//! - put/delete fire export GET then import POST with
+//!   `overwrite=true` on the QUERY string, `Content-Type:
+//!   application/zip`, and a body the test round-trips through the
+//!   SAME surgery helpers to assert the member changed (member-level
+//!   honesty — byte-exact zip equality is not required);
+//! - put APPENDS absent members (upsert) and preserves neighbors;
+//! - a nonexistent project surfaces through export's existing 404
+//!   path (`not_found`, exit 6) — for every op in the family.
 
+use ignition_core::actions::resources as actions;
 mod common;
-
-use common::IgnitionMock;
-use ignition_core::client::{GatewayApi, ReqwestGatewayApi};
+use ignition_core::client::ReqwestGatewayApi;
+use ignition_core::client::resources::{read_member, resource_members};
 use ignition_core::error::CoreError;
 
-/// The list parses a plausible mcp-shaped item (typed `path` +
-/// passthrough extras) inside the standard `{items, metadata}`
-/// envelope — and the recorded request proves NO `path` query param
-/// rode the wire (the filter is opt-in).
-#[tokio::test]
-async fn resources_list_parses_without_prefix_param() {
-    let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/PlantFloor/resources",
-        ))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": [
-                    {
-                        "path": "com.inductiveautomation.perspective/views/Dashboard",
-                        "scope": "A",
-                        "version": 1,
-                        "restricted": false
-                    },
-                    {
-                        "path": "ignition/script-python/e2e/scratch",
-                        "scope": "G"
-                    }
-                ],
-                "metadata": {"total": 2, "matching": 2, "limit": -1, "offset": 0}
-            })),
-        )
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
-
-    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
-    let page = api
-        .project_resources("PlantFloor", None)
-        .await
-        .expect("plausible list shape must parse");
-    assert_eq!(page.items.len(), 2);
-    assert_eq!(
-        page.items[0].path.as_deref(),
-        Some("com.inductiveautomation.perspective/views/Dashboard")
-    );
-    assert_eq!(
-        page.items[0].extra.get("scope"),
-        Some(&serde_json::json!("A")),
-        "unmodeled keys round-trip (MEDIUM shape, passthrough)"
-    );
-
-    let requests = guard.received_requests().await;
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].url.query().is_none(),
-        "NO prefix given = NO path param on the wire: {}",
-        requests[0].url
-    );
+/// Build a small export zip: `project.json` + one member per pair, in
+/// order (the same zip crate the surgery rides — honest fixtures).
+fn fixture_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("project.json", options)
+        .expect("project.json starts");
+    writer
+        .write_all(br#"{"title":"T","enabled":true}"#)
+        .expect("project.json writes");
+    for (name, bytes) in members {
+        writer.start_file(*name, options).expect("member starts");
+        writer.write_all(bytes).expect("member writes");
+    }
+    writer.finish().expect("zip finalizes").into_inner()
 }
 
-/// THE filter pin: `--prefix view` rides the wire as `path=view` —
-/// and ONLY that param (no list-envelope limit/offset extras; mcp's
-/// params carry just the prefix).
-#[tokio::test]
-async fn resources_list_prefix_rides_path_query_param() {
-    let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/PlantFloor/resources",
-        ))
-        .and(wiremock::matchers::query_param("path", "ignition/views"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"items": [], "metadata": {}})),
-        )
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+/// The two-member fixture the sequence pins ride: a core script
+/// (member form `<collection>/resources/<rest>`) and a Perspective
+/// view file.
+const SCRIPT_MEMBER: &str = "ignition/resources/script-python/e2e/scratch";
+const SCRIPT_USER_PATH: &str = "ignition/script-python/e2e/scratch";
+const VIEW_MEMBER: &str = "com.example/resources/views/Dashboard/view.json";
 
-    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
-    let page = api
-        .project_resources("PlantFloor", Some("ignition/views"))
-        .await
-        .expect("prefix-filtered list classifies Ok");
-    assert!(page.items.is_empty());
-
-    let requests = guard.received_requests().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].url.query(),
-        Some("path=ignition%2Fviews".to_string()).as_deref(),
-        "the prefix rides the path query param (its own / encodes): {}",
-        requests[0].url
-    );
+fn sample_export_zip() -> Vec<u8> {
+    fixture_zip(&[
+        (
+            SCRIPT_MEMBER,
+            br#"{"scope":"G","code":"print('old')"}"#.as_slice(),
+        ),
+        (VIEW_MEMBER, br#"{"scope":"A"}"#.as_slice()),
+    ])
 }
 
-/// THE Pitfall-6 pin: a SPACED resource path (mixed case, dot in the
-/// module segment, space in the folder) hits the EXACT per-segment
-/// encoded path with `/` separators intact — the recorded request
-/// proves the wire form.
-#[tokio::test]
-async fn resource_get_encodes_spaced_path_exact() {
-    let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/My%20Proj/resources/com%2Ex/views/My%20Folder/V1",
+/// Mount the export GET (200 + the zip body) with `expect(n)`.
+async fn mount_export(server: &wiremock::MockServer, project: &str, zip: Vec<u8>, n: u64) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/export/{project}"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
+        .expect(n)
+        .mount(server)
+        .await;
+}
+
+/// Mount the import POST (matching `overwrite=true` + the zip content
+/// type) with `expect(n)` — the mutation half of every surgery
+/// sequence.
+async fn mount_import(server: &wiremock::MockServer, project: &str, n: u64) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/import/{project}"
+        )))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/zip",
         ))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
-                // set_body_raw: the resource body is JSON bytes with a
-                // JSON content type — exactly as the gateway would.
-                .set_body_raw(b"{\"scope\":\"A\"}".to_vec(), "application/json"),
+                .set_body_json(serde_json::json!({"success": true})),
         )
-        .expect(1)
-        .mount_as_scoped(&server)
+        .expect(n)
+        .mount(server)
         .await;
+}
+
+/// THE read-sequence pin: `resource list` fires exactly ONE export
+/// GET and ZERO import POSTs, and the member map lands in the result
+/// (user-facing paths, `resources/` stripped, `project.json` gone).
+#[tokio::test]
+async fn resource_list_is_export_only() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    mount_import(&server, "p", 0).await;
 
     let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
-    let content = api
-        .project_resource_get("My Proj", "com.x/views/My Folder/V1")
+    let result = actions::resources_list(&api, "p", None)
         .await
-        .expect("encoded path classifies Ok");
-    assert_eq!(content.bytes, b"{\"scope\":\"A\"}".to_vec());
-    assert_eq!(content.content_type.as_deref(), Some("application/json"));
-
-    let requests = guard.received_requests().await;
-    assert_eq!(requests.len(), 1);
+        .expect("list orchestrates Ok");
     assert_eq!(
-        requests[0].url.path(),
-        "/data/api/v1/projects/My%20Proj/resources/com%2Ex/views/My%20Folder/V1",
-        "per-segment encoding, slashes intact (project fully encoded)"
+        result
+            .resources
+            .iter()
+            .filter_map(|entry| entry.path.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            "ignition/script-python/e2e/scratch",
+            "com.example/views/Dashboard/view.json",
+        ],
+        "member paths map to the user-facing form"
     );
 }
 
-/// THE put pin: the EXACT body bytes ride the request with the
-/// DECLARED Content-Type (the actions-layer sniffer decides both —
-/// the client seam passes them through untouched).
+/// The prefix filter is CLIENT-SIDE now: it narrows the member list
+/// after the (single) export — no query param rides the wire.
 #[tokio::test]
-async fn resource_put_carries_exact_bytes_and_content_type() {
+async fn resource_list_prefix_filters_client_side() {
     let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("PUT"))
-        .and(wiremock::matchers::path(
-            // over-encoding is safe: `-` rides as %2D (NON_ALPHANUMERIC)
-            "/data/api/v1/projects/p/resources/ignition/script%2Dpython/e2e/scratch",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
 
     let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
-    let body = br#"{"scope":"G","code":"print('hi')"}"#.to_vec();
-    api.project_resource_put(
-        "p",
-        "ignition/script-python/e2e/scratch",
-        body.clone(),
-        "application/json",
-    )
-    .await
-    .expect("put classifies Ok (upsert semantics)");
-
-    let requests = guard.received_requests().await;
-    assert_eq!(requests.len(), 1);
+    let result = actions::resources_list(&api, "p", Some("com.example"))
+        .await
+        .expect("prefix-filtered list Ok");
     assert_eq!(
-        requests[0].body, body,
-        "the EXACT bytes ride the request, untransformed"
+        result.resources[0].path.as_deref(),
+        Some("com.example/views/Dashboard/view.json"),
+        "only the prefixed member survives"
     );
-    assert_eq!(
-        requests[0]
-            .headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json"),
-        "the DECLARED content type rides the request"
-    );
-    assert_eq!(
-        requests[0].url.path(),
-        "/data/api/v1/projects/p/resources/ignition/script%2Dpython/e2e/scratch",
-        "the wire saw the per-segment-encoded path"
-    );
+    assert_eq!(result.resources.len(), 1);
 }
 
-/// The delete pin: DELETE hits the exact per-segment-encoded path
-/// (authed, empty body — the destructive verb's wire shape).
+/// THE read-sequence pin for get: ONE export, ZERO imports — and the
+/// member bytes ride out VERBATIM for the sniffer.
 #[tokio::test]
-async fn resource_delete_hits_exact_path() {
+async fn resource_get_is_export_only_and_verbatim() {
     let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("DELETE"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/com%2Ex/views/My%20Folder/V1",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    mount_import(&server, "p", 0).await;
 
-    let api = ReqwestGatewayApi::for_tests(
-        &server.uri(),
-        Some(ignition_core::config::Credential::Token(
-            ignition_core::config::Secret::new("name:key"),
-        )),
-    );
-    api.project_resource_delete("p", "com.x/views/My Folder/V1")
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = actions::resource_get(&api, "p", SCRIPT_USER_PATH)
         .await
-        .expect("delete classifies Ok");
-
-    let requests = guard.received_requests().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].url.path(),
-        "/data/api/v1/projects/p/resources/com%2Ex/views/My%20Folder/V1"
-    );
-    assert!(requests[0].body.is_empty(), "the DELETE carries no body");
-    let headers = format!("{:?}", requests[0].headers).to_lowercase();
-    assert!(
-        headers.contains("x-ignition-api-token"),
-        "the mutation is authed: {headers}"
-    );
+        .expect("get orchestrates Ok");
+    assert_eq!(result.content_kind, "json");
+    assert_eq!(result.content["code"], "print('old')");
 }
 
-/// A nonexistent resource: 404 → `NotFound` (exit 6) — the
-/// classification the surgical loop's `resource get` surfaces.
+/// A missing member is the family's not-found shape (exit 6) — from
+/// the surgery helper, over the export transport, still ONE export
+/// and ZERO imports.
 #[tokio::test]
-async fn resource_get_nonexistent_is_not_found() {
-    let mock = IgnitionMock::start().await;
-    mock.status_json(
-        "GET",
-        "/data/api/v1/projects/p/resources/nope",
-        404,
-        serde_json::json!({"message": "Resource not found"}),
-    )
-    .await;
+async fn resource_get_missing_member_is_not_found() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    mount_import(&server, "p", 0).await;
 
-    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
-    let err = api
-        .project_resource_get("p", "nope")
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = actions::resource_get(&api, "p", "ignition/script-python/nope")
         .await
-        .expect_err("404 must fail");
+        .expect_err("missing member must fail");
     assert!(
-        matches!(&err, CoreError::NotFound { .. }),
+        matches!(err, CoreError::NotFound { .. }),
         "wrong class: {err}"
     );
     assert_eq!(err.exit_code(), 6);
     assert_eq!(err.code(), "not_found");
 }
 
-/// 401 Jetty HTML (header-less get against default security) →
-/// `Auth` (exit 5) — the standard page that crashes naive `.json()`;
-/// classify runs before any body consumption, binary or otherwise.
+/// THE binary fence on the new transport: a member whose BYTES sniff
+/// binary refuses `resource_binary` (exit 6) — the export still rode
+/// (the sniff happens after the member read), but ZERO imports: a
+/// data.bin-class resource must never round-trip the JSON loop.
 #[tokio::test]
-async fn resource_get_html_401_classifies_auth() {
-    let mock = IgnitionMock::start().await;
-    mock.html_error("GET", "/data/api/v1/projects/p/resources/x", 401)
+async fn resource_get_binary_member_refuses() {
+    let server = wiremock::MockServer::start().await;
+    let binary_zip = fixture_zip(&[("com.x/resources/perms/data.bin", &[0x00, 0x50, 0x4B, 0x03])]);
+    mount_export(&server, "p", binary_zip, 1).await;
+    mount_import(&server, "p", 0).await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = actions::resource_get(&api, "p", "com.x/perms/data.bin")
+        .await
+        .expect_err("binary member must refuse");
+    assert!(
+        matches!(err, CoreError::ResourceBinary { .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(err.code(), "resource_binary");
+}
+
+/// THE put-sequence pin: export GET THEN import POST
+/// (`overwrite=true`, `application/zip`), and the import body —
+/// round-tripped through the same surgery helpers — carries the NEW
+/// member content with the neighbor preserved.
+#[tokio::test]
+async fn resource_put_runs_export_then_overwrite_import() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let new_body = br#"{"scope":"G","code":"print('new')"}"#.to_vec();
+    let result = actions::resource_put(&api, "p", SCRIPT_USER_PATH, new_body.clone())
+        .await
+        .expect("put orchestrates Ok");
+    assert_eq!(result.content_kind, "json");
+
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import POST");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip"),
+        "the import body declares the zip content type"
+    );
+    // Member-level honesty on the surgical body (byte-exact zip
+    // equality is NOT the contract — the members are).
+    assert_eq!(
+        read_member(&requests[0].body, SCRIPT_USER_PATH).expect("surgical body re-reads"),
+        new_body,
+        "the import body carries the NEW member content"
+    );
+    assert_eq!(
+        read_member(&requests[0].body, "com.example/views/Dashboard/view.json")
+            .expect("neighbor survives"),
+        br#"{"scope":"A"}"#.to_vec(),
+        "the untouched neighbor rides the surgical zip"
+    );
+    assert_eq!(resource_members(&requests[0].body).unwrap().len(), 2);
+}
+
+/// THE upsert pin: putting an ABSENT member appends it — the import
+/// body carries the new member plus every original.
+#[tokio::test]
+async fn resource_put_appends_absent_member() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    actions::resource_put(
+        &api,
+        "p",
+        "ignition/script-python/e2e/brand-new",
+        b"print('x')".to_vec(),
+    )
+    .await
+    .expect("append put Ok");
+
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    let members = resource_members(&requests[0].body).expect("surgical body lists");
+    assert!(members.contains(&"ignition/script-python/e2e/brand-new".to_string()));
+    assert!(members.contains(&SCRIPT_USER_PATH.to_string()));
+    assert_eq!(
+        read_member(&requests[0].body, "ignition/script-python/e2e/brand-new").unwrap(),
+        b"print('x')".to_vec()
+    );
+}
+
+/// A BINARY put input refuses BEFORE any network I/O: no export, no
+/// import — binary content never enters the surgery (Pitfall 7).
+#[tokio::test]
+async fn resource_put_binary_input_refuses_before_network() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 0).await;
+    mount_import(&server, "p", 0).await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = actions::resource_put(&api, "p", "com.x/perms/data.bin", vec![0x00, 0x50, 0x4B])
+        .await
+        .expect_err("binary input must refuse");
+    assert!(matches!(err, CoreError::ResourceBinary { .. }), "{err}");
+    assert_eq!(err.exit_code(), 6);
+}
+
+/// THE delete-sequence pin: export THEN overwrite-import, and the
+/// import body NO LONGER carries the member (surgically removed) —
+/// while the neighbor survives.
+#[tokio::test]
+async fn resource_delete_runs_export_then_overwrite_import() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = actions::resource_delete(&api, "p", "com.example/views/Dashboard/view.json")
+        .await
+        .expect("delete orchestrates Ok");
+    assert_eq!(result.deleted, "com.example/views/Dashboard/view.json");
+
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import POST");
+    let gone = read_member(&requests[0].body, "com.example/views/Dashboard/view.json");
+    assert!(
+        matches!(gone, Err(CoreError::NotFound { .. })),
+        "the member is GONE from the surgical body"
+    );
+    assert_eq!(
+        resource_members(&requests[0].body).expect("surgical body lists"),
+        vec![SCRIPT_USER_PATH.to_string()],
+        "exactly the neighbor survives"
+    );
+}
+
+/// Deleting a MISSING member is not-found — and ZERO imports fire
+/// (nothing to remove; the project is never touched).
+#[tokio::test]
+async fn resource_delete_missing_member_is_not_found_no_import() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    mount_import(&server, "p", 0).await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = actions::resource_delete(&api, "p", "com.example/views/Never")
+        .await
+        .expect_err("missing member must fail");
+    assert!(matches!(err, CoreError::NotFound { .. }), "{err}");
+    assert_eq!(err.exit_code(), 6);
+}
+
+/// THE project-error path pin: a nonexistent project surfaces through
+/// export's existing classification (404 JSON → `not_found`, exit 6)
+/// for EVERY op in the family.
+#[tokio::test]
+async fn nonexistent_project_surfaces_export_not_found() {
+    let server = wiremock::MockServer::start().await;
+    for method in ["GET", "POST"] {
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(
+                "/data/api/v1/projects/export/ghost",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"message": "No project ghost"})),
+            )
+            .expect(if method == "GET" { 4 } else { 0 })
+            .mount(&server)
+            .await;
+    }
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    for err in [
+        actions::resources_list(&api, "ghost", None)
+            .await
+            .expect_err("list on ghost project must fail"),
+        actions::resource_get(&api, "ghost", "x/y")
+            .await
+            .expect_err("get on ghost project must fail"),
+        actions::resource_put(&api, "ghost", "x/y", b"{}".to_vec())
+            .await
+            .expect_err("put on ghost project must fail"),
+        actions::resource_delete(&api, "ghost", "x/y")
+            .await
+            .expect_err("delete on ghost project must fail"),
+    ] {
+        assert!(
+            matches!(err, CoreError::NotFound { .. }),
+            "wrong class: {err}"
+        );
+        assert_eq!(err.exit_code(), 6);
+    }
+}
+
+/// The family classifies like every other: 401 Jetty HTML on the
+/// export (header-less under default security) → `Auth` (exit 5) —
+/// classify runs before any body consumption, zip or otherwise.
+#[tokio::test]
+async fn export_html_401_classifies_auth() {
+    let mock = common::IgnitionMock::start().await;
+    mock.html_error("GET", "/data/api/v1/projects/export/p", 401)
         .await;
 
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
-    let err = api
-        .project_resource_get("p", "x")
+    let err = actions::resources_list(&api, "p", None)
         .await
         .expect_err("401 must fail");
     assert!(
@@ -286,26 +422,4 @@ async fn resource_get_html_401_classifies_auth() {
         "wrong class: {err}"
     );
     assert_eq!(err.exit_code(), 5);
-}
-
-/// The list stays on the standard envelope path: the family does NOT
-/// smuggle ListQuery params (limit/offset) the way other lists do —
-/// mcp's list carries only the optional prefix. A spaced project
-/// name encodes on the list path too (the same encoder everywhere).
-#[tokio::test]
-async fn resources_list_encodes_spaced_project_name() {
-    let mock = IgnitionMock::start().await;
-    mock.list_json(
-        "GET",
-        "/data/api/v1/projects/My%20Proj/resources",
-        serde_json::json!({"items": [], "metadata": {"total": 0}}),
-    )
-    .await;
-
-    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
-    let page = api
-        .project_resources("My Proj", None)
-        .await
-        .expect("spaced project name encodes (exact-path mock matched)");
-    assert_eq!(page.metadata.total, 0);
 }

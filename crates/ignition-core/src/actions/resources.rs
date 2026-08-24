@@ -1,32 +1,54 @@
-//! Resource actions (03-03, PROJ-05): the surgical edit loop —
-//! list/get/put/delete ONE resource inside a project, serde models
-//! OUT, no printing (ARCHITECTURE.md layering: the Phase-6 TUI rides
-//! this same layer).
+//! Resource actions (05-02 re-point): the surgical edit loop —
+//! list/get/put/delete ONE resource inside a project — riding
+//! project-export ZIP surgery instead of the nonexistent
+//! `/projects/{p}/resources/**` REST routes (the Phase 3 cross-phase
+//! defect, closed here; 05-RESEARCH §Resource Family Decision).
+//! Serde models OUT, no printing (ARCHITECTURE.md layering: the
+//! Phase-6 TUI rides this same layer).
 //!
-//! The heart is [`classify_content`] — the classify/HTML-sniffer
-//! discipline INVERTED: instead of sniffing an ERROR body to pick an
-//! error class, it sniffs resource CONTENT to pick the wire
-//! representation. The order is the contract (Pitfall 7):
+//! THE ORCHESTRATION (transport swapped, UX contract untouched):
+//! - list/get: [`GatewayApi::project_export_to_file`] to a temp zip
+//!   → read the bytes → the pure helpers in
+//!   [`crate::client::resources`] (`resource_members` / `read_member`)
+//!   → the existing result shapes. A nonexistent project surfaces
+//!   through export's existing 404 path (`not_found`, exit 6).
+//! - put: sniff the INPUT first (binary refuses before ANY network) →
+//!   export → `replace_member` (append-when-absent = upsert) →
+//!   [`GatewayApi::project_import`] with `overwrite=true` — put
+//!   implicitly REPLACES the entire project, so the CLI guards it
+//!   `--yes` like every destructive verb (05-02; the 03-03 unguarded
+//!   put is superseded, README documents the consequence).
+//! - delete: same surgery with `remove_member` (missing member →
+//!   `not_found`) → import overwrite.
+//!
+//! Perf honesty (research's accepted trade): every resource op
+//! round-trips the WHOLE project zip. Rigs and dev projects are
+//! small; the alternative was the family not working at all.
+//!
+//! The heart that survives from 03-03 is [`classify_content`] — the
+//! classify/HTML-sniffer discipline INVERTED: it sniffs resource
+//! CONTENT to pick the wire representation. The order is the
+//! contract (Pitfall 7):
 //! 1. NUL byte in the first 8 KiB → Binary (refuse — a `data.bin`
 //!    resource must NEVER round-trip through the JSON/text loop;
 //!    export/import owns binary resources);
-//! 2. valid UTF-8 that JSON-parses → Json (`application/json` on
-//!    put; pretty-printed on get);
-//! 3. valid UTF-8 → Text (`text/plain; charset=utf-8` on put; raw
-//!    passthrough on get);
-//! 4. invalid UTF-8 (no NUL in the head) → Binary all the same —
-//!    non-UTF-8 payloads have no honest textual representation.
+//! 2. valid UTF-8 that JSON-parses → Json;
+//! 3. valid UTF-8 → Text;
+//! 4. invalid UTF-8 (no NUL in the head) → Binary all the same.
 //!
 //! The get result keeps the family's stable agent shape
 //! (`{project, path, content_kind, content}` — all keys always
 //! present; `content` is the parsed JSON value or the text as a JSON
 //! string); a Binary get refuses with [`CoreError::ResourceBinary`]
-//! before any result is built.
+//! before any result is built — now sniffed from the zip MEMBER
+//! bytes.
 
 use serde::Serialize;
 
 use crate::client::GatewayApi;
-use crate::client::resources::ResourceEntry;
+use crate::client::resources::{
+    ResourceEntry, read_member, remove_member, replace_member, resource_members,
+};
 use crate::error::CoreError;
 
 /// How far into a resource body the binary heuristic looks — real
@@ -72,22 +94,13 @@ impl ContentKind {
             Self::Binary => "binary",
         }
     }
-
-    /// The wire Content-Type a put of this kind declares.
-    fn put_content_type(&self) -> &'static str {
-        match self {
-            Self::Json(_) => "application/json",
-            Self::Text(_) => "text/plain; charset=utf-8",
-            Self::Binary => "application/octet-stream",
-        }
-    }
 }
 
-/// `ign resource list` output model: the passthrough entries, one
-/// path per line in human mode.
+/// `ign resource list` output model: the entries, one path per line
+/// in human mode (surgery-sourced entries carry only `path`).
 #[derive(Debug, Serialize)]
 pub struct ResourcesResult {
-    /// The project's resources (passthrough-heavy — MEDIUM shape).
+    /// The project's resources (member paths in zip order).
     pub resources: Vec<ResourceEntry>,
 }
 
@@ -114,7 +127,7 @@ pub struct ResourcePutResult {
     pub project: String,
     /// The resource path (created if absent — upsert).
     pub path: String,
-    /// "json" | "text" — the sniffed kind that rode the wire.
+    /// "json" | "text" — the sniffed kind that rode the surgery.
     pub content_kind: String,
 }
 
@@ -125,30 +138,58 @@ pub struct ResourceDeleteResult {
     pub deleted: String,
 }
 
-/// `ign resource list PROJECT [--prefix P]` — the passthrough entries;
-/// the prefix rides the wire as the server-side `path` filter.
+/// The shared first half of every resource op: stream the project
+/// export into a unique temp file, then read the bytes back for
+/// in-memory surgery. A nonexistent project fails inside export's
+/// existing classification (404 → `not_found`, exit 6). The
+/// `tempfile` dependency (promoted from dev — already in the
+/// workspace graph) owns uniqueness and cleanup-on-drop.
+async fn export_zip_bytes(api: &dyn GatewayApi, project: &str) -> Result<Vec<u8>, CoreError> {
+    let temp = tempfile::NamedTempFile::new()
+        .map_err(|err| CoreError::Internal(format!("cannot create temp export file: {err}")))?;
+    api.project_export_to_file(project, temp.path()).await?;
+    tokio::fs::read(temp.path()).await.map_err(|err| {
+        CoreError::Internal(format!(
+            "cannot read back export {}: {err}",
+            temp.path().display()
+        ))
+    })
+}
+
+/// `ign resource list PROJECT [--prefix P]` — export → member list.
+/// The prefix filters CLIENT-SIDE now (member paths, `starts_with`):
+/// the old server-side `path` query param rode routes that never
+/// existed; the UX contract (one path per line) is unchanged.
 pub async fn resources_list(
     api: &dyn GatewayApi,
     project: &str,
     prefix: Option<&str>,
 ) -> Result<ResourcesResult, CoreError> {
-    let page = api.project_resources(project, prefix).await?;
-    Ok(ResourcesResult {
-        resources: page.items,
-    })
+    let zip = export_zip_bytes(api, project).await?;
+    let resources = resource_members(&zip)?
+        .into_iter()
+        .filter(|path| prefix.is_none_or(|prefix| path.starts_with(prefix)))
+        .map(|path| ResourceEntry {
+            path: Some(path),
+            extra: Default::default(),
+        })
+        .collect();
+    Ok(ResourcesResult { resources })
 }
 
-/// `ign resource get PROJECT PATH` — fetch the RAW bytes, sniff, and
-/// hand back the stable shape. Binary → [`CoreError::ResourceBinary`]
-/// (exit 6): a `data.bin`-class resource must never be corrupted
-/// through the JSON loop (Pitfall 7).
+/// `ign resource get PROJECT PATH` — export → member read → sniff →
+/// the stable shape. Binary (now sniffed from the zip member bytes)
+/// → [`CoreError::ResourceBinary`] (exit 6): a `data.bin`-class
+/// resource must never be corrupted through the JSON loop (Pitfall
+/// 7). A missing member is `not_found` from the surgery helper.
 pub async fn resource_get(
     api: &dyn GatewayApi,
     project: &str,
     path: &str,
 ) -> Result<ResourceGetResult, CoreError> {
-    let raw = api.project_resource_get(project, path).await?;
-    match classify_content(&raw.bytes) {
+    let zip = export_zip_bytes(api, project).await?;
+    let bytes = read_member(&zip, path)?;
+    match classify_content(&bytes) {
         ContentKind::Json(value) => Ok(ResourceGetResult {
             project: project.to_string(),
             path: path.to_string(),
@@ -168,10 +209,13 @@ pub async fn resource_get(
     }
 }
 
-/// `ign resource put PROJECT PATH --file F|-` — sniff the INPUT: Json
-/// rides as `application/json`, Text as `text/plain; charset=utf-8`,
-/// Binary refuses (exit 6). Upsert semantics server-side: the
-/// resource is created when absent, replaced when present.
+/// `ign resource put PROJECT PATH --file F|-` — sniff the INPUT
+/// first: Binary refuses (exit 6) before ANY network I/O. Then the
+/// surgery loop: export → `replace_member` (append-when-absent =
+/// upsert) → import `overwrite=true`. The import REPLACES the entire
+/// project — replace-not-merge wipes concurrent Designer edits — so
+/// the CLI dispatch guards this verb `--yes` BEFORE resolution (the
+/// 05-02 destructive-verb set; 03-03's unguarded put is superseded).
 pub async fn resource_put(
     api: &dyn GatewayApi,
     project: &str,
@@ -185,9 +229,9 @@ pub async fn resource_put(
             endpoint: None,
         });
     }
-    let content_type = kind.put_content_type();
-    api.project_resource_put(project, path, input, content_type)
-        .await?;
+    let zip = export_zip_bytes(api, project).await?;
+    let surgical = replace_member(&zip, path, &input)?;
+    api.project_import(project, surgical, true).await?;
     Ok(ResourcePutResult {
         project: project.to_string(),
         path: path.to_string(),
@@ -195,15 +239,18 @@ pub async fn resource_put(
     })
 }
 
-/// `ign resource delete PROJECT PATH` — the obedient arm; the `--yes`
+/// `ign resource delete PROJECT PATH` — export → `remove_member`
+/// (missing member → `not_found`) → import overwrite. The `--yes`
 /// guard belongs to the CLI CALLER (it refuses pre-resolution, the
-/// LOCKED 02-03 shape). Audit-logged server-side.
+/// LOCKED 02-03 shape) — this arm only runs once confirmed.
 pub async fn resource_delete(
     api: &dyn GatewayApi,
     project: &str,
     path: &str,
 ) -> Result<ResourceDeleteResult, CoreError> {
-    api.project_resource_delete(project, path).await?;
+    let zip = export_zip_bytes(api, project).await?;
+    let surgical = remove_member(&zip, path)?;
+    api.project_import(project, surgical, true).await?;
     Ok(ResourceDeleteResult {
         deleted: path.to_string(),
     })
@@ -260,19 +307,11 @@ mod tests {
         assert_eq!(classify_content(&bytes), ContentKind::Binary);
     }
 
-    /// The labels and content types the results/requests ride on.
+    /// The labels the results ride on.
     #[test]
-    fn content_kind_labels_and_content_types() {
+    fn content_kind_labels() {
         assert_eq!(ContentKind::Json(serde_json::json!(1)).label(), "json");
         assert_eq!(ContentKind::Text(String::new()).label(), "text");
         assert_eq!(ContentKind::Binary.label(), "binary");
-        assert_eq!(
-            ContentKind::Json(serde_json::json!(1)).put_content_type(),
-            "application/json"
-        );
-        assert_eq!(
-            ContentKind::Text(String::new()).put_content_type(),
-            "text/plain; charset=utf-8"
-        );
     }
 }

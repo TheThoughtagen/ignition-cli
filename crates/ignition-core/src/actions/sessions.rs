@@ -197,7 +197,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for SessionsRig {
-
         async fn trial_status_wire(&self) -> Result<crate::client::trial::TrialWire, CoreError> {
             unreachable!("not part of this action")
         }
@@ -390,39 +389,6 @@ mod tests {
             _zip: Vec<u8>,
             _overwrite: bool,
         ) -> Result<crate::client::projects::ImportOutcome, CoreError> {
-            unreachable!("not part of this action")
-        }
-        async fn project_resources(
-            &self,
-            _project: &str,
-            _prefix: Option<&str>,
-        ) -> Result<
-            crate::client::query::ListEnvelope<crate::client::resources::ResourceEntry>,
-            CoreError,
-        > {
-            unreachable!("not part of this action")
-        }
-        async fn project_resource_get(
-            &self,
-            _project: &str,
-            _path: &str,
-        ) -> Result<crate::client::resources::ResourceContent, CoreError> {
-            unreachable!("not part of this action")
-        }
-        async fn project_resource_put(
-            &self,
-            _project: &str,
-            _path: &str,
-            _body: Vec<u8>,
-            _content_type: &str,
-        ) -> Result<(), CoreError> {
-            unreachable!("not part of this action")
-        }
-        async fn project_resource_delete(
-            &self,
-            _project: &str,
-            _path: &str,
-        ) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
     }

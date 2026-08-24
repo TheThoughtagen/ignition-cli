@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] } # serde feature: Profile.url round-trips through TOML/JSON
 percent-encoding = "2" # already a transitive dep of url; declared so encode_segment's direct import is legal (03-01)
+zip = { version = "8.6", default-features = false, features = ["deflate"] } # 05-02: project-export zip member surgery (resource family re-point) — the ONLY new dependency, research-approved; deflate covers Ignition export zips both ways
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

@@ -20,6 +20,8 @@ futures-util = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 percent-encoding = { workspace = true }
+zip = { workspace = true }
+tempfile = { workspace = true } # promoted from dev (05-02): the resource-surgery temp export file — already in the workspace graph, NOT a new dependency
 
 [dev-dependencies]
 wiremock = { workspace = true }

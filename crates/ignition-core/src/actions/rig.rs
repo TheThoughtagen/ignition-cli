@@ -34,13 +34,13 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::client::GatewayApi;
-use crate::rig::compose::{
-    check_output, compose_version, down_args, docker_ps_publish_args, logs_args,
-    parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
-    up_args, volume_ls_args, ComposeRunner,
-};
 use crate::error::CoreError;
 use crate::poll::{self, PollConfig, PollState};
+use crate::rig::compose::{
+    ComposeRunner, check_output, compose_version, docker_ps_publish_args, down_args, logs_args,
+    parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
+    up_args, volume_ls_args,
+};
 use crate::rig::{RigPlan, port_preflight};
 
 /// Default wait budget for BOTH `up --wait-timeout` and the
@@ -286,7 +286,10 @@ async fn commissioned_wait(
 
 /// `ign rig down`: version gate → `down --remove-orphans` (volumes
 /// KEPT — the `-v` teardown half belongs to `rig reset`, 04-02).
-pub async fn rig_down(runner: &dyn ComposeRunner, plan: &RigPlan) -> Result<RigDownResult, CoreError> {
+pub async fn rig_down(
+    runner: &dyn ComposeRunner,
+    plan: &RigPlan,
+) -> Result<RigDownResult, CoreError> {
     compose_version(runner).await?;
     let output = runner.run(&down_args(plan, false)).await;
     check_output(&output, "docker compose down")?;
@@ -452,7 +455,10 @@ pub async fn trial_status(gateway: &dyn GatewayApi) -> Result<TrialStatusResult,
             match trial_banner {
                 Some(banner) => {
                     let active = banner.data.severity == "info"
-                        && banner.data.expire_time_ms.is_some_and(|ms| ms > epoch_ms_now());
+                        && banner
+                            .data
+                            .expire_time_ms
+                            .is_some_and(|ms| ms > epoch_ms_now());
                     TrialBanners {
                         severity: Some(banner.data.severity.clone()),
                         expire_time_ms: banner.data.expire_time_ms,
@@ -589,7 +595,11 @@ pub async fn trial_reset(
 }
 
 /// The shared success tail: the flip check + result assembly.
-fn finish(rig_url: &str, mechanism: &str, after: crate::client::trial::TrialWire) -> Result<TrialResetResult, CoreError> {
+fn finish(
+    rig_url: &str,
+    mechanism: &str,
+    after: crate::client::trial::TrialWire,
+) -> Result<TrialResetResult, CoreError> {
     if after.expired {
         return Err(CoreError::Internal(format!(
             "trial reset was accepted but the read-back still reports expired \
@@ -776,9 +786,11 @@ pub async fn rig_snapshot(
         .as_secs() as i64;
     let dir: PathBuf = match out_dir {
         Some(dir) => dir.to_path_buf(),
-        None => {
-            PathBuf::from("ign-rig-snapshots").join(format!("{}-{}", rig_name, stamp_from_secs(epoch_s)))
-        }
+        None => PathBuf::from("ign-rig-snapshots").join(format!(
+            "{}-{}",
+            rig_name,
+            stamp_from_secs(epoch_s)
+        )),
     };
     tokio::fs::create_dir_all(&dir)
         .await
@@ -799,14 +811,16 @@ pub async fn rig_snapshot(
             tokio::fs::create_dir_all(&projects_dir)
                 .await
                 .map_err(|err| {
-                    CoreError::Internal(format!(
-                        "cannot create {}: {err}",
-                        projects_dir.display()
-                    ))
+                    CoreError::Internal(format!("cannot create {}: {err}", projects_dir.display()))
                 })?;
         }
-        let file = format!("projects/{}.zip", crate::client::projects::encode_segment(&record.name));
-        gateway.project_export_to_file(&record.name, &dir.join(&file)).await?;
+        let file = format!(
+            "projects/{}.zip",
+            crate::client::projects::encode_segment(&record.name)
+        );
+        gateway
+            .project_export_to_file(&record.name, &dir.join(&file))
+            .await?;
         exported.push((record.name.clone(), file));
     }
 
@@ -828,9 +842,11 @@ pub async fn rig_snapshot(
         "notes": MANIFEST_NOTES,
     });
     let manifest_path = dir.join("manifest.json");
-    tokio::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).map_err(|err| {
-        CoreError::Internal(format!("manifest serialization failed: {err}"))
-    })?)
+    tokio::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|err| CoreError::Internal(format!("manifest serialization failed: {err}")))?,
+    )
     .await
     .map_err(|err| {
         CoreError::Internal(format!("cannot write {}: {err}", manifest_path.display()))
@@ -918,7 +934,10 @@ pub async fn rig_restore(
 /// port occupancy — serialized as an ALLOWLIST (services' state/health/
 /// publishers, volume names, identity). Exit 0 even when the rig is
 /// down: state is data.
-pub async fn rig_status(runner: &dyn ComposeRunner, plan: &RigPlan) -> Result<RigStatusResult, CoreError> {
+pub async fn rig_status(
+    runner: &dyn ComposeRunner,
+    plan: &RigPlan,
+) -> Result<RigStatusResult, CoreError> {
     compose_version(runner).await?;
 
     let ps = runner.run(&ps_args(plan)).await;
@@ -986,11 +1005,11 @@ mod tests {
         rig_up, trial_reset, trial_status,
     };
     use crate::client::GatewayApi;
+    use crate::error::CoreError;
+    use crate::rig::RigPlan;
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
     };
-    use crate::error::CoreError;
-    use crate::rig::RigPlan;
 
     // ---------------------------------------------------------------------
     // Test doubles
@@ -1020,13 +1039,24 @@ mod tests {
     #[async_trait::async_trait]
     impl ComposeRunner for FakeRunner {
         async fn run(&self, args: &[String]) -> ComposeOutput {
-            self.calls.lock().unwrap().push(("docker compose", args.to_vec()));
-            self.outputs.lock().unwrap().pop_front().expect("outputs exhausted")
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("docker compose", args.to_vec()));
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("outputs exhausted")
         }
 
         async fn run_docker(&self, args: &[String]) -> ComposeOutput {
             self.calls.lock().unwrap().push(("docker", args.to_vec()));
-            self.outputs.lock().unwrap().pop_front().expect("outputs exhausted")
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("outputs exhausted")
         }
 
         async fn run_streaming(
@@ -1034,7 +1064,10 @@ mod tests {
             args: &[String],
             line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> ComposeOutput {
-            self.calls.lock().unwrap().push(("docker compose", args.to_vec()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("docker compose", args.to_vec()));
             let output = self
                 .outputs
                 .lock()
@@ -1073,7 +1106,8 @@ mod tests {
     /// on machines where a REAL rig publishes 9088/9443 (the fixture's
     /// ports — live-verification found the lsof fallback observing the
     /// host's own rig; the rig/mod.rs port-1 dodge, reconsidered).
-    const OWN_OCCUPANT: &str = r#"{"Names":"fixture-rig-ignition-1","Labels":"com.docker.compose.project=fixture-rig"}"#;
+    const OWN_OCCUPANT: &str =
+        r#"{"Names":"fixture-rig-ignition-1","Labels":"com.docker.compose.project=fixture-rig"}"#;
 
     /// The scripted pre-flight answers for a two-port gw_plan(): both
     /// ports held by THIS project (a recreate — the honest shape for
@@ -1119,9 +1153,10 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/StatusPing"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "state": state }),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "state": state })),
+            )
             .expect(1..)
             .mount(&server)
             .await;
@@ -1135,10 +1170,9 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/StatusPing"))
-            .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
-                "Location",
-                "/welcome",
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302).insert_header("Location", "/welcome"),
+            )
             .expect(1..)
             .mount(&server)
             .await;
@@ -1254,7 +1288,10 @@ mod tests {
         assert_eq!(err.exit_code(), 7);
         let message = err.to_string();
         assert!(message.contains("did not reach RUNNING"), "{message}");
-        assert!(message.contains("STARTING"), "last observation named: {message}");
+        assert!(
+            message.contains("STARTING"),
+            "last observation named: {message}"
+        );
     }
 
     /// Port conflict aborts BEFORE the up, with attribution.
@@ -1312,7 +1349,10 @@ mod tests {
             .await
             .expect_err("no docker errors");
         let message = err.to_string();
-        assert!(message.contains("docker compose is unavailable"), "{message}");
+        assert!(
+            message.contains("docker compose is unavailable"),
+            "{message}"
+        );
         assert!(message.contains("not supported"), "{message}");
     }
 
@@ -1351,7 +1391,10 @@ mod tests {
             .await
             .expect_err("down failure errors");
         let message = err.to_string();
-        assert!(message.contains("docker compose down failed (exit 1)"), "{message}");
+        assert!(
+            message.contains("docker compose down failed (exit 1)"),
+            "{message}"
+        );
         assert!(message.contains("active endpoints"), "{message}");
     }
 
@@ -1459,11 +1502,11 @@ mod tests {
     async fn reset_port_regrabbed_midcycle_errors_and_never_ups() {
         let occupant = r#"{"Names":"other-gw-1","Labels":"com.docker.compose.project=other"}"#;
         let runner = FakeRunner::with(vec![
-            ok(""),              // volume ls: nothing to remove
+            ok(""), // volume ls: nothing to remove
             version_ok(),
-            ok(""),              // down -v
-            ok(occupant),        // preflight 9088: re-grabbed mid-cycle
-            ok(OWN_OCCUPANT),    // preflight 9443: own project
+            ok(""),           // down -v
+            ok(occupant),     // preflight 9088: re-grabbed mid-cycle
+            ok(OWN_OCCUPANT), // preflight 9443: own project
         ]);
         let err = rig_reset(&runner, &gw_plan(), 300, None)
             .await
@@ -1501,7 +1544,10 @@ mod tests {
             .await
             .expect_err("down -v failure errors");
         let message = err.to_string();
-        assert!(message.contains("docker compose down failed (exit 1)"), "{message}");
+        assert!(
+            message.contains("docker compose down failed (exit 1)"),
+            "{message}"
+        );
         assert!(message.contains("in use"), "{message}");
     }
 
@@ -1537,7 +1583,10 @@ mod tests {
             "lines pass through verbatim — no envelope wrapping ever"
         );
         let calls = runner.calls();
-        assert_eq!(calls, vec![("docker compose", logs_args(&gw_plan(), 200, false, None))]);
+        assert_eq!(
+            calls,
+            vec![("docker compose", logs_args(&gw_plan(), 200, false, None))]
+        );
     }
 
     /// Follow: rides the STREAMING seam (the fake replays its
@@ -1546,9 +1595,14 @@ mod tests {
     async fn logs_follow_streams_via_the_streaming_seam() {
         let runner = FakeRunner::with(vec![ok(LOGS_STDOUT)]);
         let mut received: Vec<String> = Vec::new();
-        let result = rig_logs(&runner, &gw_plan(), 50, true, Some("ignition"), &mut |line| {
-            received.push(line)
-        })
+        let result = rig_logs(
+            &runner,
+            &gw_plan(),
+            50,
+            true,
+            Some("ignition"),
+            &mut |line| received.push(line),
+        )
         .await
         .expect("follow logs succeeds");
         assert_eq!(result.streamed, 2, "streamed lines counted in follow mode");
@@ -1556,7 +1610,10 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(
             calls,
-            vec![("docker compose", logs_args(&gw_plan(), 50, true, Some("ignition")))]
+            vec![(
+                "docker compose",
+                logs_args(&gw_plan(), 50, true, Some("ignition"))
+            )]
         );
     }
 
@@ -1570,13 +1627,21 @@ mod tests {
             code: 1,
         }]);
         let mut received: Vec<String> = Vec::new();
-        let err = rig_logs(&runner, &gw_plan(), 200, false, Some("nosvc"), &mut |line| {
-            received.push(line)
-        })
+        let err = rig_logs(
+            &runner,
+            &gw_plan(),
+            200,
+            false,
+            Some("nosvc"),
+            &mut |line| received.push(line),
+        )
         .await
         .expect_err("unknown service errors");
         let message = err.to_string();
-        assert!(message.contains("docker compose logs failed (exit 1)"), "{message}");
+        assert!(
+            message.contains("docker compose logs failed (exit 1)"),
+            "{message}"
+        );
         assert!(message.contains("no such service"), "{message}");
         assert!(received.is_empty(), "diagnostics never ride the data sink");
     }
@@ -1591,27 +1656,27 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/data/api/v1/trial"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "licenseMode": "Trial", "trialState": "AllInDemo",
                     "trialSecondsLeft": 0, "expired": true,
                     "emergency": false, "emergencySecondsLeft": 0,
                     "development": false, "developmentSecondsLeft": 0
-                }),
-            ))
+                })),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/data/api/v1/overview/banners"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "banners": [{
                         "order": 0, "type": "trial",
                         "data": { "severity": "warning", "expireTime": null,
                                   "toolTips": [], "actions": [] }
                     }]
-                }),
-            ))
+                })),
+            )
             .mount(&server)
             .await;
         server
@@ -1703,14 +1768,14 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/data/api/v1/trial"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "licenseMode": "Trial", "trialState": "AllInDemo",
                     "trialSecondsLeft": 0, "expired": true,
                     "emergency": false, "emergencySecondsLeft": 0,
                     "development": false, "developmentSecondsLeft": 0
-                }),
-            ))
+                })),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1720,7 +1785,10 @@ mod tests {
             .await;
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
         let result = trial_status(&api).await.expect("primary endpoint answered");
-        assert!(result.expired, "primary truth survives the cross-check failure");
+        assert!(
+            result.expired,
+            "primary truth survives the cross-check failure"
+        );
         assert_eq!(result.banners.severity, None);
         assert_eq!(result.banners.expire_time_ms, None);
         assert!(!result.banners.active);
@@ -1771,7 +1839,8 @@ mod tests {
                 return wiremock::ResponseTemplate::new(self.post_status);
             }
             let expired = !self.reset_done.load(std::sync::atomic::Ordering::SeqCst);
-            wiremock::ResponseTemplate::new(200).set_body_json(trial_body(expired, if expired { 0 } else { 7199 }))
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(trial_body(expired, if expired { 0 } else { 7199 }))
         }
     }
 
@@ -1852,9 +1921,8 @@ mod tests {
     #[tokio::test]
     async fn trial_reset_token_refused_without_login_errors() {
         let (server, _script) = trial_reset_server(401).await;
-        let credential = crate::config::Credential::Token(crate::config::Secret::new(
-            "spike:wrongtoken",
-        ));
+        let credential =
+            crate::config::Credential::Token(crate::config::Secret::new("spike:wrongtoken"));
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), Some(credential));
         let err = trial_reset(&api, &server.uri(), true, None)
             .await
@@ -1874,32 +1942,35 @@ mod tests {
         let (server, script) = trial_reset_server(401).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/data/app/login"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(302).insert_header(
-                    "Location",
-                    "/idp/default/oidc/auth?app=gateway&state=st&nonce=nc",
-                ),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+                "Location",
+                "/idp/default/oidc/auth?app=gateway&state=st&nonce=nc",
+            ))
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/idp/default/oidc/auth"))
             .and(wiremock::matchers::query_param_is_missing("token"))
             .respond_with(
-                wiremock::ResponseTemplate::new(302).insert_header(
-                    "Location",
-                    "/idp/default/authn/login?app=gateway&token=TT0",
-                ),
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", "/idp/default/authn/login?app=gateway&token=TT0"),
             )
             .mount(&server)
             .await;
         for (body_token, answer) in [
-            ("TT0", r#"{"complete":false,"nextChallenge":[{"type":"basic"}],"token":"TT1"}"#),
+            (
+                "TT0",
+                r#"{"complete":false,"nextChallenge":[{"type":"basic"}],"token":"TT1"}"#,
+            ),
             ("TT2", r#"{"complete":true,"token":"TT3"}"#),
         ] {
             wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::path("/idp/default/authn/next-challenge"))
-                .and(wiremock::matchers::body_json(serde_json::json!({ "token": body_token })))
+                .and(wiremock::matchers::path(
+                    "/idp/default/authn/next-challenge",
+                ))
+                .and(wiremock::matchers::body_json(
+                    serde_json::json!({ "token": body_token }),
+                ))
                 .respond_with(
                     wiremock::ResponseTemplate::new(200)
                         .set_body_string(answer)
@@ -1909,7 +1980,9 @@ mod tests {
                 .await;
         }
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/idp/default/authn/submit-challenge/basic"))
+            .and(wiremock::matchers::path(
+                "/idp/default/authn/submit-challenge/basic",
+            ))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .set_body_string(r#"{"success":true,"token":"TT2"}"#)
@@ -1976,9 +2049,8 @@ mod tests {
     #[tokio::test]
     async fn trial_reset_falls_through_to_the_login_rung() {
         let (server, _script) = login_dance_server().await;
-        let credential = crate::config::Credential::Token(crate::config::Secret::new(
-            "spike:rejectedtoken",
-        ));
+        let credential =
+            crate::config::Credential::Token(crate::config::Secret::new("spike:rejectedtoken"));
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), Some(credential));
         let password = crate::config::Secret::new("rig-password");
         let result = trial_reset(&api, &server.uri(), true, Some(("admin", &password)))
@@ -2074,7 +2146,10 @@ mod tests {
             out: &Path,
         ) -> Result<crate::client::projects::ExportMeta, CoreError> {
             self.record("backup_download".into());
-            Ok(Self::serve_download(out, Self::fixture_bytes().len() as u64))
+            Ok(Self::serve_download(
+                out,
+                Self::fixture_bytes().len() as u64,
+            ))
         }
         async fn backup_restore(&self, _gwbk: &Path) -> Result<(), CoreError> {
             self.record("backup_restore".into());
@@ -2083,8 +2158,10 @@ mod tests {
         async fn projects(
             &self,
             _query: &crate::client::query::ListQuery,
-        ) -> Result<crate::client::query::ListEnvelope<crate::client::projects::ProjectRecord>, CoreError>
-        {
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::projects::ProjectRecord>,
+            CoreError,
+        > {
             self.record("projects".into());
             let items: Vec<crate::client::projects::ProjectRecord> = self
                 .project_names
@@ -2119,7 +2196,10 @@ mod tests {
             out: &Path,
         ) -> Result<crate::client::projects::ExportMeta, CoreError> {
             self.record(format!("export:{name}"));
-            Ok(Self::serve_download(out, Self::fixture_bytes().len() as u64))
+            Ok(Self::serve_download(
+                out,
+                Self::fixture_bytes().len() as u64,
+            ))
         }
         async fn gateway_info(&self) -> Result<crate::client::version::GatewayInfo, CoreError> {
             self.record("gateway_info".into());
@@ -2163,10 +2243,8 @@ mod tests {
             &self,
             _quarantined: bool,
             _query: &crate::client::query::ListQuery,
-        ) -> Result<
-            crate::client::query::ListEnvelope<crate::client::status::ModuleInfo>,
-            CoreError,
-        > {
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::status::ModuleInfo>, CoreError>
+        {
             unreachable!("not part of this action")
         }
         async fn metrics_current(
@@ -2185,8 +2263,10 @@ mod tests {
         async fn designers(
             &self,
             _query: &crate::client::query::ListQuery,
-        ) -> Result<crate::client::query::ListEnvelope<crate::client::sessions::DesignerInfo>, CoreError>
-        {
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::sessions::DesignerInfo>,
+            CoreError,
+        > {
             unreachable!("not part of this action")
         }
         async fn perspective_sessions(
@@ -2201,8 +2281,10 @@ mod tests {
         async fn vision_clients(
             &self,
             _query: &crate::client::query::ListQuery,
-        ) -> Result<crate::client::query::ListEnvelope<crate::client::sessions::VisionClient>, CoreError>
-        {
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::sessions::VisionClient>,
+            CoreError,
+        > {
             unreachable!("not part of this action")
         }
         async fn terminate_perspective_session(
@@ -2307,37 +2389,6 @@ mod tests {
         ) -> Result<crate::client::projects::ImportOutcome, CoreError> {
             unreachable!("not part of this action")
         }
-        async fn project_resources(
-            &self,
-            _project: &str,
-            _prefix: Option<&str>,
-        ) -> Result<crate::client::query::ListEnvelope<crate::client::resources::ResourceEntry>, CoreError>
-        {
-            unreachable!("not part of this action")
-        }
-        async fn project_resource_get(
-            &self,
-            _project: &str,
-            _path: &str,
-        ) -> Result<crate::client::resources::ResourceContent, CoreError> {
-            unreachable!("not part of this action")
-        }
-        async fn project_resource_put(
-            &self,
-            _project: &str,
-            _path: &str,
-            _body: Vec<u8>,
-            _content_type: &str,
-        ) -> Result<(), CoreError> {
-            unreachable!("not part of this action")
-        }
-        async fn project_resource_delete(
-            &self,
-            _project: &str,
-            _path: &str,
-        ) -> Result<(), CoreError> {
-            unreachable!("not part of this action")
-        }
     }
 
     /// THE composition pin: gwbk first, every project exported (the
@@ -2359,7 +2410,10 @@ mod tests {
             .expect("snapshot composes");
         let fixture_len = SnapshotRig::fixture_bytes().len() as u64;
         assert_eq!(result.gwbk_bytes, fixture_len);
-        assert_eq!(result.projects, vec!["alpha".to_string(), "My Project".to_string()]);
+        assert_eq!(
+            result.projects,
+            vec!["alpha".to_string(), "My Project".to_string()]
+        );
         assert_eq!(result.dir, out_dir.path().display().to_string());
 
         // The gwbk landed with the fixture bytes (the primary artifact).
@@ -2468,10 +2522,11 @@ mod tests {
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/data/api/v1/projects/list"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "items": [], "metadata": {
-                    "total": 0, "matching": 0, "limit": -1, "offset": 0 } }),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "metadata": {
+                    "total": 0, "matching": 0, "limit": -1, "offset": 0 } })),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -2610,7 +2665,11 @@ mod tests {
         assert_eq!(super::RESTORE_WAIT_FLOOR_S, 300);
         assert_eq!(super::restore_deadline(1), 300, "short budgets floor up");
         assert_eq!(super::restore_deadline(300), 300);
-        assert_eq!(super::restore_deadline(600), 600, "longer budgets pass through");
+        assert_eq!(
+            super::restore_deadline(600),
+            600,
+            "longer budgets pass through"
+        );
     }
 
     /// The std-only stamp: known instants render the documented
@@ -2696,13 +2755,7 @@ mod tests {
     /// services, ports_free true (state is data).
     #[tokio::test]
     async fn status_down_rig_is_data() {
-        let runner = FakeRunner::with(vec![
-            version_ok(),
-            ok(""),
-            ok(""),
-            ok(""),
-            ok(""),
-        ]);
+        let runner = FakeRunner::with(vec![version_ok(), ok(""), ok(""), ok(""), ok("")]);
         let result = rig_status(&runner, &gw_plan())
             .await
             .expect("status of a down rig exits 0");
@@ -2746,7 +2799,14 @@ mod tests {
         for key in ["rig", "project", "removed_volumes", "state", "warnings"] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
-        let status_keys = ["rig", "project", "compose_file", "services", "volumes", "ports_free"];
+        let status_keys = [
+            "rig",
+            "project",
+            "compose_file",
+            "services",
+            "volumes",
+            "ports_free",
+        ];
         let _ = RigStatusResult {
             rig: "r".into(),
             project: "r".into(),
