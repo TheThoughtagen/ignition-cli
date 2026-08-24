@@ -343,9 +343,14 @@ async fn doctor_json_shape_and_flags() {
         .expect(1..)
         .mount(&server)
         .await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/system/webdev/stacked"))
-        .respond_with(wiremock::ResponseTemplate::new(404))
+    // THE 05-03 re-pin: doctor probes the route's version action via
+    // POST `/system/webdev/ign-cli/cli/{route}` — 405 is the absent
+    // marker (the Phase-2 404 assumption was research-Pitfall-1 WRONG).
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/stacked",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(405))
         .expect(1..)
         .mount(&server)
         .await;
@@ -419,7 +424,7 @@ async fn doctor_json_shape_and_flags() {
             .as_str()
             .expect("detail")
             .contains("absent"),
-        "404 = route absent (warn)"
+        "405 = route absent (warn)"
     );
     assert_eq!(by_name("url")["hint"], Value::Null, "hint null-able");
     // The rig row is ok-or-skip depending on the machine — both valid.

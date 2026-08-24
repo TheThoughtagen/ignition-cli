@@ -131,6 +131,11 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Resource(ResourceArgs),
 
+    /// Manage the CLI's own WebDev routes on the gateway: deploy the
+    /// embedded bundle, verify the version handshake
+    #[command(arg_required_else_help = true)]
+    Webdev(WebdevArgs),
+
     /// Manage a Docker compose rig: up/down/reset/status/logs/trial
     /// (snapshot arrives in a later plan) — docker-only, no profile
     /// needed
@@ -349,6 +354,45 @@ pub enum ResourceCommand {
         project: String,
         /// Resource path
         path: String,
+    },
+}
+
+/// Webdev subcommands (05-03, WEB-01/02). Deploy is deliberately NOT
+/// `--yes`-guarded: the dedicated project (default `ign-cli`) is
+/// CLI-OWNED — born from the first deploy zip and overwrite-replaced
+/// on every deploy (replace-not-merge is the CONTRACT here; user
+/// projects are never touched — README documents). scriptExec rides
+/// only on explicit request, gated by a deploy-time generated shared
+/// secret stored in the profile config at 0600.
+#[derive(Debug, clap::Args)]
+pub struct WebdevArgs {
+    #[command(subcommand)]
+    pub command: WebdevCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebdevCommand {
+    /// Deploy the embedded route bundle into the dedicated project
+    /// (overwrite-replace — the CLI owns that project wholesale)
+    Deploy {
+        /// Target project (default ign-cli; the CLI owns it wholesale)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+        /// Also deploy the secret-gated scriptExec route (a fresh
+        /// secret is generated and stored at 0600 when none exists)
+        #[arg(long)]
+        with_script_exec: bool,
+        /// Generate a FRESH scriptExec secret before deploying (any
+        /// route deployed with the old secret starts refusing)
+        #[arg(long, requires = "with_script_exec")]
+        rotate_secret: bool,
+    },
+    /// Probe every route's version handshake — a READ: exit 0
+    /// whenever the sweep completes, per-route degradation is data
+    Status {
+        /// Target project (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
     },
 }
 

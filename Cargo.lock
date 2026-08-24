@@ -1184,6 +1184,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+ "zip",
 ]
 
 [[package]]

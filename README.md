@@ -32,7 +32,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -139,7 +139,9 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign wait gateway [--interval S --timeout S]` | Wait until the gateway reports RUNNING | unauthenticated `/StatusPing` poll — works with no/broken credential; already-RUNNING = immediate success (default 120 s) |
 | `ign wait restart [--interval S --timeout S]` | Wait for a restart to complete | shares `restart --wait`'s semantics: a non-RUNNING state observed once → RUNNING completes immediately (witnessed restart, no floor wait); an all-RUNNING wait reports success only after the same 5 s floor — no false positive when run right after `ign restart` |
 | `ign wait module <ID> [--interval S --timeout S]` | Wait until a module reports ACTIVE | polls `modules/healthy?search=<id>` (authed); timeout names the id + last observed state |
-| `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route` probes `/system/webdev/<NAME>` (404 = absent, anything else = present); config errors (no profile) still exit 3 |
+| `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route NAME` probes that route's version action in the CLI's `ign-cli` WebDev project — **405 = absent** (the live-proven 8.3 marker; the earlier 404 assumption was wrong), 402 = module unlicensed, 200 = present (+ handshake version); config errors (no profile) still exit 3 |
+| `ign webdev deploy [--project NAME] [--with-script-exec] [--rotate-secret]` | Install the CLI's own WebDev route bundle into the dedicated `ign-cli` project (default) — `tags`, `tagConfig`, `alarms`, `tagHistory` (+ `scriptExec` only with `--with-script-exec`) | **not `--yes`-guarded by design**: the dedicated project is CLI-OWNED — born from the first deploy zip, overwrite-REPLACED on every deploy (replace-not-merge is the contract here; user projects are never touched); every WebDev-dependent tag command (Phase 5) refuses exit 6 `routes_not_deployed` naming `ign webdev deploy` until this runs; `--with-script-exec` generates a fresh hex secret (stored in the profile config at 0600) when none exists, `--rotate-secret` regenerates unconditionally (requires `--with-script-exec`); the secret NEVER appears in any output, envelope, or log (it lives in exactly one place: the baked route zip member); JSON data `{project, routes, script_exec, secret_rotated, import}` |
+| `ign webdev status [--project NAME]` | The version-handshake sweep: probe every route's version action — per-route `{route, status, deployed_version, expected_version}` | **a read — exits 0 whenever the sweep completes** (per-route degradation is DATA, the doctor precedent): `present`/`absent`/`unlicensed`/`auth_gated`/`secret_mismatch`/`version_mismatch` per route; the `ok` flag (data, not exit code) is true only when every always-on route is present with a matching version; scriptExec is probed ONLY when a secret is configured for the profile and never gates `ok` |
 | `ign rig [--rig NAME] up [--timeout S]` | Bring a Docker compose rig up (`compose up -d --wait`) and wait for the gateway | docker-only (`profile: null` envelope); `--timeout` is BOTH compose's `--wait-timeout` and the commissioned-probe deadline (default 300 s); a fresh-volume rig reports `"up, uncommissioned"` as DATA (exit 0, wizard URL in `warnings`) |
 | `ign rig [--rig NAME] down` | Stop the rig (`compose down --remove-orphans`; volumes KEPT) | docker-only; the volume-deleting teardown belongs to `rig reset` |
 | `ign rig [--rig NAME] reset [--timeout S]` | Tear the rig down AND remove its volumes, then bring it back up fresh (`down -v --remove-orphans` → pre-flight → `up --wait` → commissioned wait) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`, BEFORE any discovery runs; `removed_volumes` in the data reports exactly what `-v` took; no stale project/trial state survives (a fresh volume usually boots uncommissioned — exit 0, wizard URL in `warnings`) |
@@ -535,3 +537,80 @@ writes are
 audit-logged server-side by the gateway. Non-destructive project
 mutations (`copy`, `rename`, `set`, `export`) create, relabel, or read
 rather than destroy, so they carry no `--yes`.
+
+## The CLI's WebDev routes (`ign webdev`)
+
+Every tag operation the CLI performs on a gateway rides the CLI's own
+WebDev route bundle — small Jython `doPost.py` routes deployed into a
+DEDICATED project (`ign-cli` by default) under
+`/system/webdev/ign-cli/cli/{route}` (the wire protocol — NOT
+`/data/webdev/*`, which does not exist). The bundle is embedded in the
+binary at build time and carries a `ROUTE_BUNDLE_VERSION` handshake
+(`{"action":"version"}` → `{routeVersion, minCli}`) on every route.
+
+### Deploy semantics
+
+`ign webdev deploy` packs the embedded bundle into a project zip and
+imports it with `overwrite=true` — a **clean replace**, never a merge.
+The dedicated project is CLI-OWNED: it is born from the first deploy
+zip and wholesale-replaced by every later deploy, which is why deploy
+carries **no `--yes` guard** (user projects are never touched; you
+cannot accidentally deploy over anything you own — use `--project`
+only if you deliberately want a different name). There is no
+pre-flight project create (the gateway's first-import quirk); the
+import is the deployment.
+
+### The version-negotiation refusal matrix
+
+WebDev-dependent commands (the tag family, from Phase 5 on) probe the
+canonical `tags` route's handshake BEFORE doing anything, and refuse
+exit 6 with an actionable error — no auto-upgrade magic, ever:
+
+| Probe answer          | Slug                   | Hint                                                |
+|-----------------------|------------------------|-----------------------------------------------------|
+| 405 (route/project absent) | `routes_not_deployed` | run `ign webdev deploy`                             |
+| deployed < expected   | `route_version_mismatch` | run `ign webdev deploy` (old routes on the gateway) |
+| deployed > expected   | `route_version_mismatch` | update `ign` (the binary is older than the routes)  |
+| 402                   | `webdev_unlicensed`   | license the gateway (trial-expired rigs cannot serve `/system/webdev`) |
+| 200 body denial, unmapped code | `webdev_route_error` | the route's own `code` + `message` verbatim |
+
+Two wire facts the matrix is built on (live-proven on 8.3): **denials
+ride HTTP 200** — WebDev ignores a `status` key in route returns, so
+every refusal is detectable only from the body envelope
+`{ok, data|error}`; and **405 = absent** (missing routes and missing
+projects both answer 405 — `ign doctor`'s earlier 404 assumption was
+wrong and has been re-pinned).
+
+`ign webdev status` itself is a READ: it exits 0 whenever the sweep
+completes and reports per-route degradation as data (the doctor
+precedent) — the refusal matrix above belongs to the tag commands
+that DEPEND on the routes, not to the sweep that inspects them.
+
+### scriptExec — the LOCKED security posture
+
+`scriptExec` (arbitrary Jython execution through the gateway) ships
+in the bundle only as a TEMPLATE with a `__IGN_CLI_SECRET__` marker
+and deploys ONLY with an explicit `--with-script-exec`:
+
+- the deploy generates a fresh 32-byte hex secret from
+  `/dev/urandom`, substitutes it into the template (the placeholder
+  can never ship — it is excluded from the plain manifest), and
+  persists it in the profile config at 0600; `--rotate-secret`
+  regenerates (any route copy deployed with the old secret starts
+  refusing);
+- the route fail-closes on every action — version included — unless
+  the request carries the matching `X-Ignition-CLI-Secret` header:
+  no header → `secret_required`, wrong secret → `secret_mismatch`
+  (constant-time compare);
+- the secret appears in exactly ONE place: the baked zip member on
+  the gateway. Never in command output, JSON envelopes, or logs.
+
+Threat-model honesty: the secret gate is a SHARED-SECRET posture, not
+real authentication — anyone who can read the gateway project's
+resources (e.g. a Designer user or a project export) can read the
+secret. It exists to make `scriptExec` an opt-in, auditable surface
+with a definite off switch (never deploy it, or redeploy without the
+flag), not to protect against gateway insiders. The route keeps its
+config at require-auth=false deliberately: an auth layer would lock
+the CLI's own token-authenticated calls out (API tokens 401 on WebDev
+require-auth — live-verified).

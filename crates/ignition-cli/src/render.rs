@@ -31,6 +31,7 @@ use ignition_core::actions::rig::{
     SnapshotResult, TrialResetResult, TrialStatusResult,
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
+use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
 use ignition_core::error::CoreError;
@@ -197,6 +198,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::RigRestore(result) => render_rig_restore_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
+        ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
+        ActionOutput::WebdevStatus(result) => render_webdev_status_human(result),
     }
 }
 
@@ -641,7 +644,10 @@ fn render_rig_up_human(result: &RigUpResult) {
     match result.state.as_str() {
         "uncommissioned" => {
             let url = result.gateway_url.as_deref().unwrap_or("<gateway>");
-            println!("rig {} up — uncommissioned (open {url}/welcome)", result.rig);
+            println!(
+                "rig {} up — uncommissioned (open {url}/welcome)",
+                result.rig
+            );
         }
         _ => match result.gateway_url.as_deref() {
             Some(url) => println!("rig {} up — gateway RUNNING ({url})", result.rig),
@@ -664,7 +670,10 @@ fn render_rig_down_human(result: &RigDownResult) {
 /// the URL).
 fn render_rig_reset_human(result: &RigResetResult) {
     if result.removed_volumes.is_empty() {
-        println!("rig {} reset — no named volumes found to remove", result.rig);
+        println!(
+            "rig {} reset — no named volumes found to remove",
+            result.rig
+        );
     } else {
         println!("rig {} reset — removed volumes:", result.rig);
         for volume in &result.removed_volumes {
@@ -768,6 +777,64 @@ fn render_trial_reset_human(result: &TrialResetResult) {
     );
 }
 
+/// `ign webdev deploy` human lines: the routes + the import outcome.
+/// The scriptExec secret NEVER prints — only its lifecycle state
+/// (generated/stored or reused).
+fn render_webdev_deploy_human(result: &WebdevDeployResult) {
+    println!(
+        "deployed {} routes to project {} (overwrite import)",
+        result.routes.len(),
+        result.project
+    );
+    println!("routes: {}", result.routes.join(", "));
+    if result.script_exec {
+        if result.secret_rotated {
+            println!(
+                "scriptExec: deployed (secret generated — stored in the profile config at 0600)"
+            );
+        } else {
+            println!("scriptExec: deployed (reusing the stored profile secret)");
+        }
+    }
+    println!(
+        "import: {}",
+        serde_json::to_string(&result.import).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// `ign webdev status` human lines: one row per route plus the ok
+/// summary — a READ (degradation is data, the doctor precedent; the
+/// ok=false summary names the fix).
+fn render_webdev_status_human(result: &WebdevStatusResult) {
+    for row in &result.routes {
+        println!(
+            "{:<12} {:<16} {}",
+            row.route,
+            route_status_word(row.status),
+            row.deployed_version.as_deref().unwrap_or("-")
+        );
+    }
+    if result.ok {
+        println!("ok: all always-on routes present with matching versions");
+    } else {
+        println!("degraded: run `ign webdev deploy` to install/refresh the routes");
+    }
+}
+
+/// The status word — exactly the serialized snake_case value (agents
+/// and humans read the same vocabulary).
+fn route_status_word(status: ignition_core::actions::webdev::RouteStatus) -> &'static str {
+    use ignition_core::actions::webdev::RouteStatus;
+    match status {
+        RouteStatus::Present => "present",
+        RouteStatus::Absent => "absent",
+        RouteStatus::Unlicensed => "unlicensed",
+        RouteStatus::AuthGated => "auth_gated",
+        RouteStatus::SecretMismatch => "secret_mismatch",
+        RouteStatus::VersionMismatch => "version_mismatch",
+    }
+}
+
 /// `ign rig status` human table: identity header, one row per service
 /// (`service  state  health  published->target/proto`), volumes, and
 /// the ports occupancy line — a down rig prints its emptiness as data
@@ -795,7 +862,10 @@ fn render_rig_status_human(result: &RigStatusResult) {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        println!("{:<16} {:<8} {:<9} {}", service.name, service.state, health, ports);
+        println!(
+            "{:<16} {:<8} {:<9} {}",
+            service.name, service.state, health, ports
+        );
     }
     if result.services.is_empty() {
         println!("(no running services — rig is down)");
@@ -808,11 +878,7 @@ fn render_rig_status_human(result: &RigStatusResult) {
     println!("volumes: {volumes}");
     println!(
         "ports {}",
-        if result.ports_free {
-            "free"
-        } else {
-            "in use"
-        }
+        if result.ports_free { "free" } else { "in use" }
     );
 }
 

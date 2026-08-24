@@ -32,7 +32,7 @@ use ignition_core::error::CoreError;
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
     ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
-    WaitArgs, WaitCmd,
+    WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -140,6 +140,12 @@ enum ActionOutput {
     /// `ign rig trial reset` — the ladder's outcome: mechanism +
     /// before/after flip (04-03).
     RigTrialReset(actions::rig::TrialResetResult),
+    /// `ign webdev deploy` — the embedded bundle installed (routes +
+    /// import outcome; the scriptExec secret NEVER rides any output).
+    WebdevDeploy(actions::webdev::WebdevDeployResult),
+    /// `ign webdev status` — the per-route version-handshake sweep
+    /// (degradation is data; exit 0 whenever the sweep completes).
+    WebdevStatus(actions::webdev::WebdevStatusResult),
 }
 
 impl ActionOutput {
@@ -199,6 +205,8 @@ impl ActionOutput {
             ActionOutput::RigRestore(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
+            ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
+            ActionOutput::WebdevStatus(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -939,6 +947,67 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
         },
+        // Webdev (05-03, WEB-01/02): the CLI's own gateway-side
+        // surface. Deploy is deliberately NOT --yes-guarded — the
+        // dedicated ign-cli project is CLI-OWNED (born from the first
+        // deploy zip; overwrite-replace is the contract, README
+        // documents; user projects are never touched). This arm
+        // resolves the profile MANUALLY (the Doctor precedent):
+        // deploy needs the config PATH + profile NAME for the
+        // scriptExec secret lifecycle, and status needs the stored
+        // secret from the resolved profile. Both are authed commands
+        // (required credential, exit 3 without — the
+        // inspection-command rule).
+        Commands::Webdev(WebdevArgs { command }) => {
+            match resolve_profile_context(&mut config, cli.profile.as_deref()) {
+                Ok(None) => (None, Err(CoreError::NoActiveProfile)),
+                Ok(Some((name, profile))) => {
+                    let client = config::resolve_secret(&name, &profile.auth, &secret_chain())
+                        .and_then(|credential| ReqwestGatewayApi::new(&profile, Some(credential)));
+                    match command {
+                        WebdevCommand::Deploy {
+                            project,
+                            with_script_exec,
+                            rotate_secret,
+                        } => {
+                            let result = match client {
+                                Ok(api) => {
+                                    if mode == RenderMode::Human {
+                                        eprintln!("deploying webdev routes to {project} …");
+                                    }
+                                    actions::webdev::webdev_deploy(
+                                        &api,
+                                        &project,
+                                        with_script_exec,
+                                        rotate_secret,
+                                        &path,
+                                        &name,
+                                    )
+                                    .await
+                                    .map(ActionOutput::WebdevDeploy)
+                                }
+                                Err(err) => Err(err),
+                            };
+                            (Some(name), result)
+                        }
+                        WebdevCommand::Status { project } => {
+                            let result = match client {
+                                Ok(api) => actions::webdev::webdev_status(
+                                    &api,
+                                    &project,
+                                    profile.webdev_secret.as_deref(),
+                                )
+                                .await
+                                .map(ActionOutput::WebdevStatus),
+                                Err(err) => Err(err),
+                            };
+                            (Some(name), result)
+                        }
+                    }
+                }
+                Err(err) => (None, Err(err)),
+            }
+        }
         // `rig reset`, `rig trial reset`, and `rig restore` are the
         // family's destructive verbs: their guards fire BEFORE the
         // runner/discovery even exist (the sessions-terminate
@@ -1008,16 +1077,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             _ => unreachable!("guarded by the outer match arm"),
                         }
                     }
-                    RigCommand::Down => {
-                        actions::rig::rig_down(&runner, &plan)
-                            .await
-                            .map(ActionOutput::RigDown)
-                    }
-                    RigCommand::Status => {
-                        actions::rig::rig_status(&runner, &plan)
-                            .await
-                            .map(ActionOutput::RigStatus)
-                    }
+                    RigCommand::Down => actions::rig::rig_down(&runner, &plan)
+                        .await
+                        .map(ActionOutput::RigDown),
+                    RigCommand::Status => actions::rig::rig_status(&runner, &plan)
+                        .await
+                        .map(ActionOutput::RigStatus),
                     // The THIRD sanctioned stdout exception (after
                     // completions and `logs -f`): raw passthrough in
                     // EVERY render mode — compose log lines are not
@@ -1051,14 +1116,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     // which rung lands) and/or the tier-1 pair
                     // (--user / IGNITION_USER + IGNITION_PASSWORD).
                     RigCommand::Trial(ref trial_args) => match trial_args.command.clone() {
-                        crate::cli::TrialCommand::Status => {
-                            match rig_gateway_client(&plan, None) {
-                                Some(api) => actions::rig::trial_status(&api)
-                                    .await
-                                    .map(ActionOutput::RigTrialStatus),
-                                None => Err(trial_no_gateway(&plan)),
-                            }
-                        }
+                        crate::cli::TrialCommand::Status => match rig_gateway_client(&plan, None) {
+                            Some(api) => actions::rig::trial_status(&api)
+                                .await
+                                .map(ActionOutput::RigTrialStatus),
+                            None => Err(trial_no_gateway(&plan)),
+                        },
                         crate::cli::TrialCommand::Reset { user } => {
                             // Cred sourcing (rig family — no profile
                             // chain): tier-0 token = IGNITION_TOKEN;
@@ -1068,9 +1131,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             let token = std::env::var("IGNITION_TOKEN")
                                 .ok()
                                 .filter(|value| !value.is_empty());
-                            let username = user
-                                .clone()
-                                .or_else(|| env_non_empty("IGNITION_USER"));
+                            let username = user.clone().or_else(|| env_non_empty("IGNITION_USER"));
                             let password = env_non_empty("IGNITION_PASSWORD");
                             let basic = username.zip(password).map(|(user, password)| {
                                 (user, ignition_core::config::Secret::new(password))
@@ -1090,10 +1151,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             let token_available = credential.is_some();
                             match rig_gateway_client(&plan, credential) {
                                 Some(api) => {
-                                    let rig_url =
-                                        actions::rig::gateway_url_from(&plan).expect(
-                                            "rig_gateway_client derived it or returned None",
-                                        );
+                                    let rig_url = actions::rig::gateway_url_from(&plan)
+                                        .expect("rig_gateway_client derived it or returned None");
                                     let basic_ref = basic
                                         .as_ref()
                                         .map(|(user, password)| (user.as_str(), password));
@@ -1125,13 +1184,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         };
                         let credential = Some(Credential::Token(config::Secret::new(token)));
                         match rig_gateway_client(&plan, credential) {
-                            Some(api) => actions::rig::rig_snapshot(
-                                &api,
-                                &plan.name,
-                                output.as_deref(),
-                            )
-                            .await
-                            .map(ActionOutput::RigSnapshot),
+                            Some(api) => {
+                                actions::rig::rig_snapshot(&api, &plan.name, output.as_deref())
+                                    .await
+                                    .map(ActionOutput::RigSnapshot)
+                            }
                             None => Err(trial_no_gateway(&plan)),
                         }
                     }
@@ -1151,9 +1208,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let credential = Some(Credential::Token(config::Secret::new(token)));
                         match rig_gateway_client(&plan, credential) {
                             Some(api) => {
-                                let rig_url = actions::rig::gateway_url_from(&plan).expect(
-                                    "rig_gateway_client derived it or returned None",
-                                );
+                                let rig_url = actions::rig::gateway_url_from(&plan)
+                                    .expect("rig_gateway_client derived it or returned None");
                                 actions::rig::rig_restore(&api, &rig_url, &file, timeout)
                                     .await
                                     .map(ActionOutput::RigRestore)
