@@ -46,6 +46,7 @@ pub mod sessions;
 pub mod status;
 pub mod trial;
 pub mod version;
+pub mod webdev;
 
 use crate::client::connections::GatewayConnection;
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
@@ -60,6 +61,7 @@ use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
 use crate::client::trial::{BannerSet, TrialWire};
 use crate::client::version::GatewayInfo;
+use crate::client::webdev::{RouteBody, RouteProbe};
 use crate::config::{Credential, Profile};
 use crate::error::CoreError;
 
@@ -183,6 +185,35 @@ pub trait GatewayApi: Send + Sync {
     /// 200/401/403 = exists). Deliberately NOT classified: presence
     /// IS the answer; only transport failures are errors.
     async fn webdev_route_status(&self, route: &str) -> Result<u16, CoreError>;
+    /// POST `/system/webdev/{project}/cli/{route}` (authed + any
+    /// caller headers — scriptExec's secret gate) with the action
+    /// JSON. classify() runs for transport/status errors, BUT the
+    /// 200 BODY is the route envelope `{ok, data|error}` — WebDev
+    /// IGNORES `status`, so denials ride HTTP 200: `ok:false` maps
+    /// `error.code` onto the taxonomy (05-03), `ok:true` returns
+    /// `data`. HTTP 200 alone is NEVER a success verdict.
+    async fn webdev_route_call(
+        &self,
+        project: &str,
+        route: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<serde_json::Value, CoreError>;
+    /// POST the route's `{"action":"version"}` handshake and
+    /// discriminate ([`webdev::RouteProbe`]): 200-body-ok →
+    /// `Present{route_version}`, 405 → `Absent` (the live-proven 8.3
+    /// marker — NOT 404), 402 → `Unlicensed`, 401/403 → `AuthGated`,
+    /// 200-body-denial → `Denied{code,message}`. Deliberately NOT
+    /// classified — the status code IS the answer (the
+    /// `webdev_route_status` precedent); only transport failures and
+    /// shapes the enum has no variant for (wizard redirects, 503
+    /// restarts, foreign 404s) are errors.
+    async fn webdev_route_probe(
+        &self,
+        project: &str,
+        route: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<RouteProbe, CoreError>;
     /// GET `/data/api/v1/projects/list` (authed) — every RUNNABLE
     /// project with inheritance info from the items themselves
     /// (PROJ-01; standard list params, `limit=-1` UI convention).
@@ -512,9 +543,9 @@ impl ReqwestGatewayApi {
     /// (callers read the body as their capability needs; the project
     /// mutations treat Ok classification AS the success contract —
     /// those bodies are unverified LOW, the restart `literal true`
-    /// precedent). Token-auth POSTs need NO CSRF (verified 02-RESEARCH
-    /// §Auth Model). One of the two body-carrying pipeline helpers
-    /// (03-01); serde serializes struct fields in declaration order, so
+    /// precedent). Token-auth POSTs need NO CSRF (verified
+    /// 02-RESEARCH §Auth Model). One of the two body-carrying pipeline
+    /// helpers (03-01); serde serializes struct fields in declaration order, so
     /// recorded bodies are deterministic for the wiremock pins.
     async fn post_json<T: serde::Serialize + ?Sized>(
         &self,
@@ -524,6 +555,33 @@ impl ReqwestGatewayApi {
         let url = self.url_for(path);
         let request = self.apply_auth(self.client.post(url.clone()).json(body));
         self.send_and_classify(request, &url).await
+    }
+
+    /// POST the action JSON to a webdev route with caller headers +
+    /// auth applied, returning `(full URL, response)` — the shared
+    /// head of the two webdev seam methods (05-03). NO classify here:
+    /// `webdev_route_probe` reads the raw status (the code IS the
+    /// answer); `webdev_route_call` classifies downstream. Transport
+    /// failures map to `Network` like every pipeline.
+    async fn webdev_post_raw(
+        &self,
+        project: &str,
+        route: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<(String, reqwest::Response), CoreError> {
+        let path = webdev::route_url(project, route);
+        let url = self.url_for(&path);
+        let mut request = self.client.post(url.clone()).json(body);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        let request = self.apply_auth(request);
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+        })?;
+        Ok((url.to_string(), response))
     }
 
     /// PUT `path` with a JSON body → classify → `Ok(())` (modify/
@@ -793,6 +851,87 @@ impl GatewayApi for ReqwestGatewayApi {
             source: Some(err),
         })?;
         Ok(response.status().as_u16())
+    }
+
+    async fn webdev_route_call(
+        &self,
+        project: &str,
+        route: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<serde_json::Value, CoreError> {
+        // classify() runs normally for transport/status errors; the
+        // 200 BODY is then the route envelope — WebDev ignores
+        // `status`, so denials ride HTTP 200 and the body verdict is
+        // the ONLY success oracle (never the status line alone).
+        let (url, response) = self
+            .webdev_post_raw(project, route, body, extra_headers)
+            .await?;
+        let response = classify::classify(response, &url).await?;
+        let text = response.text().await.unwrap_or_default();
+        match webdev::parse_route_body(&text)? {
+            RouteBody::Ok(data) => Ok(data),
+            RouteBody::Denied { code, message } => {
+                Err(webdev::denial_to_error(&code, &message, url))
+            }
+        }
+    }
+
+    async fn webdev_route_probe(
+        &self,
+        project: &str,
+        route: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<RouteProbe, CoreError> {
+        // NOT classified — the status code IS the answer (the
+        // webdev_route_status precedent): 405/402/401 discriminate
+        // presence/licensing/gating, and a 200 body carries the
+        // version handshake or the structured denial.
+        let (url, response) = self
+            .webdev_post_raw(
+                project,
+                route,
+                &serde_json::json!({"action": "version"}),
+                extra_headers,
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return match webdev::parse_route_body(&text)? {
+                RouteBody::Ok(data) => {
+                    let route_version = data
+                        .get("routeVersion")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            CoreError::Internal(format!(
+                                "webdev route version action from {url} answered no routeVersion"
+                            ))
+                        })?;
+                    Ok(RouteProbe::Present { route_version })
+                }
+                RouteBody::Denied { code, message } => {
+                    Ok(RouteProbe::Denied { code, message })
+                }
+            };
+        }
+        match status.as_u16() {
+            401 | 403 => Ok(RouteProbe::AuthGated),
+            402 => Ok(RouteProbe::Unlicensed),
+            405 => Ok(RouteProbe::Absent),
+            // Shapes the enum has no variant for (wizard redirects,
+            // mid-restart 503s, foreign 404s) — reuse classify's
+            // status mappings verbatim; every non-success response
+            // classifies to Err, and the Ok arm is unreachable by
+            // construction (all 2xx took the body branch above).
+            _ => match classify::classify(response, &url).await {
+                Err(err) => Err(err),
+                Ok(_) => Err(CoreError::Internal(format!(
+                    "unexpected HTTP {status} from webdev route probe at {url}"
+                ))),
+            },
+        }
     }
 
     async fn projects(

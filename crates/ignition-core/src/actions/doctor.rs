@@ -673,6 +673,23 @@ mod tests {
         async fn webdev_route_status(&self, _route: &str) -> Result<u16, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn webdev_route_call(
+            &self,
+            _project: &str,
+            _route: &str,
+            _body: &serde_json::Value,
+            _extra_headers: &[(&str, &str)],
+        ) -> Result<serde_json::Value, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn webdev_route_probe(
+            &self,
+            _project: &str,
+            _route: &str,
+            _extra_headers: &[(&str, &str)],
+        ) -> Result<crate::client::webdev::RouteProbe, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn projects(
             &self,
             _query: &crate::client::query::ListQuery,

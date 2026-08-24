@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -169,6 +169,65 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// The WebDev route family a command depends on is not deployed —
+    /// the presence probe answered 405, the live-proven 8.3 absent
+    /// marker (missing routes AND missing projects both answer 405,
+    /// NOT 404; 05-RESEARCH Pitfall 1). Exit 6 — target state: the
+    /// command is invalid until `ign webdev deploy` installs the
+    /// routes (the TrialNotExpired precedent: action-constructed, not
+    /// classify).
+    #[error("webdev routes are not deployed (probe of {route:?} in project {project:?} answered 405)")]
+    RoutesNotDeployed {
+        /// The deploy project the probe targeted.
+        project: String,
+        /// The route folder the probe named.
+        route: String,
+        /// Path of the probe request, when known.
+        endpoint: Option<String>,
+    },
+
+    /// The WebDev module answered 402 — installed but unlicensed (a
+    /// trial-expired gateway; live-verified cross-version on 8.3.6,
+    /// 05-RESEARCH §Servlet). Exit 6 — no `/system/webdev` route can
+    /// answer until the gateway is licensed.
+    #[error("the WebDev module is unlicensed on this gateway (HTTP 402 — trial-expired rigs cannot serve /system/webdev routes)")]
+    WebdevUnlicensed {
+        /// Path of the probe request, when known.
+        endpoint: Option<String>,
+    },
+
+    /// A deployed route's handshake version differs from the embedded
+    /// bundle's — the CLI refuses rather than auto-upgrading either
+    /// side (roadmap-locked: actionable error, no auto-upgrade
+    /// magic). Exit 6.
+    #[error("route {route:?} version mismatch: deployed {deployed}, this CLI expects {expected}")]
+    RouteVersionMismatch {
+        /// The route folder that answered.
+        route: String,
+        /// The route's deployed `routeVersion`.
+        deployed: String,
+        /// The embedded bundle's version
+        /// ([`crate::webdev::ROUTE_BUNDLE_VERSION`]).
+        expected: String,
+        /// Path of the probe request, when known.
+        endpoint: Option<String>,
+    },
+
+    /// A WebDev route answered HTTP 200 with a body denial
+    /// (`{ok:false, error{code,message}}`) whose machine code this CLI
+    /// does not specifically map — code + message ride verbatim so
+    /// agents can branch on the stable route contract (05-01). Exit 6
+    /// — target state: the deployed route refused the action.
+    #[error("webdev route denied the call ({code}): {message}")]
+    WebdevRouteError {
+        /// The route's machine error code (stable contract).
+        code: String,
+        /// The route's human message.
+        message: String,
+        /// Path of the request, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -196,6 +255,10 @@ impl CoreError {
             Self::ProjectExists { .. } => "project_exists",
             Self::ResourceBinary { .. } => "resource_binary",
             Self::TrialNotExpired { .. } => "trial_not_expired",
+            Self::RoutesNotDeployed { .. } => "routes_not_deployed",
+            Self::WebdevUnlicensed { .. } => "webdev_unlicensed",
+            Self::RouteVersionMismatch { .. } => "route_version_mismatch",
+            Self::WebdevRouteError { .. } => "webdev_route_error",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -219,7 +282,11 @@ impl CoreError {
             | Self::NotFound { .. }
             | Self::ProjectExists { .. }
             | Self::ResourceBinary { .. }
-            | Self::TrialNotExpired { .. } => 6,
+            | Self::TrialNotExpired { .. }
+            | Self::RoutesNotDeployed { .. }
+            | Self::WebdevUnlicensed { .. }
+            | Self::RouteVersionMismatch { .. }
+            | Self::WebdevRouteError { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -323,6 +390,49 @@ impl CoreError {
                   run `ign rig reset --yes` for a completely fresh trial volume"
                     .to_string(),
             ),
+            Self::RoutesNotDeployed { .. } => Some(
+                "run `ign webdev deploy` to install the CLI's WebDev routes into \
+                  the gateway, then retry"
+                    .to_string(),
+            ),
+            Self::WebdevUnlicensed { .. } => Some(
+                "license the gateway — the WebDev module answers 402 while \
+                  unlicensed (on a rig, `ign rig trial reset --yes` restarts an \
+                  expired trial)"
+                    .to_string(),
+            ),
+            Self::RouteVersionMismatch { deployed, expected, .. } => {
+                // Direction decides the fix (roadmap criterion): an older
+                // deployed route → redeploy from THIS binary; a NEWER
+                // deployed route → this CLI is behind (the route bundle
+                // travels with the binary). Same slug either way.
+                let newer = semver::Version::parse(deployed)
+                    .ok()
+                    .zip(semver::Version::parse(expected).ok())
+                    .is_some_and(|(deployed, expected)| deployed > expected);
+                Some(if newer {
+                    "the deployed routes are NEWER than this CLI — update ign \
+                      (the route bundle travels with the binary)"
+                        .to_string()
+                } else {
+                    "run `ign webdev deploy` to redeploy the route version \
+                      this CLI expects"
+                        .to_string()
+                })
+            }
+            Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
+                "the scriptExec route is secret-gated — deploy it with `ign \
+                  webdev deploy --with-script-exec` (the secret is generated \
+                  and stored in the profile config at 0600); a mismatch means \
+                  the route was deployed with a different secret: redeploy or \
+                  pass --rotate-secret"
+                    .to_string()
+            } else {
+                "the deployed route refused the action — the code and message \
+                  are the route's stable contract; `ign webdev status` \
+                  diagnoses the deployment"
+                    .to_string()
+            }),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -343,7 +453,11 @@ impl CoreError {
             | Self::NotFound { endpoint }
             | Self::ProjectExists { endpoint, .. }
             | Self::ResourceBinary { endpoint, .. }
-            | Self::TrialNotExpired { endpoint, .. } => endpoint.clone(),
+            | Self::TrialNotExpired { endpoint, .. }
+            | Self::RoutesNotDeployed { endpoint, .. }
+            | Self::WebdevUnlicensed { endpoint }
+            | Self::RouteVersionMismatch { endpoint, .. }
+            | Self::WebdevRouteError { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -528,6 +642,41 @@ mod tests {
                 6,
                 "trial_not_expired",
             ),
+            (
+                CoreError::RoutesNotDeployed {
+                    project: "ign-cli".into(),
+                    route: "tags".into(),
+                    endpoint: Some("/system/webdev/ign-cli/cli/tags".into()),
+                },
+                6,
+                "routes_not_deployed",
+            ),
+            (
+                CoreError::WebdevUnlicensed {
+                    endpoint: Some("/system/webdev/ign-cli/cli/tags".into()),
+                },
+                6,
+                "webdev_unlicensed",
+            ),
+            (
+                CoreError::RouteVersionMismatch {
+                    route: "tags".into(),
+                    deployed: "0.9.0".into(),
+                    expected: "1.0.0".into(),
+                    endpoint: Some("/system/webdev/ign-cli/cli/tags".into()),
+                },
+                6,
+                "route_version_mismatch",
+            ),
+            (
+                CoreError::WebdevRouteError {
+                    code: "route_error".into(),
+                    message: "boom".into(),
+                    endpoint: Some("/system/webdev/ign-cli/cli/tags".into()),
+                },
+                6,
+                "webdev_route_error",
+            ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {
@@ -594,6 +743,55 @@ mod tests {
         assert!(
             hint.contains("8.3.1"),
             "target-state hint must name the minimum: {hint}"
+        );
+
+        // The WebDev refusal matrix (05-03): every hint names the fix
+        // — `ign webdev deploy` for absent/older routes, `update ign`
+        // for newer ones (the roadmap's actionable-error criterion).
+        let undeployed = CoreError::RoutesNotDeployed {
+            project: "ign-cli".into(),
+            route: "tags".into(),
+            endpoint: None,
+        };
+        let hint = undeployed.hint().expect("hint required");
+        assert!(
+            hint.contains("ign webdev deploy"),
+            "absent-routes hint must name the fix: {hint}"
+        );
+
+        let older = CoreError::RouteVersionMismatch {
+            route: "tags".into(),
+            deployed: "0.9.0".into(),
+            expected: "1.0.0".into(),
+            endpoint: None,
+        };
+        let hint = older.hint().expect("hint required");
+        assert!(
+            hint.contains("ign webdev deploy") && !hint.contains("update ign"),
+            "older-route hint says redeploy: {hint}"
+        );
+
+        let newer = CoreError::RouteVersionMismatch {
+            route: "tags".into(),
+            deployed: "1.1.0".into(),
+            expected: "1.0.0".into(),
+            endpoint: None,
+        };
+        let hint = newer.hint().expect("hint required");
+        assert!(
+            hint.contains("update ign") && !hint.contains("ign webdev deploy"),
+            "newer-route hint says update ign: {hint}"
+        );
+
+        let secret_gate = CoreError::WebdevRouteError {
+            code: "secret_required".into(),
+            message: "missing x-ignition-cli-secret header".into(),
+            endpoint: None,
+        };
+        let hint = secret_gate.hint().expect("hint required");
+        assert!(
+            hint.contains("--with-script-exec"),
+            "secret-gate hint names the deploy flag: {hint}"
         );
 
         // Totality: no class silently loses its hint later.
