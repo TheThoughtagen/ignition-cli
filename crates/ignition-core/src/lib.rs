@@ -14,8 +14,9 @@
 //! `output` (the LOCKED success envelope), `config` (discovery, profiles,
 //! secrets, rigs), `client` (the [`client::GatewayApi`] seam + GatewayInfo),
 //! `poll` (the shared wait/retry engine), `rig` (the compose shell-out
-//! engine — runner seam, discovery, pre-flight), and `actions` (the
-//! shared verb layer).
+//! engine — runner seam, discovery, pre-flight), `actions` (the shared
+//! verb layer), and `webdev` (the embedded route bundle `ign webdev deploy`
+//! zips — pure data, no I/O).
 
 pub mod actions;
 pub mod client;
@@ -24,3 +25,4 @@ pub mod error;
 pub mod output;
 pub mod poll;
 pub mod rig;
+pub mod webdev;
