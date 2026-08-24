@@ -416,10 +416,16 @@ pub struct PortMapping {
 /// object — current compose — or a single-element array — older
 /// builds); loud where identity is at stake (no `.name` → error, never
 /// an implicit directory-name project).
-pub fn parse_config(stdout: &str, compose_file: &Path, project_dir: &Path) -> Result<RigPlan, CoreError> {
+pub fn parse_config(
+    stdout: &str,
+    compose_file: &Path,
+    project_dir: &Path,
+) -> Result<RigPlan, CoreError> {
     let trimmed = stdout.trim();
     let doc: Value = serde_json::from_str(trimmed).map_err(|err| {
-        CoreError::Rig(format!("cannot parse `docker compose config` output: {err}"))
+        CoreError::Rig(format!(
+            "cannot parse `docker compose config` output: {err}"
+        ))
     })?;
     let root = match doc {
         Value::Array(mut items) => items.pop().unwrap_or(Value::Null),
@@ -455,13 +461,12 @@ pub fn parse_config(stdout: &str, compose_file: &Path, project_dir: &Path) -> Re
                 // a number on some builds — tolerate both; entries
                 // without a published port (random host ports) don't
                 // map and are skipped.
-                let published = port
-                    .get("published")
-                    .and_then(|value| {
-                        value.as_str().and_then(|s| s.parse().ok()).or_else(|| {
-                            value.as_u64().and_then(|n| u16::try_from(n).ok())
-                        })
-                    });
+                let published = port.get("published").and_then(|value| {
+                    value
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| value.as_u64().and_then(|n| u16::try_from(n).ok()))
+                });
                 let target = port
                     .get("target")
                     .and_then(|value| value.as_u64().and_then(|n| u16::try_from(n).ok()));
@@ -700,8 +705,15 @@ mod tests {
                 Path::new("/rigs/docker/compose.yml"),
                 Path::new("/rigs/docker"),
             ),
-            s(&["-f", "/rigs/docker/compose.yml", "--project-directory", "/rigs/docker",
-                "config", "--format", "json"]),
+            s(&[
+                "-f",
+                "/rigs/docker/compose.yml",
+                "--project-directory",
+                "/rigs/docker",
+                "config",
+                "--format",
+                "json"
+            ]),
         );
     }
 
@@ -709,8 +721,18 @@ mod tests {
     fn up_args_pinned() {
         assert_eq!(
             up_args(&sample_plan(), 300),
-            s(&["-p", "ignition-devops", "-f", "/rigs/git-module/docker/docker-compose.yml",
-                "up", "-d", "--wait", "--wait-timeout", "300", "--remove-orphans"]),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "300",
+                "--remove-orphans"
+            ]),
         );
     }
 
@@ -718,14 +740,27 @@ mod tests {
     fn down_args_pinned_with_and_without_volumes() {
         assert_eq!(
             down_args(&sample_plan(), false),
-            s(&["-p", "ignition-devops", "-f", "/rigs/git-module/docker/docker-compose.yml",
-                "down", "--remove-orphans"]),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "down",
+                "--remove-orphans"
+            ]),
             "plain down keeps volumes (reset's -v arrives in 04-02)"
         );
         assert_eq!(
             down_args(&sample_plan(), true),
-            s(&["-p", "ignition-devops", "-f", "/rigs/git-module/docker/docker-compose.yml",
-                "down", "--remove-orphans", "-v"]),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "down",
+                "--remove-orphans",
+                "-v"
+            ]),
         );
     }
 
@@ -733,8 +768,15 @@ mod tests {
     fn ps_args_pinned() {
         assert_eq!(
             ps_args(&sample_plan()),
-            s(&["-p", "ignition-devops", "-f", "/rigs/git-module/docker/docker-compose.yml",
-                "ps", "--format", "json"]),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "ps",
+                "--format",
+                "json"
+            ]),
         );
     }
 
@@ -742,13 +784,29 @@ mod tests {
     fn logs_args_pinned() {
         assert_eq!(
             logs_args(&sample_plan(), 200, false, None),
-            s(&["-p", "ignition-devops", "-f", "/rigs/git-module/docker/docker-compose.yml",
-                "logs", "--tail", "200"]),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "logs",
+                "--tail",
+                "200"
+            ]),
         );
         assert_eq!(
             logs_args(&sample_plan(), 50, true, Some("ignition")),
-            s(&["-p", "ignition-devops", "-f", "/rigs/git-module/docker/docker-compose.yml",
-                "logs", "--tail", "50", "-f", "ignition"]),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "logs",
+                "--tail",
+                "50",
+                "-f",
+                "ignition"
+            ]),
         );
     }
 
@@ -756,8 +814,14 @@ mod tests {
     fn volume_ls_args_pinned_plain_docker_shape() {
         assert_eq!(
             volume_ls_args("ignition-devops"),
-            s(&["volume", "ls", "--filter", "label=com.docker.compose.project=ignition-devops",
-                "--format", "json"]),
+            s(&[
+                "volume",
+                "ls",
+                "--filter",
+                "label=com.docker.compose.project=ignition-devops",
+                "--format",
+                "json"
+            ]),
             "plain docker CLI: no compose subcommand, no -p prefix"
         );
     }
@@ -814,9 +878,15 @@ mod tests {
         let err = check_output(&failed, "docker compose up").unwrap_err();
         assert!(matches!(err, crate::error::CoreError::Rig(_)));
         let message = err.to_string();
-        assert!(message.contains("docker compose up failed (exit 1)"), "{message}");
+        assert!(
+            message.contains("docker compose up failed (exit 1)"),
+            "{message}"
+        );
         // The tail is the LAST ~5 lines only.
-        assert!(!message.contains("line-4\n"), "tail keeps at most 5 lines: {message}");
+        assert!(
+            !message.contains("line-4\n"),
+            "tail keeps at most 5 lines: {message}"
+        );
         assert!(message.contains("line-5"));
         assert!(message.contains("line-9"));
     }
@@ -945,9 +1015,7 @@ mod tests {
         }
         // The spawn's cwd is the TEST binary's dir — nowhere near the
         // fixture — which is exactly the cwd-elsewhere case.
-        let output = runner
-            .run(&config_args(&compose, dir.path()))
-            .await;
+        let output = runner.run(&config_args(&compose, dir.path())).await;
         assert_eq!(output.code, 0, "config run: {}", output.stderr);
         let plan = parse_config(&output.stdout, &compose, dir.path()).expect("resolve parses");
         assert_eq!(
@@ -987,9 +1055,19 @@ mod tests {
         let output = runner
             .run_streaming(&logs_args(&plan, 5, false, None), &mut sink)
             .await;
-        assert_eq!(output.code, 0, "compose logs on an absent project: {}", output.stderr);
-        assert_eq!(streamed, 0, "no containers → no lines, but the spawn/read/wait ran");
-        assert!(output.stdout.is_empty(), "streamed stdout never reports back");
+        assert_eq!(
+            output.code, 0,
+            "compose logs on an absent project: {}",
+            output.stderr
+        );
+        assert_eq!(
+            streamed, 0,
+            "no containers → no lines, but the spawn/read/wait ran"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "streamed stdout never reports back"
+        );
     }
 
     // ----- LDJSON parsers (research Pitfall 1: BOTH conventions pinned) --
@@ -1053,7 +1131,8 @@ mod tests {
         assert_eq!(rows[0].compose_project.as_deref(), Some("other-project"));
 
         // The compose-ps-style map labels + Name key are accepted too.
-        let map_labels = r#"{"Name":"ign-research","Labels":{"com.docker.compose.project":"research"}}"#;
+        let map_labels =
+            r#"{"Name":"ign-research","Labels":{"com.docker.compose.project":"research"}}"#;
         let rows = parse_docker_ps_ldjson(map_labels);
         assert_eq!(rows[0].name, "ign-research");
         assert_eq!(rows[0].compose_project.as_deref(), Some("research"));

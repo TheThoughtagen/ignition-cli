@@ -252,7 +252,13 @@ fn snapshot_mutate_restore_round_trip() {
         &ign_rig(
             &rig_config,
             &env,
-            &["rig", "snapshot", "-o", snap_dir.to_str().unwrap(), "--compact"],
+            &[
+                "rig",
+                "snapshot",
+                "-o",
+                snap_dir.to_str().unwrap(),
+                "--compact",
+            ],
         ),
     );
     let manifest = read_manifest(&snap_dir);
@@ -272,7 +278,11 @@ fn snapshot_mutate_restore_round_trip() {
     // 4. THE restore (guarded; the action waits for the witnessed
     //    RUNNING — this is the slow leg, the gateway restarts).
     let gwbk_path = snap_dir.join(manifest["gwbk"].as_str().expect("gwbk file name"));
-    assert!(gwbk_path.exists(), "the gwbk landed: {}", gwbk_path.display());
+    assert!(
+        gwbk_path.exists(),
+        "the gwbk landed: {}",
+        gwbk_path.display()
+    );
     let restored = ign_rig(
         &rig_config,
         &env,
@@ -296,16 +306,17 @@ fn snapshot_mutate_restore_round_trip() {
     }
     let restore_data = data_envelope(&restored)["data"].clone();
     assert_eq!(
-        restore_data["state"], Value::String("running".into()),
+        restore_data["state"],
+        Value::String("running".into()),
         "success is a WITNESSED RUNNING, never a bare 2xx: {restore_data}"
     );
     let warnings = restore_data["warnings"]
         .as_array()
         .expect("warnings array (all keys always)");
     assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.as_str().is_some_and(|warning| warning.contains("API tokens"))),
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("API tokens"))),
         "the Pitfall-5 token warning rides data: {restore_data}"
     );
 
@@ -384,7 +395,9 @@ fn read_manifest(snap_dir: &Path) -> Value {
     )
     .expect("manifest parses");
     assert!(
-        manifest["gwbk"].as_str().is_some_and(|name| !name.is_empty()),
+        manifest["gwbk"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
         "manifest carries the gwbk file name: {manifest}"
     );
     assert!(
@@ -392,7 +405,9 @@ fn read_manifest(snap_dir: &Path) -> Value {
         "manifest carries the projects array: {manifest}"
     );
     assert!(
-        manifest["notes"].as_array().is_some_and(|notes| notes.len() == 2),
+        manifest["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.len() == 2),
         "manifest carries BOTH composition notes: {manifest}"
     );
     manifest

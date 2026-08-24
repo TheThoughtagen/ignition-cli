@@ -112,9 +112,7 @@ async fn mount_export(server: &wiremock::MockServer, project: &str, zip: Vec<u8>
         .and(wiremock::matchers::path(format!(
             "/data/api/v1/projects/export/{project}"
         )))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
         .expect(1..)
         .mount(server)
         .await;
@@ -128,7 +126,10 @@ async fn mount_import(server: &wiremock::MockServer, project: &str) -> wiremock:
             "/data/api/v1/projects/import/{project}"
         )))
         .and(wiremock::matchers::query_param("overwrite", "true"))
-        .and(wiremock::matchers::header("content-type", "application/zip"))
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/zip",
+        ))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"success": true})),

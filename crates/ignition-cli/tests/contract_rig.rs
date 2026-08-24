@@ -89,8 +89,7 @@ fn missing_rig_exits_7_with_search_trail() {
     let out = ign_rig(&config, &roots, cwd.path(), &["rig", "status", "--compact"]);
     assert_eq!(out.status.code(), Some(7), "rig class");
     assert!(out.stdout.is_empty(), "errors never touch stdout");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["ok"], Value::Bool(false));
     assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
     assert_eq!(
@@ -108,7 +107,12 @@ fn missing_rig_exits_7_with_search_trail() {
         "cwd candidates named in the trail: {message}"
     );
     // The hint stays the class-wide docker hint.
-    assert!(body["error"]["hint"].as_str().unwrap_or("").contains("docker ps"));
+    assert!(
+        body["error"]["hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("docker ps")
+    );
 }
 
 /// `--rig unknown-name`: exit 7 listing the known rigs (the
@@ -128,11 +132,15 @@ fn unknown_rig_name_lists_knowns_golden() {
     let (_roots_dir, roots) = isolated_roots();
     let cwd = tempfile::tempdir().expect("cwd tempdir");
 
-    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "--rig", "nope", "status", "--compact"]);
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &["rig", "--rig", "nope", "status", "--compact"],
+    );
     assert_eq!(out.status.code(), Some(7));
     assert!(out.stdout.is_empty(), "errors never touch stdout");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["ok"], Value::Bool(false));
     assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
     assert_eq!(body["error"]["code"], Value::String("rig_error".into()));
@@ -196,8 +204,7 @@ fn discovery_precedence_config_default_beats_cwd() {
     let out = ign_rig(&config, &roots, cwd.path(), &["rig", "status", "--compact"]);
     assert_eq!(out.status.code(), Some(7), "no docker: resolve fails");
 
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["profile"], Value::Null);
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
@@ -229,7 +236,10 @@ fn rig_help_shows_the_subtree() {
     assert!(out.status.success(), "help exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     for expected in ["--rig <NAME>", "up", "down", "reset", "status", "logs"] {
-        assert!(stdout.contains(expected), "help mentions {expected}: {stdout}");
+        assert!(
+            stdout.contains(expected),
+            "help mentions {expected}: {stdout}"
+        );
     }
 
     // Bare `ign rig` (no verb) is the friendly usage error, exit 2.
@@ -259,8 +269,7 @@ fn rig_reset_refuses_without_yes_before_any_discovery() {
         "guard exit 2 — NOT the exit 7 a discovery run would produce"
     );
     assert!(out.stdout.is_empty(), "errors never touch stdout");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["ok"], Value::Bool(false));
     assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
     assert_eq!(
@@ -269,7 +278,10 @@ fn rig_reset_refuses_without_yes_before_any_discovery() {
         "stable slug"
     );
     let message = body["error"]["message"].as_str().expect("message");
-    assert!(message.contains("rig reset"), "names the operation: {message}");
+    assert!(
+        message.contains("rig reset"),
+        "names the operation: {message}"
+    );
     let hint = body["error"]["hint"].as_str().expect("hint required");
     assert!(
         hint.contains("--yes") && hint.contains("IGNITION_YES"),
@@ -287,10 +299,18 @@ fn rig_reset_with_yes_in_no_rig_cwd_fails_cleanly_at_discovery() {
     let (_roots_dir, roots) = isolated_roots();
     let cwd = tempfile::tempdir().expect("cwd tempdir");
 
-    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "reset", "--yes", "--compact"]);
-    assert_eq!(out.status.code(), Some(7), "guard passed: discovery failure");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &["rig", "reset", "--yes", "--compact"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "guard passed: discovery failure"
+    );
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["profile"], Value::Null);
     assert_eq!(body["error"]["code"], Value::String("rig_error".into()));
     let message = body["error"]["message"].as_str().expect("message");
@@ -315,7 +335,10 @@ fn rig_logs_help_shows_tail_follow_service() {
     assert!(stdout.contains("--tail"), "tail visible: {stdout}");
     assert!(stdout.contains("--follow"), "follow visible: {stdout}");
     assert!(stdout.contains("-f"), "the -f short form visible: {stdout}");
-    assert!(stdout.contains("[SERVICE]"), "the SERVICE positional visible: {stdout}");
+    assert!(
+        stdout.contains("[SERVICE]"),
+        "the SERVICE positional visible: {stdout}"
+    );
 }
 
 /// `IGNITION_RIG` fills a missing `--rig` (the env→flag fold in
@@ -342,8 +365,7 @@ fn ignition_rig_env_folds_into_selection() {
         .args(["rig", "status", "--compact"]);
     let out = command.output().expect("spawn ign");
     assert_eq!(out.status.code(), Some(7));
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
         message.contains("env-named-rig") && message.contains("known rigs"),
@@ -363,15 +385,19 @@ fn rig_trial_reset_refuses_without_yes_before_any_discovery() {
     let (_roots_dir, roots) = isolated_roots();
     let cwd = tempfile::tempdir().expect("cwd tempdir");
 
-    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial", "reset", "--compact"]);
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &["rig", "trial", "reset", "--compact"],
+    );
     assert_eq!(
         out.status.code(),
         Some(2),
         "guard exit 2 — NOT the exit 7 a discovery run would produce"
     );
     assert!(out.stdout.is_empty(), "errors never touch stdout");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["ok"], Value::Bool(false));
     assert_eq!(body["profile"], Value::Null, "refusal: profile null");
     assert_eq!(
@@ -402,13 +428,21 @@ fn rig_trial_help_shows_verbs_and_no_password_flag() {
     assert!(out.status.success(), "help exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     for expected in ["status", "reset"] {
-        assert!(stdout.contains(expected), "help mentions {expected}: {stdout}");
+        assert!(
+            stdout.contains(expected),
+            "help mentions {expected}: {stdout}"
+        );
     }
 
     // The reset verb's own help carries --user; a PASSWORD flag must
     // NOT exist anywhere (env-only redaction discipline — pinned by
     // this absence in the same golden as the presence checks).
-    let out = ign_rig(&config, &roots, cwd.path(), &["rig", "trial", "reset", "--help"]);
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &["rig", "trial", "reset", "--help"],
+    );
     assert!(out.status.success(), "reset help exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--user <NAME>"), "--user visible: {stdout}");
@@ -452,8 +486,7 @@ fn rig_restore_refuses_without_yes_before_any_discovery() {
         "guard exit 2 — NOT the exit 7 a discovery run would produce"
     );
     assert!(out.stdout.is_empty(), "errors never touch stdout");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["ok"], Value::Bool(false));
     assert_eq!(body["profile"], Value::Null, "refusal: profile null");
     assert_eq!(
@@ -492,9 +525,12 @@ fn rig_restore_with_yes_in_no_rig_cwd_fails_cleanly_at_discovery() {
             "--compact",
         ],
     );
-    assert_eq!(out.status.code(), Some(7), "guard passed: discovery failure");
-    let body: Value =
-        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "guard passed: discovery failure"
+    );
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
     assert_eq!(body["profile"], Value::Null);
     assert_eq!(body["error"]["code"], Value::String("rig_error".into()));
     assert!(
@@ -519,14 +555,20 @@ fn rig_snapshot_restore_help_surfaces() {
     let out = ign_rig(&config, &roots, cwd.path(), &["rig", "snapshot", "--help"]);
     assert!(out.status.success(), "snapshot help exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("--output <DIR>"), "output visible: {stdout}");
+    assert!(
+        stdout.contains("--output <DIR>"),
+        "output visible: {stdout}"
+    );
     assert!(stdout.contains("-o"), "the -o short form visible: {stdout}");
 
     let out = ign_rig(&config, &roots, cwd.path(), &["rig", "restore", "--help"]);
     assert!(out.status.success(), "restore help exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--file <PATH>"), "file visible: {stdout}");
-    assert!(stdout.contains("--timeout <SECS>"), "timeout visible: {stdout}");
+    assert!(
+        stdout.contains("--timeout <SECS>"),
+        "timeout visible: {stdout}"
+    );
     assert!(
         stdout.contains("--yes"),
         "the destructive guard is documented in the verb's help: {stdout}"

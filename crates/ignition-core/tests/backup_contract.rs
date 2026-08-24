@@ -44,10 +44,10 @@ async fn backup_download_streams_bytes_identical() {
     let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(BACKUP_PATH))
         .and(wiremock::matchers::query_param("type", "roaming"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
-            fixture.clone(),
-            "application/octet-stream",
-        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(fixture.clone(), "application/octet-stream"),
+        )
         .expect(1)
         .mount_as_scoped(&mock.server)
         .await;

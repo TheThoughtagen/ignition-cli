@@ -161,7 +161,9 @@ pub enum CoreError {
     /// turns that misleading auth-shaped 403 into the honest
     /// target-state refusal. Exit 6 (the ProjectExists precedent:
     /// action-constructed, not classify).
-    #[error("trial is not expired ({remaining_s}s left) — the gateway only honors resets once the trial expires")]
+    #[error(
+        "trial is not expired ({remaining_s}s left) — the gateway only honors resets once the trial expires"
+    )]
     TrialNotExpired {
         /// Seconds left on the active trial.
         remaining_s: i64,
@@ -176,7 +178,9 @@ pub enum CoreError {
     /// command is invalid until `ign webdev deploy` installs the
     /// routes (the TrialNotExpired precedent: action-constructed, not
     /// classify).
-    #[error("webdev routes are not deployed (probe of {route:?} in project {project:?} answered 405)")]
+    #[error(
+        "webdev routes are not deployed (probe of {route:?} in project {project:?} answered 405)"
+    )]
     RoutesNotDeployed {
         /// The deploy project the probe targeted.
         project: String,
@@ -190,7 +194,9 @@ pub enum CoreError {
     /// trial-expired gateway; live-verified cross-version on 8.3.6,
     /// 05-RESEARCH §Servlet). Exit 6 — no `/system/webdev` route can
     /// answer until the gateway is licensed.
-    #[error("the WebDev module is unlicensed on this gateway (HTTP 402 — trial-expired rigs cannot serve /system/webdev routes)")]
+    #[error(
+        "the WebDev module is unlicensed on this gateway (HTTP 402 — trial-expired rigs cannot serve /system/webdev routes)"
+    )]
     WebdevUnlicensed {
         /// Path of the probe request, when known.
         endpoint: Option<String>,

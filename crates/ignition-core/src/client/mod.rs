@@ -911,9 +911,7 @@ impl GatewayApi for ReqwestGatewayApi {
                         })?;
                     Ok(RouteProbe::Present { route_version })
                 }
-                RouteBody::Denied { code, message } => {
-                    Ok(RouteProbe::Denied { code, message })
-                }
+                RouteBody::Denied { code, message } => Ok(RouteProbe::Denied { code, message }),
             };
         }
         match status.as_u16() {

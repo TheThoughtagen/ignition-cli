@@ -31,34 +31,37 @@ async fn trial_and_banners_fetch_header_less() {
     let mock = IgnitionMock::start().await;
     let trial_guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(TRIAL_PATH))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "licenseMode": "Trial", "trialState": "AllInDemo",
                 "trialSecondsLeft": 0, "expired": true,
                 "emergency": false, "emergencySecondsLeft": 0,
                 "development": false, "developmentSecondsLeft": 0
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(&mock.server)
         .await;
     let banners_guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(BANNERS_PATH))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "banners": [{
                     "order": 0, "type": "trial",
                     "data": { "severity": "warning", "expireTime": null,
                               "toolTips": [], "actions": [] }
                 }]
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(&mock.server)
         .await;
 
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
-    let trial: TrialWire = api.trial_status_wire().await.expect("unauth works (live fact)");
+    let trial: TrialWire = api
+        .trial_status_wire()
+        .await
+        .expect("unauth works (live fact)");
     assert!(trial.expired);
     assert_eq!(trial.trial_seconds_left, 0);
     let banners: BannerSet = api.banners().await.expect("unauth works (live fact)");
@@ -85,14 +88,14 @@ async fn credential_rides_along_on_trial_fetches() {
     for path in [TRIAL_PATH, BANNERS_PATH] {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(path))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "licenseMode": "Trial", "trialState": "AllInDemo",
                     "trialSecondsLeft": 6590, "expired": false,
                     "emergency": false, "emergencySecondsLeft": 0,
                     "development": false, "developmentSecondsLeft": 0
-                }),
-            ))
+                })),
+            )
             .expect(1)
             .mount(&mock.server)
             .await;
@@ -100,8 +103,12 @@ async fn credential_rides_along_on_trial_fetches() {
 
     let credential = Credential::Token(Secret::new("spike:tokengeneratedlive"));
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(credential));
-    api.trial_status_wire().await.expect("credentialed fetch works");
-    api.banners().await.expect("banners parse under the token too (unused fields)");
+    api.trial_status_wire()
+        .await
+        .expect("credentialed fetch works");
+    api.banners()
+        .await
+        .expect("banners parse under the token too (unused fields)");
 }
 
 /// The tier-0 reset POST's exact request shape: EMPTY body, authed
@@ -113,21 +120,24 @@ async fn trial_reset_tier0_posts_empty_body_with_token() {
     let mock = IgnitionMock::start().await;
     let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(TRIAL_PATH))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "licenseMode": "Trial", "trialState": "AllInDemo",
                 "trialSecondsLeft": 7199, "expired": false,
                 "emergency": false, "emergencySecondsLeft": 0,
                 "development": false, "developmentSecondsLeft": 0
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(&mock.server)
         .await;
 
     let credential = Credential::Token(Secret::new("spike:tokengeneratedlive"));
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(credential));
-    let fresh = api.trial_reset_wire().await.expect("200 parses as the fresh trial");
+    let fresh = api
+        .trial_reset_wire()
+        .await
+        .expect("200 parses as the fresh trial");
     assert!(!fresh.expired, "the reset response IS the fresh state");
     assert_eq!(fresh.trial_seconds_left, 7199);
 
@@ -170,7 +180,7 @@ async fn trial_reset_403_classifies_auth() {
 // password confined to exactly ONE request body (redaction proof).
 // -------------------------------------------------------------------------
 
-use ignition_core::client::idp::{IdpLoginFlow, GatewaySession, login, trial_reset_via_session};
+use ignition_core::client::idp::{GatewaySession, IdpLoginFlow, login, trial_reset_via_session};
 
 /// The scripted fixture tokens/cookies (invented values; the SHAPES
 /// are the live-captured ones).
@@ -223,43 +233,54 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
     // 3. POST next-challenge {"token": T0} → T1 (body-EXACT matcher =
     //    the threading proof for this hop).
     let g3 = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/idp/default/authn/next-challenge"))
-        .and(wiremock::matchers::body_json(serde_json::json!({ "token": T0 })))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/next-challenge",
+        ))
+        .and(wiremock::matchers::body_json(
+            serde_json::json!({ "token": T0 }),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "complete": false,
                 "nextChallenge": [{"type": "basic", "config": {}}],
                 "rememberMe": false, "passwordExpired": false,
                 "token": T1
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(server)
         .await;
     // 4. POST submit-challenge/basic carrying T1 + the creds → T2.
     let g4 = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/idp/default/authn/submit-challenge/basic"))
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/submit-challenge/basic",
+        ))
         .and(wiremock::matchers::body_partial_json(serde_json::json!({
             "token": T1,
             "challenge": { "username": "admin" }
         })))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({ "success": true, "token": T2 }),
-        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": true, "token": T2 })),
+        )
         .expect(1)
         .mount_as_scoped(server)
         .await;
     // 5. POST next-challenge {"token": T2} → complete + T3.
     let g5 = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/idp/default/authn/next-challenge"))
-        .and(wiremock::matchers::body_json(serde_json::json!({ "token": T2 })))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/next-challenge",
+        ))
+        .and(wiremock::matchers::body_json(
+            serde_json::json!({ "token": T2 }),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "complete": true,
                 "rememberMe": false, "passwordExpired": false,
                 "token": T3
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(server)
         .await;
@@ -295,12 +316,12 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
     //    flow replays ALL captured cookies — not just the session one).
     let g8 = wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/data/app/session"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "userPayload": { "user": { "userName": "admin" } },
                 "csrfToken": CSRF
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(server)
         .await;
@@ -313,14 +334,14 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
             "Cookie",
             format!("{SESSION_COOKIE_NAME}={SESSION_COOKIE_VALUE}"),
         ))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "licenseMode": "Trial", "trialState": "AllInDemo",
                 "trialSecondsLeft": 7199, "expired": false,
                 "emergency": false, "emergencySecondsLeft": 0,
                 "development": false, "developmentSecondsLeft": 0
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount_as_scoped(server)
         .await;
@@ -370,8 +391,9 @@ async fn tier1_login_flow_pins_the_full_request_chain() {
 
     let flow = IdpLoginFlow::new(&server.uri()).expect("flow builds");
     let password = Secret::new("correct-horse-battery");
-    let (flow, session): (IdpLoginFlow, GatewaySession) =
-        login(flow, "admin", &password).await.expect("the dance completes");
+    let (flow, session): (IdpLoginFlow, GatewaySession) = login(flow, "admin", &password)
+        .await
+        .expect("the dance completes");
     assert_eq!(session.cookie_name, SESSION_COOKIE_NAME);
     assert_eq!(session.csrf_token, CSRF);
 
@@ -465,30 +487,33 @@ async fn tier1_bad_credentials_classify_auth() {
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+        .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("/idp/default/authn/login?app=gateway&token={T0}"),
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/next-challenge",
+        ))
         .respond_with(
-            wiremock::ResponseTemplate::new(302).insert_header(
-                "Location",
-                format!("/idp/default/authn/login?app=gateway&token={T0}"),
-            ),
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "complete": false,
+                "nextChallenge": [{"type": "basic", "config": {}}],
+                "token": T1
+            })),
         )
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/idp/default/authn/next-challenge"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
-                "complete": false,
-                "nextChallenge": [{"type": "basic", "config": {}}],
-                "token": T1
-            }),
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/submit-challenge/basic",
         ))
-        .mount(&server)
-        .await;
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/idp/default/authn/submit-challenge/basic"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({ "success": false, "token": T2 }),
-        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": false, "token": T2 })),
+        )
         .mount(&server)
         .await;
 
@@ -517,22 +542,20 @@ async fn tier1_consumed_token_replay_names_the_html_title() {
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/idp/default/oidc/auth"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(302).insert_header(
-                "Location",
-                format!("/idp/default/authn/login?app=gateway&token={T0}"),
-            ),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("/idp/default/authn/login?app=gateway&token={T0}"),
+        ))
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/idp/default/authn/next-challenge"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(400).set_body_raw(
-                common::jetty_error_html(400, "/idp/default/authn/next-challenge"),
-                "text/html;charset=iso-8859-1",
-            ),
-        )
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/next-challenge",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_raw(
+            common::jetty_error_html(400, "/idp/default/authn/next-challenge"),
+            "text/html;charset=iso-8859-1",
+        ))
         .mount(&server)
         .await;
 
@@ -628,7 +651,9 @@ async fn trial_reset_tier0_probe() {
         Err(err) => {
             // Not a test failure — the probe's ANSWER: tier 0 does not
             // satisfy the reset on this gateway; tier 1 owns it.
-            eprintln!("TIER 0 REJECTED by the live gateway: {err} — tier 1 (login) remains the mechanism");
+            eprintln!(
+                "TIER 0 REJECTED by the live gateway: {err} — tier 1 (login) remains the mechanism"
+            );
         }
     }
 }

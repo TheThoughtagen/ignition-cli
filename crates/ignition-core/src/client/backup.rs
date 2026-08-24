@@ -52,10 +52,7 @@ pub const BACKUP_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) fn restore_query() -> [(String, String); 4] {
     [
         ("restoreDisabled".to_string(), "false".to_string()),
-        (
-            "disableTempProjectBackup".to_string(),
-            "false".to_string(),
-        ),
+        ("disableTempProjectBackup".to_string(), "false".to_string()),
         ("renameEnabled".to_string(), "false".to_string()),
         ("restoreLocal".to_string(), "false".to_string()),
     ]

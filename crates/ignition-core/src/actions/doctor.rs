@@ -1024,7 +1024,11 @@ mod tests {
             webdev.detail
         );
         assert!(
-            webdev.hint.as_deref().unwrap().contains("ign webdev deploy"),
+            webdev
+                .hint
+                .as_deref()
+                .unwrap()
+                .contains("ign webdev deploy"),
             "hint names the fix"
         );
     }
@@ -1073,7 +1077,6 @@ mod tests {
             webdev.detail
         );
     }
-
 
     /// Serialization pins: statuses are lowercase; the checks[] keys
     /// are exactly {name, status, detail, hint} with hint null-able.

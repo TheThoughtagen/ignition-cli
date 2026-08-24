@@ -302,7 +302,9 @@ fn absent_row(route: &str, status: RouteStatus) -> RouteStatusRow {
 fn generate_secret() -> Result<String, CoreError> {
     let mut bytes = [0u8; 32];
     let mut source = std::fs::File::open("/dev/urandom").map_err(|err| {
-        CoreError::Internal(format!("cannot open /dev/urandom for secret generation: {err}"))
+        CoreError::Internal(format!(
+            "cannot open /dev/urandom for secret generation: {err}"
+        ))
     })?;
     source
         .read_exact(&mut bytes)
@@ -375,13 +377,13 @@ mod tests {
             &self,
             _quarantined: bool,
             _query: &crate::client::query::ListQuery,
-        ) -> Result<
-            crate::client::query::ListEnvelope<crate::client::status::ModuleInfo>,
-            CoreError,
-        > {
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::status::ModuleInfo>, CoreError>
+        {
             unreachable!("not part of this action")
         }
-        async fn metrics_current(&self) -> Result<crate::client::metrics::CurrentGauges, CoreError> {
+        async fn metrics_current(
+            &self,
+        ) -> Result<crate::client::metrics::CurrentGauges, CoreError> {
             unreachable!("not part of this action")
         }
         async fn metrics_historic(
@@ -737,7 +739,12 @@ mod tests {
             .await
             .expect("status sweep");
         assert_eq!(result.routes.len(), 4);
-        assert!(result.routes.iter().all(|row| row.status == RouteStatus::Present));
+        assert!(
+            result
+                .routes
+                .iter()
+                .all(|row| row.status == RouteStatus::Present)
+        );
         assert!(result.ok);
 
         // One route absent, one mismatched: ok=false, degradation is
@@ -775,10 +782,7 @@ mod tests {
             Some("9.9.9")
         );
         assert_eq!(by_route("tagHistory").status, RouteStatus::Unlicensed);
-        assert_eq!(
-            by_route("scriptExec").status,
-            RouteStatus::SecretMismatch
-        );
+        assert_eq!(by_route("scriptExec").status, RouteStatus::SecretMismatch);
         assert!(!result.ok);
         // scriptExec never gates ok: the healthy sweep with a secret
         // whose probe denies stays ok=true.
@@ -851,16 +855,16 @@ mod tests {
     }
 
     fn member_names(zip_bytes: &[u8]) -> Vec<String> {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
-            .expect("built zip is readable");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("built zip is readable");
         (0..archive.len())
             .map(|index| archive.by_index(index).expect("member").name().to_string())
             .collect()
     }
 
     fn member(zip_bytes: &[u8], name: &str) -> Vec<u8> {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
-            .expect("built zip is readable");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("built zip is readable");
         let mut file = archive.by_name(name).expect("member present");
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut bytes).expect("member reads");

@@ -483,7 +483,14 @@ fn full_project_resource_loop() {
         &ign(
             &config,
             &env,
-            &["resource", "delete", &name, SCRATCH_PATH, "--yes", "--compact"],
+            &[
+                "resource",
+                "delete",
+                &name,
+                SCRATCH_PATH,
+                "--yes",
+                "--compact",
+            ],
         ),
     );
     let deleted = ign(

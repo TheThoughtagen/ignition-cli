@@ -114,7 +114,10 @@ fn whk_roots() -> Vec<PathBuf> {
             .map(expand_path)
             .collect();
     }
-    WHK_HOME_ROOTS.iter().map(|root| expand_path(root)).collect()
+    WHK_HOME_ROOTS
+        .iter()
+        .map(|root| expand_path(root))
+        .collect()
 }
 
 /// Expand a configured path: leading `~`/`~/` against the home dir,
@@ -363,7 +366,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        ComposeOutput, ComposeRunner, DockerPsEntry, DiscoveryEnv, PortConflict, RigSelection,
+        ComposeOutput, ComposeRunner, DiscoveryEnv, DockerPsEntry, PortConflict, RigSelection,
         WHK_HOME_ROOTS, config_args, expand_path, parse_config, parse_docker_ps_ldjson,
         port_preflight, resolve_plan_with,
     };
@@ -375,7 +378,8 @@ mod tests {
     const MINIMAL_COMPOSE: &str = "services:\n  sidecar:\n    image: alpine:latest\n";
 
     /// The resolve run's scripted answer: a one-service project.
-    const RESOLVE_STDOUT: &str = r#"{"name":"fixture-rig","services":{"sidecar":{"image":"alpine"}},"volumes":{}}"#;
+    const RESOLVE_STDOUT: &str =
+        r#"{"name":"fixture-rig","services":{"sidecar":{"image":"alpine"}},"volumes":{}}"#;
 
     /// Scripted fake runner: records (program, args) per call and serves
     /// queued outputs. `run` and `run_docker` are recorded separately so
@@ -395,10 +399,7 @@ mod tests {
         }
 
         fn next(&self, program: &'static str, args: &[String]) -> ComposeOutput {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((program, args.to_vec()));
+            self.calls.lock().unwrap().push((program, args.to_vec()));
             self.outputs
                 .lock()
                 .unwrap()
@@ -489,10 +490,7 @@ mod tests {
             let home = home.home_dir();
             assert_eq!(expand_path("~/"), home.to_path_buf());
             assert_eq!(expand_path("~"), home.to_path_buf());
-            assert_eq!(
-                expand_path("~/sub/rig"),
-                home.join("sub/rig")
-            );
+            assert_eq!(expand_path("~/sub/rig"), home.join("sub/rig"));
         }
         // SAFETY: single-threaded under ENV_LOCK.
         unsafe { std::env::remove_var("IGNITION_TEST_VAR") };
@@ -501,7 +499,10 @@ mod tests {
 
     #[test]
     fn whk_roots_const_pins_both_home_roots_in_order() {
-        assert_eq!(WHK_HOME_ROOTS, &["~/Documents/whiskeyhouse", "~/whiskeyhouse"]);
+        assert_eq!(
+            WHK_HOME_ROOTS,
+            &["~/Documents/whiskeyhouse", "~/whiskeyhouse"]
+        );
     }
 
     // ----- levels 1/2/3: named + config default ---------------------------
@@ -531,10 +532,7 @@ mod tests {
         assert_eq!(calls.len(), 1, "exactly one resolve run");
         assert_eq!(
             calls[0],
-            (
-                "docker compose",
-                config_args(&compose, dir.path()),
-            ),
+            ("docker compose", config_args(&compose, dir.path()),),
             "resolve-then-act: -f + --project-directory + config --format json"
         );
     }
@@ -542,10 +540,9 @@ mod tests {
     #[tokio::test]
     async fn named_rig_miss_lists_knowns() {
         let mut config = Config::default();
-        config.rigs.insert(
-            "alpha".into(),
-            entry(Path::new("/does-not-matter.yml")),
-        );
+        config
+            .rigs
+            .insert("alpha".into(), entry(Path::new("/does-not-matter.yml")));
 
         let err = resolve_plan_with(
             &FakeRunner::default(),
@@ -619,8 +616,7 @@ mod tests {
         std::fs::write(&rig_compose, MINIMAL_COMPOSE).expect("write rig compose");
 
         let cwd = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cwd.path().join("compose.yml"), MINIMAL_COMPOSE)
-            .expect("write cwd compose");
+        std::fs::write(cwd.path().join("compose.yml"), MINIMAL_COMPOSE).expect("write cwd compose");
 
         let mut config = Config {
             rig: RigConfig {
@@ -734,7 +730,10 @@ mod tests {
             &FakeRunner::with(vec![resolve_output()]),
             RigSelection::Auto,
             &Config::default(),
-            &discovery_env(Path::new("/empty-cwd"), &[root1.path().into(), root2.path().into()]),
+            &discovery_env(
+                Path::new("/empty-cwd"),
+                &[root1.path().into(), root2.path().into()],
+            ),
         )
         .await
         .expect("level-5 resolves via the second root");
@@ -745,7 +744,9 @@ mod tests {
     async fn whk_global_convention_tried_after_git_module() {
         let root = tempfile::tempdir().expect("root");
         // No git-module repo; WHK-Global present.
-        let path = root.path().join("whk-environment-orchestration/docker-compose.yml");
+        let path = root
+            .path()
+            .join("whk-environment-orchestration/docker-compose.yml");
         std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
         std::fs::write(&path, MINIMAL_COMPOSE).expect("write");
 
@@ -809,7 +810,10 @@ mod tests {
             &FakeRunner::with(vec![resolve_output()]),
             RigSelection::Auto,
             &Config::default(),
-            &discovery_env(Path::new("/empty-cwd"), &[root1.path().into(), root2.path().into()]),
+            &discovery_env(
+                Path::new("/empty-cwd"),
+                &[root1.path().into(), root2.path().into()],
+            ),
         )
         .await
         .expect("resolves");
@@ -821,8 +825,7 @@ mod tests {
     #[tokio::test]
     async fn failing_config_run_maps_to_rig_error_with_tail() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cwd.path().join("compose.yml"), MINIMAL_COMPOSE)
-            .expect("write compose");
+        std::fs::write(cwd.path().join("compose.yml"), MINIMAL_COMPOSE).expect("write compose");
 
         let failed = ComposeOutput {
             stdout: String::new(),
@@ -838,7 +841,10 @@ mod tests {
         .await
         .expect_err("config failure propagates");
         let message = err.to_string();
-        assert!(message.contains("docker compose config failed (exit 14)"), "{message}");
+        assert!(
+            message.contains("docker compose config failed (exit 14)"),
+            "{message}"
+        );
         assert!(message.contains("no configuration file"), "{message}");
     }
 

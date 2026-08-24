@@ -210,7 +210,11 @@ impl IdpLoginFlow {
 
     /// GET `path_and_query` with the captured cookies; expect a 302
     /// and return its Location (path + query — the next hop).
-    async fn follow_redirect(&mut self, step: &str, path_and_query: &str) -> Result<String, CoreError> {
+    async fn follow_redirect(
+        &mut self,
+        step: &str,
+        path_and_query: &str,
+    ) -> Result<String, CoreError> {
         let url = self.url_for(path_and_query);
         let mut request = self.client.get(url.clone());
         if !self.cookies.is_empty() {
@@ -262,10 +266,14 @@ impl IdpLoginFlow {
         if !self.cookies.is_empty() {
             request = request.header(reqwest::header::COOKIE, self.cookie_header());
         }
-        let response = request.json(body).send().await.map_err(|err| CoreError::Network {
-            url: url.to_string(),
-            source: Some(err),
-        })?;
+        let response = request
+            .json(body)
+            .send()
+            .await
+            .map_err(|err| CoreError::Network {
+                url: url.to_string(),
+                source: Some(err),
+            })?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
         if !(200..300).contains(&status) {
@@ -280,19 +288,13 @@ impl IdpLoginFlow {
             }
             return Err(Self::flow_error(
                 step,
-                format!(
-                    "HTTP {status} ({})",
-                    Self::html_title_or_excerpt(&text)
-                ),
+                format!("HTTP {status} ({})", Self::html_title_or_excerpt(&text)),
             ));
         }
         serde_json::from_str(&text).map_err(|err| {
             Self::flow_error(
                 step,
-                format!(
-                    "non-JSON answer ({})",
-                    Self::html_title_or_excerpt(&text)
-                ),
+                format!("non-JSON answer ({})", Self::html_title_or_excerpt(&text)),
             )
             .tap_detail(err)
         })
@@ -308,9 +310,7 @@ trait TapDetail {
 impl TapDetail for CoreError {
     fn tap_detail(self, err: serde_json::Error) -> CoreError {
         match self {
-            CoreError::Internal(message) => {
-                CoreError::Internal(format!("{message}: {err}"))
-            }
+            CoreError::Internal(message) => CoreError::Internal(format!("{message}: {err}")),
             other => other,
         }
     }
@@ -527,7 +527,9 @@ pub async fn trial_reset_via_session(
         ));
     }
     serde_json::from_str(&text).map_err(|err| {
-        CoreError::Internal(format!("trial reset response did not match the trial shape: {err}"))
+        CoreError::Internal(format!(
+            "trial reset response did not match the trial shape: {err}"
+        ))
     })
 }
 

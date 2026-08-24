@@ -45,9 +45,7 @@ async fn probe_present_parses_the_handshake_version() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(version_body("1.0.0")),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(version_body("1.0.0")))
         .expect(1)
         .mount(&server)
         .await;
@@ -111,7 +109,9 @@ async fn probe_402_is_unlicensed() {
 async fn probe_401_is_auth_gated() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/scriptExec"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/scriptExec",
+        ))
         .respond_with(wiremock::ResponseTemplate::new(401))
         .expect(1)
         .mount(&server)
@@ -131,11 +131,13 @@ async fn probe_401_is_auth_gated() {
 async fn probe_200_denial_carries_code_and_message() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/scriptExec"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(denial_body(
-            "secret_mismatch",
-            "scriptExec secret mismatch",
-        )))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/scriptExec",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(denial_body("secret_mismatch", "scriptExec secret mismatch")),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -161,12 +163,19 @@ async fn route_call_ok_returns_data_and_records_the_action_body() {
     let server = wiremock::MockServer::start().await;
     let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
-        .and(wiremock::matchers::body_json(serde_json::json!({"action": "read", "paths": ["[default]T1"]})))
-        .and(wiremock::matchers::header("x-ignition-cli-secret", "s3cret"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "ok": true,
-            "data": {"results": [{"path": "[default]T1", "value": 7, "quality": "Good"}]},
-        })))
+        .and(wiremock::matchers::body_json(
+            serde_json::json!({"action": "read", "paths": ["[default]T1"]}),
+        ))
+        .and(wiremock::matchers::header(
+            "x-ignition-cli-secret",
+            "s3cret",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [{"path": "[default]T1", "value": 7, "quality": "Good"}]},
+            })),
+        )
         .expect(1)
         .mount_as_scoped(&server)
         .await;
@@ -192,11 +201,15 @@ async fn route_call_ok_returns_data_and_records_the_action_body() {
 async fn route_call_denial_with_unknown_code_is_webdev_route_error() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(denial_body(
-            "no_alarm_journal",
-            "No alarm journal profile specified",
-        )))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/alarms",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(denial_body(
+                "no_alarm_journal",
+                "No alarm journal profile specified",
+            )),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -218,7 +231,8 @@ async fn route_call_denial_with_unknown_code_is_webdev_route_error() {
         "code rides verbatim: {err}"
     );
     assert!(
-        err.to_string().contains("No alarm journal profile specified"),
+        err.to_string()
+            .contains("No alarm journal profile specified"),
         "message rides verbatim: {err}"
     );
 }
@@ -229,7 +243,9 @@ async fn route_call_denial_with_unknown_code_is_webdev_route_error() {
 async fn route_call_not_found_denial_reuses_the_not_found_slug() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tagConfig"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(denial_body("not_found", "tag path not found")),
@@ -266,7 +282,12 @@ async fn route_call_401_classifies_auth() {
 
     let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
     let err = api
-        .webdev_route_call("ign-cli", "tags", &serde_json::json!({"action": "read"}), &[])
+        .webdev_route_call(
+            "ign-cli",
+            "tags",
+            &serde_json::json!({"action": "read"}),
+            &[],
+        )
         .await
         .expect_err("401 classifies");
     assert_eq!(err.code(), "auth_rejected");
@@ -277,8 +298,8 @@ async fn route_call_401_classifies_auth() {
 
 /// Unpack a zip's member names, in writer order.
 fn member_names(zip_bytes: &[u8]) -> Vec<String> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
-        .expect("built zip is readable");
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("built zip is readable");
     (0..archive.len())
         .map(|index| archive.by_index(index).expect("member").name().to_string())
         .collect()
@@ -286,8 +307,8 @@ fn member_names(zip_bytes: &[u8]) -> Vec<String> {
 
 /// Read one member's bytes.
 fn member(zip_bytes: &[u8], name: &str) -> Vec<u8> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
-        .expect("built zip is readable");
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("built zip is readable");
     let mut file = archive.by_name(name).expect("member present");
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).expect("member reads");
@@ -302,7 +323,9 @@ fn deploy_zip_plain_members_are_the_manifest() {
     let expected: Vec<&str> = ROUTE_FILES.iter().map(|(name, _)| *name).collect();
     assert_eq!(member_names(&zip), expected);
     assert!(
-        !member_names(&zip).iter().any(|name| name.contains("scriptExec")),
+        !member_names(&zip)
+            .iter()
+            .any(|name| name.contains("scriptExec")),
         "scriptExec must NOT ship in a plain deploy"
     );
     // project.json rides VERBATIM when the title is the default.
@@ -315,15 +338,14 @@ fn deploy_zip_plain_members_are_the_manifest() {
 /// substituted secret rides doPost.py — the placeholder NEVER ships.
 #[test]
 fn deploy_zip_script_exec_substitutes_the_secret() {
-    let zip = build_deploy_zip("ign-cli", true, Some("cafebabe1234"))
-        .expect("scriptExec deploy packs");
+    let zip =
+        build_deploy_zip("ign-cli", true, Some("cafebabe1234")).expect("scriptExec deploy packs");
     let names = member_names(&zip);
     assert_eq!(names.len(), ROUTE_FILES.len() + 3, "manifest + 3 members");
     for suffix in ["resource.json", "config.json", "doPost.py"] {
         assert!(
-            names
-                .iter()
-                .any(|name| name == &format!("com.inductiveautomation.webdev/resources/cli/scriptExec/{suffix}")),
+            names.iter().any(|name| name
+                == &format!("com.inductiveautomation.webdev/resources/cli/scriptExec/{suffix}")),
             "missing scriptExec/{suffix}"
         );
     }
@@ -380,7 +402,10 @@ async fn deploy_action_posts_the_zip_through_the_import_machinery() {
             "/data/api/v1/projects/import/ign%2Dcli",
         ))
         .and(wiremock::matchers::query_param("overwrite", "true"))
-        .and(wiremock::matchers::header("content-type", "application/zip"))
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/zip",
+        ))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"success": true})),
@@ -445,7 +470,10 @@ async fn deploy_action_posts_the_zip_through_the_import_machinery() {
         .and_then(|profile| profile.webdev_secret.clone())
         .expect("secret persisted");
     assert_eq!(stored.len(), 64);
-    assert!(do_post.contains(&stored), "the stored secret IS the baked one");
+    assert!(
+        do_post.contains(&stored),
+        "the stored secret IS the baked one"
+    );
     let serialized = serde_json::to_string(&result).expect("result serializes");
     assert!(!serialized.contains(&stored), "redaction: {serialized}");
     let _ = dir;

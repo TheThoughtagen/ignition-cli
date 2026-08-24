@@ -59,9 +59,7 @@ const SCRIPT_EXEC_CONFIG_JSON: &str = include_str!(
 pub fn always_on_routes() -> Vec<String> {
     let mut routes = Vec::new();
     for (name, _) in bundle::ROUTE_FILES {
-        let Some(rest) = name
-            .strip_prefix("com.inductiveautomation.webdev/resources/cli/")
-        else {
+        let Some(rest) = name.strip_prefix("com.inductiveautomation.webdev/resources/cli/") else {
             continue;
         };
         if let Some((route, file)) = rest.rsplit_once('/')
@@ -201,10 +199,9 @@ pub fn build_deploy_zip(
 ) -> Result<Vec<u8>, CoreError> {
     let script_exec_py = match (with_script_exec, secret) {
         (false, _) => None,
-        (true, Some(secret)) => Some(
-            bundle::SCRIPT_EXEC_TEMPLATE
-                .replace("__IGN_CLI_SECRET__", secret),
-        ),
+        (true, Some(secret)) => {
+            Some(bundle::SCRIPT_EXEC_TEMPLATE.replace("__IGN_CLI_SECRET__", secret))
+        }
         (true, None) => {
             return Err(CoreError::Internal(
                 "scriptExec deploy requires a substituted secret — the deploy \
@@ -224,9 +221,7 @@ pub fn build_deploy_zip(
         } else {
             (*contents).to_string()
         };
-        writer
-            .start_file(*name, options)
-            .map_err(zip_write_err)?;
+        writer.start_file(*name, options).map_err(zip_write_err)?;
         writer.write_all(body.as_bytes()).map_err(|err| {
             CoreError::Internal(format!("cannot build the webdev deploy zip: {err}"))
         })?;
@@ -274,9 +269,8 @@ fn retitle_project_json(project_json: &str, title: &str) -> Result<String, CoreE
         CoreError::Internal(format!("embedded project.json does not parse: {err}"))
     })?;
     value["title"] = Value::String(title.to_string());
-    serde_json::to_string(&value).map_err(|err| {
-        CoreError::Internal(format!("cannot re-serialize project.json: {err}"))
-    })
+    serde_json::to_string(&value)
+        .map_err(|err| CoreError::Internal(format!("cannot re-serialize project.json: {err}")))
 }
 
 #[cfg(test)]
