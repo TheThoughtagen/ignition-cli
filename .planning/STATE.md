@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 4 COMPLETE (RIG-01..04: up/down/status, reset/logs, trial status+reset tier-1 live-verified, snapshot/restore wire-pinned + two-sided e2e gate) — 04-04's live round-trip gate deferred (rig down; ports held by the active whk-services stack) and ign-research token provisioning remains the one open human task (04-USER-SETUP.md)
+**Current focus:** Phase 4 COMPLETE + VERIFIED 18/18 (status: passed — live gates executed autonomously via docker compose: tier-1 trial reset live-proven on 8.3.6, snapshot→mutate→restore two-sided PASS via real CLI verbs) — ready for Phase 5 discuss/plan, which INHERITS one agenda item: the Phase 3 resource-route defect (see Blockers)
 
 ## Current Position
 
 **Phase:** 4 of 7 (Rig Lifecycle & Trial State)
 **Current Plan:** 4
 **Total Plans in Phase:** 4
-**Status:** Phase complete — ready for verification
+**Status:** Phase 4 complete & verified (18/18, passed) — ready for /gsd-discuss-phase 5
 **Last Activity:** 2026-08-23
 
 **Progress:** [██████████] 100%
@@ -117,15 +117,15 @@ None yet.
 
 ### Blockers/Concerns
 
-- ~~04-04 live round-trip e2e~~ DEFERRED (not blocking — the gate ships #[ignore]/env-gated per convention): at execution time the ignition-devops rig was DOWN and its ports (9088/9043) were held by the actively-used whk-services compose stack — stopping another stack is a human decision. To run later: bring the rig up with ports free, provision a token, then `IGNITION_LIVE_URL+TOKEN+MUTATIONS=1 cargo test -p ignition-cli --test e2e_rig -- --ignored` (README §rig snapshot/restore documents the port-collision hazard: verify with `rig status` first).
+- **[CROSS-PHASE — routed to Phase 5 planning]** Phase 3 `resource` family defect: `ign resource` (client/resources.rs + cli arm + e2e witnesses) targets `/data/api/v1/projects/{name}/resources/**` routes that DO NOT EXIST on real 8.3 gateways — openapi-evidenced against 8.3.3 (extract committed as `04-*-openapi-8.3.6-phase3-extract.json`, `captured_from` records truth; 575 paths, zero matches). Phase 3's Open Question 1 settled NEGATIVELY. Phase 5 planning must decide: re-point resource ops to export/import machinery or drop the family, then re-point the e2e witness approach. NONE counted against Phase 4 (snapshot manifest is project-granular).
+- ~~Phase 4 live gates~~ CLOSED AUTONOMOUSLY post-verification (04-VERIFICATION.md addendum, commits bf51760/3d075ee): tier-1 trial reset live-proven on fresh 8.3.6 rig (0/expired → 7187s/active); snapshot→mutate→restore two-sided PASS via real CLI verbs on an 8.3.3 clone; lifecycle smoke passed. HEADLESS TOKEN PROVISIONING SOLVED (version-agnostic, proven both lines): OIDC login → `POST api-token/generate` → `POST resources/ignition/api-token` with `collection:"core"` → patch `security-properties` read/writePermissions to `AnyOf [Authenticated]` — full recipe in the addendum. Bonus findings: trial clock RIDES the restore (snapshot taken mid-trial restores the remaining clock); tokens+permissions inside a snapshot survive restore (Pitfall-5 warning not observed live). Tier-0-on-8.3.6 probe remains one natural-expiry away (non-blocking curiosity; tier-1 is the shipped mechanism). e2e_rig gate's resource-witness step blocked by the Phase 3 defect above.
 - ~~Phase 4 spike pending: trial-reset mechanism (Playwright delegation vs native HTTP+CSRF)~~ RESOLVED at Phase 4 planning by 04-RESEARCH.md (live-probed on ign-research 8.3.6): native Rust HTTP ladder — tier 0 token-auth POST /data/api/v1/trial (one live call decides), tier 1 mapped OIDC challenge flow (client/idp.rs), tier 2 Playwright README-documented fallback only. Playwright delegation rejected (Node+chromium runtime, broke across 8.3.3 UI rewrite, DOM-text verification).
 - Phase 5 spike pending: WebDev deploy mechanism (per-resource vs project-zip import); script-exec security posture; tag-history route availability on default rigs
-- ~~Phase 4 trial-reset e2e needs rig creds~~ MOSTLY CLOSED by 04-03: 8.3.3 creds discovered+verified (admin/password), tier-1 flip LIVE-VERIFIED; remaining = ign-research (8.3.6) token provisioning for the tier-0 probe + 8.3.6-line reset e2e (04-USER-SETUP.md — gateway web UI manual step; no headless token creation exists)
 - ~~Phase 2 gap: live-gateway auth verification (token header across /data + /webdev, Basic viability)~~ CLOSED by 02-01: claims verified empirically during research + wiremock-pinned; executable proof path = live_gateway.rs `-- --ignored` (needs IGNITION_LIVE_URL/IGNITION_LIVE_TOKEN per 02-USER-SETUP.md; research rig `ign-research` still up on port 18088 if a fresh token is created). /webdev half re-checks in Phase 5.
 - ~~Phase 1: smoke-test keyring 4.1 on headless Linux CI~~ CLOSED & CI-CONFIRMED: keyring-smoke job green on ubuntu headless (run 32517734178, 2026-08-21)
 
 ## Session Continuity
 
-**Last session:** 2026-08-23T03:30:55.333Z
-**Stopped At:** Completed 04-04-PLAN.md (Phase 4 complete — snapshot/restore shipped, RIG-01..04 all stand)
+**Last session:** 2026-08-23T05:00:00.000Z
+**Stopped At:** Phase 4 complete & verified (18/18 passed — live gates executed autonomously via docker compose per user direction)
 **Resume file:** None
