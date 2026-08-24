@@ -26,7 +26,20 @@
 //!
 //! ## The loop test's contract pins (the phase's open questions)
 //!
-//! ORDER MATTERS — export happens AFTER the first resource put and
+//! 05-02 RE-POINT: the resource verbs ride project-export ZIP
+//! surgery (export → member surgery → overwrite-import) — this loop
+//! is live-runnable against a real 8.3 gateway for the FIRST time
+//! since Phase 3 (the `/projects/{p}/resources/**` REST routes never
+//! existed; the STATE.md cross-phase blocker is CLOSED by that
+//! plan). Resource `put`/`delete` are `--yes`-guarded now — every
+//! mutation implicitly re-imports the project.
+//!
+//! ORDER MATTERS — the loop additionally pins TWO-SIDED put honesty
+//! (a get before the second put witnesses the OLD member content —
+//! get rides the same export; the put after it flips the content a
+//! follow-up get reads back) and the delete surgery (the member is
+//! `not_found` after `resource delete`). The PROJECT-level pins stay
+//! from 03-02: export happens AFTER the first resource put and
 //! BEFORE the second, because overwrite import REPLACES the entire
 //! project (Pitfall 4). The two post-import gets pin BOTH halves of
 //! the replace-not-merge contract: the pre-export resource SURVIVED
@@ -179,11 +192,15 @@ const SCRATCH_PATH: &str = "ignition/script-python/e2e/scratch";
 const SCRATCH2_PATH: &str = "ignition/script-python/e2e/scratch2";
 
 /// THE full loop (order is the contract — see the module docs):
-/// new → list-contains → put scratch → get round-trip → export
-/// (scope metadata) → put scratch2 (gateway-only) → abort import
-/// (`project_exists`) → overwrite import (+`--yes`) → scratch
-/// SURVIVED + scratch2 `not_found` (replace-not-merge, Pitfall 4) →
-/// rename → copy → delete both (cleanup).
+/// new → list-contains → resource list EMPTY → put scratch --yes
+/// (surgery) → get round-trip → resource list CONTAINS → TWO-SIDED
+/// put honesty (get OLD → export (scope metadata) → put scratch NEW
+/// --yes → get NEW) → put scratch2 --yes (gateway-only) → abort
+/// import (`project_exists`) → overwrite import (+`--yes`) →
+/// scratch SURVIVED with OLD content + scratch2 `not_found`
+/// (replace-not-merge, Pitfall 4) → resource delete scratch --yes →
+/// get `not_found` (the delete surgery witness) → rename → copy →
+/// delete both (cleanup).
 #[test]
 #[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
 fn full_project_resource_loop() {
@@ -215,7 +232,20 @@ fn full_project_resource_loop() {
         .any(|project| project["name"] == Value::String(name.clone()));
     assert!(listed, "the new project appears in `project list`");
 
-    // 3. resource put a scratch script (JSON body → application/json).
+    // 3. resource list on the FRESH project is EMPTY (all-keys
+    // always: resources [], zero members under the resource roots —
+    // the surgery list over a real export).
+    let out = ign(&config, &env, &["resource", "list", &name, "--compact"]);
+    expect_ok("resource list (fresh)", &out);
+    let fresh = data_envelope(&out)["data"].clone();
+    assert_eq!(
+        fresh["resources"],
+        Value::Array(vec![]),
+        "a brand-new project exports zero resource members: {fresh}"
+    );
+
+    // 4. resource put a scratch script (--yes: the put re-imports
+    // the whole project — the 05-02 guarded-verb set).
     let scratch_body = format!(
         r#"{{"scope":"G","code":"print('{}')", "e2e": true}}"#,
         name.replace('\'', "")
@@ -234,13 +264,14 @@ fn full_project_resource_loop() {
                 SCRATCH_PATH,
                 "--file",
                 scratch_file.to_str().unwrap(),
+                "--yes",
                 "--compact",
             ],
         ),
     );
 
-    // 4. resource get verifies the round-trip (content survives the
-    // write path byte-honestly — sniffed json, same code).
+    // 5. resource get verifies the round-trip (content survives the
+    // surgery write path byte-honestly — sniffed json, same code).
     let out = ign(
         &config,
         &env,
@@ -255,7 +286,38 @@ fn full_project_resource_loop() {
         "the written content reads back: {got}"
     );
 
-    // 5. export AFTER the first put — the ZIP must CONTAIN scratch.
+    // 6. resource list now CONTAINS the scratch path (the surgery
+    // list sees the member the put injected).
+    let out = ign(&config, &env, &["resource", "list", &name, "--compact"]);
+    expect_ok("resource list (populated)", &out);
+    let populated = data_envelope(&out)["data"].clone();
+    assert!(
+        populated["resources"]
+            .as_array()
+            .expect("resources array")
+            .iter()
+            .any(|entry| entry["path"] == Value::String(SCRATCH_PATH.into())),
+        "the put member appears in the surgery list: {populated}"
+    );
+
+    // 7. TWO-SIDED PUT HONESTY, first half: a get BEFORE the second
+    // put witnesses the OLD content (get rides the same export the
+    // put's surgery will operate on).
+    let out = ign(
+        &config,
+        &env,
+        &["resource", "get", &name, SCRATCH_PATH, "--compact"],
+    );
+    expect_ok("resource get scratch (pre-second-put)", &out);
+    let old_content = data_envelope(&out)["data"]["content"].clone();
+    assert_eq!(
+        old_content["e2e"],
+        Value::Bool(true),
+        "the export BEFORE the second put carries the member with OLD content: {old_content}"
+    );
+
+    // 8. export AFTER the first put — the ZIP must CONTAIN scratch
+    // (this is also the replace-not-merge substrate below).
     let out = ign(
         &config,
         &env,
@@ -289,7 +351,45 @@ fn full_project_resource_loop() {
         "scope.excludes carries tags: {export}"
     );
 
-    // 6. put a SECOND scratch that exists ONLY on the gateway — the
+    // 9. TWO-SIDED PUT HONESTY, second half: put the scratch with
+    // NEW content, then a get reads the NEW content back.
+    let scratch_new = workdir.path().join("scratch-new.json");
+    std::fs::write(
+        &scratch_new,
+        r#"{"scope":"G","code":"print('second-edition')", "e2e": true, "edited": true}"#,
+    )
+    .expect("write scratch-new body");
+    expect_ok(
+        "resource put scratch (new content)",
+        &ign(
+            &config,
+            &env,
+            &[
+                "resource",
+                "put",
+                &name,
+                SCRATCH_PATH,
+                "--file",
+                scratch_new.to_str().unwrap(),
+                "--yes",
+                "--compact",
+            ],
+        ),
+    );
+    let out = ign(
+        &config,
+        &env,
+        &["resource", "get", &name, SCRATCH_PATH, "--compact"],
+    );
+    expect_ok("resource get scratch (post-second-put)", &out);
+    let new_content = data_envelope(&out)["data"]["content"].clone();
+    assert_eq!(
+        new_content["edited"],
+        Value::Bool(true),
+        "the export AFTER the second put carries the member with NEW content: {new_content}"
+    );
+
+    // 10. put a SECOND scratch that exists ONLY on the gateway — the
     // ZIP on disk predates it.
     let scratch2_file = workdir.path().join("scratch2.json");
     std::fs::write(&scratch2_file, r#"{"scope":"G","code":"print('second')"}"#)
@@ -306,12 +406,13 @@ fn full_project_resource_loop() {
                 SCRATCH2_PATH,
                 "--file",
                 scratch2_file.to_str().unwrap(),
+                "--yes",
                 "--compact",
             ],
         ),
     );
 
-    // 7. abort-policy import into the SAME name → project_exists,
+    // 11. abort-policy import into the SAME name → project_exists,
     // BEFORE any upload.
     let abort = ign(
         &config,
@@ -327,7 +428,7 @@ fn full_project_resource_loop() {
     );
     expect_exit(&abort, 6, "project_exists", "abort import");
 
-    // 8. overwrite import (guarded) → success.
+    // 12. overwrite import (guarded) → success.
     expect_ok(
         "overwrite import",
         &ign(
@@ -347,8 +448,9 @@ fn full_project_resource_loop() {
         ),
     );
 
-    // 9. THE two-sided replace-not-merge pin (Pitfall 4):
-    //    scratch SURVIVED (rode the ZIP — export→import fidelity)…
+    // 13. THE two-sided replace-not-merge pin (Pitfall 4):
+    //     scratch SURVIVED with the OLD (in-ZIP) content — the
+    //     overwrite import replaced the second put's edit…
     let out = ign(
         &config,
         &env,
@@ -361,6 +463,11 @@ fn full_project_resource_loop() {
         Value::Bool(true),
         "the pre-export resource survived the overwrite import: {survived}"
     );
+    assert_eq!(
+        survived["content"]["edited"],
+        Value::Null,
+        "…and carries the IN-ZIP (old) content — the import replaced the later edit: {survived}"
+    );
     //    …and scratch2 is GONE (absent from the ZIP → deleted).
     let wiped = ign(
         &config,
@@ -369,7 +476,24 @@ fn full_project_resource_loop() {
     );
     expect_exit(&wiped, 6, "not_found", "resource get scratch2 post-import");
 
-    // 10. rename + copy (the family's remaining verbs).
+    // 14. THE delete-surgery witness: `resource delete --yes` then a
+    // get is `not_found` (remove_member → overwrite-import).
+    expect_ok(
+        "resource delete scratch",
+        &ign(
+            &config,
+            &env,
+            &["resource", "delete", &name, SCRATCH_PATH, "--yes", "--compact"],
+        ),
+    );
+    let deleted = ign(
+        &config,
+        &env,
+        &["resource", "get", &name, SCRATCH_PATH, "--compact"],
+    );
+    expect_exit(&deleted, 6, "not_found", "resource get scratch post-delete");
+
+    // 15. rename + copy (the family's remaining verbs).
     let renamed = timestamped_name("-renamed");
     expect_ok(
         "project rename",
@@ -389,7 +513,7 @@ fn full_project_resource_loop() {
         ),
     );
 
-    // 11. cleanup (best-effort by design — a failure above leaves
+    // 16. cleanup (best-effort by design — a failure above leaves
     // forensic state under the timestamped names).
     for candidate in [name.as_str(), renamed.as_str(), copied.as_str()] {
         let _ = ign(

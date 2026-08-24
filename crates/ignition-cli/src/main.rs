@@ -829,16 +829,17 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
         },
-        // Resources (03-03, PROJ-05): the surgical edit loop. All arms
-        // are authed (inspection-command rule: exit 3 without a
-        // credential). Delete is the family's destructive verb — the
-        // LOCKED guard shape (fires BEFORE resolve_gateway_api, so a
-        // refusal exits 2 with profile null and does ZERO work). Put
-        // is an upsert of ONE resource with explicit content — NOT in
-        // the --yes family (planner decision: the surgical edit loop
-        // stays friction-free); the dispatch layer owns the byte
-        // source (`--file PATH` via std::fs, `--file -` via tokio
-        // stdin), the action owns the sniff.
+        // Resources (05-02 re-point): the surgical edit loop riding
+        // project-export ZIP surgery. All arms are authed
+        // (inspection-command rule: exit 3 without a credential).
+        // Delete AND put are the family's guarded verbs: every
+        // mutation now implicitly OVERWRITE-IMPORTS the whole project
+        // (replace-not-merge wipes concurrent Designer edits), so the
+        // LOCKED guard shape fires BEFORE resolve_gateway_api (a
+        // refusal exits 2 with profile null and does ZERO work). The
+        // dispatch layer owns the byte source (`--file PATH` via
+        // std::fs, `--file -` via tokio stdin — the unchanged
+        // InvalidInput path), the action owns the sniff + surgery.
         Commands::Resource(ResourceArgs { command }) => match command {
             ResourceCommand::List { project, prefix } => {
                 let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
@@ -894,6 +895,18 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         }
                     }
                 };
+                // The 05-02 guard: put overwrite-imports the WHOLE
+                // project — a refusal costs nothing and never touches
+                // the gateway (the resource-delete shape verbatim).
+                // The operation string names the consequence: the
+                // replace-not-merge import wipes concurrent Designer
+                // edits (research's accepted-tradeoff language).
+                if let Err(err) = require_confirmation(
+                    cli.yes,
+                    "resource put (re-imports the project; concurrent Designer edits are replaced)",
+                ) {
+                    return (None, Err(err));
+                }
                 let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => actions::resources::resource_put(&api, &project, &path, input)
@@ -908,7 +921,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // (exit 2, confirmation_required, profile null)
                 // BEFORE any profile/secret/client resolution — a
                 // refusal costs nothing and never touches the gateway.
-                if let Err(err) = require_confirmation(cli.yes, "resource delete") {
+                // 05-02: the operation string names the consequence —
+                // delete re-imports the project without the member.
+                if let Err(err) = require_confirmation(
+                    cli.yes,
+                    "resource delete (re-imports the project; concurrent Designer edits are replaced)",
+                ) {
                     return (None, Err(err));
                 }
                 let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());

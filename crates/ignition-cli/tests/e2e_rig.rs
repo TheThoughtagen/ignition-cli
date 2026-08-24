@@ -238,6 +238,9 @@ fn snapshot_mutate_restore_round_trip() {
                 SCRATCH_PATH,
                 "--file",
                 scratch_file.to_str().unwrap(),
+                // 05-02: resource put re-imports the whole project —
+                // the guarded-verb set rides the e2e witnesses too.
+                "--yes",
                 "--compact",
             ],
         ),

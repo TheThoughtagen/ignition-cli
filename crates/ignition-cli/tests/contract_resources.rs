@@ -1,24 +1,31 @@
-//! Golden-file contract tests for `ign resource` (03-03, PROJ-05) —
-//! wiremock fixtures shaped after the mcp-derived (MEDIUM) family,
-//! harness inherited from `contract_projects.rs` (03-01): isolated
-//! `IGNITION_CLI_CONFIG`, `stdout_for_golden`, programmatic envelopes
-//! where the `endpoint` embeds the random mock URI.
+//! Golden-file contract tests for `ign resource` (05-02 re-point) —
+//! the surgical edit loop now rides project-export ZIP surgery: the
+//! fixtures speak the export GET + import(overwrite) POST wire shape
+//! against the BUILT binary, harness inherited from
+//! `contract_projects.rs` (03-01): isolated `IGNITION_CLI_CONFIG`,
+//! `stdout_for_golden`, programmatic envelopes where the `endpoint`
+//! embeds the random mock URI.
 //!
-//! The crown pins:
-//! - `resource delete` WITHOUT `--yes` exits 2 with the
-//!   `confirmation_required` envelope and profile null — the guard
-//!   fires BEFORE any resolution (no mock even exists);
+//! THE crown pins:
+//! - `resource put`/`delete` WITHOUT `--yes` exit 2 with the
+//!   `confirmation_required` envelope and profile NULL — the guard
+//!   fires BEFORE any resolution (no mock even exists) and the
+//!   MESSAGE names the consequence (the op overwrite-imports the
+//!   whole project);
 //! - a BINARY resource get refuses with exit 6 `resource_binary`
-//!   (never corrupted through the JSON loop — Pitfall 7) and a
-//!   binary put input refuses BEFORE any network I/O;
-//! - put from a file declares `application/json` with the EXACT file
-//!   bytes; put from stdin declares `text/plain; charset=utf-8`;
-//! - get renders PRETTY JSON in human mode (the surgical edit loop's
-//!   round-trip form).
+//!   (now sniffed from the zip MEMBER bytes — never corrupted
+//!   through the JSON loop, Pitfall 7) and a binary put input
+//!   refuses BEFORE any network I/O;
+//! - put/delete success runs the export → import(overwrite)
+//!   sequence, the import body round-tripped through the surgery
+//!   helpers for member-level honesty;
+//! - get renders PRETTY JSON in human mode (the surgical edit
+//!   loop's round-trip form).
 
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use ignition_core::client::resources::{read_member, remove_member, replace_member};
 use serde_json::Value;
 
 /// Isolated config dir + the config path inside it (file need not exist).
@@ -77,48 +84,88 @@ fn stderr_envelope(out: &std::process::Output) -> String {
     stderr[start..].to_string()
 }
 
-/// The list fixture: two plausible resources (a view and a script —
-/// the two families the surgical loop edits most).
-async fn mount_resources_list(server: &wiremock::MockServer) {
+// ---- Fixture zips (the export wire shape the re-point rides) ----
+
+/// Build a small export zip: `project.json` + one member per pair, in
+/// order (the same zip crate the surgery rides — honest fixtures).
+fn fixture_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("project.json", options)
+        .expect("project.json starts");
+    writer
+        .write_all(br#"{"title":"T","enabled":true}"#)
+        .expect("project.json writes");
+    for (name, bytes) in members {
+        writer.start_file(*name, options).expect("member starts");
+        writer.write_all(bytes).expect("member writes");
+    }
+    writer.finish().expect("zip finalizes").into_inner()
+}
+
+/// Mount the export GET (200 + zip body) against the mock gateway.
+async fn mount_export(server: &wiremock::MockServer, project: &str, zip: Vec<u8>) {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/PlantFloor/resources",
-        ))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/export/{project}"
+        )))
         .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": [
-                    {
-                        "path": "com.example/views/Dashboard",
-                        "scope": "A",
-                        "version": 1,
-                        "restricted": false
-                    },
-                    {
-                        "path": "ignition/script-python/e2e/scratch",
-                        "scope": "G"
-                    }
-                ],
-                "metadata": {"total": 2, "matching": 2, "limit": -1, "offset": 0}
-            })),
+            wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"),
         )
         .expect(1..)
         .mount(server)
         .await;
 }
 
+/// Mount the import POST (`overwrite=true`, `application/zip`),
+/// returning the scoped guard for recorded-request assertions.
+async fn mount_import(server: &wiremock::MockServer, project: &str) -> wiremock::MockGuard {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/import/{project}"
+        )))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .and(wiremock::matchers::header("content-type", "application/zip"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1..)
+        .mount_as_scoped(server)
+        .await
+}
+
+/// The list fixture zip: a view file and a script — the two families
+/// the surgical loop edits most (user-facing paths identical to the
+/// Phase-3 goldens: the members live under `<collection>/resources/`).
+fn list_fixture_zip() -> Vec<u8> {
+    fixture_zip(&[
+        (
+            "com.example/resources/views/Dashboard",
+            br#"{"scope":"A"}"#.as_slice(),
+        ),
+        (
+            "ignition/resources/script-python/e2e/scratch",
+            b"print('scratch')".as_slice(),
+        ),
+    ])
+}
+
 /// `ign resource list` goldens in all three modes: one path per line
-/// (human), the pretty envelope, and compact — passthrough extras
-/// ride the JSON items (MEDIUM shape: `path` typed, everything else
-/// round-trips).
+/// (human), the pretty envelope, and compact — surgery-sourced items
+/// carry exactly the typed `path` (the member map IS the truth).
 #[tokio::test]
 async fn resource_list_render_modes_golden() {
     let server = wiremock::MockServer::start().await;
-    mount_resources_list(&server).await;
+    mount_export(&server, "PlantFloor", list_fixture_zip()).await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
 
-    // Pretty JSON: passthrough extras sorted after the typed path.
+    // Pretty JSON: one `path`-only item per member (zip order).
     let out = ign(
         &config,
         &server.uri(),
@@ -138,14 +185,10 @@ async fn resource_list_render_modes_golden() {
   "data": {
     "resources": [
       {
-        "path": "com.example/views/Dashboard",
-        "restricted": false,
-        "scope": "A",
-        "version": 1
+        "path": "com.example/views/Dashboard"
       },
       {
-        "path": "ignition/script-python/e2e/scratch",
-        "scope": "G"
+        "path": "ignition/script-python/e2e/scratch"
       }
     ]
   }
@@ -178,7 +221,7 @@ ignition/script-python/e2e/scratch
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"resources":[{"path":"com.example/views/Dashboard","restricted":false,"scope":"A","version":1},{"path":"ignition/script-python/e2e/scratch","scope":"G"}]}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"resources":[{"path":"com.example/views/Dashboard"},{"path":"ignition/script-python/e2e/scratch"}]}}"#]],
     );
 }
 
@@ -188,17 +231,15 @@ ignition/script-python/e2e/scratch
 #[tokio::test]
 async fn resource_get_json_pretty_golden() {
     let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/ignition/script%2Dpython/e2e/scratch",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
-            br#"{"scope":"G","code":"print('hi')"}"#.to_vec(),
-            "application/json",
-        ))
-        .expect(1..)
-        .mount(&server)
-        .await;
+    mount_export(
+        &server,
+        "p",
+        fixture_zip(&[(
+            "ignition/resources/script-python/e2e/scratch",
+            br#"{"scope":"G","code":"print('hi')"}"#.as_slice(),
+        )]),
+    )
+    .await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
@@ -247,17 +288,12 @@ async fn resource_get_json_pretty_golden() {
 #[tokio::test]
 async fn resource_get_text_raw_golden() {
     let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/notes/readme",
-        ))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_raw(b"just a text payload".to_vec(), "text/plain"),
-        )
-        .expect(1..)
-        .mount(&server)
-        .await;
+    mount_export(
+        &server,
+        "p",
+        fixture_zip(&[("notes/resources/readme", b"just a text payload".as_slice())]),
+    )
+    .await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
@@ -285,29 +321,29 @@ just a text payload
         &server.uri(),
         &["resource", "get", "p", "notes/readme", "--compact"],
     );
+    assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
         snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"notes/readme","content_kind":"text","content":"just a text payload"}}"#]],
     );
 }
 
-/// THE binary-refusal golden: a `data.bin`-class resource get exits 6
+/// THE binary-refusal golden: a `data.bin`-class MEMBER get exits 6
 /// `resource_binary` with the export/import hint — the content is
-/// NEVER corrupted through the JSON loop (Pitfall 7).
+/// NEVER corrupted through the JSON loop (Pitfall 7), now sniffed
+/// from the zip member bytes.
 #[tokio::test]
 async fn resource_get_binary_refuses_exit_6_golden() {
     let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/com%2Ex/perms/data%2Ebin",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
-            vec![0x00, 0x01, 0x02, 0xFF, 0xFE],
-            "application/octet-stream",
-        ))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount_export(
+        &server,
+        "p",
+        fixture_zip(&[(
+            "com.x/resources/perms/data.bin",
+            [0x00, 0x01, 0x02, 0xFF, 0xFE].as_slice(),
+        )]),
+    )
+    .await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
@@ -328,23 +364,85 @@ async fn resource_get_binary_refuses_exit_6_golden() {
     );
 }
 
-/// `resource put --file F` with JSON content: the PUT mock's matchers
-/// only fire on the EXACT body bytes and `Content-Type:
-/// application/json` (the sniffer's JSON arm), and the human line
-/// names the path + kind.
+/// THE new crown pin (05-02): `resource put` WITHOUT `--yes` exits 2
+/// with the `confirmation_required` envelope and profile NULL — the
+/// operation MESSAGE names the consequence (the put re-imports the
+/// whole project, replacing concurrent Designer edits). Fully static
+/// content: the guard fires before any resolution — no mock, no
+/// network, the config points at a dead URL and it does not matter.
+#[tokio::test]
+async fn resource_put_without_yes_exits_2_golden() {
+    let body = br#"{"scope":"G","code":"print('hi')"}"#;
+    let file_dir = tempfile::tempdir().expect("filedir");
+    let file_path = file_dir.path().join("scratch.json");
+    std::fs::write(&file_path, body).expect("write fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "resource",
+            "put",
+            "p",
+            "ignition/script-python/e2e/scratch",
+            "--file",
+            file_path.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class, zero network");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"confirmation_required","message":"resource put (re-imports the project; concurrent Designer edits are replaced) is destructive; rerun with --yes to confirm","endpoint":null,"hint":"this operation is destructive; re-run with --yes or set IGNITION_YES=1"}}
+
+"#]],
+    );
+
+    // Human mode: the message + hint on stderr.
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "resource",
+            "put",
+            "p",
+            "some/path",
+            "--file",
+            file_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("re-imports the project"),
+        "human message names the consequence: {stderr}"
+    );
+    assert!(stderr.contains("--yes"), "human hint names --yes: {stderr}");
+}
+
+/// `resource put --file F --yes` with JSON content: the export →
+/// import(overwrite) sequence fires, the import body carries the NEW
+/// member content (member-level honesty via the surgery helpers),
+/// and the human line names the path + kind.
 #[tokio::test]
 async fn resource_put_from_file_json_golden() {
     let body = br#"{"scope":"G","code":"print('hi')"}"#.to_vec();
     let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("PUT"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/ignition/script%2Dpython/e2e/scratch",
-        ))
-        .and(wiremock::matchers::body_bytes(body.clone()))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1..)
-        .mount(&server)
-        .await;
+    mount_export(
+        &server,
+        "p",
+        fixture_zip(&[(
+            "ignition/resources/script-python/e2e/scratch",
+            br#"{"scope":"G","code":"print('old')"}"#.as_slice(),
+        )]),
+    )
+    .await;
+    let import = mount_import(&server, "p").await;
 
     let file_dir = tempfile::tempdir().expect("filedir");
     let file_path = file_dir.path().join("scratch.json");
@@ -363,6 +461,7 @@ async fn resource_put_from_file_json_golden() {
             "ignition/script-python/e2e/scratch",
             "--file",
             file_path.to_str().unwrap(),
+            "--yes",
         ],
     );
     assert!(
@@ -388,6 +487,7 @@ put ignition/script-python/e2e/scratch (json)
             "ignition/script-python/e2e/scratch",
             "--file",
             file_path.to_str().unwrap(),
+            "--yes",
             "--compact",
         ],
     );
@@ -396,25 +496,34 @@ put ignition/script-python/e2e/scratch (json)
         stdout_for_golden(&out),
         snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"ignition/script-python/e2e/scratch","content_kind":"json"}}"#]],
     );
+
+    // Member-level honesty on the import body (both invocations).
+    let requests = import.received_requests().await;
+    assert_eq!(requests.len(), 2, "one import per invocation");
+    for request in &requests {
+        assert_eq!(
+            request.url.path(),
+            "/data/api/v1/projects/import/p",
+            "the import rode the surgery transport"
+        );
+        assert_eq!(
+            read_member(&request.body, "ignition/script-python/e2e/scratch")
+                .expect("surgical body re-reads"),
+            body,
+            "the import body carries the NEW member content"
+        );
+    }
 }
 
-/// `resource put --file -` from stdin with NON-JSON text: the PUT
-/// declares `text/plain; charset=utf-8` (the sniffer's text arm) with
-/// the exact piped bytes.
+/// `resource put --file - --yes` from stdin with NON-JSON text: the
+/// import body carries the piped bytes as the member's content (the
+/// sniffer's text arm labels the result; the transport is always
+/// `application/zip` now — the surgery IS the wire).
 #[tokio::test]
 async fn resource_put_stdin_text_golden() {
     let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("PUT"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/notes/readme",
-        ))
-        .and(wiremock::matchers::body_bytes(
-            b"piped text content".to_vec(),
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+    mount_export(&server, "p", fixture_zip(&[])).await;
+    let import = mount_import(&server, "p").await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
@@ -429,6 +538,7 @@ async fn resource_put_stdin_text_golden() {
             "notes/readme",
             "--file",
             "-",
+            "--yes",
             "--compact",
         ],
         b"piped text content",
@@ -443,22 +553,28 @@ async fn resource_put_stdin_text_golden() {
         snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"p","path":"notes/readme","content_kind":"text"}}"#]],
     );
 
-    let requests = guard.received_requests().await;
+    let requests = import.received_requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0]
             .headers
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
-        Some("text/plain; charset=utf-8"),
-        "the sniffer's TEXT arm declared the wire content type"
+        Some("application/zip"),
+        "the surgery import declares the zip content type"
     );
-    assert_eq!(requests[0].body, b"piped text content".to_vec());
+    assert_eq!(
+        read_member(&requests[0].body, "notes/readme").expect("appended member reads"),
+        b"piped text content".to_vec(),
+        "the piped text rides the surgical member (upsert appended it)"
+    );
 }
 
 /// A BINARY put input refuses with exit 6 `resource_binary` BEFORE
 /// any network I/O — the config points at a DEAD URL and no mock
-/// exists; if any HTTP had been attempted the command would exit 4.
+/// exists; if any HTTP had been attempted the command would exit 4
+/// (or 5). `--yes` is present so the refusal provably comes from the
+/// SNIFFER, not the guard.
 #[tokio::test]
 async fn resource_put_binary_input_refuses_before_network_golden() {
     let bad_dir = tempfile::tempdir().expect("bad dir");
@@ -477,6 +593,7 @@ async fn resource_put_binary_input_refuses_before_network_golden() {
             "com.x/perms/data.bin",
             "--file",
             bad_path.to_str().unwrap(),
+            "--yes",
             "--compact",
         ],
     );
@@ -496,7 +613,8 @@ async fn resource_put_binary_input_refuses_before_network_golden() {
 }
 
 /// A nonexistent `--file` on put exits 2 `invalid_input` — the
-/// caller's byte source, usage class, zero network.
+/// caller's byte source, usage class, zero network (the input read
+/// precedes the guard; a bad byte source fails before anything else).
 #[tokio::test]
 async fn resource_put_missing_file_exits_2_golden() {
     let (_dir, config) = isolated_config();
@@ -526,10 +644,12 @@ async fn resource_put_missing_file_exits_2_golden() {
     );
 }
 
-/// THE crown pin: `resource delete` WITHOUT `--yes` exits 2 with the
-/// `confirmation_required` envelope and profile NULL — fully static
-/// content (the guard fires before any API construction — no mock, no
-/// network, the config points at a dead URL and it does not matter).
+/// THE delete-refusal golden (05-02 update): the message now names
+/// the consequence too — delete re-imports the project without the
+/// member. Without `--yes`: exit 2, profile NULL, fully static
+/// content (the guard fires before any API construction — no mock,
+/// no network, the config points at a dead URL and it does not
+/// matter).
 #[tokio::test]
 async fn resource_delete_without_yes_exits_2_golden() {
     let (_dir, config) = isolated_config();
@@ -545,7 +665,7 @@ async fn resource_delete_without_yes_exits_2_golden() {
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stderr_envelope(&out),
         snapbox::str![[r#"
-{"ok":false,"profile":null,"error":{"code":"confirmation_required","message":"resource delete is destructive; rerun with --yes to confirm","endpoint":null,"hint":"this operation is destructive; re-run with --yes or set IGNITION_YES=1"}}
+{"ok":false,"profile":null,"error":{"code":"confirmation_required","message":"resource delete (re-imports the project; concurrent Designer edits are replaced) is destructive; rerun with --yes to confirm","endpoint":null,"hint":"this operation is destructive; re-run with --yes or set IGNITION_YES=1"}}
 
 "#]],
     );
@@ -565,20 +685,28 @@ async fn resource_delete_without_yes_exits_2_golden() {
     assert!(stderr.contains("--yes"), "human hint names --yes: {stderr}");
 }
 
-/// Delete WITH `--yes`: the gateway-side DELETE fires against the
-/// exact per-segment-encoded path (authed, empty body) and the
-/// success line golden-pins.
+/// Delete WITH `--yes`: the export → import(overwrite) sequence
+/// fires and the import body NO LONGER carries the member (asserted
+/// through the same surgery helpers) — the success line golden-pins.
 #[tokio::test]
-async fn resource_delete_with_yes_hits_exact_path() {
+async fn resource_delete_with_yes_runs_surgery_sequence() {
     let server = wiremock::MockServer::start().await;
-    let guard = wiremock::Mock::given(wiremock::matchers::method("DELETE"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/com%2Ex/views/My%20Folder/V1",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1..)
-        .mount_as_scoped(&server)
-        .await;
+    mount_export(
+        &server,
+        "p",
+        fixture_zip(&[
+            (
+                "com.example/resources/views/My Folder/V1",
+                br#"{"scope":"A"}"#.as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/e2e/scratch",
+                b"print('scratch')".as_slice(),
+            ),
+        ]),
+    )
+    .await;
+    let import = mount_import(&server, "p").await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
@@ -590,7 +718,7 @@ async fn resource_delete_with_yes_hits_exact_path() {
             "resource",
             "delete",
             "p",
-            "com.x/views/My Folder/V1",
+            "com.example/views/My Folder/V1",
             "--yes",
         ],
     );
@@ -603,7 +731,7 @@ async fn resource_delete_with_yes_hits_exact_path() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-deleted com.x/views/My Folder/V1
+deleted com.example/views/My Folder/V1
 "#]],
     );
 
@@ -614,47 +742,43 @@ deleted com.x/views/My Folder/V1
             "resource",
             "delete",
             "p",
-            "com.x/views/My Folder/V1",
+            "com.example/views/My Folder/V1",
             "--yes",
             "--compact",
         ],
     );
+    assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
         snapbox::str![[
-            r#"{"ok":true,"profile":"dev","data":{"deleted":"com.x/views/My Folder/V1"}}"#
+            r#"{"ok":true,"profile":"dev","data":{"deleted":"com.example/views/My Folder/V1"}}"#
         ]],
     );
 
-    let requests = guard.received_requests().await;
-    assert_eq!(requests.len(), 2, "one DELETE per invocation");
+    let requests = import.received_requests().await;
+    assert_eq!(requests.len(), 2, "one import per invocation");
     for request in &requests {
-        assert_eq!(
-            request.url.path(),
-            "/data/api/v1/projects/p/resources/com%2Ex/views/My%20Folder/V1",
-            "the per-segment-encoded path rode the wire"
+        assert_eq!(request.url.path(), "/data/api/v1/projects/import/p");
+        assert!(
+            read_member(&request.body, "com.example/views/My Folder/V1").is_err(),
+            "the member is GONE from the surgical body"
         );
-        assert!(request.body.is_empty(), "the DELETE carries no body");
+        assert_eq!(
+            read_member(&request.body, "ignition/script-python/e2e/scratch")
+                .expect("neighbor survives"),
+            b"print('scratch')".to_vec(),
+            "the neighbor rides the surgical zip untouched"
+        );
     }
 }
 
-/// A nonexistent resource: the gateway answers 404 → exit 6,
-/// `not_found` (endpoint embeds the dynamic mock URI — programmatic
-/// envelope assertions, the version_gateway_contract pattern).
+/// A nonexistent resource: the member is absent from the export zip
+/// → exit 6 `not_found` (the surgery helper's error, endpoint null —
+/// there was no 404 URL, there was a missing member).
 #[tokio::test]
 async fn resource_get_nonexistent_exits_6() {
     let server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/data/api/v1/projects/p/resources/nope",
-        ))
-        .respond_with(
-            wiremock::ResponseTemplate::new(404)
-                .set_body_json(serde_json::json!({"message": "Resource not found"})),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount_export(&server, "p", fixture_zip(&[])).await;
 
     let (_dir, config) = isolated_config();
     write_profile_config(&config, "http://ignored.example.com");
@@ -678,9 +802,24 @@ async fn resource_get_nonexistent_exits_6() {
     );
     assert_eq!(
         body["error"]["endpoint"],
-        Value::String(format!(
-            "{}/data/api/v1/projects/p/resources/nope",
-            server.uri()
-        ))
+        Value::Null,
+        "member-level not-found carries no endpoint (no 404 URL exists)"
     );
+}
+
+/// The surgery helpers are re-used verbatim by these goldens — a
+/// compile-time sanity reference (read_member/replace_member/
+/// remove_member are the SAME primitives the actions orchestrate).
+#[test]
+fn surgery_helpers_reachable_from_cli_tests() {
+    let zip = fixture_zip(&[("a/resources/x", b"1".as_slice())]);
+    assert_eq!(
+        read_member(&zip, "a/x").expect("reads"),
+        b"1".to_vec(),
+        "fixture_zip + read_member agree on the member mapping"
+    );
+    let out = replace_member(&zip, "a/x", b"2").expect("replaces");
+    assert_eq!(read_member(&out, "a/x").expect("re-reads"), b"2".to_vec());
+    let out = remove_member(&out, "a/x").expect("removes");
+    assert!(read_member(&out, "a/x").is_err());
 }

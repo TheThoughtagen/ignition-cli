@@ -31,3 +31,4 @@ tempfile = { workspace = true }
 snapbox = { workspace = true }
 wiremock = { workspace = true } # binary-level gateway contract tests (version exit classes)
 reqwest = { workspace = true } # e2e openapi-capture gate fetches /openapi.json directly (03-03)
+zip = { workspace = true } # dev-only (05-02): binary-level goldens build export-zip fixtures — same crate ignition-core already depends on, NOT a new dependency

@@ -125,10 +125,10 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign project delete <NAME>` | Delete a project | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the wire DELETE always carries the server's own `confirm=true` query param (both guard layers); a nonexistent name exits 6 (`not_found`); audit-logged server-side |
 | `ign project export <NAME> [-o FILE]` | Export a project as a ZIP archive | the ZIP STREAMS to disk chunk-by-chunk (no memory buffering; 120 s per-request timeout); default filename from `Content-Disposition`, else `<name>.zip`; stdout stays data-only — JSON carries `{project, file, bytes, scope}` (see scope metadata below) |
 | `ign project import <NAME> --file PATH\|--file - [--collision-policy abort\|overwrite]` | Import a project from a ZIP (`-` reads stdin) | default policy **abort**: importing over an existing name exits 6 (`project_exists`) BEFORE any upload; **overwrite** is destructive — exit 2 without `--yes` and it REPLACES the entire project (resources absent from the ZIP are deleted; merge is Designer-only); a non-ZIP or >512 MB input exits 2 (`invalid_import_file`) before any network I/O; 300 s per-request timeout |
-| `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resources, one path per line | `--prefix` filters server-side (rides the wire as the `path` query param); JSON items are passthrough-shaped (`path` typed, every other key round-trips); ⚠ MEDIUM-confidence family — see the resource caveat below |
-| `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`); a binary (data.bin-class) resource refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
-| `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource (upsert: created if absent, replaced if present) | content is sniffed: JSON if parseable (`application/json`), else UTF-8 text (`text/plain; charset=utf-8`); binary-looking input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; NOT `--yes`-guarded (an explicit-content upsert, not a destructive op) |
-| `ign resource delete <PROJECT> <PATH>` | Delete ONE resource | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the surgical loop's destructive verb; a nonexistent path exits 6 (`not_found`) |
+| `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
+| `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
+| `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource member (upsert: created if absent, replaced if present) | **destructive**: the whole project is re-imported (`overwrite=true`) after the member surgery — exit 2 (`confirmation_required`) without `--yes`; content is sniffed (json/text); binary input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; concurrent Designer edits are REPLACED (see the resource section) |
+| `ign resource delete <PROJECT> <PATH>` | Delete ONE resource member | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the surgery drops the member and re-imports the project; a nonexistent path/member exits 6 (`not_found`) |
 | `ign logs [--logger L] [--min-level L] [--since SPAN] [--limit N]` | Recent log entries, newest first (`ISO-UTC  LEVEL  logger  message`) | `--limit` is ALWAYS explicit (default 200 — the server default is unlimited); `--since` takes EPOCH-MS or `500ms/30s/5min/2h`; sorts `desc(timestamp)` so you see the NEWEST entries, never the oldest 200 |
 | `ign logs -f [--interval S] [--timeout S]` | Live tail: entries stream to stdout as they occur | poll-based (no server push exists — `GET /logs?startTime=<cursor>` IS the tail); `--timeout` expiry ends cleanly (exit 0); without it, run until Ctrl-C (default process kill, no envelope); see the streaming exception below |
 | `ign logs download [-o FILE]` | Download the log archive — a SQLite `.idb`, never a zip | bytes written exactly as received; default filename from `Content-Disposition`, else `<profile>-logs-<ts>.idb`; `--json` data is `{file, bytes, content_type}` |
@@ -436,36 +436,54 @@ the ENTIRE project — resources absent from the ZIP are deleted).
 `merge` is the Designer import popup's mode and is not available via
 REST; the CLI rejects it at the flag level by simply not offering it.
 
-### Resource editing — the surgical loop (and its caveat)
+### Resource editing — the surgical loop (export-zip surgery)
 
-`ign resource` changes ONE view/script/query without re-importing the
-whole project — the get → edit → put loop:
+`ign resource` changes ONE view/script/query member — the
+get → edit → put loop:
 
 ```bash
+ign resource list PlantFloor                       # member paths from the export tree
 ign resource get PlantFloor ignition/script-python/e2e/scratch > scratch.json
 # ...edit scratch.json...
-ign resource put PlantFloor ignition/script-python/e2e/scratch --file scratch.json
-ign resource delete PlantFloor com.example/views/OldView --yes
+ign resource put PlantFloor ignition/script-python/e2e/scratch --file scratch.json --yes
+ign resource delete PlantFloor com.example/views/OldView/view.json --yes
 ```
 
-Paths keep their slashes and match the export tree
-(`{module}/{resource-type}/…/name`; the core module's folder is
-`ignition/`, not the `com.inductiveautomation.ignition` the old docs
-suggest). `put` sniffs its input: valid JSON rides as
-`application/json`, other UTF-8 as text — and BINARY content (a NUL
-byte near the head, `data.bin`-class resources like Perspective
-session-permissions) refuses with exit 6 `resource_binary` on BOTH
-get and put: binary resources belong to the export/import family,
-never the JSON loop.
+**Mechanism (05-02 re-point).** There are NO per-resource REST
+endpoints on 8.3 gateways (the Phase-3 family originally targeted
+`/projects/{p}/resources/**` routes that do not exist —
+openapi-evidenced against real 8.3.x, 575 paths, zero matches). Every
+resource op therefore rides the native export/import round-trip:
+export the project to a temp ZIP → perform member surgery (list /
+read / replace-inject / remove) → import back with `overwrite=true`.
+Paths keep their slashes and address ZIP MEMBERS — the file at
+`<collection>/resources/<rest>`, listed as `<collection>/<rest>`
+(the core module's folder is `ignition/`, not the
+`com.inductiveautomation.ignition` the old docs suggest).
 
-⚠ **MEDIUM-confidence caveat.** The resource endpoints exist only in
-a single third-party client (ignition-mcp) — they are absent from
-the official 83-api collection — so paths and envelope shapes here
-are wiremock-pinned but not yet live-verified. The verdict arrives
-the moment a gateway token exists: run the openapi-capture hook in
-`crates/ignition-cli/tests/e2e_projects.rs` (`-- --ignored`) and it
-writes an authoritative projects+resources extract into the phase
-dir; the same run drives the full e2e loop against a live gateway.
+`put` sniffs its input: valid JSON parses, other UTF-8 rides as text
+— and BINARY content (a NUL byte near the head, `data.bin`-class
+resources like Perspective session-permissions) refuses with exit 6
+`resource_binary` on BOTH get and put: binary resources belong to
+the export/import family, never the JSON loop.
+
+**Perf honesty (accepted trade).** Every resource op round-trips the
+WHOLE project ZIP — heavier than a hypothetical per-resource route,
+but rigs and dev projects are small and the alternative was the
+family not working at all. **Concurrent-edit race:** because put and
+delete re-import the project, edits made in a Designer between the
+CLI's export and import are REPLACED (replace-not-merge — resources
+absent from the ZIP are deleted). This is the documented, accepted
+trade for the CLI's dev-tool scope; both verbs are `--yes`-guarded
+and their refusal messages name the consequence.
+
+**e2e witness.** The loop is live-runnable for the first time since
+Phase 3: `crates/ignition-cli/tests/e2e_projects.rs` (`-- --ignored`,
+needs `IGNITION_LIVE_URL` + `IGNITION_LIVE_TOKEN` +
+`IGNITION_LIVE_MUTATIONS=1`) drives list/get/put/delete through the
+surgery implementation against a real gateway, including two-sided
+put honesty (the export before a put carries the member's old
+content; the export after carries the new).
 
 ### Streaming output (the stdout exceptions)
 
@@ -489,7 +507,9 @@ kill, no envelope), exactly the `logs -f` pipeline caveat.
 
 Commands that change gateway state (`sessions terminate`,
 `logs loggers set`/`reset`, `project delete`, `project import
---collision-policy overwrite`, `resource delete`, `restart` — the
+--collision-policy overwrite`, `resource put`, `resource delete`
+(both re-import the whole project — their refusal messages name the
+consequence), `restart` — the
 big one: it takes
 the whole gateway down for ~1 min — and `rig reset`, which deletes
 the rig's volumes, plus `rig trial reset`, which restarts the trial
@@ -507,10 +527,10 @@ kind). `project delete` and
 pair: besides the CLI refusal, delete's wire request always carries
 the gateway's own `confirm=true` query param, and overwrite REPLACES
 the entire project (abort-policy imports need no `--yes` — they fail
-safely server-side). `resource put` is deliberately NOT in this
-family: it upserts ONE resource with explicit content (the surgical
-edit loop stays friction-free), while `resource delete` removes one
-and is guarded. Termination, restart, project mutations, and resource
+safely server-side). `resource put` joined this family in 05-02: its
+member surgery implicitly overwrite-imports the project (the 03-03
+unguarded put is superseded), as does `resource delete`. Termination,
+restart, project mutations, and resource
 writes are
 audit-logged server-side by the gateway. Non-destructive project
 mutations (`copy`, `rename`, `set`, `export`) create, relabel, or read
