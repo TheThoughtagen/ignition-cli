@@ -9,13 +9,13 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 
 ## Current Position
 
-**Phase:** 4 of 7 (Rig Lifecycle & Trial State)
-**Current Plan:** 4
-**Total Plans in Phase:** 4
-**Status:** Phase 4 complete & verified (18/18, passed) — ready for /gsd-discuss-phase 5
-**Last Activity:** 2026-08-23
+**Phase:** 5 of 7 (WebDev Backend & Tag Operations)
+**Current Plan:** 1
+**Total Plans in Phase:** 6
+**Status:** Phase 5 executing — 05-01 complete (route sources + embedded bundle); wave-1 sibling plans (05-02..) running in parallel in this tree
+**Last Activity:** 2026-08-24
 
-**Progress:** [██████████] 100%
+**Progress:** [████████░░] 77%
 
 ## Performance Metrics
 
@@ -44,6 +44,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 04 P02 | 18min | 3 tasks | 8 files |
 | Phase 04 P03 | 406min | 3 tasks | 14 files |
 | Phase 04 PP04 | 37min | 3 tasks | 17 files |
+| Phase 05 P01 | 24min | 3 tasks | 19 files |
 
 ## Accumulated Context
 
@@ -110,6 +111,10 @@ Recent decisions affecting current work:
 - [Phase 04-04]: backup download rides download_to_file via ONE optional Accept param (not a forked chunk loop — the single streaming body-consumption site holds); roaming query rides the path constant; restore POST = raw octet-stream with 4 explicit-false params, NOT multipart
 - [Phase 04-04]: Snapshot manifest is the honest composition contract: BOTH exclusion notes verbatim (trial clock NOT captured by gwbk; tag-provider bulk export = Phase 5); gateway_info failure degrades to ignition.version null in the artifact; project file names percent-encode injectively
 - [Phase 04-04]: snapshot/restore creds = IGNITION_TOKEN only (backup route 401s unauth; Basic dead on 8.3 /data — no second rung), missing token = exit 3; restore is the 5th guarded destructive verb (binary-pinned before discovery)
+- [Phase 05]: [Phase 05-01]: scriptExec secret = SECRET = None or '__IGN_CLI_SECRET__' template marker — deploy does ONE string substitution; None AND placeholder-shape (leading underscore) both fail-closed (version included), so the public template can never arm the gate; template excluded from ROUTE_FILES so unsubstituted deploy is impossible by construction
+- [Phase 05]: [Phase 05-01]: scriptExec config.json stays require-auth FALSE / user-source '' — secret-only posture (API tokens 401 on WebDev require-auth, a Basic layer would lock the CLI's own token-authed calls out; research OQ3 resolved)
+- [Phase 05]: [Phase 05-01]: route body envelope LOCKED — {ok,data}/{ok,error{code,message,traceback?}} at HTTP 200 (WebDev ignores 'status'); machine codes are the stable route contract: no_alarm_journal (structured journal-missing denial), secret_required, secret_mismatch, unknown_action, not_found, route_error
+- [Phase 05]: [Phase 05-01]: route folders are SELF-CONTAINED by design (no cross-resource imports) — the ~25-line shared core (unicode re-parse, jv() depth-12 walker, bare-except traceback envelope) is duplicated across all five routes deliberately; ignition-core::webdev is pure data (include_str!), deploy orchestration lives in the actions layer (05-03)
 
 ### Pending Todos
 
@@ -126,6 +131,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-23T05:00:00.000Z
-**Stopped At:** Phase 4 complete & verified (18/18 passed — live gates executed autonomously via docker compose per user direction)
+**Last session:** 2026-08-24T14:51:55.653Z
+**Stopped At:** Completed 05-01-PLAN.md (WebDev route sources + embedded bundle; wave-1 siblings 05-02+ running concurrently)
 **Resume file:** None
