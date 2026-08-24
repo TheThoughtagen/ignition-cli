@@ -44,6 +44,7 @@ pub mod resources;
 pub mod restart;
 pub mod sessions;
 pub mod status;
+pub mod tags;
 pub mod trial;
 pub mod version;
 pub mod webdev;
@@ -59,6 +60,7 @@ use crate::client::query::ListEnvelope;
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
+use crate::client::tags::{TagProviderCreate, TagProviderRecord};
 use crate::client::trial::{BannerSet, TrialWire};
 use crate::client::version::GatewayInfo;
 use crate::client::webdev::{RouteBody, RouteProbe};
@@ -270,6 +272,30 @@ pub trait GatewayApi: Send + Sync {
         zip: Vec<u8>,
         overwrite: bool,
     ) -> Result<ImportOutcome, CoreError>;
+    /// GET `/data/api/v1/resources/list/ignition/tag-provider`
+    /// (authed) — the tag-provider resource list: full records
+    /// incl. `config`, `metrics.tagCount`, `healthchecks.status`
+    /// (05-04, TAGS-01 — the NATIVE provider seam; no deployed
+    /// route involved). Standard list params (limit=-1, the UI
+    /// convention).
+    async fn tag_provider_list(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<TagProviderRecord>, CoreError>;
+    /// GET `/data/api/v1/resources/find/ignition/tag-provider/{name}`
+    /// (authed, name percent-encoded per segment) — one provider's
+    /// full record incl. the `signature` the chained delete needs.
+    /// 404 → `NotFound` via classify.
+    async fn tag_provider_find(&self, name: &str) -> Result<TagProviderRecord, CoreError>;
+    /// POST `/data/api/v1/resources/ignition/tag-provider` (authed)
+    /// with a JSON **ARRAY** body of create records — the
+    /// live-proven create shape (05-RESEARCH provider table).
+    /// Audit-logged server-side.
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError>;
+    /// DELETE `/data/api/v1/resources/ignition/tag-provider/{name}/{signature}`
+    /// (authed, both segments percent-encoded) — delete-by-signature;
+    /// the signature comes from find. Audit-logged server-side.
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError>;
     /// GET `/data/api/v1/trial` — the trial state, live-verified
     /// UNAUTHENTICATED on 8.3.3 + 8.3.6 (both trial states): auth
     /// headers ride ONLY when the client carries a credential (fresh
@@ -1045,6 +1071,43 @@ impl GatewayApi for ReqwestGatewayApi {
             .filter(|value| value.is_object())
             .unwrap_or_else(|| serde_json::json!({"status": "success"}));
         Ok(ImportOutcome { response: parsed })
+    }
+
+    async fn tag_provider_list(
+        &self,
+        query: &query::ListQuery,
+    ) -> Result<ListEnvelope<TagProviderRecord>, CoreError> {
+        // Standard list params (limit=-1 = the UI's "everything") —
+        // the connections-family resource lists' exact shape.
+        self.get_json(
+            tags::TAG_PROVIDERS_LIST_PATH,
+            Some(&query.to_query_pairs()),
+            true,
+        )
+        .await
+    }
+
+    async fn tag_provider_find(&self, name: &str) -> Result<TagProviderRecord, CoreError> {
+        self.get_json(&tags::tag_provider_find_path(name), None, true)
+            .await
+    }
+
+    async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
+        // The ARRAY body is the wire contract (a bare object 400s);
+        // serde serializes elements in declaration order so the
+        // recorded body is deterministic. Ok classification IS the
+        // success contract (the project-create precedent).
+        self.post_json(tags::TAG_PROVIDERS_CREATE_PATH, body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
+        // The signature rides the PATH (from find) — the
+        // live-proven delete-by-signature chain; both segments
+        // percent-encoded through the ONE locked encoder.
+        self.delete_with_query(&tags::tag_provider_delete_path(name, signature), &[])
+            .await
     }
 
     async fn trial_status_wire(&self) -> Result<TrialWire, CoreError> {

@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -219,6 +219,20 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// A tag provider of this name does not exist — the
+    /// find→signature→delete chain's find half missed (05-04,
+    /// TAGS-01). Exit 6 — target state: the named thing is absent
+    /// (the ProjectExists precedent family: action-constructed, not
+    /// classify — the honest, family-specific refusal over a bare
+    /// 404).
+    #[error("tag provider {name:?} not found on the gateway")]
+    ProviderNotFound {
+        /// The provider name that missed.
+        name: String,
+        /// URL of the find request, when known.
+        endpoint: Option<String>,
+    },
+
     /// A WebDev route answered HTTP 200 with a body denial
     /// (`{ok:false, error{code,message}}`) whose machine code this CLI
     /// does not specifically map — code + message ride verbatim so
@@ -261,6 +275,7 @@ impl CoreError {
             Self::ProjectExists { .. } => "project_exists",
             Self::ResourceBinary { .. } => "resource_binary",
             Self::TrialNotExpired { .. } => "trial_not_expired",
+            Self::ProviderNotFound { .. } => "provider_not_found",
             Self::RoutesNotDeployed { .. } => "routes_not_deployed",
             Self::WebdevUnlicensed { .. } => "webdev_unlicensed",
             Self::RouteVersionMismatch { .. } => "route_version_mismatch",
@@ -289,6 +304,7 @@ impl CoreError {
             | Self::ProjectExists { .. }
             | Self::ResourceBinary { .. }
             | Self::TrialNotExpired { .. }
+            | Self::ProviderNotFound { .. }
             | Self::RoutesNotDeployed { .. }
             | Self::WebdevUnlicensed { .. }
             | Self::RouteVersionMismatch { .. }
@@ -426,6 +442,11 @@ impl CoreError {
                         .to_string()
                 })
             }
+            Self::ProviderNotFound { .. } => Some(
+                "check the provider name; `ign tags provider list` shows the \
+                 gateway's tag providers"
+                    .to_string(),
+            ),
             Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
                 "the scriptExec route is secret-gated — deploy it with `ign \
                   webdev deploy --with-script-exec` (the secret is generated \
@@ -460,6 +481,7 @@ impl CoreError {
             | Self::ProjectExists { endpoint, .. }
             | Self::ResourceBinary { endpoint, .. }
             | Self::TrialNotExpired { endpoint, .. }
+            | Self::ProviderNotFound { endpoint, .. }
             | Self::RoutesNotDeployed { endpoint, .. }
             | Self::WebdevUnlicensed { endpoint }
             | Self::RouteVersionMismatch { endpoint, .. }
@@ -647,6 +669,16 @@ mod tests {
                 },
                 6,
                 "trial_not_expired",
+            ),
+            (
+                CoreError::ProviderNotFound {
+                    name: "nope".into(),
+                    endpoint: Some(
+                        "/data/api/v1/resources/find/ignition/tag-provider/nope".into(),
+                    ),
+                },
+                6,
+                "provider_not_found",
             ),
             (
                 CoreError::RoutesNotDeployed {

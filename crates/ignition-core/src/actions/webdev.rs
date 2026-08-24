@@ -348,6 +348,35 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for WebdevRig {
+
+        async fn tag_provider_list(
+            &self,
+            _query: &crate::client::query::ListQuery,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::tags::TagProviderRecord>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn tag_provider_find(
+            &self,
+            _name: &str,
+        ) -> Result<crate::client::tags::TagProviderRecord, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn tag_provider_create(
+            &self,
+            _body: &[crate::client::tags::TagProviderCreate],
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn tag_provider_delete(
+            &self,
+            _name: &str,
+            _signature: &str,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn webdev_route_probe(
             &self,
             _project: &str,

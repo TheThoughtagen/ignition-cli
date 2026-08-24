@@ -14,5 +14,6 @@ pub mod resources;
 pub mod restart;
 pub mod rig;
 pub mod sessions;
+pub mod tags;
 pub mod version;
 pub mod webdev;
