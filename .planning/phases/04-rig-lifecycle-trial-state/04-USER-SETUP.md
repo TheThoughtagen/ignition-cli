@@ -1,12 +1,32 @@
 # Phase 4: User Setup Required (04-03 trial state — live e2e gates)
 
 **Generated:** 2026-08-23
-**Phase:** 04-rig-lifecycle-trial-state
-**Status:** Partially complete — the 8.3.3 rig's credentials were discovered and live-verified during execution; the ign-research (8.3.6) items remain
+**Updated:** 2026-08-24 — the human tasks below are OBSOLETE. All live gates
+were executed autonomously via docker compose; token provisioning is now a
+fully headless recipe. See the addendum in
+[04-VERIFICATION.md](./04-VERIFICATION.md) → "Live Gates — Automated
+Execution (addendum)" for what ran, verbatim results, and the copy-paste
+provisioning script.
 
-Everything Claude could automate was automated and live-verified during
-04-03 (see 04-03-SUMMARY.md). These items need human access to the
-gateway web UI or rig credentials.
+## Status: superseded (no human action required)
+
+- ~~Provision an API token on ign-research~~ — **obsolete**: API tokens can
+  be provisioned headlessly (OIDC login ladder + `api-token/generate` +
+  `resources/ignition/api-token` create + a `security-properties`
+  read/write-permission patch). The full script lives in the VERIFICATION
+  addendum; it was executed on a fresh 8.3.6 rig (not ign-research, whose
+  admin password remains unknown and which stays untouched).
+- ~~Mint a durable token on the git-module rig~~ — **obsolete** for the
+  gates (executed on disposable rigs instead); the recipe applies to any
+  rig whose admin credentials are known. NOTE the `collection` mystery from
+  the 04-03 spike is solved: the value is `"core"` — but registration alone
+  is NOT enough: the gateway's `security-properties` singleton must also
+  admit the token's security level (`Authenticated`) in
+  `readPermissions`/`writePermissions` (AnyOf), otherwise every
+  token-authenticated `/data/api/v1/*` call returns 403. Phase 02's
+  research had already predicted exactly this.
+
+## Historical content (as written 2026-08-23, for the record)
 
 ## What already works (no action needed)
 
