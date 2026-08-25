@@ -122,12 +122,12 @@ Plans:
 *Planner refinement:* all three flagged spikes are RESOLVED by 05-RESEARCH.md with live evidence (HIGH confidence, disposable 8.3.3 rig): deploy = project-zip import on Phase 3 machinery (routes embedded in the binary — no source-checkout dependency); scriptExec = deploy-time shared secret baked via template substitution (research's `secret.json` sibling-file idea was never runtime-proven readable — template-baking is the guaranteed mechanism, same threat model), fail-closed constant-time gate, deployed ONLY via `--with-script-exec` — planner locked secret-ONLY posture (`require-auth:false`: API tokens 401 on require-auth routes, so the Basic layer would lock the CLI's own calls out); tag history = structurally safe everywhere, InternalHistorian provisionable headlessly (the tag↔historian data-flow binding rides as a bounded ≤30min execution spike in 05-06 with the assert-and-document fallback pre-cleared). The Phase 3 `resource`-family blocker lands as its OWN plan (05-02, `gap_closure: true`): export/import zip surgery per the research's native-first negative verdict, `zip` crate 8.6 verified at planning (research said 6.x — corrected), e2e witnesses re-pointed; execution updates STATE.md to close the blocker. Bulk export/import formats resolved to JSON-native only (xml/csv were delegated format-discretion; research found JSON is the native interchange — round-trip live-proven — xml/csv deferred to backlog). Roadmap sketch renumbered: deploy moved 05-02→05-03 to sit after the resource plan (it reuses the zip dep), providers+browse/read/write kept together per sketch (05-04).
 
 Plans:
-- [ ] 05-01-PLAN.md — webdev/ route sources (tags, tagConfig, alarms, tagHistory, scriptExec-template) with the versioned handshake + embedded bundle module in ignition-core (wave 1, parallel with 05-02)
-- [ ] 05-02-PLAN.md — resource family re-point: export→zip-member-surgery→import(overwrite), zip 8.6 dep, guarded put/delete, e2e witnesses re-pointed (closes the Phase 3 cross-phase blocker) (wave 1, parallel with 05-01)
-- [ ] 05-03-PLAN.md — webdev client seam (route_call + 405/402/401/200-denial probe + deploy zip builder) + `ign webdev deploy/status` + version refusal matrix + scriptExec secret lifecycle + doctor 405 re-pin (WEB-01/02)
-- [ ] 05-04-PLAN.md — tag providers (native REST, signature-chained delete) + browse filtered tree + single/batch read + write, with the version precondition every webdev command inherits (TAGS-01..04)
-- [ ] 05-05-PLAN.md — tag config CRUD (stringified-JSON re-parse) + UDT types/def + bulk export/import with abort-default collisions (TAGS-05/06/09)
-- [ ] 05-06-PLAN.md — alarms active/history(journal-gated)/ack(3-arg) + tag history query + InternalHistorian fixture + the binding spike + alarm lifecycle live gate (TAGS-07/08 — phase closer)
+- [x] 05-01-PLAN.md — webdev/ route sources (tags, tagConfig, alarms, tagHistory, scriptExec-template) with the versioned handshake + embedded bundle module in ignition-core (wave 1, parallel with 05-02)
+- [x] 05-02-PLAN.md — resource family re-point: export→zip-member-surgery→import(overwrite), zip 8.6 dep, guarded put/delete, e2e witnesses re-pointed (closes the Phase 3 cross-phase blocker) (wave 1, parallel with 05-01)
+- [x] 05-03-PLAN.md — webdev client seam (route_call + 405/402/401/200-denial probe + deploy zip builder) + `ign webdev deploy/status` + version refusal matrix + scriptExec secret lifecycle + doctor 405 re-pin (WEB-01/02)
+- [x] 05-04-PLAN.md — tag providers (native REST, signature-chained delete) + browse filtered tree + single/batch read + write, with the version precondition every webdev command inherits (TAGS-01..04)
+- [x] 05-05-PLAN.md — tag config CRUD (stringified-JSON re-parse) + UDT types/def + bulk export/import with abort-default collisions (TAGS-05/06/09)
+- [x] 05-06-PLAN.md — alarms active/history(journal-gated)/ack(3-arg) + tag history query + InternalHistorian fixture + the binding spike + alarm lifecycle live gate (TAGS-07/08 — phase closer)
 
 ### Phase 6: TUI Cockpit
 **Goal:** A user can open `ign tui` and drive every CLI capability through a k9s/lazygit-style cockpit — the primary human interface, structurally complete because TUI and CLI share the same actions layer.
@@ -177,6 +177,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 2. Gateway Health & Inspection | 5/5 | Complete | 2026-08-22 |
 | 3. Project Operations | 3/3 | Complete | 2026-08-22 |
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
-| 5. WebDev Backend & Tag Operations | 0/6 | Not started | - |
+| 5. WebDev Backend & Tag Operations | 6/6 | Complete | 2026-08-25 |
 | 6. TUI Cockpit | 0/4 | Not started | - |
 | 7. Ecosystem Interop & Advanced Ops | 0/4 | Not started | - |
