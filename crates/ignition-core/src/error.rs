@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -267,6 +267,22 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// The gateway has no alarm-journal profile configured — alarm
+    /// history has nowhere to read from. The alarms route's
+    /// structured `no_alarm_journal` denial maps here (the
+    /// denial_to_error seam, 05-06 TAGS-07): DEFAULT rigs hit this
+    /// ALWAYS, because the journal is a config-resource chain —
+    /// database connection + `ignition/alarm-journal` profile + the
+    /// `general-alarm-settings` singleton pointing at it. Exit 6 —
+    /// target state: the command is invalid for the gateway's
+    /// current state until that chain is provisioned (the honest,
+    /// actionable refusal over a bare route error).
+    #[error("no alarm journal profile is configured on this gateway — alarm history has nothing to read")]
+    AlarmJournalMissing {
+        /// URL of the alarms route request, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -300,6 +316,7 @@ impl CoreError {
             Self::RouteVersionMismatch { .. } => "route_version_mismatch",
             Self::WebdevRouteError { .. } => "webdev_route_error",
             Self::TagCollision { .. } => "tag_collision",
+            Self::AlarmJournalMissing { .. } => "alarm_journal_missing",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -329,7 +346,8 @@ impl CoreError {
             | Self::WebdevUnlicensed { .. }
             | Self::RouteVersionMismatch { .. }
             | Self::WebdevRouteError { .. }
-            | Self::TagCollision { .. } => 6,
+            | Self::TagCollision { .. }
+            | Self::AlarmJournalMissing { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -473,6 +491,13 @@ impl CoreError {
                   existing tags (destructive: requires --yes)"
                     .to_string(),
             ),
+            Self::AlarmJournalMissing { .. } => Some(
+                "alarm history needs a journal profile — provision a database \
+                  connection + alarm-journal profile on the gateway (and point \
+                  the general-alarm-settings singleton at it), then retry; see \
+                  the README 'Alarm history' section"
+                    .to_string(),
+            ),
             Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
                 "the scriptExec route is secret-gated — deploy it with `ign \
                   webdev deploy --with-script-exec` (the secret is generated \
@@ -512,7 +537,8 @@ impl CoreError {
             | Self::WebdevUnlicensed { endpoint }
             | Self::RouteVersionMismatch { endpoint, .. }
             | Self::WebdevRouteError { endpoint, .. }
-            | Self::TagCollision { endpoint, .. } => endpoint.clone(),
+            | Self::TagCollision { endpoint, .. }
+            | Self::AlarmJournalMissing { endpoint } => endpoint.clone(),
             _ => None,
         }
     }
@@ -749,6 +775,13 @@ mod tests {
                 6,
                 "tag_collision",
             ),
+            (
+                CoreError::AlarmJournalMissing {
+                    endpoint: Some("/system/webdev/ign-cli/cli/alarms".into()),
+                },
+                6,
+                "alarm_journal_missing",
+            ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {
@@ -864,6 +897,19 @@ mod tests {
         assert!(
             hint.contains("--with-script-exec"),
             "secret-gate hint names the deploy flag: {hint}"
+        );
+
+        // The alarm-journal refusal (05-06): the hint names the missing
+        // provisioning chain AND the README section.
+        let journal = CoreError::AlarmJournalMissing { endpoint: None };
+        let hint = journal.hint().expect("hint required");
+        assert!(
+            hint.contains("journal profile") && hint.contains("database connection"),
+            "journal hint names the chain: {hint}"
+        );
+        assert!(
+            hint.contains("README"),
+            "journal hint points at the README section: {hint}"
         );
 
         // Totality: no class silently loses its hint later.

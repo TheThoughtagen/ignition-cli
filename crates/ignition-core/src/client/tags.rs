@@ -21,6 +21,15 @@
 //! is a JSON string parsed at the action layer), so this file's
 //! models are unchanged.
 //!
+//! 05-06's alarms active/history/ack (TAGS-07) and tag-history
+//! query (TAGS-08) ride the deployed `alarms` + `tagHistory` routes
+//! the same way — free-form payloads at the action layer — with ONE
+//! client-seam addition: the alarms route's structured
+//! `no_alarm_journal` denial maps to the actionable
+//! [`CoreError::AlarmJournalMissing`] in
+//! [`super::webdev::denial_to_error`] (the single body-denial
+//! mapping site).
+//!
 //! Two-layer naming (the LOCKED convention): client models stay
 //! wire-faithful (the browse route answers gateway-native camelCase
 //! `fullPath`/`tagType`/`hasChildren`/`dataType` — renames here,

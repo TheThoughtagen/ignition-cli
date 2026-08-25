@@ -778,3 +778,170 @@ async fn import_overwrite_pins_configure_body_without_precheck() {
     assert_eq!(guard.received_requests().await.len(), 1);
     assert_eq!(browse_guard.received_requests().await.len(), 0);
 }
+
+// ---- Task 1 (05-06, TAGS-07): the alarms route ----
+
+use ignition_core::actions::tags::{tags_alarms_ack, tags_alarms_active, tags_alarms_history};
+
+/// THE active filter pin: only PRESENT filters ride the body (the
+/// kwargs passthrough — `source`/`priority`/`state` go to
+/// `system.alarm.queryStatus` verbatim), rows mapping under
+/// unit-explicit keys.
+#[tokio::test]
+async fn alarms_active_pins_filter_kwargs_passthrough() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "active",
+            "source": "prov:tagprov",
+            "priority": "High",
+            "state": "Active, Unacknowledged"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"eventId": "e-1", "source": "prov:tagprov:/T1/HighLimit", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit"}
+                ], "count": 1}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_alarms_active(
+        &api,
+        "ign-cli",
+        Some("prov:tagprov"),
+        Some("High"),
+        Some("Active, Unacknowledged"),
+    )
+    .await
+    .expect("active through the real client");
+    assert_eq!(result.count, 1);
+    assert_eq!(result.alarms[0].event_id, "e-1");
+    assert_eq!(result.alarms[0].name.as_deref(), Some("HighLimit"));
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE journal-missing pin (the honest default-rig path): the
+/// alarms route's structured `no_alarm_journal` denial — HTTP 200,
+/// `{ok:false, error{code,message}}` — maps to the ADDITIVE
+/// `alarm_journal_missing` slug (exit 6) with the hint naming the
+/// provisioning chain + README section.
+#[tokio::test]
+async fn alarms_history_no_alarm_journal_maps_to_actionable_refusal() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "history",
+            "startDateMs": 1000,
+            "endDateMs": 2000
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "no_alarm_journal",
+                    "message": "No alarm journal profile specified"
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_alarms_history(&api, "ign-cli", 1_000, 2_000)
+        .await
+        .expect_err("a journal-less rig refuses history");
+    assert_eq!(err.code(), "alarm_journal_missing");
+    assert_eq!(err.exit_code(), 6);
+    let hint = err.hint().unwrap();
+    assert!(
+        hint.contains("journal profile") && hint.contains("README"),
+        "hint names the chain + the README section: {hint}"
+    );
+}
+
+/// History success: journal rows ride VERBATIM (the wire shape is
+/// journal-dataset-dependent — never re-modeled).
+#[tokio::test]
+async fn alarms_history_success_passes_journal_rows_verbatim() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "history"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"eventId": "e-1", "source": "prov:x", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit", "eventData": "{\"a\": 1}"}
+                ], "count": 1}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_alarms_history(&api, "ign-cli", 1_000, 2_000)
+        .await
+        .expect("history through the real client");
+    assert_eq!(result.count, 1);
+    assert_eq!(
+        result.rows[0]["eventData"],
+        serde_json::json!("{\"a\": 1}"),
+        "journal rows verbatim — eventData string never re-parsed"
+    );
+    assert!(result.columns.contains(&"eventData".to_string()));
+}
+
+/// THE ack body pin: the gateway-scope 3-arg form rides the body
+/// (string ids + note + username), and the return — the
+/// UNacknowledged remainder — lands in the result with the honest
+/// client-side acknowledged count.
+#[tokio::test]
+async fn alarms_ack_pins_three_arg_body_and_remainder() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "acknowledge",
+            "eventIds": ["e-1", "e-2"],
+            "note": "handled",
+            "username": "op"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"unacknowledged": ["e-2"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_alarms_ack(
+        &api,
+        "ign-cli",
+        &["e-1".to_string(), "e-2".to_string()],
+        "handled",
+        "op",
+    )
+    .await
+    .expect("ack through the real client");
+    assert_eq!(result.acknowledged, 1, "requested 2, remainder 1");
+    assert_eq!(result.unacknowledged, vec!["e-2".to_string()]);
+    assert_eq!(guard.received_requests().await.len(), 1);
+}

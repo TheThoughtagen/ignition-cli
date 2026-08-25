@@ -1,6 +1,6 @@
-//! Tag actions (05-04..05-05) — serde models OUT, no printing.
+//! Tag actions (05-04..05-06) — serde models OUT, no printing.
 //!
-//! THREE seams, one family (05-RESEARCH's crisp split):
+//! FOUR seams, one family (05-RESEARCH's crisp split):
 //!
 //! - **Providers** (TAGS-01) ride the NATIVE config-resource REST
 //!   (`ignition/tag-provider` — healthier data: tagCount metrics,
@@ -27,6 +27,13 @@
 //!   configure's `'a'`/`'o'` (abort = browse pre-check refusing
 //!   `tag_collision` BEFORE any write; overwrite = `--yes`-guarded,
 //!   NO pre-check — server authority).
+//! - **alarms active/history/ack + tag history query** (05-06,
+//!   TAGS-07/08) ride the deployed `alarms` and `tagHistory`
+//!   routes — the same precondition, the same seam. Alarm history
+//!   on a default rig refuses `alarm_journal_missing` (exit 6, the
+//!   actionable journal-chain hint); history query passes
+//!   `{columns, rows}` through with `t_stamp` preserved EXACTLY
+//!   (never renamed — the prior-art defect the route corrects).
 //!
 //! Two-layer naming: the client models stay wire-faithful; the
 //! action results re-expose selected fields under unit-explicit
@@ -372,6 +379,212 @@ pub async fn tags_write(
         project: project.to_string(),
         path: row["path"].as_str().unwrap_or_default().to_string(),
         quality: row["quality"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
+// ---- alarms active/history/ack (05-06, TAGS-07) ----
+//
+// The alarms route's action set rides the same 05-03 generic seam:
+// `active` (queryStatus with OPTIONAL filter kwargs — only present
+// filters ride the body), `history` (queryJournal — a DEFAULT rig
+// denies with the structured `no_alarm_journal` code, which the
+// client seam maps to the actionable `alarm_journal_missing` exit 6),
+// `acknowledge` (the gateway-scope 3-arg String[]/note/username form
+// whose return IS the unacknowledged remainder — acknowledged is
+// computed client-side honestly from requested − remainder).
+
+/// The alarms route folder name (the deployed bundle's alarm
+/// lifecycle route).
+const ALARMS_ROUTE: &str = "alarms";
+
+/// One active alarm row — unit-explicit keys over the route's
+/// camelCase passthrough (`eventId` → `event_id`). State strings read
+/// `'Active, Unacknowledged'` verbatim — never parsed further (the
+/// quality-is-data convention).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AlarmRow {
+    /// The alarm event's id (a UUID, stringified route-side).
+    pub event_id: String,
+    /// The alarm's source path.
+    pub source: String,
+    /// State string verbatim (`'Active, Unacknowledged'`, …).
+    pub state: String,
+    /// Priority string verbatim (`'High'`, …).
+    pub priority: String,
+    /// The alarm definition's name, when the event carries one.
+    pub name: Option<String>,
+}
+
+/// `ign tags alarms active` result.
+#[derive(Debug, Serialize)]
+pub struct TagsAlarmsActiveResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// Active alarm rows, gateway order.
+    pub alarms: Vec<AlarmRow>,
+    /// Row count (== `alarms.len()`).
+    pub count: usize,
+}
+
+/// `ign tags alarms history` result — journal rows ride VERBATIM as
+/// raw values (the wire shape is journal-dataset-dependent: columns
+/// vary by journal schema and Ignition version, so the row dicts pass
+/// through unparsed under the `{columns, rows}` convention the
+/// tagHistory query established). `columns` derives from the first
+/// row's keys (empty when the journal answered no rows).
+#[derive(Debug, Serialize)]
+pub struct TagsAlarmsHistoryResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// Column names (the first row's keys; empty on an empty journal).
+    pub columns: Vec<String>,
+    /// Journal rows verbatim.
+    pub rows: Vec<serde_json::Value>,
+    /// Row count.
+    pub count: usize,
+}
+
+/// `ign tags alarms ack` result — the 8.3 acknowledge return IS the
+/// UNacknowledged remainder; `acknowledged` is computed client-side
+/// honestly (requested − remainder), never trusted from a field the
+/// route never sent.
+#[derive(Debug, Serialize)]
+pub struct TagsAlarmsAckResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// How many of the requested ids the gateway acknowledged.
+    pub acknowledged: usize,
+    /// The ids that REMAIN unacknowledged (the route's own return).
+    pub unacknowledged: Vec<String>,
+}
+
+/// `ign tags alarms active` — route action `active`; only PRESENT
+/// filters ride the body (the route passes them through to
+/// `system.alarm.queryStatus` as kwargs verbatim).
+pub async fn tags_alarms_active(
+    api: &dyn GatewayApi,
+    project: &str,
+    source: Option<&str>,
+    priority: Option<&str>,
+    state: Option<&str>,
+) -> Result<TagsAlarmsActiveResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let mut body = serde_json::json!({"action": "active"});
+    for (key, value) in [
+        ("source", source),
+        ("priority", priority),
+        ("state", state),
+    ] {
+        if let Some(value) = value {
+            body[key] = serde_json::Value::String(value.to_string());
+        }
+    }
+    let data = api
+        .webdev_route_call(project, ALARMS_ROUTE, &body, &[])
+        .await?;
+    let wire_rows: Vec<serde_json::Value> = parse_results(&data, "active")?;
+    let alarms: Vec<AlarmRow> = wire_rows
+        .into_iter()
+        .map(|row| AlarmRow {
+            event_id: row["eventId"].as_str().unwrap_or_default().to_string(),
+            source: row["source"].as_str().unwrap_or_default().to_string(),
+            state: row["state"].as_str().unwrap_or_default().to_string(),
+            priority: row["priority"].as_str().unwrap_or_default().to_string(),
+            name: row["name"].as_str().map(str::to_string),
+        })
+        .collect();
+    let count = alarms.len();
+    Ok(TagsAlarmsActiveResult {
+        project: project.to_string(),
+        alarms,
+        count,
+    })
+}
+
+/// `ign tags alarms history` — route action `history`. On a DEFAULT
+/// rig (no journal chain) this refuses
+/// [`CoreError::AlarmJournalMissing`] — the honest, actionable
+/// default-rig path (exit 6, hint names the provisioning chain).
+pub async fn tags_alarms_history(
+    api: &dyn GatewayApi,
+    project: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<TagsAlarmsHistoryResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            ALARMS_ROUTE,
+            &serde_json::json!({
+                "action": "history",
+                "startDateMs": start_ms,
+                "endDateMs": end_ms,
+            }),
+            &[],
+        )
+        .await?;
+    let rows: Vec<serde_json::Value> = parse_results(&data, "history")?;
+    let columns: Vec<String> = rows
+        .first()
+        .and_then(serde_json::Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    let count = rows.len();
+    Ok(TagsAlarmsHistoryResult {
+        project: project.to_string(),
+        columns,
+        rows,
+        count,
+    })
+}
+
+/// `ign tags alarms ack ID...` — route action `acknowledge` (the
+/// gateway-scope 3-arg form: String[] ids, note, username — the CLI
+/// demands the username explicitly, no default-guessing). The route's
+/// return is the UNacknowledged remainder; acknowledged is the honest
+/// client-side difference.
+pub async fn tags_alarms_ack(
+    api: &dyn GatewayApi,
+    project: &str,
+    ids: &[String],
+    note: &str,
+    username: &str,
+) -> Result<TagsAlarmsAckResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            ALARMS_ROUTE,
+            &serde_json::json!({
+                "action": "acknowledge",
+                "eventIds": ids,
+                "note": note,
+                "username": username,
+            }),
+            &[],
+        )
+        .await?;
+    let unacknowledged: Vec<String> = data
+        .get("unacknowledged")
+        .and_then(|value| value.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "alarms route acknowledge returned an unexpected shape (missing `unacknowledged`)"
+                    .to_string(),
+            )
+        })?;
+    let acknowledged = ids.len().saturating_sub(unacknowledged.len());
+    Ok(TagsAlarmsAckResult {
+        project: project.to_string(),
+        acknowledged,
+        unacknowledged,
     })
 }
 
@@ -1583,7 +1796,7 @@ mod tests {
         assert!(rig.calls.lock().unwrap().is_empty());
     }
 
-    // ---- config get/create/edit/delete (05-05, TAGS-05) ----
+// ---- config get/create/edit/delete (05-05, TAGS-05) ----
 
     use super::{
         TagsConfigGetResult, configure_single, reparse_stringified, split_base_path,
@@ -2127,5 +2340,178 @@ mod tests {
             calls[2]["tags"], payload,
             "the configure tags are the parsed export payload VERBATIM"
         );
+    }
+
+    // ---- alarms active/history/ack (05-06, TAGS-07) ----
+
+    use super::{AlarmRow, TagsAlarmsAckResult, tags_alarms_ack, tags_alarms_active, tags_alarms_history};
+
+    /// Active alarms: rows map under unit-explicit keys (eventId →
+    /// event_id, state verbatim, name Option), and the body carries
+    /// ONLY the present filters — a bare call is exactly
+    /// `{action: active}`.
+    #[tokio::test]
+    async fn alarms_active_maps_rows_and_pins_filter_kwargs() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"results": [
+                {"eventId": "e-1", "source": "prov:tagprov:/T1/HighLimit", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit"},
+                {"eventId": "e-2", "source": "prov:tagprov:/T2/LowLimit", "state": "Active, Unacknowledged", "priority": "Medium", "name": null}
+            ], "count": 2}),
+        );
+        let result = tags_alarms_active(
+            &rig,
+            "ign-cli",
+            Some("prov:tagprov"),
+            Some("High"),
+            Some("Active, Unacknowledged"),
+        )
+        .await
+        .expect("active parses");
+        assert_eq!(result.count, 2);
+        assert_eq!(
+            result.alarms[0],
+            AlarmRow {
+                event_id: "e-1".into(),
+                source: "prov:tagprov:/T1/HighLimit".into(),
+                state: "Active, Unacknowledged".into(),
+                priority: "High".into(),
+                name: Some("HighLimit".into()),
+            }
+        );
+        assert_eq!(result.alarms[1].name, None, "null name degrades to None");
+        let first_call = {
+            let calls = rig.calls.lock().unwrap();
+            calls[0].clone()
+        };
+        assert_eq!(
+            first_call,
+            serde_json::json!({
+                "action": "active",
+                "source": "prov:tagprov",
+                "priority": "High",
+                "state": "Active, Unacknowledged"
+            }),
+            "only PRESENT filters ride the body (kwargs passthrough)"
+        );
+
+        // Bare call: the body is exactly the action — no filter keys.
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({"results": []}));
+        let result = tags_alarms_active(&rig, "ign-cli", None, None, None)
+            .await
+            .expect("bare active parses");
+        assert_eq!(result.count, 0);
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "active"}),
+            "no filters, no filter keys"
+        );
+    }
+
+    /// History success: rows ride VERBATIM, columns derive from the
+    /// first row's keys (empty on an empty journal), and the body
+    /// carries epoch-ms start/end.
+    #[tokio::test]
+    async fn alarms_history_passes_rows_verbatim_and_derives_columns() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"results": [
+                {"eventId": "e-1", "source": "prov:x", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit", "eventData": null}
+            ], "count": 1}),
+        );
+        let result = tags_alarms_history(&rig, "ign-cli", 1_000, 2_000)
+            .await
+            .expect("history parses");
+        assert_eq!(result.count, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["eventId"], "e-1", "rows verbatim");
+        assert!(
+            result.columns.contains(&"eventId".to_string())
+                && result.columns.contains(&"eventData".to_string()),
+            "columns derive from the first row: {:?}",
+            result.columns
+        );
+        let history_call = {
+            let calls = rig.calls.lock().unwrap();
+            calls[0].clone()
+        };
+        assert_eq!(
+            history_call,
+            serde_json::json!({"action": "history", "startDateMs": 1000, "endDateMs": 2000})
+        );
+
+        // Empty journal: empty columns, empty rows — still a success.
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({"results": []}));
+        let result = tags_alarms_history(&rig, "ign-cli", 1_000, 2_000)
+            .await
+            .expect("empty history parses");
+        assert!(result.columns.is_empty());
+        assert_eq!(result.count, 0);
+    }
+
+    /// THE ack body pin + the remainder-honest computation: the
+    /// 3-arg String[]/note/username form rides the body; the route's
+    /// return IS the unacknowledged remainder; acknowledged = 2 − 1
+    /// client-side.
+    #[tokio::test]
+    async fn alarms_ack_pins_three_arg_body_and_computes_remainder() {
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({"unacknowledged": ["e-2"]}));
+        let result: TagsAlarmsAckResult = tags_alarms_ack(
+            &rig,
+            "ign-cli",
+            &["e-1".to_string(), "e-2".to_string()],
+            "handled by on-call",
+            "op",
+        )
+        .await
+        .expect("ack parses");
+        assert_eq!(result.acknowledged, 1, "requested 2, remainder 1");
+        assert_eq!(result.unacknowledged, vec!["e-2".to_string()]);
+        let ack_call = {
+            let calls = rig.calls.lock().unwrap();
+            calls[0].clone()
+        };
+        assert_eq!(
+            ack_call,
+            serde_json::json!({
+                "action": "acknowledge",
+                "eventIds": ["e-1", "e-2"],
+                "note": "handled by on-call",
+                "username": "op"
+            }),
+            "the ack body is the 3-arg form: string ids + note + username"
+        );
+
+        // Full acknowledgment: empty remainder, all acknowledged.
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({"unacknowledged": []}));
+        let result = tags_alarms_ack(&rig, "ign-cli", &["e-1".to_string()], "", "op")
+            .await
+            .expect("clean ack parses");
+        assert_eq!(result.acknowledged, 1);
+        assert!(result.unacknowledged.is_empty());
+
+        // A missing `unacknowledged` key is an internal-class honesty
+        // error (never silently defaulted).
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({}));
+        let err = tags_alarms_ack(&rig, "ign-cli", &["e-1".to_string()], "", "op")
+            .await
+            .expect_err("shape violation refuses");
+        assert_eq!(err.code(), "internal");
+    }
+
+    /// Precondition refusal inheritance: absent routes refuse
+    /// BEFORE any alarms route call (zero route calls).
+    #[tokio::test]
+    async fn alarms_refuse_when_routes_absent() {
+        let rig = TagsRig::with(Vec::new()).route(RouteProbe::Absent, serde_json::json!({}));
+        let err = tags_alarms_active(&rig, "ign-cli", None, None, None)
+            .await
+            .expect_err("absent routes refuse");
+        assert_eq!(err.code(), "routes_not_deployed");
+        assert_eq!(err.exit_code(), 6);
+        assert!(rig.calls.lock().unwrap().is_empty());
     }
 }

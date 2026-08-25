@@ -157,13 +157,20 @@ pub(crate) fn parse_route_body(body: &str) -> Result<RouteBody, CoreError> {
 
 /// Map a body denial onto the taxonomy: the route contract's
 /// `not_found` code reuses the existing [`CoreError::NotFound`] slug
-/// (it means exactly that — the named thing is absent); every other
-/// code — known-but-unmapped like `secret_required`, or unknown from
-/// a future route — rides [`CoreError::WebdevRouteError`] with
-/// code + message verbatim, the stable contract agents branch on.
+/// (it means exactly that — the named thing is absent); the alarms
+/// route's `no_alarm_journal` maps to the actionable
+/// [`CoreError::AlarmJournalMissing`] (default rigs ALWAYS deny
+/// history there — the missing journal chain is target state, not a
+/// route bug, 05-06); every other code — known-but-unmapped like
+/// `secret_required`, or unknown from a future route — rides
+/// [`CoreError::WebdevRouteError`] with code + message verbatim, the
+/// stable contract agents branch on.
 pub(crate) fn denial_to_error(code: &str, message: &str, endpoint: String) -> CoreError {
     match code {
         "not_found" => CoreError::NotFound {
+            endpoint: Some(endpoint),
+        },
+        "no_alarm_journal" => CoreError::AlarmJournalMissing {
             endpoint: Some(endpoint),
         },
         _ => CoreError::WebdevRouteError {
@@ -353,6 +360,21 @@ mod tests {
         assert_eq!(secret.exit_code(), 6);
         assert!(secret.to_string().contains("secret_required"));
         assert!(secret.to_string().contains("missing header"));
+
+        // The alarms route's journal-missing denial maps to the
+        // actionable slug (default rigs ALWAYS hit it — the missing
+        // journal chain is target state, not a route bug).
+        let journal = denial_to_error(
+            "no_alarm_journal",
+            "No alarm journal profile specified",
+            "/system/webdev/ign-cli/cli/alarms".into(),
+        );
+        assert_eq!(journal.code(), "alarm_journal_missing");
+        assert_eq!(journal.exit_code(), 6);
+        assert!(
+            journal.hint().unwrap().contains("journal profile"),
+            "hint names the chain: {journal}"
+        );
     }
 
     /// THE fail-closed guard: scriptExec packing demands a secret —
