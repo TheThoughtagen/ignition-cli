@@ -462,6 +462,129 @@ pub enum TagsCommand {
         #[arg(long, default_value = "ign-cli", value_name = "NAME")]
         project: String,
     },
+    /// Tag CONFIGURATION CRUD (the surgical edit loop — JSON in,
+    /// JSON out): get/create/edit/delete tag configs through the
+    /// deployed tagConfig route; stringified values are re-parsed so
+    /// agents see real JSON
+    #[command(subcommand)]
+    Config(TagsConfigCommand),
+    /// UDT types and definitions (recursive: parameters + nested
+    /// children) — needs the deployed routes
+    #[command(subcommand)]
+    Udt(TagsUdtCommand),
+    /// Export tag subtrees to a JSON file (the bulk-transfer half —
+    /// the gateway's native interchange, JSON only)
+    Export {
+        /// Tag paths to export, e.g. `[default]P5` (one or more)
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// Output file (`-` = stdout — the raw payload, no envelope;
+        /// default: `<last-path-segment>.json` in the cwd)
+        #[arg(short = 'o', long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Import a JSON tag export into a target provider — abort
+    /// (default) refuses on collisions; overwrite replaces them
+    /// (destructive: requires --yes)
+    Import {
+        /// The export file to import (`-` = stdin)
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+        /// Target tag provider (must exist — `ign tags provider
+        /// create NAME` first)
+        #[arg(long, value_name = "NAME")]
+        provider: String,
+        /// Collision policy: abort refuses when tags already exist
+        /// (default); overwrite replaces them (destructive:
+        /// requires --yes). merge is Designer-only (not a value)
+        #[arg(long, value_enum, default_value_t = CollisionPolicy::Abort)]
+        collision_policy: CollisionPolicy,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+}
+
+/// `tags config …` — the configuration CRUD subfamily (05-05,
+/// TAGS-05): the get→edit-file→write-back surgical loop. Definition
+/// files are the configure shape (README's traps table: tagType
+/// discriminator, nested children, alarms-as-LIST).
+#[derive(Debug, Subcommand)]
+pub enum TagsConfigCommand {
+    /// Get a tag's configuration as (pretty) JSON — stringified
+    /// value/defaultValue sub-dicts re-parsed into real JSON
+    Get {
+        /// Tag path, e.g. `[default]P5/T1`
+        path: String,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Create a tag from a JSON definition file (`-` = stdin) —
+    /// aborts on an existing node (collision policy 'a')
+    Create {
+        /// Tag path to create, e.g. `[default]P5/T1`
+        path: String,
+        /// JSON definition file (`-` = stdin): `{tagType, value,
+        /// alarms, …}` — see the README configure-shape table
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Edit a tag's configuration from a JSON definition file (`-` =
+    /// stdin) — overwrites that single node (collision policy 'o')
+    Edit {
+        /// Tag path to edit, e.g. `[default]P5/T1`
+        path: String,
+        /// JSON definition file (`-` = stdin)
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Delete tag configurations — destructive, refused without
+    /// --yes (the guard fires before ANY resolution: zero network
+    /// work)
+    Delete {
+        /// Tag paths to delete (one or more)
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+}
+
+/// `tags udt …` — the UDT subfamily (05-05, TAGS-06).
+#[derive(Debug, Subcommand)]
+pub enum TagsUdtCommand {
+    /// List the provider's UDT types
+    Types {
+        /// Tag provider whose `_types_` folder to browse (default
+        /// `default`)
+        #[arg(long, default_value = "default", value_name = "NAME")]
+        provider: String,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Get a UDT definition (parameters + nested children, recursive)
+    Def {
+        /// UDT type name, e.g. `Motor`
+        name: String,
+        /// Tag provider (default `default`)
+        #[arg(long, default_value = "default", value_name = "NAME")]
+        provider: String,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -99,12 +99,44 @@ fn isolated_live_config(env: &LiveEnv) -> (tempfile::TempDir, PathBuf) {
 
 /// Spawn the built `ign` binary at the live gateway with args.
 fn ign(config: &Path, env: &LiveEnv, args: &[&str]) -> Output {
+    spawn_ign(config, env, args, None, None)
+}
+
+/// `ign` with a JSON document piped to stdin (`--file -`).
+fn ign_stdin(config: &Path, env: &LiveEnv, args: &[&str], stdin: &str) -> Output {
+    spawn_ign(config, env, args, Some(stdin), None)
+}
+
+/// The one spawn primitive: env pinning, optional stdin, optional
+/// pinned working directory (the default-file export path).
+fn spawn_ign(
+    config: &Path,
+    env: &LiveEnv,
+    args: &[&str],
+    stdin: Option<&str>,
+    cwd: Option<&Path>,
+) -> Output {
     let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
     command
         .env("IGNITION_CLI_CONFIG", config)
         .env("IGNITION_TOKEN", &env.token)
         .env("IGNITION_URL", &env.url);
-    command.args(args).output().expect("spawn ign")
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.args(args);
+    if let Some(text) = stdin {
+        command.write_stdin(text);
+    }
+    command.output().expect("spawn ign")
+}
+
+/// Parse the compact JSON FAILURE envelope from stderr (the
+/// first-`{` convention — log-tolerant).
+fn err_envelope(out: &Output) -> Value {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let from = stderr.find('{').expect("envelope starts somewhere");
+    serde_json::from_str(&stderr[from..]).expect("envelope parses")
 }
 
 fn expect_ok(what: &str, out: &Output) {
@@ -415,4 +447,183 @@ async fn live_tags_provider_browse_read_write_loop() {
     expect_ok("provider delete p5e2e (guarded)", &out);
     let envelope = data_envelope(&out);
     assert_eq!(envelope["data"]["deleted"], "p5e2e");
+}
+
+/// THE tagConfig live round-trip (05-05) — the research-proven loop
+/// that closes TAGS-05/09: config create an Int4 memory tag (value
+/// 123) → read back Good/123 (05-04's read IS the oracle) → export
+/// the provider → import into a fresh provider (abort first: the
+/// second import refuses `tag_collision`, then overwrite --yes
+/// replaces) → read the IMPORTED tag == 123/Good (values intact —
+/// TAGS-09's live proof) → config delete cleanup → provider deletes.
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_config_export_import_roundtrip() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+
+    // Routes first: every tagConfig verb refuses exit 6 without them.
+    let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
+    expect_ok("deploy (the tagConfig route's precondition)", &out);
+
+    // Fresh providers for the round-trip (native REST, pre-cleaned).
+    for provider in ["p5e2e", "p5import"] {
+        let out = ign(
+            &config,
+            &env,
+            &["tags", "provider", "create", provider, "--compact"],
+        );
+        expect_ok(&format!("provider create {provider}"), &out);
+    }
+
+    // Config create: an Int4 memory tag, value 123 (stdin definition —
+    // the surgical edit loop's write half).
+    let out = ign_stdin(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "create",
+            "[p5e2e]T1",
+            "--file",
+            "-",
+            "--compact",
+        ],
+        r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 123}"#,
+    );
+    expect_ok("config create [p5e2e]T1", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["quality"], "Good");
+
+    // Read back: Good/123 — 05-04's read verb is the oracle.
+    let out = ign(&config, &env, &["tags", "read", "[p5e2e]T1", "--compact"]);
+    expect_ok("read [p5e2e]T1", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["results"][0]["quality"], "Good");
+    assert_eq!(envelope["data"]["results"][0]["value"], 123);
+
+    // Export the provider subtree → a JSON file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let export_file = tmp.path().join("p5e2e.json");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[p5e2e]",
+            "-o",
+            export_file.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("export [p5e2e]", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["tag_count"], 1, "one top-level subtree");
+    assert_eq!(envelope["data"]["file"], export_file.display().to_string());
+
+    // Import #1 (abort, clean target): the browse pre-check passes,
+    // configure 'a' imports.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            export_file.to_str().expect("path"),
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+    );
+    expect_ok("import #1 (abort, clean target)", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["imported"], 1);
+
+    // Import #2 (abort again): the collision refusal — exit 6,
+    // tag_collision, BEFORE any write.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            export_file.to_str().expect("path"),
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "collision refuses exit 6; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = err_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "tag_collision");
+
+    // Import #3 (overwrite --yes): the guarded replace.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            export_file.to_str().expect("path"),
+            "--provider",
+            "p5import",
+            "--collision-policy",
+            "overwrite",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("import #3 (overwrite --yes)", &out);
+
+    // THE round-trip proof: the imported tag reads back 123/Good —
+    // values intact across the export/import interchange.
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "read", "[p5import]T1", "--compact"],
+    );
+    expect_ok("read [p5import]T1 (the round-trip oracle)", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["results"][0]["quality"], "Good");
+    assert_eq!(envelope["data"]["results"][0]["value"], 123);
+
+    // Cleanup: config delete both tags (guarded), then the providers.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "delete",
+            "[p5e2e]T1",
+            "[p5import]T1",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("config delete cleanup", &out);
+    for provider in ["p5e2e", "p5import"] {
+        let out = ign(
+            &config,
+            &env,
+            &["tags", "provider", "delete", provider, "--yes", "--compact"],
+        );
+        expect_ok(&format!("provider delete {provider} (guarded)"), &out);
+    }
 }

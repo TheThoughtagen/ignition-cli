@@ -50,6 +50,69 @@ fn ign(config: &Path, url: &str, args: &[&str]) -> std::process::Output {
     command.args(args).output().expect("spawn ign")
 }
 
+/// `ign` with a JSON document piped to stdin (`--file -`) and a
+/// pinned working directory (the default-file export golden).
+fn ign_stdin(
+    config: &Path,
+    url: &str,
+    args: &[&str],
+    stdin: &str,
+    cwd: Option<&Path>,
+) -> std::process::Output {
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command
+        .env("IGNITION_CLI_CONFIG", config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_URL", url);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command
+        .args(args)
+        .write_stdin(stdin)
+        .output()
+        .expect("spawn ign")
+}
+
+/// Mount the matching version probe on the TAGS route (the
+/// precondition's pass) — repeatable: one probe per action.
+async fn mount_tags_probe(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "version"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"routeVersion": ignition_core::webdev::ROUTE_BUNDLE_VERSION, "minCli": "1.0"},
+            })),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// Mount ONE scripted action on the tagConfig route (the
+/// precondition probe included).
+async fn mount_tagconfig_action(server: &wiremock::MockServer, action: &str, data: Value) {
+    mount_tags_probe(server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": action}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"ok": true, "data": data})),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
 /// stdout minus the single trailing newline `println!` appends.
 fn stdout_for_golden(out: &std::process::Output) -> &str {
     let stdout = std::str::from_utf8(&out.stdout).expect("utf-8 stdout");
@@ -525,4 +588,619 @@ wrote [default]T1  quality: Good
         "bare strings ride as strings; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ---- 05-05 goldens: config CRUD, UDTs, export/import ----
+
+/// config get goldens: human = path+tagType header then PRETTY JSON
+/// (the stringified values RE-PARSED and visible); compact = the
+/// stable agent envelope.
+#[tokio::test]
+async fn tags_config_get_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(
+        &server,
+        "getConfig",
+        serde_json::json!({"config": {
+            "name": "T1",
+            "tagType": "AtomicTag",
+            "value": "{\"dataType\": \"Int4\", \"value\": 123}"
+        }}),
+    )
+    .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "get", "[default]T1"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+[default]T1  AtomicTag
+{
+  "name": "T1",
+  "tagType": "AtomicTag",
+  "value": {
+    "dataType": "Int4",
+    "value": 123
+  }
+}
+"#]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "get", "[default]T1", "--compact"],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[
+            r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","path":"[default]T1","tag_type":"AtomicTag","config":{"name":"T1","tagType":"AtomicTag","value":{"dataType":"Int4","value":123}}}}"#
+        ]],
+    );
+}
+
+/// config create/edit goldens: the definition rides `--file -`
+/// (stdin, resource-put precedent), the configure body pins the
+/// basePath split + collisionPolicy char, and the success lines name
+/// the verb + quality.
+#[tokio::test]
+async fn tags_config_create_edit_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "configure",
+            "basePath": "[default]P5",
+            "tags": [{"tagType": "AtomicTag", "value": 42, "name": "T1"}],
+            "collisionPolicy": "a"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "configure",
+            "basePath": "[default]P5",
+            "tags": [{"tagType": "AtomicTag", "value": 99, "name": "T1"}],
+            "collisionPolicy": "o"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &["tags", "config", "create", "[default]P5/T1", "--file", "-"],
+        r#"{"tagType": "AtomicTag", "value": 42}"#,
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+created [default]P5/T1  quality: Good
+"#]],
+    );
+
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &["tags", "config", "edit", "[default]P5/T1", "--file", "-"],
+        r#"{"tagType": "AtomicTag", "value": 99}"#,
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+edited [default]P5/T1  quality: Good
+"#]],
+    );
+}
+
+/// THE config-delete pins: the guard refuses WITHOUT --yes (exit 2,
+/// profile null, ZERO wire work — no mocks mounted) and the
+/// confirmed delete pins the batch deleteTags body.
+#[tokio::test]
+async fn tags_config_delete_guard_and_body() {
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server, "deleteTags", serde_json::json!({"deleted": 2})).await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    // THE zero-work pin: refusal fires PRE-resolution (the server's
+    // mocks only answer the confirmed run).
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "delete", "[default]T1", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2), "guard refuses without --yes");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["profile"], Value::Null);
+    assert_eq!(envelope["error"]["code"], "confirmation_required");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "config",
+            "delete",
+            "[default]T1",
+            "[default]T2",
+            "--yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+deleted 2 tag config(s)
+"#]],
+    );
+    // The deleteTags body carried BOTH paths.
+    let received = server.received_requests().await.expect("requests recorded");
+    let delete = received
+        .iter()
+        .rev()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("deleteTags"))
+        .expect("deleteTags request recorded");
+    let body: Value = serde_json::from_slice(&delete.body).expect("body parses");
+    assert_eq!(
+        body["paths"],
+        serde_json::json!(["[default]T1", "[default]T2"])
+    );
+}
+
+/// UDT goldens: types = provider header + name/tagType rows; def =
+/// the `_types_` path header + the recursive definition as pretty
+/// JSON (re-parse applied).
+#[tokio::test]
+async fn tags_udt_goldens() {
+    let server = wiremock::MockServer::start().await;
+    // TWO actions run (types + def) — the probe answers repeatedly.
+    mount_tagconfig_action(
+        &server,
+        "listUDTTypes",
+        serde_json::json!({"results": [
+            {"fullPath": "[default]_types_/Motor", "name": "Motor", "tagType": "UdtType", "hasChildren": true, "dataType": null},
+            {"fullPath": "[default]_types_/Pump", "name": "Pump", "tagType": "UdtType", "hasChildren": true, "dataType": null}
+        ]}),
+    )
+    .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(&config, &server.uri(), &["tags", "udt", "types"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+provider default
+Motor  UdtType
+Pump  UdtType
+"#]],
+    );
+
+    // def: its own server (one probe each keeps the mocks honest).
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(
+        &server,
+        "getUDTDefinition",
+        serde_json::json!({"definition": {
+            "name": "Motor",
+            "tagType": "UdtType",
+            "parameters": {"speed": {"defaultValue": "{\"dataType\": \"Float8\", \"value\": 0.0}"}}
+        }}),
+    )
+    .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "udt", "def", "Motor", "--provider", "default"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+[default]_types_/Motor
+{
+  "name": "Motor",
+  "parameters": {
+    "speed": {
+      "defaultValue": {
+        "dataType": "Float8",
+        "value": 0.0
+      }
+    }
+  },
+  "tagType": "UdtType"
+}
+"#]],
+    );
+}
+
+/// Export goldens: default mode writes the pretty JSON to
+/// `<last-segment>.json` in the cwd (artifact line); `-o -` prints
+/// the payload RAW in every mode (the fourth sanctioned stdout
+/// exception — no envelope even under --compact).
+#[tokio::test]
+async fn tags_export_goldens() {
+    let payload = serde_json::json!([
+        {"name": "P5", "tagType": "Folder", "tags": [
+            {"name": "T1", "tagType": "AtomicTag", "value": "{\"dataType\": \"Int4\", \"value\": 123}"}
+        ]}
+    ]);
+    let export_data = serde_json::json!({
+        "payload": serde_json::to_string(&payload).expect("serializes")
+    });
+
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server, "exportTags", export_data.clone()).await;
+    let server_stdout = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server_stdout, "exportTags", export_data).await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    // Default file: <last-segment>.json in the cwd (pinned tempdir).
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &["tags", "export", "[p5e2e]P5"],
+        "",
+        Some(cwd.path()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+exported 1 path(s) → P5.json (1 tag(s))
+"#]],
+    );
+    let written: Value = serde_json::from_str(
+        &std::fs::read_to_string(cwd.path().join("P5.json")).expect("default file written"),
+    )
+    .expect("pretty JSON parses");
+    assert_eq!(written, payload);
+
+    // `-o -` (stdout): RAW pretty payload in EVERY mode — even
+    // --compact prints no envelope.
+    let out = ign(
+        &config,
+        &server_stdout.uri(),
+        &["tags", "export", "[p5e2e]P5", "-o", "-", "--compact"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        // NOTE (the 03-02 snapbox gotcha): str! normalizes
+        // backslashes in ACTUAL output to forward slashes — the
+        // stringified value's escapes golden as /" not \".
+        snapbox::str![[r#"
+[
+  {
+    "name": "P5",
+    "tagType": "Folder",
+    "tags": [
+      {
+        "name": "T1",
+        "tagType": "AtomicTag",
+        "value": "{/"dataType/": /"Int4/", /"value/": 123}"
+      }
+    ]
+  }
+]
+"#]],
+    );
+}
+
+/// Import goldens — the LOCKED collision matrix at the binary level:
+/// abort-clean imports (browse pre-check + configure 'a'), a
+/// collision refuses exit 6 `tag_collision` with the overwrite hint,
+/// overwrite guards on --yes (exit 2 zero-work) then succeeds with
+/// configure 'o' and no pre-check.
+#[tokio::test]
+async fn tags_import_collision_matrix_goldens() {
+    let payload = serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}]);
+    let payload_text = serde_json::to_string(&payload).expect("serializes");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let file_dir = tempfile::tempdir().expect("tempdir");
+    let payload_file = file_dir.path().join("p5.json");
+    std::fs::write(&payload_file, &payload_text).expect("write payload");
+
+    // (1) abort + clean target: browse (empty) → configure 'a' → the
+    // counts+provider line.
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p5import]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": []}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "configure"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--file",
+            payload_file.to_str().unwrap(),
+            "--provider",
+            "p5import",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+imported 1 tag(s) into p5import (abort)
+"#]],
+    );
+
+    // (2) abort + collision: browse finds T1 → exit 6 tag_collision
+    // with the overwrite hint (the configure mock is absent — zero
+    // writes even reach the wire matcher).
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p5import]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": [
+                    {"fullPath": "[p5import]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--file",
+            payload_file.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "collision refuses exit 6");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "tag_collision");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("T1")
+    );
+
+    // (3) overwrite guards: without --yes → exit 2, profile null,
+    // zero wire work (the server has no mocks mounted).
+    let out = ign(
+        &config,
+        "http://ignored.example.com",
+        &[
+            "tags",
+            "import",
+            "--file",
+            payload_file.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--collision-policy",
+            "overwrite",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "overwrite guards on --yes");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "confirmation_required");
+    assert_eq!(envelope["profile"], Value::Null);
+
+    // (4) overwrite --yes: NO browse pre-check — configure 'o' is
+    // the only route call past the probe.
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "configure",
+            "basePath": "[p5import]",
+            "tags": payload,
+            "collisionPolicy": "o"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--file",
+            payload_file.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--collision-policy",
+            "overwrite",
+            "--yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+imported 1 tag(s) into p5import (overwrite)
+"#]],
+    );
+}
+
+/// The malformed-JSON usage refusals (InvalidInput class,
+/// pre-resolution): a bad definition file and a bad payload file
+/// both exit 2 with zero wire work.
+#[tokio::test]
+async fn tags_json_input_usage_refusals() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "not json {").expect("write bad file");
+
+    let out = ign_stdin(
+        &config,
+        "http://ignored.example.com",
+        &[
+            "tags",
+            "config",
+            "create",
+            "[default]T1",
+            "--file",
+            "-",
+            "--compact",
+        ],
+        "{not json",
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input");
+
+    let out = ign(
+        &config,
+        "http://ignored.example.com",
+        &[
+            "tags",
+            "import",
+            "--file",
+            bad.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input");
+    assert_eq!(envelope["profile"], Value::Null);
 }

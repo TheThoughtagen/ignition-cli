@@ -31,7 +31,10 @@ use ignition_core::actions::rig::{
     SnapshotResult, TrialResetResult, TrialStatusResult,
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
-use ignition_core::actions::tags::{TagProvidersResult, TagsBrowseResult, TagsReadResult};
+use ignition_core::actions::tags::{
+    TagProvidersResult, TagsBrowseResult, TagsConfigGetResult, TagsExportResult, TagsReadResult,
+    TagsUdtDefResult, TagsUdtTypesResult,
+};
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
@@ -85,6 +88,17 @@ pub fn render_ok(out: &ActionOutput, profile: Option<&str>, mode: RenderMode) {
     // The THIRD is its sibling: `rig logs` already streamed its raw
     // compose lines in EVERY mode (passthrough — same exception).
     if matches!(out, ActionOutput::LogsTail(_) | ActionOutput::RigLogs(_)) {
+        return;
+    }
+    // The FOURTH sanctioned stdout exception: a stdout-mode export
+    // (`tags export -o -`) prints its pretty payload raw in EVERY
+    // mode — the payload IS the product (piping `tags export -o -`
+    // into `tags import --file -` is the round-trip); no envelope,
+    // no profile header (README §Streaming).
+    if let ActionOutput::TagsExport(result) = out
+        && result.stdout
+    {
+        print!("{}", result.payload.as_deref().unwrap_or_default());
         return;
     }
     match mode {
@@ -212,6 +226,28 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::TagsRead(result) => render_tags_read_human(result),
         ActionOutput::TagsWrite(result) => {
             println!("wrote {}  quality: {}", result.path, result.quality);
+        }
+        ActionOutput::TagsConfigGet(result) => render_tags_config_get_human(result),
+        ActionOutput::TagsConfigCreate(result) | ActionOutput::TagsConfigEdit(result) => {
+            println!(
+                "{} {}  quality: {}",
+                result.operation, result.path, result.quality
+            );
+        }
+        ActionOutput::TagsConfigDelete(result) => {
+            println!("deleted {} tag config(s)", result.deleted);
+        }
+        ActionOutput::TagsUdtTypes(result) => render_tags_udt_types_human(result),
+        ActionOutput::TagsUdtDef(result) => render_tags_udt_def_human(result),
+        // Unreachable in practice (render_ok intercepts the
+        // stdout-mode export before mode dispatch — the payload
+        // already printed raw).
+        ActionOutput::TagsExport(result) => render_tags_export_human(result),
+        ActionOutput::TagsImport(result) => {
+            println!(
+                "imported {} tag(s) into {} ({})",
+                result.imported, result.provider, result.collision_policy
+            );
         }
     }
 }
@@ -923,6 +959,46 @@ fn render_tags_read_human(result: &TagsReadResult) {
             row.path, value, row.quality, row.timestamp
         );
     }
+}
+
+/// `ign tags config get` human mode: the path + tagType header then
+/// the config as PRETTY JSON (agents and humans both want the
+/// object — the stringified re-parse already applied upstream).
+fn render_tags_config_get_human(result: &TagsConfigGetResult) {
+    let tag_type = result.tag_type.as_deref().unwrap_or("-");
+    println!("{}  {}", result.path, tag_type);
+    let pretty = serde_json::to_string_pretty(&result.config).unwrap_or_default();
+    println!("{pretty}");
+}
+
+/// `ign tags udt types` human mode: the provider header then one
+/// name + tagType row per type.
+fn render_tags_udt_types_human(result: &TagsUdtTypesResult) {
+    println!("provider {}", result.provider);
+    for row in &result.types {
+        println!("{}  {}", row.name, row.tag_type);
+    }
+}
+
+/// `ign tags udt def` human mode: the `_types_` path header then
+/// the recursive definition as PRETTY JSON.
+fn render_tags_udt_def_human(result: &TagsUdtDefResult) {
+    println!("[{}]_types_/{}", result.provider, result.name);
+    let pretty = serde_json::to_string_pretty(&result.definition).unwrap_or_default();
+    println!("{pretty}");
+}
+
+/// `ign tags export` human mode: the artifact line (stdout-mode
+/// exports are intercepted in render_ok — the payload already
+/// printed).
+fn render_tags_export_human(result: &TagsExportResult) {
+    let file = result.file.as_deref().unwrap_or("stdout");
+    println!(
+        "exported {} path(s) → {} ({} tag(s))",
+        result.paths.len(),
+        file,
+        result.tag_count
+    );
 }
 
 /// `ign rig status` human table: identity header, one row per service

@@ -32,7 +32,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -148,6 +148,14 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign tags browse [PATH] [--filter SUBSTR] [--include-properties] [--project NAME]` | Browse tags as a tree — providers at the root, folders/tags nested | needs the deployed routes (see the version-negotiation matrix above — refuses exit 6 pre-deploy); **Property children are filtered out by default** (`--include-properties` keeps them — the display default); `--filter` is a case-insensitive substring on name and full path; human mode renders the indented tree with tagType badges, JSON is the flat `{path, name, tag_type, has_children, data_type}[]` (nesting derivable from `path`) |
 | `ign tags read <PATH>... [--project NAME]` | Read one or more tag values — `path  =  value  [quality]  timestamp` | needs the deployed routes; always batch on the wire (a single path is a one-element batch); rows pass through VERBATIM — quality strings carry their own detail (`Good`, `Bad_NotFound`, …) and are never parsed further: a missing tag is DATA (exit 0, quality `Bad_NotFound`), not an error |
 | `ign tags write <PATH> --value V [--project NAME]` | Write a value to a tag — returns the post-write quality | needs the deployed routes; **the write-scalar-is-JSON rule**: `--value` parses as a JSON scalar (`42`, `1.5`, `true`, `null`, `"quoted"`); text that does not parse is sent as the bare string (`--value hello` is the string `hello`); arrays/objects refuse exit 2 (`invalid_input`) before any network I/O — the tag value wire slot is a scalar; a nonexistent target writes back a `Bad…` quality (quality is data) |
+| `ign tags config get <PATH> [--project NAME]` | A tag's configuration as (pretty) JSON — the surgical edit loop's read half | needs the deployed routes; the gateway hands `value`/`defaultValue` back as STRINGIFIED JSON — the CLI re-parses them into real JSON objects/arrays so agents see structured data, not JSON-in-a-string (unparseable and scalar-parse strings stay strings); JSON data carries `{project, path, tag_type, config}`; a missing tag exits 6 (`not_found` — the route's own denial) |
+| `ign tags config create <PATH> --file FILE\|- [--project NAME]` | Create a tag from a JSON definition (`-` = stdin) | needs the deployed routes; the definition is the configure shape — see the **configure-shape traps table** below; the CLI splits the path into configure's basePath + per-tag name (a bare path rides under `[default]`; the path-derived name wins over any `name` in the definition) and does NOT otherwise reshape the dict; collision policy `'a'` (abort): creating over an existing node refuses server-side; `--file` JSON errors exit 2 (`invalid_input`) pre-resolution |
+| `ign tags config edit <PATH> --file FILE\|- [--project NAME]` | Edit a tag's configuration from a JSON definition (`-` = stdin) | the same configure call with collision policy `'o'` scoped to the single named node (edit = overwrite that node); NOT `--yes`-guarded — a single-node edit is not a project-wide destructive |
+| `ign tags config delete <PATH>... [--project NAME]` | Delete tag configurations | **destructive**: exit 2 (`confirmation_required`) without `--yes` — the guard fires before ANY resolution (zero network work); the delete is batch on the wire (`deleteTags {paths}`); JSON data `{project, deleted}` |
+| `ign tags udt types [--provider NAME] [--project NAME]` | List a provider's UDT types (`[provider]_types_` browse) | needs the deployed routes; JSON data `{project, provider, types: [{name, tag_type}]}` |
+| `ign tags udt def <NAME> [--provider NAME] [--project NAME]` | A UDT definition (parameters + nested children, recursive) | needs the deployed routes; the SAME stringified re-parse applies (parameter `defaultValue`s and child values become real JSON); JSON data `{project, provider, name, definition}` |
+| `ign tags export <PATH>... [-o FILE] [--project NAME]` | Export tag subtrees to a JSON file — the bulk-transfer half | needs the deployed routes; **JSON only** — the gateway's native interchange (`exportTags`), xml/csv deferred to backlog as documented format-discretion; the payload is parsed and validated (a list of subtrees) and written PRETTY; default file `<last-path-segment>.json` in the cwd, `-o FILE` overrides, **`-o -` prints the raw pretty payload in every mode** (the fourth sanctioned stdout exception — pipe it into `tags import --file -`); JSON data `{project, paths, file, stdout, tag_count}` |
+| `ign tags import --file FILE\|- --provider NAME [--collision-policy abort\|overwrite] [--project NAME]` | Import a JSON tag export into a target provider | needs the deployed routes; the provider must exist (`ign tags provider create NAME`); **the locked collision matrix**: abort (default) pre-checks by browsing the target and refuses exit 6 (`tag_collision`, hint names `--collision-policy overwrite`) BEFORE any write, then imports with server-side abort as the backstop; overwrite replaces existing tags — **destructive: exit 2 without `--yes`**, no pre-check (the server is the authority); merge is Designer-only (not a value); JSON data `{project, provider, collision_policy, imported}` |
 | `ign rig [--rig NAME] up [--timeout S]` | Bring a Docker compose rig up (`compose up -d --wait`) and wait for the gateway | docker-only (`profile: null` envelope); `--timeout` is BOTH compose's `--wait-timeout` and the commissioned-probe deadline (default 300 s); a fresh-volume rig reports `"up, uncommissioned"` as DATA (exit 0, wizard URL in `warnings`) |
 | `ign rig [--rig NAME] down` | Stop the rig (`compose down --remove-orphans`; volumes KEPT) | docker-only; the volume-deleting teardown belongs to `rig reset` |
 | `ign rig [--rig NAME] reset [--timeout S]` | Tear the rig down AND remove its volumes, then bring it back up fresh (`down -v --remove-orphans` → pre-flight → `up --wait` → commissioned wait) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`, BEFORE any discovery runs; `removed_volumes` in the data reports exactly what `-v` took; no stale project/trial state survives (a fresh volume usually boots uncommissioned — exit 0, wizard URL in `warnings`) |
@@ -511,13 +519,23 @@ lines, NOT gateway JSON — so it streams verbatim in EVERY mode
 transformation to attempt). `-f` follows until Ctrl-C (default process
 kill, no envelope), exactly the `logs -f` pipeline caveat.
 
+`ign tags export -o -` is the FOURTH exception: the export payload IS
+the product, so it prints raw pretty JSON in EVERY mode (no envelope
+even under `--json`/`--compact` — the rig-logs precedent). This is
+what makes the pipe round-trip work:
+`ign tags export [default]P5 -o - | ign tags import --file - --provider other`.
+File-mode exports (the default, `-o FILE`) keep the normal envelope.
+
 ### Destructive operations
 
 Commands that change gateway state (`sessions terminate`,
 `logs loggers set`/`reset`, `project delete`, `project import
 --collision-policy overwrite`, `resource put`, `resource delete`
 (both re-import the whole project — their refusal messages name the
-consequence), `restart` — the
+consequence), `tags provider delete`, `tags config delete`, and
+`tags import --collision-policy overwrite` (abort-policy imports need
+no `--yes` — the pre-check fails safely before any write),
+`restart` — the
 big one: it takes
 the whole gateway down for ~1 min — and `rig reset`, which deletes
 the rig's volumes, plus `rig trial reset`, which restarts the trial
@@ -591,6 +609,36 @@ wrong and has been re-pinned).
 completes and reports per-route degradation as data (the doctor
 precedent) — the refusal matrix above belongs to the tag commands
 that DEPEND on the routes, not to the sweep that inspects them.
+
+### The configure-shape traps (authoring tag definitions)
+
+`tags config create|edit` definitions ride `system.tag.configure`
+verbatim — the CLI never reshapes them. Four traps reproduced live
+during Phase 5 research (each one silently breaks or misleadingly
+errors on a real 8.3 gateway — author definitions against this
+table):
+
+| Trap | Wrong | Right |
+|------|-------|-------|
+| Discriminator key | `"type": "AtomicTag"` | `"tagType": "AtomicTag"` (`type` is silently ignored) |
+| Nesting | slash-names (`"name": "P5/T1"`) — rejected | children NEST under a `tags` array on Folder/UdtType entries |
+| Alarms | a name-keyed dict — silently ignored (returns Good, no alarm attached) | alarms are a **LIST** of dicts: `"alarms": [{"name": "HighLimit", "mode": "AboveValue", "setpointA": 100, "priority": "High"}]` |
+| Base path | a provider name as configure's first arg | a basePath (`[default]P5`) + per-tag `name`s — the CLI derives both from the PATH you pass, so this trap cannot bite via the CLI |
+
+A minimal memory tag definition: `{"tagType": "AtomicTag",
+"dataType": "Int4", "value": 123}`.
+
+### Bulk export/import (the portability loop)
+
+`tags export` → `tags import` moves a tag subtree between providers
+(or gateways) with values intact — the payload is the gateway's own
+JSON interchange, parsed and written pretty (JSON only; xml/csv were
+a roadmap sketch and stay deferred to backlog — the native format
+round-trips losslessly, which is the whole point). The collision
+conventions are IDENTICAL to project import's (locked in Phase 3):
+abort pre-checks and refuses before any write; overwrite is
+`--yes`-guarded with no pre-check. `export -o -` pipes into
+`import --file -`.
 
 ### scriptExec — the LOCKED security posture
 

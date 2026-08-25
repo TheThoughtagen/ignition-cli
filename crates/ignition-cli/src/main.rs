@@ -32,7 +32,8 @@ use ignition_core::error::CoreError;
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
     ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
-    TagsArgs, TagsCommand, TagsProviderCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    TagsArgs, TagsCommand, TagsConfigCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs,
+    WaitCmd, WebdevArgs, WebdevCommand,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -160,6 +161,23 @@ enum ActionOutput {
     TagsRead(actions::tags::TagsReadResult),
     /// `ign tags write` — the post-write quality.
     TagsWrite(actions::tags::TagsWriteResult),
+    /// `ign tags config get` — the re-parsed config dict.
+    TagsConfigGet(actions::tags::TagsConfigGetResult),
+    /// `ign tags config create|edit` — the configure quality.
+    TagsConfigCreate(actions::tags::TagsConfigWriteResult),
+    /// `ign tags config edit` — the configure quality.
+    TagsConfigEdit(actions::tags::TagsConfigWriteResult),
+    /// `ign tags config delete` — the echoed count.
+    TagsConfigDelete(actions::tags::TagsConfigDeleteResult),
+    /// `ign tags udt types` — the provider's type rows.
+    TagsUdtTypes(actions::tags::TagsUdtTypesResult),
+    /// `ign tags udt def` — the recursive definition.
+    TagsUdtDef(actions::tags::TagsUdtDefResult),
+    /// `ign tags export` — the artifact line's data (stdout mode is
+    /// intercepted in render_ok — the payload already printed).
+    TagsExport(actions::tags::TagsExportResult),
+    /// `ign tags import` — counts + provider.
+    TagsImport(actions::tags::TagsImportResult),
 }
 
 impl ActionOutput {
@@ -227,6 +245,17 @@ impl ActionOutput {
             ActionOutput::TagsBrowse(result) => render_success(profile, result, compact),
             ActionOutput::TagsRead(result) => render_success(profile, result, compact),
             ActionOutput::TagsWrite(result) => render_success(profile, result, compact),
+            ActionOutput::TagsConfigGet(result) => render_success(profile, result, compact),
+            ActionOutput::TagsConfigCreate(result) => render_success(profile, result, compact),
+            ActionOutput::TagsConfigEdit(result) => render_success(profile, result, compact),
+            ActionOutput::TagsConfigDelete(result) => render_success(profile, result, compact),
+            ActionOutput::TagsUdtTypes(result) => render_success(profile, result, compact),
+            ActionOutput::TagsUdtDef(result) => render_success(profile, result, compact),
+            // Unreachable in practice (render_ok intercepts the
+            // stdout-mode export before mode dispatch — the payload
+            // already printed raw).
+            ActionOutput::TagsExport(result) => render_success(profile, result, compact),
+            ActionOutput::TagsImport(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -1034,16 +1063,29 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // precedent) — a refusal is exit 2 with profile null and does
         // ZERO discovery work (binary-pinned: exit 2 in a cwd with no
         // rig discoverable at all).
-        // Tags (05-04, TAGS-01..04): provider verbs ride the NATIVE
-        // config-resource REST; browse/read/write ride the deployed
-        // routes (every one refuses exit 6 pre-deploy via the
-        // precondition). `tags provider delete` is the 6th
-        // destructive verb — guarded BEFORE resolution (exit 2,
-        // profile null, zero work); write's --value parses
-        // PRE-resolution (non-scalar JSON → invalid_input exit 2).
+        // Tags (05-04/05-05): provider verbs ride the NATIVE
+        // config-resource REST; browse/read/write/config/udt/export/
+        // import ride the deployed routes (every one refuses exit 6
+        // pre-deploy via the precondition). The destructive verbs —
+        // provider delete, config delete, and import-under-overwrite
+        // — guard BEFORE resolution (exit 2, profile null, zero
+        // work); write's --value parses PRE-resolution; the config
+        // create/edit + import byte sources (definition/payload JSON)
+        // read PRE-resolution (the resource-put precedent).
         Commands::Tags(TagsArgs { command }) => {
-            if let TagsCommand::Provider(TagsProviderCommand::Delete { .. }) = &command
-                && let Err(err) = require_confirmation(cli.yes, "tags provider delete")
+            let guard_operation = match &command {
+                TagsCommand::Provider(TagsProviderCommand::Delete { .. }) => {
+                    Some("tags provider delete")
+                }
+                TagsCommand::Config(TagsConfigCommand::Delete { .. }) => Some("tags config delete"),
+                TagsCommand::Import {
+                    collision_policy: crate::cli::CollisionPolicy::Overwrite,
+                    ..
+                } => Some("tags import --collision-policy overwrite"),
+                _ => None,
+            };
+            if let Some(operation) = guard_operation
+                && let Err(err) = require_confirmation(cli.yes, operation)
             {
                 return (None, Err(err));
             }
@@ -1052,6 +1094,33 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(parsed) => Some(parsed),
                     Err(err) => return (None, Err(err)),
                 },
+                _ => None,
+            };
+            // The JSON document inputs: config create/edit's
+            // definition and import's payload (`--file PATH` /
+            // `--file -`, parsed — InvalidInput pre-resolution).
+            let json_input = match &command {
+                TagsCommand::Config(TagsConfigCommand::Create { file, .. })
+                | TagsCommand::Config(TagsConfigCommand::Edit { file, .. })
+                | TagsCommand::Import { file, .. } => match read_json_input(file).await {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => return (None, Err(err)),
+                },
+                _ => None,
+            };
+            // Export's output resolution: `-o -` = stdout (the
+            // payload rides the result; render prints it raw — the
+            // sanctioned stdout exception), `-o FILE` = that file,
+            // none = the default `<last-segment>.json` (the
+            // export-streaming convention).
+            let export_out = match &command {
+                TagsCommand::Export { paths, output, .. } => Some(match output {
+                    Some(path) if path == std::path::Path::new("-") => None,
+                    Some(path) => Some(path.clone()),
+                    None => Some(std::path::PathBuf::from(
+                        actions::tags::default_export_file_name(paths),
+                    )),
+                }),
                 _ => None,
             };
             let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
@@ -1100,6 +1169,81 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         .await
                         .map(ActionOutput::TagsWrite)
                 }
+                (TagsCommand::Config(TagsConfigCommand::Get { path, project }), Ok(api)) => {
+                    actions::tags::tags_config_get(&api, project, path)
+                        .await
+                        .map(ActionOutput::TagsConfigGet)
+                }
+                (TagsCommand::Config(TagsConfigCommand::Create { path, project, .. }), Ok(api)) => {
+                    actions::tags::tags_config_create(
+                        &api,
+                        project,
+                        path,
+                        json_input.as_ref().expect("parsed pre-resolution"),
+                    )
+                    .await
+                    .map(ActionOutput::TagsConfigCreate)
+                }
+                (TagsCommand::Config(TagsConfigCommand::Edit { path, project, .. }), Ok(api)) => {
+                    actions::tags::tags_config_edit(
+                        &api,
+                        project,
+                        path,
+                        json_input.as_ref().expect("parsed pre-resolution"),
+                    )
+                    .await
+                    .map(ActionOutput::TagsConfigEdit)
+                }
+                (TagsCommand::Config(TagsConfigCommand::Delete { paths, project }), Ok(api)) => {
+                    actions::tags::tags_config_delete(&api, project, paths)
+                        .await
+                        .map(ActionOutput::TagsConfigDelete)
+                }
+                (TagsCommand::Udt(TagsUdtCommand::Types { provider, project }), Ok(api)) => {
+                    actions::tags::tags_udt_types(&api, project, provider)
+                        .await
+                        .map(ActionOutput::TagsUdtTypes)
+                }
+                (
+                    TagsCommand::Udt(TagsUdtCommand::Def {
+                        name: udt_name,
+                        provider,
+                        project,
+                    }),
+                    Ok(api),
+                ) => actions::tags::tags_udt_def(&api, project, provider, udt_name)
+                    .await
+                    .map(ActionOutput::TagsUdtDef),
+                (TagsCommand::Export { paths, project, .. }, Ok(api)) => {
+                    actions::tags::tags_export(
+                        &api,
+                        project,
+                        paths,
+                        export_out
+                            .as_ref()
+                            .expect("resolved pre-resolution")
+                            .as_deref(),
+                    )
+                    .await
+                    .map(ActionOutput::TagsExport)
+                }
+                (
+                    TagsCommand::Import {
+                        provider,
+                        project,
+                        collision_policy,
+                        ..
+                    },
+                    Ok(api),
+                ) => actions::tags::tags_import(
+                    &api,
+                    project,
+                    provider,
+                    json_input.expect("parsed pre-resolution"),
+                    (*collision_policy).into(),
+                )
+                .await
+                .map(ActionOutput::TagsImport),
                 (_, Err(err)) => Err(err),
             };
             (name, result)
@@ -1632,6 +1776,38 @@ fn parse_write_scalar(raw: &str) -> Result<serde_json::Value, CoreError> {
         }),
         Err(_) => Ok(serde_json::Value::String(raw.to_string())),
     }
+}
+
+/// Read a JSON document from `--file PATH` (std::fs) or `--file -`
+/// (tokio stdin) and PARSE it — the resource-put byte-source
+/// precedent (InvalidInput class, pre-resolution: exit 2 with zero
+/// network work on an unreadable file or malformed JSON). Used by
+/// `tags config create|edit` (the definition) and `tags import`
+/// (the payload).
+async fn read_json_input(file: &std::path::Path) -> Result<serde_json::Value, CoreError> {
+    let label = if file == std::path::Path::new("-") {
+        "stdin".to_string()
+    } else {
+        file.display().to_string()
+    };
+    let bytes = if file == std::path::Path::new("-") {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        tokio::io::stdin()
+            .read_to_end(&mut buffer)
+            .await
+            .map_err(|err| CoreError::InvalidInput {
+                reason: format!("cannot read stdin: {err}"),
+            })?;
+        buffer
+    } else {
+        std::fs::read(file).map_err(|err| CoreError::InvalidInput {
+            reason: format!("cannot read {label}: {err}"),
+        })?
+    };
+    serde_json::from_slice(&bytes).map_err(|err| CoreError::InvalidInput {
+        reason: format!("{label} is not valid JSON: {err}"),
+    })
 }
 
 /// stderr-only tracing init. Filter levels: 0=warn (default), 1=info, 2=debug,
