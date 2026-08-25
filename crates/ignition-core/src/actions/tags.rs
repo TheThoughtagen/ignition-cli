@@ -595,6 +595,207 @@ pub async fn tags_alarms_ack(
 // route owns that trap), `configure` (basePath + per-tag names,
 // collisionPolicy 'a'/'o'), `deleteTags` (batch paths).
 
+// ---- tag history query (05-06, TAGS-08) ----
+//
+// The tagHistory route's `query` action rides the same seam. The
+// route wraps `Date(long(ms))` route-side (Pitfall 12), so the
+// CLIENT SENDS EPOCH MS — the CLI's --start/--end accept RFC3339 OR
+// epoch-ms and parse to ms pre-resolution
+// ([`parse_time_ms`]). Structurally safe on ANY rig (zero
+// historians → a well-formed dataset with null values); data
+// requires a provisioned historian (the e2e fixture provisions an
+// InternalHistorian via native REST — no database needed).
+
+/// The tagHistory route folder name (the deployed bundle's history
+/// query route).
+const TAG_HISTORY_ROUTE: &str = "tagHistory";
+
+/// `ign tags history query` result — the dataset VERBATIM: the
+/// `t_stamp` column preserved EXACTLY (never renamed — the
+/// prior-art defect the route corrects), tag columns
+/// provider-relative, every cell raw JSON.
+#[derive(Debug, Serialize)]
+pub struct TagsHistoryQueryResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The tag paths queried, request order.
+    pub paths: Vec<String>,
+    /// Column names verbatim (`t_stamp` first, then per-tag paths).
+    pub columns: Vec<String>,
+    /// Row cells verbatim (aligned to `columns`).
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// Row count.
+    pub row_count: usize,
+}
+
+/// `ign tags history query PATH...` — route action `query` →
+/// `{columns, rows}` verbatim. `return_size` and `aggregation` ride
+/// the body ONLY when present (the route defaults returnSize itself
+/// and reads `aggregationMode` — an absent aggregation falls back to
+/// route-side LastValue).
+pub async fn tags_history_query(
+    api: &dyn GatewayApi,
+    project: &str,
+    paths: &[String],
+    start_ms: i64,
+    end_ms: i64,
+    return_size: Option<i64>,
+    aggregation: Option<&str>,
+) -> Result<TagsHistoryQueryResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let mut body = serde_json::json!({
+        "action": "query",
+        "paths": paths,
+        "startDateMs": start_ms,
+        "endDateMs": end_ms,
+    });
+    if let Some(size) = return_size {
+        body["returnSize"] = serde_json::json!(size);
+    }
+    if let Some(mode) = aggregation {
+        body["aggregationMode"] = serde_json::Value::String(mode.to_string());
+    }
+    let data = api
+        .webdev_route_call(project, TAG_HISTORY_ROUTE, &body, &[])
+        .await?;
+    let columns: Vec<String> = data
+        .get("columns")
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "tagHistory route query returned an unexpected shape (missing `columns`)".to_string(),
+            )
+        })?;
+    let rows: Vec<Vec<serde_json::Value>> = data
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_array().cloned())
+                .collect()
+        })
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "tagHistory route query returned an unexpected shape (missing `rows`)".to_string(),
+            )
+        })?;
+    let row_count = rows.len();
+    Ok(TagsHistoryQueryResult {
+        project: project.to_string(),
+        paths: paths.to_vec(),
+        columns,
+        rows,
+        row_count,
+    })
+}
+
+/// Parse a CLI time argument into EPOCH MILLISECONDS — either raw
+/// epoch-ms (all digits) or an RFC3339 timestamp
+/// (`2026-08-25T12:00:00Z`, `2026-08-25T12:00:00.123+02:00`; a
+/// space separator and lowercase `t`/`z` tolerated). Zero-dep on
+/// purpose: `days_from_civil` is the hand-rolled inverse of the
+/// CLI's `iso_utc` (the Howard Hinnant pair). Pure — unit-pinned.
+pub fn parse_time_ms(input: &str) -> Result<i64, CoreError> {
+    let input = input.trim();
+    if !input.is_empty() && input.bytes().all(|b| b.is_ascii_digit()) {
+        return input.parse::<i64>().map_err(|err| CoreError::InvalidInput {
+            reason: format!("epoch-ms time {input:?} does not parse as an integer: {err}"),
+        });
+    }
+    parse_rfc3339_ms(input).ok_or_else(|| CoreError::InvalidInput {
+        reason: format!(
+            "time {input:?} is neither epoch milliseconds (digits) nor an RFC3339 \
+             timestamp (e.g. 2026-08-25T12:00:00Z or 2026-08-25T14:00:00+02:00)"
+        ),
+    })
+}
+
+/// RFC3339 → epoch ms. Hand-rolled: date (Y-M-D) → days-from-civil,
+/// time-of-day + fractional ms, timezone `Z`/`±HH:MM` offset. None
+/// on any shape violation (the caller renders the usage refusal).
+fn parse_rfc3339_ms(input: &str) -> Option<i64> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = input.get(0..4)?.parse().ok()?;
+    let month: u32 = input.get(5..7)?.parse().ok()?;
+    let day: u32 = input.get(8..10)?.parse().ok()?;
+    let hour: i64 = input.get(11..13)?.parse().ok()?;
+    let minute: i64 = input.get(14..16)?.parse().ok()?;
+    let second: i64 = input.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut rest = &input[19..];
+    // Fractional seconds: up to 3 digits become milliseconds
+    // (`.1` = 100 ms, `.1234` truncates to 123 ms).
+    let mut millis: i64 = 0;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let taken = digits.min(3);
+        let value: i64 = frac[..taken].parse().ok()?;
+        millis = value * 10_i64.pow(3 - taken as u32);
+        rest = &rest[1 + digits..];
+    }
+    let offset_s: i64 = match rest {
+        "Z" | "z" => 0,
+        _ if rest.len() == 6 && matches!(rest.as_bytes()[0], b'+' | b'-') => {
+            if rest.as_bytes()[3] != b':' {
+                return None;
+            }
+            let sign: i64 = if rest.starts_with('-') { -1 } else { 1 };
+            let offset_hour: i64 = rest.get(1..3)?.parse().ok()?;
+            let offset_minute: i64 = rest.get(4..6)?.parse().ok()?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            sign * (offset_hour * 3600 + offset_minute * 60)
+        }
+        _ => return None,
+    };
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(secs * 1000 + millis - offset_s * 1000)
+}
+
+/// (year, month, day) → days since 1970-01-01 — Howard Hinnant's
+/// `days_from_civil`, the inverse of the CLI's `civil_from_days`.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400; // [0, 399]
+    let month_prime: i64 = if month > 2 {
+        month as i64 - 3
+    } else {
+        month as i64 + 9
+    }; // [0, 11]
+    let day_of_year = (153 * month_prime + 2) / 5 + day as i64 - 1; // [0, 365]
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year; // [0, 146096]
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// The tagConfig route folder name (05-01's config-CRUD/UDT/export
 /// route — everything in this plan's second half dispatches here).
 const TAG_CONFIG_ROUTE: &str = "tagConfig";
@@ -2513,5 +2714,154 @@ mod tests {
         assert_eq!(err.code(), "routes_not_deployed");
         assert_eq!(err.exit_code(), 6);
         assert!(rig.calls.lock().unwrap().is_empty());
+    }
+
+    // ---- tag history query (05-06, TAGS-08) ----
+
+    use super::{TagsHistoryQueryResult, parse_time_ms, tags_history_query};
+
+    /// THE query body pin + t_stamp preservation: `{action, paths,
+    /// startDateMs, endDateMs}` exactly when no optionals — the
+    /// dataset comes back VERBATIM with `t_stamp` in place (never
+    /// renamed) and null cells passing through on a historian-less
+    /// rig (the structural default).
+    #[tokio::test]
+    async fn history_query_pins_body_and_preserves_t_stamp() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({
+                "columns": ["t_stamp", "[default]T1"],
+                "rows": [["Mon Aug 24 00:00:00 UTC 2026", null]],
+                "rowCount": 1
+            }),
+        );
+        let result: TagsHistoryQueryResult = tags_history_query(
+            &rig,
+            "ign-cli",
+            &["[default]T1".to_string()],
+            1_000,
+            2_000,
+            None,
+            None,
+        )
+        .await
+        .expect("query parses");
+        assert_eq!(result.columns, vec!["t_stamp".to_string(), "[default]T1".to_string()]);
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][0], "Mon Aug 24 00:00:00 UTC 2026");
+        assert_eq!(result.rows[0][1], serde_json::Value::Null, "null cells verbatim");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({
+                "action": "query",
+                "paths": ["[default]T1"],
+                "startDateMs": 1000,
+                "endDateMs": 2000
+            }),
+            "no optionals, no optional keys"
+        );
+    }
+
+    /// Optionals ride ONLY when present: `returnSize` +
+    /// `aggregationMode` (the route's own kwarg names).
+    #[tokio::test]
+    async fn history_query_optionals_ride_only_when_present() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"columns": [], "rows": [], "rowCount": 0}),
+        );
+        tags_history_query(
+            &rig,
+            "ign-cli",
+            &["[default]T1".to_string()],
+            0,
+            1,
+            Some(100),
+            Some("average"),
+        )
+        .await
+        .expect("query with optionals parses");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls[0]["returnSize"], 100);
+        assert_eq!(calls[0]["aggregationMode"], "average");
+    }
+
+    /// A missing `columns`/`rows` key is an internal-class honesty
+    /// error (never silently defaulted).
+    #[tokio::test]
+    async fn history_query_refuses_shape_violations() {
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({"rowCount": 0}));
+        let err = tags_history_query(
+            &rig,
+            "ign-cli",
+            &["[default]T1".to_string()],
+            0,
+            1,
+            None,
+            None,
+        )
+        .await
+        .expect_err("shape violation refuses");
+        assert_eq!(err.code(), "internal");
+    }
+
+    /// THE time-arg parser: epoch-ms passthrough, RFC3339 with Z /
+    /// offsets / fractional seconds, leap-day math — each pinned
+    /// against independently computed epoch values.
+    #[test]
+    fn parse_time_ms_accepts_epoch_and_rfc3339() {
+        assert_eq!(parse_time_ms("1787659200000").expect("epoch ms"), 1_787_659_200_000);
+        assert_eq!(
+            parse_time_ms("1970-01-01T00:00:00Z").expect("epoch"),
+            0,
+            "the origin"
+        );
+        assert_eq!(
+            parse_time_ms("2026-08-25T12:00:00Z").expect("z"),
+            1_787_659_200_000
+        );
+        assert_eq!(
+            parse_time_ms("2026-08-25T14:00:00+02:00").expect("east offset"),
+            1_787_659_200_000,
+            "+02:00 lands on the same instant"
+        );
+        assert_eq!(
+            parse_time_ms("2026-08-25T10:00:00-04:00").expect("west offset"),
+            1_787_666_400_000
+        );
+        assert_eq!(
+            parse_time_ms("2026-08-25T12:00:00.123Z").expect("millis"),
+            1_787_659_200_123
+        );
+        assert_eq!(
+            parse_time_ms("2026-01-01T00:00:00.5Z").expect("sub-second padding"),
+            1_767_225_600_500,
+            ".5 → 500 ms"
+        );
+        assert_eq!(
+            parse_time_ms("2024-02-29T12:00:00Z").expect("leap day"),
+            1_709_208_000_000
+        );
+        // Tolerated forms: space separator, lowercase.
+        assert_eq!(
+            parse_time_ms("2026-08-25 12:00:00Z").expect("space separator"),
+            1_787_659_200_000
+        );
+        assert_eq!(
+            parse_time_ms("2026-08-25t12:00:00z").expect("lowercase"),
+            1_787_659_200_000
+        );
+    }
+
+    /// Unparseable times refuse invalid_input with the usage-class
+    /// shape (what the caller must fix).
+    #[test]
+    fn parse_time_ms_refuses_garbage() {
+        for bad in ["", "yesterday", "2026-08-25", "2026-8-25T12:00:00Z", "2026-13-01T00:00:00Z", "2026-08-25T25:00:00Z", "2026-08-25T12:00:00Zulu"] {
+            let err = parse_time_ms(bad).expect_err("garbage refuses");
+            assert_eq!(err.code(), "invalid_input", "{bad}: {err}");
+            assert_eq!(err.exit_code(), 2);
+        }
     }
 }

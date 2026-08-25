@@ -945,3 +945,59 @@ async fn alarms_ack_pins_three_arg_body_and_remainder() {
     assert_eq!(result.unacknowledged, vec!["e-2".to_string()]);
     assert_eq!(guard.received_requests().await.len(), 1);
 }
+
+// ---- Task 2 (05-06, TAGS-08): the tagHistory route ----
+
+use ignition_core::actions::tags::tags_history_query;
+
+/// THE history-query pin through the real client: the epoch-ms body
+/// shape + the dataset VERBATIM with `t_stamp` preserved EXACTLY
+/// (never renamed) and null cells passing through (the
+/// historian-less structural default).
+#[tokio::test]
+async fn history_query_pins_epoch_ms_body_and_t_stamp_passthrough() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tagHistory"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "query",
+            "paths": ["[default]T1"],
+            "startDateMs": 1000,
+            "endDateMs": 2000
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {
+                    "columns": ["t_stamp", "[default]T1"],
+                    "rows": [["Mon Aug 24 00:00:00 UTC 2026", null]],
+                    "rowCount": 1
+                }
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_history_query(
+        &api,
+        "ign-cli",
+        &["[default]T1".to_string()],
+        1_000,
+        2_000,
+        None,
+        None,
+    )
+    .await
+    .expect("history query through the real client");
+    assert_eq!(
+        result.columns,
+        vec!["t_stamp".to_string(), "[default]T1".to_string()],
+        "t_stamp preserved EXACTLY — never renamed"
+    );
+    assert_eq!(result.rows[0][1], serde_json::Value::Null);
+    assert_eq!(result.row_count, 1);
+    assert_eq!(guard.received_requests().await.len(), 1);
+}

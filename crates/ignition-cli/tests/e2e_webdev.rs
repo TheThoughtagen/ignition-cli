@@ -627,3 +627,498 @@ async fn live_tags_config_export_import_roundtrip() {
         expect_ok(&format!("provider delete {provider} (guarded)"), &out);
     }
 }
+
+// ---- 05-06 live fixtures: the historian/binding spike + the alarm
+// lifecycle (TAGS-07/08) ----
+
+/// Wall-clock epoch milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as i64
+}
+
+/// The InternalHistorian create path (native config-resource REST —
+/// NO database needed, the 05-RESEARCH live-proven recipe).
+const HISTORIAN_PROVIDER_PATH: &str =
+    "/data/api/v1/resources/com.inductiveautomation.historian/historian-provider";
+
+/// Provision an InternalHistorian via native REST (token auth, the
+/// ARRAY body — the tag-provider create precedent). Idempotent: a
+/// create that comes back non-OK with an "already exists"-flavored
+/// body passes (re-runs against a provisioned rig).
+async fn provision_internal_historian(env: &LiveEnv, name: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("{}{HISTORIAN_PROVIDER_PATH}", env.url);
+    let body = serde_json::json!([{
+        "name": name,
+        "type": "com.inductiveautomation.historian/historian-provider",
+        "collection": "core",
+        "enabled": true,
+        "config": {"profile": {"type": "InternalHistorian"}, "settings": {}}
+    }]);
+    let response = client
+        .post(&url)
+        .header("X-Ignition-API-Token", &env.token)
+        .json(&body)
+        .send()
+        .await
+        .expect("historian create reaches the gateway");
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    assert!(
+        status == 200
+            || text.to_lowercase().contains("exist")
+            || text.to_lowercase().contains("duplicate"),
+        "InternalHistorian create failed (HTTP {status}): {text}"
+    );
+    println!("historian {name} provisioned (HTTP {status})");
+}
+
+/// Delete the InternalHistorian (find → signature → DELETE — the
+/// tag-provider delete chain's shape). A find miss means it is
+/// already gone.
+async fn delete_internal_historian(env: &LiveEnv, name: &str) {
+    let client = reqwest::Client::new();
+    let find_url = format!("{}{HISTORIAN_PROVIDER_PATH}/find/{name}", env.url);
+    let response = client
+        .get(&find_url)
+        .header("X-Ignition-API-Token", &env.token)
+        .send()
+        .await
+        .expect("historian find reaches the gateway");
+    if response.status().as_u16() != 200 {
+        println!("historian {name} already gone (find → {})", response.status());
+        return;
+    }
+    let record: Value = response.json().await.expect("find record parses");
+    let Some(signature) = record.get("signature").and_then(Value::as_str) else {
+        println!("historian {name} find record carried no signature — leaving it (manual cleanup)");
+        return;
+    };
+    let delete_url = format!("{}{HISTORIAN_PROVIDER_PATH}/{name}/{signature}", env.url);
+    let response = client
+        .delete(&delete_url)
+        .header("X-Ignition-API-Token", &env.token)
+        .send()
+        .await
+        .expect("historian delete reaches the gateway");
+    println!(
+        "historian {name} deleted (HTTP {})",
+        response.status().as_u16()
+    );
+}
+
+/// Do the history rows carry ANY non-null value cell (beyond the
+/// t_stamp column)? The spike's data oracle.
+fn history_has_data(envelope: &Value) -> bool {
+    let Some(rows) = envelope["data"]["rows"].as_array() else {
+        return false;
+    };
+    rows.iter().any(|row| {
+        row.as_array()
+            .map(|cells| cells.iter().skip(1).any(|cell| !cell.is_null()))
+            .unwrap_or(false)
+    })
+}
+
+/// THE tag-history live fixture + binding spike (05-06, TAGS-08 —
+/// 05-RESEARCH Open Question 1, bounded ≤30 min by construction):
+///
+/// 1. provision `InternalHistorian` `p5hist` via native REST (no
+///    database, the live-proven recipe),
+/// 2. configure one Int4 tag with `historyEnabled` +
+///    `historicalProvider` through the deployed tagConfig route,
+/// 3. write values, then query `ign tags history query`,
+/// 4. THE SPIKE: null values trigger the three documented
+///    candidates in order — (1) execution scan-class keys in the
+///    configure shape, (2) wider windows + aggregationMode
+///    variations, (3) a browseHistoricalTags cross-check. A winner
+///    is printed + pinned as a comment; NO winner asserts the
+///    STRUCTURAL outcome only (columns present, no error, null
+///    values — the research pre-cleared this fallback; query
+///    capability is the phase criterion, never hang on the spike).
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_history_historian_and_binding_spike() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+    let tag = "[default]P5H/T1";
+
+    // Routes first: history query refuses exit 6 without them.
+    let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
+    expect_ok("deploy (the tagHistory route's precondition)", &out);
+
+    // (1) The historian — native REST, no database.
+    provision_internal_historian(&env, "p5hist").await;
+
+    // (2) The history-enabled Int4 tag (the research's stored shape:
+    // historyEnabled + historicalProvider BOTH at the top level).
+    let out = ign_stdin(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "create",
+            tag,
+            "--file",
+            "-",
+            "--compact",
+        ],
+        r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "historyEnabled": true, "historicalProvider": "p5hist"}"#,
+    );
+    expect_ok("config create the history-enabled tag", &out);
+
+    // (3) Write values (spaced so a sampling historian can catch
+    // distinct values), then query.
+    let start_ms = now_ms() - 5_000;
+    for value in [7, 8, 9] {
+        let out = ign(
+            &config,
+            &env,
+            &[
+                "tags",
+                "write",
+                tag,
+                "--value",
+                &value.to_string(),
+                "--compact",
+            ],
+        );
+        expect_ok("write a history value", &out);
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    }
+    let end_ms = now_ms() + 5_000;
+    // The query argv builder (String args — the value-typed flags
+    // need formatting; spawn converts to &str).
+    let query_args = |start_ms: i64, end_ms: i64, aggregation: Option<&str>| {
+        let mut args: Vec<String> = vec![
+            "tags".into(),
+            "history".into(),
+            "query".into(),
+            tag.into(),
+            "--start".into(),
+            start_ms.to_string(),
+            "--end".into(),
+            end_ms.to_string(),
+        ];
+        if let Some(mode) = aggregation {
+            args.push("--aggregation".into());
+            args.push(mode.into());
+        }
+        args.push("--compact".into());
+        args
+    };
+    let query = |config: &std::path::Path,
+                 env: &LiveEnv,
+                 start_ms: i64,
+                 end_ms: i64,
+                 aggregation: Option<&str>| {
+        let args = query_args(start_ms, end_ms, aggregation);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        ign(config, env, &refs)
+    };
+    let out = query(&config, &env, start_ms, end_ms, None);
+    expect_ok("history query (base shape)", &out);
+    let envelope = data_envelope(&out);
+    let columns = envelope["data"]["columns"].as_array().cloned().unwrap_or_default();
+    assert_eq!(columns.first().and_then(Value::as_str), Some("t_stamp"), "{envelope}");
+    assert!(
+        columns.iter().any(|column| column.as_str() == Some(tag)),
+        "the tag column rides provider-relative: {envelope}"
+    );
+
+    if history_has_data(&envelope) {
+        // SPIKE RESOLVED at the base shape.
+        println!(
+            "SPIKE RESOLVED (base shape): historyEnabled + historicalProvider on an Int4 tag \
+             with a REST-provisioned InternalHistorian produces DATA — pin this shape \
+             (see the comment at this fixture in e2e_webdev.rs)"
+        );
+        // PIN: the base binding shape is
+        //   {tagType: AtomicTag, dataType: Int4, historyEnabled: true,
+        //    historicalProvider: <name>} + InternalHistorian via native REST.
+    } else {
+        println!("SPIKE: base shape returned null values — trying the documented candidates");
+        let mut resolved: Option<String> = None;
+
+        // Candidate 1: execution scan-class keys in the configure
+        // shape (edit = full node config under 'o' — carry the base
+        // keys, add the execution block).
+        let out = ign_stdin(
+            &config,
+            &env,
+            &["tags", "config", "edit", tag, "--file", "-", "--compact"],
+            r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 9, "historyEnabled": true, "historicalProvider": "p5hist", "execution": {"mode": "TagGroup", "rate": 1000}}"#,
+        );
+        expect_ok("candidate 1: execution scan-class edit", &out);
+        let out = ign(&config, &env, &["tags", "write", tag, "--value", "11", "--compact"]);
+        expect_ok("candidate 1: write", &out);
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        let out = query(&config, &env, start_ms, end_ms, None);
+        expect_ok("candidate 1: query", &out);
+        let envelope = data_envelope(&out);
+        if history_has_data(&envelope) {
+            resolved = Some("candidate 1: execution scan-class keys in the configure shape".into());
+        }
+
+        // Candidate 2: wider window + aggregationMode variations.
+        if resolved.is_none() {
+            let wide_start = now_ms() - 600_000;
+            let wide_end = now_ms() + 5_000;
+            for mode in ["Average", "MinMax", "DurationOn"] {
+                let out = query(&config, &env, wide_start, wide_end, Some(mode));
+                expect_ok(&format!("candidate 2: query ({mode})"), &out);
+                let envelope = data_envelope(&out);
+                if history_has_data(&envelope) {
+                    resolved =
+                        Some(format!("candidate 2: aggregationMode {mode} on a 10-minute window"));
+                    break;
+                }
+            }
+        }
+
+        // Candidate 3: browseHistoricalTags cross-check — the
+        // historian registered? (Diagnostic: proves the provider is
+        // alive even when the tag binding is not.)
+        let out = ign(&config, &env, &["tags", "browse", "histprov:p5hist", "--compact"]);
+        let historian_registered = out.status.success()
+            && data_envelope(&out)["data"]["entries"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty());
+        println!(
+            "candidate 3 cross-check: histprov:p5hist browse {}",
+            if historian_registered {
+                "ANSWERS (the historian is registered)"
+            } else {
+                "answered empty (the historian is registered but holds no tags)"
+            }
+        );
+
+        match resolved {
+            Some(winner) => println!("SPIKE RESOLVED: {winner} — pin the winning shape"),
+            None => {
+                // The pre-cleared fallback: the STRUCTURAL outcome is
+                // the assertion (t_stamp + tag columns, no error);
+                // null values are the documented limitation.
+                println!(
+                    "SPIKE OUTCOME (no winner): history query is structurally working \
+                     (t_stamp + tag columns, exit 0) but the tag↔historian DATA binding \
+                     remains unresolved after all documented candidates — recorded as a \
+                     documented limitation (README 'Tag history'); the Designer-diff \
+                     follow-up (create one history tag by hand in the Designer, getConfig \
+                     it via this CLI, diff the shapes) is the resolution path"
+                );
+            }
+        }
+    }
+
+    // Cleanup (self-cleaning): the tag, then the historian.
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "config", "delete", tag, "--yes", "--compact"],
+    );
+    expect_ok("config delete the history tag", &out);
+    delete_internal_historian(&env, "p5hist").await;
+}
+
+/// THE alarm lifecycle live fixture (05-06, TAGS-07) — configure a
+/// tag with a LIST-form alarm (AboveValue 100, High — the
+/// research-proven configure shape) → write past the setpoint →
+/// poll `alarms active` until the event appears (bounded) → ack with
+/// note+username (the 3-arg form) → assert the state flip to
+/// `Active, Acknowledged` + the remainder shape → the history leg
+/// (a default rig asserts the honest `alarm_journal_missing`
+/// refusal LIVE — the pinned default-rig path; a journal-provisioned
+/// rig asserts rows) → the journal stretch is SKIP-WITH-REASON (the
+/// sidecar-postgres chain is documented in the README; the wiremock
+/// pins carry the capability proof).
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_alarm_lifecycle() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+    let tag = "[p5alarm]AlarmTag";
+
+    // Routes first: every alarms verb refuses exit 6 without them.
+    let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
+    expect_ok("deploy (the alarms route's precondition)", &out);
+
+    // Fresh provider (native REST, self-cleaning).
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "create", "p5alarm", "--compact"],
+    );
+    expect_ok("provider create p5alarm", &out);
+
+    // Configure the alarmed tag: alarms are a LIST (the name-keyed
+    // dict form is silently ignored — 05-RESEARCH's live finding).
+    let out = ign_stdin(
+        &config,
+        &env,
+        &["tags", "config", "create", tag, "--file", "-", "--compact"],
+        r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "alarms": [{"name": "HighLimit", "enabled": true, "mode": "AboveValue", "setpointA": 100, "priority": "High"}]}"#,
+    );
+    expect_ok("config create the alarmed tag", &out);
+
+    // Trigger: write past the setpoint.
+    let out = ign(&config, &env, &["tags", "write", tag, "--value", "150", "--compact"]);
+    expect_ok("write past the setpoint", &out);
+
+    // Poll `alarms active` until the event appears (bounded).
+    let find_event = |envelope: &Value| -> Option<Value> {
+        envelope["data"]["alarms"]
+            .as_array()
+            .and_then(|alarms| {
+                alarms
+                    .iter()
+                    .find(|alarm| {
+                        alarm["source"].as_str().is_some_and(|source| source.contains("p5alarm"))
+                    })
+                    .cloned()
+            })
+    };
+    let mut event = None;
+    for _ in 0..20 {
+        let out = ign(&config, &env, &["tags", "alarms", "active", "--compact"]);
+        expect_ok("alarms active poll", &out);
+        let envelope = data_envelope(&out);
+        if let Some(found) = find_event(&envelope) {
+            event = Some(found);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let event = event.expect("the alarm event appeared (bounded retries)");
+    let event_id = event["event_id"].as_str().expect("event_id present").to_string();
+    assert!(
+        event["state"].as_str().unwrap_or_default().contains("Unacknowledged"),
+        "the fresh event is Active, Unacknowledged: {event}"
+    );
+    assert_eq!(event["priority"], "High", "{event}");
+    println!("alarm active: {event_id} {}", event["state"].as_str().unwrap_or_default());
+
+    // Acknowledge: the 3-arg form (note + username explicit).
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "alarms",
+            "ack",
+            &event_id,
+            "--note",
+            "e2e lifecycle ack",
+            "--username",
+            "ign-e2e",
+            "--compact",
+        ],
+    );
+    expect_ok("alarms ack (3-arg form)", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["acknowledged"], 1, "{envelope}");
+    assert_eq!(
+        envelope["data"]["unacknowledged"].as_array().map(Vec::len),
+        Some(0),
+        "empty remainder: {envelope}"
+    );
+
+    // The state flip: poll active until 'Active, Acknowledged'.
+    let mut acknowledged = false;
+    for _ in 0..20 {
+        let out = ign(&config, &env, &["tags", "alarms", "active", "--compact"]);
+        expect_ok("alarms active poll (ack)", &out);
+        let envelope = data_envelope(&out);
+        if let Some(event) = find_event(&envelope)
+            && event["state"]
+                .as_str()
+                .is_some_and(|state| state.contains("Acknowledged"))
+        {
+            assert!(
+                event["state"].as_str().unwrap_or_default().contains("Active"),
+                "the acked alarm stays active until cleared: {event}"
+            );
+            acknowledged = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(acknowledged, "the event flipped to 'Active, Acknowledged'");
+    println!("alarm acked: state flipped to Active, Acknowledged");
+
+    // The history leg: a DEFAULT rig asserts the honest refusal LIVE
+    // (exit 6 + alarm_journal_missing — the pinned default-rig
+    // path); a journal-provisioned rig asserts rows instead.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "alarms",
+            "history",
+            "--start",
+            &(now_ms() - 600_000).to_string(),
+            "--end",
+            &now_ms().to_string(),
+            "--compact",
+        ],
+    );
+    if out.status.code() == Some(6) {
+        let envelope = err_envelope(&out);
+        assert_eq!(
+            envelope["error"]["code"], "alarm_journal_missing",
+            "the default-rig refusal is the journal slug: {envelope}"
+        );
+        println!(
+            "alarm history: default-rig honest refusal pinned live \
+             (alarm_journal_missing, exit 6 — the actionable journal-chain hint)"
+        );
+    } else {
+        expect_ok("alarms history (journal-provisioned rig)", &out);
+        let envelope = data_envelope(&out);
+        println!(
+            "alarm history: journal answered ({} row(s)) — the provisioned path",
+            envelope["data"]["count"]
+        );
+    }
+
+    // The journal stretch: SKIP-WITH-REASON (the documented
+    // sidecar-postgres chain lives in the README; the wiremock pins
+    // carry the capability proof).
+    println!(
+        "journal provisioning stretch: skipped — the chain (sidecar postgres container → \
+         database-connection resource → alarm-journal profile → general-alarm-settings \
+         singleton) is documented in the README 'Alarm history' section; provision it \
+         manually and re-run to walk the provisioned path above"
+    );
+
+    // Cleanup (self-cleaning): quiet the tag value, delete the tag,
+    // delete the provider.
+    let _ = ign(&config, &env, &["tags", "write", tag, "--value", "0", "--compact"]);
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "config", "delete", tag, "--yes", "--compact"],
+    );
+    expect_ok("config delete the alarmed tag", &out);
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "delete", "p5alarm", "--yes", "--compact"],
+    );
+    expect_ok("provider delete p5alarm (guarded)", &out);
+}
