@@ -14,7 +14,7 @@ clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "fs", "io-std", "io-util", "process"] } # fs: streaming export writes (03-02); io-std/io-util: stdin import read; process: docker compose shell-out (04-01) — the ONLY Phase 4 dep change
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "fs", "io-std", "io-util", "process", "sync"] } # fs: streaming export writes (03-02); io-std/io-util: stdin import read; process: docker compose shell-out (04-01); sync: the e2e live-gate serializer mutex (05-06 — the live tests mutate SHARED gateway state)
 reqwest = { version = "0.13", default-features = true, features = ["json", "query", "stream"] } # query: .query() for ListQuery params (02-01); stream: bytes_stream for the export download (03-02)
 futures-util = { version = "0.3", default-features = false, features = ["std"] } # StreamExt over the export chunk stream (arrives transitively with reqwest's stream feature; declared direct so the import is legal)
 async-trait = "0.1" # GatewayApi: dyn-compatible today, ubiquitous (research Open Question 2, resolved)

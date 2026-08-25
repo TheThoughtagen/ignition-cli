@@ -1235,11 +1235,15 @@ pub fn default_export_file_name(paths: &[String]) -> String {
 
 /// `ign tags export PATH...` — route action `exportTags` (the
 /// kwargs-only form is enforced route-side). The JSON-string payload
-/// is PARSED and validated as a list of subtrees (never stored
-/// opaque), then written PRETTY to the out file (stdout mode when
-/// `out` is None — the render layer prints it raw). JSON ONLY: the
-/// planner lock (the gateway's native interchange; xml/csv deferred
-/// to backlog as documented format-discretion).
+/// is PARSED (never stored opaque) and NORMALIZED to the list-of-
+/// subtrees interchange format: the live gateway answers a SINGLE
+/// subtree object for one path and the `{"tags": [...]}` wrapper for
+/// several — never a bare array (live-proven 05-06; a bare array is
+/// tolerated defensively) — then written PRETTY to the out file
+/// (stdout mode when `out` is None — the render layer prints it
+/// raw). JSON ONLY: the planner lock (the gateway's native
+/// interchange; xml/csv deferred to backlog as documented
+/// format-discretion).
 pub async fn tags_export(
     api: &dyn GatewayApi,
     project: &str,
@@ -1264,19 +1268,37 @@ pub async fn tags_export(
                     .to_string(),
             )
         })?;
-    // Parse + validate: the payload must be a JSON LIST of subtrees
-    // (the configure/import shape), not an opaque string.
+    // Parse + normalize: the LIVE payload shapes (05-06 live-run
+    // discovery) are a SINGLE subtree object (one path) or the
+    // multi-path wrapper `{"tags": [...]}` — never a bare array. The
+    // normalized list-of-subtrees is the CLI's interchange format
+    // (import + the round-trip oracle); a bare array is tolerated
+    // defensively.
     let parsed: serde_json::Value = serde_json::from_str(payload_text).map_err(|err| {
         CoreError::Internal(format!(
             "tagConfig route exportTags returned a non-JSON payload: {err}"
         ))
     })?;
-    let tag_count = parsed.as_array().map(Vec::len).ok_or_else(|| {
-        CoreError::Internal(
-            "tagConfig route exportTags payload is not a list of tag subtrees".to_string(),
-        )
-    })?;
-    let pretty = serde_json::to_string_pretty(&parsed)
+    let subtrees: Vec<serde_json::Value> = match &parsed {
+        serde_json::Value::Array(items) => items.clone(),
+        serde_json::Value::Object(map)
+            if map.len() == 1
+                && map
+                    .get("tags")
+                    .is_some_and(serde_json::Value::is_array) =>
+        {
+            map["tags"].as_array().cloned().unwrap_or_default()
+        }
+        serde_json::Value::Object(_) => vec![parsed.clone()],
+        _ => {
+            return Err(CoreError::Internal(
+                "tagConfig route exportTags payload is not tag subtrees (object or {tags: [...]})"
+                    .to_string(),
+            ));
+        }
+    };
+    let tag_count = subtrees.len();
+    let pretty = serde_json::to_string_pretty(&subtrees)
         .map_err(|err| CoreError::Internal(err.to_string()))?;
     match out {
         Some(path) => {
@@ -1301,6 +1323,34 @@ pub async fn tags_export(
             payload: Some(pretty),
         }),
     }
+}
+
+/// The top-level tag names a configure call with this subtree will
+/// LAND at the target basePath: a named subtree lands itself; an
+/// EMPTY-named subtree (the provider-shaped export wrapper) lands
+/// its CHILDREN (live-proven 05-06 — configuring
+/// `{name: "", tagType: Provider, tags: [...]}` under `[target]`
+/// creates the children at the target's top level). Pure —
+/// unit-pinned.
+fn effective_top_level_names(subtree: &serde_json::Value) -> Vec<String> {
+    let name = subtree
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !name.is_empty() {
+        return vec![name.to_string()];
+    }
+    subtree
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|child| child.get("name").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `ign tags import --file -` — the LOCKED Phase-3 collision matrix
@@ -1334,12 +1384,20 @@ pub async fn tags_import(
                      (the `tags export` shape)"
                 .to_string(),
         })?;
-    let imported = tags.len();
+    // The EFFECTIVE top-level names: a subtree with an EMPTY name is
+    // the provider-shaped export wrapper — configure lands its
+    // CHILDREN at the target (live-proven 05-06), so the children's
+    // names are what actually arrive.
+    let effective_names: Vec<String> = tags
+        .iter()
+        .flat_map(effective_top_level_names)
+        .collect();
+    let imported = effective_names.len();
     webdev_precondition(api, project).await?;
     if matches!(collision, CollisionPolicy::Abort) {
         // The zero-write pre-check: browse the target basePath, refuse
-        // on ANY top-level name overlap (03-02's find-precheck shape
-        // mapped onto the route seam).
+        // on ANY effective top-level name overlap (03-02's
+        // find-precheck shape mapped onto the route seam).
         let data = api
             .webdev_route_call(
                 project,
@@ -1349,11 +1407,16 @@ pub async fn tags_import(
             )
             .await?;
         let entries: Vec<BrowseEntry> = parse_results(&data, "browse")?;
-        let collisions: Vec<String> = tags
+        // `_types_` is STRUCTURAL — every provider carries the UDT
+        // types folder, and the server's own abort policy accepts
+        // configuring it (live-proven Good); it never counts as a
+        // collision.
+        let collisions: Vec<String> = effective_names
             .iter()
-            .filter_map(|tag| tag.get("name").and_then(|value| value.as_str()))
-            .filter(|name| entries.iter().any(|entry| entry.name == *name))
-            .map(str::to_string)
+            .filter(|name| {
+                **name != "_types_" && entries.iter().any(|entry| &entry.name == *name)
+            })
+            .cloned()
             .collect();
         if !collisions.is_empty() {
             return Err(CoreError::TagCollision {
@@ -2367,18 +2430,61 @@ mod tests {
         assert_eq!(result.tag_count, 1);
     }
 
-    /// A non-JSON or non-list payload is an internal-class honesty
-    /// error (the route contract is a list of subtrees).
+    /// A scalar payload (neither object nor array) is an
+    /// internal-class honesty error.
     #[tokio::test]
-    async fn export_refuses_non_list_payloads() {
-        let rig = TagsRig::with(Vec::new()).route(
-            present(),
-            serde_json::json!({"payload": "{\"not\": \"a list\"}"}),
-        );
+    async fn export_refuses_scalar_payloads() {
+        let rig =
+            TagsRig::with(Vec::new()).route(present(), serde_json::json!({"payload": "42"}));
         let err = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
             .await
-            .expect_err("non-list payload refuses");
+            .expect_err("scalar payload refuses");
         assert_eq!(err.code(), "internal");
+    }
+
+    /// THE LIVE payload shapes (05-06 live-run discovery): one path
+    /// → a SINGLE subtree OBJECT; several → the `{"tags": [...]}`
+    /// wrapper. Both normalize to the list-of-subtrees interchange
+    /// (what the export file carries + import consumes).
+    #[tokio::test]
+    async fn export_normalizes_the_live_payload_shapes() {
+        // Single subtree object.
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"payload": "{\"name\": \"T1\", \"tagType\": \"AtomicTag\", \"value\": 123}"}),
+        );
+        let result = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
+            .await
+            .expect("single-subtree payload normalizes");
+        assert_eq!(result.tag_count, 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(result.payload.expect("stdout payload").as_str())
+                .expect("normalizes to a list");
+        assert_eq!(
+            payload,
+            serde_json::json!([{"name": "T1", "tagType": "AtomicTag", "value": 123}]),
+            "the single subtree rides as a one-element list"
+        );
+
+        // Multi-path wrapper {"tags": [...]}.
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"payload": "{\"tags\": [{\"name\": \"T1\", \"tagType\": \"AtomicTag\"}, {\"name\": \"_types_\", \"tagType\": \"Folder\"}]}"}),
+        );
+        let result = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
+            .await
+            .expect("wrapper payload normalizes");
+        assert_eq!(result.tag_count, 2, "the wrapper's children count");
+
+        // A bare array rides through unchanged (defensive arm).
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"payload": "[{\"name\": \"T1\", \"tagType\": \"AtomicTag\"}]"}),
+        );
+        let result = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
+            .await
+            .expect("array payload passes");
+        assert_eq!(result.tag_count, 1);
     }
 
     /// THE zero-write collision proof (the 03-02 pattern on the
@@ -2503,6 +2609,67 @@ mod tests {
         .expect_err("non-array payload refuses");
         assert_eq!(err.code(), "invalid_input");
         assert!(rig.calls.lock().unwrap().is_empty());
+    }
+
+    /// THE provider-shaped pre-check pin (live-proven 05-06): a
+    /// subtree with an EMPTY name is the export wrapper — its
+    /// CHILDREN land at the target, so the collision pre-check (and
+    /// the imported count) key on the children's names.
+    #[test]
+    fn effective_top_level_names_derivation() {
+        let named = serde_json::json!({"name": "T1", "tagType": "AtomicTag"});
+        assert_eq!(
+            super::effective_top_level_names(&named),
+            vec!["T1".to_string()]
+        );
+        let provider_wrapper = serde_json::json!({
+            "name": "", "tagType": "Provider",
+            "tags": [
+                {"name": "T1", "tagType": "AtomicTag"},
+                {"name": "_types_", "tagType": "Folder"}
+            ]
+        });
+        assert_eq!(
+            super::effective_top_level_names(&provider_wrapper),
+            vec!["T1".to_string(), "_types_".to_string()],
+            "the wrapper's children land at the target"
+        );
+    }
+
+    /// The provider-shaped collision refusal: importing the exported
+    /// provider wrapper into a provider whose top level already has
+    /// the child's name refuses `tag_collision` BEFORE any write.
+    #[tokio::test]
+    async fn import_provider_shaped_payload_collides_on_children() {
+        let rig = TagsRig::with(Vec::new())
+            .route(
+                present(),
+                serde_json::json!({"results": [
+                    {"fullPath": "[p5import]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}),
+            )
+            .responses(vec![
+                serde_json::json!({"results": [
+                    {"fullPath": "[p5import]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}),
+                serde_json::json!({"results": ["Good"]}),
+            ]);
+        let err = tags_import(
+            &rig,
+            "ign-cli",
+            "p5import",
+            serde_json::json!([{"name": "", "tagType": "Provider", "tags": [{"name": "T1", "tagType": "AtomicTag"}]}]),
+            CollisionPolicy::Abort,
+        )
+        .await
+        .expect_err("the child collision refuses");
+        assert_eq!(err.code(), "tag_collision");
+        assert!(
+            err.to_string().contains("T1"),
+            "the CHILD's name rides the message: {err}"
+        );
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only the browse pre-check ran");
     }
 
     /// THE round-trip unit (the research-proven loop): export one

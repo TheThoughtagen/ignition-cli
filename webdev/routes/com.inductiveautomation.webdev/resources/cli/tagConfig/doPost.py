@@ -1,40 +1,39 @@
-# ign-cli WebDev route: tagConfig -- tag CONFIGURATION CRUD, UDTs, bulk export.
-#
-# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
-#   version          -- handshake: {routeVersion, minCli}
-#   getConfig        -- {tagPath, recursive=False} -> {config}
-#   configure        -- {basePath, tags, collisionPolicy='m'} -> {results}
-#   deleteTags       -- {paths: [...]} -> {deleted}
-#   listUDTTypes     -- {provider='default'} -> {results} (browse entry shape)
-#   getUDTDefinition -- {provider, name} -> {definition}
-#   exportTags       -- {paths: [...]} -> {payload: <json string>}
-#
-# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
-#   success: {"ok": true, "data": {...}}
-#   failure: {"ok": false, "error": {"code": "<machine_code>",
-#                                    "message": "<human>",
-#                                    "traceback": <optional>}}
-#
-# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
-# cross-resource imports), so the ~25-line shared core (unicode re-parse,
-# jv() walker, envelope) is duplicated across the five cli/* routes
-# deliberately. Do not "fix" the duplication by importing.
-#
-# Every ignition-mcp prior-art defect is CORRECTED here (live-verified forms
-# from 05-RESEARCH.md -- do not regress them):
-#   - getConfiguration takes a STRING first arg; a list's '[' poisons
-#     TagPathParser with a misleading TagPathFormatException.
-#   - configure takes a basePath ('[default]'), NEVER a provider name.
-#   - children NEST under Folder/UdtType entries; slash-names are rejected.
-#   - alarms are a LIST of dicts; a name-keyed dict is silently ignored.
-#   - tagType (not 'type') is the discriminator.
-#   - exportTags is KWARGS-ONLY (tagPaths=...); the positional form fails.
-
-ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
-MIN_CLI = '1.0'
-
-
 def doPost(request, session):
+	# ign-cli WebDev route: tagConfig -- tag CONFIGURATION CRUD, UDTs, bulk export.
+	#
+	# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
+	#   version          -- handshake: {routeVersion, minCli}
+	#   getConfig        -- {tagPath, recursive=False} -> {config}
+	#   configure        -- {basePath, tags, collisionPolicy='m'} -> {results}
+	#   deleteTags       -- {paths: [...]} -> {deleted}
+	#   listUDTTypes     -- {provider='default'} -> {results} (browse entry shape)
+	#   getUDTDefinition -- {provider, name} -> {definition}
+	#   exportTags       -- {paths: [...]} -> {payload: <json string>}
+	#
+	# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
+	#   success: {"ok": true, "data": {...}}
+	#   failure: {"ok": false, "error": {"code": "<machine_code>",
+	#                                    "message": "<human>",
+	#                                    "traceback": <optional>}}
+	#
+	# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
+	# cross-resource imports), so the ~25-line shared core (unicode re-parse,
+	# jv() walker, envelope) is duplicated across the five cli/* routes
+	# deliberately. Do not "fix" the duplication by importing.
+	#
+	# Every ignition-mcp prior-art defect is CORRECTED here (live-verified forms
+	# from 05-RESEARCH.md -- do not regress them):
+	#   - getConfiguration takes a STRING first arg; a list's '[' poisons
+	#     TagPathParser with a misleading TagPathFormatException.
+	#   - configure takes a basePath ('[default]'), NEVER a provider name.
+	#   - children NEST under Folder/UdtType entries; slash-names are rejected.
+	#   - alarms are a LIST of dicts; a name-keyed dict is silently ignored.
+	#   - tagType (not 'type') is the discriminator.
+	#   - exportTags is KWARGS-ONLY (tagPaths=...); the positional form fails.
+
+	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	MIN_CLI = '1.0'
+
 	import json, traceback
 	data = request['data']
 	if isinstance(data, (str, unicode)):  # Pitfall 3: parsed dict for JSON bodies, str/unicode only when malformed

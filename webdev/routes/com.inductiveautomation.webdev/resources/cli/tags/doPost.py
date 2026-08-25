@@ -1,33 +1,32 @@
-# ign-cli WebDev route: tags -- live tag VALUE operations.
-#
-# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
-#   version -- handshake: {routeVersion, minCli}
-#   browse  -- {path=''} -> tag-tree entries; discriminator is tagType
-#              (Provider/Folder/AtomicTag/UdtType/UdtInstance/Property). ALL
-#              entries pass through, Property children INCLUDED -- filtering
-#              is the CLI's display decision.
-#   read    -- {paths: [...]} -> per-path {path, value, quality, timestamp}
-#   write   -- {path, value} -> {path, quality}
-#
-# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
-#   success: {"ok": true, "data": {...}}
-#   failure: {"ok": false, "error": {"code": "<machine_code>",
-#                                    "message": "<human>",
-#                                    "traceback": <optional>}}
-#
-# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
-# cross-resource imports), so the ~25-line shared core (unicode re-parse,
-# jv() walker, envelope) is duplicated across the five cli/* routes
-# deliberately. Do not "fix" the duplication by importing.
-#
-# Every scripting call below is the LIVE-PROVEN form from the Phase 5
-# research probe (05-RESEARCH.md). Do not "modernize" them.
-
-ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
-MIN_CLI = '1.0'
-
-
 def doPost(request, session):
+	# ign-cli WebDev route: tags -- live tag VALUE operations.
+	#
+	# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
+	#   version -- handshake: {routeVersion, minCli}
+	#   browse  -- {path=''} -> tag-tree entries; discriminator is tagType
+	#              (Provider/Folder/AtomicTag/UdtType/UdtInstance/Property). ALL
+	#              entries pass through, Property children INCLUDED -- filtering
+	#              is the CLI's display decision.
+	#   read    -- {paths: [...]} -> per-path {path, value, quality, timestamp}
+	#   write   -- {path, value} -> {path, quality}
+	#
+	# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
+	#   success: {"ok": true, "data": {...}}
+	#   failure: {"ok": false, "error": {"code": "<machine_code>",
+	#                                    "message": "<human>",
+	#                                    "traceback": <optional>}}
+	#
+	# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
+	# cross-resource imports), so the ~25-line shared core (unicode re-parse,
+	# jv() walker, envelope) is duplicated across the five cli/* routes
+	# deliberately. Do not "fix" the duplication by importing.
+	#
+	# Every scripting call below is the LIVE-PROVEN form from the Phase 5
+	# research probe (05-RESEARCH.md). Do not "modernize" them.
+
+	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	MIN_CLI = '1.0'
+
 	import json, traceback
 	data = request['data']
 	if isinstance(data, (str, unicode)):  # Pitfall 3: parsed dict for JSON bodies, str/unicode only when malformed

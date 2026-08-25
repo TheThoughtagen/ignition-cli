@@ -1,39 +1,38 @@
-# ign-cli WebDev route: alarms -- active alarm status, journal history, acknowledge.
-#
-# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
-#   version      -- handshake: {routeVersion, minCli}
-#   active       -- {source?, priority?, state?} -> {results, count}; entries
-#                   carry {eventId, source, state, priority, name} (eventId is
-#                   a UUID object -- stringified; state strings look like
-#                   'Active, Unacknowledged').
-#   history      -- {startDateMs?, endDateMs?} -> {results, count}; on a rig
-#                   with no alarm journal profile configured, returns the
-#                   STRUCTURED denial code no_alarm_journal (the CLI maps it
-#                   to an actionable slug) -- default rigs always hit this.
-#   acknowledge  -- {eventIds: [...], note='', username='ign-cli'} ->
-#                   {unacknowledged: [...]}; the gateway-scope 3-arg form
-#                   (String[] eventIds, note, username) -- the 2-arg form
-#                   fails, and UUID objects don't coerce to String[].
-#
-# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
-#   success: {"ok": true, "data": {...}}
-#   failure: {"ok": false, "error": {"code": "<machine_code>",
-#                                    "message": "<human>",
-#                                    "traceback": <optional>}}
-#
-# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
-# cross-resource imports), so the ~25-line shared core (unicode re-parse,
-# jv() walker, envelope) is duplicated across the five cli/* routes
-# deliberately. Do not "fix" the duplication by importing.
-#
-# Every scripting call below is the LIVE-PROVEN form from the Phase 5
-# research probe (05-RESEARCH.md). Do not "modernize" them.
-
-ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
-MIN_CLI = '1.0'
-
-
 def doPost(request, session):
+	# ign-cli WebDev route: alarms -- active alarm status, journal history, acknowledge.
+	#
+	# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
+	#   version      -- handshake: {routeVersion, minCli}
+	#   active       -- {source?, priority?, state?} -> {results, count}; entries
+	#                   carry {eventId, source, state, priority, name} (eventId is
+	#                   a UUID object -- stringified; state strings look like
+	#                   'Active, Unacknowledged').
+	#   history      -- {startDateMs?, endDateMs?} -> {results, count}; on a rig
+	#                   with no alarm journal profile configured, returns the
+	#                   STRUCTURED denial code no_alarm_journal (the CLI maps it
+	#                   to an actionable slug) -- default rigs always hit this.
+	#   acknowledge  -- {eventIds: [...], note='', username='ign-cli'} ->
+	#                   {unacknowledged: [...]}; the gateway-scope 3-arg form
+	#                   (String[] eventIds, note, username) -- the 2-arg form
+	#                   fails, and UUID objects don't coerce to String[].
+	#
+	# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
+	#   success: {"ok": true, "data": {...}}
+	#   failure: {"ok": false, "error": {"code": "<machine_code>",
+	#                                    "message": "<human>",
+	#                                    "traceback": <optional>}}
+	#
+	# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
+	# cross-resource imports), so the ~25-line shared core (unicode re-parse,
+	# jv() walker, envelope) is duplicated across the five cli/* routes
+	# deliberately. Do not "fix" the duplication by importing.
+	#
+	# Every scripting call below is the LIVE-PROVEN form from the Phase 5
+	# research probe (05-RESEARCH.md). Do not "modernize" them.
+
+	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	MIN_CLI = '1.0'
+
 	import json, traceback
 	import java.lang.Throwable
 	data = request['data']

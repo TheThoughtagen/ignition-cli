@@ -229,6 +229,8 @@ async fn live_webdev_deploy_status_scriptexec_loop() {
         return;
     };
     let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
     let mut all_output = String::new();
 
     // (1) status BEFORE any deploy: a READ — exit 0 whether the
@@ -344,6 +346,35 @@ async fn live_webdev_deploy_status_scriptexec_loop() {
     );
 }
 
+/// Best-effort pre-clean (idempotent re-runs): delete a provider
+/// with the guarded verb, IGNORE failures (an absent provider is the
+/// usual case; the OWN-OCCUPANT convention — a mid-run panic must
+/// not poison the next run against the same rig).
+fn clean_provider(config: &Path, env: &LiveEnv, provider: &str) {
+    let _ = ign(
+        config,
+        env,
+        &["tags", "provider", "delete", provider, "--yes", "--compact"],
+    );
+}
+
+/// Best-effort pre-clean: delete tag configs, ignoring failures.
+fn clean_tag_configs(config: &Path, env: &LiveEnv, paths: &[&str]) {
+    let mut args: Vec<&str> = vec!["tags", "config", "delete"];
+    args.extend_from_slice(paths);
+    args.push("--yes");
+    args.push("--compact");
+    let _ = ign(config, env, &args);
+}
+
+/// THE live-gate serializer: every live test mutates SHARED gateway
+/// state (the CLI-owned ign-cli deploy project — five concurrent
+/// overwrite-imports race each other — plus tag providers), so the
+/// gates hold this lock for their whole body and run ONE AT A TIME
+/// within the process (cargo's default parallelism would 409-race
+/// the deploys and provider creates; live-proven 05-06).
+static LIVE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// THE tags live loop (05-04) — the first route-consuming family,
 /// self-contained: deploy the routes (browse/read/write need them),
 /// then provider create → browse root sees it → read/write on a
@@ -362,10 +393,15 @@ async fn live_tags_provider_browse_read_write_loop() {
         return;
     };
     let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
 
     // Routes first: browse/read/write refuse exit 6 without them.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the tags route's precondition)", &out);
+
+    // Pre-clean a leftover occupant from a prior aborted run.
+    clean_provider(&config, &env, "p5e2e");
 
     // Provider create (NATIVE REST): a STANDARD provider named p5e2e.
     let out = ign(
@@ -402,8 +438,9 @@ async fn live_tags_provider_browse_read_write_loop() {
     );
 
     // Read a NONEXISTENT path: exit 0, the quality passthrough IS
-    // the honest oracle (Bad_NotFound — quality never parsed, so a
-    // missing tag is DATA, not an error).
+    // the honest oracle (Bad_NotFound(...) — quality never parsed, so
+    // a missing tag is DATA, not an error; the LIVE string carries
+    // embedded detail: `Bad_NotFound("Path ... not found.")`).
     let out = ign(
         &config,
         &env,
@@ -411,7 +448,13 @@ async fn live_tags_provider_browse_read_write_loop() {
     );
     expect_ok("read nonexistent path (quality is data)", &out);
     let envelope = data_envelope(&out);
-    assert_eq!(envelope["data"]["results"][0]["quality"], "Bad_NotFound");
+    assert!(
+        envelope["data"]["results"][0]["quality"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Bad_NotFound"),
+        "quality is data with embedded detail: {envelope}"
+    );
 
     // Write to the nonexistent path likewise returns a Bad quality
     // (verifiable without mutation side effects on a fresh
@@ -466,10 +509,17 @@ async fn live_tags_config_export_import_roundtrip() {
         return;
     };
     let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
 
     // Routes first: every tagConfig verb refuses exit 6 without them.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the tagConfig route's precondition)", &out);
+
+    // Pre-clean leftovers from a prior aborted run (idempotent).
+    for provider in ["p5e2e", "p5import"] {
+        clean_provider(&config, &env, provider);
+    }
 
     // Fresh providers for the round-trip (native REST, pre-cleaned).
     for provider in ["p5e2e", "p5import"] {
@@ -545,7 +595,10 @@ async fn live_tags_config_export_import_roundtrip() {
     );
     expect_ok("import #1 (abort, clean target)", &out);
     let envelope = data_envelope(&out);
-    assert_eq!(envelope["data"]["imported"], 1);
+    // The provider-shaped export wrapper (empty name) lands its
+    // CHILDREN at the target — the effective top-level count is the
+    // children's (T1 + the provider's _types_ folder).
+    assert_eq!(envelope["data"]["imported"], 2, "{envelope}");
 
     // Import #2 (abort again): the collision refusal — exit 6,
     // tag_collision, BEFORE any write.
@@ -749,7 +802,15 @@ async fn live_tags_history_historian_and_binding_spike() {
         return;
     };
     let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
     let tag = "[default]P5H/T1";
+
+    // Pre-clean leftovers from a prior aborted run (idempotent):
+    // the tag first (create over an existing node would abort), then
+    // the historian.
+    clean_tag_configs(&config, &env, &[tag]);
+    delete_internal_historian(&env, "p5hist").await;
 
     // Routes first: history query refuses exit 6 without them.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
@@ -830,8 +891,14 @@ async fn live_tags_history_historian_and_binding_spike() {
     let envelope = data_envelope(&out);
     let columns = envelope["data"]["columns"].as_array().cloned().unwrap_or_default();
     assert_eq!(columns.first().and_then(Value::as_str), Some("t_stamp"), "{envelope}");
+    // LIVE-DISCOVERED (05-06): history tag columns ride PROVIDER-RELATIVE
+    // (the bracket is stripped — `[default]P5H/T1` surfaces as `P5H/T1`);
+    // t_stamp is preserved exactly, never renamed.
+    let relative = tag.trim_start_matches('[').split_once(']').map(|(_, rest)| rest);
     assert!(
-        columns.iter().any(|column| column.as_str() == Some(tag)),
+        columns
+            .iter()
+            .any(|column| column.as_str() == relative && relative.is_some()),
         "the tag column rides provider-relative: {envelope}"
     );
 
@@ -951,11 +1018,16 @@ async fn live_tags_alarm_lifecycle() {
         return;
     };
     let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
     let tag = "[p5alarm]AlarmTag";
 
     // Routes first: every alarms verb refuses exit 6 without them.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the alarms route's precondition)", &out);
+
+    // Pre-clean a leftover occupant from a prior aborted run.
+    clean_provider(&config, &env, "p5alarm");
 
     // Fresh provider (native REST, self-cleaning).
     let out = ign(

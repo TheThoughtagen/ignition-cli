@@ -1,36 +1,35 @@
-# ign-cli WebDev route: tagHistory -- historical tag value queries.
-#
-# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
-#   version -- handshake: {routeVersion, minCli}
-#   query   -- {paths: [...], startDateMs, endDateMs,
-#               aggregationMode='LastValue', returnSize=N} -> {columns, rows,
-#               rowCount}. The time column is 't_stamp' (NOT 'Timestamp' --
-#               prior-art defect 8) and is passed through VERBATIM; tag
-#               columns are provider-relative paths. Every cell rides jv().
-#
-#   The query PATH is structurally safe on default rigs (zero historians):
-#   it returns a well-formed dataset with null values. Data requires a
-#   historian (InternalHistorian is provisionable via native REST).
-#
-# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
-#   success: {"ok": true, "data": {...}}
-#   failure: {"ok": false, "error": {"code": "<machine_code>",
-#                                    "message": "<human>",
-#                                    "traceback": <optional>}}
-#
-# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
-# cross-resource imports), so the ~25-line shared core (unicode re-parse,
-# jv() walker, envelope) is duplicated across the five cli/* routes
-# deliberately. Do not "fix" the duplication by importing.
-#
-# Every scripting call below is the LIVE-PROVEN form from the Phase 5
-# research probe (05-RESEARCH.md). Do not "modernize" them.
-
-ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
-MIN_CLI = '1.0'
-
-
 def doPost(request, session):
+	# ign-cli WebDev route: tagHistory -- historical tag value queries.
+	#
+	# Action-dispatch contract (doPost only, JSON body): {"action": "<name>", ...}
+	#   version -- handshake: {routeVersion, minCli}
+	#   query   -- {paths: [...], startDateMs, endDateMs,
+	#               aggregationMode='LastValue', returnSize=N} -> {columns, rows,
+	#               rowCount}. The time column is 't_stamp' (NOT 'Timestamp' --
+	#               prior-art defect 8) and is passed through VERBATIM; tag
+	#               columns are provider-relative paths. Every cell rides jv().
+	#
+	#   The query PATH is structurally safe on default rigs (zero historians):
+	#   it returns a well-formed dataset with null values. Data requires a
+	#   historian (InternalHistorian is provisionable via native REST).
+	#
+	# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
+	#   success: {"ok": true, "data": {...}}
+	#   failure: {"ok": false, "error": {"code": "<machine_code>",
+	#                                    "message": "<human>",
+	#                                    "traceback": <optional>}}
+	#
+	# SELF-CONTAINED BY DESIGN: WebDev route folders are independent (no
+	# cross-resource imports), so the ~25-line shared core (unicode re-parse,
+	# jv() walker, envelope) is duplicated across the five cli/* routes
+	# deliberately. Do not "fix" the duplication by importing.
+	#
+	# Every scripting call below is the LIVE-PROVEN form from the Phase 5
+	# research probe (05-RESEARCH.md). Do not "modernize" them.
+
+	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	MIN_CLI = '1.0'
+
 	import json, traceback
 	data = request['data']
 	if isinstance(data, (str, unicode)):  # Pitfall 3: parsed dict for JSON bodies, str/unicode only when malformed
