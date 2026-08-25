@@ -34,6 +34,7 @@
 
 use serde::Serialize;
 
+use crate::actions::projects::CollisionPolicy;
 use crate::actions::webdev::webdev_precondition;
 use crate::client::GatewayApi;
 use crate::client::query::ListQuery;
@@ -639,6 +640,341 @@ pub async fn tags_config_delete(
     })
 }
 
+// ---- UDT types/definitions (05-05, TAGS-06) ----
+
+/// One UDT type row from `listUDTTypes` — unit-explicit keys.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TagsUdtTypeRow {
+    /// The UDT type's name (its `_types_` leaf).
+    pub name: String,
+    /// Wire `tagType` token verbatim (`UdtType`).
+    pub tag_type: String,
+}
+
+/// `ign tags udt types` result.
+#[derive(Debug, Serialize)]
+pub struct TagsUdtTypesResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The provider whose `_types_` folder was browsed.
+    pub provider: String,
+    /// The type entries, gateway order.
+    pub types: Vec<TagsUdtTypeRow>,
+}
+
+/// `ign tags udt def NAME` result — the recursive definition with
+/// the stringified re-parse applied.
+#[derive(Debug, Serialize)]
+pub struct TagsUdtDefResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The provider whose `_types_` folder was read.
+    pub provider: String,
+    /// The UDT type's name.
+    pub name: String,
+    /// The full recursive definition (parameters + nested children),
+    /// stringified values re-parsed.
+    pub definition: serde_json::Value,
+}
+
+/// `ign tags udt types` — route action `listUDTTypes` (the route
+/// browses `[provider]_types_`).
+pub async fn tags_udt_types(
+    api: &dyn GatewayApi,
+    project: &str,
+    provider: &str,
+) -> Result<TagsUdtTypesResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({"action": "listUDTTypes", "provider": provider}),
+            &[],
+        )
+        .await?;
+    let entries: Vec<BrowseEntry> = parse_results(&data, "listUDTTypes")?;
+    Ok(TagsUdtTypesResult {
+        project: project.to_string(),
+        provider: provider.to_string(),
+        types: entries
+            .into_iter()
+            .map(|entry| TagsUdtTypeRow {
+                name: entry.name,
+                tag_type: entry.tag_type,
+            })
+            .collect(),
+    })
+}
+
+/// `ign tags udt def NAME` — route action `getUDTDefinition` (the
+/// route walks `[provider]_types_/NAME` recursively); the SAME
+/// stringified re-parse is applied so agents see real JSON.
+pub async fn tags_udt_def(
+    api: &dyn GatewayApi,
+    project: &str,
+    provider: &str,
+    name: &str,
+) -> Result<TagsUdtDefResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({"action": "getUDTDefinition", "provider": provider, "name": name}),
+            &[],
+        )
+        .await?;
+    let mut definition = data
+        .get("definition")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "tagConfig route getUDTDefinition returned an unexpected shape (missing `definition`)"
+                    .to_string(),
+            )
+        })?;
+    reparse_stringified(&mut definition);
+    Ok(TagsUdtDefResult {
+        project: project.to_string(),
+        provider: provider.to_string(),
+        name: name.to_string(),
+        definition,
+    })
+}
+
+// ---- bulk export/import (05-05, TAGS-09) ----
+
+/// `ign tags export` result — the artifact line's data (file mode)
+/// or the payload itself (stdout mode, printed raw by the render
+/// layer).
+#[derive(Debug, Serialize)]
+pub struct TagsExportResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The exported paths, request order.
+    pub paths: Vec<String>,
+    /// The file the pretty JSON landed in (stdout mode: null).
+    pub file: Option<String>,
+    /// Whether the payload rode to stdout (the export-streaming
+    /// convention's stdout half — `-o -`).
+    pub stdout: bool,
+    /// Top-level subtree count in the payload.
+    pub tag_count: usize,
+    /// The pretty payload in stdout mode — NEVER serialized (the
+    /// render layer prints it raw as the sanctioned stdout
+    /// exception; the ProjectSetResult serde-skip precedent).
+    #[serde(skip)]
+    pub payload: Option<String>,
+}
+
+/// `ign tags import` result — counts + provider.
+#[derive(Debug, Serialize)]
+pub struct TagsImportResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The target provider imported into.
+    pub provider: String,
+    /// The policy that ran (`abort`/`overwrite` — the stable
+    /// labels).
+    pub collision_policy: String,
+    /// Top-level subtree count imported.
+    pub imported: usize,
+}
+
+/// The default export file name: the FIRST path's last segment
+/// (provider brackets stripped), sanitized to filesystem-safe
+/// characters, `.json` — the export-streaming convention's file
+/// half. Pure — unit-pinned.
+pub fn default_export_file_name(paths: &[String]) -> String {
+    let first = paths.first().map(String::as_str).unwrap_or("tags");
+    // Strip the provider bracket prefix ([p5e2e]P5 → P5; a
+    // provider-only path falls back to the provider name itself).
+    let stem = match first.find(']') {
+        Some(close) if first.starts_with('[') => &first[close + 1..],
+        _ => first,
+    };
+    let stem = if stem.is_empty() {
+        &first[1..first.find(']').unwrap_or(first.len())]
+    } else {
+        stem
+    };
+    let last = stem.rsplit('/').next().unwrap_or(stem);
+    let sanitized: String = last
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = if sanitized.is_empty() {
+        "tags".to_string()
+    } else {
+        sanitized
+    };
+    format!("{stem}.json")
+}
+
+/// `ign tags export PATH...` — route action `exportTags` (the
+/// kwargs-only form is enforced route-side). The JSON-string payload
+/// is PARSED and validated as a list of subtrees (never stored
+/// opaque), then written PRETTY to the out file (stdout mode when
+/// `out` is None — the render layer prints it raw). JSON ONLY: the
+/// planner lock (the gateway's native interchange; xml/csv deferred
+/// to backlog as documented format-discretion).
+pub async fn tags_export(
+    api: &dyn GatewayApi,
+    project: &str,
+    paths: &[String],
+    out: Option<&std::path::Path>,
+) -> Result<TagsExportResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({"action": "exportTags", "paths": paths}),
+            &[],
+        )
+        .await?;
+    let payload_text = data
+        .get("payload")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "tagConfig route exportTags returned an unexpected shape (missing `payload`)"
+                    .to_string(),
+            )
+        })?;
+    // Parse + validate: the payload must be a JSON LIST of subtrees
+    // (the configure/import shape), not an opaque string.
+    let parsed: serde_json::Value = serde_json::from_str(payload_text).map_err(|err| {
+        CoreError::Internal(format!(
+            "tagConfig route exportTags returned a non-JSON payload: {err}"
+        ))
+    })?;
+    let tag_count = parsed.as_array().map(Vec::len).ok_or_else(|| {
+        CoreError::Internal(
+            "tagConfig route exportTags payload is not a list of tag subtrees".to_string(),
+        )
+    })?;
+    let pretty = serde_json::to_string_pretty(&parsed)
+        .map_err(|err| CoreError::Internal(err.to_string()))?;
+    match out {
+        Some(path) => {
+            std::fs::write(path, format!("{pretty}\n")).map_err(|err| {
+                CoreError::Internal(format!("cannot write {}: {err}", path.display()))
+            })?;
+            Ok(TagsExportResult {
+                project: project.to_string(),
+                paths: paths.to_vec(),
+                file: Some(path.display().to_string()),
+                stdout: false,
+                tag_count,
+                payload: None,
+            })
+        }
+        None => Ok(TagsExportResult {
+            project: project.to_string(),
+            paths: paths.to_vec(),
+            file: None,
+            stdout: true,
+            tag_count,
+            payload: Some(pretty),
+        }),
+    }
+}
+
+/// `ign tags import --file -` — the LOCKED Phase-3 collision matrix
+/// mapped onto configure's `'a'`/`'o'` (03-02 verbatim):
+///
+/// - **abort (default)**: a browse of the target basePath
+///   (`[provider]`) pre-checks for EXISTING top-level names — any
+///   collision refuses [`CoreError::TagCollision`] (exit 6, hint
+///   names `--collision-policy overwrite`) BEFORE any route write,
+///   then configure runs with `'a'` (the server-side backstop).
+/// - **overwrite**: `--yes`-guarded pre-resolution at the CLI layer
+///   with NO pre-check (the server is the authority), configure
+///   `'o'`.
+/// - **merge** is not a clap value (Designer-only, README).
+///
+/// The payload is the `tags export` shape (a parsed JSON array of
+/// subtrees) sent to configure VERBATIM — the gateway's own
+/// interchange format round-trips untouched.
+pub async fn tags_import(
+    api: &dyn GatewayApi,
+    project: &str,
+    provider: &str,
+    payload: serde_json::Value,
+    collision: CollisionPolicy,
+) -> Result<TagsImportResult, CoreError> {
+    let tags = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| CoreError::InvalidInput {
+            reason: "import payload must be a JSON array of tag definitions \
+                     (the `tags export` shape)"
+                .to_string(),
+        })?;
+    let imported = tags.len();
+    webdev_precondition(api, project).await?;
+    if matches!(collision, CollisionPolicy::Abort) {
+        // The zero-write pre-check: browse the target basePath, refuse
+        // on ANY top-level name overlap (03-02's find-precheck shape
+        // mapped onto the route seam).
+        let data = api
+            .webdev_route_call(
+                project,
+                TAGS_ROUTE,
+                &serde_json::json!({"action": "browse", "path": format!("[{provider}]")}),
+                &[],
+            )
+            .await?;
+        let entries: Vec<BrowseEntry> = parse_results(&data, "browse")?;
+        let collisions: Vec<String> = tags
+            .iter()
+            .filter_map(|tag| tag.get("name").and_then(|value| value.as_str()))
+            .filter(|name| entries.iter().any(|entry| entry.name == *name))
+            .map(str::to_string)
+            .collect();
+        if !collisions.is_empty() {
+            return Err(CoreError::TagCollision {
+                provider: provider.to_string(),
+                names: collisions,
+                endpoint: Some(crate::client::webdev::route_url(project, TAGS_ROUTE)),
+            });
+        }
+    }
+    let policy_char = match collision {
+        CollisionPolicy::Abort => "a",
+        CollisionPolicy::Overwrite => "o",
+    };
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({
+                "action": "configure",
+                "basePath": format!("[{provider}]"),
+                "tags": tags,
+                "collisionPolicy": policy_char,
+            }),
+            &[],
+        )
+        .await?;
+    let _qualities: Vec<String> = parse_results(&data, "configure")?;
+    Ok(TagsImportResult {
+        project: project.to_string(),
+        provider: provider.to_string(),
+        collision_policy: collision.label().to_string(),
+        imported,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -668,6 +1004,10 @@ mod tests {
         calls: Mutex<Vec<serde_json::Value>>,
         /// The scripted route-call `data` payload.
         route_data: serde_json::Value,
+        /// A per-call response queue (the export→import round-trip
+        /// needs SEQUENTIAL different answers); when empty every call
+        /// falls back to `route_data`.
+        responses: Mutex<Vec<serde_json::Value>>,
     }
 
     impl TagsRig {
@@ -682,6 +1022,7 @@ mod tests {
                 },
                 calls: Mutex::new(Vec::new()),
                 route_data: serde_json::json!({"results": []}),
+                responses: Mutex::new(Vec::new()),
             }
         }
 
@@ -693,6 +1034,13 @@ mod tests {
         ) -> Self {
             self.probe = probe;
             self.route_data = route_data;
+            self
+        }
+
+        /// Script a per-call response QUEUE (each route call pops
+        /// the front; an exhausted queue reuses the last answer).
+        fn responses(self, queue: Vec<serde_json::Value>) -> Self {
+            *self.responses.lock().unwrap() = queue;
             self
         }
     }
@@ -867,7 +1215,14 @@ mod tests {
             _extra_headers: &[(&str, &str)],
         ) -> Result<serde_json::Value, CoreError> {
             self.calls.lock().unwrap().push(body.clone());
-            Ok(self.route_data.clone())
+            let mut queue = self.responses.lock().unwrap();
+            if queue.len() > 1 {
+                Ok(queue.remove(0))
+            } else if let Some(last) = queue.first() {
+                Ok(last.clone())
+            } else {
+                Ok(self.route_data.clone())
+            }
         }
         async fn webdev_route_probe(
             &self,
@@ -1453,6 +1808,324 @@ mod tests {
         assert!(
             rig.calls.lock().unwrap().is_empty(),
             "zero route calls past the usage refusals"
+        );
+    }
+
+    // ---- UDT types/def + export/import (05-05, TAGS-06/09) ----
+
+    use super::{
+        CollisionPolicy, TagsExportResult, TagsImportResult, default_export_file_name, tags_export,
+        tags_import, tags_udt_def, tags_udt_types,
+    };
+
+    /// udt types rides listUDTTypes with the provider on the body and
+    /// maps the browse-entry results into `{name, tag_type}` rows.
+    #[tokio::test]
+    async fn udt_types_maps_rows_and_pins_body() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"results": [
+                {"fullPath": "[default]_types_/Motor", "name": "Motor", "tagType": "UdtType", "hasChildren": true, "dataType": null},
+                {"fullPath": "[default]_types_/Pump", "name": "Pump", "tagType": "UdtType", "hasChildren": true, "dataType": null}
+            ]}),
+        );
+        let result = tags_udt_types(&rig, "ign-cli", "default")
+            .await
+            .expect("udt types parses");
+        assert_eq!(result.types.len(), 2);
+        assert_eq!(result.types[0].name, "Motor");
+        assert_eq!(result.types[0].tag_type, "UdtType");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "listUDTTypes", "provider": "default"})
+        );
+    }
+
+    /// udt def rides getUDTDefinition and applies the SAME
+    /// stringified re-parse (agents see real JSON inside UDT
+    /// parameters too).
+    #[tokio::test]
+    async fn udt_def_reparses_and_pins_body() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"definition": {
+                "name": "Motor",
+                "tagType": "UdtType",
+                "parameters": {"speed": {"defaultValue": "{\"dataType\": \"Float8\", \"value\": 0.0}"}},
+                "tags": [{"name": "Run", "tagType": "AtomicTag", "value": "{\"dataType\": \"Boolean\", \"value\": true}"}]
+            }}),
+        );
+        let result = tags_udt_def(&rig, "ign-cli", "default", "Motor")
+            .await
+            .expect("udt def parses");
+        assert_eq!(result.name, "Motor");
+        assert_eq!(
+            result.definition["parameters"]["speed"]["defaultValue"],
+            serde_json::json!({"dataType": "Float8", "value": 0.0}),
+            "parameter defaultValues are re-parsed"
+        );
+        assert_eq!(
+            result.definition["tags"][0]["value"],
+            serde_json::json!({"dataType": "Boolean", "value": true}),
+            "nested child values are re-parsed"
+        );
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "getUDTDefinition", "provider": "default", "name": "Motor"})
+        );
+    }
+
+    /// The default export file name: first path's last segment,
+    /// provider brackets stripped, sanitized.
+    #[test]
+    fn default_export_file_name_derivations() {
+        assert_eq!(
+            default_export_file_name(&["[p5e2e]".to_string()]),
+            "p5e2e.json"
+        );
+        assert_eq!(
+            default_export_file_name(&["[p5e2e]P5".to_string()]),
+            "P5.json"
+        );
+        assert_eq!(
+            default_export_file_name(&["[default]Area/Motor 1".to_string()]),
+            "Motor_1.json"
+        );
+        assert_eq!(default_export_file_name(&[]), "tags.json");
+    }
+
+    /// export PARSES the JSON-string payload (never opaque) and
+    /// writes it PRETTY to the out file; the result carries the file
+    /// + the top-level subtree count.
+    #[tokio::test]
+    async fn export_parses_payload_and_writes_pretty_file() {
+        let payload = serde_json::json!([
+            {"name": "P5", "tagType": "Folder", "tags": [{"name": "T1", "tagType": "AtomicTag", "value": "{\"dataType\": \"Int4\", \"value\": 123}"}]}
+        ]);
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"payload": serde_json::to_string(&payload).expect("serializes")}),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("p5.json");
+        let result: TagsExportResult =
+            tags_export(&rig, "ign-cli", &["[p5e2e]P5".to_string()], Some(&out))
+                .await
+                .expect("export writes");
+        assert_eq!(
+            result.file.as_deref(),
+            Some(out.display().to_string().as_str())
+        );
+        assert!(!result.stdout);
+        assert_eq!(result.tag_count, 1, "one top-level subtree");
+        let written = std::fs::read_to_string(&out).expect("file written");
+        let reparsed: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("pretty JSON");
+        assert_eq!(
+            reparsed, payload,
+            "the payload round-trips byte-faithfully (verbatim — import fidelity)"
+        );
+        assert!(written.contains("\n  "), "pretty-printed");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "exportTags", "paths": ["[p5e2e]P5"]})
+        );
+    }
+
+    /// Stdout mode (`-o -`): the result carries the pretty payload
+    /// (render prints it raw); no file is touched.
+    #[tokio::test]
+    async fn export_stdout_mode_carries_the_payload() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"payload": "[{\"name\": \"T1\", \"tagType\": \"AtomicTag\"}]"}),
+        );
+        let result = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
+            .await
+            .expect("export stdout mode");
+        assert!(result.stdout);
+        assert_eq!(result.file, None);
+        let payload = result.payload.expect("payload rides the result");
+        assert!(payload.starts_with("[\n  {"), "pretty-printed: {payload}");
+        assert_eq!(result.tag_count, 1);
+    }
+
+    /// A non-JSON or non-list payload is an internal-class honesty
+    /// error (the route contract is a list of subtrees).
+    #[tokio::test]
+    async fn export_refuses_non_list_payloads() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"payload": "{\"not\": \"a list\"}"}),
+        );
+        let err = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
+            .await
+            .expect_err("non-list payload refuses");
+        assert_eq!(err.code(), "internal");
+    }
+
+    /// THE zero-write collision proof (the 03-02 pattern on the
+    /// route seam): abort-policy import browses the target, finds an
+    /// existing top-level name, and refuses `tag_collision` (exit 6,
+    /// hint names the overwrite policy) — the ONLY route call is the
+    /// browse read; configure NEVER ran.
+    #[tokio::test]
+    async fn import_abort_refuses_collision_with_zero_writes() {
+        let rig = TagsRig::with(Vec::new())
+            .route(
+                present(),
+                serde_json::json!({"results": [
+                    {"fullPath": "[p5import]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}),
+            )
+            .responses(vec![
+                serde_json::json!({"results": [
+                    {"fullPath": "[p5import]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}),
+                serde_json::json!({"results": ["Good"]}),
+            ]);
+        let err = tags_import(
+            &rig,
+            "ign-cli",
+            "p5import",
+            serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}]),
+            CollisionPolicy::Abort,
+        )
+        .await
+        .expect_err("collision refuses");
+        assert_eq!(err.code(), "tag_collision");
+        assert_eq!(err.exit_code(), 6);
+        assert!(
+            err.hint().unwrap().contains("--collision-policy overwrite"),
+            "hint names the fix: {err}"
+        );
+        assert!(
+            err.to_string().contains("T1"),
+            "the colliding name rides the message"
+        );
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only the browse read ran");
+        assert_eq!(calls[0]["action"], "browse");
+        assert_eq!(calls[0]["path"], "[p5import]");
+    }
+
+    /// Abort with NO collision: browse (empty) → configure 'a' with
+    /// `[provider]` as basePath and the payload VERBATIM as tags.
+    #[tokio::test]
+    async fn import_abort_clean_configures_with_policy_a() {
+        let payload = serde_json::json!([
+            {"name": "P5", "tagType": "Folder", "tags": [{"name": "T1", "tagType": "AtomicTag"}]}
+        ]);
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({"results": ["Good"]}))
+            .responses(vec![
+                serde_json::json!({"results": []}),
+                serde_json::json!({"results": ["Good"]}),
+            ]);
+        let result: TagsImportResult = tags_import(
+            &rig,
+            "ign-cli",
+            "p5import",
+            payload.clone(),
+            CollisionPolicy::Abort,
+        )
+        .await
+        .expect("clean abort imports");
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.collision_policy, "abort");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "browse pre-check then configure");
+        assert_eq!(calls[0]["action"], "browse");
+        assert_eq!(
+            calls[1],
+            serde_json::json!({
+                "action": "configure",
+                "basePath": "[p5import]",
+                "tags": payload,
+                "collisionPolicy": "a"
+            }),
+            "the configure body is exactly basePath+tags+policy"
+        );
+    }
+
+    /// Overwrite: NO pre-check (server authority) — configure 'o' is
+    /// the ONLY route call; the CLI guards it with --yes upstream.
+    #[tokio::test]
+    async fn import_overwrite_skips_precheck_and_configures_with_policy_o() {
+        let rig =
+            TagsRig::with(Vec::new()).route(present(), serde_json::json!({"results": ["Good"]}));
+        let result = tags_import(
+            &rig,
+            "ign-cli",
+            "p5import",
+            serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}]),
+            CollisionPolicy::Overwrite,
+        )
+        .await
+        .expect("overwrite imports");
+        assert_eq!(result.collision_policy, "overwrite");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no browse pre-check ran");
+        assert_eq!(calls[0]["action"], "configure");
+        assert_eq!(calls[0]["collisionPolicy"], "o");
+    }
+
+    /// A non-array payload refuses invalid_input with ZERO route
+    /// calls (usage class, pre-wire).
+    #[tokio::test]
+    async fn import_refuses_non_array_payloads() {
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({}));
+        let err = tags_import(
+            &rig,
+            "ign-cli",
+            "p5import",
+            serde_json::json!({"name": "T1"}),
+            CollisionPolicy::Abort,
+        )
+        .await
+        .expect_err("non-array payload refuses");
+        assert_eq!(err.code(), "invalid_input");
+        assert!(rig.calls.lock().unwrap().is_empty());
+    }
+
+    /// THE round-trip unit (the research-proven loop): export one
+    /// provider's subtree, import the payload into a DIFFERENT
+    /// provider — the configure body's tags match the parsed export
+    /// payload exactly (values intact, verbatim interchange).
+    #[tokio::test]
+    async fn export_import_round_trip_shapes_match() {
+        let payload = serde_json::json!([
+            {"name": "T1", "tagType": "AtomicTag", "value": "{\"dataType\": \"Int4\", \"value\": 123}"}
+        ]);
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({"results": ["Good"]}))
+            .responses(vec![
+                serde_json::json!({"payload": serde_json::to_string(&payload).expect("serializes")}),
+                serde_json::json!({"results": []}),
+                serde_json::json!({"results": ["Good"]}),
+            ]);
+        // Export (stdout mode — the payload rides the result).
+        let exported = tags_export(&rig, "ign-cli", &["[p5e2e]".to_string()], None)
+            .await
+            .expect("export parses");
+        let text = exported.payload.expect("stdout payload");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("payload parses");
+        // Import into a different provider (abort — clean target).
+        let result = tags_import(&rig, "ign-cli", "p5import", parsed, CollisionPolicy::Abort)
+            .await
+            .expect("round-trip imports");
+        assert_eq!(result.imported, 1);
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "export, browse pre-check, configure");
+        assert_eq!(calls[0]["action"], "exportTags");
+        assert_eq!(calls[2]["action"], "configure");
+        assert_eq!(calls[2]["basePath"], "[p5import]");
+        assert_eq!(
+            calls[2]["tags"], payload,
+            "the configure tags are the parsed export payload VERBATIM"
         );
     }
 }

@@ -248,6 +248,25 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// A tag import under abort policy found EXISTING tags at the
+    /// target provider (05-05, TAGS-09) — the browse pre-check
+    /// refuses BEFORE any route write (the LOCKED Phase-3 collision
+    /// matrix mapped onto configure's 'a'/'o'). Exit 6 — target
+    /// state: the named tags exist; overwrite is the explicit,
+    /// guarded opt-in.
+    #[error(
+        "tag collision importing into provider {provider:?}: {} already exist(s)",
+        names.join(", ")
+    )]
+    TagCollision {
+        /// The target provider the import was headed for.
+        provider: String,
+        /// The colliding top-level tag names the pre-check found.
+        names: Vec<String>,
+        /// URL of the pre-check browse request, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -280,6 +299,7 @@ impl CoreError {
             Self::WebdevUnlicensed { .. } => "webdev_unlicensed",
             Self::RouteVersionMismatch { .. } => "route_version_mismatch",
             Self::WebdevRouteError { .. } => "webdev_route_error",
+            Self::TagCollision { .. } => "tag_collision",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -308,7 +328,8 @@ impl CoreError {
             | Self::RoutesNotDeployed { .. }
             | Self::WebdevUnlicensed { .. }
             | Self::RouteVersionMismatch { .. }
-            | Self::WebdevRouteError { .. } => 6,
+            | Self::WebdevRouteError { .. }
+            | Self::TagCollision { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -444,7 +465,12 @@ impl CoreError {
             }
             Self::ProviderNotFound { .. } => Some(
                 "check the provider name; `ign tags provider list` shows the \
-                 gateway's tag providers"
+                  gateway's tag providers"
+                    .to_string(),
+            ),
+            Self::TagCollision { .. } => Some(
+                "re-run with --collision-policy overwrite to replace the \
+                  existing tags (destructive: requires --yes)"
                     .to_string(),
             ),
             Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
@@ -485,7 +511,8 @@ impl CoreError {
             | Self::RoutesNotDeployed { endpoint, .. }
             | Self::WebdevUnlicensed { endpoint }
             | Self::RouteVersionMismatch { endpoint, .. }
-            | Self::WebdevRouteError { endpoint, .. } => endpoint.clone(),
+            | Self::WebdevRouteError { endpoint, .. }
+            | Self::TagCollision { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -712,6 +739,15 @@ mod tests {
                 },
                 6,
                 "webdev_route_error",
+            ),
+            (
+                CoreError::TagCollision {
+                    provider: "p5import".into(),
+                    names: vec!["T1".into(), "P5".into()],
+                    endpoint: Some("/system/webdev/ign-cli/cli/tags".into()),
+                },
+                6,
+                "tag_collision",
             ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];

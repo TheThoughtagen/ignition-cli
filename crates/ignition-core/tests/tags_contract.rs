@@ -549,3 +549,232 @@ async fn config_get_refuses_routes_not_deployed_zero_tagconfig_calls() {
         "zero tagConfig calls past the refusal"
     );
 }
+
+// ---- Task 2 (05-05, TAGS-06/09): UDTs + export/import ----
+
+use ignition_core::actions::projects::CollisionPolicy;
+use ignition_core::actions::tags::{tags_export, tags_import, tags_udt_def, tags_udt_types};
+
+/// UDT pins: `listUDTTypes` body + row mapping, `getUDTDefinition`
+/// body + the stringified re-parse applied to the definition.
+#[tokio::test]
+async fn udt_types_and_def_ride_the_tagconfig_route() {
+    let server = wiremock::MockServer::start().await;
+    // TWO actions run (types + def) — the probe answers repeatedly.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "version"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(version_body(ignition_core::webdev::ROUTE_BUNDLE_VERSION)),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tagConfig"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "listUDTTypes", "provider": "default"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"fullPath": "[default]_types_/Motor", "name": "Motor", "tagType": "UdtType", "hasChildren": true, "dataType": null}
+                ]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tagConfig"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "getUDTDefinition", "provider": "default", "name": "Motor"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"definition": {
+                    "name": "Motor", "tagType": "UdtType",
+                    "parameters": {"speed": {"defaultValue": "{\"dataType\": \"Float8\", \"value\": 0.0}"}}
+                }}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let types = tags_udt_types(&api, "ign-cli", "default")
+        .await
+        .expect("udt types through the real client");
+    assert_eq!(types.types.len(), 1);
+    assert_eq!(types.types[0].name, "Motor");
+
+    let def = tags_udt_def(&api, "ign-cli", "default", "Motor")
+        .await
+        .expect("udt def through the real client");
+    assert_eq!(
+        def.definition["parameters"]["speed"]["defaultValue"],
+        serde_json::json!({"dataType": "Float8", "value": 0.0}),
+        "the SAME stringified re-parse applies to UDT definitions"
+    );
+}
+
+/// THE export pin: exportTags (kwargs enforced route-side) returns
+/// the JSON-STRING payload; the action PARSES it and writes the
+/// pretty JSON to the out file.
+#[tokio::test]
+async fn export_parses_the_payload_and_writes_the_file() {
+    let payload = serde_json::json!([
+        {"name": "P5", "tagType": "Folder", "tags": [
+            {"name": "T1", "tagType": "AtomicTag", "value": "{\"dataType\": \"Int4\", \"value\": 123}"}
+        ]}
+    ]);
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "exportTags", "paths": ["[p5e2e]P5"]
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"payload": serde_json::to_string(&payload).expect("serializes")}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("p5.json");
+    let result = tags_export(&api, "ign-cli", &["[p5e2e]P5".to_string()], Some(&out))
+        .await
+        .expect("export through the real client");
+    assert_eq!(result.tag_count, 1);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("file written"))
+            .expect("pretty JSON parses");
+    assert_eq!(written, payload, "verbatim round-trip fidelity");
+}
+
+/// THE zero-write collision proof at the WIRE level (the 03-02
+/// pattern): abort-policy import browses the target provider, finds
+/// `T1` existing, and refuses `tag_collision` (exit 6, hint names
+/// the overwrite policy) — the configure mock proves ZERO writes
+/// ran past the browse read.
+#[tokio::test]
+async fn import_abort_refuses_collision_with_zero_configure_writes() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p5import]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"fullPath": "[p5import]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let configure_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_import(
+        &api,
+        "ign-cli",
+        "p5import",
+        serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}]),
+        CollisionPolicy::Abort,
+    )
+    .await
+    .expect_err("collision refuses before any write");
+    assert_eq!(err.code(), "tag_collision");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.hint().unwrap().contains("--collision-policy overwrite"),
+        "hint names the fix: {err}"
+    );
+    assert_eq!(
+        configure_guard.received_requests().await.len(),
+        0,
+        "ZERO configure writes past the refusal"
+    );
+}
+
+/// Overwrite: NO browse pre-check (server authority) — the configure
+/// body is exactly basePath `[provider]` + the payload VERBATIM +
+/// collisionPolicy 'o'.
+#[tokio::test]
+async fn import_overwrite_pins_configure_body_without_precheck() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let payload = serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}]);
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "configure",
+            "basePath": "[p5import]",
+            "tags": payload,
+            "collisionPolicy": "o"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    // A browse mock proves the overwrite path never consults it.
+    let browse_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse"}),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_import(
+        &api,
+        "ign-cli",
+        "p5import",
+        payload,
+        CollisionPolicy::Overwrite,
+    )
+    .await
+    .expect("overwrite imports through the real client");
+    assert_eq!(result.collision_policy, "overwrite");
+    assert_eq!(guard.received_requests().await.len(), 1);
+    assert_eq!(browse_guard.received_requests().await.len(), 0);
+}
