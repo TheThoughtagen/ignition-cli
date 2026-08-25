@@ -236,7 +236,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for HealthyRig {
-
         async fn tag_provider_list(
             &self,
             _query: &crate::client::query::ListQuery,
@@ -545,7 +544,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for BrokenOverview {
-
         async fn tag_provider_list(
             &self,
             _query: &crate::client::query::ListQuery,

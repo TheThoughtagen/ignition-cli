@@ -369,7 +369,7 @@ pub async fn tags_write(
 #[cfg(test)]
 mod tests {
     use super::{
-        TagProviderRecord, TagProvidersResult, TagProviderRow, provider_row, tag_provider_delete,
+        TagProviderRecord, TagProviderRow, TagProvidersResult, provider_row, tag_provider_delete,
         tag_provider_list,
     };
     use crate::client::GatewayApi;
@@ -465,21 +465,14 @@ mod tests {
                 .cloned()
                 .ok_or(CoreError::NotFound { endpoint: None })
         }
-        async fn tag_provider_create(
-            &self,
-            body: &[TagProviderCreate],
-        ) -> Result<(), CoreError> {
+        async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
             let mut created = self.created.lock().unwrap();
             for record in body {
                 created.push(serde_json::to_value(record).expect("serializes"));
             }
             Ok(())
         }
-        async fn tag_provider_delete(
-            &self,
-            name: &str,
-            signature: &str,
-        ) -> Result<(), CoreError> {
+        async fn tag_provider_delete(&self, name: &str, signature: &str) -> Result<(), CoreError> {
             self.deleted
                 .lock()
                 .unwrap()
@@ -554,7 +547,8 @@ mod tests {
         }
         async fn opc_connections(
             &self,
-        ) -> Result<ListEnvelope<crate::client::connections::GatewayConnection>, CoreError> {
+        ) -> Result<ListEnvelope<crate::client::connections::GatewayConnection>, CoreError>
+        {
             unreachable!("not part of this action")
         }
         async fn logs(
@@ -751,10 +745,7 @@ mod tests {
     /// `tags provider list` maps every record into the agent shape.
     #[tokio::test]
     async fn provider_list_maps_rows() {
-        let rig = TagsRig::with(vec![
-            record("default", 12, None),
-            record("System", 0, None),
-        ]);
+        let rig = TagsRig::with(vec![record("default", 12, None), record("System", 0, None)]);
         let result: TagProvidersResult = tag_provider_list(&rig).await.expect("lists");
         assert_eq!(result.providers.len(), 2);
         assert_eq!(result.providers[1].name, "System");
@@ -911,9 +902,13 @@ mod tests {
                 {"path": "[default]Ghost", "value": null, "quality": "Bad_NotFound", "timestamp": "Mon Aug 24 00:00:00 UTC 2026"}
             ]}),
         );
-        let result = tags_read(&rig, "ign-cli", &["[default]T1".into(), "[default]Ghost".into()])
-            .await
-            .expect("read parses");
+        let result = tags_read(
+            &rig,
+            "ign-cli",
+            &["[default]T1".into(), "[default]Ghost".into()],
+        )
+        .await
+        .expect("read parses");
         assert_eq!(result.results.len(), 2);
         assert_eq!(result.results[0].value, 7);
         assert_eq!(result.results[1].quality, "Bad_NotFound");

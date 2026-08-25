@@ -673,9 +673,7 @@ mod tests {
             (
                 CoreError::ProviderNotFound {
                     name: "nope".into(),
-                    endpoint: Some(
-                        "/data/api/v1/resources/find/ignition/tag-provider/nope".into(),
-                    ),
+                    endpoint: Some("/data/api/v1/resources/find/ignition/tag-provider/nope".into()),
                 },
                 6,
                 "provider_not_found",

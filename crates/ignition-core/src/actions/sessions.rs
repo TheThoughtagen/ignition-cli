@@ -197,7 +197,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for SessionsRig {
-
         async fn tag_provider_list(
             &self,
             _query: &crate::client::query::ListQuery,
