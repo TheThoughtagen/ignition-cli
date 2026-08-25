@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 EXECUTING: 05-01..05-05 COMPLETE (route sources, resource re-point, webdev seam + deploy/status, tags provider CRUD + browse/read/write, tag config CRUD + UDTs + bulk export/import with the locked collision matrix and the tag_collision slug). Next: 05-06 alarms/tagHistory — the LAST plan, inheriting the require_routes precondition + family patterns
+**Current focus:** Phase 5 COMPLETE (6/6): route sources + deploy/status, resource re-point, tags provider/browse/read/write, config CRUD + UDTs + bulk transfer, alarms + tag history. ALL FIVE live e2e gates green on a real commissioned 8.3.3 rig (the run un-broke every shipped route: the byte-0 loader contract). 21-tool MCP parity surface closed. Next: /gsd-verify-work (phase UAT), then Phase 6 (TUI)
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
 **Current Plan:** 6
 **Total Plans in Phase:** 6
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-25
 
-**Progress:** [██████████] 95%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -49,6 +49,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P03 | ~400min (2 sessions) | 3 tasks | 35 files |
 | Phase 05 P04 | ~450min (3 sessions) | 3 tasks | 21 files |
 | Phase 05 P05 | 39min | 3 tasks | 10 files |
+| Phase 05 P06 | 114min | 3 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -130,6 +131,10 @@ Recent decisions affecting current work:
 - [Phase 05]: [Phase 05-04]: tags provider delete = 6th --yes-guarded destructive verb (binary-pinned zero-work refusal); find-miss = additive provider_not_found exit 6; write --value follows the JSON-scalar rule (bare string stays string, arrays/objects invalid_input exit 2 pre-resolution); browse human mode = indented tree from fullPath, JSON = flat agent shape; quality strings are DATA never parsed (Bad_NotFound reads exit 0)
 - [Phase 05]: [Phase 05-05]: tags export mode resolution — -o FILE writes, no -o defaults to <last-segment>.json, -o - prints the raw pretty payload in EVERY mode (the FOURTH sanctioned stdout exception) so 'tags export -o - | tags import --file -' pipes; import payload rides VERBATIM (stringified values intact — round-trip fidelity), the re-parse is getConfig/getUDTDefinition read-side presentation only — The plan's 'out file or stdout (file default)' mapped onto three modes; the pipe symmetry with --file - makes the interchange composable
 - [Phase 05]: [Phase 05-05]: collision semantics on the tagConfig seam — create = configure 'a' (server-side abort backstop), edit = 'o' scoped to the single node and NOT --yes-guarded (single-node edit ≠ project-wide destructive); config delete is the 7th guarded destructive verb; import abort = browse pre-check refusing tag_collision (additive exit-6 slug, names + overwrite hint) BEFORE any write (zero-write proven at unit AND wire level); import overwrite = --yes-guarded, NO pre-check; actions::projects::CollisionPolicy reused verbatim (one enum, two verbs) — The 03-02 locked collision matrix mapped onto configure's a/o exactly as the plan required
+- [Phase 05-06]: Route-authoring byte-0 contract (live-bisected): doPost.py must begin with 'def doPost' at byte 0 — module-level content (comments/constants/blank lines) makes the route silently unloadable; all five routes restructured with headers+constants nested inside doPost. Related: exec(...) call form fails to compile at deep nesting on this Jython build — use the statement form
+- [Phase 05-06]: Live export/import truth: exportTags answers a single subtree OBJECT (one path) or the {tags:[...]} wrapper (never a bare array) — tags_export normalizes to the list-of-subtrees interchange; an empty-named (provider-shaped) subtree lands its CHILDREN at the configure target, so collision pre-checks/counts key on effective top-level names with the structural _types_ folder never colliding
+- [Phase 05-06]: tags alarms ack: NOT --yes-guarded (acknowledging never un-acknowledges — a state-advancing read-adjacent verb) with REQUIRED --username (the 3-arg wire form; no default-guessing); the 8.3 ack return IS the unacknowledged remainder — acknowledged computed client-side honestly
+- [Phase 05-06]: The binding spike ran live (InternalHistorian via native REST, no database): structural query proven anywhere (t_stamp + provider-relative tag columns), DATA binding unresolved after all documented candidates — documented limitation with the Designer-diff follow-up as the resolution path (the plan pre-cleared this fallback). History tag columns ride PROVIDER-RELATIVE ([default]X → X)
 
 ### Pending Todos
 
@@ -146,6 +151,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-25T12:00:18.037Z
-**Stopped At:** Completed 05-05-PLAN.md (tag config CRUD + UDTs + bulk export/import with the locked collision matrix)
+**Last session:** 2026-08-25T13:58:09.641Z
+**Stopped At:** Completed 05-06-PLAN.md (alarms + tag history — Phase 5 COMPLETE, all live gates green)
 **Resume file:** None
