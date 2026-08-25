@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 EXECUTING: 05-01..05-04 COMPLETE (route sources, resource re-point, webdev seam + deploy/status, tags provider CRUD + browse/read/write with the require_routes precondition). Next: 05-05 tagConfig + 05-06 alarms/tagHistory — both inherit the require_routes precondition template from 05-04
+**Current focus:** Phase 5 EXECUTING: 05-01..05-05 COMPLETE (route sources, resource re-point, webdev seam + deploy/status, tags provider CRUD + browse/read/write, tag config CRUD + UDTs + bulk export/import with the locked collision matrix and the tag_collision slug). Next: 05-06 alarms/tagHistory — the LAST plan, inheriting the require_routes precondition + family patterns
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
-**Current Plan:** 5
+**Current Plan:** 6
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-08-25
 
-**Progress:** [█████████░] 91%
+**Progress:** [██████████] 95%
 
 ## Performance Metrics
 
@@ -48,6 +48,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P02 | 38min | 3 tasks | 16 files |
 | Phase 05 P03 | ~400min (2 sessions) | 3 tasks | 35 files |
 | Phase 05 P04 | ~450min (3 sessions) | 3 tasks | 21 files |
+| Phase 05 P05 | 39min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -127,6 +128,8 @@ Recent decisions affecting current work:
 - [Phase 05]: [Phase 05-04]: Tag split LOCKED — providers ride NATIVE config-resource REST (list/find/create-array-body/delete-by-signature, tagCount+health metrics, no route dependency); browse/read/write ride the deployed tags route via webdev_route_call
 - [Phase 05]: [Phase 05-04]: ONE shared require_routes precondition (405→routes_not_deployed, 402→webdev_unlicensed, mismatch→route_version_mismatch) runs before EVERY webdev-dependent action — one extra probe round trip, correctness over latency, no caching this phase; the template 05-05/06 inherit
 - [Phase 05]: [Phase 05-04]: tags provider delete = 6th --yes-guarded destructive verb (binary-pinned zero-work refusal); find-miss = additive provider_not_found exit 6; write --value follows the JSON-scalar rule (bare string stays string, arrays/objects invalid_input exit 2 pre-resolution); browse human mode = indented tree from fullPath, JSON = flat agent shape; quality strings are DATA never parsed (Bad_NotFound reads exit 0)
+- [Phase 05]: [Phase 05-05]: tags export mode resolution — -o FILE writes, no -o defaults to <last-segment>.json, -o - prints the raw pretty payload in EVERY mode (the FOURTH sanctioned stdout exception) so 'tags export -o - | tags import --file -' pipes; import payload rides VERBATIM (stringified values intact — round-trip fidelity), the re-parse is getConfig/getUDTDefinition read-side presentation only — The plan's 'out file or stdout (file default)' mapped onto three modes; the pipe symmetry with --file - makes the interchange composable
+- [Phase 05]: [Phase 05-05]: collision semantics on the tagConfig seam — create = configure 'a' (server-side abort backstop), edit = 'o' scoped to the single node and NOT --yes-guarded (single-node edit ≠ project-wide destructive); config delete is the 7th guarded destructive verb; import abort = browse pre-check refusing tag_collision (additive exit-6 slug, names + overwrite hint) BEFORE any write (zero-write proven at unit AND wire level); import overwrite = --yes-guarded, NO pre-check; actions::projects::CollisionPolicy reused verbatim (one enum, two verbs) — The 03-02 locked collision matrix mapped onto configure's a/o exactly as the plan required
 
 ### Pending Todos
 
@@ -143,6 +146,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-25T03:59:03.375Z
-**Stopped At:** Completed 05-04-PLAN.md (tags provider CRUD + browse/read/write; recovered Task 3 from cancelled sessions)
+**Last session:** 2026-08-25T12:00:18.037Z
+**Stopped At:** Completed 05-05-PLAN.md (tag config CRUD + UDTs + bulk export/import with the locked collision matrix)
 **Resume file:** None
