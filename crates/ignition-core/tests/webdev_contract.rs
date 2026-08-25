@@ -206,8 +206,8 @@ async fn route_call_denial_with_unknown_code_is_webdev_route_error() {
         ))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(denial_body(
-                "no_alarm_journal",
-                "No alarm journal profile specified",
+                "some_future_code",
+                "a code this CLI does not map",
             )),
         )
         .expect(1)
@@ -227,12 +227,11 @@ async fn route_call_denial_with_unknown_code_is_webdev_route_error() {
     assert_eq!(err.code(), "webdev_route_error");
     assert_eq!(err.exit_code(), 6);
     assert!(
-        err.to_string().contains("no_alarm_journal"),
+        err.to_string().contains("some_future_code"),
         "code rides verbatim: {err}"
     );
     assert!(
-        err.to_string()
-            .contains("No alarm journal profile specified"),
+        err.to_string().contains("a code this CLI does not map"),
         "message rides verbatim: {err}"
     );
 }
