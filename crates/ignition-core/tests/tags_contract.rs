@@ -347,3 +347,205 @@ async fn write_body_pins_path_and_value_through_the_real_client() {
     assert_eq!(result.quality, "Good");
     assert_eq!(guard.received_requests().await.len(), 1);
 }
+
+// ---- Task 1 (05-05, TAGS-05): the tagConfig route's config CRUD ----
+
+use ignition_core::actions::tags::{
+    tags_config_create, tags_config_delete, tags_config_edit, tags_config_get,
+};
+
+/// THE getConfig pin through the real client: STRING tagPath on the
+/// body, and the STRINGIFIED `value`/`defaultValue` sub-dicts are
+/// RE-PARSED into real JSON (agents see objects, not
+/// JSON-in-a-string — the plan's research-pitfall fixture).
+#[tokio::test]
+async fn config_get_reparses_stringified_values() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "getConfig",
+            "tagPath": "[default]P5/T1"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"config": {
+                    "name": "T1",
+                    "tagType": "AtomicTag",
+                    "value": "{\"dataType\": \"Int4\", \"value\": 123}",
+                    "defaultValue": "{\"dataType\": \"Int4\", \"value\": 0}"
+                }}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_config_get(&api, "ign-cli", "[default]P5/T1")
+        .await
+        .expect("config get through the real client");
+    assert_eq!(result.tag_type.as_deref(), Some("AtomicTag"));
+    assert_eq!(
+        result.config["value"],
+        serde_json::json!({"dataType": "Int4", "value": 123}),
+        "the stringified value is re-parsed for agents"
+    );
+    assert_eq!(
+        result.config["defaultValue"],
+        serde_json::json!({"dataType": "Int4", "value": 0})
+    );
+}
+
+/// THE create body pin: configure with the SPLIT basePath + the
+/// path-derived name riding the definition + collisionPolicy 'a'
+/// (create = abort-collision — refusing to clobber an existing
+/// node is the server's backstop).
+#[tokio::test]
+async fn config_create_pins_configure_body_with_abort_policy() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "configure",
+            "basePath": "[p5e2e]Area",
+            "tags": [{"tagType": "AtomicTag", "value": 42, "name": "Motor1"}],
+            "collisionPolicy": "a"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_config_create(
+        &api,
+        "ign-cli",
+        "[p5e2e]Area/Motor1",
+        &serde_json::json!({"tagType": "AtomicTag", "value": 42}),
+    )
+    .await
+    .expect("create through the real client");
+    assert_eq!(result.quality, "Good");
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE edit body pin: the same configure call with collisionPolicy
+/// 'o' (overwrite the single named node — edit semantics).
+#[tokio::test]
+async fn config_edit_pins_overwrite_policy() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "configure",
+            "basePath": "[default]",
+            "tags": [{"tagType": "AtomicTag", "value": 99, "name": "T1"}],
+            "collisionPolicy": "o"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    tags_config_edit(
+        &api,
+        "ign-cli",
+        "[default]T1",
+        &serde_json::json!({"tagType": "AtomicTag", "value": 99}),
+    )
+    .await
+    .expect("edit through the real client");
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE deleteTags pin: batch paths on the body, the echoed count in
+/// the result.
+#[tokio::test]
+async fn config_delete_pins_batch_paths_on_the_wire() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "deleteTags",
+            "paths": ["[default]T1", "[default]T2"]
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"deleted": 2}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_config_delete(
+        &api,
+        "ign-cli",
+        &["[default]T1".to_string(), "[default]T2".to_string()],
+    )
+    .await
+    .expect("delete through the real client");
+    assert_eq!(result.deleted, 2);
+}
+
+/// Precondition-refusal regression pin for the tagConfig half: an
+/// undeployed gateway refuses `routes_not_deployed` (exit 6) with
+/// ZERO tagConfig route calls — the require_routes inheritance.
+#[tokio::test]
+async fn config_get_refuses_routes_not_deployed_zero_tagconfig_calls() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .respond_with(wiremock::ResponseTemplate::new(405))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let tagconfig_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_config_get(&api, "ign-cli", "[default]T1")
+        .await
+        .expect_err("absent routes refuse pre-deploy");
+    assert_eq!(err.code(), "routes_not_deployed");
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(guard.received_requests().await.len(), 1);
+    assert_eq!(
+        tagconfig_guard.received_requests().await.len(),
+        0,
+        "zero tagConfig calls past the refusal"
+    );
+}

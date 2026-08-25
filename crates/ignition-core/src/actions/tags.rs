@@ -1,6 +1,6 @@
-//! Tag actions (05-04, TAGS-01..04) — serde models OUT, no printing.
+//! Tag actions (05-04..05-05) — serde models OUT, no printing.
 //!
-//! TWO seams, one family (05-RESEARCH's crisp split):
+//! THREE seams, one family (05-RESEARCH's crisp split):
 //!
 //! - **Providers** (TAGS-01) ride the NATIVE config-resource REST
 //!   (`ignition/tag-provider` — healthier data: tagCount metrics,
@@ -19,6 +19,14 @@
 //!   all exit 6 with hints naming `ign webdev deploy`). One extra
 //!   round trip per command, correctness over latency — no caching
 //!   this phase (documented).
+//! - **config CRUD / UDTs / bulk export+import** (05-05,
+//!   TAGS-05/06/09) ride the deployed `tagConfig` route — the same
+//!   precondition, the same generic seam. Configs carry STRINGIFIED
+//!   JSON (`value`/`defaultValue`) that gets re-parsed for agents;
+//!   import maps the LOCKED Phase-3 collision matrix onto
+//!   configure's `'a'`/`'o'` (abort = browse pre-check refusing
+//!   `tag_collision` BEFORE any write; overwrite = `--yes`-guarded,
+//!   NO pre-check — server authority).
 //!
 //! Two-layer naming: the client models stay wire-faithful; the
 //! action results re-expose selected fields under unit-explicit
@@ -363,6 +371,271 @@ pub async fn tags_write(
         project: project.to_string(),
         path: row["path"].as_str().unwrap_or_default().to_string(),
         quality: row["quality"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
+// ---- config get/create/edit/delete (05-05, TAGS-05) ----
+//
+// The tagConfig route's action set rides the same 05-03 generic
+// seam (no new trait methods): `getConfig` (STRING tagPath — the
+// route owns that trap), `configure` (basePath + per-tag names,
+// collisionPolicy 'a'/'o'), `deleteTags` (batch paths).
+
+/// The tagConfig route folder name (05-01's config-CRUD/UDT/export
+/// route — everything in this plan's second half dispatches here).
+const TAG_CONFIG_ROUTE: &str = "tagConfig";
+
+/// `ign tags config get PATH` result — the re-parsed config under
+/// unit-explicit keys.
+#[derive(Debug, Serialize)]
+pub struct TagsConfigGetResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The tag path requested.
+    pub path: String,
+    /// The config's `tagType` discriminator when present.
+    pub tag_type: Option<String>,
+    /// The full config dict with stringified `value`/`defaultValue`
+    /// re-parsed into real JSON.
+    pub config: serde_json::Value,
+}
+
+/// `ign tags config create|edit PATH` result — the configure
+/// quality IS the success contract (quality is data).
+#[derive(Debug, Serialize)]
+pub struct TagsConfigWriteResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The tag path created/edited.
+    pub path: String,
+    /// Post-configure quality string verbatim (`Good` on success).
+    pub quality: String,
+    /// The verb for the human line (`created`/`edited`) — never
+    /// serialized (the ProjectSetResult fields-touched precedent).
+    #[serde(skip)]
+    pub operation: &'static str,
+}
+
+/// `ign tags config delete PATH...` result.
+#[derive(Debug, Serialize)]
+pub struct TagsConfigDeleteResult {
+    /// The project the route answered from.
+    pub project: String,
+    /// The count the route echoed (the request length).
+    pub deleted: i64,
+}
+
+/// Recursively re-parse STRINGIFIED JSON inside a tag config: the
+/// gateway's `getConfiguration` hands `value`/`defaultValue` back as
+/// STRINGS containing JSON objects/arrays (05-RESEARCH's
+/// serialization hazard — configs carry JSON-in-a-string) — agents
+/// must see real JSON. Only OBJECT/ARRAY parses are re-parsed (a
+/// string value that parses as a scalar is still semantically a
+/// string); unparseable strings pass through verbatim. Pure —
+/// unit-pinned.
+fn reparse_stringified(config: &mut serde_json::Value) {
+    match config {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if (key == "value" || key == "defaultValue")
+                    && let serde_json::Value::String(text) = value
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text)
+                    && (parsed.is_object() || parsed.is_array())
+                {
+                    *value = parsed;
+                    continue;
+                }
+                reparse_stringified(value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                reparse_stringified(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Split a bracket-qualified tag path into `(basePath, name)` for
+/// the configure call (05-RESEARCH Pitfall 3: configure takes a
+/// basePath — NEVER a provider name — plus per-tag `name`s). The
+/// last segment after the provider bracket is the tag name; a BARE
+/// path (no brackets) rides under `[default]`. Pure — unit-pinned.
+fn split_base_path(path: &str) -> (String, String) {
+    let after_bracket = match path.find(']') {
+        Some(close) => &path[close + 1..],
+        // Bare path: the whole thing is the name under [default].
+        None => return ("[default]".to_string(), path.to_string()),
+    };
+    let bracket_end = path.len() - after_bracket.len();
+    match after_bracket.rfind('/') {
+        Some(idx) => {
+            let split = bracket_end + idx;
+            (path[..split].to_string(), path[split + 1..].to_string())
+        }
+        None => (path[..bracket_end].to_string(), after_bracket.to_string()),
+    }
+}
+
+/// The shared configure half of create/edit: derive basePath + name
+/// from the path, merge the caller's definition (the path-derived
+/// name WINS — the path is the argument of record; the CLI never
+/// re-shapes the definition — the route owns the four configure
+/// traps), then one configure call with the collision policy char.
+async fn configure_single(
+    api: &dyn GatewayApi,
+    project: &str,
+    path: &str,
+    definition: &serde_json::Value,
+    collision_policy: &str,
+    operation: &'static str,
+) -> Result<TagsConfigWriteResult, CoreError> {
+    let (base_path, name) = split_base_path(path);
+    if name.is_empty() {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "tag path {path:?} names no tag — use a full path like \
+                 [provider]Folder/TagName or [provider]TagName"
+            ),
+        });
+    }
+    let serde_json::Value::Object(map) = definition else {
+        return Err(CoreError::InvalidInput {
+            reason: "tag definition must be a JSON object (tagType/value/alarms/…)".to_string(),
+        });
+    };
+    let mut tag = map.clone();
+    tag.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({
+                "action": "configure",
+                "basePath": base_path,
+                "tags": [tag],
+                "collisionPolicy": collision_policy,
+            }),
+            &[],
+        )
+        .await?;
+    let mut rows: Vec<String> = parse_results(&data, "configure")?;
+    let quality = if rows.len() == 1 {
+        rows.remove(0)
+    } else {
+        return Err(CoreError::Internal(format!(
+            "tagConfig route configure returned {} result rows (expected exactly 1)",
+            rows.len()
+        )));
+    };
+    Ok(TagsConfigWriteResult {
+        project: project.to_string(),
+        path: path.to_string(),
+        quality,
+        operation,
+    })
+}
+
+/// `ign tags config get PATH` — route action `getConfig` (STRING
+/// tagPath — the route owns the list-form trap) with the
+/// stringified-JSON re-parse applied so agents see real JSON, not
+/// JSON-in-a-string.
+pub async fn tags_config_get(
+    api: &dyn GatewayApi,
+    project: &str,
+    path: &str,
+) -> Result<TagsConfigGetResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({"action": "getConfig", "tagPath": path}),
+            &[],
+        )
+        .await?;
+    let mut config = data
+        .get("config")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "tagConfig route getConfig returned an unexpected shape (missing `config`)"
+                    .to_string(),
+            )
+        })?;
+    let tag_type = config
+        .get("tagType")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    reparse_stringified(&mut config);
+    Ok(TagsConfigGetResult {
+        project: project.to_string(),
+        path: path.to_string(),
+        tag_type,
+        config,
+    })
+}
+
+/// `ign tags config create PATH --file -` — one configure call with
+/// collisionPolicy `'a'` (abort): creating over an existing node
+/// refuses server-side rather than silently clobbering. The CLI does
+/// NOT re-shape the definition dict (tagType discriminator, nested
+/// children, alarms-as-LIST — README documents the required shape;
+/// the route owns the four configure traps).
+pub async fn tags_config_create(
+    api: &dyn GatewayApi,
+    project: &str,
+    path: &str,
+    definition: &serde_json::Value,
+) -> Result<TagsConfigWriteResult, CoreError> {
+    configure_single(api, project, path, definition, "a", "created").await
+}
+
+/// `ign tags config edit PATH --file -` — the same configure call
+/// with collisionPolicy `'o'` scoped to the single named node (edit
+/// = overwrite that node). NOT `--yes`-guarded: a single-node edit
+/// is not a project-wide destructive (the guard set's line).
+pub async fn tags_config_edit(
+    api: &dyn GatewayApi,
+    project: &str,
+    path: &str,
+    definition: &serde_json::Value,
+) -> Result<TagsConfigWriteResult, CoreError> {
+    configure_single(api, project, path, definition, "o", "edited").await
+}
+
+/// `ign tags config delete PATH...` — route action `deleteTags`
+/// (batch paths; the route echoes the request length). Guarded at
+/// the CLI layer (destructive) — the action is the wire half.
+pub async fn tags_config_delete(
+    api: &dyn GatewayApi,
+    project: &str,
+    paths: &[String],
+) -> Result<TagsConfigDeleteResult, CoreError> {
+    webdev_precondition(api, project).await?;
+    let data = api
+        .webdev_route_call(
+            project,
+            TAG_CONFIG_ROUTE,
+            &serde_json::json!({"action": "deleteTags", "paths": paths}),
+            &[],
+        )
+        .await?;
+    let deleted = data
+        .get("deleted")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| {
+            CoreError::Internal(
+                "tagConfig route deleteTags returned an unexpected shape (missing `deleted`)"
+                    .to_string(),
+            )
+        })?;
+    Ok(TagsConfigDeleteResult {
+        project: project.to_string(),
+        deleted,
     })
 }
 
@@ -953,5 +1226,233 @@ mod tests {
             .expect_err("absent routes refuse");
         assert_eq!(err.code(), "routes_not_deployed");
         assert!(rig.calls.lock().unwrap().is_empty());
+    }
+
+    // ---- config get/create/edit/delete (05-05, TAGS-05) ----
+
+    use super::{
+        TagsConfigGetResult, configure_single, reparse_stringified, split_base_path,
+        tags_config_create, tags_config_delete, tags_config_edit, tags_config_get,
+    };
+
+    fn present() -> RouteProbe {
+        RouteProbe::Present {
+            route_version: BUNDLE_VERSION.to_string(),
+        }
+    }
+
+    /// THE stringified re-parse: `value`/`defaultValue` strings
+    /// containing JSON objects/arrays become real JSON; scalar-parse
+    /// strings and unparseable strings stay STRINGS (semantics
+    /// preserved); other keys are untouched; nested children are
+    /// walked.
+    #[test]
+    fn reparse_stringified_rewrites_only_structured_value_strings() {
+        let mut config = serde_json::json!({
+            "name": "T1",
+            "tagType": "AtomicTag",
+            "value": "{\"dataType\": \"Int4\", \"value\": 123}",
+            "defaultValue": "[1, 2, 3]",
+            "scaleFactor": "{\"not\": \"a value key\"}",
+            "notes": "plain text stays text",
+            "numericString": "123",
+            "children": [
+                {"name": "C1", "value": "{\"a\": 1}", "junk": "not json {"}
+            ]
+        });
+        reparse_stringified(&mut config);
+        assert_eq!(
+            config["value"],
+            serde_json::json!({"dataType": "Int4", "value": 123}),
+            "stringified object value re-parsed into real JSON"
+        );
+        assert_eq!(config["defaultValue"], serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            config["scaleFactor"],
+            serde_json::json!("{\"not\": \"a value key\"}"),
+            "other string keys are NOT re-parsed"
+        );
+        assert_eq!(config["notes"], "plain text stays text");
+        assert_eq!(config["numericString"], "123", "scalar parses stay strings");
+        assert_eq!(
+            config["children"][0]["value"],
+            serde_json::json!({"a": 1}),
+            "nested children are walked"
+        );
+        assert_eq!(config["children"][0]["junk"], "not json {");
+    }
+
+    /// The path split: last segment after the bracket is the name;
+    /// everything before (bracket-qualified) is the basePath; a
+    /// BARE path rides under `[default]`.
+    #[test]
+    fn split_base_path_derives_configure_operands() {
+        assert_eq!(
+            split_base_path("[default]P5/T1"),
+            ("[default]P5".into(), "T1".into())
+        );
+        assert_eq!(
+            split_base_path("[default]T1"),
+            ("[default]".into(), "T1".into())
+        );
+        assert_eq!(
+            split_base_path("[p5e2e]Area/Motor1"),
+            ("[p5e2e]Area".into(), "Motor1".into())
+        );
+        assert_eq!(split_base_path("T1"), ("[default]".into(), "T1".into()));
+        // A provider-only path names no tag — create/edit refuse it
+        // (the empty-name guard's input).
+        assert_eq!(
+            split_base_path("[default]"),
+            ("[default]".into(), "".into())
+        );
+    }
+
+    /// config get rides the precondition + getConfig with the STRING
+    /// tagPath, and the returned config is RE-PARSED (agents see
+    /// real JSON — the must-have).
+    #[tokio::test]
+    async fn config_get_reparse_and_body_pin() {
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"config": {
+                "name": "T1",
+                "tagType": "AtomicTag",
+                "value": "{\"dataType\": \"Int4\", \"value\": 123}"
+            }}),
+        );
+        let result: TagsConfigGetResult = tags_config_get(&rig, "ign-cli", "[default]T1")
+            .await
+            .expect("config get parses");
+        assert_eq!(result.tag_type.as_deref(), Some("AtomicTag"));
+        assert_eq!(
+            result.config["value"],
+            serde_json::json!({"dataType": "Int4", "value": 123}),
+            "the stringified value is re-parsed"
+        );
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "getConfig", "tagPath": "[default]T1"}),
+            "the getConfig body is exactly action+tagPath (STRING arg)"
+        );
+    }
+
+    /// THE create body pin: basePath split + the path-derived name +
+    /// collisionPolicy 'a' — the definition rides verbatim beside
+    /// the injected name.
+    #[tokio::test]
+    async fn config_create_body_pins_base_path_and_abort_policy() {
+        let rig =
+            TagsRig::with(Vec::new()).route(present(), serde_json::json!({"results": ["Good"]}));
+        let result = tags_config_create(
+            &rig,
+            "ign-cli",
+            "[p5e2e]Area/Motor1",
+            &serde_json::json!({"tagType": "AtomicTag", "value": 42}),
+        )
+        .await
+        .expect("create configures");
+        assert_eq!(result.quality, "Good");
+        assert_eq!(result.operation, "created");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            serde_json::json!({
+                "action": "configure",
+                "basePath": "[p5e2e]Area",
+                "tags": [{"tagType": "AtomicTag", "value": 42, "name": "Motor1"}],
+                "collisionPolicy": "a"
+            }),
+            "create = configure with the split basePath and abort policy"
+        );
+    }
+
+    /// Edit is the same call with collisionPolicy 'o' (overwrite the
+    /// single named node) — and the PATH-derived name wins over any
+    /// name inside the definition (the path is the argument of
+    /// record).
+    #[tokio::test]
+    async fn config_edit_pins_overwrite_policy_and_name_precedence() {
+        let rig =
+            TagsRig::with(Vec::new()).route(present(), serde_json::json!({"results": ["Good"]}));
+        tags_config_edit(
+            &rig,
+            "ign-cli",
+            "[default]T1",
+            &serde_json::json!({"tagType": "AtomicTag", "name": "WrongName"}),
+        )
+        .await
+        .expect("edit configures");
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls[0]["collisionPolicy"], "o");
+        assert_eq!(calls[0]["basePath"], "[default]");
+        assert_eq!(
+            calls[0]["tags"][0]["name"], "T1",
+            "path wins over the definition's name"
+        );
+    }
+
+    /// The deleteTags pin: batch paths on the body, count echoed.
+    #[tokio::test]
+    async fn config_delete_pins_batch_paths() {
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({"deleted": 2}));
+        let result = tags_config_delete(
+            &rig,
+            "ign-cli",
+            &["[default]T1".to_string(), "[default]T2".to_string()],
+        )
+        .await
+        .expect("delete dispatches");
+        assert_eq!(result.deleted, 2);
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"action": "deleteTags", "paths": ["[default]T1", "[default]T2"]})
+        );
+    }
+
+    /// Precondition refusal inheritance regression pin: absent routes
+    /// refuse BEFORE any tagConfig call (zero route calls).
+    #[tokio::test]
+    async fn config_get_refuses_when_routes_absent() {
+        let rig = TagsRig::with(Vec::new()).route(RouteProbe::Absent, serde_json::json!({}));
+        let err = tags_config_get(&rig, "ign-cli", "[default]T1")
+            .await
+            .expect_err("absent routes refuse");
+        assert_eq!(err.code(), "routes_not_deployed");
+        assert_eq!(err.exit_code(), 6);
+        assert!(rig.calls.lock().unwrap().is_empty());
+    }
+
+    /// A provider-only path (no tag name) and a non-object definition
+    /// refuse invalid_input PRE-resolution of the route (zero wire
+    /// work) — the usage-error class.
+    #[tokio::test]
+    async fn config_create_refuses_path_and_shape_usage_errors() {
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({}));
+        let err = configure_single(
+            &rig,
+            "ign-cli",
+            "[default]",
+            &serde_json::json!({"tagType": "AtomicTag"}),
+            "a",
+            "created",
+        )
+        .await
+        .expect_err("provider-only path refuses");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(err.exit_code(), 2);
+
+        let err = tags_config_create(&rig, "ign-cli", "[default]T1", &serde_json::json!([1]))
+            .await
+            .expect_err("non-object definition refuses");
+        assert_eq!(err.code(), "invalid_input");
+        assert!(
+            rig.calls.lock().unwrap().is_empty(),
+            "zero route calls past the usage refusals"
+        );
     }
 }
