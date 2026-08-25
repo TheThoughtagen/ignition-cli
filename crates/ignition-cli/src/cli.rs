@@ -136,6 +136,12 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Webdev(WebdevArgs),
 
+    /// Tag operations: manage providers (native REST) and browse /
+    /// read / write tag values (the deployed WebDev routes — run
+    /// `ign webdev deploy` first)
+    #[command(arg_required_else_help = true)]
+    Tags(TagsArgs),
+
     /// Manage a Docker compose rig: up/down/reset/status/logs/trial
     /// (snapshot arrives in a later plan) — docker-only, no profile
     /// needed
@@ -393,6 +399,85 @@ pub enum WebdevCommand {
         /// Target project (default ign-cli)
         #[arg(long, default_value = "ign-cli", value_name = "NAME")]
         project: String,
+    },
+}
+
+/// Tags args (05-04, TAGS-01..04) — the grouped-subfamily pattern:
+/// `tags provider …` nests one level deeper (the family's native
+/// REST half), browse/read/write ride the TOP level. The
+/// webdev-dependent arms carry `--project` (default `ign-cli`, the
+/// same default as deploy — the deployed routes live in that
+/// project).
+#[derive(Debug, clap::Args)]
+pub struct TagsArgs {
+    #[command(subcommand)]
+    pub command: TagsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TagsCommand {
+    /// Manage tag providers (native config-resource REST — no
+    /// deployed routes involved): list with tag counts + health,
+    /// create a STANDARD provider, delete (guarded)
+    #[command(subcommand)]
+    Provider(TagsProviderCommand),
+
+    /// Browse tags as a tree (Property children filtered by
+    /// default) — providers appear at the root; needs the deployed
+    /// routes (`ign webdev deploy`)
+    Browse {
+        /// Tag path to browse from (default: the root — providers)
+        path: Option<String>,
+        /// Case-insensitive substring filter on name and full path
+        #[arg(long, value_name = "SUBSTR")]
+        filter: Option<String>,
+        /// Include Property children (filtered out by default)
+        #[arg(long)]
+        include_properties: bool,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Read one or more tag values (quality and timestamp included)
+    /// — needs the deployed routes
+    Read {
+        /// Tag paths to read, e.g. `[default]T1` (one or more)
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Write a value to a tag — the value is parsed as a JSON
+    /// scalar (number/bool/null); anything unparseable is sent as a
+    /// string; arrays/objects refuse — needs the deployed routes
+    Write {
+        /// Tag path to write, e.g. `[default]T1`
+        path: String,
+        /// Value to write: JSON scalar (42, 1.5, true), else the raw
+        /// text is sent as a string
+        #[arg(long, value_name = "V")]
+        value: String,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TagsProviderCommand {
+    /// List the gateway's tag providers (tag counts + health)
+    List,
+    /// Create a STANDARD tag provider (DB-backed providers are out
+    /// of scope at MVP)
+    Create {
+        /// Provider name to create
+        name: String,
+    },
+    /// Delete a tag provider — destructive, refused without --yes
+    Delete {
+        /// Provider name to delete
+        name: String,
     },
 }
 

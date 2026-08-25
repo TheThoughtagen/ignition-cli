@@ -31,6 +31,7 @@ use ignition_core::actions::rig::{
     SnapshotResult, TrialResetResult, TrialStatusResult,
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
+use ignition_core::actions::tags::{TagProvidersResult, TagsBrowseResult, TagsReadResult};
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
@@ -200,6 +201,18 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
         ActionOutput::WebdevStatus(result) => render_webdev_status_human(result),
+        ActionOutput::TagProviders(result) => render_tag_providers_human(result),
+        ActionOutput::TagProviderCreate(result) => {
+            println!("created tag provider {}", result.name);
+        }
+        ActionOutput::TagProviderDelete(result) => {
+            println!("deleted tag provider {}", result.deleted);
+        }
+        ActionOutput::TagsBrowse(result) => render_tags_browse_human(result),
+        ActionOutput::TagsRead(result) => render_tags_read_human(result),
+        ActionOutput::TagsWrite(result) => {
+            println!("wrote {}  quality: {}", result.path, result.quality);
+        }
     }
 }
 
@@ -832,6 +845,83 @@ fn route_status_word(status: ignition_core::actions::webdev::RouteStatus) -> &'s
         RouteStatus::AuthGated => "auth_gated",
         RouteStatus::SecretMismatch => "secret_mismatch",
         RouteStatus::VersionMismatch => "version_mismatch",
+    }
+}
+
+/// `ign tags provider list` human table: name / enabled / tags /
+/// health, the managed marker trailing (the native seam's healthy
+/// data — tag counts the route can't offer).
+fn render_tag_providers_human(result: &TagProvidersResult) {
+    println!("{:<20} {:<8} {:>5}  health", "name", "enabled", "tags");
+    for provider in &result.providers {
+        let tags = provider
+            .tag_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let health = provider.health.as_deref().unwrap_or("-");
+        let managed = if provider.managed { "  (managed)" } else { "" };
+        println!(
+            "{:<20} {:<8} {:>5}  {}{}",
+            provider.name, provider.enabled, tags, health, managed
+        );
+    }
+}
+
+/// Tree depth from a bracket-qualified fullPath: the leading
+/// `[provider]` segment is depth 0; each following segment (split on
+/// `/`, the first riding DIRECTLY after the bracket with no slash)
+/// adds one.
+fn browse_depth(path: &str) -> usize {
+    match path.find(']') {
+        Some(close) => {
+            let rest = &path[close + 1..];
+            if rest.is_empty() {
+                0
+            } else {
+                1 + rest.matches('/').count()
+            }
+        }
+        // Unbracketed paths (defensive): segments by slash.
+        None => path.matches('/').count(),
+    }
+}
+
+/// `ign tags browse` human mode: an INDENTED TREE derived from
+/// fullPath nesting (providers at the root) with tagType badges (+
+/// dataType where present). JSON mode keeps the stable flat list —
+/// agents get the flat shape, humans get the hierarchy.
+fn render_tags_browse_human(result: &TagsBrowseResult) {
+    let root = if result.path.is_empty() {
+        "root".to_string()
+    } else {
+        result.path.clone()
+    };
+    match &result.filter {
+        Some(filter) => println!("browsing {root} (filter: {filter})"),
+        None => println!("browsing {root}"),
+    }
+    for entry in &result.entries {
+        let depth = browse_depth(&entry.path);
+        let data_type = entry.data_type.as_deref().unwrap_or_default();
+        let badge = if data_type.is_empty() {
+            entry.tag_type.clone()
+        } else {
+            format!("{} {}", entry.tag_type, data_type)
+        };
+        println!("{}{}  {}", "  ".repeat(depth), entry.name, badge);
+    }
+}
+
+/// `ign tags read` human rows: path / value / quality / timestamp,
+/// aligned (the verbatim passthrough — quality strings carry their
+/// own detail and are never re-parsed).
+fn render_tags_read_human(result: &TagsReadResult) {
+    for row in &result.results {
+        let value = serde_json::to_string(&row.value).unwrap_or_default();
+        println!(
+            "{}  =  {}  [{}]  {}",
+            row.path, value, row.quality, row.timestamp
+        );
     }
 }
 

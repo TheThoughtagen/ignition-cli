@@ -32,7 +32,7 @@ use ignition_core::error::CoreError;
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
     ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
-    WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    TagsArgs, TagsCommand, TagsProviderCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -146,6 +146,20 @@ enum ActionOutput {
     /// `ign webdev status` — the per-route version-handshake sweep
     /// (degradation is data; exit 0 whenever the sweep completes).
     WebdevStatus(actions::webdev::WebdevStatusResult),
+    /// `ign tags provider list` — the native provider rows (tag
+    /// counts + health, System flagged managed).
+    TagProviders(actions::tags::TagProvidersResult),
+    /// `ign tags provider create` — a STANDARD provider created.
+    TagProviderCreate(actions::tags::TagProviderCreateResult),
+    /// `ign tags provider delete` — the signature-chained delete.
+    TagProviderDelete(actions::tags::TagProviderDeleteResult),
+    /// `ign tags browse` — the filtered flat entry list (JSON mode;
+    /// human renders the tree).
+    TagsBrowse(actions::tags::TagsBrowseResult),
+    /// `ign tags read` — verbatim per-path rows.
+    TagsRead(actions::tags::TagsReadResult),
+    /// `ign tags write` — the post-write quality.
+    TagsWrite(actions::tags::TagsWriteResult),
 }
 
 impl ActionOutput {
@@ -207,6 +221,12 @@ impl ActionOutput {
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
             ActionOutput::WebdevStatus(result) => render_success(profile, result, compact),
+            ActionOutput::TagProviders(result) => render_success(profile, result, compact),
+            ActionOutput::TagProviderCreate(result) => render_success(profile, result, compact),
+            ActionOutput::TagProviderDelete(result) => render_success(profile, result, compact),
+            ActionOutput::TagsBrowse(result) => render_success(profile, result, compact),
+            ActionOutput::TagsRead(result) => render_success(profile, result, compact),
+            ActionOutput::TagsWrite(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -1014,6 +1034,76 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // precedent) — a refusal is exit 2 with profile null and does
         // ZERO discovery work (binary-pinned: exit 2 in a cwd with no
         // rig discoverable at all).
+        // Tags (05-04, TAGS-01..04): provider verbs ride the NATIVE
+        // config-resource REST; browse/read/write ride the deployed
+        // routes (every one refuses exit 6 pre-deploy via the
+        // precondition). `tags provider delete` is the 6th
+        // destructive verb — guarded BEFORE resolution (exit 2,
+        // profile null, zero work); write's --value parses
+        // PRE-resolution (non-scalar JSON → invalid_input exit 2).
+        Commands::Tags(TagsArgs { command }) => {
+            if let TagsCommand::Provider(TagsProviderCommand::Delete { .. }) = &command
+                && let Err(err) = require_confirmation(cli.yes, "tags provider delete")
+            {
+                return (None, Err(err));
+            }
+            let write_value = match &command {
+                TagsCommand::Write { value, .. } => match parse_write_scalar(value) {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => return (None, Err(err)),
+                },
+                _ => None,
+            };
+            let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+            let result = match (&command, api) {
+                (TagsCommand::Provider(TagsProviderCommand::List), Ok(api)) => {
+                    actions::tags::tag_provider_list(&api)
+                        .await
+                        .map(ActionOutput::TagProviders)
+                }
+                (
+                    TagsCommand::Provider(TagsProviderCommand::Create { name: provider }),
+                    Ok(api),
+                ) => actions::tags::tag_provider_create(&api, provider)
+                    .await
+                    .map(ActionOutput::TagProviderCreate),
+                (
+                    TagsCommand::Provider(TagsProviderCommand::Delete { name: provider }),
+                    Ok(api),
+                ) => actions::tags::tag_provider_delete(&api, provider)
+                    .await
+                    .map(ActionOutput::TagProviderDelete),
+                (
+                    TagsCommand::Browse {
+                        path,
+                        filter,
+                        include_properties,
+                        project,
+                    },
+                    Ok(api),
+                ) => actions::tags::tags_browse(
+                    &api,
+                    project,
+                    path.as_deref().unwrap_or(""),
+                    filter.as_deref(),
+                    *include_properties,
+                )
+                .await
+                .map(ActionOutput::TagsBrowse),
+                (TagsCommand::Read { paths, project }, Ok(api)) => {
+                    actions::tags::tags_read(&api, project, paths)
+                        .await
+                        .map(ActionOutput::TagsRead)
+                }
+                (TagsCommand::Write { path, project, .. }, Ok(api)) => {
+                    actions::tags::tags_write(&api, project, path, write_value.expect("parsed"))
+                        .await
+                        .map(ActionOutput::TagsWrite)
+                }
+                (_, Err(err)) => Err(err),
+            };
+            (name, result)
+        }
         Commands::Rig(RigArgs { rig, command }) => {
             // Guard BEFORE the runner/discovery even exist (the
             // sessions-terminate precedent) — a refusal is exit 2
@@ -1522,6 +1612,25 @@ fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
         Err(CoreError::ConfirmationRequired {
             operation: operation.to_string(),
         })
+    }
+}
+
+/// `tags write --value`'s JSON-scalar rule (05-04, README-documented):
+/// parse as JSON — a scalar (number/bool/null/string) rides untyped;
+/// text that does NOT parse is a bare string (`--value hello` is the
+/// string "hello"); a parsed ARRAY/OBJECT is a usage error
+/// (`invalid_input`, exit 2, pre-resolution — the tag value wire
+/// slot is a scalar).
+fn parse_write_scalar(raw: &str) -> Result<serde_json::Value, CoreError> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) if !value.is_array() && !value.is_object() => Ok(value),
+        Ok(_) => Err(CoreError::InvalidInput {
+            reason: format!(
+                "--value must be a JSON scalar (number, bool, null, or string) — \
+                 arrays/objects cannot ride the tag write slot: {raw:?}"
+            ),
+        }),
+        Err(_) => Ok(serde_json::Value::String(raw.to_string())),
     }
 }
 

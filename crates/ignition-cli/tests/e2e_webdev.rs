@@ -311,3 +311,108 @@ async fn live_webdev_deploy_status_scriptexec_loop() {
         "redaction: the secret leaked into a spawn's output"
     );
 }
+
+/// THE tags live loop (05-04) — the first route-consuming family,
+/// self-contained: deploy the routes (browse/read/write need them),
+/// then provider create → browse root sees it → read/write on a
+/// NONEXISTENT path assert the QUALITY passthrough (quality IS data
+/// — `Bad_NotFound`/`Bad` come back as exit-0 data, the honest
+/// oracle verifiable without mutation side effects) → provider
+/// delete cleans up. Provider verbs themselves ride the NATIVE REST
+/// (no route dependency).
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_provider_browse_read_write_loop() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+
+    // Routes first: browse/read/write refuse exit 6 without them.
+    let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
+    expect_ok("deploy (the tags route's precondition)", &out);
+
+    // Provider create (NATIVE REST): a STANDARD provider named p5e2e.
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "create", "p5e2e", "--compact"],
+    );
+    expect_ok("provider create p5e2e", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["name"], "p5e2e");
+
+    // Provider list sees it (native), browse root sees it (route).
+    let out = ign(&config, &env, &["tags", "provider", "list", "--compact"]);
+    expect_ok("provider list", &out);
+    let envelope = data_envelope(&out);
+    assert!(
+        envelope["data"]["providers"]
+            .as_array()
+            .expect("providers[]")
+            .iter()
+            .any(|row| row["name"] == "p5e2e"),
+        "p5e2e in the native list: {envelope}"
+    );
+    let out = ign(&config, &env, &["tags", "browse", "--compact"]);
+    expect_ok("browse root", &out);
+    let envelope = data_envelope(&out);
+    assert!(
+        envelope["data"]["entries"]
+            .as_array()
+            .expect("entries[]")
+            .iter()
+            .any(|entry| entry["path"] == "[p5e2e]"),
+        "browse root contains the fresh provider: {envelope}"
+    );
+
+    // Read a NONEXISTENT path: exit 0, the quality passthrough IS
+    // the honest oracle (Bad_NotFound — quality never parsed, so a
+    // missing tag is DATA, not an error).
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "read", "[p5e2e]DoesNotExist", "--compact"],
+    );
+    expect_ok("read nonexistent path (quality is data)", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["results"][0]["quality"], "Bad_NotFound");
+
+    // Write to the nonexistent path likewise returns a Bad quality
+    // (verifiable without mutation side effects on a fresh
+    // provider).
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "write",
+            "[p5e2e]DoesNotExist",
+            "--value",
+            "7",
+            "--compact",
+        ],
+    );
+    expect_ok("write nonexistent path (quality is data)", &out);
+    let envelope = data_envelope(&out);
+    assert!(
+        envelope["data"]["quality"]
+            .as_str()
+            .expect("quality present")
+            .starts_with("Bad"),
+        "a nonexistent target writes Bad quality: {envelope}"
+    );
+
+    // Cleanup: the guarded, signature-chained native delete.
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "delete", "p5e2e", "--yes", "--compact"],
+    );
+    expect_ok("provider delete p5e2e (guarded)", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["deleted"], "p5e2e");
+}
