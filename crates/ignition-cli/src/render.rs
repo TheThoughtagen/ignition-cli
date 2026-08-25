@@ -32,8 +32,9 @@ use ignition_core::actions::rig::{
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::actions::tags::{
-    TagProvidersResult, TagsBrowseResult, TagsConfigGetResult, TagsExportResult, TagsReadResult,
-    TagsUdtDefResult, TagsUdtTypesResult,
+    TagProvidersResult, TagsAlarmsActiveResult, TagsAlarmsAckResult, TagsAlarmsHistoryResult,
+    TagsBrowseResult, TagsConfigGetResult, TagsExportResult, TagsHistoryQueryResult,
+    TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
 };
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::client::logs::LogEntry;
@@ -249,6 +250,10 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
                 result.imported, result.provider, result.collision_policy
             );
         }
+        ActionOutput::TagsAlarmsActive(result) => render_tags_alarms_active_human(result),
+        ActionOutput::TagsAlarmsHistory(result) => render_tags_alarms_history_human(result),
+        ActionOutput::TagsAlarmsAck(result) => render_tags_alarms_ack_human(result),
+        ActionOutput::TagsHistoryQuery(result) => render_tags_history_query_human(result),
     }
 }
 
@@ -999,6 +1004,114 @@ fn render_tags_export_human(result: &TagsExportResult) {
         file,
         result.tag_count
     );
+}
+
+/// One dataset cell → display text: strings unquoted, null as
+/// `null`, structured values as compact JSON (the t_stamp/quality
+/// strings carry their own meaning — never re-parsed).
+fn cell_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// The aligned columns/rows table shared by the history renderers
+/// (alarms history + history query): header row, then rows padded to
+/// the column widths (the LAST column rides unpadded — no trailing
+/// whitespace).
+fn render_aligned_columns(columns: &[String], rows: &[Vec<String>]) {
+    let mut widths: Vec<usize> = columns.iter().map(String::len).collect();
+    for row in rows {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(cell.len());
+        }
+    }
+    let header: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            if idx + 1 == columns.len() {
+                name.clone()
+            } else {
+                format!("{:<width$}", name, width = widths[idx])
+            }
+        })
+        .collect();
+    println!("{}", header.join("  "));
+    for row in rows {
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| {
+                if idx + 1 == row.len() {
+                    cell.clone()
+                } else {
+                    format!("{:<width$}", cell, width = widths[idx])
+                }
+            })
+            .collect();
+        println!("{}", line.join("  "));
+    }
+}
+
+/// `ign tags alarms active` human table: the SHORT eventId (first 8
+/// chars of the UUID — the full id rides JSON), source, state,
+/// priority, name.
+fn render_tags_alarms_active_human(result: &TagsAlarmsActiveResult) {
+    println!(
+        "{:<10} {:<44} {:<24} {:<8} name",
+        "eventId", "source", "state", "priority"
+    );
+    for alarm in &result.alarms {
+        let short_id = &alarm.event_id[..alarm.event_id.len().min(8)];
+        let name = alarm.name.as_deref().unwrap_or("-");
+        println!(
+            "{:<10} {:<44} {:<24} {:<8} {}",
+            short_id, alarm.source, alarm.state, alarm.priority, name
+        );
+    }
+}
+
+/// `ign tags alarms history` human mode: the journal dataset as an
+/// aligned table (the wire shape is journal-dataset-dependent — the
+/// header IS the column list) + the row count.
+fn render_tags_alarms_history_human(result: &TagsAlarmsHistoryResult) {
+    let rows: Vec<Vec<String>> = result
+        .rows
+        .iter()
+        .map(|row| result.columns.iter().map(|column| cell_text(&row[column])).collect())
+        .collect();
+    render_aligned_columns(&result.columns, &rows);
+    println!("{} row(s)", result.count);
+}
+
+/// `ign tags alarms ack` human mode: the honest count + the
+/// unacknowledged remainder (the route's own return).
+fn render_tags_alarms_ack_human(result: &TagsAlarmsAckResult) {
+    if result.unacknowledged.is_empty() {
+        println!("acknowledged {} alarm(s)", result.acknowledged);
+    } else {
+        println!(
+            "acknowledged {} alarm(s); unacknowledged: {}",
+            result.acknowledged,
+            result.unacknowledged.join(", ")
+        );
+    }
+}
+
+/// `ign tags history query` human mode: the dataset as an aligned
+/// table — `t_stamp` first (preserved EXACTLY), one column per tag
+/// path — + the row count.
+fn render_tags_history_query_human(result: &TagsHistoryQueryResult) {
+    let rows: Vec<Vec<String>> = result
+        .rows
+        .iter()
+        .map(|row| row.iter().map(cell_text).collect())
+        .collect();
+    render_aligned_columns(&result.columns, &rows);
+    println!("{} row(s)", result.row_count);
 }
 
 /// `ign rig status` human table: identity header, one row per service

@@ -32,8 +32,8 @@ use ignition_core::error::CoreError;
 use crate::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
     ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
-    TagsArgs, TagsCommand, TagsConfigCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs,
-    WaitCmd, WebdevArgs, WebdevCommand,
+    TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
+    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
@@ -178,6 +178,16 @@ enum ActionOutput {
     TagsExport(actions::tags::TagsExportResult),
     /// `ign tags import` — counts + provider.
     TagsImport(actions::tags::TagsImportResult),
+    /// `ign tags alarms active` — the active alarm rows.
+    TagsAlarmsActive(actions::tags::TagsAlarmsActiveResult),
+    /// `ign tags alarms history` — the journal rows (journal-shape
+    /// dependent, verbatim).
+    TagsAlarmsHistory(actions::tags::TagsAlarmsHistoryResult),
+    /// `ign tags alarms ack` — the honest count + remainder.
+    TagsAlarmsAck(actions::tags::TagsAlarmsAckResult),
+    /// `ign tags history query` — the dataset with t_stamp
+    /// preserved exactly.
+    TagsHistoryQuery(actions::tags::TagsHistoryQueryResult),
 }
 
 impl ActionOutput {
@@ -256,6 +266,10 @@ impl ActionOutput {
             // already printed raw).
             ActionOutput::TagsExport(result) => render_success(profile, result, compact),
             ActionOutput::TagsImport(result) => render_success(profile, result, compact),
+            ActionOutput::TagsAlarmsActive(result) => render_success(profile, result, compact),
+            ActionOutput::TagsAlarmsHistory(result) => render_success(profile, result, compact),
+            ActionOutput::TagsAlarmsAck(result) => render_success(profile, result, compact),
+            ActionOutput::TagsHistoryQuery(result) => render_success(profile, result, compact),
         }
     }
 }
@@ -1072,6 +1086,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // work); write's --value parses PRE-resolution; the config
         // create/edit + import byte sources (definition/payload JSON)
         // read PRE-resolution (the resource-put precedent).
+        // 05-06 adds alarms active/history/ack + history query:
+        // --start/--end parse PRE-resolution (usage errors lead);
+        // ack is deliberately NOT guarded (acknowledging never
+        // un-acknowledges — a state-advancing read-adjacent verb).
         Commands::Tags(TagsArgs { command }) => {
             let guard_operation = match &command {
                 TagsCommand::Provider(TagsProviderCommand::Delete { .. }) => {
@@ -1121,6 +1139,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         actions::tags::default_export_file_name(paths),
                     )),
                 }),
+                _ => None,
+            };
+            // The time-bearing verbs (alarms history, history
+            // query): --start/--end parse to epoch-ms PRE-resolution
+            // (RFC3339 or raw digits; the parse_write_scalar
+            // precedent — usage errors lead, zero wire work).
+            let time_args = match &command {
+                TagsCommand::Alarms(TagsAlarmsCommand::History { start, end, .. })
+                | TagsCommand::History(TagsHistoryCommand::Query { start, end, .. }) => {
+                    match (
+                        actions::tags::parse_time_ms(start),
+                        actions::tags::parse_time_ms(end),
+                    ) {
+                        (Ok(start_ms), Ok(end_ms)) => Some((start_ms, end_ms)),
+                        (Err(err), _) | (_, Err(err)) => return (None, Err(err)),
+                    }
+                }
                 _ => None,
             };
             let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
@@ -1244,6 +1279,72 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 )
                 .await
                 .map(ActionOutput::TagsImport),
+                (
+                    TagsCommand::Alarms(TagsAlarmsCommand::Active {
+                        source,
+                        priority,
+                        state,
+                        project,
+                    }),
+                    Ok(api),
+                ) => actions::tags::tags_alarms_active(
+                    &api,
+                    project,
+                    source.as_deref(),
+                    priority.as_deref(),
+                    state.as_deref(),
+                )
+                .await
+                .map(ActionOutput::TagsAlarmsActive),
+                (
+                    TagsCommand::Alarms(TagsAlarmsCommand::History { project, .. }),
+                    Ok(api),
+                ) => {
+                    let (start_ms, end_ms) = time_args.expect("parsed pre-resolution");
+                    actions::tags::tags_alarms_history(&api, project, start_ms, end_ms)
+                        .await
+                        .map(ActionOutput::TagsAlarmsHistory)
+                }
+                (
+                    TagsCommand::Alarms(TagsAlarmsCommand::Ack {
+                        ids,
+                        note,
+                        username,
+                        project,
+                    }),
+                    Ok(api),
+                ) => actions::tags::tags_alarms_ack(
+                    &api,
+                    project,
+                    ids,
+                    note.as_deref().unwrap_or(""),
+                    username,
+                )
+                .await
+                .map(ActionOutput::TagsAlarmsAck),
+                (
+                    TagsCommand::History(TagsHistoryCommand::Query {
+                        paths,
+                        return_size,
+                        aggregation,
+                        project,
+                        ..
+                    }),
+                    Ok(api),
+                ) => {
+                    let (start_ms, end_ms) = time_args.expect("parsed pre-resolution");
+                    actions::tags::tags_history_query(
+                        &api,
+                        project,
+                        paths,
+                        start_ms,
+                        end_ms,
+                        *return_size,
+                        aggregation.as_deref(),
+                    )
+                    .await
+                    .map(ActionOutput::TagsHistoryQuery)
+                }
                 (_, Err(err)) => Err(err),
             };
             (name, result)

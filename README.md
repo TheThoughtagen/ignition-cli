@@ -32,7 +32,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -156,6 +156,10 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign tags udt def <NAME> [--provider NAME] [--project NAME]` | A UDT definition (parameters + nested children, recursive) | needs the deployed routes; the SAME stringified re-parse applies (parameter `defaultValue`s and child values become real JSON); JSON data `{project, provider, name, definition}` |
 | `ign tags export <PATH>... [-o FILE] [--project NAME]` | Export tag subtrees to a JSON file — the bulk-transfer half | needs the deployed routes; **JSON only** — the gateway's native interchange (`exportTags`), xml/csv deferred to backlog as documented format-discretion; the payload is parsed and validated (a list of subtrees) and written PRETTY; default file `<last-path-segment>.json` in the cwd, `-o FILE` overrides, **`-o -` prints the raw pretty payload in every mode** (the fourth sanctioned stdout exception — pipe it into `tags import --file -`); JSON data `{project, paths, file, stdout, tag_count}` |
 | `ign tags import --file FILE\|- --provider NAME [--collision-policy abort\|overwrite] [--project NAME]` | Import a JSON tag export into a target provider | needs the deployed routes; the provider must exist (`ign tags provider create NAME`); **the locked collision matrix**: abort (default) pre-checks by browsing the target and refuses exit 6 (`tag_collision`, hint names `--collision-policy overwrite`) BEFORE any write, then imports with server-side abort as the backstop; overwrite replaces existing tags — **destructive: exit 2 without `--yes`**, no pre-check (the server is the authority); merge is Designer-only (not a value); JSON data `{project, provider, collision_policy, imported}` |
+| `ign tags alarms active [--source S] [--priority P] [--state S] [--project NAME]` | List ACTIVE alarms — `eventId (short)  source  state  priority  name` | needs the deployed routes; only present filters ride the wire (kwargs passthrough to `system.alarm.queryStatus`); state strings read `'Active, Unacknowledged'` verbatim — never parsed; JSON rows carry `{event_id, source, state, priority, name}` (name null when the event carries none) |
+| `ign tags alarms history --start T --end T [--project NAME]` | Query alarm history (journal rows, columns dataset-dependent) | needs the deployed routes; **a journal-provisioned gateway only** — default rigs refuse exit 6 `alarm_journal_missing` with the hint naming the provisioning chain (see **Alarm history** below); `--start/--end` take RFC3339 or epoch-ms; rows ride VERBATIM (the journal schema varies by Ignition version — the header IS the column list) |
+| `ign tags alarms ack ID... --username NAME [--note NOTE] [--project NAME]` | Acknowledge alarms — the count + the unacknowledged remainder | needs the deployed routes; the gateway-scope 3-arg wire form needs the username, so `--username` is REQUIRED (the CLI never guesses one); **NOT `--yes`-guarded by design** — acknowledging never un-acknowledges anything (a state-advancing, read-adjacent verb); the 8.3 return IS the unacknowledged remainder — `acknowledged` is computed honestly (requested − remainder); JSON data `{project, acknowledged, unacknowledged}` |
+| `ign tags history query PATH... --start T --end T [--return-size N] [--aggregation MODE] [--project NAME]` | Query HISTORICAL tag values — the `t_stamp` column + one column per tag | needs the deployed routes; **structurally safe on ANY rig** (zero historians → a well-formed dataset with null values, exit 0); DATA requires a provisioned historian (see **Tag history** below); `t_stamp` is preserved EXACTLY (never renamed) and tag columns ride PROVIDER-RELATIVE (`[default]P5H/T1` surfaces as `P5H/T1` — live-proven); `--start/--end` take RFC3339 or epoch-ms; `--aggregation` defaults to the route's `LastValue`; JSON data `{project, paths, columns, rows, row_count}` |
 | `ign rig [--rig NAME] up [--timeout S]` | Bring a Docker compose rig up (`compose up -d --wait`) and wait for the gateway | docker-only (`profile: null` envelope); `--timeout` is BOTH compose's `--wait-timeout` and the commissioned-probe deadline (default 300 s); a fresh-volume rig reports `"up, uncommissioned"` as DATA (exit 0, wizard URL in `warnings`) |
 | `ign rig [--rig NAME] down` | Stop the rig (`compose down --remove-orphans`; volumes KEPT) | docker-only; the volume-deleting teardown belongs to `rig reset` |
 | `ign rig [--rig NAME] reset [--timeout S]` | Tear the rig down AND remove its volumes, then bring it back up fresh (`down -v --remove-orphans` → pre-flight → `up --wait` → commissioned wait) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`, BEFORE any discovery runs; `removed_volumes` in the data reports exactly what `-v` took; no stale project/trial state survives (a fresh volume usually boots uncommissioned — exit 0, wizard URL in `warnings`) |
@@ -560,7 +564,10 @@ restart, project mutations, and resource
 writes are
 audit-logged server-side by the gateway. Non-destructive project
 mutations (`copy`, `rename`, `set`, `export`) create, relabel, or read
-rather than destroy, so they carry no `--yes`.
+rather than destroy, so they carry no `--yes`. `tags alarms ack`
+likewise carries no guard — acknowledging is state-advancing but
+never destructive (it cannot un-acknowledge anything), the
+read-adjacent verb family's line.
 
 ## The CLI's WebDev routes (`ign webdev`)
 
@@ -605,6 +612,17 @@ every refusal is detectable only from the body envelope
 projects both answer 405 — `ign doctor`'s earlier 404 assumption was
 wrong and has been re-pinned).
 
+**The route-authoring contract (live-bisected 05-06):** every
+`doPost.py` must begin with `def doPost(...)` at BYTE 0. Any
+module-level content before it — comments, constants, even a blank
+line — makes the route silently unloadable on the real WebDev engine
+(the servlet answers 200 with an empty body; nothing is logged). The
+route sources keep their header docs and `ROUTE_VERSION`/`MIN_CLI`
+constants NESTED inside `doPost` for exactly this reason. A second,
+related engine quirk: the `exec(...)` CALL form can fail to compile
+at deep nesting on this Jython build — use the statement form
+(`exec code in globals`) in route scripts.
+
 `ign webdev status` itself is a READ: it exits 0 whenever the sweep
 completes and reports per-route degradation as data (the doctor
 precedent) — the refusal matrix above belongs to the tag commands
@@ -639,6 +657,84 @@ conventions are IDENTICAL to project import's (locked in Phase 3):
 abort pre-checks and refuses before any write; overwrite is
 `--yes`-guarded with no pre-check. `export -o -` pipes into
 `import --file -`.
+
+Live-proven payload shapes (05-06): the gateway's `exportTags` never
+answers a bare array — one path yields a SINGLE subtree object,
+several yield the `{"tags": [...]}` wrapper. `tags export`
+NORMALIZES both to the list-of-subtrees interchange (what the export
+file carries and `tags import` consumes). A provider-shaped export
+subtree (empty `name`) lands its CHILDREN at the import target —
+the abort pre-check and the `imported` count therefore key on the
+EFFECTIVE top-level names, and the structural `_types_` folder
+(present on every provider; the server's own abort policy accepts
+configuring it) never counts as a collision.
+
+### Alarms and tag history
+
+The alarms + tagHistory routes close the tag surface (TAGS-07/08).
+**The alarm lifecycle is live-proven end-to-end** (configure a
+LIST-form alarm → write past the setpoint → `alarms active` shows
+`Active, Unacknowledged` → `alarms ack` → the state flips to
+`Active, Acknowledged`):
+
+- `alarms active` filters ride `system.alarm.queryStatus` kwargs
+  verbatim; quality/state strings are data, never parsed.
+- **Alarm history needs a JOURNAL — and default rigs have none.**
+  `alarms history` on an unprovisioned rig refuses exit 6
+  (`alarm_journal_missing`) naming the missing chain — the honest,
+  actionable default-rig path (live-proven). The provisioning chain
+  is: (1) a running database reachable from the gateway (e.g. a
+  sidecar postgres container), (2) a `ignition/database-connection`
+  resource pointing at it, (3) an `ignition/alarm-journal` profile
+  referencing that connection, and (4) the
+  `ignition/general-alarm-settings` singleton pointed at the journal
+  profile. All four steps are native config-resource REST (the same
+  resource family as tag providers) — provisionable headlessly once
+  a database exists; the e2e gate leaves this as a documented
+  stretch (the wiremock pins carry the capability proof).
+- `alarms ack` is the gateway-scope 3-arg form (`String[] ids, note,
+  username`) — the explicit `--username` is required, and the
+  unacknowledged REMAINDER comes back as data (acknowledged =
+  requested − remainder, computed client-side honestly).
+
+**Tag history (TAGS-08):** `tags history query` works STRUCTURALLY
+on any rig (a well-formed `t_stamp`-keyed dataset, null values
+without a historian — exit 0). DATA requires a provisioned
+historian: an **InternalHistorian needs no database** — creatable
+via native REST
+(`POST /data/api/v1/resources/com.inductiveautomation.historian/historian-provider`,
+profile type `InternalHistorian`; the e2e gate provisions one
+live). The e2e gate also runs the bounded tag↔historian **binding
+spike** (05-RESEARCH's open question): the base shape
+(`historyEnabled: true` + `historicalProvider` on the tag) stores
+and the historian registers, but queryTagHistory still answers null
+— none of the documented candidates (execution scan-class keys,
+aggregation variations, browseHistoricalTags cross-check) produced
+data within the budget. **Outcome: documented limitation** — the
+query capability is the phase criterion; the Designer-diff
+follow-up (create one history tag by hand in the Designer, `tags
+config get` it via this CLI, diff the shapes) is the resolution
+path.
+
+### Phase 5 requirement map
+
+| Requirement | Shipped as |
+|-------------|------------|
+| WEB-01 (route bundle + deploy) | `ign webdev deploy` (+ the embedded 13-member bundle) |
+| WEB-02 (status sweep) | `ign webdev status` |
+| TAGS-01 (provider CRUD) | `ign tags provider list/create/delete` |
+| TAGS-02 (browse) | `ign tags browse` |
+| TAGS-03 (read) | `ign tags read` |
+| TAGS-04 (write) | `ign tags write` |
+| TAGS-05 (config CRUD) | `ign tags config get/create/edit/delete` |
+| TAGS-06 (UDTs) | `ign tags udt types/def` |
+| TAGS-07 (alarms) | `ign tags alarms active/history/ack` |
+| TAGS-08 (tag history) | `ign tags history query` |
+| TAGS-09 (bulk transfer) | `ign tags export/import` |
+
+Parity with the 21-tool MCP tag-domain surface is complete
+(intent-corrected, not bug-replicated — the prior-art defects the
+research found are corrected in the routes).
 
 ### scriptExec — the LOCKED security posture
 

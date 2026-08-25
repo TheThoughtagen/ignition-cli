@@ -472,6 +472,15 @@ pub enum TagsCommand {
     /// children) — needs the deployed routes
     #[command(subcommand)]
     Udt(TagsUdtCommand),
+    /// Alarm operations: active status (with filters), journal
+    /// history, acknowledge — needs the deployed routes
+    #[command(subcommand)]
+    Alarms(TagsAlarmsCommand),
+    /// Tag history queries (historian-backed values) — needs the
+    /// deployed routes; structurally safe on any rig (data requires
+    /// a provisioned historian)
+    #[command(subcommand)]
+    History(TagsHistoryCommand),
     /// Export tag subtrees to a JSON file (the bulk-transfer half —
     /// the gateway's native interchange, JSON only)
     Export {
@@ -601,6 +610,94 @@ pub enum TagsProviderCommand {
     Delete {
         /// Provider name to delete
         name: String,
+    },
+}
+
+/// `tags alarms …` — the alarm subfamily (05-06, TAGS-07). History
+/// needs a JOURNAL-PROVISIONED gateway (database connection +
+/// alarm-journal profile + general-alarm-settings — default rigs
+/// refuse exit 6 with the provisioning hint); acknowledge is the
+/// gateway-scope 3-arg form, so `--username` is REQUIRED (no
+/// default-guessing) and ack is deliberately NOT `--yes`-guarded
+/// (acknowledging never un-acknowledges anything — a state-advancing
+/// read-adjacent verb).
+#[derive(Debug, Subcommand)]
+pub enum TagsAlarmsCommand {
+    /// List active alarms — eventId/source/state/priority/name
+    Active {
+        /// Filter by alarm source (e.g. `prov:default`)
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
+        /// Filter by priority (e.g. `High`)
+        #[arg(long, value_name = "PRIORITY")]
+        priority: Option<String>,
+        /// Filter by state (e.g. `Active, Unacknowledged`)
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Query alarm history — requires a journal-provisioned gateway
+    /// (default rigs refuse with the provisioning hint naming the
+    /// missing chain)
+    History {
+        /// Window start: RFC3339 timestamp or epoch-ms
+        #[arg(long, value_name = "T")]
+        start: String,
+        /// Window end: RFC3339 timestamp or epoch-ms
+        #[arg(long, value_name = "T")]
+        end: String,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Acknowledge alarms (explicit --username: the 3-arg wire form
+    /// needs it). NOT --yes-guarded — acknowledging never
+    /// un-acknowledges anything
+    Ack {
+        /// Alarm event ids to acknowledge (from `alarms active`)
+        #[arg(value_name = "ID", required = true)]
+        ids: Vec<String>,
+        /// Acknowledgement note (default: empty)
+        #[arg(long, value_name = "NOTE")]
+        note: Option<String>,
+        /// The username acknowledging (REQUIRED — the 3-arg wire
+        /// form needs it; the CLI never guesses one)
+        #[arg(long, value_name = "NAME")]
+        username: String,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+}
+
+/// `tags history …` — the historian subfamily (05-06, TAGS-08).
+#[derive(Debug, Subcommand)]
+pub enum TagsHistoryCommand {
+    /// Query historical tag values — t_stamp + one column per tag;
+    /// structurally safe anywhere (data requires a provisioned
+    /// historian)
+    Query {
+        /// Tag paths to query, e.g. `[default]T1` (one or more)
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// Window start: RFC3339 timestamp or epoch-ms
+        #[arg(long, value_name = "T")]
+        start: String,
+        /// Window end: RFC3339 timestamp or epoch-ms
+        #[arg(long, value_name = "T")]
+        end: String,
+        /// Maximum rows returned
+        #[arg(long, value_name = "N")]
+        return_size: Option<i64>,
+        /// Aggregation mode (e.g. `LastValue`, `Average`, `MinMax`);
+        /// default is the route's LastValue
+        #[arg(long, value_name = "MODE")]
+        aggregation: Option<String>,
+        /// Project holding the deployed routes (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
     },
 }
 

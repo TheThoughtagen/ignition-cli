@@ -1204,3 +1204,398 @@ async fn tags_json_input_usage_refusals() {
     assert_eq!(envelope["error"]["code"], "invalid_input");
     assert_eq!(envelope["profile"], Value::Null);
 }
+
+// ---- 05-06: alarms + history query goldens ----
+
+/// Mount ONE scripted action on the ALARMS route (the precondition
+/// probe included — it always probes the tags route).
+async fn mount_alarms_action(server: &wiremock::MockServer, action: &str, data: Value) {
+    mount_tags_probe(server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": action}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"ok": true, "data": data})),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// Alarms active goldens: the human table (SHORT eventId, source,
+/// state, priority, name) and the compact agent shape
+/// (unit-explicit keys, all keys always — name null degrades).
+#[tokio::test]
+async fn tags_alarms_active_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_alarms_action(
+        &server,
+        "active",
+        serde_json::json!({"results": [
+            {"eventId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301", "source": "prov:tagprov:/T1/HighLimit", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit"},
+            {"eventId": "9b9e9e9e-1111-2222-3333-444455556666", "source": "prov:tagprov:/T2/LowLimit", "state": "Active, Unacknowledged", "priority": "Medium", "name": null}
+        ], "count": 2}),
+    )
+    .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "alarms", "active", "--source", "prov:tagprov"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+eventId    source                                       state                    priority name
+3f2504e0   prov:tagprov:/T1/HighLimit                   Active, Unacknowledged   High     HighLimit
+9b9e9e9e   prov:tagprov:/T2/LowLimit                    Active, Unacknowledged   Medium   -
+"#]],
+    );
+
+    let out = ign(&config, &server.uri(), &["tags", "alarms", "active", "--compact"]);
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","alarms":[{"event_id":"3f2504e0-4f89-11d3-9a0c-0305e82c3301","source":"prov:tagprov:/T1/HighLimit","state":"Active, Unacknowledged","priority":"High","name":"HighLimit"},{"event_id":"9b9e9e9e-1111-2222-3333-444455556666","source":"prov:tagprov:/T2/LowLimit","state":"Active, Unacknowledged","priority":"Medium","name":null}],"count":2}}"#]],
+    );
+}
+
+/// THE journal-missing refusal golden: a default rig (the alarms
+/// route denies history with the structured code) → exit 6,
+/// `alarm_journal_missing`, hint naming the provisioning chain +
+/// README section. (Also proves the denial mapping at the BINARY
+/// level.)
+#[tokio::test]
+async fn tags_alarms_journal_missing_refusal_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "history"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {"code": "no_alarm_journal", "message": "No alarm journal profile specified"}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "alarms",
+            "history",
+            "--start",
+            "2026-08-25T00:00:00Z",
+            "--end",
+            "1787659200000",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "journal-less rig exits 6");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "alarm_journal_missing");
+    let hint = envelope["error"]["hint"].as_str().expect("hint present");
+    assert!(
+        hint.contains("journal profile") && hint.contains("README"),
+        "hint names the chain + README section: {hint}"
+    );
+}
+
+/// Alarm history SUCCESS golden: journal rows render as the aligned
+/// columns/rows table (the journal wire shape is dataset-dependent —
+/// the header IS the column list).
+#[tokio::test]
+async fn tags_alarms_history_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_alarms_action(
+        &server,
+        "history",
+        serde_json::json!({"results": [
+            {"eventId": "e-1", "source": "prov:tagprov:/T1/HighLimit", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit", "eventData": null}
+        ], "count": 1}),
+    )
+    .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "alarms",
+            "history",
+            "--start",
+            "1787000000000",
+            "--end",
+            "1787659200000",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+eventData  eventId  name       priority  source                      state
+null       e-1      HighLimit  High      prov:tagprov:/T1/HighLimit  Active, Unacknowledged
+1 row(s)
+"#]],
+    );
+}
+
+/// THE ack golden: the 3-arg body pins on the wire (string ids +
+/// note + username), and both render modes carry the honest count +
+/// the unacknowledged remainder.
+#[tokio::test]
+async fn tags_alarms_ack_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "acknowledge",
+            "eventIds": ["e-1", "e-2"],
+            "note": "handled",
+            "username": "op"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"unacknowledged": ["e-2"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "alarms",
+            "ack",
+            "e-1",
+            "e-2",
+            "--note",
+            "handled",
+            "--username",
+            "op",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+acknowledged 1 alarm(s); unacknowledged: e-2
+"#]],
+    );
+
+    // The compact agent shape: the honest count + remainder array.
+    let server = wiremock::MockServer::start().await;
+    mount_alarms_action(&server, "acknowledge", serde_json::json!({"unacknowledged": []}))
+        .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "alarms",
+            "ack",
+            "e-1",
+            "--username",
+            "op",
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","acknowledged":1,"unacknowledged":[]}}"#]],
+    );
+}
+
+/// THE history query golden: RFC3339 + epoch-ms time args parse to
+/// the epoch-ms body (pinned on the wire), the dataset renders with
+/// `t_stamp` visible (preserved EXACTLY), and the compact shape
+/// carries {columns, rows, row_count} verbatim.
+#[tokio::test]
+async fn tags_history_query_golden() {
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tagHistory"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "query",
+            "paths": ["[default]T1"],
+            "startDateMs": 1787659200000_i64,
+            "endDateMs": 1787659260000_i64,
+            "returnSize": 10
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {
+                    "columns": ["t_stamp", "[default]T1"],
+                    "rows": [["Mon Aug 24 00:00:00 UTC 2026", 7], ["Mon Aug 24 00:01:00 UTC 2026", null]],
+                    "rowCount": 2
+                }
+            })),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    // RFC3339 start (→ 1787659200000) + epoch-ms end, --return-size
+    // riding the body.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "history",
+            "query",
+            "[default]T1",
+            "--start",
+            "2026-08-25T12:00:00Z",
+            "--end",
+            "1787659260000",
+            "--return-size",
+            "10",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+t_stamp                       [default]T1
+Mon Aug 24 00:00:00 UTC 2026  7
+Mon Aug 24 00:01:00 UTC 2026  null
+2 row(s)
+"#]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "history",
+            "query",
+            "[default]T1",
+            "--start",
+            "2026-08-25T12:00:00Z",
+            "--end",
+            "1787659260000",
+            "--return-size",
+            "10",
+            "--compact",
+        ],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","paths":["[default]T1"],"columns":["t_stamp","[default]T1"],"rows":[["Mon Aug 24 00:00:00 UTC 2026",7],["Mon Aug 24 00:01:00 UTC 2026",null]],"row_count":2}}"#]],
+    );
+}
+
+/// The time-arg usage refusals (invalid_input, pre-resolution, ZERO
+/// wire work) and the missing-required-username shape: an
+/// unparseable --start/--end exits 2 before ANY resolution; ack
+/// without --username is a clap usage error.
+#[tokio::test]
+async fn tags_time_and_username_usage_refusals() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    // Garbage time: exit 2 invalid_input, profile null — no mocks
+    // mounted, so any wire work would have failed the spawn.
+    for args in [
+        vec![
+            "tags",
+            "alarms",
+            "history",
+            "--start",
+            "yesterday",
+            "--end",
+            "1787659200000",
+            "--compact",
+        ],
+        vec![
+            "tags",
+            "history",
+            "query",
+            "[default]T1",
+            "--start",
+            "1787659200000",
+            "--end",
+            "soon",
+            "--compact",
+        ],
+    ] {
+        let out = ign(&config, "http://ignored.example.com", &args);
+        assert_eq!(out.status.code(), Some(2));
+        let envelope = stderr_envelope(&out);
+        assert_eq!(envelope["error"]["code"], "invalid_input");
+        assert_eq!(envelope["profile"], Value::Null);
+    }
+
+    // Ack without --username: clap usage error (exit 2).
+    let out = ign(
+        &config,
+        "http://ignored.example.com",
+        &["tags", "alarms", "ack", "e-1", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--username"),
+        "the usage error names the required flag"
+    );
+}
