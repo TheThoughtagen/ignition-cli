@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 EXECUTING: 05-01 route sources + embedded bundle, 05-02 resource-family re-point (Phase 3 blocker CLOSED), and 05-03 webdev client seam + deploy/status COMPLETE — the hinge seam every tag command rides. Next: 05-04..05-06 (tags family rides webdev_precondition + webdev_route_call)
+**Current focus:** Phase 5 EXECUTING: 05-01..05-04 COMPLETE (route sources, resource re-point, webdev seam + deploy/status, tags provider CRUD + browse/read/write with the require_routes precondition). Next: 05-05 tagConfig + 05-06 alarms/tagHistory — both inherit the require_routes precondition template from 05-04
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
-**Current Plan:** 4
+**Current Plan:** 5
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
-**Last Activity:** 2026-08-24
+**Last Activity:** 2026-08-25
 
-**Progress:** [█████████░] 86%
+**Progress:** [█████████░] 91%
 
 ## Performance Metrics
 
@@ -47,6 +47,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P01 | 24min | 3 tasks | 19 files |
 | Phase 05 P02 | 38min | 3 tasks | 16 files |
 | Phase 05 P03 | ~400min (2 sessions) | 3 tasks | 35 files |
+| Phase 05 P04 | ~450min (3 sessions) | 3 tasks | 21 files |
 
 ## Accumulated Context
 
@@ -123,6 +124,9 @@ Recent decisions affecting current work:
 - [Phase 05-03]: WebDev seam LOCKED: POST /system/webdev/{project}/cli/{route} with the 200-BODY envelope as the only success oracle (denials ride 200); probe matrix 405=Absent (not 404), 402=Unlicensed, 401/403=AuthGated — doctor re-pinned at every layer incl. its CLI golden
 - [Phase 05-03]: webdev deploy NOT --yes-guarded: the dedicated ign-cli project is CLI-OWNED (born from the deploy zip, overwrite-replaced every deploy — replace-not-merge IS the contract; user projects never touched); no pre-flight project create (Pitfall 10); status is a READ (exit 0 whenever the sweep completes, degradation is data — the exit-6 refusal matrix belongs to WebDev-DEPENDENT commands via webdev_precondition)
 - [Phase 05-03]: scriptExec LOCKED posture shipped: /dev/urandom 32-byte hex secret persisted 0600 in the profile BEFORE upload and substituted into the template (placeholder excluded from the plain manifest — unsubstituted deploy impossible by construction); route fail-closes on every action incl. version; secret appears in exactly one place (the baked zip member) — redaction proven at action AND binary level; README documents the shared-secret threat-model honesty note
+- [Phase 05]: [Phase 05-04]: Tag split LOCKED — providers ride NATIVE config-resource REST (list/find/create-array-body/delete-by-signature, tagCount+health metrics, no route dependency); browse/read/write ride the deployed tags route via webdev_route_call
+- [Phase 05]: [Phase 05-04]: ONE shared require_routes precondition (405→routes_not_deployed, 402→webdev_unlicensed, mismatch→route_version_mismatch) runs before EVERY webdev-dependent action — one extra probe round trip, correctness over latency, no caching this phase; the template 05-05/06 inherit
+- [Phase 05]: [Phase 05-04]: tags provider delete = 6th --yes-guarded destructive verb (binary-pinned zero-work refusal); find-miss = additive provider_not_found exit 6; write --value follows the JSON-scalar rule (bare string stays string, arrays/objects invalid_input exit 2 pre-resolution); browse human mode = indented tree from fullPath, JSON = flat agent shape; quality strings are DATA never parsed (Bad_NotFound reads exit 0)
 
 ### Pending Todos
 
@@ -139,6 +143,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-24T16:10:10.900Z
-**Stopped At:** Completed 05-03-PLAN.md (webdev client seam + deploy/status; recovered from rate-limited prior session and finished Task 3)
+**Last session:** 2026-08-25T03:59:03.375Z
+**Stopped At:** Completed 05-04-PLAN.md (tags provider CRUD + browse/read/write; recovered Task 3 from cancelled sessions)
 **Resume file:** None
