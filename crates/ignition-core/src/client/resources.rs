@@ -92,6 +92,77 @@ fn rewrite_options() -> zip::write::SimpleFileOptions {
     zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
 }
 
+/// The folder-descriptor filename every resource folder carries in a
+/// gateway-produced export (live-extracted 8.3.3, 05-07 spike): the
+/// `ign-cli` export's every route folder (`.../cli/tags/`, …) and a
+/// fresh project's `ignition/global-props/` alike carry a
+/// `resource.json` whose `files` array lists the folder's file
+/// members. LIVE-PROVEN LANDING RULE: an overwrite-import LANDS a NEW
+/// file member only when its immediate parent folder's descriptor
+/// exists and lists the basename — a bare appended file is silently
+/// ignored (the import still answers `{"success":true}` while nothing
+/// lands; verified with AND without zip directory entries).
+/// Intermediate plain folders above the resource folder carry
+/// nothing (the webdev `cli/` precedent).
+const FOLDER_DESCRIPTOR: &str = "resource.json";
+
+/// The parent directory of a member path (`a/b/c` → `a/b`); `None`
+/// for a root-level name.
+fn parent_of(member: &str) -> Option<&str> {
+    member.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+/// Merge one basename into an EXISTING parent descriptor's `files`
+/// array (idempotent): parse, append when absent, re-serialize
+/// pretty. An unparseable descriptor is an export-contract violation
+/// — refusing beats recreating the exact bug this plan closes
+/// (`ok:true` while nothing lands).
+fn merge_descriptor_member(existing: &[u8], basename: &str) -> Result<Vec<u8>, CoreError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(existing).map_err(|err| {
+            CoreError::Internal(format!("parent resource descriptor is not valid JSON: {err}"))
+        })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        CoreError::Internal("parent resource descriptor is not a JSON object".to_string())
+    })?;
+    let files = object
+        .entry("files")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !files.is_array() {
+        *files = serde_json::Value::Array(Vec::new());
+    }
+    let listed = files
+        .as_array()
+        .expect("just normalized to an array")
+        .iter()
+        .any(|name| name.as_str() == Some(basename));
+    if !listed {
+        files
+            .as_array_mut()
+            .expect("just normalized to an array")
+            .push(serde_json::Value::String(basename.to_string()));
+    }
+    serde_json::to_vec_pretty(&value).map_err(|err| {
+        CoreError::Internal(format!("cannot serialize merged resource descriptor: {err}"))
+    })
+}
+
+/// Synthesize a NEW parent-folder descriptor in the live-proven
+/// shape (the 05-07 variant-D wire answer): scope G, version 1,
+/// unrestricted, overridable, `files` listing exactly the appended
+/// basename, empty attributes.
+fn synthesized_descriptor(basename: &str) -> Vec<u8> {
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "scope": "G",
+        "version": 1,
+        "restricted": false,
+        "overridable": true,
+        "files": [basename],
+        "attributes": {},
+    }))
+    .expect("the descriptor shape always serializes")
+}
+
 /// THE list primitive: user-facing paths of every resource member in
 /// the export zip, in member order. `project.json`, directory
 /// entries, and non-`resources`-shaped members are skipped.
@@ -138,17 +209,60 @@ enum Surgery<'a> {
     Remove,
 }
 
+/// The put-new descriptor action resolved before the copy loop
+/// (05-07): append-when-absent needs the parent folder's descriptor
+/// to list the new basename.
+enum DescriptorSurgery {
+    /// The archive already carries the parent descriptor — merge the
+    /// basename into its `files` (edited in place, position kept —
+    /// the live-proven variant-E ordering).
+    Merge(String),
+    /// No parent descriptor exists — synthesize one just before the
+    /// appended member (the live-proven variant-D ordering:
+    /// descriptor before file).
+    Synthesize(String),
+}
+
 /// Full-zip rewrite: copy every member (decompressed → recompressed,
 /// deflate, original order, directory entries preserved), applying
 /// the surgery to the target. Returns the new zip plus whether the
 /// target was seen (remove's not-found proof; replace appends when
 /// unseen).
+///
+/// Put-new (05-07): when a Replace target is ABSENT, the append also
+/// lands the parent-folder descriptor — merged when the archive
+/// already carries one, synthesized otherwise. A target that IS a
+/// descriptor (basename `resource.json`) authors it explicitly and
+/// gets no second one. [`Surgery::Remove`] never touches descriptors:
+/// the gateway reconciles a stale `files` list itself (live-proven —
+/// the deleted file's descriptor comes back with the entry pruned).
 fn rewrite_zip(
     zip_bytes: &[u8],
     target: &str,
     surgery: Surgery<'_>,
 ) -> Result<(Vec<u8>, bool), CoreError> {
     let mut archive = open_archive(zip_bytes)?;
+    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let target_present = names.iter().any(|name| name == target);
+
+    // Resolve the descriptor surgery BEFORE copying (the merge must
+    // edit the descriptor member as it streams past).
+    let descriptor_surgery = match (&surgery, target_present) {
+        (Surgery::Replace(_), false)
+            if target.rsplit('/').next().is_some_and(|base| base != FOLDER_DESCRIPTOR) =>
+        {
+            parent_of(target).map(|parent| {
+                let descriptor_path = format!("{parent}/{FOLDER_DESCRIPTOR}");
+                if names.iter().any(|name| name == &descriptor_path) {
+                    DescriptorSurgery::Merge(descriptor_path)
+                } else {
+                    DescriptorSurgery::Synthesize(descriptor_path)
+                }
+            })
+        }
+        _ => None,
+    };
+
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = rewrite_options();
     let mut seen = false;
@@ -178,6 +292,12 @@ fn rewrite_zip(
             .map_err(|err| CoreError::Internal(format!("cannot rewrite zip: {err}")))?;
         let content = match (is_target, &surgery) {
             (true, Surgery::Replace(content)) => *content,
+            (_, Surgery::Replace(_)) if matches!(&descriptor_surgery, Some(DescriptorSurgery::Merge(path)) if path == &name) => {
+                // The parent descriptor rides MERGED: the new basename
+                // joins its files list (idempotent), everything else
+                // about it kept verbatim.
+                &merge_descriptor_member(&bytes, target.rsplit('/').next().expect("non-root — checked above"))?
+            }
             _ => &bytes,
         };
         writer
@@ -187,8 +307,19 @@ fn rewrite_zip(
 
     // Replace-appends-when-absent: the put-upsert semantics (a new
     // resource joins the zip at the end, member order otherwise
-    // preserved).
+    // preserved) — the parent descriptor lands FIRST (the
+    // live-proven ordering: descriptor before file).
     if !seen && let Surgery::Replace(content) = surgery {
+        if let Some(DescriptorSurgery::Synthesize(descriptor_path)) = &descriptor_surgery {
+            let basename = target.rsplit('/').next().expect("non-root — checked above");
+            let descriptor = synthesized_descriptor(basename);
+            writer
+                .start_file(descriptor_path.clone(), options)
+                .map_err(|err| CoreError::Internal(format!("cannot rewrite zip: {err}")))?;
+            writer
+                .write_all(&descriptor)
+                .map_err(|err| CoreError::Internal(format!("cannot rewrite zip: {err}")))?;
+        }
         writer
             .start_file(target, options)
             .map_err(|err| CoreError::Internal(format!("cannot rewrite zip: {err}")))?;
@@ -362,9 +493,11 @@ mod tests {
         );
     }
 
-    /// THE upsert pin: replacing an ABSENT member appends it (put can
-    /// create new resources) — existing members and their order
-    /// untouched.
+    /// THE upsert pin (05-07 re-pinned): replacing an ABSENT member
+    /// appends it (put can create new resources) AND lands the
+    /// parent-folder `resource.json` descriptor the live-proven
+    /// landing rule requires — the descriptor rides FIRST (the
+    /// gateway-accepted ordering), existing members keep their order.
     #[test]
     fn replace_member_appends_when_absent() {
         let zip = sample_zip();
@@ -374,14 +507,165 @@ mod tests {
             read_member(&out, "ignition/script-python/e2e/brand-new").expect("appended reads"),
             b"print('x')".to_vec()
         );
+        // THE landing shape: the parent folder now carries a
+        // descriptor listing the new basename.
+        let descriptor =
+            read_member(&out, "ignition/script-python/e2e/resource.json").expect("descriptor");
+        let parsed: serde_json::Value = serde_json::from_slice(&descriptor).expect("json");
+        assert_eq!(parsed["files"], serde_json::json!(["brand-new"]));
+        assert_eq!(parsed["scope"], serde_json::json!("G"));
+        // Member order: originals first, then the synthesized
+        // descriptor, then the appended member.
         assert_eq!(
             resource_members(&out).expect("re-list"),
             vec![
                 "ignition/script-python/e2e/scratch".to_string(),
                 "com.example/views/Dashboard/view.json".to_string(),
+                "ignition/script-python/e2e/resource.json".to_string(),
                 "ignition/script-python/e2e/brand-new".to_string(),
             ],
-            "the new member rides last; the originals keep their order"
+            "the descriptor rides LAST-but-one; the originals keep their order"
+        );
+    }
+
+    /// THE merge pin (05-07, variant-E wire truth): appending into a
+    /// folder that ALREADY carries a descriptor merges the basename
+    /// into its `files` (idempotently — an already-listed name does
+    /// not duplicate), every other descriptor key kept verbatim, the
+    /// descriptor's member position preserved.
+    #[test]
+    fn replace_member_appends_merging_existing_descriptor() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("project.json", options).expect("starts");
+        writer.write_all(br#"{"title":"T"}"#).expect("writes");
+        writer
+            .start_file("ignition/resources/script-python/uat/resource.json", options)
+            .expect("starts");
+        writer
+            .write_all(br#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["hello2.py"],"attributes":{"keep":"me"}}"#)
+            .expect("writes");
+        writer
+            .start_file("ignition/resources/script-python/uat/hello2.py", options)
+            .expect("starts");
+        writer.write_all(b"print('old')").expect("writes");
+        let zip = writer.finish().expect("finalize").into_inner();
+
+        // Append a sibling into the SAME resource folder.
+        let out =
+            replace_member(&zip, "ignition/script-python/uat/hello3.py", b"print('new')'")
+                .expect("append rewrites");
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(
+                &read_member(&out, "ignition/script-python/uat/resource.json").expect("descriptor"),
+            )
+            .expect("descriptor json");
+        assert_eq!(
+            descriptor["files"],
+            serde_json::json!(["hello2.py", "hello3.py"]),
+            "the new basename joins the files list"
+        );
+        assert_eq!(
+            descriptor["attributes"]["keep"],
+            serde_json::json!("me"),
+            "unknown descriptor keys ride verbatim"
+        );
+        assert_eq!(
+            read_member(&out, "ignition/script-python/uat/hello3.py").expect("appended reads"),
+            b"print('new')'".to_vec()
+        );
+
+        // Idempotent re-merge: replacing the SAME absent-member path
+        // again does not duplicate the files entry (and a SECOND new
+        // sibling appends after the first).
+        let again = replace_member(&out, "ignition/script-python/uat/hello4.py", b"x")
+            .expect("second append");
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(
+                &read_member(&again, "ignition/script-python/uat/resource.json").expect("d"),
+            )
+            .expect("json");
+        assert_eq!(
+            descriptor["files"],
+            serde_json::json!(["hello2.py", "hello3.py", "hello4.py"])
+        );
+    }
+
+    /// An appended member whose basename IS the descriptor authors it
+    /// explicitly — NO second (parent-of-parent) descriptor is
+    /// synthesized, and the member rides at exactly its path.
+    #[test]
+    fn replace_member_appending_a_descriptor_authors_it_explicitly() {
+        let zip = sample_zip();
+        let descriptor_body = br#"{"scope":"A","version":1,"files":["view.json"]}"#;
+        let out = replace_member(
+            &zip,
+            "com.example/views/Dashboard/resource.json",
+            descriptor_body,
+        )
+        .expect("append rewrites");
+        assert_eq!(
+            read_member(&out, "com.example/views/Dashboard/resource.json").expect("reads"),
+            descriptor_body.to_vec(),
+            "the authored descriptor rides verbatim"
+        );
+        // No descriptor-of-the-descriptor: the parent folder gained
+        // nothing but the member itself.
+        assert!(
+            read_member(&out, "com.example/views/resource.json").is_err(),
+            "no second descriptor is synthesized for an authored descriptor member"
+        );
+    }
+
+    /// An unparseable EXISTING parent descriptor on the append path
+    /// refuses (internal) rather than shipping an import the gateway
+    /// would silently ignore — the exact bug class 05-07 closes.
+    #[test]
+    fn replace_member_append_over_corrupt_descriptor_refuses() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("project.json", options).expect("starts");
+        writer.write_all(br#"{"title":"T"}"#).expect("writes");
+        writer
+            .start_file("ignition/resources/script-python/uat/resource.json", options)
+            .expect("starts");
+        writer.write_all(b"<<<not json>>>").expect("writes");
+        let zip = writer.finish().expect("finalize").into_inner();
+
+        let err = replace_member(&zip, "ignition/script-python/uat/new.py", b"x")
+            .expect_err("corrupt descriptor must refuse the append");
+        assert!(matches!(err, CoreError::Internal(_)), "{err}");
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    /// THE delete pin (05-07, live-proven): remove leaves the parent
+    /// descriptor UNTOUCHED — the gateway itself reconciles the stale
+    /// `files` entry (the wire truth from the variant-G2 probe).
+    #[test]
+    fn remove_member_leaves_descriptor_to_gateway_reconciliation() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("project.json", options).expect("starts");
+        writer.write_all(br#"{"title":"T"}"#).expect("writes");
+        writer
+            .start_file("ignition/resources/script-python/uat/resource.json", options)
+            .expect("starts");
+        writer
+            .write_all(br#"{"scope":"G","version":1,"files":["scratch.py"],"attributes":{}}"#)
+            .expect("writes");
+        writer
+            .start_file("ignition/resources/script-python/uat/scratch.py", options)
+            .expect("starts");
+        writer.write_all(b"print('x')").expect("writes");
+        let zip = writer.finish().expect("finalize").into_inner();
+
+        let out = remove_member(&zip, "ignition/script-python/uat/scratch.py")
+            .expect("remove rewrites");
+        assert_eq!(
+            read_member(&out, "ignition/script-python/uat/resource.json").expect("descriptor"),
+            br#"{"scope":"G","version":1,"files":["scratch.py"],"attributes":{}}"#.to_vec(),
+            "the descriptor rides verbatim — the gateway prunes the stale entry"
         );
     }
 
