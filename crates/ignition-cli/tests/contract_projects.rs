@@ -758,6 +758,82 @@ imported x (26 bytes, policy overwrite)
     }
 }
 
+/// THE import-denial seam pin (05-07): the gateway refusing an
+/// overwrite import over HTTP 200 (`{success:false, problem}` — the
+/// live-witnessed 8.3 shape) surfaces as exit 6 `import_denied`, the
+/// problem text verbatim in the message — the 03-02 verb shares the
+/// ONE `project_import` seam with resource put/delete and webdev
+/// deploy (endpoint embeds the dynamic mock URI — programmatic
+/// envelope assertions, the delete-nonexistent pattern).
+#[tokio::test]
+async fn project_import_denial_exits_6_golden() {
+    let server = wiremock::MockServer::start().await;
+    let _import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/x"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "success": false,
+                "problem": "resource already exists: ResourceId{resourcePath=com.example, collectionName=views}"
+            }),
+        ))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    // Overwrite performs NO pre-check (the server is the authority) —
+    // the refusal below is the gateway's own answer.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/find/x"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let zip_dir = tempfile::tempdir().expect("zipdir");
+    let zip_path = zip_dir.path().join("proj.zip");
+    std::fs::write(&zip_path, zip_fixture()).expect("write fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            zip_path.to_str().unwrap(),
+            "--collision-policy",
+            "overwrite",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "target-state class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+
+    let envelope: Value = serde_json::from_str(&stderr_envelope(&out))
+        .unwrap_or_else(|err| panic!("stderr envelope parses: {err}"));
+    assert_eq!(
+        envelope["error"]["code"],
+        Value::String("import_denied".into()),
+        "the denial slug: {envelope}"
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("resource already exists"),
+        "the gateway's problem text rides the message: {envelope}"
+    );
+    let endpoint = envelope["error"]["endpoint"].as_str().unwrap_or_default();
+    assert!(
+        endpoint.starts_with(&server.uri()) && endpoint.contains("/projects/import/x"),
+        "the endpoint names the import request: {endpoint}"
+    );
+}
+
 /// Stdin import (`--file -`): piped bytes ride the same guards and
 /// the abort policy's find pre-check (404 = name free) precedes the
 /// `overwrite=false` upload.

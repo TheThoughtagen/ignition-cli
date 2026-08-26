@@ -1070,6 +1070,20 @@ impl GatewayApi for ReqwestGatewayApi {
             .ok()
             .filter(|value| value.is_object())
             .unwrap_or_else(|| serde_json::json!({"status": "success"}));
+        // Denial honesty (05-07, UAT Gap 1): the gateway refuses
+        // imports over HTTP 200 with {success:false, problem} —
+        // live-witnessed while NOTHING landed. ONE seam here fixes
+        // every import caller at once (resource put/delete, project
+        // import, webdev deploy) — per-caller checks are forbidden;
+        // this IS the contract (the WebDev 200-denial precedent
+        // applied to the import family).
+        if let Some(problem) = projects::import_denied(&parsed) {
+            return Err(CoreError::ImportDenied {
+                project: name.to_string(),
+                problem,
+                endpoint: Some(url.to_string()),
+            });
+        }
         Ok(ImportOutcome { response: parsed })
     }
 

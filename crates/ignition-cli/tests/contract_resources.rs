@@ -139,6 +139,28 @@ async fn mount_import(server: &wiremock::MockServer, project: &str) -> wiremock:
         .await
 }
 
+/// Mount the DENIAL import POST (05-07, UAT Gap 1's wire truth): the
+/// gateway answers HTTP 200 with `{success:false, problem}` — the
+/// live-witnessed shape (an append-member overwrite-import on 8.3.3
+/// answers exactly this while landing NOTHING). Before the seam, the
+/// CLI parsed this opaquely and reported ok:true.
+async fn mount_import_denied(server: &wiremock::MockServer, project: &str) -> wiremock::MockGuard {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/import/{project}"
+        )))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "problem": "resource already exists: ResourceId{resourcePath=com.example, collectionName=views}"
+            })),
+        )
+        .expect(1..)
+        .mount_as_scoped(server)
+        .await
+}
+
 /// The list fixture zip: a view file and a script — the two families
 /// the surgical loop edits most (user-facing paths identical to the
 /// Phase-3 goldens: the members live under `<collection>/resources/`).
@@ -772,6 +794,110 @@ deleted com.example/views/My Folder/V1
         );
     }
 }
+
+/// THE denial-honesty golden (05-07): `resource put --yes` against a
+/// gateway that answers the import with HTTP 200 `{success:false,
+/// problem}` exits 6 `import_denied` — the problem text rides
+/// VERBATIM in the message and the endpoint names the import request
+/// (the `[..]` elides the mock's random port). Before the seam this
+/// exact wire shape reported ok:true while nothing landed (UAT Gap 1).
+#[tokio::test]
+async fn resource_put_import_denied_exits_6_golden() {
+    let body = br#"{"scope":"G","code":"print('hi')"}"#.to_vec();
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", fixture_zip(&[])).await;
+    let import = mount_import_denied(&server, "p").await;
+
+    let file_dir = tempfile::tempdir().expect("filedir");
+    let file_path = file_dir.path().join("new.json");
+    std::fs::write(&file_path, &body).expect("write fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "put",
+            "p",
+            "com.example/views/BrandNew",
+            "--file",
+            file_path.to_str().unwrap(),
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "target-state class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":"dev","error":{"code":"import_denied","message":"gateway rejected the project import for /"p/": resource already exists: ResourceId{resourcePath=com.example, collectionName=views}","endpoint":"http://[..]/data/api/v1/projects/import/p","hint":"the gateway refused the import over a 200 answer — the problem text above is the gateway's own; `ign project export` of the current state is the honest baseline for hand-editing (resource already exists: ResourceId{resourcePath=com.example, collectionName=views})"}}
+
+"#]],
+    );
+
+    // The import WAS attempted (the refusal is the gateway's answer,
+    // not a CLI-side pre-check) — exactly one upload.
+    let requests = import.received_requests().await;
+    assert_eq!(requests.len(), 1, "the denied import reached the wire");
+}
+
+/// Same denial shape on `resource delete --yes`: the shared
+/// `project_import` seam refuses identically (one seam, every
+/// caller).
+#[tokio::test]
+async fn resource_delete_import_denied_exits_6() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(
+        &server,
+        "p",
+        fixture_zip(&[(
+            "com.example/resources/views/Dashboard",
+            br#"{"scope":"A"}"#.as_slice(),
+        )]),
+    )
+    .await;
+    let _import = mount_import_denied(&server, "p").await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "resource",
+            "delete",
+            "p",
+            "com.example/views/Dashboard",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "target-state class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let envelope: Value = serde_json::from_str(&stderr_envelope(&out))
+        .unwrap_or_else(|err| panic!("stderr envelope parses: {err}"));
+    assert_eq!(
+        envelope["error"]["code"],
+        Value::String("import_denied".into())
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("resource already exists"),
+        "the gateway's problem text rides the message: {envelope}"
+    );
+    assert!(
+        envelope["error"]["endpoint"].is_string(),
+        "the endpoint names the import request: {envelope}"
+    );
+}
+
 
 /// A nonexistent resource: the member is absent from the export zip
 /// → exit 6 `not_found` (the surgery helper's error, endpoint null —

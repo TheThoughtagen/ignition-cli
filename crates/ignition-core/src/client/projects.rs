@@ -245,9 +245,32 @@ pub struct ImportOutcome {
     pub response: serde_json::Value,
 }
 
+/// Denial detection on a parsed import-response body (05-07, UAT
+/// Gap 1): the gateway refuses imports over HTTP 200 with
+/// `{"success": false, "problem": "…"}` — live-witnessed on the
+/// 8.3.3 rig (an append-member overwrite-import answers exactly
+/// this while landing NOTHING). Returns the problem string when the
+/// body carries an EXPLICIT bool `success: false`; every opaque
+/// family member (missing key, `true`, the `{"status":"success"}`
+/// fallback) returns `None` — we refuse only on an explicit denial,
+/// never on absence of proof.
+pub(crate) fn import_denied(body: &serde_json::Value) -> Option<String> {
+    if body.get("success") != Some(&serde_json::Value::Bool(false)) {
+        return None;
+    }
+    Some(
+        body.get("problem")
+            .and_then(|problem| problem.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                "gateway reported success:false without a problem message".to_string()
+            }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProjectCreate, ProjectModify, encode_segment};
+    use super::{ProjectCreate, ProjectModify, encode_segment, import_denied};
 
     /// Pitfall 6: spaces and mixed case encode per segment with the
     /// NON_ALPHANUMERIC set — over-encoding is safe, under-encoding is
@@ -302,6 +325,42 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&body).expect("serializes"),
             serde_json::json!({"title": "T"})
+        );
+    }
+
+    /// 05-07 denial detection: an EXPLICIT bool `success:false` yields
+    /// the problem text; every opaque family member (missing key,
+    /// `true`, the fallback object) is NOT a denial — only an explicit
+    /// refusal counts, never absence of proof.
+    #[test]
+    fn import_denied_pins_the_denial_family() {
+        // THE live-witnessed shape: success:false + problem → Some
+        // (the problem text rides verbatim).
+        assert_eq!(
+            import_denied(&serde_json::json!({
+                "success": false,
+                "problem": "resource already exists: ResourceId{resourcePath=com.example, collectionName=views}"
+            }))
+            .as_deref(),
+            Some("resource already exists: ResourceId{resourcePath=com.example, collectionName=views}")
+        );
+        // success:true is success.
+        assert_eq!(import_denied(&serde_json::json!({"success": true})), None);
+        // The opaque fallback family: no success key at all.
+        assert_eq!(import_denied(&serde_json::json!({"status": "success"})), None);
+        assert_eq!(import_denied(&serde_json::json!({})), None);
+        // success:"false" as a STRING is not a bool denial — only
+        // bool false counts.
+        assert_eq!(
+            import_denied(&serde_json::json!({"success": "false"})),
+            None,
+            "string \"false\" is the opaque family, not an explicit denial"
+        );
+        // success:false WITHOUT a problem message still refuses, with
+        // the standing message.
+        assert_eq!(
+            import_denied(&serde_json::json!({"success": false})).as_deref(),
+            Some("gateway reported success:false without a problem message")
         );
     }
 }

@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -39,6 +39,23 @@ pub enum CoreError {
     /// change, like [`Self::ConfirmationRequired`] (03-02).
     #[error("invalid import file: {reason}")]
     InvalidImportFile { reason: String },
+
+    /// The gateway ANSWERED the import POST with HTTP 200 but the
+    /// body says `{"success": false, "problem": "…"}` — the
+    /// denial-rides-200 class the WebDev family handles (05-01)
+    /// applied to the project-import family (05-07, UAT Gap 1):
+    /// without this check the import caller reports ok while nothing
+    /// landed. Exit 6 — target state: the gateway refused the
+    /// import (the problem text names why, verbatim).
+    #[error("gateway rejected the project import for {project:?}: {problem}")]
+    ImportDenied {
+        /// The project the import was headed for.
+        project: String,
+        /// The gateway's own `problem` text (verbatim when present).
+        problem: String,
+        /// URL of the import request, when known.
+        endpoint: Option<String>,
+    },
 
     /// A command input the caller must fix (unreadable `--file`, failed
     /// stdin read). Exit 2 — usage class, the generic sibling of
@@ -296,6 +313,7 @@ impl CoreError {
             Self::Internal(_) => "internal",
             Self::ConfirmationRequired { .. } => "confirmation_required",
             Self::InvalidImportFile { .. } => "invalid_import_file",
+            Self::ImportDenied { .. } => "import_denied",
             Self::InvalidInput { .. } => "invalid_input",
             Self::ProfileNotFound { .. } => "profile_not_found",
             Self::NoActiveProfile => "no_active_profile",
@@ -347,7 +365,8 @@ impl CoreError {
             | Self::RouteVersionMismatch { .. }
             | Self::WebdevRouteError { .. }
             | Self::TagCollision { .. }
-            | Self::AlarmJournalMissing { .. } => 6,
+            | Self::AlarmJournalMissing { .. }
+            | Self::ImportDenied { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -371,6 +390,11 @@ impl CoreError {
                    via --file (or `-` to pipe one on stdin)"
                     .to_string(),
             ),
+            Self::ImportDenied { problem, .. } => Some(format!(
+                "the gateway refused the import over a 200 answer — the problem \
+                   text above is the gateway's own; `ign project export` of the \
+                   current state is the honest baseline for hand-editing ({problem})"
+            )),
             Self::InvalidInput { .. } => Some(
                 "fix the input source — a readable file path via --file, or `-` \
                    to pipe the content on stdin"
@@ -538,7 +562,8 @@ impl CoreError {
             | Self::RouteVersionMismatch { endpoint, .. }
             | Self::WebdevRouteError { endpoint, .. }
             | Self::TagCollision { endpoint, .. }
-            | Self::AlarmJournalMissing { endpoint } => endpoint.clone(),
+            | Self::AlarmJournalMissing { endpoint }
+            | Self::ImportDenied { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -781,6 +806,15 @@ mod tests {
                 },
                 6,
                 "alarm_journal_missing",
+            ),
+            (
+                CoreError::ImportDenied {
+                    project: "PlantFloor".into(),
+                    problem: "resource already exists: ResourceId{resourcePath=com.example, collectionName=views}".into(),
+                    endpoint: Some("http://gw:8088/data/api/v1/projects/import/PlantFloor?overwrite=true".into()),
+                },
+                6,
+                "import_denied",
             ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
