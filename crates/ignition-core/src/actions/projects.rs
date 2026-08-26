@@ -150,6 +150,33 @@ fn validate_import(zip: &[u8]) -> Result<(), CoreError> {
     if let Some(err) = import_size_error(zip.len()) {
         return Err(err);
     }
+    // (05-07, Rule 2) Full-structure validation BEFORE any upload:
+    // live-witnessed on 8.3.3, a TRUNCATED zip (valid magic, broken
+    // tail) imports with `{"success":true,"changes":[]}` and — on
+    // overwrite — REPLACES the project with the partial contents
+    // (data loss wearing a success face). Walking every member and
+    // decompressing it catches truncation/corruption here, where the
+    // refusal names the caller's own file to fix (exit 2, zero
+    // network).
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).map_err(|err| {
+        CoreError::InvalidImportFile {
+            reason: format!("not a readable ZIP archive: {err}"),
+        }
+    })?;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|err| {
+            CoreError::InvalidImportFile {
+                reason: format!("cannot read import archive member {index}: {err}"),
+            }
+        })?;
+        let name = file.name().to_string();
+        let mut sink = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut sink).map_err(|err| {
+            CoreError::InvalidImportFile {
+                reason: format!("cannot decompress import member {name:?}: {err}"),
+            }
+        })?;
+    }
     Ok(())
 }
 
@@ -561,12 +588,23 @@ mod tests {
     }
 
     impl ProjectsRig {
-        /// A minimal valid-looking ZIP fixture (real magic bytes — the
-        /// action's import guard checks them).
+        /// A minimal VALID ZIP fixture (real archive — the action's
+        /// import guard walks every member since 05-07; the old
+        /// magic-bytes-plus-junk shape now refuses, correctly).
         fn zip_fixture() -> Vec<u8> {
-            let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
-            bytes.extend_from_slice(b"project-export-fixture");
-            bytes
+            use std::io::Write as _;
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("project.json", options)
+                .expect("fixture member starts");
+            writer
+                .write_all(br#"{"title":"fixture"}"#)
+                .expect("fixture member writes");
+            writer
+                .finish()
+                .expect("fixture finalizes")
+                .into_inner()
         }
     }
 
@@ -1008,6 +1046,38 @@ mod tests {
             "zero pre-check calls — the guard runs first"
         );
         assert!(rig.imports.lock().unwrap().is_empty(), "zero uploads");
+    }
+
+    /// THE truncated-zip pin (05-07, Rule 2): a zip with VALID magic
+    /// but a broken tail — the live-witnessed wipe shape (8.3.3
+    /// answers success:true changes:[] and replaces the project with
+    /// the partial contents) — refuses `invalid_import_file` exit 2
+    /// BEFORE any network I/O.
+    #[tokio::test]
+    async fn import_refuses_truncated_zip_before_any_network() {
+        let rig = ProjectsRig::default();
+        let truncated = {
+            let full = ProjectsRig::zip_fixture();
+            // Keep the magic + most of the body, cut the central
+            // directory — exactly the partially-written-writer shape
+            // the spike produced.
+            let cut = full.len() - 10;
+            full[..cut].to_vec()
+        };
+        let err = super::project_import(
+            &rig,
+            "x",
+            truncated,
+            super::CollisionPolicy::Overwrite,
+        )
+        .await
+        .expect_err("the structure guard refuses");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_import_file");
+        assert!(
+            rig.finds.lock().unwrap().is_empty() && rig.imports.lock().unwrap().is_empty(),
+            "zero network of any kind — the structure guard runs before everything"
+        );
     }
 
     /// The 512 MB sanity guard refuses with the same slug — checked

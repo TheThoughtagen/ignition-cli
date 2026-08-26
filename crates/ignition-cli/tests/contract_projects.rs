@@ -470,12 +470,26 @@ fn ign_stdin(config: &Path, url: &str, args: &[&str], stdin: &[u8]) -> std::proc
         .expect("spawn ign")
 }
 
-/// The binary-level ZIP fixture — real magic bytes + a known payload
-/// (4 + 22 = 26 bytes, pinned in the goldens).
+/// The binary-level ZIP fixture — a REAL minimal archive (one
+/// `project.json` member) since 05-07's full-structure import
+/// validation: magic-bytes-plus-junk refuses as `invalid_import_file`
+/// (correctly — the gateway would silently wipe the target on
+/// overwrite). The byte count is `[..]`-elided in the goldens (it is
+/// writer-deterministic but meaningless to pin).
 fn zip_fixture() -> Vec<u8> {
-    let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
-    bytes.extend_from_slice(b"project-export-fixture");
-    bytes
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer
+        .start_file("project.json", options)
+        .expect("fixture member starts");
+    writer
+        .write_all(br#"{"title":"fixture"}"#)
+        .expect("fixture member writes");
+    writer
+        .finish()
+        .expect("fixture finalizes")
+        .into_inner()
 }
 
 /// `ign project export` goldens (PROJ-03): the ZIP streams to the
@@ -522,7 +536,7 @@ async fn project_export_success_golden() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-exported My Proj → MyProj-export.zip (26 bytes)
+exported My Proj → MyProj-export.zip ([..] bytes)
 scope: includes views/scripts/named-queries/vision-windows/perspective-themes-styles/reporting/alarm-notification-profiles/webdev-routes/translations/sfc-charts · excludes tag-providers/tags/udts/gateway-config/database-connections/users-roles/alarm-journal/certificates
 "#]],
     );
@@ -548,7 +562,7 @@ scope: includes views/scripts/named-queries/vision-windows/perspective-themes-st
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"My Proj","file":"MyProj-export.zip","bytes":26,"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"My Proj","file":"MyProj-export.zip","bytes":[..],"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
     );
 }
 
@@ -584,7 +598,7 @@ async fn project_export_explicit_output_golden() {
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"x","file":"out.zip","bytes":26,"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"x","file":"out.zip","bytes":[..],"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
     );
     assert_eq!(
         std::fs::read(workdir.path().join("out.zip")).expect("file written"),
@@ -738,7 +752,7 @@ async fn project_import_overwrite_with_yes_uploads() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-imported x (26 bytes, policy overwrite)
+imported x ([..] bytes, policy overwrite)
 "#]],
     );
 
@@ -874,7 +888,7 @@ async fn project_import_stdin_golden() {
     );
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"name":"piped","collision_policy":"abort","bytes":26,"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]},"outcome":{"status":"success"}}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"name":"piped","collision_policy":"abort","bytes":[..],"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]},"outcome":{"status":"success"}}}"#]],
     );
     let requests = import_guard.received_requests().await;
     assert_eq!(requests.len(), 1);
@@ -916,6 +930,50 @@ async fn project_import_non_zip_exits_2_golden() {
 {"ok":false,"profile":"dev","error":{"code":"invalid_import_file","message":"invalid import file: missing ZIP magic (PK//x03//x04) — not a project export archive","endpoint":null,"hint":"import expects a project-export ZIP (PK//x03//x04 magic) of at most 512 MB — pass a file produced by `ign project export` via --file (or `-` to pipe one on stdin)"}}
 
 "#]],
+    );
+}
+
+/// THE truncated-zip guard (05-07, Rule 2): a TRUNCATED archive —
+/// valid magic, broken tail — refuses exit 2 `invalid_import_file`
+/// BEFORE any upload. Live-witnessed on 8.3.3: the gateway accepts
+/// exactly this shape with `{"success":true,"changes":[]}` and, on
+/// overwrite, REPLACES the project with the partial contents — data
+/// loss wearing a success face. Zero network: dead URL, no mock.
+#[tokio::test]
+async fn project_import_truncated_zip_exits_2_golden() {
+    let truncated = {
+        let full = zip_fixture();
+        full[..full.len() - 10].to_vec()
+    };
+    let bad_dir = tempfile::tempdir().expect("bad dir");
+    let bad_path = bad_dir.path().join("truncated.zip");
+    std::fs::write(&bad_path, truncated).expect("write truncated zip");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            bad_path.to_str().unwrap(),
+            "--collision-policy",
+            "overwrite",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class, zero network");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let envelope: Value = serde_json::from_str(&stderr_envelope(&out))
+        .unwrap_or_else(|err| panic!("stderr envelope parses: {err}"));
+    assert_eq!(
+        envelope["error"]["code"],
+        Value::String("invalid_import_file".into()),
+        "the structure guard names the caller's file: {envelope}"
     );
 }
 
