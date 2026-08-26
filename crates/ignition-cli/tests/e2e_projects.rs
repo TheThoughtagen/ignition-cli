@@ -38,14 +38,20 @@
 //! (a get before the second put witnesses the OLD member content —
 //! get rides the same export; the put after it flips the content a
 //! follow-up get reads back) and the delete surgery (the member is
-//! `not_found` after `resource delete`). The PROJECT-level pins stay
-//! from 03-02: export happens AFTER the first resource put and
-//! BEFORE the second, because overwrite import REPLACES the entire
-//! project (Pitfall 4). The two post-import gets pin BOTH halves of
-//! the replace-not-merge contract: the pre-export resource SURVIVED
-//! (export→import round-trip fidelity) and the post-export resource
-//! is GONE (`not_found` — resources absent from the ZIP are deleted;
-//! merge is Designer-only). Timestamped project names mean a failure
+//! `not_found` after `resource delete`). 05-07 adds THE put-new-on-a-
+//! USED-project witness (UAT Gap 1's exact failure shape): a new
+//! member in a new folder chain on a project that already carries
+//! resources must LAND — read-back verified, never trusted on the
+//! import's success body (the gateway answers success:true for
+//! descriptor-less appends while landing NOTHING, live-proven). The
+//! PROJECT-level pins stay from 03-02: export happens AFTER the
+//! first resource put and BEFORE the second, because overwrite
+//! import REPLACES the entire project (Pitfall 4). The two
+//! post-import gets pin BOTH halves of the replace-not-merge
+//! contract: the pre-export resource SURVIVED (export→import
+//! round-trip fidelity) and the post-export resource is GONE
+//! (`not_found` — resources absent from the ZIP are deleted; merge
+//! is Designer-only). Timestamped project names mean a failure
 //! leaves forensic state on the gateway for inspection; cleanup is
 //! best-effort.
 
@@ -190,6 +196,11 @@ const SCRATCH_PATH: &str = "ignition/script-python/e2e/scratch";
 /// The SECOND scratch, written only AFTER the export so it exists on
 /// the gateway but NOT in the ZIP (the replace-not-merge witness).
 const SCRATCH2_PATH: &str = "ignition/script-python/e2e/scratch2";
+/// The THIRD scratch (05-07, UAT Gap 1's exact failure shape): a NEW
+/// member in a NEW folder chain on a USED project — the half the
+/// fresh-project loop could never catch (put-new must LAND, verified
+/// by read-back, not by the import's success body).
+const SCRATCH3_PATH: &str = "ignition/script-python/uat2/second.py";
 
 /// THE full loop (order is the contract — see the module docs):
 /// new → list-contains → resource list EMPTY → put scratch --yes
@@ -412,6 +423,70 @@ fn full_project_resource_loop() {
         ),
     );
 
+    // 10b. THE put-new-on-a-USED-project witness (05-07, UAT Gap 1):
+    // a NEW member in a NEW folder chain (`uat2/`, disjoint from
+    // `e2e/`) on a project that already carries resources — the
+    // fresh-project half alone never caught the landing gap, and the
+    // wiremock fixtures own only the DENIAL honesty. The put must
+    // LAND: a follow-up get reads the exact content back and the
+    // list carries the member (and its synthesized parent
+    // descriptor) — never trusting the import's success body alone.
+    let scratch3_file = workdir.path().join("scratch3.txt");
+    std::fs::write(&scratch3_file, "print('used-project-put-new')\n").expect("write scratch3");
+    expect_ok(
+        "resource put scratch3 (new chain, used project)",
+        &ign(
+            &config,
+            &env,
+            &[
+                "resource",
+                "put",
+                &name,
+                SCRATCH3_PATH,
+                "--file",
+                scratch3_file.to_str().unwrap(),
+                "--yes",
+                "--compact",
+            ],
+        ),
+    );
+    let out = ign(
+        &config,
+        &env,
+        &["resource", "get", &name, SCRATCH3_PATH, "--compact"],
+    );
+    expect_ok("resource get scratch3", &out);
+    let landed = data_envelope(&out)["data"].clone();
+    assert_eq!(
+        landed["content_kind"],
+        Value::String("text".into()),
+        "plain text put classifies text: {landed}"
+    );
+    assert_eq!(
+        landed["content"],
+        Value::String("print('used-project-put-new')\n".into()),
+        "THE UAT Gap-1 truth: put-new LANDS on a used project — get reads it back: {landed}"
+    );
+    let out = ign(&config, &env, &["resource", "list", &name, "--compact"]);
+    expect_ok("resource list (scratch3 landed)", &out);
+    let listed3 = data_envelope(&out)["data"].clone();
+    assert!(
+        listed3["resources"]
+            .as_array()
+            .expect("resources array")
+            .iter()
+            .any(|entry| entry["path"] == Value::String(SCRATCH3_PATH.into())),
+        "the new-chain member appears in the list: {listed3}"
+    );
+    assert!(
+        listed3["resources"]
+            .as_array()
+            .expect("resources array")
+            .iter()
+            .any(|entry| entry["path"] == Value::String("ignition/script-python/uat2/resource.json".into())),
+        "the synthesized parent descriptor rides the archive (the live-proven landing shape): {listed3}"
+    );
+
     // 11. abort-policy import into the SAME name → project_exists,
     // BEFORE any upload.
     let abort = ign(
@@ -468,13 +543,20 @@ fn full_project_resource_loop() {
         Value::Null,
         "…and carries the IN-ZIP (old) content — the import replaced the later edit: {survived}"
     );
-    //    …and scratch2 is GONE (absent from the ZIP → deleted).
+    //    …and scratch2 is GONE (absent from the ZIP → deleted), as is
+    //    the new-chain scratch3 (it postdated the export too).
     let wiped = ign(
         &config,
         &env,
         &["resource", "get", &name, SCRATCH2_PATH, "--compact"],
     );
     expect_exit(&wiped, 6, "not_found", "resource get scratch2 post-import");
+    let wiped3 = ign(
+        &config,
+        &env,
+        &["resource", "get", &name, SCRATCH3_PATH, "--compact"],
+    );
+    expect_exit(&wiped3, 6, "not_found", "resource get scratch3 post-import");
 
     // 14. THE delete-surgery witness: `resource delete --yes` then a
     // get is `not_found` (remove_member → overwrite-import).

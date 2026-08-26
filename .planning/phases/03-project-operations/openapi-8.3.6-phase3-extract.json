@@ -1,5 +1,5 @@
 {
-  "captured_from": "http://localhost:19188/openapi.json",
+  "captured_from": "http://localhost:9088/openapi.json",
   "families": [
     "/data/api/v1/projects",
     "/data/api/v1/scan",
@@ -202744,7 +202744,7 @@
                     "timestamp": {
                       "description": "Time the lock was acquired",
                       "examples": [
-                        1787538008886
+                        1787780018996
                       ],
                       "type": "integer"
                     }
@@ -202866,7 +202866,7 @@
                     "timestamp": {
                       "description": "Time the lock was acquired",
                       "examples": [
-                        1787538008886
+                        1787780018997
                       ],
                       "type": "integer"
                     }
