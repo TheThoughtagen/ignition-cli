@@ -2693,6 +2693,36 @@ fn clear_pending(state: &mut AppState) {
     state.projects.pending_form = None;
 }
 
+/// The confirm-parity classifier (06-05 Task 3) — EXHAUSTIVE over
+/// [`PendingAction`] (every variant is Confirm-gated by
+/// construction: the enum IS the confirm-executed set), mapping each
+/// to the CLI operation string main.rs's `require_confirmation`
+/// guards. Adding a variant breaks this match until it is
+/// classified — the compile-time tripwire until 06-06's structural
+/// clap-walk test lands. The rig family's guards (reset / trial
+/// reset / restore) are the remaining CLI-guarded verbs; they arrive
+/// with 06-06's screen and are deliberately NOT PendingActions yet.
+// Test-only today (the parity tripwire's data source); 06-06's
+// structural test graduates it — the Phase-01 cfg_attr pattern.
+#[cfg_attr(not(test), expect(dead_code))]
+fn gated_cli_verb(pending: &PendingAction) -> &'static str {
+    match pending {
+        PendingAction::Restart => "restart",
+        PendingAction::TerminateSession { .. } => "sessions terminate",
+        PendingAction::LoggersSet { .. } => "logs loggers set",
+        PendingAction::LoggersReset => "logs loggers reset",
+        PendingAction::TagsProviderDelete { .. } => "tags provider delete",
+        PendingAction::TagsConfigDelete { .. } => "tags config delete",
+        PendingAction::TagsImportOverwrite { .. } => "tags import --collision-policy overwrite",
+        PendingAction::ProjectDelete { .. } => "project delete",
+        PendingAction::ProjectImportOverwrite { .. } => {
+            "project import --collision-policy overwrite"
+        }
+        PendingAction::ResourcePut { .. } => "resource put",
+        PendingAction::ResourceDelete { .. } => "resource delete",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -3324,8 +3354,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let (_dir, vars) = isolated_profiles();
-        // Break prod's secret: remove its token so rebuild fails with
-        // SecretUnavailable (the REQUIRED-credential chain).
+        // Break prod's secret: remove its token so rebuild fails the
+        // REQUIRED-credential chain (the credential-unavailable
+        // refusal).
         unsafe { std::env::remove_var("IGNITION_TOKEN_PROD") };
 
         let mut state = AppState::new();
@@ -5670,5 +5701,113 @@ mod tests {
         update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(state.modal.is_none());
         assert!(state.projects.pending_form.is_none(), "form slot cleared");
+    }
+
+    // ---- Destructive-verb confirm-parity audit (06-05 Task 3) ----
+
+    /// One of every confirm-gated PendingAction shape — the audit's
+    /// live inventory (construction forces this list to know every
+    /// variant; [`super::gated_cli_verb`]'s exhaustive match forces
+    /// the classifier to).
+    fn every_gated_pending() -> Vec<PendingAction> {
+        vec![
+            PendingAction::Restart,
+            PendingAction::TerminateSession {
+                kind: ignition_core::actions::sessions::SessionType::Designer,
+                id: "d-1".into(),
+            },
+            PendingAction::LoggersSet {
+                logger: "GatewayManager".into(),
+                level: "WARN".into(),
+            },
+            PendingAction::LoggersReset,
+            PendingAction::TagsProviderDelete {
+                name: "scratch".into(),
+            },
+            PendingAction::TagsConfigDelete {
+                path: "[default]T1".into(),
+            },
+            PendingAction::TagsImportOverwrite {
+                file: "tags.json".into(),
+                provider: "default".into(),
+            },
+            PendingAction::ProjectDelete {
+                name: "PlantFloor".into(),
+            },
+            PendingAction::ProjectImportOverwrite {
+                name: "restored".into(),
+                file: "plant.zip".into(),
+            },
+            PendingAction::ResourcePut {
+                project: "PlantFloor".into(),
+                path: "views/root.json".into(),
+                file: "root.new".into(),
+            },
+            PendingAction::ResourceDelete {
+                project: "PlantFloor".into(),
+                path: "views/root.json".into(),
+            },
+        ]
+    }
+
+    /// THE parity tripwire: the confirm-gated TUI set is exactly the
+    /// CLI's `--yes`-guarded verbs for every registry-mapped family
+    /// (main.rs `require_confirmation` sites minus the rig family,
+    /// which 06-06 owns) — 11 verbs across 6 families, each with its
+    /// family route-mapped onto the right screen.
+    #[test]
+    fn confirm_parity_matches_the_cli_guard_set() {
+        let pendings = every_gated_pending();
+        let mut verbs: Vec<&'static str> = pendings.iter().map(super::gated_cli_verb).collect();
+        verbs.sort_unstable();
+        let expected = [
+            "logs loggers reset",
+            "logs loggers set",
+            "project delete",
+            "project import --collision-policy overwrite",
+            "resource delete",
+            "resource put",
+            "restart",
+            "sessions terminate",
+            "tags config delete",
+            "tags import --collision-policy overwrite",
+            "tags provider delete",
+        ];
+        assert_eq!(
+            verbs, expected,
+            "the gated set is exactly the CLI guard set for mapped families"
+        );
+
+        // Each gated verb's FAMILY is route-mapped (the coverage side
+        // of the parity claim): sessions/logs/restart on the
+        // dashboard, tags on Tags, project/resource on Projects.
+        let routes: Vec<&str> = crate::routes::routes()
+            .iter()
+            .map(|route| route.path)
+            .collect();
+        for family in [
+            "sessions terminate",
+            "logs loggers",
+            "restart",
+            "tags provider",
+            "tags config",
+            "tags import",
+            "project delete",
+            "project import",
+            "resource put",
+            "resource delete",
+        ] {
+            assert!(
+                routes
+                    .iter()
+                    .any(|path| path.starts_with(family) || *path == family),
+                "gated family {family:?} has a route row"
+            );
+        }
+
+        // The deliberately UNGUARDED webdev verbs have NO
+        // PendingAction shape (they fire directly from the menu —
+        // behaviorally pinned in webdev_deploy_needs_no_confirm);
+        // the CLI guards nothing there either (05-03).
     }
 }
