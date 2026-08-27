@@ -5,17 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 FULLY CLOSED (8/8 plans; gap re-verification PASSED 7/7 — see 05-VERIFICATION-GAPS.md; prior 5/5 holds, 523 tests green, zero regressions). UAT Gap 1 closed by 05-07 (import-denial seam + put-new descriptors + truncated-zip guard), UAT Gap 2 closed by 05-08 (full event ids + prefix expansion + tracebacks). Remaining: UAT re-test for closure (10/12 → 12/12, confirmatory — both loops already live-proven green). Next: Phase 6 (TUI)
+**Current focus:** Phase 6 executing: 06-01 cockpit foundation SHIPPED (async select-loop shell + Elm state/update + modal infra + context resolution + tail-sink Send fix + routes scaffold; 542 tests green, fmt/clippy clean; pty-proven lifecycle). Next: 06-02 Dashboard.
 
 ## Current Position
 
-**Phase:** 5 of 7 (WebDev Backend & Tag Operations)
-**Current Plan:** 8
-**Total Plans in Phase:** 8 (6 original + 2 gap-closure: 05-07 ✅, 05-08 ✅)
-**Status:** Phase 5 gap closure verified (05-VERIFICATION-GAPS.md: passed, 7/7 + prior 5/5) — ready for UAT re-test, then Phase 6 discuss/plan
+**Phase:** 6 of 7 (TUI Cockpit)
+**Current Plan:** 2 of 6
+**Status:** 06-01 complete (cockpit shell live — screens 06-02..06-06 purely additive)
 **Last Activity:** 2026-08-27
 
-**Progress:** [██████████] 100%
+**Progress:** [████████░░] 83%
 
 ## Performance Metrics
 
@@ -52,6 +51,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P06 | 114min | 3 tasks | 17 files |
 | Phase 05 P07 | 196min | 3 tasks | 10 files |
 | Phase 05 P08 | 60min | 2 tasks | 9 files |
+| Phase 06 P01 | 222min | 3 tasks | 31 files |
 
 ## Accumulated Context
 
@@ -142,6 +142,10 @@ Recent decisions affecting current work:
 - [Phase 05-07]: [Phase 05-07]: DATA-LOSS GUARD (Rule 2, live-witnessed): the gateway accepts a TRUNCATED zip (valid PK magic, broken tail) with success:true changes:[] and on overwrite REPLACES the project with partial contents — validate_import now walks+decompresses every member before any upload (invalid_import_file exit 2); test fixtures upgraded to real archives, 3 goldens moved ([..]-elided byte counts)
 - [Phase 05]: [Phase 05-08]: Alarms view→ack loop closed BOTH ends (planner-locked) — active table prints the FULL UUID (copy-paste-verbatim) AND ack expands short prefixes via tags_alarms_active's own precondition; full-UUID detection is a SHAPE check (len 36, hyphens at 8/13/18/23, no uuid dep — the route stays the id authority); ambiguous prefix → exit 2 naming full candidates, unknown → exit 2 naming the miss + --json hint; all-full input takes zero extra round trips
 - [Phase 05]: [Phase 05-08]: Route traceback surfacing — error.traceback flows RouteBody::Denied → RouteProbe::Denied → appended to the WebdevRouteError message String ('\nroute traceback: {tb}'); VARIANT/slug/taxonomy untouched (no error.rs edit); absent traceback renders byte-identical (no-traceback goldens moved zero bytes); live-proven via a full-shaped invalid uuid surfacing the route's NumberFormatException
+- [Phase 06]: [Phase 06-01]: TUI architecture LOCKED — AppEvent mpsc + crossterm EventStream + 250ms tick in ONE tokio::select! (exhaustive Ok/Err/None match on the stream arm); update() PURE SYNC (zero awaits, grep-enforced); draw after EVERY processed arm, tick is only the staleness floor; the shell holds a live sender so the worker rail stays armed for 06-02 — ratatui's official async example adapted; Pitfall 3 (frozen input) and anti-pattern 1 (I/O in update) designed out from day one
+- [Phase 06]: [Phase 06-01]: ign tui stdout contract — TuiExited renders NOTHING in every mode (intercepted in render_ok before mode dispatch); piped stdout = CoreError::InvalidInput exit 2 (usage-class; no dedicated Usage variant exists in the frozen taxonomy); profile resolution runs BEFORE ratatui::init so config/secret errors never flash the alt screen — the cockpit owns the alternate screen; errors after restore flow the frozen envelope + exit taxonomy untouched
+- [Phase 06]: [Phase 06-01]: Cockpit keymap + seam pins — Ctrl-C checked BEFORE modal routing (raw mode disables ISIG; the escape hatch cannot be escapable, even mid-input-modal); 'q' inserts into Input modal buffers, never quits behind a modal; Esc pops modal first, quits only second; Screen enum ships ALL six variants day one (next()/prev() wrap) so screen plans never edit it; logs::tail sink + Send (06-03's spawn seam); context::resolve/rebuild mirror main.rs's private resolution via public config fns only (choke files untouched, REQUIRED credential — authed surface) — Pitfall 4/5 designed out; must-have truths over plan sketches where they conflicted
+- [Phase 06]: [Phase 06-01]: Rule-3 fmt sweep — CI last ran 2026-08-22 so all Phase 5 plans (05-02..05-08) landed unvalidated and carried rustfmt drift; one style-only commit normalized 15 files (542 tests green, zero behavior change) — this plan's push is the first CI validation of the Phase 5 tail — CI's cargo fmt --all --check would have failed on push; drift was unvalidated, not CI-green
 
 ### Pending Todos
 
@@ -158,6 +162,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T02:34:28.180Z
-**Stopped At:** Completed 05-08-PLAN.md (gap closure: alarms view→ack full-UUID loop + traceback surfacing — BOTH UAT gaps now closed; phase ready for verification/UAT re-test)
+**Last session:** 2026-08-27T18:11:46.696Z
+**Stopped At:** Completed 06-01-PLAN.md (cockpit foundation: select loop, Elm state/update, modal infra, context, routes scaffold — screens 06-02..06-06 purely additive)
 **Resume file:** None
