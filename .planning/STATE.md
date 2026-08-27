@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 COMPLETE (6/6 core + BOTH gap-closure plans) — UAT Gap 1 closed by 05-07 (import-denial seam + put-new descriptors), UAT Gap 2 closed by 05-08 (alarms active prints FULL event ids ack accepts verbatim; short prefixes expand with honest exit-2 refusals; route tracebacks surface in webdev_route_error). Live-proven on a refreshed trial. Ready for UAT re-test (10/12 → target 12/12) then phase verification. Rig ignition-devops up (fresh ~2h trial from 02:05Z 2026-08-27), routes healthy 1.0.0, token in /var/folders/.../opencode/token.txt
+**Current focus:** Phase 5 FULLY CLOSED (8/8 plans; gap re-verification PASSED 7/7 — see 05-VERIFICATION-GAPS.md; prior 5/5 holds, 523 tests green, zero regressions). UAT Gap 1 closed by 05-07 (import-denial seam + put-new descriptors + truncated-zip guard), UAT Gap 2 closed by 05-08 (full event ids + prefix expansion + tracebacks). Remaining: UAT re-test for closure (10/12 → 12/12, confirmatory — both loops already live-proven green). Next: Phase 6 (TUI)
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
 **Current Plan:** 8
 **Total Plans in Phase:** 8 (6 original + 2 gap-closure: 05-07 ✅, 05-08 ✅)
-**Status:** Phase complete — ready for verification
+**Status:** Phase 5 gap closure verified (05-VERIFICATION-GAPS.md: passed, 7/7 + prior 5/5) — ready for UAT re-test, then Phase 6 discuss/plan
 **Last Activity:** 2026-08-27
 
 **Progress:** [██████████] 100%

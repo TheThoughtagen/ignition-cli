@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Gateway Health & Inspection** - Read-only gateway operations against any 8.3 gateway: status, modules, logs, connections, metrics, sessions, restart, doctor, wait
 - [x] **Phase 3: Project Operations** - Full project CRUD, export/import, and surgical resource editing — the gateway webpage's project pages replaced
 - [x] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore (2026-08-23)
-- [x] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar (2026-08-25; all five live e2e gates green on a real 8.3.3 rig)
+- [x] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar (2026-08-25; all five live e2e gates green on a real 8.3.3 rig; UAT gaps closed & re-verified 7/7 on 2026-08-26)
 - [ ] **Phase 6: TUI Cockpit** - Ratatui cockpit exposing every CLI action: dashboard, log tail, tag browser with live watch, alarm panel, project browser, profile switcher
 - [ ] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows
 
@@ -128,8 +128,8 @@ Plans:
 - [x] 05-04-PLAN.md — tag providers (native REST, signature-chained delete) + browse filtered tree + single/batch read + write, with the version precondition every webdev command inherits (TAGS-01..04)
 - [x] 05-05-PLAN.md — tag config CRUD (stringified-JSON re-parse) + UDT types/def + bulk export/import with abort-default collisions (TAGS-05/06/09)
 - [x] 05-06-PLAN.md — alarms active/history(journal-gated)/ack(3-arg) + tag history query + InternalHistorian fixture + the binding spike + alarm lifecycle live gate (TAGS-07/08 — phase closer)
-- [ ] 05-07-PLAN.md — [GAP CLOSURE] import-denial seam (success:false on 200 → exit 6 `import_denied`, additive slug) + put-new landing via spike-verified surgery shape (dir-entry ancestors) + live e2e_projects gate run (UAT gap 1)
-- [ ] 05-08-PLAN.md — [GAP CLOSURE] alarms view→ack loop: full event_id in the active table + short-prefix expansion in ack + route traceback surfaced in webdev_route_error (UAT gap 2)
+- [x] 05-07-PLAN.md — [GAP CLOSURE] import-denial seam (success:false on 200 → exit 6 `import_denied`, additive slug) + put-new landing via spike-verified surgery shape (parent-folder resource.json descriptors — dir-entry candidate disproven live) + live e2e_projects gate run (UAT gap 1)
+- [x] 05-08-PLAN.md — [GAP CLOSURE] alarms view→ack loop: full event_id in the active table + short-prefix expansion in ack + route traceback surfaced in webdev_route_error (UAT gap 2)
 
 ### Phase 6: TUI Cockpit
 **Goal:** A user can open `ign tui` and drive every CLI capability through a k9s/lazygit-style cockpit — the primary human interface, structurally complete because TUI and CLI share the same actions layer.
@@ -179,6 +179,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 2. Gateway Health & Inspection | 5/5 | Complete | 2026-08-22 |
 | 3. Project Operations | 3/3 | Complete | 2026-08-22 |
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
-| 5. WebDev Backend & Tag Operations | 6/6 | Complete | 2026-08-25 |
+| 5. WebDev Backend & Tag Operations | 8/8 | Complete | 2026-08-26 |
 | 6. TUI Cockpit | 0/4 | Not started | - |
 | 7. Ecosystem Interop & Advanced Ops | 0/4 | Not started | - |
