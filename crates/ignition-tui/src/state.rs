@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ignition_core::actions::sessions::{SessionType, SessionsResult};
+use ignition_core::actions::tags::AlarmRow;
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::client::logs::LogEntry;
 use ratatui::widgets::TableState;
@@ -143,6 +144,17 @@ pub enum Modal {
         url: String,
         field: usize,
     },
+    /// The alarm-acknowledge form (06-03): `username` (REQUIRED — the
+    /// 3-arg wire form needs it; Enter is a no-op until non-empty) and
+    /// an optional `note`, Tab toggling between them. `event_id` is the
+    /// ack TARGET — the selected row's id AS SHOWN (the action expands
+    /// short prefixes itself, 05-08; the table shows full UUIDs).
+    Ack {
+        event_id: String,
+        username: String,
+        note: String,
+        field: usize,
+    },
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
@@ -187,6 +199,7 @@ impl Modal {
             Modal::LogsActions { .. } => "actions",
             Modal::Profiles { .. } => "profiles",
             Modal::ProfileAdd { .. } => "profile add",
+            Modal::Ack { .. } => "ack alarm",
         }
     }
 }
@@ -475,6 +488,28 @@ impl LogsData {
     }
 }
 
+/// The Alarms screen's data (06-03): the polled active-alarm table
+/// (the action's own row type — re-used, never re-mapped) with the
+/// per-poll degrade convention, and the poll worker's rail.
+#[derive(Debug, Default)]
+pub struct AlarmsData {
+    /// Latest accepted rows (None until the first poll — or after an
+    /// errored poll: the honest error state replaces stale rows).
+    pub active: Option<Vec<AlarmRow>>,
+    /// Why the last poll errored, when it did.
+    pub error: Option<String>,
+    /// When the last accepted poll landed — the header's poll age.
+    pub last_poll: Option<Instant>,
+    /// A one-shot poll is in flight — the ack-refresh trigger's busy
+    /// guard.
+    pub busy: bool,
+    /// The table cursor (the ack target's selector).
+    pub table: TableState,
+    /// The poll worker's shutdown switch — screen-scoped like the
+    /// tail's.
+    pub shutdown: Option<watch::Sender<bool>>,
+}
+
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
@@ -505,6 +540,8 @@ pub struct AppState {
     pub dashboard: DashboardData,
     /// Logs screen data (06-03) — the ring, filter, follow/scroll.
     pub logs: LogsData,
+    /// Alarms screen data (06-03) — the polled table + ack target.
+    pub alarms: AlarmsData,
     /// The active profile's name (workers' target — what `p` switches).
     pub profile: Option<String>,
     /// The status-line banner — set by a landed profile switch

@@ -75,6 +75,8 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
+        // The ack form owns its geometry (screen-owned render).
+        Modal::Ack { .. } => 9,
     } as u16;
     let area = frame.area().centered(Ratio(1, 2), Length(height.max(5)));
 
@@ -95,6 +97,11 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         // screen-owned module) — centered geometry included.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => {
             profiles::render_overlay(modal, frame);
+        }
+        // The ack form owns its rendering too (06-03's screen-owned
+        // module — the alarms twin of the profiles pattern).
+        Modal::Ack { .. } => {
+            alarms::render_ack_overlay(modal, frame);
         }
         Modal::Input { title, buffer } => {
             let text = vec![
@@ -231,11 +238,11 @@ mod tests {
     #[test]
     fn screen_dispatch_renders_the_active_screen() {
         let mut state = AppState::new();
-        state.screen = Screen::Alarms;
+        state.screen = Screen::Projects;
         let rows = rendered_rows(&state);
         assert!(
-            rows[1].starts_with("┌Alarms — not yet wired"),
-            "Alarms placeholder rendered: {}",
+            rows[1].starts_with("┌Projects — not yet wired"),
+            "Projects placeholder rendered: {}",
             rows[1]
         );
     }

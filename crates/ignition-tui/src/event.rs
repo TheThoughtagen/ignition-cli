@@ -60,6 +60,17 @@ pub enum AppEvent {
         /// The newly active profile's name.
         name: String,
     },
+    /// One alarms poll result (06-03): the active-alarm table's whole
+    /// world. `Ok` replaces the table; `Err` degrades to the honest
+    /// error state (data dropped — the poll-error answer to a dead or
+    /// route-less gateway, per the per-panel degrade convention). Stale
+    /// eras drop whole (Pitfall 9).
+    Alarms {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The active rows (gateway order), or the poll's error.
+        result: Result<Vec<ignition_core::actions::tags::AlarmRow>, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

@@ -137,6 +137,21 @@ pub fn routes() -> &'static [CliRoute] {
             path: "logs loggers reset",
             mapping: Mapping::Screen(Screen::Logs),
         },
+        // 06-03: the tags-alarms family — exact TagsAlarmsCommand
+        // spellings (active / history / ack), all on the Alarms screen
+        // (the 5 s poll IS active; history rides `h`; ack rides `a`).
+        CliRoute {
+            path: "tags alarms active",
+            mapping: Mapping::Screen(Screen::Alarms),
+        },
+        CliRoute {
+            path: "tags alarms history",
+            mapping: Mapping::Screen(Screen::Alarms),
+        },
+        CliRoute {
+            path: "tags alarms ack",
+            mapping: Mapping::Screen(Screen::Alarms),
+        },
     ]
 }
 
@@ -226,6 +241,27 @@ mod tests {
                 .iter()
                 .find(|route| route.path == path)
                 .unwrap_or_else(|| panic!("logs route row {path:?} missing"));
+            assert!(
+                matches!(row.mapping, super::Mapping::Screen(s) if s == screen),
+                "{path} maps to {screen:?}"
+            );
+        }
+    }
+
+    /// The 06-03 tags-alarms rows carry the exact TagsAlarmsCommand
+    /// spellings onto the Alarms screen.
+    #[test]
+    fn alarms_rows_cover_the_tags_alarms_family() {
+        let expected = [
+            ("tags alarms active", Screen::Alarms),
+            ("tags alarms history", Screen::Alarms),
+            ("tags alarms ack", Screen::Alarms),
+        ];
+        for (path, screen) in expected {
+            let row = routes()
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("alarms route row {path:?} missing"));
             assert!(
                 matches!(row.mapping, super::Mapping::Screen(s) if s == screen),
                 "{path} maps to {screen:?}"

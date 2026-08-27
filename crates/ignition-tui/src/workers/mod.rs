@@ -6,8 +6,6 @@
 //! the era they were spawned under. The shell ships the helpers; the
 //! first real worker (dashboard refresh) arrives in 06-02.
 
-use tokio::sync::watch;
-
 use crate::state::AppState;
 
 /// Bump the state's era counter and return the fresh value — call when
@@ -22,8 +20,11 @@ pub fn new_era(state: &mut AppState) -> u64 {
 /// A fresh shutdown channel: send `true` to stop every worker holding
 /// the receiver (the watch-channel cancellation answer — zero new deps;
 /// research Pattern 2b).
-pub fn shutdown_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
-    watch::channel(false)
+pub fn shutdown_channel() -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::sync::watch::channel(false)
 }
 
 /// Whether a worker's stamped era still matches the state's — the
@@ -68,6 +69,7 @@ where
 
 pub mod refresh;
 pub mod tail;
+pub mod watch;
 
 #[cfg(test)]
 mod tests {

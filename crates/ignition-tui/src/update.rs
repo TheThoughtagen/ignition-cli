@@ -38,6 +38,35 @@ pub fn update(state: &mut AppState, event: AppEvent) {
         // cap. Not era-stamped (plan-locked: ring turnover is the
         // acceptance policy; the worker's shutdown watch is the scope).
         AppEvent::LogLine(entry) => state.logs.push_line(entry),
+        // One alarms poll result (06-03): replace the table (Ok) or
+        // degrade to the honest error state (Err). Stale eras drop
+        // whole (Pitfall 9); the selection clamps into the new rows.
+        AppEvent::Alarms { era, result } => {
+            if workers::is_current(state.era, era) {
+                state.alarms.busy = false;
+                state.alarms.last_poll = Some(std::time::Instant::now());
+                match result {
+                    Ok(rows) => {
+                        if rows.is_empty() {
+                            state.alarms.table.select(None);
+                        } else if state
+                            .alarms
+                            .table
+                            .selected()
+                            .is_some_and(|index| index >= rows.len())
+                        {
+                            state.alarms.table.select(Some(rows.len() - 1));
+                        }
+                        state.alarms.active = Some(rows);
+                        state.alarms.error = None;
+                    }
+                    Err(message) => {
+                        state.alarms.active = None;
+                        state.alarms.error = Some(message);
+                    }
+                }
+            }
+        }
         // The dashboard refresh: store, clear busy, record freshness.
         // Stale-era snapshots are dropped whole (Pitfall 9) — a result
         // from the pre-switch profile never lands, not even partially.
@@ -66,6 +95,12 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                     lines,
                     scroll: 0,
                 });
+                // The ack-refresh trigger: a landed (or failed) ack
+                // means the active table changed — poll once NOW
+                // instead of waiting out the ≤5 s interval.
+                if label == "alarms ack" {
+                    workers::watch::spawn_alarms_once(state);
+                }
             }
         }
         // A profile switch landed: the era-gated banner confirmation
@@ -116,18 +151,23 @@ fn handle_input(state: &mut AppState, event: Event) {
 
 /// Change the active screen, starting/stopping the screen-scoped
 /// workers on the transition: LEAVING the Logs screen stops the tail
-/// (must-have truth #3), entering it re-arms the tail resuming past
-/// the ring's newest entry (no duplicate flood).
+/// (must-have truth #3) and leaving Alarms stops the poll; entering
+/// re-arms them (the tail resuming past the ring's newest entry — no
+/// duplicate flood).
 fn set_screen(state: &mut AppState, screen: Screen) {
     if state.screen == screen {
         return;
     }
-    if state.screen == Screen::Logs {
-        workers::tail::stop_tail(state);
+    match state.screen {
+        Screen::Logs => workers::tail::stop_tail(state),
+        Screen::Alarms => workers::watch::stop_alarms(state),
+        _ => {}
     }
     state.screen = screen;
-    if state.screen == Screen::Logs {
-        workers::tail::spawn_tail(state);
+    match state.screen {
+        Screen::Logs => workers::tail::spawn_tail(state),
+        Screen::Alarms => workers::watch::spawn_alarms(state),
+        _ => {}
     }
 }
 
@@ -187,23 +227,27 @@ fn switch_profile(state: &mut AppState, name: &str) {
     let (resolved_name, url, api) = rebuilt;
     // Stop the old world's refresh worker BEFORE adopting (its results
     // are already stale — the era bump below formally retires them).
-    // The screen-scoped tail stops too, and its ring clears: the new
-    // world's Logs screen starts from the new gateway's buffer.
+    // The screen-scoped workers stop too, and their data clears: the
+    // new world's screens start from the new gateway.
     if let Some(shutdown) = &state.refresh_shutdown {
         let _ = shutdown.send(true);
     }
     workers::tail::stop_tail(state);
+    workers::watch::stop_alarms(state);
     state.client = Some(crate::state::ClientHandle(api));
     state.profile_url = Some(url);
     state.profile = Some(resolved_name.clone());
     state.dashboard = crate::state::DashboardData::default();
     state.logs = crate::state::LogsData::default();
+    state.alarms = crate::state::AlarmsData::default();
     state.close_modal();
     // Re-spawn under a new era (bumps) + post the banner through the
     // rail so the loop redraws on it.
     workers::refresh::spawn_refresh(state);
-    if state.screen == Screen::Logs {
-        workers::tail::spawn_tail(state);
+    match state.screen {
+        Screen::Logs => workers::tail::spawn_tail(state),
+        Screen::Alarms => workers::watch::spawn_alarms(state),
+        _ => {}
     }
     if let Some(tx) = &state.events_tx {
         let _ = tx.send(AppEvent::ProfileChanged {
@@ -245,6 +289,7 @@ fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
     match state.screen {
         Screen::Dashboard => dashboard_keys(state, code),
         Screen::Logs => logs_keys(state, code),
+        Screen::Alarms => alarms_keys(state, code),
         _ => {}
     }
 }
@@ -298,6 +343,89 @@ fn parse_logger_level_line(line: &str) -> Result<(String, String), String> {
         }
         _ => Err("expected `LOGGER LEVEL` (e.g. `GatewayManager WARN`)".to_string()),
     }
+}
+
+/// The Alarms keymap (06-03): Up/Down move the table cursor, `a`
+/// opens the ack form on the selected alarm (username REQUIRED — NOT
+/// confirm-gated: acknowledging never un-acknowledges, the CLI family
+/// is unguarded too), `h` browses the journal history for the last 24
+/// hours (one-shot worker + the result modal — the LOCKED one-mechanism
+/// display for raw journal rows).
+fn alarms_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Up => move_alarm_selection(state, -1),
+        KeyCode::Down => move_alarm_selection(state, 1),
+        KeyCode::Char('a') => open_ack_modal(state),
+        KeyCode::Char('h') => spawn_alarms_history(state),
+        _ => {}
+    }
+}
+
+/// The currently selected alarm row, if any.
+fn selected_alarm_row(state: &AppState) -> Option<ignition_core::actions::tags::AlarmRow> {
+    let active = state.alarms.active.as_ref()?;
+    let index = state.alarms.table.selected()?;
+    active.get(index).cloned()
+}
+
+/// Move the alarms-table cursor (clamped, like the sessions table).
+fn move_alarm_selection(state: &mut AppState, delta: i32) {
+    let Some(active) = &state.alarms.active else {
+        return;
+    };
+    if active.is_empty() {
+        return;
+    }
+    let next = match state.alarms.table.selected() {
+        None => 0,
+        Some(index) if delta < 0 => index.saturating_sub(1),
+        Some(index) => (index + 1).min(active.len() - 1),
+    };
+    state.alarms.table.select(Some(next));
+}
+
+/// `a` on a selected alarm: the ack form carrying the id AS SHOWN (the
+/// full UUID from the table; the ACTION expands short prefixes itself —
+/// 05-08 behavior inherited).
+fn open_ack_modal(state: &mut AppState) {
+    if let Some(alarm) = selected_alarm_row(state) {
+        state.open_modal(Modal::Ack {
+            event_id: alarm.event_id,
+            username: String::new(),
+            note: String::new(),
+            field: 0,
+        });
+    }
+}
+
+/// The history browse: journal rows for the last 24 h — one-shot
+/// worker over `tags_alarms_history`, result in the scrollable modal.
+/// A journal-less default rig refuses with the provisioning hint (the
+/// action's own alarm_journal_missing path) — surfaced as data.
+fn spawn_alarms_history(state: &mut AppState) {
+    if let Some(client) = client_arc(state) {
+        let (start_ms, end_ms) = history_window_24h();
+        workers::spawn_action(state, "alarms history", async move {
+            ignition_core::actions::tags::tags_alarms_history(
+                &*client,
+                workers::watch::ALARMS_PROJECT,
+                start_ms,
+                end_ms,
+            )
+            .await
+        });
+    }
+}
+
+/// The history window: the trailing 24 hours in epoch-ms (the TUI's
+/// fixed browse policy — the CLI's --start/--end stay on the command
+/// line where they belong).
+fn history_window_24h() -> (i64, i64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or_default();
+    (now_ms.saturating_sub(24 * 60 * 60 * 1000), now_ms)
 }
 
 /// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
@@ -576,6 +704,44 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         return;
     }
 
+    // The ack form (06-03): Tab toggles username/note; Enter submits —
+    // a NO-OP while the username is empty (OK disabled until non-empty,
+    // the must-have). Not confirm-gated (the CLI verb isn't either).
+    if let Some(Modal::Ack {
+        event_id,
+        username,
+        note,
+        field,
+    }) = state.modal.as_mut()
+    {
+        if code == KeyCode::Tab {
+            *field = (*field + 1) % 2;
+            return;
+        }
+        if code == KeyCode::Enter {
+            if username.trim().is_empty() {
+                return; // required-username gate — the form cannot OK
+            }
+            let event_id = event_id.clone();
+            let username = username.clone();
+            let note = note.clone();
+            state.close_modal();
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "alarms ack", async move {
+                    ignition_core::actions::tags::tags_alarms_ack(
+                        &*client,
+                        workers::watch::ALARMS_PROJECT,
+                        &[event_id],
+                        &note,
+                        &username,
+                    )
+                    .await
+                });
+            }
+            return;
+        }
+    }
+
     // The Logs actions menu: the same nav shape as the dashboard's
     // menu, over the loggers family.
     if let Some(Modal::LogsActions { selected }) = state.modal.as_mut()
@@ -737,6 +903,41 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                     }
                     _ => {
                         url.pop();
+                    }
+                }
+                return;
+            }
+            // The ack form's active field (username / note).
+            (
+                Some(Modal::Ack {
+                    username,
+                    note,
+                    field,
+                    ..
+                }),
+                KeyCode::Char(c),
+            ) => {
+                match field {
+                    0 => username.push(c),
+                    _ => note.push(c),
+                }
+                return;
+            }
+            (
+                Some(Modal::Ack {
+                    username,
+                    note,
+                    field,
+                    ..
+                }),
+                KeyCode::Backspace,
+            ) => {
+                match field {
+                    0 => {
+                        username.pop();
+                    }
+                    _ => {
+                        note.pop();
                     }
                 }
                 return;
@@ -1801,5 +2002,214 @@ mod tests {
         update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(fresh.dashboard.in_flight, Some("loggers list"));
+    }
+
+    // ---- Alarms screen (06-03 Task 3) ----
+
+    fn alarm_row(event_id: &str) -> ignition_core::actions::tags::AlarmRow {
+        ignition_core::actions::tags::AlarmRow {
+            event_id: event_id.to_string(),
+            source: "prov:default".into(),
+            state: "Active, Unacknowledged".into(),
+            priority: "High".into(),
+            name: Some("PumpCavitation".into()),
+        }
+    }
+
+    /// An Alarms-screen state with rails armed, entering via Tab×3
+    /// (Dashboard → Logs → Tags → Alarms) so the transition hooks arm
+    /// the poll rail like production.
+    fn alarms_screen_with_rails() -> AppState {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        for _ in 0..3 {
+            update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(state.screen, Screen::Alarms);
+        state
+    }
+
+    /// Entering Alarms arms the poll rail; leaving stops it.
+    #[test]
+    fn alarms_screen_entry_and_exit_arm_and_stop_the_poll_rail() {
+        let mut state = alarms_screen_with_rails();
+        assert!(
+            state.alarms.shutdown.is_some(),
+            "entering Alarms arms the poll rail"
+        );
+
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Projects);
+        assert!(
+            state.alarms.shutdown.is_none(),
+            "leaving Alarms stops the poll worker"
+        );
+    }
+
+    /// A current-era poll fills the table (and records freshness,
+    /// clears the busy guard); a stale-era poll drops whole.
+    #[test]
+    fn alarms_poll_fills_the_table_and_stale_drops() {
+        let mut state = alarms_screen_with_rails();
+        state.alarms.busy = true;
+        let era = state.era;
+        let rows = vec![alarm_row("c0ffee00-1234-5678-9abc-def012345678")];
+
+        update(
+            &mut state,
+            AppEvent::Alarms {
+                era,
+                result: Ok(rows),
+            },
+        );
+        assert_eq!(
+            state.alarms.active.as_ref().map(|rows| rows.len()),
+            Some(1),
+            "table filled"
+        );
+        assert!(state.alarms.error.is_none());
+        assert!(state.alarms.last_poll.is_some(), "freshness recorded");
+        assert!(!state.alarms.busy, "busy clears");
+
+        // Stale era: dropped whole — old-world alarms never land.
+        state.alarms.busy = true;
+        let before = state.alarms.active.clone();
+        update(
+            &mut state,
+            AppEvent::Alarms {
+                era: era.wrapping_sub(1),
+                result: Ok(vec![]),
+            },
+        );
+        assert_eq!(state.alarms.active, before, "stale poll dropped");
+        assert!(state.alarms.busy, "stale poll does not clear busy");
+    }
+
+    /// A poll error degrades to the honest error state (data dropped).
+    #[test]
+    fn alarms_poll_error_degrades_the_table() {
+        let mut state = alarms_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::Alarms {
+                era,
+                result: Ok(vec![alarm_row("c0ffee00-1234-5678-9abc-def012345678")]),
+            },
+        );
+        assert!(state.alarms.active.is_some());
+
+        update(
+            &mut state,
+            AppEvent::Alarms {
+                era,
+                result: Err("routes_not_deployed (exit 6)".into()),
+            },
+        );
+        assert!(state.alarms.active.is_none(), "rows dropped on error");
+        assert_eq!(
+            state.alarms.error.as_deref(),
+            Some("routes_not_deployed (exit 6)")
+        );
+    }
+
+    /// The ack form: `a` opens it carrying the selected row's id AS
+    /// SHOWN; Enter with an EMPTY username is a NO-OP (OK disabled);
+    /// typed username + Enter moves the ack to in-flight — NOT
+    /// confirm-gated (the CLI verb isn't either).
+    #[test]
+    fn ack_form_requires_username_and_spawns_on_accept() {
+        let mut state = alarms_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::Alarms {
+                era,
+                result: Ok(vec![alarm_row("c0ffee00-1234-5678-9abc-def012345678")]),
+            },
+        );
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        state.alarms.table.select(Some(0));
+
+        // `a` opens the form with the full UUID target.
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        match &state.modal {
+            Some(Modal::Ack { event_id, .. }) => {
+                assert_eq!(event_id, "c0ffee00-1234-5678-9abc-def012345678");
+            }
+            other => panic!("ack form open, got {other:?}"),
+        }
+
+        // Enter with empty username: NO-OP (modal stays, nothing runs).
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Ack { .. })),
+            "empty username cannot OK"
+        );
+        assert!(state.dashboard.in_flight.is_none());
+
+        // Type the username into field 0, tab to note, type, Enter.
+        for ch in "operator".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "seen".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.modal.is_none(), "form closed on accept");
+        assert_eq!(
+            state.dashboard.in_flight,
+            Some("alarms ack"),
+            "ack in flight (unguarded — no Confirm gate)"
+        );
+    }
+
+    /// The ack-refresh trigger: a landed `alarms ack` ActionDone arms
+    /// the one-shot poll (busy) — the active table refreshes NOW, not
+    /// at the next 5 s tick. Other labels do not trigger.
+    #[test]
+    fn ack_landing_triggers_an_immediate_active_poll() {
+        let mut state = alarms_screen_with_rails();
+        let era = state.era;
+
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "alarms ack",
+                result: Ok("{\"acknowledged\": 1}".into()),
+            },
+        );
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { title, .. }) if title == "alarms ack"),
+            "result modal shows the ack outcome"
+        );
+        assert!(state.alarms.busy, "one-shot poll armed by the ack");
+
+        // A different action's completion does not trigger.
+        state.alarms.busy = false;
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "version",
+                result: Ok("{}".into()),
+            },
+        );
+        assert!(!state.alarms.busy, "non-ack labels do not trigger");
+    }
+
+    /// `h` browses history: the one-shot verb moves to in-flight (the
+    /// 24 h window is computed at spawn; the journal-less refusal will
+    /// surface as the action's own data).
+    #[test]
+    fn h_spawns_the_history_browse() {
+        let mut state = alarms_screen_with_rails();
+        update(&mut state, key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("alarms history"));
     }
 }

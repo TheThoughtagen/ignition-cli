@@ -102,6 +102,9 @@ async fn run_loop(
     if let Some(shutdown) = &state.logs.tail_shutdown {
         let _ = shutdown.send(true);
     }
+    if let Some(shutdown) = &state.alarms.shutdown {
+        let _ = shutdown.send(true);
+    }
     result
 }
 
