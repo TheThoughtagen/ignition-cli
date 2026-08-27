@@ -20,6 +20,8 @@ mod cli;
 mod completions;
 mod render;
 
+#[cfg(feature = "tui")]
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -188,6 +190,12 @@ enum ActionOutput {
     /// `ign tags history query` — the dataset with t_stamp
     /// preserved exactly.
     TagsHistoryQuery(actions::tags::TagsHistoryQueryResult),
+    /// `ign tui` — the cockpit ran and exited. Renders NOTHING in every
+    /// mode (LOCKED stdout decision: the TUI owns the alternate screen
+    /// and prints nothing on success; errors after restore flow the
+    /// normal stderr envelope + exit taxonomy).
+    #[cfg(feature = "tui")]
+    TuiExited,
 }
 
 impl ActionOutput {
@@ -270,6 +278,10 @@ impl ActionOutput {
             ActionOutput::TagsAlarmsHistory(result) => render_success(profile, result, compact),
             ActionOutput::TagsAlarmsAck(result) => render_success(profile, result, compact),
             ActionOutput::TagsHistoryQuery(result) => render_success(profile, result, compact),
+            // Unreachable in practice (render_ok intercepts TuiExited
+            // before mode dispatch — the cockpit prints nothing).
+            #[cfg(feature = "tui")]
+            ActionOutput::TuiExited => String::new(),
         }
     }
 }
@@ -1623,12 +1635,24 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             unreachable!("completions handled before config load")
         }
         #[cfg(feature = "tui")]
-        Commands::Tui => (
-            None,
-            Err(CoreError::Internal(
-                "the TUI cockpit arrives in a later phase".into(),
-            )),
-        ),
+        // TTY guard BEFORE anything: ratatui::init panics on non-terminal
+        // stdout (Pitfall 10) — refuse usage-class instead. The cockpit
+        // itself (loop, lifecycle, restore) lives in ignition-tui; this
+        // arm stays thin (choke-file discipline).
+        Commands::Tui => {
+            if !std::io::stdout().is_terminal() {
+                return (
+                    None,
+                    Err(CoreError::InvalidInput {
+                        reason: "ign tui requires a terminal (stdout is not a TTY)".to_string(),
+                    }),
+                );
+            }
+            match ignition_tui::run(cli.profile.clone()).await {
+                Ok(()) => (None, Ok(ActionOutput::TuiExited)),
+                Err(err) => (None, Err(err)),
+            }
+        }
     }
 }
 

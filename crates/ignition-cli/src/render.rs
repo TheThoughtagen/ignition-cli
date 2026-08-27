@@ -102,6 +102,13 @@ pub fn render_ok(out: &ActionOutput, profile: Option<&str>, mode: RenderMode) {
         print!("{}", result.payload.as_deref().unwrap_or_default());
         return;
     }
+    // `ign tui` prints NOTHING on success in every mode (LOCKED Phase 6
+    // stdout decision): the cockpit owned the alternate screen and
+    // restored it; there is no envelope, no summary line.
+    #[cfg(feature = "tui")]
+    if matches!(out, ActionOutput::TuiExited) {
+        return;
+    }
     match mode {
         RenderMode::Human => render_human(out, profile),
         RenderMode::PrettyJson => {
@@ -254,6 +261,10 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::TagsAlarmsHistory(result) => render_tags_alarms_history_human(result),
         ActionOutput::TagsAlarmsAck(result) => render_tags_alarms_ack_human(result),
         ActionOutput::TagsHistoryQuery(result) => render_tags_history_query_human(result),
+        // Unreachable: render_ok intercepts TuiExited before mode
+        // dispatch (the prints-nothing decision).
+        #[cfg(feature = "tui")]
+        ActionOutput::TuiExited => {}
     }
 }
 
