@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 executing: 06-04 SHIPPED (Tags screen — provider-first tree browse with one-level Esc ascent, on-demand detail reads, 2s whole-set live watch with generation-gated respawns, full actions menu with JSON-scalar write rule and Confirm gates on provider delete / config delete / import overwrite, complete non-alarm tags route rows; 645 tests green, fmt/clippy clean + two environment-sensitive ignition-core tests stabilized). Next: 06-05 Projects.
+**Current focus:** Phase 6 executing: 06-05 SHIPPED (Projects screen — list → find-detail → resources drill-down with scrollable content preview, name/seq stale gates over the era; full project/resource/webdev action menus with exact CLI confirm-parity — project delete/import-overwrite/resource put/resource delete Confirm-gated, webdev deploy deliberately ungated; all 14 family route rows registered; gated_cli_verb exhaustive tripwire staged for 06-06; 676 tests green, fmt/clippy clean, secrets confined to context.rs). Next: 06-06 (Rig screen + structural coverage proof — the final plan).
 
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit)
-**Current Plan:** 5
+**Current Plan:** 6
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-08-27
 
-**Progress:** [█████████░] 93%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -54,6 +54,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P02 | 60min | 3 tasks | 16 files |
 | Phase 06 P03 | 36min | 3 tasks tasks | 11 files files |
 | Phase 06 P04 | 12min | 3 tasks | 8 files |
+| Phase 06 P05 | 29min | 3 tasks tasks | 8 files files |
 
 ## Accumulated Context
 
@@ -159,6 +160,9 @@ Recent decisions affecting current work:
 - [Phase 06]: Rich tags operations use chained common-field inputs; ? opens the exact CLI synopsis rather than adding a general form framework.
 - [Phase 06]: TUI JSON-file inputs reject stdin because crossterm owns raw terminal input; files are read asynchronously inside workers.
 - [Phase 06]: tags export -o - remains a CLI-only flag-value exception, so no separate OutOfBand route row exists.
+- [Phase 06]: [Phase 06-05]: Projects screen browse = list → project_find detail (no 'project get' leaf exists — the find IS the read-back source; the detail uniquely shows defaultDb/tagProvider/userSource passthrough) → resources list → resource get with scrollable preview; stale results gate on pane NAME identity (ProjectGet/ResourcesList) or seq (ResourceGet) over the era — the Tags path-lookup shape, no per-pane eras
+- [Phase 06]: [Phase 06-05]: ONE ProjectsActions menu hosts all three families (11 verbs incl. copy/rename so every route row is honestly reachable); Confirm gates mirror main.rs exactly — project delete, project import-overwrite, resource put, resource delete gated (cancel spawns nothing, y fires unguarded); webdev deploy deliberately UNGATED firing with CLI defaults (ign-cli, no scriptExec — 05-03 CLI-owned-project decision)
+- [Phase 06]: [Phase 06-05]: confirm-parity tripwire — gated_cli_verb EXHAUSTIVELY classifies every PendingAction to its main.rs require_confirmation operation string (#[cfg_attr(not(test), expect(dead_code))] until 06-06's structural test); gated set = 11 verbs / 6 mapped families, rig reset/trial-reset/restore remain 06-06's; project set parses ONE FIELD=VALUE pair per prompt (spaces allowed after the first =; db/tagprov/usersrc stay CLI-form per the LOCKED modal-depth decision); set/import/export/resource forms read files INSIDE workers, stdin refused
 
 ### Pending Todos
 
@@ -175,6 +179,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T22:52:00.000Z
-**Stopped At:** Completed 06-04-PLAN.md (continuation executor finished verification, test stabilization, SUMMARY, docs commit)
+**Last session:** 2026-08-27T23:29:51.531Z
+**Stopped At:** Completed 06-05-PLAN.md (Projects screen shipped — browser + full project/resource/webdev action surface with CLI confirm-parity; 676 tests green)
 **Resume file:** None
