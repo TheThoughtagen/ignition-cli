@@ -5,16 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 executing: 06-02 dashboard SHIPPED (4-panel live refresh + actions menu with confirm-gated verbs + session terminate + atomic profile switcher; poll.rs Probe now Send; 570 tests green, fmt/clippy clean). Next: 06-03 Logs.
+**Current focus:** Phase 6 executing: 06-03 SHIPPED (Logs screen — channel-sink tail into a 10k ring, render-side level filter, follow/scrollback, loggers menu with confirm-gated set/reset; Alarms screen — 5s full-UUID poll, 24h history, username-required ack; both streaming worker patterns proven for 06-04; 607 tests green, fmt/clippy clean). Next: 06-04 Tags.
 
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit)
-**Current Plan:** 3 of 6
-**Status:** 06-02 complete (dashboard + actions menu + profile switcher live — 06-03..06-06 purely additive)
+**Current Plan:** 4 of 6
+**Total Plans in Phase:** 6
+**Status:** Ready to execute 06-04 (Tags — browser + live watch reusing the two streaming patterns)
 **Last Activity:** 2026-08-27
 
-**Progress:** [█████████░] 87%
+**Progress:** [█████████░] 90%
 
 ## Performance Metrics
 
@@ -30,8 +31,6 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 01 P04 | 37min | 3 tasks | 18 files |
 | Phase 02 P01 | 19min | 3 tasks | 14 files |
 
-*Updated after each plan completion*
-| Phase 02 P01 | 19min | 3 tasks | 14 files |
 | Phase 02 P02 | 12min | 3 tasks | 14 files |
 | Phase Phase 02 PP03 | 14min | 3 tasks | 15 files |
 | Phase 02 P04 | 35min | 3 tasks | 18 files |
@@ -53,6 +52,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P08 | 60min | 2 tasks | 9 files |
 | Phase 06 P01 | 222min | 3 tasks | 31 files |
 | Phase 06 P02 | 60min | 3 tasks | 16 files |
+| Phase 06 P03 | 36min | 3 tasks tasks | 11 files files |
 
 ## Accumulated Context
 
@@ -150,6 +150,9 @@ Recent decisions affecting current work:
 - [Phase 06-02]: [Phase 06-02]: TUI worker patterns LOCKED — snapshot() composes action fns AS-IS via future::join4 with per-panel degrade (Option<T>+error, one dead endpoint never blanks the dashboard); spawn_action is the one-shot pattern (in-flight busy guard, era-stamped, pretty-JSON result modal, Handle::try_current-guarded so update() never panics in tests); poll.rs Probe gained +Send with outer scratch Cells→Mutexes (restart/logs/rig) — every locked HRTB contract intact, all core tests green, the TUI can tokio::spawn whole waits
 - [Phase 06-02]: [Phase 06-02]: Profile switch is ATOMIC by ordering (rebuild FIRST → use_profile persist → adopt+era-bump+respawn) — a failed rebuild leaves config.active unwritten and old workers running (truths-over-plan-sketch); ProfileChanged banner retires on the new world's first refresh; Esc clears armed modal payloads so a canceled Confirm can never arm a later y
 - [Phase 06-02]: [Phase 06-02]: ONE crate-wide #[cfg(test)] ENV_LOCK in ignition-tui lib.rs — per-module env locks do NOT serialize cross-module (a racing teardown made context::resolve fall back to the real machine config); routes.rs carries 15 dashboard/profile rows for 06-06's clap-walk completeness test (bare 'sessions' IS the list leaf)
+- [Phase 06]: [Phase 06-03]: Screen-scoped workers (tail, alarms poll) live and die by their own shutdown watches armed in set_screen — NO era bump on screen transitions (the global era stays world-scoped = profile switches; a Tab-driven bump would retire the dashboard refresh worker); LogLine events are unera'd by plan-lock (ring turnover is the acceptance policy)
+- [Phase 06]: [Phase 06-03]: Tail spawn resumes at the ring's newest timestamp (since = ring.back()) — re-entry and level-filter restarts never duplicate-flood; the filter applies AT RENDER over retained entries AND as min_level on restart
+- [Phase 06]: [Phase 06-03]: Alarm ack is NOT confirm-gated with Enter disabled until username non-empty (the 3-arg wire form); ids pass AS SHOWN to the expanding action (05-08); ActionDone on 'alarms ack' triggers a busy-guarded one-shot active re-poll; history = 24h window through the LOCKED result modal (one-mechanism display)
 
 ### Pending Todos
 
@@ -166,6 +169,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T19:21:01.201Z
-**Stopped At:** Completed 06-02-PLAN.md (dashboard + actions menu + session terminate + profile switcher; poll.rs Send fix; 570 tests green)
+**Last session:** 2026-08-27T20:15:40.619Z
+**Stopped At:** Completed 06-03-PLAN.md (Logs tail+ring+filter screen, loggers menu, Alarms poll/UUID/ack screen; 607 tests green)
 **Resume file:** None

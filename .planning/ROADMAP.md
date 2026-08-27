@@ -19,7 +19,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Project Operations** - Full project CRUD, export/import, and surgical resource editing — the gateway webpage's project pages replaced
 - [x] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore (2026-08-23)
 - [x] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar (2026-08-25; all five live e2e gates green on a real 8.3.3 rig; UAT gaps closed & re-verified 7/7 on 2026-08-26)
-- [~] **Phase 6: TUI Cockpit** (In progress — 1/6 plans: 06-01 foundation shipped) - Ratatui cockpit exposing every CLI action: dashboard, log tail, tag browser with live watch, alarm panel, project browser, profile switcher
+- [~] **Phase 6: TUI Cockpit** (In progress — 3/6 plans: 06-01 foundation + 06-02 dashboard + 06-03 logs/alarms shipped) - Ratatui cockpit exposing every CLI action: dashboard, log tail, tag browser with live watch, alarm panel, project browser, profile switcher
 - [ ] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows
 
 ## Phase Details
