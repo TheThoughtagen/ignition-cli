@@ -113,7 +113,14 @@ pub enum Modal {
     /// A single-line text input, hand-rolled (no tui-input dep):
     /// char-append/backspace editing, Esc cancels, Enter accepts (the
     /// accepted buffer routes by `dashboard.pending_input`).
-    Input { title: String, buffer: String },
+    /// `hint` is the optional one-line rule reminder (06-04's write
+    /// form states the JSON-scalar rule; the loggers forms carry
+    /// none).
+    Input {
+        title: String,
+        hint: Option<String>,
+        buffer: String,
+    },
     /// Read-only result/report lines (errors land here too). PgUp/PgDn
     /// scroll — the LOCKED one-mechanism result display every action
     /// verb shares (serde_json::to_string_pretty of the typed result).
@@ -156,12 +163,18 @@ pub enum Modal {
         note: String,
         field: usize,
     },
+    /// The Tags screen's actions menu (06-04): the remaining tags
+    /// family verbs with a moving selection — the same shape as
+    /// [`Modal::Actions`], its own list.
+    TagsActions { selected: usize },
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
 /// (`y`) looks here; cancel (Esc) clears it. The LOGGED verbs join the
-/// set (the loggers family's two `--yes`-guarded mutations, 06-03) —
-/// the TUI owns their confirmation, the action fns stay unguarded.
+/// set (the loggers family's two `--yes`-guarded mutations, 06-03) and
+/// the tags family's guarded three (provider delete, config delete,
+/// import overwrite — 06-04) — the TUI owns their confirmation, the
+/// action fns stay unguarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingAction {
     /// `ign restart` — the guarded global verb.
@@ -172,6 +185,15 @@ pub enum PendingAction {
     LoggersSet { logger: String, level: String },
     /// `ign logs loggers reset` (Confirm ≡ `--yes`).
     LoggersReset,
+    /// `ign tags provider delete NAME` (Confirm ≡ `--yes` — the 6th
+    /// guarded verb in the CLI; the TUI mirrors the guard).
+    TagsProviderDelete { name: String },
+    /// `ign tags config delete PATH` (Confirm ≡ `--yes` — the 7th).
+    TagsConfigDelete { path: String },
+    /// `ign tags import --collision-policy overwrite` (Confirm ≡
+    /// `--yes`; the ABORT policy is unguarded — its collisions refuse
+    /// at the action's own zero-write pre-check).
+    TagsImportOverwrite { file: String, provider: String },
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
@@ -198,6 +220,7 @@ impl Modal {
             | Modal::Result_ { title, .. } => title,
             Modal::Actions { .. } => "actions",
             Modal::LogsActions { .. } => "actions",
+            Modal::TagsActions { .. } => "actions",
             Modal::Profiles { .. } => "profiles",
             Modal::ProfileAdd { .. } => "profile add",
             Modal::Ack { .. } => "ack alarm",
@@ -279,6 +302,77 @@ pub const ACTIONS: [&str; 7] = [
 /// family. Labels are display-side; the route rows in
 /// [`crate::routes`] carry the clap-exact spellings.
 pub const LOG_ACTIONS: [&str; 3] = ["loggers list", "loggers set", "loggers reset"];
+
+/// The Tags screen's actions menu entries (06-04) — the remaining
+/// tags family verbs (browse/read live on the navigation itself;
+/// alarms lives on the Alarms screen, 06-03). Labels are display
+/// side; the route rows in [`crate::routes`] carry the clap-exact
+/// spellings.
+pub const TAG_ACTIONS: [&str; 13] = [
+    "write",
+    "providers list",
+    "providers create",
+    "providers delete",
+    "config get",
+    "config create",
+    "config edit",
+    "config delete",
+    "export",
+    "import",
+    "udt types",
+    "udt def",
+    "history query",
+];
+
+/// What an accepted Input modal's buffer is for on the Tags screen
+/// (06-04) — the tags family's own small-form router, carrying its
+/// own payloads (multi-step flows chain through these). Cleared by
+/// the shared cancel path so a stale form can never arm a later
+/// Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagsForm {
+    /// `write` — the VALUE for the carried path (the JSON-scalar rule
+    /// applies at accept; the modal's hint states it).
+    WriteValue { path: String },
+    /// `providers create` — the new provider's NAME.
+    ProviderCreateName,
+    /// `providers delete` — the target provider's NAME (a Confirm
+    /// gate arms before the fire).
+    ProviderDeleteName,
+    /// `config get` — the tag PATH.
+    ConfigGetPath,
+    /// `config create` step 1 — the tag PATH (the definition-file
+    /// prompt chains next).
+    ConfigCreatePath,
+    /// `config create` step 2 — the JSON definition FILE path.
+    ConfigCreateFile { path: String },
+    /// `config edit` step 1 — the tag PATH.
+    ConfigEditPath,
+    /// `config edit` step 2 — the JSON definition FILE path.
+    ConfigEditFile { path: String },
+    /// `config delete` — the tag PATH (a Confirm gate arms before the
+    /// fire).
+    ConfigDeletePath,
+    /// `export` — the output FILE (prefilled with the 05-05 default
+    /// naming for the carried path).
+    ExportFile { path: String },
+    /// `import` step 1 — the export FILE path.
+    ImportFile,
+    /// `import` step 2 — the target PROVIDER.
+    ImportProvider { file: String },
+    /// `import` step 3 — the collision POLICY (`abort`/`overwrite`;
+    /// the overwrite arm is Confirm-gated, abort fires unguarded).
+    ImportPolicy { file: String, provider: String },
+    /// `udt types` — the PROVIDER whose `_types_` folder to list.
+    UdtTypesProvider,
+    /// `udt def` step 1 — the UDT type NAME.
+    UdtDefName,
+    /// `udt def` step 2 — the PROVIDER.
+    UdtDefProvider { name: String },
+    /// `history query` — the tag PATH (the trailing-24h window rides
+    /// like the alarms history browse).
+    HistoryQueryPath,
+}
 
 /// The dashboard screen's data (06-02).
 #[derive(Debug, Default)]
@@ -605,6 +699,9 @@ pub struct TagsData {
     /// The watch worker's shutdown switch — screen exit, empty set,
     /// set-change respawn, profile switch.
     pub watch_shutdown: Option<watch::Sender<bool>>,
+    /// The armed tags form (the Input modal's routing slot for the
+    /// tags family — [`TagsForm`]); cleared by the shared cancel path.
+    pub pending_form: Option<TagsForm>,
 }
 
 /// The whole cockpit, in plain data. The era counter is the stale-worker

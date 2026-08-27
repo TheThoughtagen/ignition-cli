@@ -13,7 +13,7 @@ use ignition_core::client::ReqwestGatewayApi;
 use crate::event::AppEvent;
 use crate::state::{
     ACTIONS, AppState, LOG_ACTIONS, Modal, PendingAction, PendingInput, Screen, SessionRow,
-    session_rows,
+    TAG_ACTIONS, TagsForm, session_rows,
 };
 use crate::workers;
 
@@ -218,6 +218,12 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 // instead of waiting out the ≤5 s interval.
                 if label == "alarms ack" {
                     workers::watch::spawn_alarms_once(state);
+                }
+                // A landed provider mutation refreshes the Tags
+                // screen's provider list (the ack-refresh pattern's
+                // tags twin).
+                if matches!(label, "providers create" | "providers delete") {
+                    workers::watch::spawn_providers_once(state);
                 }
             }
         }
@@ -577,14 +583,16 @@ fn history_window_24h() -> (i64, i64) {
 /// The Tags keymap (06-04): Up/Down (j/k) move the current level's
 /// cursor, Enter descends (provider → its tree; folder → deeper) or
 /// opens the tag detail (with the on-demand read), `w` toggles live
-/// watch on the selected tag (06-04 Task 2), Esc ascends one level
-/// (handled in [`handle_input`] — the global key owns Esc).
+/// watch on the selected tag, `a` opens the actions menu (the
+/// remaining tags verbs), Esc ascends one level (handled in
+/// [`handle_input`] — the global key owns Esc).
 fn tags_keys(state: &mut AppState, code: KeyCode) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => move_tags_selection(state, -1),
         KeyCode::Down | KeyCode::Char('j') => move_tags_selection(state, 1),
         KeyCode::Enter => tags_enter(state),
         KeyCode::Char('w') => toggle_watch(state),
+        KeyCode::Char('a') => state.open_modal(Modal::TagsActions { selected: 0 }),
         _ => {}
     }
 }
@@ -752,6 +760,533 @@ fn toggle_watch(state: &mut AppState) {
     workers::watch::spawn_tag_watch(state);
 }
 
+// ---- Tags actions menu (06-04 Task 3) ----
+
+/// The selected tag path at menu time — the write/config/export/
+/// history forms' prefill source. The detail pane's path, else the
+/// selected tree row, else the selected provider's bracket path (a
+/// whole provider is exportable; per-tag verbs that cannot use it
+/// refuse honestly at the action layer).
+fn tags_context_path(state: &AppState) -> Option<String> {
+    if let Some(detail) = &state.tags.detail {
+        return Some(detail.path.clone());
+    }
+    if let Some(row) = selected_tree_row(state) {
+        return Some(row.path);
+    }
+    selected_provider_row(state).map(|provider| format!("[{}]", provider.name))
+}
+
+/// The provider name context for the udt/import prefills: the
+/// current tree level's bracket, else the selected provider, else
+/// the CLI family's own `default`.
+fn tags_context_provider(state: &AppState) -> String {
+    if let Some(provider) = state
+        .tags
+        .stack
+        .last()
+        .and_then(|level| level.path.strip_prefix('['))
+        .and_then(|rest| rest.split(']').next())
+        .filter(|name| !name.is_empty())
+    {
+        return provider.to_string();
+    }
+    if let Some(row) = selected_provider_row(state) {
+        return row.name;
+    }
+    "default".to_string()
+}
+
+/// Open a tags Input form: arm the form slot, then the modal (title,
+/// optional hint (line breaks are preserved), optional prefill).
+fn open_tags_input(
+    state: &mut AppState,
+    form: TagsForm,
+    title: String,
+    hint: Option<String>,
+    prefill: String,
+) {
+    state.tags.pending_form = Some(form);
+    state.open_modal(Modal::Input {
+        title,
+        hint,
+        buffer: prefill,
+    });
+}
+
+/// The write-scalar-is-JSON rule (05-04), the TUI twin of main.rs's
+/// `parse_write_scalar`: parse as JSON — a scalar rides typed, an
+/// array/object refuses (the invalid_input message), unparseable
+/// text rides as a STRING. Pure — unit-pinned.
+fn parse_write_value(raw: &str) -> Result<serde_json::Value, String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) if !value.is_array() && !value.is_object() => Ok(value),
+        Ok(_) => Err(format!(
+            "value must be a JSON scalar (number, bool, null, or string) — \
+             arrays/objects cannot ride the tag write slot: {raw:?}"
+        )),
+        Err(_) => Ok(serde_json::Value::String(raw.to_string())),
+    }
+}
+
+/// The import policy line: `abort`/`overwrite` (case-insensitive);
+/// merge is Designer-only (the CLI's own refusal language).
+fn parse_import_policy(
+    raw: &str,
+) -> Result<ignition_core::actions::projects::CollisionPolicy, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "abort" => Ok(ignition_core::actions::projects::CollisionPolicy::Abort),
+        "overwrite" => Ok(ignition_core::actions::projects::CollisionPolicy::Overwrite),
+        _ => Err(
+            "collision policy must be `abort` or `overwrite` (merge is Designer-only)".to_string(),
+        ),
+    }
+}
+
+/// Exact CLI synopsis for the active tags form. `?` opens this in the
+/// shared result pane rather than trying to reproduce every rich clap
+/// form in the cockpit.
+fn tags_cli_form(form: &TagsForm) -> String {
+    match form {
+        TagsForm::WriteValue { path } => {
+            format!("ign tags write {path:?} --value <JSON_SCALAR>")
+        }
+        TagsForm::ProviderCreateName => "ign tags provider create <NAME>".to_string(),
+        TagsForm::ProviderDeleteName => "ign tags provider delete <NAME> --yes".to_string(),
+        TagsForm::ConfigGetPath => "ign tags config get <PATH>".to_string(),
+        TagsForm::ConfigCreatePath => "ign tags config create <PATH> --file <FILE>".to_string(),
+        TagsForm::ConfigCreateFile { path } => {
+            format!("ign tags config create {path:?} --file <FILE>")
+        }
+        TagsForm::ConfigEditPath => "ign tags config edit <PATH> --file <FILE>".to_string(),
+        TagsForm::ConfigEditFile { path } => {
+            format!("ign tags config edit {path:?} --file <FILE>")
+        }
+        TagsForm::ConfigDeletePath => "ign tags config delete <PATH> --yes".to_string(),
+        TagsForm::ExportFile { path } => {
+            format!("ign tags export {path:?} --output <FILE>")
+        }
+        TagsForm::ImportFile => {
+            "ign tags import --file <FILE> --provider <NAME> [--collision-policy abort|overwrite]"
+                .to_string()
+        }
+        TagsForm::ImportProvider { file } => format!(
+            "ign tags import --file {file:?} --provider <NAME> [--collision-policy abort|overwrite]"
+        ),
+        TagsForm::ImportPolicy { file, provider } => format!(
+            "ign tags import --file {file:?} --provider {provider:?} --collision-policy <abort|overwrite>"
+        ),
+        TagsForm::UdtTypesProvider => "ign tags udt types --provider <NAME>".to_string(),
+        TagsForm::UdtDefName => "ign tags udt def <NAME> --provider <PROVIDER>".to_string(),
+        TagsForm::UdtDefProvider { name } => {
+            format!("ign tags udt def {name:?} --provider <PROVIDER>")
+        }
+        TagsForm::HistoryQueryPath => {
+            "ign tags history query <PATH> --start <TIME> --end <TIME>".to_string()
+        }
+    }
+}
+
+/// Execute a Tags-actions-menu entry `index` (Enter in the
+/// TagsActions modal). Unguarded reads spawn immediately; inputs
+/// prompt; the guarded verbs (provider delete, config delete, import
+/// overwrite) arm their Confirm gates at the form-accept step — the
+/// TUI's `--yes` mirrors of main.rs's `require_confirmation` set.
+fn execute_tags_menu_action(state: &mut AppState, index: usize) {
+    match TAG_ACTIONS.get(index).copied() {
+        Some("write") => {
+            let Some(path) = tags_context_path(state) else {
+                open_error_modal(
+                    state,
+                    "tags write",
+                    "no tag selected — browse into a provider first",
+                );
+                return;
+            };
+            open_tags_input(
+                state,
+                TagsForm::WriteValue { path },
+                "write value".to_string(),
+                Some("JSON scalar; bare text stays string\narrays/objects are invalid".to_string()),
+                String::new(),
+            );
+        }
+        Some("providers list") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "providers list", async move {
+                    ignition_core::actions::tags::tag_provider_list(&*client).await
+                });
+            }
+        }
+        Some("providers create") => {
+            open_tags_input(
+                state,
+                TagsForm::ProviderCreateName,
+                "new provider name".to_string(),
+                Some(
+                    "STANDARD profile (DB-backed stays CLI-only)\npress ? for the CLI form"
+                        .to_string(),
+                ),
+                String::new(),
+            );
+        }
+        Some("providers delete") => {
+            let prefill = if state.tags.stack.is_empty() {
+                selected_provider_row(state)
+                    .map(|row| row.name)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            open_tags_input(
+                state,
+                TagsForm::ProviderDeleteName,
+                "provider name to delete".to_string(),
+                Some("guarded — a Confirm gate arms next".to_string()),
+                prefill,
+            );
+        }
+        Some("config get") => {
+            open_tags_input(
+                state,
+                TagsForm::ConfigGetPath,
+                "config get — tag path".to_string(),
+                Some("full tag path, e.g. [default]P5/T1".to_string()),
+                tags_context_path(state).unwrap_or_default(),
+            );
+        }
+        Some("config create") => {
+            open_tags_input(
+                state,
+                TagsForm::ConfigCreatePath,
+                "config create — tag path".to_string(),
+                Some(
+                    "common fields: path + JSON definition file\npress ? for the CLI form"
+                        .to_string(),
+                ),
+                tags_context_path(state).unwrap_or_default(),
+            );
+        }
+        Some("config edit") => {
+            open_tags_input(
+                state,
+                TagsForm::ConfigEditPath,
+                "config edit — tag path".to_string(),
+                Some(
+                    "common fields: path + JSON definition file\npress ? for the CLI form"
+                        .to_string(),
+                ),
+                tags_context_path(state).unwrap_or_default(),
+            );
+        }
+        Some("config delete") => {
+            open_tags_input(
+                state,
+                TagsForm::ConfigDeletePath,
+                "config delete — tag path".to_string(),
+                Some("guarded — a Confirm gate arms next".to_string()),
+                tags_context_path(state).unwrap_or_default(),
+            );
+        }
+        Some("export") => {
+            let Some(path) = tags_context_path(state) else {
+                open_error_modal(
+                    state,
+                    "tags export",
+                    "no tag selected — browse into a provider first",
+                );
+                return;
+            };
+            let prefill =
+                ignition_core::actions::tags::default_export_file_name(std::slice::from_ref(&path));
+            open_tags_input(
+                state,
+                TagsForm::ExportFile { path },
+                "export — output file".to_string(),
+                Some("`-o -` (stdout) is CLI-only in the TUI".to_string()),
+                prefill,
+            );
+        }
+        Some("import") => {
+            open_tags_input(
+                state,
+                TagsForm::ImportFile,
+                "import — export file path".to_string(),
+                Some("the `tags export` JSON shape\npress ? for the CLI form".to_string()),
+                String::new(),
+            );
+        }
+        Some("udt types") => {
+            open_tags_input(
+                state,
+                TagsForm::UdtTypesProvider,
+                "udt types — provider".to_string(),
+                None,
+                tags_context_provider(state),
+            );
+        }
+        Some("udt def") => {
+            open_tags_input(
+                state,
+                TagsForm::UdtDefName,
+                "udt def — type name".to_string(),
+                Some("the provider prompts next".to_string()),
+                String::new(),
+            );
+        }
+        Some("history query") => {
+            open_tags_input(
+                state,
+                TagsForm::HistoryQueryPath,
+                "history query — tag path".to_string(),
+                Some("trailing 24 h window (the alarms-history policy)".to_string()),
+                tags_context_path(state).unwrap_or_default(),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Route an accepted tags Input form (Enter): each arm fires its
+/// one-shot (through [`workers::spawn_action`] — the LOCKED
+/// result-modal display) or chains the next prompt. An EMPTY value
+/// cancels (the wait-module precedent). File inputs are read INSIDE
+/// the spawned worker (I/O lives in workers; `-`/stdin is refused —
+/// the cockpit owns the terminal input).
+fn accept_tags_form(state: &mut AppState, value: &str) {
+    let Some(form) = state.tags.pending_form.take() else {
+        return;
+    };
+    if value.trim().is_empty() {
+        return; // empty accepts cancel — nothing armed, nothing fired
+    }
+    let value = value.trim().to_string();
+    match form {
+        TagsForm::WriteValue { path } => match parse_write_value(&value) {
+            Ok(parsed) => {
+                if let Some(client) = client_arc(state) {
+                    workers::spawn_action(state, "tags write", async move {
+                        ignition_core::actions::tags::tags_write(
+                            &*client,
+                            workers::watch::TAGS_PROJECT,
+                            &path,
+                            parsed,
+                        )
+                        .await
+                    });
+                }
+            }
+            Err(reason) => open_error_modal(state, "tags write", &reason),
+        },
+        TagsForm::ProviderCreateName => {
+            if let Some(client) = client_arc(state) {
+                let name = value.clone();
+                workers::spawn_action(state, "providers create", async move {
+                    ignition_core::actions::tags::tag_provider_create(&*client, &name).await
+                });
+            }
+        }
+        TagsForm::ProviderDeleteName => {
+            state.dashboard.pending = Some(PendingAction::TagsProviderDelete {
+                name: value.clone(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "providers delete".to_string(),
+                body: format!("delete tag provider {value:?}? every tag it holds is destroyed"),
+            });
+        }
+        TagsForm::ConfigGetPath => {
+            if let Some(client) = client_arc(state) {
+                let path = value.clone();
+                workers::spawn_action(state, "config get", async move {
+                    ignition_core::actions::tags::tags_config_get(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &path,
+                    )
+                    .await
+                });
+            }
+        }
+        TagsForm::ConfigCreatePath => {
+            open_tags_input(
+                state,
+                TagsForm::ConfigCreateFile { path: value },
+                "config create — definition file".to_string(),
+                Some("JSON file path (no `-` stdin in the TUI)".to_string()),
+                String::new(),
+            );
+        }
+        TagsForm::ConfigCreateFile { path } => {
+            if let Some(client) = client_arc(state) {
+                let file = value.clone();
+                workers::spawn_action(state, "config create", async move {
+                    let definition = workers::watch::read_json_file(&file).await?;
+                    ignition_core::actions::tags::tags_config_create(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &path,
+                        &definition,
+                    )
+                    .await
+                });
+            }
+        }
+        TagsForm::ConfigEditPath => {
+            open_tags_input(
+                state,
+                TagsForm::ConfigEditFile { path: value },
+                "config edit — definition file".to_string(),
+                Some("JSON file path (no `-` stdin in the TUI)".to_string()),
+                String::new(),
+            );
+        }
+        TagsForm::ConfigEditFile { path } => {
+            if let Some(client) = client_arc(state) {
+                let file = value.clone();
+                workers::spawn_action(state, "config edit", async move {
+                    let definition = workers::watch::read_json_file(&file).await?;
+                    ignition_core::actions::tags::tags_config_edit(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &path,
+                        &definition,
+                    )
+                    .await
+                });
+            }
+        }
+        TagsForm::ConfigDeletePath => {
+            state.dashboard.pending = Some(PendingAction::TagsConfigDelete {
+                path: value.clone(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "config delete".to_string(),
+                body: format!("delete the tag configuration at {value:?}?"),
+            });
+        }
+        TagsForm::ExportFile { path } => {
+            if let Some(client) = client_arc(state) {
+                let out = std::path::PathBuf::from(&value);
+                workers::spawn_action(state, "tags export", async move {
+                    ignition_core::actions::tags::tags_export(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        std::slice::from_ref(&path),
+                        Some(&out),
+                    )
+                    .await
+                });
+            }
+        }
+        TagsForm::ImportFile => {
+            open_tags_input(
+                state,
+                TagsForm::ImportProvider { file: value },
+                "import — target provider".to_string(),
+                Some("must exist (`providers create` first)".to_string()),
+                tags_context_provider(state),
+            );
+        }
+        TagsForm::ImportProvider { file } => {
+            open_tags_input(
+                state,
+                TagsForm::ImportPolicy {
+                    file,
+                    provider: value,
+                },
+                "import — collision policy".to_string(),
+                Some("abort | overwrite (overwrite is Confirm-gated)".to_string()),
+                "abort".to_string(),
+            );
+        }
+        TagsForm::ImportPolicy { file, provider } => match parse_import_policy(&value) {
+            Ok(ignition_core::actions::projects::CollisionPolicy::Abort) => {
+                if let Some(client) = client_arc(state) {
+                    workers::spawn_action(state, "tags import", async move {
+                        let payload = workers::watch::read_json_file(&file).await?;
+                        ignition_core::actions::tags::tags_import(
+                            &*client,
+                            workers::watch::TAGS_PROJECT,
+                            &provider,
+                            payload,
+                            ignition_core::actions::projects::CollisionPolicy::Abort,
+                        )
+                        .await
+                    });
+                }
+            }
+            Ok(ignition_core::actions::projects::CollisionPolicy::Overwrite) => {
+                // The guarded arm: overwrite replaces existing tags —
+                // the Confirm modal IS the TUI's `--yes` (05-05).
+                state.dashboard.pending =
+                    Some(PendingAction::TagsImportOverwrite { file, provider });
+                state.open_modal(Modal::Confirm {
+                    title: "tags import".to_string(),
+                    body: "import with collision-policy OVERWRITE? existing top-level \
+                           tags at the target are replaced"
+                        .to_string(),
+                });
+            }
+            Err(reason) => open_error_modal(state, "tags import", &reason),
+        },
+        TagsForm::UdtTypesProvider => {
+            if let Some(client) = client_arc(state) {
+                let provider = value.clone();
+                workers::spawn_action(state, "udt types", async move {
+                    ignition_core::actions::tags::tags_udt_types(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &provider,
+                    )
+                    .await
+                });
+            }
+        }
+        TagsForm::UdtDefName => {
+            open_tags_input(
+                state,
+                TagsForm::UdtDefProvider { name: value },
+                "udt def — provider".to_string(),
+                None,
+                tags_context_provider(state),
+            );
+        }
+        TagsForm::UdtDefProvider { name } => {
+            if let Some(client) = client_arc(state) {
+                let provider = value.clone();
+                workers::spawn_action(state, "udt def", async move {
+                    ignition_core::actions::tags::tags_udt_def(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &provider,
+                        &name,
+                    )
+                    .await
+                });
+            }
+        }
+        TagsForm::HistoryQueryPath => {
+            if let Some(client) = client_arc(state) {
+                let path = value.clone();
+                let (start_ms, end_ms) = history_window_24h();
+                workers::spawn_action(state, "history query", async move {
+                    ignition_core::actions::tags::tags_history_query(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &[path],
+                        start_ms,
+                        end_ms,
+                        None,
+                        None,
+                    )
+                    .await
+                });
+            }
+        }
+    }
+}
+
 /// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
 /// modal): `loggers list` prompts for the optional search, `loggers
 /// set` prompts for the `LOGGER LEVEL` line, `loggers reset` goes
@@ -763,6 +1298,7 @@ fn execute_logs_menu_action(state: &mut AppState, index: usize) {
             state.dashboard.pending_input = Some(PendingInput::LoggersSearch);
             state.open_modal(Modal::Input {
                 title: "logger search (optional)".to_string(),
+                hint: None,
                 buffer: String::new(),
             });
         }
@@ -770,6 +1306,7 @@ fn execute_logs_menu_action(state: &mut AppState, index: usize) {
             state.dashboard.pending_input = Some(PendingInput::LoggersSetLine);
             state.open_modal(Modal::Input {
                 title: "LOGGER LEVEL".to_string(),
+                hint: None,
                 buffer: String::new(),
             });
         }
@@ -879,6 +1416,7 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
             state.dashboard.pending_input = Some(PendingInput::WaitModule);
             state.open_modal(Modal::Input {
                 title: "module id".to_string(),
+                hint: None,
                 buffer: String::new(),
             });
         }
@@ -946,6 +1484,46 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
             if let Some(client) = client_arc(state) {
                 workers::spawn_action(state, "loggers reset", async move {
                     ignition_core::actions::logs::reset_logger_levels(&*client).await
+                });
+            }
+        }
+        // The confirmed tags mutations fire unguarded — the TUI owned
+        // the `--yes` (the CLI guard contract, caller-owns-guard).
+        PendingAction::TagsProviderDelete { name } => {
+            if let Some(client) = client_arc(state) {
+                let name = name.clone();
+                workers::spawn_action(state, "providers delete", async move {
+                    ignition_core::actions::tags::tag_provider_delete(&*client, &name).await
+                });
+            }
+        }
+        PendingAction::TagsConfigDelete { path } => {
+            if let Some(client) = client_arc(state) {
+                let path = path.clone();
+                workers::spawn_action(state, "config delete", async move {
+                    ignition_core::actions::tags::tags_config_delete(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &[path],
+                    )
+                    .await
+                });
+            }
+        }
+        PendingAction::TagsImportOverwrite { file, provider } => {
+            if let Some(client) = client_arc(state) {
+                let file = file.clone();
+                let provider = provider.clone();
+                workers::spawn_action(state, "tags import", async move {
+                    let payload = workers::watch::read_json_file(&file).await?;
+                    ignition_core::actions::tags::tags_import(
+                        &*client,
+                        workers::watch::TAGS_PROJECT,
+                        &provider,
+                        payload,
+                        ignition_core::actions::projects::CollisionPolicy::Overwrite,
+                    )
+                    .await
                 });
             }
         }
@@ -1091,6 +1669,31 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         }
     }
 
+    // The Tags actions menu (06-04): the same nav shape, over the
+    // remaining tags family verbs.
+    if let Some(Modal::TagsActions { selected }) = state.modal.as_mut()
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        match code {
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(TAG_ACTIONS.len() - 1);
+                return;
+            }
+            KeyCode::Enter => {
+                let index = *selected;
+                state.close_modal();
+                clear_pending(state);
+                execute_tags_menu_action(state, index);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // The Actions menu: Up/Down move, Enter executes. Long waits run in
     // the worker with NO UI block — only the status line's in-flight
     // label shows while they run.
@@ -1134,6 +1737,12 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
     {
         let value = buffer.clone();
         state.close_modal();
+        // The Tags screen's forms route first — they carry their own
+        // pending slot on TagsData (06-04's small-form router).
+        if state.tags.pending_form.is_some() {
+            accept_tags_form(state, &value);
+            return;
+        }
         match (state.dashboard.pending_input.take(), value.is_empty()) {
             (Some(PendingInput::WaitModule), false) => {
                 if let Some(client) = client_arc(state) {
@@ -1172,6 +1781,22 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
             },
             _ => clear_pending(state),
         }
+        return;
+    }
+
+    // Rich tags forms expose their exact CLI equivalent through `?`.
+    // The result pane replaces the form; Esc returns to the screen and
+    // clears the pending payload, so no stale form can later fire.
+    if matches!(state.modal, Some(Modal::Input { .. }))
+        && code == KeyCode::Char('?')
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && let Some(form) = state.tags.pending_form.take()
+    {
+        state.open_modal(Modal::Result_ {
+            title: "CLI form".to_string(),
+            lines: vec![tags_cli_form(&form)],
+            scroll: 0,
+        });
         return;
     }
 
@@ -1283,6 +1908,7 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
 fn clear_pending(state: &mut AppState) {
     state.dashboard.pending = None;
     state.dashboard.pending_input = None;
+    state.tags.pending_form = None;
 }
 
 #[cfg(test)]
@@ -1408,6 +2034,7 @@ mod tests {
         let mut state = AppState::new();
         state.open_modal(Modal::Input {
             title: "username".into(),
+            hint: None,
             buffer: String::new(),
         });
 
@@ -1421,6 +2048,7 @@ mod tests {
             state.modal,
             Some(Modal::Input {
                 title: "username".into(),
+                hint: None,
                 buffer: "adn".into(), // "adm" − backspace + "n"
             })
         );
@@ -3123,5 +3751,363 @@ mod tests {
             state.tags.watch_shutdown.is_some(),
             "re-entry resumes the watch over the retained set"
         );
+    }
+
+    // ---- Tags actions menu (06-04 Task 3) ----
+
+    /// Open the Tags menu and run entry `index` (0-based).
+    fn run_tags_menu(state: &mut AppState, index: usize) {
+        update(state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::TagsActions { selected: 0 })),
+            "a opens the tags menu"
+        );
+        for _ in 0..index {
+            update(state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Type `text` into the open Input modal and accept it.
+    fn submit_tags_input(state: &mut AppState, text: &str) {
+        for ch in text.chars() {
+            update(state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Accept the current prefilled value without editing it.
+    fn accept_tags_input(state: &mut AppState) {
+        update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Replace an Input modal's prefill, then accept it.
+    fn replace_tags_input(state: &mut AppState, text: &str) {
+        let len = match &state.modal {
+            Some(Modal::Input { buffer, .. }) => buffer.chars().count(),
+            other => panic!("expected tags Input, got {other:?}"),
+        };
+        for _ in 0..len {
+            update(state, key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        submit_tags_input(state, text);
+    }
+
+    /// The write-scalar rule (the parse unit): scalars ride typed,
+    /// bare text becomes a STRING, arrays/objects refuse with the
+    /// 05-04 message.
+    #[test]
+    fn write_value_parse_follows_the_scalar_rule() {
+        let parse = super::parse_write_value;
+        assert_eq!(parse("42").unwrap(), serde_json::json!(42));
+        assert_eq!(parse("1.5").unwrap(), serde_json::json!(1.5));
+        assert_eq!(parse("true").unwrap(), serde_json::json!(true));
+        assert_eq!(parse("null").unwrap(), serde_json::json!(null));
+        assert_eq!(
+            parse("hello world").unwrap(),
+            serde_json::json!("hello world"),
+            "unparseable text rides as a string"
+        );
+        let array = parse("[1,2]").expect_err("arrays refuse");
+        assert!(array.contains("JSON scalar"), "names the rule: {array}");
+        let object = parse("{\"a\":1}").expect_err("objects refuse");
+        assert!(
+            object.contains("arrays/objects"),
+            "names the refusal: {object}"
+        );
+    }
+
+    /// The import policy line parses abort/overwrite
+    /// case-insensitively and refuses anything else (merge is
+    /// Designer-only).
+    #[test]
+    fn import_policy_parses_and_refuses() {
+        use ignition_core::actions::projects::CollisionPolicy;
+        let parse = super::parse_import_policy;
+        assert_eq!(parse("abort").unwrap(), CollisionPolicy::Abort);
+        assert_eq!(parse("OVERWRITE").unwrap(), CollisionPolicy::Overwrite);
+        let merged = parse("merge").expect_err("merge is Designer-only");
+        assert!(
+            merged.contains("abort` or `overwrite"),
+            "names the values: {merged}"
+        );
+    }
+
+    /// `write`: the Input opens with the JSON-scalar HINT and the
+    /// selected path; a scalar accepts into in-flight, an array
+    /// refuses with the error modal and fires nothing.
+    #[test]
+    fn write_form_hints_the_rule_and_enforces_it() {
+        let mut state = tags_state_on_tree(); // cursor on [default]T1
+
+        run_tags_menu(&mut state, 0);
+        match &state.modal {
+            Some(Modal::Input { hint, .. }) => {
+                assert!(
+                    hint.as_deref().is_some_and(|h| h.contains("JSON scalar")),
+                    "the hint states the JSON-scalar rule: {hint:?}"
+                );
+            }
+            other => panic!("write form open, got {other:?}"),
+        }
+
+        // An array refuses — error modal, nothing in flight.
+        submit_tags_input(&mut state, "[1,2]");
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { title, .. }) if title == "tags write"),
+            "array refusal surfaces the error modal"
+        );
+        assert!(state.dashboard.in_flight.is_none(), "nothing fired");
+
+        // A scalar accepts — the write moves to in-flight.
+        let mut fresh = tags_state_on_tree();
+        run_tags_menu(&mut fresh, 0);
+        submit_tags_input(&mut fresh, "42");
+        assert_eq!(fresh.dashboard.in_flight, Some("tags write"));
+    }
+
+    /// `providers delete`: name Input → Confirm gate (nothing fires
+    /// before `y`); Esc cancels with the pending cleared; `y` fires
+    /// the unguarded action (the TUI's `--yes`).
+    #[test]
+    fn providers_delete_is_confirm_gated() {
+        let mut state = tags_state_on_tree();
+
+        run_tags_menu(&mut state, 3); // providers delete
+        assert!(matches!(state.modal, Some(Modal::Input { .. })));
+        submit_tags_input(&mut state, "scratch");
+        assert!(
+            matches!(state.modal, Some(Modal::Confirm { .. })),
+            "the Confirm gate arms"
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::TagsProviderDelete {
+                name: "scratch".into()
+            })
+        );
+        assert!(state.dashboard.in_flight.is_none(), "nothing before y");
+
+        // Esc cancels: pending cleared, still nothing in flight.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.dashboard.pending.is_none());
+        assert!(state.dashboard.in_flight.is_none());
+
+        // The accept twin: y fires.
+        let mut fresh = tags_state_on_tree();
+        run_tags_menu(&mut fresh, 3);
+        submit_tags_input(&mut fresh, "scratch");
+        update(&mut fresh, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("providers delete"));
+    }
+
+    /// `config delete`: path Input (prefilled with the selected tag)
+    /// → Confirm gate → y fires; the same cancel contract.
+    #[test]
+    fn config_delete_is_confirm_gated_with_the_selection_prefill() {
+        let mut state = tags_state_on_tree(); // cursor on [default]T1
+
+        run_tags_menu(&mut state, 7); // config delete
+        match &state.modal {
+            Some(Modal::Input { buffer, .. }) => {
+                assert_eq!(buffer, "[default]T1", "path prefilled from the selection");
+            }
+            other => panic!("config delete form open, got {other:?}"),
+        }
+        accept_tags_input(&mut state);
+        assert!(matches!(state.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::TagsConfigDelete {
+                path: "[default]T1".into()
+            })
+        );
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("config delete"));
+    }
+
+    /// `import`: the three-step chain (file → provider → policy).
+    /// ABORT fires directly (its collisions refuse at the action's
+    /// own zero-write pre-check); OVERWRITE arms the Confirm gate; a
+    /// bad policy line refuses and arms nothing.
+    #[test]
+    fn import_chain_abort_fires_and_overwrite_is_confirm_gated() {
+        // abort: the full chain lands in-flight with no Confirm.
+        let mut state = tags_state_on_tree();
+        run_tags_menu(&mut state, 9); // import
+        submit_tags_input(&mut state, "p5.json"); // file
+        replace_tags_input(&mut state, "p5import"); // provider
+        accept_tags_input(&mut state); // default policy = abort
+        assert!(state.modal.is_none(), "abort fires unguarded");
+        assert_eq!(state.dashboard.in_flight, Some("tags import"));
+
+        // overwrite: the same chain arms the Confirm gate instead.
+        let mut fresh = tags_state_on_tree();
+        run_tags_menu(&mut fresh, 9);
+        submit_tags_input(&mut fresh, "p5.json");
+        replace_tags_input(&mut fresh, "p5import");
+        replace_tags_input(&mut fresh, "overwrite");
+        assert!(matches!(fresh.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(
+            fresh.dashboard.pending,
+            Some(PendingAction::TagsImportOverwrite {
+                file: "p5.json".into(),
+                provider: "p5import".into()
+            })
+        );
+        assert!(fresh.dashboard.in_flight.is_none(), "overwrite waits for y");
+        update(&mut fresh, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("tags import"));
+
+        // A bad policy line: error modal, nothing armed or fired.
+        let mut bad = tags_state_on_tree();
+        run_tags_menu(&mut bad, 9);
+        submit_tags_input(&mut bad, "p5.json");
+        replace_tags_input(&mut bad, "p5import");
+        replace_tags_input(&mut bad, "merge");
+        assert!(
+            matches!(&bad.modal, Some(Modal::Result_ { title, .. }) if title == "tags import"),
+            "bad policy surfaces the error modal"
+        );
+        assert!(bad.dashboard.pending.is_none());
+        assert!(bad.dashboard.in_flight.is_none());
+    }
+
+    /// `export` prefills the 05-05 default file name for the selected
+    /// path (the context path); `udt types` prefills the provider
+    /// context; `history query` prefills the path — and each accepts
+    /// into in-flight.
+    #[test]
+    fn export_udt_and_history_forms_prefill_and_fire() {
+        let mut state = tags_state_on_tree(); // cursor on [default]T1
+
+        // export: prefill = default_export_file_name([default]T1) = T1.json
+        run_tags_menu(&mut state, 8);
+        match &state.modal {
+            Some(Modal::Input { buffer, .. }) => {
+                assert_eq!(buffer, "T1.json", "the 05-05 default naming prefills");
+            }
+            other => panic!("export form open, got {other:?}"),
+        }
+        accept_tags_input(&mut state);
+        assert_eq!(state.dashboard.in_flight, Some("tags export"));
+
+        // udt types: provider prefill = the tree's provider (default).
+        let mut fresh = tags_state_on_tree();
+        run_tags_menu(&mut fresh, 10);
+        match &fresh.modal {
+            Some(Modal::Input { buffer, .. }) => assert_eq!(buffer, "default"),
+            other => panic!("udt types form open, got {other:?}"),
+        }
+        accept_tags_input(&mut fresh);
+        assert_eq!(fresh.dashboard.in_flight, Some("udt types"));
+
+        // history query: path prefill, fires the 24 h browse.
+        let mut again = tags_state_on_tree();
+        run_tags_menu(&mut again, 12);
+        match &again.modal {
+            Some(Modal::Input { buffer, .. }) => assert_eq!(buffer, "[default]T1"),
+            other => panic!("history form open, got {other:?}"),
+        }
+        accept_tags_input(&mut again);
+        assert_eq!(again.dashboard.in_flight, Some("history query"));
+    }
+
+    /// The config create/edit chains: path Input → definition-file
+    /// Input → in-flight; the file read rides the WORKER (the state
+    /// machine only arms the label).
+    #[test]
+    fn config_create_and_edit_chain_path_then_file() {
+        let mut state = tags_state_on_tree();
+        run_tags_menu(&mut state, 5); // config create
+        replace_tags_input(&mut state, "[default]New");
+        assert!(
+            matches!(&state.modal, Some(Modal::Input { title, .. }) if title.contains("definition file")),
+            "the definition-file prompt chains next"
+        );
+        submit_tags_input(&mut state, "new.json");
+        assert_eq!(state.dashboard.in_flight, Some("config create"));
+
+        let mut fresh = tags_state_on_tree();
+        run_tags_menu(&mut fresh, 6); // config edit
+        accept_tags_input(&mut fresh);
+        submit_tags_input(&mut fresh, "t1.json");
+        assert_eq!(fresh.dashboard.in_flight, Some("config edit"));
+    }
+
+    /// Rich config forms advertise and open their exact CLI synopsis
+    /// through `?`, preserving the locked modal-depth escape hatch.
+    #[test]
+    fn config_edit_question_mark_opens_the_cli_form() {
+        let mut state = tags_state_on_tree();
+        run_tags_menu(&mut state, 6); // config edit
+        match &state.modal {
+            Some(Modal::Input { hint, .. }) => assert!(
+                hint.as_deref()
+                    .is_some_and(|text| text.contains("press ? for the CLI form")),
+                "rich form advertises the CLI escape hatch: {hint:?}"
+            ),
+            other => panic!("config edit form open, got {other:?}"),
+        }
+
+        update(&mut state, key(KeyCode::Char('?'), KeyModifiers::NONE));
+        match &state.modal {
+            Some(Modal::Result_ { title, lines, .. }) => {
+                assert_eq!(title, "CLI form");
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("ign tags config edit")),
+                    "exact command synopsis is shown: {lines:?}"
+                );
+            }
+            other => panic!("CLI help pane open, got {other:?}"),
+        }
+        assert!(
+            state.tags.pending_form.is_none(),
+            "opening help disarms the replaced input form"
+        );
+    }
+
+    /// A landed provider mutation triggers the provider-list reload
+    /// (the ack-refresh pattern's tags twin); other labels do not.
+    #[test]
+    fn provider_mutations_trigger_a_list_reload() {
+        let mut state = tags_state_on_tree();
+        let era = state.era;
+        assert!(!state.tags.providers_busy);
+
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "providers create",
+                result: Ok("{\"name\": \"p2\"}".into()),
+            },
+        );
+        assert!(state.tags.providers_busy, "the reload armed");
+
+        state.tags.providers_busy = false;
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "version",
+                result: Ok("{}".into()),
+            },
+        );
+        assert!(!state.tags.providers_busy, "other labels do not trigger");
+    }
+
+    /// Esc clears an armed tags form — a canceled form can never arm
+    /// a later Enter (the 06-02 cancel-clears-everything contract).
+    #[test]
+    fn esc_clears_an_armed_tags_form() {
+        let mut state = tags_state_on_tree();
+        run_tags_menu(&mut state, 0); // write
+        assert!(state.tags.pending_form.is_some());
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert!(state.tags.pending_form.is_none(), "the form slot cleared");
     }
 }

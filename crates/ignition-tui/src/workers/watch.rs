@@ -307,6 +307,33 @@ pub fn spawn_tag_watch(state: &mut AppState) {
     }
 }
 
+/// Read + parse a JSON document for a spawned tags form worker —
+/// the CLI's `read_json_input` shape (config create/edit's
+/// definition, import's payload), with one cockpit difference: `-`
+/// (stdin) is REFUSED — the alternate screen owns the terminal
+/// input, and reading stdin would steal crossterm's raw-mode bytes.
+/// Runs ONLY inside spawned workers (I/O lives in workers).
+pub async fn read_json_file(
+    file: &str,
+) -> Result<serde_json::Value, ignition_core::error::CoreError> {
+    use ignition_core::error::CoreError;
+    if file == "-" {
+        return Err(CoreError::InvalidInput {
+            reason: "stdin (-) is not available in the TUI — pass a file path \
+                     (the pipe form is CLI-only)"
+                .to_string(),
+        });
+    }
+    let bytes = tokio::fs::read(file)
+        .await
+        .map_err(|err| CoreError::InvalidInput {
+            reason: format!("cannot read {file}: {err}"),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|err| CoreError::InvalidInput {
+        reason: format!("{file} is not valid JSON: {err}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

@@ -68,10 +68,11 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
     // the Ratio(1,2)-wide centered geometry is the LOCKED look.
     let height = match modal {
         Modal::Confirm { body, .. } => body.lines().count().saturating_add(4).min(9),
-        Modal::Input { .. } => 5,
+        Modal::Input { hint, .. } => 5 + hint.as_deref().map_or(0, |text| text.lines().count()),
         Modal::Result_ { lines, .. } => lines.len().saturating_add(4).min(9),
         Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(3).min(11),
         Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(3),
+        Modal::TagsActions { .. } => crate::state::TAG_ACTIONS.len().saturating_add(3),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
@@ -103,12 +104,25 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::Ack { .. } => {
             alarms::render_ack_overlay(modal, frame);
         }
-        Modal::Input { title, buffer } => {
-            let text = vec![
-                Line::from(format!("{buffer}▏")),
-                Line::default(),
-                Line::from("Enter to accept · Esc to cancel"),
-            ];
+        Modal::Input {
+            title,
+            hint,
+            buffer,
+        } => {
+            let mut text = vec![Line::from(format!("{buffer}▏"))];
+            if let Some(hint) = hint {
+                // Rule reminders may use deliberate line breaks so
+                // critical guidance is never clipped by the locked
+                // half-width modal geometry.
+                text.extend(hint.lines().map(|line| {
+                    Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                }));
+            }
+            text.push(Line::default());
+            text.push(Line::from("Enter to accept · Esc to cancel"));
             frame.render_widget(
                 Paragraph::new(text).block(Block::bordered().title(title.clone())),
                 area,
@@ -153,6 +167,23 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         // shape as the dashboard's menu.
         Modal::LogsActions { selected } => {
             let text: Vec<Line> = crate::state::LOG_ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let marker = if index == *selected { "▸ " } else { "  " };
+                    Line::from(format!("{marker}{action}"))
+                })
+                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .collect();
+            frame.render_widget(
+                Paragraph::new(text).block(Block::bordered().title("actions")),
+                area,
+            );
+        }
+        // The Tags screen's menu (06-04): the remaining tags family
+        // verbs, same shape as the dashboard's menu.
+        Modal::TagsActions { selected } => {
+            let text: Vec<Line> = crate::state::TAG_ACTIONS
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
@@ -355,6 +386,7 @@ mod tests {
         let mut state = AppState::new();
         state.open_modal(Modal::Input {
             title: "username".into(),
+            hint: None,
             buffer: "adm".into(),
         });
         let rows = rendered_rows(&state);
@@ -434,6 +466,60 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("▸ loggers reset")),
             "selection marker on entry 2"
+        );
+    }
+
+    /// The Tags actions menu (06-04) renders every remaining tags
+    /// verb with the selection marker.
+    #[test]
+    fn tags_actions_menu_renders_the_tags_family() {
+        let mut state = AppState::new();
+        state.screen = Screen::Tags;
+        state.open_modal(Modal::TagsActions { selected: 0 });
+        let rows = rendered_rows(&state);
+        let text = rows.join("\n");
+        for verb in [
+            "write",
+            "providers list",
+            "providers create",
+            "providers delete",
+            "config get",
+            "config create",
+            "config edit",
+            "config delete",
+            "export",
+            "import",
+            "udt types",
+            "udt def",
+            "history query",
+        ] {
+            assert!(text.contains(verb), "menu lists {verb}: {text}");
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("▸ write")),
+            "selection marker on entry 0"
+        );
+    }
+
+    /// The Input modal's hint line renders (06-04's write form states
+    /// the JSON-scalar rule — the must-have).
+    #[test]
+    fn input_modal_renders_its_hint_line() {
+        let mut state = AppState::new();
+        state.open_modal(Modal::Input {
+            title: "write value".into(),
+            hint: Some("JSON scalar; bare text stays string\narrays/objects are invalid".into()),
+            buffer: String::new(),
+        });
+        let rows = rendered_rows(&state);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("JSON scalar"),
+            "the hint line renders: {text}"
+        );
+        assert!(
+            text.contains("arrays/objects are invalid"),
+            "the arrays/objects refusal rides the hint: {text}"
         );
     }
 }

@@ -152,6 +152,83 @@ pub fn routes() -> &'static [CliRoute] {
             path: "tags alarms ack",
             mapping: Mapping::Screen(Screen::Alarms),
         },
+        // 06-04: the tags family MINUS alarms (above) — every leaf
+        // clap spells: the provider subtree (`tags provider
+        // list|create|delete` — TagsProviderCommand), the top-level
+        // browse/read/write/export/import leaves, the config subtree
+        // (`tags config get|create|edit|delete`), the udt subtree
+        // (`tags udt types|def`), and the historian leaf (`tags
+        // history query`). `tags browse` IS the tree browser itself
+        // and `tags read` IS the detail pane's on-demand read.
+        //
+        // OutOfBand note (06-06's rule): `tags export -o -` — the
+        // FOURTH sanctioned stdout exception — is a FLAG VALUE on the
+        // `tags export` leaf, NOT a distinct leaf. The leaf maps
+        // Screen(Tags) (the TUI hosts the FILE-mode export; the
+        // stdout pipe form stays CLI-only, hint-named in the export
+        // form). The coverage test walks leaf PATHS only, so no
+        // OutOfBand row exists for it — this comment IS the
+        // documentation.
+        CliRoute {
+            path: "tags provider list",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags provider create",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags provider delete",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags browse",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags read",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags write",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags config get",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags config create",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags config edit",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags config delete",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags udt types",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags udt def",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags export",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags import",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
+        CliRoute {
+            path: "tags history query",
+            mapping: Mapping::Screen(Screen::Tags),
+        },
     ]
 }
 
@@ -265,6 +342,53 @@ mod tests {
             assert!(
                 matches!(row.mapping, super::Mapping::Screen(s) if s == screen),
                 "{path} maps to {screen:?}"
+            );
+        }
+    }
+
+    /// The 06-04 rows cover EVERY non-alarm tags leaf exactly as
+    /// clap spells it (TagsProviderCommand/TagsConfigCommand/
+    /// TagsUdtCommand/TagsHistoryCommand + the top-level leaves) —
+    /// the family's registry completeness (the largest CLI family).
+    /// There is no bare `tags` leaf (command is required) and no
+    /// `tags export -o -` leaf (a FLAG VALUE, not a subcommand —
+    /// documented at the row).
+    #[test]
+    fn tags_rows_cover_every_non_alarm_leaf() {
+        let expected = [
+            "tags provider list",
+            "tags provider create",
+            "tags provider delete",
+            "tags browse",
+            "tags read",
+            "tags write",
+            "tags config get",
+            "tags config create",
+            "tags config edit",
+            "tags config delete",
+            "tags udt types",
+            "tags udt def",
+            "tags export",
+            "tags import",
+            "tags history query",
+        ];
+        let rows: Vec<&super::CliRoute> = routes()
+            .iter()
+            .filter(|route| route.path.starts_with("tags"))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            expected.len() + 3,
+            "the tags rows are exactly the non-alarm leaves + the three 06-03 alarms rows: {rows:?}"
+        );
+        for path in expected {
+            let row = rows
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("tags route row {path:?} missing"));
+            assert!(
+                matches!(row.mapping, super::Mapping::Screen(s) if s == Screen::Tags),
+                "{path} maps to the Tags screen"
             );
         }
     }
