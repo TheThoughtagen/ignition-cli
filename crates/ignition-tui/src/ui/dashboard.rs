@@ -207,11 +207,19 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
     }
 }
 
-/// The bottom status line: refresh freshness ("N s ago", live via the
-/// 250 ms tick) + the busy markers + key hints. A running one-shot
-/// action names itself ("running: wait gateway") — long waits never
-/// block input, the label is the only footprint.
+/// The bottom status line: the active profile (the switch banner
+/// highlights it until the new world's first refresh retires it) +
+/// refresh freshness ("N s ago", live via the 250 ms tick) + the busy
+/// markers + key hints. A running one-shot action names itself
+/// ("running: wait gateway") — long waits never block input, the label
+/// is the only footprint.
 fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
+    let profile = state
+        .banner
+        .clone()
+        .or_else(|| state.profile.clone())
+        .map(|name| format!("profile: {name} · "))
+        .unwrap_or_default();
     let freshness = match state.dashboard.last_refresh {
         None => "refresh: pending".to_string(),
         Some(at) => format!("refresh: {} s ago", at.elapsed().as_secs()),
@@ -226,7 +234,9 @@ fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
         .in_flight
         .map(|label| format!(" · running: {label}"))
         .unwrap_or_default();
-    let text = format!("{freshness}{busy}{in_flight} · a actions · r refresh · t terminate");
+    let text = format!(
+        "{profile}{freshness}{busy}{in_flight} · p profiles · a actions · r refresh · t terminate"
+    );
     frame.render_widget(Paragraph::new(Line::from(text)), area);
 }
 

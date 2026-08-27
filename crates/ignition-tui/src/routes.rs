@@ -96,6 +96,20 @@ pub fn routes() -> &'static [CliRoute] {
             path: "restart",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 06-02 Task 3: the profile family rides the switcher modal
+        // (global `p` key — hosted on the dashboard).
+        CliRoute {
+            path: "profile use",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "profile list",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "profile add",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 

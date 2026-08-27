@@ -90,13 +90,9 @@ mod tests {
 
     use std::path::PathBuf;
 
-    /// Serializes env-var mutation across these tests: env is
-    /// process-global and lib tests run in parallel threads (edition 2024
-    /// makes `set_var` unsafe for exactly this reason — under this lock it
-    /// is sound). ignition-core's `ENV_LOCK` is `#[cfg(test)] pub(crate)`
-    /// and not importable from here, so the pattern is replicated locally
-    /// (same soundness rationale).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The crate-wide env lock (lib.rs) — serializes EVERY env-mutating
+    /// ignition-tui test against the others (per-module locks do not).
+    use crate::ENV_LOCK;
 
     fn temp_config_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");

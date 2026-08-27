@@ -121,6 +121,22 @@ pub enum Modal {
     /// The dashboard actions menu (06-02): the global verbs with a
     /// moving selection (Up/Down + Enter).
     Actions { selected: usize },
+    /// The profile switcher (06-02): every configured profile name
+    /// (BTreeMap order), the currently-active one marked, a moving
+    /// selection. Enter switches, `a` opens the add form.
+    Profiles {
+        names: Vec<String>,
+        active: Option<String>,
+        selected: usize,
+    },
+    /// The profile add form (06-02): name + url fields, `field` is the
+    /// one being edited (Tab toggles). Auth refs stay on the CLI form
+    /// (the LOCKED modal-depth decision) — a hint line points there.
+    ProfileAdd {
+        name: String,
+        url: String,
+        field: usize,
+    },
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
@@ -149,6 +165,8 @@ impl Modal {
             | Modal::Input { title, .. }
             | Modal::Result_ { title, .. } => title,
             Modal::Actions { .. } => "actions",
+            Modal::Profiles { .. } => "profiles",
+            Modal::ProfileAdd { .. } => "profile add",
         }
     }
 }
@@ -271,11 +289,17 @@ pub struct AppState {
     /// The AppEvent rail — a clone of the loop's sender, so update can
     /// arm workers (spawn helpers take their copy from here).
     pub events_tx: Option<mpsc::UnboundedSender<AppEvent>>,
-    /// The refresh worker's shutdown switch — `send(true)` on profile
-    /// switch (re-target) and on quit.
+    /// The dashboard's refresh worker shutdown switch — `send(true)` on
+    /// profile switch (re-target) and on quit.
     pub refresh_shutdown: Option<watch::Sender<bool>>,
     /// Dashboard screen data (06-02).
     pub dashboard: DashboardData,
+    /// The active profile's name (workers' target — what `p` switches).
+    pub profile: Option<String>,
+    /// The status-line banner — set by a landed profile switch
+    /// (`profile: NAME`), cleared by the first refresh of the new
+    /// world (the confirmation fulfilled its purpose).
+    pub banner: Option<String>,
 }
 
 impl AppState {

@@ -109,6 +109,29 @@ pub async fn refresh_worker(
     }
 }
 
+/// Spawn the interval refresh worker for the CURRENT world: a fresh
+/// shutdown channel, a fresh era, the state's client + rail. Callers
+/// own the teardown ordering — the profile switch signals the OLD
+/// shutdown before adopting the new client, then re-spawns through
+/// here (run_loop's startup spawn is the other caller).
+///
+/// Outside a tokio runtime (unit tests) the rails + era transition
+/// stands alone and nothing spawns.
+pub fn spawn_refresh(state: &mut crate::state::AppState) {
+    let Some(client) = state.client.as_ref().map(|handle| handle.0.clone()) else {
+        return;
+    };
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    state.refresh_shutdown = Some(shutdown_tx);
+    let era = crate::workers::new_era(state);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(refresh_worker(client, tx, shutdown_rx, era, REFRESH_PERIOD));
+    }
+}
+
 /// The `r` keystroke: one immediate refresh. The `dashboard_busy` guard
 /// refuses to stack on an in-flight refresh; the flag clears when the
 /// next (current-era) `Refresh` event lands.

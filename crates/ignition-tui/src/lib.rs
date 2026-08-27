@@ -29,6 +29,15 @@ use crate::event::AppEvent;
 use crate::state::{AppState, ClientHandle};
 use crate::update::update;
 
+/// Serializes env-var mutation across ALL ignition-tui tests: env is
+/// process-global and lib tests run in parallel threads (edition 2024
+/// makes `set_var` unsafe for exactly this reason — under this lock it
+/// is sound). ONE crate-wide lock — per-module copies do not serialize
+/// against each other (learned the hard way: a racing teardown sent
+/// another test's config resolution at the real machine config).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The cockpit's redraw staleness floor. The loop draws after EVERY
 /// processed event; the tick guarantees a redraw even when the world is
 /// quiet (LOCKED cadence — not tick-only).
@@ -45,10 +54,10 @@ pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
     // The cockpit owns a live client from the first frame: the
     // dashboard's refresh worker spawns against it (06-02). The URL
     // rides along for doctor's `profile_url`.
-    let (_profile_name, profile_url, client) = context::resolve(profile_flag.as_deref())?;
+    let (profile_name, profile_url, client) = context::resolve(profile_flag.as_deref())?;
 
     let mut terminal = ratatui::init();
-    let app_result = run_loop(&mut terminal, profile_url, client).await;
+    let app_result = run_loop(&mut terminal, profile_name, profile_url, client).await;
     ratatui::restore();
     app_result
 }
@@ -56,6 +65,7 @@ pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
 /// State wiring + worker spawn + the select loop, then worker teardown.
 async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
+    profile_name: String,
     profile_url: String,
     client: std::sync::Arc<ignition_core::client::ReqwestGatewayApi>,
 ) -> Result<(), CoreError> {
@@ -65,22 +75,13 @@ async fn run_loop(
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<AppEvent>();
 
     // The dashboard's interval refresh worker (06-02): one spawn per
-    // world. The shell keeps the sender (the loop's rail stays armed
-    // even if this worker is the only sender); profile switch (06-02
-    // Task 3) re-spawns against a new client under a new era.
-    let (shutdown_tx, shutdown_rx) = workers::shutdown_channel();
-    state.client = Some(ClientHandle(client.clone()));
+    // world — the profile switcher re-spawns through the same helper
+    // with the new client under a new era.
+    state.client = Some(ClientHandle(client));
+    state.profile = Some(profile_name);
     state.profile_url = Some(profile_url);
     state.events_tx = Some(events_tx.clone());
-    state.refresh_shutdown = Some(shutdown_tx);
-    let era = workers::new_era(&mut state);
-    tokio::spawn(workers::refresh::refresh_worker(
-        client,
-        events_tx,
-        shutdown_rx,
-        era,
-        workers::refresh::REFRESH_PERIOD,
-    ));
+    workers::refresh::spawn_refresh(&mut state);
 
     let result = event_loop(
         terminal,

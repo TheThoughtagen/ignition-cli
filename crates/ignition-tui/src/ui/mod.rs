@@ -8,6 +8,7 @@
 pub mod alarms;
 pub mod dashboard;
 pub mod logs;
+pub mod profiles;
 pub mod projects;
 pub mod rig;
 pub mod tags;
@@ -70,6 +71,9 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::Input { .. } => 5,
         Modal::Result_ { lines, .. } => lines.len().saturating_add(4).min(9),
         Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(3).min(11),
+        // The profiles modals compute their own centered geometry in
+        // the delegated render — these values keep the match total.
+        Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
     } as u16;
     let area = frame.area().centered(Ratio(1, 2), Length(height.max(5)));
 
@@ -85,6 +89,11 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 Paragraph::new(text).block(Block::bordered().title(title.clone())),
                 area,
             );
+        }
+        // The profile switcher modals own their rendering (06-02's
+        // screen-owned module) — centered geometry included.
+        Modal::Profiles { .. } | Modal::ProfileAdd { .. } => {
+            profiles::render_overlay(modal, frame);
         }
         Modal::Input { title, buffer } => {
             let text = vec![

@@ -44,6 +44,16 @@ pub enum AppEvent {
         /// Pretty JSON on success, the error message on failure.
         result: Result<String, String>,
     },
+    /// A profile switch landed (06-02): the switch itself ran
+    /// synchronously in update (all-local file I/O); this event is the
+    /// era-gated confirmation that drives the status-line banner. Stale
+    /// banners are dropped (Pitfall 9).
+    ProfileChanged {
+        /// Era of the NEW world (the switch already bumped the counter).
+        era: u64,
+        /// The newly active profile's name.
+        name: String,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`
