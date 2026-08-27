@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 core COMPLETE (6/6) + UAT done (10/12 passed, 2 gaps) — gap closure underway: 05-07 CLOSED UAT Gap 1 (import-denial seam exit 6 import_denied at one client seam; put-new lands via parent-folder resource.json descriptors, spike-proven live; truncated-zip import guard; first-ever live run of e2e_projects gate, GREEN). 05-08 (Gap 2: alarms view→ack full-UUID loop) remains. Rig ignition-devops up, routes healthy, token in /var/folders/.../opencode/token.txt (watch trial clock)
+**Current focus:** Phase 5 COMPLETE (6/6 core + BOTH gap-closure plans) — UAT Gap 1 closed by 05-07 (import-denial seam + put-new descriptors), UAT Gap 2 closed by 05-08 (alarms active prints FULL event ids ack accepts verbatim; short prefixes expand with honest exit-2 refusals; route tracebacks surface in webdev_route_error). Live-proven on a refreshed trial. Ready for UAT re-test (10/12 → target 12/12) then phase verification. Rig ignition-devops up (fresh ~2h trial from 02:05Z 2026-08-27), routes healthy 1.0.0, token in /var/folders/.../opencode/token.txt
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
 **Current Plan:** 8
-**Total Plans in Phase:** 8 (6 original + 2 gap-closure: 05-07 import-denial/put-new ✅, 05-08 alarms view→ack pending)
-**Status:** Gap closure in progress — 05-07 COMPLETE (UAT Gap 1 closed: denial seam + descriptor landing, live gate green); 05-08 next (UAT Gap 2: alarms view→ack loop)
+**Total Plans in Phase:** 8 (6 original + 2 gap-closure: 05-07 ✅, 05-08 ✅)
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-27
 
-**Progress:** [██████████] 96%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -51,6 +51,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P05 | 39min | 3 tasks | 10 files |
 | Phase 05 P06 | 114min | 3 tasks | 17 files |
 | Phase 05 P07 | 196min | 3 tasks | 10 files |
+| Phase 05 P08 | 60min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -139,6 +140,8 @@ Recent decisions affecting current work:
 - [Phase 05-07]: [Phase 05-07]: Import-denial seam LOCKED — ONE check in ReqwestGatewayApi::project_import (explicit bool success:false → ImportDenied, exit 6, slug import_denied, problem text verbatim) fixes all four callers (resource put/delete, project import, webdev deploy); per-caller checks forbidden; refusal only on EXPLICIT denial, never absence of proof
 - [Phase 05-07]: [Phase 05-07]: put-new landing rule (live-proven 8.3.3, spike): a new file member lands only when its IMMEDIATE parent folder's resource.json lists its basename — dir-entry ancestors DISPROVEN (bare appends silently no-op with success:true, worse than the UAT's denial); surgery merges basename into an existing descriptor or synthesizes one (scope G, version 1, files:[basename]) riding BEFORE the appended member; delete leaves descriptors alone (gateway prunes stale entries itself); appending a member NAMED resource.json authors it explicitly
 - [Phase 05-07]: [Phase 05-07]: DATA-LOSS GUARD (Rule 2, live-witnessed): the gateway accepts a TRUNCATED zip (valid PK magic, broken tail) with success:true changes:[] and on overwrite REPLACES the project with partial contents — validate_import now walks+decompresses every member before any upload (invalid_import_file exit 2); test fixtures upgraded to real archives, 3 goldens moved ([..]-elided byte counts)
+- [Phase 05]: [Phase 05-08]: Alarms view→ack loop closed BOTH ends (planner-locked) — active table prints the FULL UUID (copy-paste-verbatim) AND ack expands short prefixes via tags_alarms_active's own precondition; full-UUID detection is a SHAPE check (len 36, hyphens at 8/13/18/23, no uuid dep — the route stays the id authority); ambiguous prefix → exit 2 naming full candidates, unknown → exit 2 naming the miss + --json hint; all-full input takes zero extra round trips
+- [Phase 05]: [Phase 05-08]: Route traceback surfacing — error.traceback flows RouteBody::Denied → RouteProbe::Denied → appended to the WebdevRouteError message String ('\nroute traceback: {tb}'); VARIANT/slug/taxonomy untouched (no error.rs edit); absent traceback renders byte-identical (no-traceback goldens moved zero bytes); live-proven via a full-shaped invalid uuid surfacing the route's NumberFormatException
 
 ### Pending Todos
 
@@ -155,6 +158,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T01:29:12.979Z
-**Stopped At:** Completed 05-07-PLAN.md (gap closure: import-denial seam + put-new landing — live gate green; 05-08 next)
+**Last session:** 2026-08-27T02:34:28.180Z
+**Stopped At:** Completed 05-08-PLAN.md (gap closure: alarms view→ack full-UUID loop + traceback surfacing — BOTH UAT gaps now closed; phase ready for verification/UAT re-test)
 **Resume file:** None
