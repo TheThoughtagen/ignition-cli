@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 5 COMPLETE (6/6): route sources + deploy/status, resource re-point, tags provider/browse/read/write, config CRUD + UDTs + bulk transfer, alarms + tag history. ALL FIVE live e2e gates green on a real commissioned 8.3.3 rig (the run un-broke every shipped route: the byte-0 loader contract). 21-tool MCP parity surface closed. Next: /gsd-verify-work (phase UAT), then Phase 6 (TUI)
+**Current focus:** Phase 5 core COMPLETE (6/6) + UAT done (10/12 passed, 2 gaps) — gap closure underway: 05-07 CLOSED UAT Gap 1 (import-denial seam exit 6 import_denied at one client seam; put-new lands via parent-folder resource.json descriptors, spike-proven live; truncated-zip import guard; first-ever live run of e2e_projects gate, GREEN). 05-08 (Gap 2: alarms view→ack full-UUID loop) remains. Rig ignition-devops up, routes healthy, token in /var/folders/.../opencode/token.txt (watch trial clock)
 
 ## Current Position
 
 **Phase:** 5 of 7 (WebDev Backend & Tag Operations)
-**Current Plan:** 6
-**Total Plans in Phase:** 6
-**Status:** Phase 5 complete & verified (5/5 must-haves passed per 05-VERIFICATION.md) — ready for /gsd-verify-work UAT, then Phase 6 discuss/plan
-**Last Activity:** 2026-08-25
+**Current Plan:** 8
+**Total Plans in Phase:** 8 (6 original + 2 gap-closure: 05-07 import-denial/put-new ✅, 05-08 alarms view→ack pending)
+**Status:** Gap closure in progress — 05-07 COMPLETE (UAT Gap 1 closed: denial seam + descriptor landing, live gate green); 05-08 next (UAT Gap 2: alarms view→ack loop)
+**Last Activity:** 2026-08-27
 
-**Progress:** [██████████] 100%
+**Progress:** [██████████] 96%
 
 ## Performance Metrics
 
@@ -50,6 +50,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P04 | ~450min (3 sessions) | 3 tasks | 21 files |
 | Phase 05 P05 | 39min | 3 tasks | 10 files |
 | Phase 05 P06 | 114min | 3 tasks | 17 files |
+| Phase 05 P07 | 196min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -135,6 +136,9 @@ Recent decisions affecting current work:
 - [Phase 05-06]: Live export/import truth: exportTags answers a single subtree OBJECT (one path) or the {tags:[...]} wrapper (never a bare array) — tags_export normalizes to the list-of-subtrees interchange; an empty-named (provider-shaped) subtree lands its CHILDREN at the configure target, so collision pre-checks/counts key on effective top-level names with the structural _types_ folder never colliding
 - [Phase 05-06]: tags alarms ack: NOT --yes-guarded (acknowledging never un-acknowledges — a state-advancing read-adjacent verb) with REQUIRED --username (the 3-arg wire form; no default-guessing); the 8.3 ack return IS the unacknowledged remainder — acknowledged computed client-side honestly
 - [Phase 05-06]: The binding spike ran live (InternalHistorian via native REST, no database): structural query proven anywhere (t_stamp + provider-relative tag columns), DATA binding unresolved after all documented candidates — documented limitation with the Designer-diff follow-up as the resolution path (the plan pre-cleared this fallback). History tag columns ride PROVIDER-RELATIVE ([default]X → X)
+- [Phase 05-07]: [Phase 05-07]: Import-denial seam LOCKED — ONE check in ReqwestGatewayApi::project_import (explicit bool success:false → ImportDenied, exit 6, slug import_denied, problem text verbatim) fixes all four callers (resource put/delete, project import, webdev deploy); per-caller checks forbidden; refusal only on EXPLICIT denial, never absence of proof
+- [Phase 05-07]: [Phase 05-07]: put-new landing rule (live-proven 8.3.3, spike): a new file member lands only when its IMMEDIATE parent folder's resource.json lists its basename — dir-entry ancestors DISPROVEN (bare appends silently no-op with success:true, worse than the UAT's denial); surgery merges basename into an existing descriptor or synthesizes one (scope G, version 1, files:[basename]) riding BEFORE the appended member; delete leaves descriptors alone (gateway prunes stale entries itself); appending a member NAMED resource.json authors it explicitly
+- [Phase 05-07]: [Phase 05-07]: DATA-LOSS GUARD (Rule 2, live-witnessed): the gateway accepts a TRUNCATED zip (valid PK magic, broken tail) with success:true changes:[] and on overwrite REPLACES the project with partial contents — validate_import now walks+decompresses every member before any upload (invalid_import_file exit 2); test fixtures upgraded to real archives, 3 goldens moved ([..]-elided byte counts)
 
 ### Pending Todos
 
@@ -151,6 +155,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-25T13:58:09.641Z
-**Stopped At:** Completed 05-06-PLAN.md (alarms + tag history — Phase 5 COMPLETE, all live gates green)
+**Last session:** 2026-08-27T01:29:12.979Z
+**Stopped At:** Completed 05-07-PLAN.md (gap closure: import-denial seam + put-new landing — live gate green; 05-08 next)
 **Resume file:** None
