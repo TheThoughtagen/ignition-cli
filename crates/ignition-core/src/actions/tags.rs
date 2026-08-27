@@ -544,6 +544,14 @@ pub async fn tags_alarms_history(
 /// demands the username explicitly, no default-guessing). The route's
 /// return is the UNacknowledged remainder; acknowledged is the honest
 /// client-side difference.
+///
+/// ID normalization (the view→ack loop, 05-08): a 36-char
+/// hyphenated id (the shape `tags alarms active` prints) passes
+/// through VERBATIM; anything shorter rides prefix expansion against
+/// the active-alarm list — exactly one match substitutes the full
+/// UUID, ambiguous/unknown prefixes refuse `invalid_input` (exit 2)
+/// naming the candidates / the miss. The wire call therefore always
+/// carries full UUIDs.
 pub async fn tags_alarms_ack(
     api: &dyn GatewayApi,
     project: &str,
@@ -552,13 +560,14 @@ pub async fn tags_alarms_ack(
     username: &str,
 ) -> Result<TagsAlarmsAckResult, CoreError> {
     webdev_precondition(api, project).await?;
+    let expanded = normalize_ack_ids(api, project, ids).await?;
     let data = api
         .webdev_route_call(
             project,
             ALARMS_ROUTE,
             &serde_json::json!({
                 "action": "acknowledge",
-                "eventIds": ids,
+                "eventIds": expanded,
                 "note": note,
                 "username": username,
             }),
@@ -586,6 +595,70 @@ pub async fn tags_alarms_ack(
         acknowledged,
         unacknowledged,
     })
+}
+
+/// The full-UUID shape check: 36 chars with hyphens at indices
+/// 8/13/18/23 (the canonical stringified form the route demands).
+/// Shape ONLY — no uuid crate, no validation of the hex body (the
+/// route remains the authority on id validity).
+fn is_full_uuid_shape(id: &str) -> bool {
+    id.len() == 36
+        && id.as_bytes().get(8) == Some(&b'-')
+        && id.as_bytes().get(13) == Some(&b'-')
+        && id.as_bytes().get(18) == Some(&b'-')
+        && id.as_bytes().get(23) == Some(&b'-')
+}
+
+/// Expand ack ids to full UUIDs. All-full input passes through with
+/// ZERO extra round trips; any short id triggers one `active` lookup
+/// (same project — it runs its own precondition; the correctness-
+/// over-latency trade the family locked in 05-04), and prefixes
+/// match against the active list. Mixed short/full ids expand
+/// independently.
+async fn normalize_ack_ids(
+    api: &dyn GatewayApi,
+    project: &str,
+    ids: &[String],
+) -> Result<Vec<String>, CoreError> {
+    if ids.iter().all(|id| is_full_uuid_shape(id)) {
+        return Ok(ids.to_vec());
+    }
+    let active = tags_alarms_active(api, project, None, None, None).await?;
+    let mut expanded = Vec::with_capacity(ids.len());
+    for id in ids {
+        if is_full_uuid_shape(id) {
+            expanded.push(id.clone());
+            continue;
+        }
+        let matches: Vec<&str> = active
+            .alarms
+            .iter()
+            .map(|alarm| alarm.event_id.as_str())
+            .filter(|event_id| event_id.starts_with(id.as_str()))
+            .collect();
+        match matches.as_slice() {
+            [one] => expanded.push((*one).to_string()),
+            [] => {
+                return Err(CoreError::InvalidInput {
+                    reason: format!(
+                        "no active alarm's eventId starts with `{id}` — it may already be \
+                         acknowledged or cleared; full ids ride `tags alarms active --json`"
+                    ),
+                });
+            }
+            many => {
+                return Err(CoreError::InvalidInput {
+                    reason: format!(
+                        "eventId prefix `{id}` is ambiguous — it matches {} active alarms; \
+                         pass a longer prefix or one of: {}",
+                        many.len(),
+                        many.join(", ")
+                    ),
+                });
+            }
+        }
+    }
+    Ok(expanded)
 }
 
 // ---- config get/create/edit/delete (05-05, TAGS-05) ----
@@ -2821,31 +2894,42 @@ mod tests {
     /// THE ack body pin + the remainder-honest computation: the
     /// 3-arg String[]/note/username form rides the body; the route's
     /// return IS the unacknowledged remainder; acknowledged = 2 − 1
-    /// client-side.
+    /// client-side. Full-UUID ids pass through with NO active lookup
+    /// (calls[0] is the ack itself).
     #[tokio::test]
     async fn alarms_ack_pins_three_arg_body_and_computes_remainder() {
         let rig = TagsRig::with(Vec::new())
-            .route(present(), serde_json::json!({"unacknowledged": ["e-2"]}));
+            .route(present(), serde_json::json!({"unacknowledged": ["22222222-2222-2222-2222-222222222222"]}));
         let result: TagsAlarmsAckResult = tags_alarms_ack(
             &rig,
             "ign-cli",
-            &["e-1".to_string(), "e-2".to_string()],
+            &[
+                "11111111-1111-1111-1111-111111111111".to_string(),
+                "22222222-2222-2222-2222-222222222222".to_string(),
+            ],
             "handled by on-call",
             "op",
         )
         .await
         .expect("ack parses");
         assert_eq!(result.acknowledged, 1, "requested 2, remainder 1");
-        assert_eq!(result.unacknowledged, vec!["e-2".to_string()]);
+        assert_eq!(
+            result.unacknowledged,
+            vec!["22222222-2222-2222-2222-222222222222".to_string()]
+        );
         let ack_call = {
             let calls = rig.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "full ids: no active lookup fires");
             calls[0].clone()
         };
         assert_eq!(
             ack_call,
             serde_json::json!({
                 "action": "acknowledge",
-                "eventIds": ["e-1", "e-2"],
+                "eventIds": [
+                    "11111111-1111-1111-1111-111111111111",
+                    "22222222-2222-2222-2222-222222222222"
+                ],
                 "note": "handled by on-call",
                 "username": "op"
             }),
@@ -2855,19 +2939,119 @@ mod tests {
         // Full acknowledgment: empty remainder, all acknowledged.
         let rig = TagsRig::with(Vec::new())
             .route(present(), serde_json::json!({"unacknowledged": []}));
-        let result = tags_alarms_ack(&rig, "ign-cli", &["e-1".to_string()], "", "op")
-            .await
-            .expect("clean ack parses");
+        let result = tags_alarms_ack(
+            &rig,
+            "ign-cli",
+            &["11111111-1111-1111-1111-111111111111".to_string()],
+            "",
+            "op",
+        )
+        .await
+        .expect("clean ack parses");
         assert_eq!(result.acknowledged, 1);
         assert!(result.unacknowledged.is_empty());
 
         // A missing `unacknowledged` key is an internal-class honesty
         // error (never silently defaulted).
         let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({}));
-        let err = tags_alarms_ack(&rig, "ign-cli", &["e-1".to_string()], "", "op")
-            .await
-            .expect_err("shape violation refuses");
+        let err = tags_alarms_ack(
+            &rig,
+            "ign-cli",
+            &["11111111-1111-1111-1111-111111111111".to_string()],
+            "",
+            "op",
+        )
+        .await
+        .expect_err("shape violation refuses");
         assert_eq!(err.code(), "internal");
+    }
+
+    /// THE prefix-expansion pin: a SHORT id triggers one `active`
+    /// lookup, and the acknowledge body carries the EXPANDED full
+    /// UUID (request-level proof — what the table prints, ack
+    /// accepts). Mixed short/full ids expand independently.
+    #[tokio::test]
+    async fn alarms_ack_expands_short_id_prefixes_against_the_active_list() {
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({"unacknowledged": []}))
+            .responses(vec![
+                serde_json::json!({"results": [
+                    {"eventId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301", "source": "prov:x:/T1", "state": "Active, Unacknowledged", "priority": "High", "name": "T1"},
+                    {"eventId": "9b9e9e9e-1111-2222-3333-444455556666", "source": "prov:x:/T2", "state": "Active, Unacknowledged", "priority": "Medium", "name": null}
+                ], "count": 2}),
+                serde_json::json!({"unacknowledged": []}),
+            ]);
+        let result = tags_alarms_ack(
+            &rig,
+            "ign-cli",
+            &[
+                "3f2504e0".to_string(),
+                "9b9e9e9e-1111-2222-3333-444455556666".to_string(),
+            ],
+            "",
+            "op",
+        )
+        .await
+        .expect("mixed short/full ack parses");
+        assert_eq!(result.acknowledged, 2);
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "active lookup, then acknowledge");
+        assert_eq!(calls[0]["action"], "active");
+        assert_eq!(
+            calls[1]["eventIds"],
+            serde_json::json!([
+                "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+                "9b9e9e9e-1111-2222-3333-444455556666"
+            ]),
+            "the wire body carries the EXPANDED uuid, not the prefix"
+        );
+    }
+
+    /// Ambiguous prefix: two active alarms share the prefix →
+    /// `invalid_input` (exit 2) listing the matching FULL ids.
+    #[tokio::test]
+    async fn alarms_ack_refuses_ambiguous_prefixes_naming_candidates() {
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({}))
+            .responses(vec![serde_json::json!({"results": [
+                {"eventId": "aaaaaaaa-1111-1111-1111-111111111111", "source": "prov:x:/T1", "state": "Active, Unacknowledged", "priority": "High", "name": null},
+                {"eventId": "aaaaaaaa-2222-2222-2222-222222222222", "source": "prov:x:/T2", "state": "Active, Unacknowledged", "priority": "High", "name": null}
+            ], "count": 2})]);
+        let err = tags_alarms_ack(&rig, "ign-cli", &["aaaaaaaa".to_string()], "", "op")
+            .await
+            .expect_err("ambiguous prefix refuses");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(err.exit_code(), 2);
+        let message = err.to_string();
+        assert!(
+            message.contains("aaaaaaaa-1111-1111-1111-111111111111")
+                && message.contains("aaaaaaaa-2222-2222-2222-222222222222"),
+            "the refusal names BOTH candidates: {message}"
+        );
+        let calls = rig.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the lookup fired, the ack never did");
+        assert_eq!(calls[0]["action"], "active");
+    }
+
+    /// Unknown prefix: zero active alarms match → `invalid_input`
+    /// (exit 2) naming the miss + the already-acknowledged hint.
+    #[tokio::test]
+    async fn alarms_ack_refuses_unknown_prefixes_naming_the_miss() {
+        let rig = TagsRig::with(Vec::new())
+            .route(present(), serde_json::json!({}))
+            .responses(vec![serde_json::json!({"results": [
+                {"eventId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301", "source": "prov:x:/T1", "state": "Active, Unacknowledged", "priority": "High", "name": null}
+            ], "count": 1})]);
+        let err = tags_alarms_ack(&rig, "ign-cli", &["deadbeef".to_string()], "", "op")
+            .await
+            .expect_err("unknown prefix refuses");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(err.exit_code(), 2);
+        let message = err.to_string();
+        assert!(
+            message.contains("deadbeef") && message.contains("tags alarms active --json"),
+            "the refusal names the miss + the full-id source: {message}"
+        );
     }
 
     /// Precondition refusal inheritance: absent routes refuse

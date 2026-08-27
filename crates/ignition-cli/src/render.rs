@@ -1056,20 +1056,20 @@ fn render_aligned_columns(columns: &[String], rows: &[Vec<String>]) {
     }
 }
 
-/// `ign tags alarms active` human table: the SHORT eventId (first 8
-/// chars of the UUID — the full id rides JSON), source, state,
-/// priority, name.
+/// `ign tags alarms active` human table: the FULL eventId (the
+/// UUID VERBATIM — what `tags alarms ack` accepts as a copy-paste
+/// input; short prefixes also ack via expansion, but the table
+/// prints the canonical form), source, state, priority, name.
 fn render_tags_alarms_active_human(result: &TagsAlarmsActiveResult) {
     println!(
-        "{:<10} {:<44} {:<24} {:<8} name",
+        "{:<38} {:<44} {:<24} {:<8} name",
         "eventId", "source", "state", "priority"
     );
     for alarm in &result.alarms {
-        let short_id = &alarm.event_id[..alarm.event_id.len().min(8)];
         let name = alarm.name.as_deref().unwrap_or("-");
         println!(
-            "{:<10} {:<44} {:<24} {:<8} {}",
-            short_id, alarm.source, alarm.state, alarm.priority, name
+            "{:<38} {:<44} {:<24} {:<8} {}",
+            alarm.event_id, alarm.source, alarm.state, alarm.priority, name
         );
     }
 }

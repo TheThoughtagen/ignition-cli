@@ -908,7 +908,8 @@ async fn alarms_history_success_passes_journal_rows_verbatim() {
 /// THE ack body pin: the gateway-scope 3-arg form rides the body
 /// (string ids + note + username), and the return — the
 /// UNacknowledged remainder — lands in the result with the honest
-/// client-side acknowledged count.
+/// client-side acknowledged count. Full-UUID ids pass through with
+/// NO active lookup (one alarms request total).
 #[tokio::test]
 async fn alarms_ack_pins_three_arg_body_and_remainder() {
     let server = wiremock::MockServer::start().await;
@@ -917,14 +918,14 @@ async fn alarms_ack_pins_three_arg_body_and_remainder() {
         .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
         .and(wiremock::matchers::body_json(serde_json::json!({
             "action": "acknowledge",
-            "eventIds": ["e-1", "e-2"],
+            "eventIds": ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"],
             "note": "handled",
             "username": "op"
         })))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
-                "data": {"unacknowledged": ["e-2"]}
+                "data": {"unacknowledged": ["22222222-2222-2222-2222-222222222222"]}
             })),
         )
         .expect(1)
@@ -935,14 +936,20 @@ async fn alarms_ack_pins_three_arg_body_and_remainder() {
     let result = tags_alarms_ack(
         &api,
         "ign-cli",
-        &["e-1".to_string(), "e-2".to_string()],
+        &[
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            "22222222-2222-2222-2222-222222222222".to_string(),
+        ],
         "handled",
         "op",
     )
     .await
     .expect("ack through the real client");
     assert_eq!(result.acknowledged, 1, "requested 2, remainder 1");
-    assert_eq!(result.unacknowledged, vec!["e-2".to_string()]);
+    assert_eq!(
+        result.unacknowledged,
+        vec!["22222222-2222-2222-2222-222222222222".to_string()]
+    );
     assert_eq!(guard.received_requests().await.len(), 1);
 }
 

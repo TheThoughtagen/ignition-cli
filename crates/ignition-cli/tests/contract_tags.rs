@@ -1225,9 +1225,10 @@ async fn mount_alarms_action(server: &wiremock::MockServer, action: &str, data: 
         .await;
 }
 
-/// Alarms active goldens: the human table (SHORT eventId, source,
-/// state, priority, name) and the compact agent shape
-/// (unit-explicit keys, all keys always — name null degrades).
+/// Alarms active goldens: the human table (the FULL eventId — what
+/// `tags alarms ack` accepts verbatim, source, state, priority,
+/// name) and the compact agent shape (unit-explicit keys, all keys
+/// always — name null degrades).
 #[tokio::test]
 async fn tags_alarms_active_golden() {
     let server = wiremock::MockServer::start().await;
@@ -1258,9 +1259,9 @@ async fn tags_alarms_active_golden() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-eventId    source                                       state                    priority name
-3f2504e0   prov:tagprov:/T1/HighLimit                   Active, Unacknowledged   High     HighLimit
-9b9e9e9e   prov:tagprov:/T2/LowLimit                    Active, Unacknowledged   Medium   -
+eventId                                source                                       state                    priority name
+3f2504e0-4f89-11d3-9a0c-0305e82c3301   prov:tagprov:/T1/HighLimit                   Active, Unacknowledged   High     HighLimit
+9b9e9e9e-1111-2222-3333-444455556666   prov:tagprov:/T2/LowLimit                    Active, Unacknowledged   Medium   -
 "#]],
     );
 
@@ -1371,8 +1372,9 @@ null       e-1      HighLimit  High      prov:tagprov:/T1/HighLimit  Active, Una
 }
 
 /// THE ack golden: the 3-arg body pins on the wire (string ids +
-/// note + username), and both render modes carry the honest count +
-/// the unacknowledged remainder.
+/// note + username; full-UUID ids pass through with NO active
+/// lookup), and both render modes carry the honest count + the
+/// unacknowledged remainder.
 #[tokio::test]
 async fn tags_alarms_ack_golden() {
     let server = wiremock::MockServer::start().await;
@@ -1381,14 +1383,14 @@ async fn tags_alarms_ack_golden() {
         .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
         .and(wiremock::matchers::body_json(serde_json::json!({
             "action": "acknowledge",
-            "eventIds": ["e-1", "e-2"],
+            "eventIds": ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"],
             "note": "handled",
             "username": "op"
         })))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
-                "data": {"unacknowledged": ["e-2"]}
+                "data": {"unacknowledged": ["22222222-2222-2222-2222-222222222222"]}
             })),
         )
         .expect(1)
@@ -1405,8 +1407,8 @@ async fn tags_alarms_ack_golden() {
             "tags",
             "alarms",
             "ack",
-            "e-1",
-            "e-2",
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
             "--note",
             "handled",
             "--username",
@@ -1422,7 +1424,7 @@ async fn tags_alarms_ack_golden() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-acknowledged 1 alarm(s); unacknowledged: e-2
+acknowledged 1 alarm(s); unacknowledged: 22222222-2222-2222-2222-222222222222
 "#]],
     );
 
@@ -1437,7 +1439,7 @@ acknowledged 1 alarm(s); unacknowledged: e-2
             "tags",
             "alarms",
             "ack",
-            "e-1",
+            "11111111-1111-1111-1111-111111111111",
             "--username",
             "op",
             "--compact",
@@ -1451,6 +1453,141 @@ acknowledged 1 alarm(s); unacknowledged: e-2
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
         snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","acknowledged":1,"unacknowledged":[]}}"#]],
+    );
+}
+
+/// THE short-id expansion loop (the UAT Gap 2 seam, binary-level):
+/// ack with the 8-char PREFIX the old table used to print → the
+/// recorded acknowledge request body carries the FULL uuid
+/// (request-level proof, the surgery/wiremock family convention),
+/// and the run exits 0.
+#[tokio::test]
+async fn tags_alarms_ack_short_id_expands_on_the_wire() {
+    let server = wiremock::MockServer::start().await;
+    // The active lookup (the expansion source): two alarms, ONE
+    // matching the prefix — mount_alarms_action mounts the probe
+    // too (its contract), so no separate probe mount here.
+    mount_alarms_action(
+        &server,
+        "active",
+        serde_json::json!({"results": [
+            {"eventId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301", "source": "prov:tagprov:/T1/HighLimit", "state": "Active, Unacknowledged", "priority": "High", "name": "HighLimit"},
+            {"eventId": "9b9e9e9e-1111-2222-3333-444455556666", "source": "prov:tagprov:/T2/LowLimit", "state": "Active, Unacknowledged", "priority": "Medium", "name": null}
+        ], "count": 2}),
+    )
+    .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "acknowledge"}),
+        )
+        // Mount AFTER the active mock: wiremock matches the most
+        // recently mounted first — the body discriminator makes it
+        // exact anyway.
+        )
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"unacknowledged": []}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "alarms",
+            "ack",
+            "3f2504e0",
+            "--username",
+            "op",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+acknowledged 1 alarm(s)
+"#]],
+    );
+    // The wire proof: the acknowledge body carried the FULL uuid.
+    let received = server
+        .received_requests()
+        .await
+        .expect("requests recorded");
+    let ack = received
+        .iter()
+        .rev()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("acknowledge"))
+        .expect("acknowledge request recorded");
+    let body: Value = serde_json::from_slice(&ack.body).expect("body parses");
+    assert_eq!(
+        body["eventIds"],
+        serde_json::json!(["3f2504e0-4f89-11d3-9a0c-0305e82c3301"]),
+        "the prefix expanded to the FULL uuid before the wire call"
+    );
+}
+
+/// Ack refusal goldens: an AMBIGUOUS prefix (two active matches)
+/// and an UNKNOWN prefix both exit 2 invalid_input — the candidates
+/// / the miss named honestly.
+#[tokio::test]
+async fn tags_alarms_ack_prefix_refusal_goldens() {
+    let server = wiremock::MockServer::start().await;
+    mount_alarms_action(
+        &server,
+        "active",
+        serde_json::json!({"results": [
+            {"eventId": "aaaaaaaa-1111-1111-1111-111111111111", "source": "prov:x:/T1", "state": "Active, Unacknowledged", "priority": "High", "name": null},
+            {"eventId": "aaaaaaaa-2222-2222-2222-222222222222", "source": "prov:x:/T2", "state": "Active, Unacknowledged", "priority": "High", "name": null}
+        ], "count": 2}),
+    )
+    .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    // Ambiguous: exit 2, both FULL candidates in the message.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "alarms", "ack", "aaaaaaaa", "--username", "op", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2), "ambiguous prefix exits 2");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input");
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("aaaaaaaa-1111-1111-1111-111111111111")
+            && message.contains("aaaaaaaa-2222-2222-2222-222222222222"),
+        "the refusal names both candidates: {message}"
+    );
+
+    // Unknown: exit 2, the miss named + the full-id source hint.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "alarms", "ack", "deadbeef", "--username", "op", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2), "unknown prefix exits 2");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input");
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("deadbeef") && message.contains("tags alarms active --json"),
+        "the refusal names the miss + where full ids ride: {message}"
     );
 }
 
