@@ -210,8 +210,11 @@ struct TailState<'a> {
     /// Max timestamp delivered so far (-1 before the first page).
     cursor: i64,
     /// Receives each entry as it arrives (the action stays
-    /// printer-free — the dispatch owns stdout).
-    sink: &'a mut dyn FnMut(&LogEntry),
+    /// printer-free — the dispatch owns stdout). `+ Send` so the tail
+    /// future can cross `tokio::spawn` on the multi-thread runtime
+    /// (06-01: the TUI's logs worker; the rig.rs sinks set this
+    /// convention first).
+    sink: &'a mut (dyn FnMut(&LogEntry) + Send),
 }
 
 /// Stream new log entries to `sink` as they arrive. The action is
@@ -228,7 +231,7 @@ pub async fn tail(
     since_ms: Option<i64>,
     interval: Duration,
     deadline: Option<Duration>,
-    sink: &mut dyn FnMut(&LogEntry),
+    sink: &mut (dyn FnMut(&LogEntry) + Send),
 ) -> Result<TailResult, CoreError> {
     // -1 so the FIRST query's start_time = cursor + 1 = since exactly
     // (or 0 when no --since — the whole buffer).
@@ -631,7 +634,7 @@ mod tests {
         };
 
         let mut received: Vec<(i64, String)> = Vec::new();
-        let sink: &mut dyn FnMut(&LogEntry) = &mut |entry: &LogEntry| {
+        let sink: &mut (dyn FnMut(&LogEntry) + Send) = &mut |entry: &LogEntry| {
             received.push((entry.timestamp, entry.message.clone()));
         };
 
@@ -919,7 +922,7 @@ mod tests {
             }
         }
 
-        let sink: &mut dyn FnMut(&LogEntry) = &mut |_| {};
+        let sink: &mut (dyn FnMut(&LogEntry) + Send) = &mut |_| {};
         let err = tail(
             &AuthRig,
             None,

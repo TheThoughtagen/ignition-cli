@@ -1,11 +1,22 @@
 [package]
 name = "ignition-tui"
-description = "Ratatui TUI cockpit for ign — deliberate stub until Phase 6"
+description = "Ratatui TUI cockpit for ign — the interactive command surface over ignition-core actions"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-# Deliberately ZERO dependencies: no ratatui until Phase 6. This crate exists
-# so the workspace shape and the `tui` feature gate in ignition-cli are final
-# from day one (structural proof, per Phase 1 research).
+# Phase 6 fills this crate: ratatui 0.30 + crossterm 0.29 (event-stream)
+# are the only NEW runtime deps the whole phase takes — everything else
+# was already in the workspace graph. tokio needs no feature additions
+# (rt-multi-thread/macros/time/sync are workspace-enabled).
 [dependencies]
+ignition-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+# isolated config files for the context unit tests (already in the
+# workspace graph — NOT a new dependency)
+tempfile = { workspace = true }
