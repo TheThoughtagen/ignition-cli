@@ -136,10 +136,7 @@ mod tests {
             title: "error".into(),
             lines: vec!["boom".into()],
         });
-        update(
-            &mut state,
-            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        );
+        update(&mut state, key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(state.should_quit);
     }
 
@@ -180,10 +177,7 @@ mod tests {
         assert_eq!(state.screen, Screen::Dashboard);
 
         // Backtab wraps the other way: Dashboard → Rig.
-        update(
-            &mut state,
-            key(KeyCode::BackTab, KeyModifiers::SHIFT),
-        );
+        update(&mut state, key(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(state.screen, Screen::Rig);
     }
 

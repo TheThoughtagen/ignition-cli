@@ -118,10 +118,11 @@ fn parent_of(member: &str) -> Option<&str> {
 /// — refusing beats recreating the exact bug this plan closes
 /// (`ok:true` while nothing lands).
 fn merge_descriptor_member(existing: &[u8], basename: &str) -> Result<Vec<u8>, CoreError> {
-    let mut value: serde_json::Value =
-        serde_json::from_slice(existing).map_err(|err| {
-            CoreError::Internal(format!("parent resource descriptor is not valid JSON: {err}"))
-        })?;
+    let mut value: serde_json::Value = serde_json::from_slice(existing).map_err(|err| {
+        CoreError::Internal(format!(
+            "parent resource descriptor is not valid JSON: {err}"
+        ))
+    })?;
     let object = value.as_object_mut().ok_or_else(|| {
         CoreError::Internal("parent resource descriptor is not a JSON object".to_string())
     })?;
@@ -143,7 +144,9 @@ fn merge_descriptor_member(existing: &[u8], basename: &str) -> Result<Vec<u8>, C
             .push(serde_json::Value::String(basename.to_string()));
     }
     serde_json::to_vec_pretty(&value).map_err(|err| {
-        CoreError::Internal(format!("cannot serialize merged resource descriptor: {err}"))
+        CoreError::Internal(format!(
+            "cannot serialize merged resource descriptor: {err}"
+        ))
     })
 }
 
@@ -249,7 +252,10 @@ fn rewrite_zip(
     // edit the descriptor member as it streams past).
     let descriptor_surgery = match (&surgery, target_present) {
         (Surgery::Replace(_), false)
-            if target.rsplit('/').next().is_some_and(|base| base != FOLDER_DESCRIPTOR) =>
+            if target
+                .rsplit('/')
+                .next()
+                .is_some_and(|base| base != FOLDER_DESCRIPTOR) =>
         {
             parent_of(target).map(|parent| {
                 let descriptor_path = format!("{parent}/{FOLDER_DESCRIPTOR}");
@@ -292,11 +298,15 @@ fn rewrite_zip(
             .map_err(|err| CoreError::Internal(format!("cannot rewrite zip: {err}")))?;
         let content = match (is_target, &surgery) {
             (true, Surgery::Replace(content)) => *content,
-            (_, Surgery::Replace(_)) if matches!(&descriptor_surgery, Some(DescriptorSurgery::Merge(path)) if path == &name) => {
+            (_, Surgery::Replace(_)) if matches!(&descriptor_surgery, Some(DescriptorSurgery::Merge(path)) if path == &name) =>
+            {
                 // The parent descriptor rides MERGED: the new basename
                 // joins its files list (idempotent), everything else
                 // about it kept verbatim.
-                &merge_descriptor_member(&bytes, target.rsplit('/').next().expect("non-root — checked above"))?
+                &merge_descriptor_member(
+                    &bytes,
+                    target.rsplit('/').next().expect("non-root — checked above"),
+                )?
             }
             _ => &bytes,
         };
@@ -541,7 +551,10 @@ mod tests {
         writer.start_file("project.json", options).expect("starts");
         writer.write_all(br#"{"title":"T"}"#).expect("writes");
         writer
-            .start_file("ignition/resources/script-python/uat/resource.json", options)
+            .start_file(
+                "ignition/resources/script-python/uat/resource.json",
+                options,
+            )
             .expect("starts");
         writer
             .write_all(br#"{"scope":"G","version":1,"restricted":false,"overridable":true,"files":["hello2.py"],"attributes":{"keep":"me"}}"#)
@@ -553,14 +566,16 @@ mod tests {
         let zip = writer.finish().expect("finalize").into_inner();
 
         // Append a sibling into the SAME resource folder.
-        let out =
-            replace_member(&zip, "ignition/script-python/uat/hello3.py", b"print('new')'")
-                .expect("append rewrites");
-        let descriptor: serde_json::Value =
-            serde_json::from_slice(
-                &read_member(&out, "ignition/script-python/uat/resource.json").expect("descriptor"),
-            )
-            .expect("descriptor json");
+        let out = replace_member(
+            &zip,
+            "ignition/script-python/uat/hello3.py",
+            b"print('new')'",
+        )
+        .expect("append rewrites");
+        let descriptor: serde_json::Value = serde_json::from_slice(
+            &read_member(&out, "ignition/script-python/uat/resource.json").expect("descriptor"),
+        )
+        .expect("descriptor json");
         assert_eq!(
             descriptor["files"],
             serde_json::json!(["hello2.py", "hello3.py"]),
@@ -581,11 +596,10 @@ mod tests {
         // sibling appends after the first).
         let again = replace_member(&out, "ignition/script-python/uat/hello4.py", b"x")
             .expect("second append");
-        let descriptor: serde_json::Value =
-            serde_json::from_slice(
-                &read_member(&again, "ignition/script-python/uat/resource.json").expect("d"),
-            )
-            .expect("json");
+        let descriptor: serde_json::Value = serde_json::from_slice(
+            &read_member(&again, "ignition/script-python/uat/resource.json").expect("d"),
+        )
+        .expect("json");
         assert_eq!(
             descriptor["files"],
             serde_json::json!(["hello2.py", "hello3.py", "hello4.py"])
@@ -628,7 +642,10 @@ mod tests {
         writer.start_file("project.json", options).expect("starts");
         writer.write_all(br#"{"title":"T"}"#).expect("writes");
         writer
-            .start_file("ignition/resources/script-python/uat/resource.json", options)
+            .start_file(
+                "ignition/resources/script-python/uat/resource.json",
+                options,
+            )
             .expect("starts");
         writer.write_all(b"<<<not json>>>").expect("writes");
         let zip = writer.finish().expect("finalize").into_inner();
@@ -649,7 +666,10 @@ mod tests {
         writer.start_file("project.json", options).expect("starts");
         writer.write_all(br#"{"title":"T"}"#).expect("writes");
         writer
-            .start_file("ignition/resources/script-python/uat/resource.json", options)
+            .start_file(
+                "ignition/resources/script-python/uat/resource.json",
+                options,
+            )
             .expect("starts");
         writer
             .write_all(br#"{"scope":"G","version":1,"files":["scratch.py"],"attributes":{}}"#)
@@ -660,8 +680,8 @@ mod tests {
         writer.write_all(b"print('x')").expect("writes");
         let zip = writer.finish().expect("finalize").into_inner();
 
-        let out = remove_member(&zip, "ignition/script-python/uat/scratch.py")
-            .expect("remove rewrites");
+        let out =
+            remove_member(&zip, "ignition/script-python/uat/scratch.py").expect("remove rewrites");
         assert_eq!(
             read_member(&out, "ignition/script-python/uat/resource.json").expect("descriptor"),
             br#"{"scope":"G","version":1,"files":["scratch.py"],"attributes":{}}"#.to_vec(),

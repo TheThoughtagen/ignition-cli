@@ -1212,7 +1212,9 @@ async fn tags_json_input_usage_refusals() {
 async fn mount_alarms_action(server: &wiremock::MockServer, action: &str, data: Value) {
     mount_tags_probe(server).await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/alarms",
+        ))
         .and(wiremock::matchers::body_partial_json(
             serde_json::json!({"action": action}),
         ))
@@ -1265,7 +1267,11 @@ eventId                                source                                   
 "#]],
     );
 
-    let out = ign(&config, &server.uri(), &["tags", "alarms", "active", "--compact"]);
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "alarms", "active", "--compact"],
+    );
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
@@ -1494,8 +1500,12 @@ acknowledged 1 alarm(s); unacknowledged: 22222222-2222-2222-2222-222222222222
 
     // The compact agent shape: the honest count + remainder array.
     let server = wiremock::MockServer::start().await;
-    mount_alarms_action(&server, "acknowledge", serde_json::json!({"unacknowledged": []}))
-        .await;
+    mount_alarms_action(
+        &server,
+        "acknowledge",
+        serde_json::json!({"unacknowledged": []}),
+    )
+    .await;
     let out = ign(
         &config,
         &server.uri(),
@@ -1541,13 +1551,13 @@ async fn tags_alarms_ack_short_id_expands_on_the_wire() {
     )
     .await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
-        .and(wiremock::matchers::body_partial_json(
-            serde_json::json!({"action": "acknowledge"}),
-        )
-        // Mount AFTER the active mock: wiremock matches the most
-        // recently mounted first — the body discriminator makes it
-        // exact anyway.
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/alarms",
+        ))
+        .and(
+            wiremock::matchers::body_partial_json(serde_json::json!({"action": "acknowledge"})), // Mount AFTER the active mock: wiremock matches the most
+                                                                                                 // recently mounted first — the body discriminator makes it
+                                                                                                 // exact anyway.
         )
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1565,14 +1575,7 @@ async fn tags_alarms_ack_short_id_expands_on_the_wire() {
     let out = ign(
         &config,
         &server.uri(),
-        &[
-            "tags",
-            "alarms",
-            "ack",
-            "3f2504e0",
-            "--username",
-            "op",
-        ],
+        &["tags", "alarms", "ack", "3f2504e0", "--username", "op"],
     );
     assert!(
         out.status.success(),
@@ -1587,10 +1590,7 @@ acknowledged 1 alarm(s)
 "#]],
     );
     // The wire proof: the acknowledge body carried the FULL uuid.
-    let received = server
-        .received_requests()
-        .await
-        .expect("requests recorded");
+    let received = server.received_requests().await.expect("requests recorded");
     let ack = received
         .iter()
         .rev()
@@ -1627,7 +1627,15 @@ async fn tags_alarms_ack_prefix_refusal_goldens() {
     let out = ign(
         &config,
         &server.uri(),
-        &["tags", "alarms", "ack", "aaaaaaaa", "--username", "op", "--compact"],
+        &[
+            "tags",
+            "alarms",
+            "ack",
+            "aaaaaaaa",
+            "--username",
+            "op",
+            "--compact",
+        ],
     );
     assert_eq!(out.status.code(), Some(2), "ambiguous prefix exits 2");
     let envelope = stderr_envelope(&out);
@@ -1643,7 +1651,15 @@ async fn tags_alarms_ack_prefix_refusal_goldens() {
     let out = ign(
         &config,
         &server.uri(),
-        &["tags", "alarms", "ack", "deadbeef", "--username", "op", "--compact"],
+        &[
+            "tags",
+            "alarms",
+            "ack",
+            "deadbeef",
+            "--username",
+            "op",
+            "--compact",
+        ],
     );
     assert_eq!(out.status.code(), Some(2), "unknown prefix exits 2");
     let envelope = stderr_envelope(&out);

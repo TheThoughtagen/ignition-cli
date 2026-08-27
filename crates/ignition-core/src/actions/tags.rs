@@ -470,11 +470,7 @@ pub async fn tags_alarms_active(
 ) -> Result<TagsAlarmsActiveResult, CoreError> {
     webdev_precondition(api, project).await?;
     let mut body = serde_json::json!({"action": "active"});
-    for (key, value) in [
-        ("source", source),
-        ("priority", priority),
-        ("state", state),
-    ] {
+    for (key, value) in [("source", source), ("priority", priority), ("state", state)] {
         if let Some(value) = value {
             body[key] = serde_json::Value::String(value.to_string());
         }
@@ -742,7 +738,8 @@ pub async fn tags_history_query(
         })
         .ok_or_else(|| {
             CoreError::Internal(
-                "tagHistory route query returned an unexpected shape (missing `columns`)".to_string(),
+                "tagHistory route query returned an unexpected shape (missing `columns`)"
+                    .to_string(),
             )
         })?;
     let rows: Vec<Vec<serde_json::Value>> = data
@@ -1355,10 +1352,7 @@ pub async fn tags_export(
     let subtrees: Vec<serde_json::Value> = match &parsed {
         serde_json::Value::Array(items) => items.clone(),
         serde_json::Value::Object(map)
-            if map.len() == 1
-                && map
-                    .get("tags")
-                    .is_some_and(serde_json::Value::is_array) =>
+            if map.len() == 1 && map.get("tags").is_some_and(serde_json::Value::is_array) =>
         {
             map["tags"].as_array().cloned().unwrap_or_default()
         }
@@ -1461,10 +1455,7 @@ pub async fn tags_import(
     // the provider-shaped export wrapper — configure lands its
     // CHILDREN at the target (live-proven 05-06), so the children's
     // names are what actually arrive.
-    let effective_names: Vec<String> = tags
-        .iter()
-        .flat_map(effective_top_level_names)
-        .collect();
+    let effective_names: Vec<String> = tags.iter().flat_map(effective_top_level_names).collect();
     let imported = effective_names.len();
     webdev_precondition(api, project).await?;
     if matches!(collision, CollisionPolicy::Abort) {
@@ -1486,9 +1477,7 @@ pub async fn tags_import(
         // collision.
         let collisions: Vec<String> = effective_names
             .iter()
-            .filter(|name| {
-                **name != "_types_" && entries.iter().any(|entry| &entry.name == *name)
-            })
+            .filter(|name| **name != "_types_" && entries.iter().any(|entry| &entry.name == *name))
             .cloned()
             .collect();
         if !collisions.is_empty() {
@@ -2133,7 +2122,7 @@ mod tests {
         assert!(rig.calls.lock().unwrap().is_empty());
     }
 
-// ---- config get/create/edit/delete (05-05, TAGS-05) ----
+    // ---- config get/create/edit/delete (05-05, TAGS-05) ----
 
     use super::{
         TagsConfigGetResult, configure_single, reparse_stringified, split_base_path,
@@ -2507,8 +2496,7 @@ mod tests {
     /// internal-class honesty error.
     #[tokio::test]
     async fn export_refuses_scalar_payloads() {
-        let rig =
-            TagsRig::with(Vec::new()).route(present(), serde_json::json!({"payload": "42"}));
+        let rig = TagsRig::with(Vec::new()).route(present(), serde_json::json!({"payload": "42"}));
         let err = tags_export(&rig, "ign-cli", &["[default]T1".to_string()], None)
             .await
             .expect_err("scalar payload refuses");
@@ -2785,7 +2773,9 @@ mod tests {
 
     // ---- alarms active/history/ack (05-06, TAGS-07) ----
 
-    use super::{AlarmRow, TagsAlarmsAckResult, tags_alarms_ack, tags_alarms_active, tags_alarms_history};
+    use super::{
+        AlarmRow, TagsAlarmsAckResult, tags_alarms_ack, tags_alarms_active, tags_alarms_history,
+    };
 
     /// Active alarms: rows map under unit-explicit keys (eventId →
     /// event_id, state verbatim, name Option), and the body carries
@@ -2898,8 +2888,10 @@ mod tests {
     /// (calls[0] is the ack itself).
     #[tokio::test]
     async fn alarms_ack_pins_three_arg_body_and_computes_remainder() {
-        let rig = TagsRig::with(Vec::new())
-            .route(present(), serde_json::json!({"unacknowledged": ["22222222-2222-2222-2222-222222222222"]}));
+        let rig = TagsRig::with(Vec::new()).route(
+            present(),
+            serde_json::json!({"unacknowledged": ["22222222-2222-2222-2222-222222222222"]}),
+        );
         let result: TagsAlarmsAckResult = tags_alarms_ack(
             &rig,
             "ign-cli",
@@ -2937,8 +2929,8 @@ mod tests {
         );
 
         // Full acknowledgment: empty remainder, all acknowledged.
-        let rig = TagsRig::with(Vec::new())
-            .route(present(), serde_json::json!({"unacknowledged": []}));
+        let rig =
+            TagsRig::with(Vec::new()).route(present(), serde_json::json!({"unacknowledged": []}));
         let result = tags_alarms_ack(
             &rig,
             "ign-cli",
@@ -3097,10 +3089,17 @@ mod tests {
         )
         .await
         .expect("query parses");
-        assert_eq!(result.columns, vec!["t_stamp".to_string(), "[default]T1".to_string()]);
+        assert_eq!(
+            result.columns,
+            vec!["t_stamp".to_string(), "[default]T1".to_string()]
+        );
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][0], "Mon Aug 24 00:00:00 UTC 2026");
-        assert_eq!(result.rows[0][1], serde_json::Value::Null, "null cells verbatim");
+        assert_eq!(
+            result.rows[0][1],
+            serde_json::Value::Null,
+            "null cells verbatim"
+        );
         let calls = rig.calls.lock().unwrap();
         assert_eq!(
             calls[0],
@@ -3162,7 +3161,10 @@ mod tests {
     /// against independently computed epoch values.
     #[test]
     fn parse_time_ms_accepts_epoch_and_rfc3339() {
-        assert_eq!(parse_time_ms("1787659200000").expect("epoch ms"), 1_787_659_200_000);
+        assert_eq!(
+            parse_time_ms("1787659200000").expect("epoch ms"),
+            1_787_659_200_000
+        );
         assert_eq!(
             parse_time_ms("1970-01-01T00:00:00Z").expect("epoch"),
             0,
@@ -3209,7 +3211,15 @@ mod tests {
     /// shape (what the caller must fix).
     #[test]
     fn parse_time_ms_refuses_garbage() {
-        for bad in ["", "yesterday", "2026-08-25", "2026-8-25T12:00:00Z", "2026-13-01T00:00:00Z", "2026-08-25T25:00:00Z", "2026-08-25T12:00:00Zulu"] {
+        for bad in [
+            "",
+            "yesterday",
+            "2026-08-25",
+            "2026-8-25T12:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-08-25T25:00:00Z",
+            "2026-08-25T12:00:00Zulu",
+        ] {
             let err = parse_time_ms(bad).expect_err("garbage refuses");
             assert_eq!(err.code(), "invalid_input", "{bad}: {err}");
             assert_eq!(err.exit_code(), 2);

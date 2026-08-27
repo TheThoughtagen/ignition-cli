@@ -466,8 +466,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let min_level = min_level.map(LogLevel::wire);
                         let header = name.clone();
                         let mut first = true;
-                        let sink: &mut (dyn FnMut(&ignition_core::client::logs::LogEntry)
-                                             + Send) = &mut |entry| match mode {
+                        let sink: &mut (dyn FnMut(&ignition_core::client::logs::LogEntry) + Send) =
+                            &mut |entry| match mode {
                                 RenderMode::Human => {
                                     if first {
                                         if let Some(name) = &header {
@@ -1308,10 +1308,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 )
                 .await
                 .map(ActionOutput::TagsAlarmsActive),
-                (
-                    TagsCommand::Alarms(TagsAlarmsCommand::History { project, .. }),
-                    Ok(api),
-                ) => {
+                (TagsCommand::Alarms(TagsAlarmsCommand::History { project, .. }), Ok(api)) => {
                     let (start_ms, end_ms) = time_args.expect("parsed pre-resolution");
                     actions::tags::tags_alarms_history(&api, project, start_ms, end_ms)
                         .await

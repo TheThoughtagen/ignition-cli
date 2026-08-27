@@ -347,7 +347,10 @@ mod tests {
         // success:true is success.
         assert_eq!(import_denied(&serde_json::json!({"success": true})), None);
         // The opaque fallback family: no success key at all.
-        assert_eq!(import_denied(&serde_json::json!({"status": "success"})), None);
+        assert_eq!(
+            import_denied(&serde_json::json!({"status": "success"})),
+            None
+        );
         assert_eq!(import_denied(&serde_json::json!({})), None);
         // success:"false" as a STRING is not a bool denial — only
         // bool false counts.

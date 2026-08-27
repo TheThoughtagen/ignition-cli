@@ -32,7 +32,7 @@ use ignition_core::actions::rig::{
 };
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::actions::tags::{
-    TagProvidersResult, TagsAlarmsActiveResult, TagsAlarmsAckResult, TagsAlarmsHistoryResult,
+    TagProvidersResult, TagsAlarmsAckResult, TagsAlarmsActiveResult, TagsAlarmsHistoryResult,
     TagsBrowseResult, TagsConfigGetResult, TagsExportResult, TagsHistoryQueryResult,
     TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
 };
@@ -1092,7 +1092,13 @@ fn render_tags_alarms_history_human(result: &TagsAlarmsHistoryResult) {
     let rows: Vec<Vec<String>> = result
         .rows
         .iter()
-        .map(|row| result.columns.iter().map(|column| cell_text(&row[column])).collect())
+        .map(|row| {
+            result
+                .columns
+                .iter()
+                .map(|column| cell_text(&row[column]))
+                .collect()
+        })
         .collect();
     render_aligned_columns(&result.columns, &rows);
     println!("{} row(s)", result.count);

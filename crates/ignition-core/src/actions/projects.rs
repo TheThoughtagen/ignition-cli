@@ -164,11 +164,11 @@ fn validate_import(zip: &[u8]) -> Result<(), CoreError> {
         }
     })?;
     for index in 0..archive.len() {
-        let mut file = archive.by_index(index).map_err(|err| {
-            CoreError::InvalidImportFile {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| CoreError::InvalidImportFile {
                 reason: format!("cannot read import archive member {index}: {err}"),
-            }
-        })?;
+            })?;
         let name = file.name().to_string();
         let mut sink = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut sink).map_err(|err| {
@@ -601,10 +601,7 @@ mod tests {
             writer
                 .write_all(br#"{"title":"fixture"}"#)
                 .expect("fixture member writes");
-            writer
-                .finish()
-                .expect("fixture finalizes")
-                .into_inner()
+            writer.finish().expect("fixture finalizes").into_inner()
         }
     }
 
@@ -1064,14 +1061,9 @@ mod tests {
             let cut = full.len() - 10;
             full[..cut].to_vec()
         };
-        let err = super::project_import(
-            &rig,
-            "x",
-            truncated,
-            super::CollisionPolicy::Overwrite,
-        )
-        .await
-        .expect_err("the structure guard refuses");
+        let err = super::project_import(&rig, "x", truncated, super::CollisionPolicy::Overwrite)
+            .await
+            .expect_err("the structure guard refuses");
         assert_eq!(err.exit_code(), 2);
         assert_eq!(err.code(), "invalid_import_file");
         assert!(

@@ -486,10 +486,7 @@ fn zip_fixture() -> Vec<u8> {
     writer
         .write_all(br#"{"title":"fixture"}"#)
         .expect("fixture member writes");
-    writer
-        .finish()
-        .expect("fixture finalizes")
-        .into_inner()
+    writer.finish().expect("fixture finalizes").into_inner()
 }
 
 /// `ign project export` goldens (PROJ-03): the ZIP streams to the

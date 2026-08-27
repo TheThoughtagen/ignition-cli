@@ -742,7 +742,10 @@ async fn delete_internal_historian(env: &LiveEnv, name: &str) {
         .await
         .expect("historian find reaches the gateway");
     if response.status().as_u16() != 200 {
-        println!("historian {name} already gone (find → {})", response.status());
+        println!(
+            "historian {name} already gone (find → {})",
+            response.status()
+        );
         return;
     }
     let record: Value = response.json().await.expect("find record parses");
@@ -824,15 +827,7 @@ async fn live_tags_history_historian_and_binding_spike() {
     let out = ign_stdin(
         &config,
         &env,
-        &[
-            "tags",
-            "config",
-            "create",
-            tag,
-            "--file",
-            "-",
-            "--compact",
-        ],
+        &["tags", "config", "create", tag, "--file", "-", "--compact"],
         r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "historyEnabled": true, "historicalProvider": "p5hist"}"#,
     );
     expect_ok("config create the history-enabled tag", &out);
@@ -889,12 +884,22 @@ async fn live_tags_history_historian_and_binding_spike() {
     let out = query(&config, &env, start_ms, end_ms, None);
     expect_ok("history query (base shape)", &out);
     let envelope = data_envelope(&out);
-    let columns = envelope["data"]["columns"].as_array().cloned().unwrap_or_default();
-    assert_eq!(columns.first().and_then(Value::as_str), Some("t_stamp"), "{envelope}");
+    let columns = envelope["data"]["columns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        columns.first().and_then(Value::as_str),
+        Some("t_stamp"),
+        "{envelope}"
+    );
     // LIVE-DISCOVERED (05-06): history tag columns ride PROVIDER-RELATIVE
     // (the bracket is stripped — `[default]P5H/T1` surfaces as `P5H/T1`);
     // t_stamp is preserved exactly, never renamed.
-    let relative = tag.trim_start_matches('[').split_once(']').map(|(_, rest)| rest);
+    let relative = tag
+        .trim_start_matches('[')
+        .split_once(']')
+        .map(|(_, rest)| rest);
     assert!(
         columns
             .iter()
@@ -926,7 +931,11 @@ async fn live_tags_history_historian_and_binding_spike() {
             r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 9, "historyEnabled": true, "historicalProvider": "p5hist", "execution": {"mode": "TagGroup", "rate": 1000}}"#,
         );
         expect_ok("candidate 1: execution scan-class edit", &out);
-        let out = ign(&config, &env, &["tags", "write", tag, "--value", "11", "--compact"]);
+        let out = ign(
+            &config,
+            &env,
+            &["tags", "write", tag, "--value", "11", "--compact"],
+        );
         expect_ok("candidate 1: write", &out);
         tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
         let out = query(&config, &env, start_ms, end_ms, None);
@@ -945,8 +954,9 @@ async fn live_tags_history_historian_and_binding_spike() {
                 expect_ok(&format!("candidate 2: query ({mode})"), &out);
                 let envelope = data_envelope(&out);
                 if history_has_data(&envelope) {
-                    resolved =
-                        Some(format!("candidate 2: aggregationMode {mode} on a 10-minute window"));
+                    resolved = Some(format!(
+                        "candidate 2: aggregationMode {mode} on a 10-minute window"
+                    ));
                     break;
                 }
             }
@@ -955,7 +965,11 @@ async fn live_tags_history_historian_and_binding_spike() {
         // Candidate 3: browseHistoricalTags cross-check — the
         // historian registered? (Diagnostic: proves the provider is
         // alive even when the tag binding is not.)
-        let out = ign(&config, &env, &["tags", "browse", "histprov:p5hist", "--compact"]);
+        let out = ign(
+            &config,
+            &env,
+            &["tags", "browse", "histprov:p5hist", "--compact"],
+        );
         let historian_registered = out.status.success()
             && data_envelope(&out)["data"]["entries"]
                 .as_array()
@@ -1048,21 +1062,25 @@ async fn live_tags_alarm_lifecycle() {
     expect_ok("config create the alarmed tag", &out);
 
     // Trigger: write past the setpoint.
-    let out = ign(&config, &env, &["tags", "write", tag, "--value", "150", "--compact"]);
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "write", tag, "--value", "150", "--compact"],
+    );
     expect_ok("write past the setpoint", &out);
 
     // Poll `alarms active` until the event appears (bounded).
     let find_event = |envelope: &Value| -> Option<Value> {
-        envelope["data"]["alarms"]
-            .as_array()
-            .and_then(|alarms| {
-                alarms
-                    .iter()
-                    .find(|alarm| {
-                        alarm["source"].as_str().is_some_and(|source| source.contains("p5alarm"))
-                    })
-                    .cloned()
-            })
+        envelope["data"]["alarms"].as_array().and_then(|alarms| {
+            alarms
+                .iter()
+                .find(|alarm| {
+                    alarm["source"]
+                        .as_str()
+                        .is_some_and(|source| source.contains("p5alarm"))
+                })
+                .cloned()
+        })
     };
     let mut event = None;
     for _ in 0..20 {
@@ -1076,13 +1094,22 @@ async fn live_tags_alarm_lifecycle() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     let event = event.expect("the alarm event appeared (bounded retries)");
-    let event_id = event["event_id"].as_str().expect("event_id present").to_string();
+    let event_id = event["event_id"]
+        .as_str()
+        .expect("event_id present")
+        .to_string();
     assert!(
-        event["state"].as_str().unwrap_or_default().contains("Unacknowledged"),
+        event["state"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unacknowledged"),
         "the fresh event is Active, Unacknowledged: {event}"
     );
     assert_eq!(event["priority"], "High", "{event}");
-    println!("alarm active: {event_id} {}", event["state"].as_str().unwrap_or_default());
+    println!(
+        "alarm active: {event_id} {}",
+        event["state"].as_str().unwrap_or_default()
+    );
 
     // Acknowledge: the 3-arg form (note + username explicit).
     let out = ign(
@@ -1121,7 +1148,10 @@ async fn live_tags_alarm_lifecycle() {
                 .is_some_and(|state| state.contains("Acknowledged"))
         {
             assert!(
-                event["state"].as_str().unwrap_or_default().contains("Active"),
+                event["state"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Active"),
                 "the acked alarm stays active until cleared: {event}"
             );
             acknowledged = true;
@@ -1180,7 +1210,11 @@ async fn live_tags_alarm_lifecycle() {
 
     // Cleanup (self-cleaning): quiet the tag value, delete the tag,
     // delete the provider.
-    let _ = ign(&config, &env, &["tags", "write", tag, "--value", "0", "--compact"]);
+    let _ = ign(
+        &config,
+        &env,
+        &["tags", "write", tag, "--value", "0", "--compact"],
+    );
     let out = ign(
         &config,
         &env,
@@ -1190,7 +1224,14 @@ async fn live_tags_alarm_lifecycle() {
     let out = ign(
         &config,
         &env,
-        &["tags", "provider", "delete", "p5alarm", "--yes", "--compact"],
+        &[
+            "tags",
+            "provider",
+            "delete",
+            "p5alarm",
+            "--yes",
+            "--compact",
+        ],
     );
     expect_ok("provider delete p5alarm (guarded)", &out);
 }

@@ -837,7 +837,9 @@ async fn alarms_history_no_alarm_journal_maps_to_actionable_refusal() {
     let server = wiremock::MockServer::start().await;
     mount_precondition_ok(&server).await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/alarms",
+        ))
         .and(wiremock::matchers::body_json(serde_json::json!({
             "action": "history",
             "startDateMs": 1000,
@@ -966,7 +968,9 @@ async fn history_query_pins_epoch_ms_body_and_t_stamp_passthrough() {
     let server = wiremock::MockServer::start().await;
     mount_precondition_ok(&server).await;
     let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tagHistory"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagHistory",
+        ))
         .and(wiremock::matchers::body_json(serde_json::json!({
             "action": "query",
             "paths": ["[default]T1"],

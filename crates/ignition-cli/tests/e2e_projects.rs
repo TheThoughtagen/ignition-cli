@@ -483,7 +483,8 @@ fn full_project_resource_loop() {
             .as_array()
             .expect("resources array")
             .iter()
-            .any(|entry| entry["path"] == Value::String("ignition/script-python/uat2/resource.json".into())),
+            .any(|entry| entry["path"]
+                == Value::String("ignition/script-python/uat2/resource.json".into())),
         "the synthesized parent descriptor rides the archive (the live-proven landing shape): {listed3}"
     );
 

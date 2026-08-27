@@ -104,9 +104,9 @@ impl Modal {
     /// The modal's title line.
     pub fn title(&self) -> &str {
         match self {
-            Modal::Confirm { title, .. } | Modal::Input { title, .. } | Modal::Result_ { title, .. } => {
-                title
-            }
+            Modal::Confirm { title, .. }
+            | Modal::Input { title, .. }
+            | Modal::Result_ { title, .. } => title,
         }
     }
 }

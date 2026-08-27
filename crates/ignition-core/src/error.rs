@@ -294,7 +294,9 @@ pub enum CoreError {
     /// target state: the command is invalid for the gateway's
     /// current state until that chain is provisioned (the honest,
     /// actionable refusal over a bare route error).
-    #[error("no alarm journal profile is configured on this gateway — alarm history has nothing to read")]
+    #[error(
+        "no alarm journal profile is configured on this gateway — alarm history has nothing to read"
+    )]
     AlarmJournalMissing {
         /// URL of the alarms route request, when known.
         endpoint: Option<String>,
