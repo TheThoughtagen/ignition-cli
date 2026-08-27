@@ -269,17 +269,23 @@ mod tests {
         );
     }
 
-    /// Switching screens moves the placeholder to that screen's module
-    /// (per-screen dispatch proof).
+    /// Switching screens moves the surface to that screen's module
+    /// (per-screen dispatch proof). The Projects screen (06-05)
+    /// renders its real browser now — the bordered list pane with
+    /// its Loading state.
     #[test]
     fn screen_dispatch_renders_the_active_screen() {
         let mut state = AppState::new();
         state.screen = Screen::Projects;
         let rows = rendered_rows(&state);
         assert!(
-            rows[1].starts_with("┌Projects — not yet wired"),
-            "Projects placeholder rendered: {}",
+            rows[1].starts_with("┌projects"),
+            "Projects list pane rendered: {}",
             rows[1]
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Loading")),
+            "project list renders Loading before the first load"
         );
     }
 

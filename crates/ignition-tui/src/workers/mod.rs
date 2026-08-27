@@ -67,6 +67,7 @@ where
     }
 }
 
+pub mod ops;
 pub mod refresh;
 pub mod tail;
 pub mod watch;

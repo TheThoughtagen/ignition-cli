@@ -17,6 +17,9 @@ use crate::state::{
 };
 use crate::workers;
 
+// The Projects detail's resources cursor type (the tags tree's shape).
+use ratatui::widgets::TableState;
+
 /// Fold one event into the state. The select loop calls this exactly
 /// once per event; drawing happens in the loop, never here.
 pub fn update(state: &mut AppState, event: AppEvent) {
@@ -225,6 +228,31 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 if matches!(label, "providers create" | "providers delete") {
                     workers::watch::spawn_providers_once(state);
                 }
+                // A landed project-family mutation (or a webdev
+                // deploy — it creates/replaces the ign-cli project)
+                // refreshes the Projects screen's list (the same
+                // refresh-trigger pattern).
+                if matches!(
+                    label,
+                    "project new"
+                        | "project copy"
+                        | "project rename"
+                        | "project set"
+                        | "project delete"
+                        | "project import"
+                        | "webdev deploy"
+                ) {
+                    workers::ops::spawn_project_list(state);
+                }
+                // A landed resource mutation refreshes the open
+                // detail's resources list (the drill-down's own
+                // world changed).
+                if matches!(label, "resource put" | "resource delete")
+                    && let Some(detail) = &state.projects.detail
+                {
+                    let project = detail.name.clone();
+                    workers::ops::spawn_resources_list(state, &project);
+                }
             }
         }
         // A profile switch landed: the era-gated banner confirmation
@@ -233,6 +261,95 @@ pub fn update(state: &mut AppState, event: AppEvent) {
         AppEvent::ProfileChanged { era, name } => {
             if workers::is_current(state.era, era) {
                 state.banner = Some(format!("profile: {name}"));
+            }
+        }
+        // The Projects screen's list landed (06-05): replace the
+        // table (Ok) or degrade to the honest error state (Err).
+        // Stale eras drop whole; the selection clamps into the new
+        // rows and auto-lands on the first row (Enter-drill needs
+        // one).
+        AppEvent::ProjectsList { era, result } => {
+            if workers::is_current(state.era, era) {
+                state.projects.list_busy = false;
+                match result {
+                    Ok(rows) => {
+                        if rows.is_empty() {
+                            state.projects.list_table.select(None);
+                        } else if let Some(index) = state.projects.list_table.selected() {
+                            state
+                                .projects
+                                .list_table
+                                .select(Some(index.min(rows.len() - 1)));
+                        } else {
+                            state.projects.list_table.select(Some(0));
+                        }
+                        state.projects.list = Some(rows);
+                        state.projects.list_error = None;
+                    }
+                    Err(message) => {
+                        state.projects.list = None;
+                        state.projects.list_error = Some(message);
+                    }
+                }
+            }
+        }
+        // The open project detail's find landed (06-05): applied only
+        // when the pane still holds the SAME name — a closed/replaced
+        // pane's late result drops whole (the name lookup IS the
+        // stale gate on top of the era).
+        AppEvent::ProjectGet { era, name, result } => {
+            if workers::is_current(state.era, era)
+                && let Some(detail) = state.projects.detail.as_mut()
+                && detail.name == name
+            {
+                detail.record = match result {
+                    Ok(record) => crate::state::ProjectRecordState::Loaded(record),
+                    Err(message) => crate::state::ProjectRecordState::Error(message),
+                };
+            }
+        }
+        // The open detail's resources list landed (06-05): the
+        // project name is the pane identity (a popped detail's late
+        // result drops at the lookup).
+        AppEvent::ResourcesList {
+            era,
+            project,
+            result,
+        } => {
+            if workers::is_current(state.era, era)
+                && let Some(detail) = state.projects.detail.as_mut()
+                && detail.name == project
+            {
+                match result {
+                    Ok(paths) => {
+                        if paths.is_empty() {
+                            detail.resources_table.select(None);
+                        } else if detail.resources_table.selected().is_none() {
+                            detail.resources_table.select(Some(0));
+                        }
+                        detail.resources = Some(paths);
+                        detail.resources_error = None;
+                    }
+                    Err(message) => {
+                        detail.resources = None;
+                        detail.resources_error = Some(message);
+                    }
+                }
+            }
+        }
+        // The resource detail's get landed (06-05): applied only when
+        // the seq (the open's request-id) still matches — a get for a
+        // left/replaced pane drops; the era gates profile switches.
+        AppEvent::ResourceGet { era, seq, result } => {
+            if workers::is_current(state.era, era)
+                && state.projects.resource.is_some()
+                && state.projects.resource_seq == seq
+                && let Some(resource) = state.projects.resource.as_mut()
+            {
+                resource.state = match result {
+                    Ok(result) => crate::state::ResourceGetState::Loaded(result),
+                    Err(message) => crate::state::ResourceGetState::Error(message),
+                };
             }
         }
     }
@@ -265,9 +382,14 @@ fn handle_input(state: &mut AppState, event: Event) {
         // Esc ascends the Tags screen's navigation stack FIRST — one
         // level per press, the navigation-honesty contract (detail →
         // tree → … → providers); only at the bottom of the stack does
-        // it fall through to the global quit.
+        // it fall through to the global quit. The Projects screen
+        // carries the same contract (resource → project → list).
         KeyCode::Esc => {
-            let ascended = state.screen == Screen::Tags && tags_ascend(state);
+            let ascended = match state.screen {
+                Screen::Tags => tags_ascend(state),
+                Screen::Projects => projects_ascend(state),
+                _ => false,
+            };
             if !ascended {
                 state.should_quit = true;
             }
@@ -310,6 +432,9 @@ fn set_screen(state: &mut AppState, screen: Screen) {
             workers::watch::spawn_providers_once(state);
             workers::watch::spawn_tag_watch(state);
         }
+        // Entering Projects loads the project list (one-shot, busy
+        // guarded — the screen's entry read).
+        Screen::Projects => workers::ops::spawn_project_list(state),
         _ => {}
     }
 }
@@ -385,6 +510,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     state.logs = crate::state::LogsData::default();
     state.alarms = crate::state::AlarmsData::default();
     state.tags = crate::state::TagsData::default();
+    state.projects = crate::state::ProjectsData::default();
     state.close_modal();
     // Re-spawn under a new era (bumps) + post the banner through the
     // rail so the loop redraws on it.
@@ -396,6 +522,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
             workers::watch::spawn_providers_once(state);
             workers::watch::spawn_tag_watch(state);
         }
+        Screen::Projects => workers::ops::spawn_project_list(state),
         _ => {}
     }
     if let Some(tx) = &state.events_tx {
@@ -432,7 +559,7 @@ fn submit_profile_add(state: &mut AppState) {
     }
 }
 
-/// Screen-local keymaps (no modal open). Screens not yet wired (06-04+)
+/// Screen-local keymaps (no modal open). Screens not yet wired (06-06)
 /// take no keys beyond the global set.
 fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
     match state.screen {
@@ -440,6 +567,7 @@ fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
         Screen::Logs => logs_keys(state, code),
         Screen::Alarms => alarms_keys(state, code),
         Screen::Tags => tags_keys(state, code),
+        Screen::Projects => projects_keys(state, code),
         _ => {}
     }
 }
@@ -1285,6 +1413,183 @@ fn accept_tags_form(state: &mut AppState, value: &str) {
             }
         }
     }
+}
+
+// ---- Projects screen (06-05) ----
+
+/// The Projects keymap (06-05): Up/Down (j/k) move the current
+/// level's cursor (list row / resources row) or scroll the resource
+/// preview at the deepest level, Enter drills down (project list →
+/// project detail + resources → resource detail with the content
+/// preview; Enter in the resource detail refires the get), Esc
+/// ascends one level (handled in [`handle_input`] — the global key
+/// owns Esc). `a` (the actions menu) arrives with Task 2.
+fn projects_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => projects_up(state),
+        KeyCode::Down | KeyCode::Char('j') => projects_down(state),
+        KeyCode::Enter => projects_enter(state),
+        _ => {}
+    }
+}
+
+/// Up at the current depth: the resource preview scrolls, else the
+/// owning table's cursor moves (clamped, no wrap — a cursor that
+/// wraps lies about adjacency).
+fn projects_up(state: &mut AppState) {
+    if let Some(resource) = state.projects.resource.as_mut() {
+        resource.scroll = resource.scroll.saturating_sub(1);
+        return;
+    }
+    let (table, len) = if state.projects.detail.is_some() {
+        let Some(detail) = state.projects.detail.as_mut() else {
+            return;
+        };
+        let len = detail.resources.as_ref().map_or(0, Vec::len);
+        (&mut detail.resources_table, len)
+    } else {
+        let len = state.projects.list.as_ref().map_or(0, Vec::len);
+        (&mut state.projects.list_table, len)
+    };
+    if len == 0 {
+        return;
+    }
+    let next = match table.selected() {
+        None => 0,
+        Some(index) => index.saturating_sub(1),
+    };
+    table.select(Some(next));
+}
+
+/// Down at the current depth: the resource preview scrolls, else the
+/// cursor advances (clamped at the last row).
+fn projects_down(state: &mut AppState) {
+    if let Some(resource) = state.projects.resource.as_mut() {
+        // The render clamps to the content's line count; the state
+        // side just advances (u16 saturates far past any preview).
+        resource.scroll = resource.scroll.saturating_add(1);
+        return;
+    }
+    let (table, len) = if state.projects.detail.is_some() {
+        let Some(detail) = state.projects.detail.as_mut() else {
+            return;
+        };
+        let len = detail.resources.as_ref().map_or(0, Vec::len);
+        (&mut detail.resources_table, len)
+    } else {
+        let len = state.projects.list.as_ref().map_or(0, Vec::len);
+        (&mut state.projects.list_table, len)
+    };
+    if len == 0 {
+        return;
+    }
+    let next = match table.selected() {
+        None => 0,
+        Some(index) => (index + 1).min(len - 1),
+    };
+    table.select(Some(next));
+}
+
+/// The currently selected project row, if any (the list level's
+/// selection).
+fn selected_project_row(
+    state: &AppState,
+) -> Option<ignition_core::actions::projects::ProjectSummary> {
+    let rows = state.projects.list.as_ref()?;
+    let index = state.projects.list_table.selected()?;
+    rows.get(index).cloned()
+}
+
+/// The selected resource path of the open detail's resources list.
+fn selected_resource_path(state: &AppState) -> Option<String> {
+    let detail = state.projects.detail.as_ref()?;
+    let paths = detail.resources.as_ref()?;
+    let index = detail.resources_table.selected()?;
+    paths.get(index).cloned()
+}
+
+/// Enter: drill down one level. List → the selected project's detail
+/// (record find + resources list spawn together); detail → the
+/// selected resource's detail (get under a fresh seq); resource
+/// detail → refire the get (on-demand refresh).
+fn projects_enter(state: &mut AppState) {
+    if state.projects.resource.is_some() {
+        refire_resource_get(state);
+        return;
+    }
+    if state.projects.detail.is_some() {
+        if let Some(path) = selected_resource_path(state) {
+            let project = state
+                .projects
+                .detail
+                .as_ref()
+                .expect("checked")
+                .name
+                .clone();
+            open_resource_detail(state, &project, &path);
+        }
+        return;
+    }
+    if let Some(project) = selected_project_row(state) {
+        state.projects.detail = Some(crate::state::ProjectDetail {
+            name: project.name.clone(),
+            record: crate::state::ProjectRecordState::Loading,
+            resources: None,
+            resources_error: None,
+            resources_table: TableState::default(),
+        });
+        state.projects.resource = None;
+        let name = project.name;
+        workers::ops::spawn_project_get(state, &name);
+        workers::ops::spawn_resources_list(state, &name);
+    }
+}
+
+/// Open the resource detail pane and fire its get under a fresh seq
+/// (the request-id gate).
+fn open_resource_detail(state: &mut AppState, project: &str, path: &str) {
+    state.projects.resource_seq += 1;
+    let seq = state.projects.resource_seq;
+    state.projects.resource = Some(crate::state::ResourceDetail {
+        project: project.to_string(),
+        path: path.to_string(),
+        state: crate::state::ResourceGetState::Loading,
+        scroll: 0,
+    });
+    workers::ops::spawn_resource_get(state, seq, project, path);
+}
+
+/// Refire the open resource detail's get (Enter at the deepest
+/// level): a fresh seq retires the in-flight get and a new Loading
+/// state arms.
+fn refire_resource_get(state: &mut AppState) {
+    let Some(resource) = state.projects.resource.as_ref() else {
+        return;
+    };
+    state.projects.resource_seq += 1;
+    let seq = state.projects.resource_seq;
+    let (project, path) = (resource.project.clone(), resource.path.clone());
+    if let Some(resource) = state.projects.resource.as_mut() {
+        resource.state = crate::state::ResourceGetState::Loading;
+        resource.scroll = 0;
+    }
+    workers::ops::spawn_resource_get(state, seq, &project, &path);
+}
+
+/// Esc's Projects-screen half: ascend EXACTLY one level per press —
+/// resource detail → project detail → list; at the list level it
+/// returns false and the global Esc (quit) takes over (navigation
+/// honesty, the Tags contract's twin).
+fn projects_ascend(state: &mut AppState) -> bool {
+    if state.projects.resource.is_some() {
+        state.projects.resource = None;
+        return true;
+    }
+    if state.projects.detail.is_some() {
+        state.projects.detail = None;
+        return true;
+    }
+    false
 }
 
 /// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
@@ -4109,5 +4414,451 @@ mod tests {
         update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(state.modal.is_none());
         assert!(state.tags.pending_form.is_none(), "the form slot cleared");
+    }
+
+    // ---- Projects screen (06-05 Task 1) ----
+
+    fn project_row(name: &str) -> ignition_core::actions::projects::ProjectSummary {
+        ignition_core::actions::projects::ProjectSummary {
+            name: name.to_string(),
+            title: Some(format!("{name} title")),
+            description: None,
+            enabled: true,
+            parent: Some("Base".into()),
+            inheritable: Some(false),
+        }
+    }
+
+    fn project_record(name: &str) -> ignition_core::client::projects::ProjectRecord {
+        ignition_core::client::projects::ProjectRecord {
+            name: name.to_string(),
+            title: Some(format!("{name} title")),
+            description: None,
+            enabled: true,
+            parent: Some("Base".into()),
+            inheritable: Some(false),
+            default_db: None,
+            tag_provider: None,
+            user_source: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// A Projects-screen state with rails armed, entering via Tab×4
+    /// (Dashboard → Logs → Tags → Alarms → Projects) so the
+    /// transition hooks fire the list load like production.
+    fn projects_screen_with_rails() -> AppState {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        for _ in 0..4 {
+            update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(state.screen, Screen::Projects);
+        state
+    }
+
+    /// A seeded list state: the rows landed (a current-era
+    /// ProjectsList event) and the cursor sits on the first row.
+    fn projects_state_with_list() -> AppState {
+        let mut state = projects_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::ProjectsList {
+                era,
+                result: Ok(vec![project_row("PlantFloor"), project_row("Base")]),
+            },
+        );
+        state
+    }
+
+    /// Entering Projects fires the list load (busy guard armed); a
+    /// landed list fills the table with the cursor on the first row;
+    /// a stale-era list drops whole.
+    #[test]
+    fn projects_entry_loads_list_and_events_fill_or_drop() {
+        let mut state = projects_screen_with_rails();
+        assert!(
+            state.projects.list_busy,
+            "entering Projects fires the list load"
+        );
+
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::ProjectsList {
+                era,
+                result: Ok(vec![project_row("PlantFloor"), project_row("Base")]),
+            },
+        );
+        assert_eq!(
+            state.projects.list.as_ref().map(|rows| rows.len()),
+            Some(2),
+            "table filled"
+        );
+        assert!(!state.projects.list_busy, "busy clears");
+        assert_eq!(state.projects.list_table.selected(), Some(0));
+
+        // Stale era: dropped whole (Pitfall 9).
+        state.projects.list_busy = true;
+        update(
+            &mut state,
+            AppEvent::ProjectsList {
+                era: era.wrapping_sub(1),
+                result: Ok(vec![]),
+            },
+        );
+        assert_eq!(
+            state.projects.list.as_ref().map(|rows| rows.len()),
+            Some(2),
+            "stale list dropped"
+        );
+        assert!(state.projects.list_busy, "stale does not clear busy");
+    }
+
+    /// A list-load error degrades to the honest error state.
+    #[test]
+    fn projects_list_error_degrades() {
+        let mut state = projects_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::ProjectsList {
+                era,
+                result: Err("gateway unreachable".into()),
+            },
+        );
+        assert!(state.projects.list.is_none(), "rows dropped");
+        assert_eq!(
+            state.projects.list_error.as_deref(),
+            Some("gateway unreachable")
+        );
+    }
+
+    /// THE drill-down state machine: Enter on a selected project
+    /// opens the detail (record Loading + resources Loading — both
+    /// spawns fire); the named find fills the record; a mismatched
+    /// name (a closed pane's late answer) drops whole.
+    #[test]
+    fn enter_opens_the_detail_and_events_fill_by_name() {
+        let mut state = projects_state_with_list();
+
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        let detail = state.projects.detail.as_ref().expect("detail open");
+        assert_eq!(detail.name, "PlantFloor");
+        assert!(
+            matches!(detail.record, crate::state::ProjectRecordState::Loading),
+            "record is Loading"
+        );
+        assert!(detail.resources.is_none(), "resources are Loading");
+
+        let era = state.era;
+        // A late result for a pane nobody holds drops whole.
+        update(
+            &mut state,
+            AppEvent::ProjectGet {
+                era,
+                name: "gone".into(),
+                result: Ok(project_record("gone")),
+            },
+        );
+        assert!(
+            matches!(
+                state.projects.detail.as_ref().expect("detail").record,
+                crate::state::ProjectRecordState::Loading
+            ),
+            "wrong-name find dropped"
+        );
+
+        // The matching find fills the record.
+        update(
+            &mut state,
+            AppEvent::ProjectGet {
+                era,
+                name: "PlantFloor".into(),
+                result: Ok(project_record("PlantFloor")),
+            },
+        );
+        assert!(matches!(
+            state.projects.detail.as_ref().expect("detail").record,
+            crate::state::ProjectRecordState::Loaded(_)
+        ));
+
+        // The matching resources list fills its half (the name lookup
+        // gates it too); the cursor lands for Enter-drill.
+        update(
+            &mut state,
+            AppEvent::ResourcesList {
+                era,
+                project: "PlantFloor".into(),
+                result: Ok(vec!["views/root.json".into(), "views/home.json".into()]),
+            },
+        );
+        let detail = state.projects.detail.as_ref().expect("detail");
+        assert_eq!(
+            detail.resources.as_ref().map(Vec::len),
+            Some(2),
+            "resources filled"
+        );
+        assert_eq!(detail.resources_table.selected(), Some(0));
+    }
+
+    /// Enter again drills into the selected resource under a fresh
+    /// seq; the get lands only under its seq (the request-id gate);
+    /// Enter in the resource detail REFIRES the get.
+    #[test]
+    fn resource_drill_down_lands_under_its_seq_and_refires() {
+        let mut state = projects_state_with_list();
+        let era = state.era;
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::ResourcesList {
+                era,
+                project: "PlantFloor".into(),
+                result: Ok(vec!["views/root.json".into()]),
+            },
+        );
+
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        let seq = state.projects.resource_seq;
+        let resource = state.projects.resource.as_ref().expect("resource open");
+        assert_eq!(resource.project, "PlantFloor");
+        assert_eq!(resource.path, "views/root.json");
+        assert!(matches!(
+            resource.state,
+            crate::state::ResourceGetState::Loading
+        ));
+
+        // A stale-seq get drops (a replaced pane's read).
+        update(
+            &mut state,
+            AppEvent::ResourceGet {
+                era,
+                seq: seq - 1,
+                result: Ok(ignition_core::actions::resources::ResourceGetResult {
+                    project: "PlantFloor".into(),
+                    path: "views/OLD.json".into(),
+                    content_kind: "json".into(),
+                    content: serde_json::json!({}),
+                }),
+            },
+        );
+        assert!(matches!(
+            state.projects.resource.as_ref().expect("resource").state,
+            crate::state::ResourceGetState::Loading
+        ));
+
+        // The matching-seq get lands.
+        update(
+            &mut state,
+            AppEvent::ResourceGet {
+                era,
+                seq,
+                result: Ok(ignition_core::actions::resources::ResourceGetResult {
+                    project: "PlantFloor".into(),
+                    path: "views/root.json".into(),
+                    content_kind: "json".into(),
+                    content: serde_json::json!({"v": 1}),
+                }),
+            },
+        );
+        assert!(matches!(
+            state.projects.resource.as_ref().expect("resource").state,
+            crate::state::ResourceGetState::Loaded(_)
+        ));
+
+        // Enter at the deepest level refires the get under a NEW seq
+        // (Loading re-arms, scroll resets).
+        state.projects.resource.as_mut().expect("resource").scroll = 5;
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.projects.resource_seq, seq + 1, "seq bumped");
+        let resource = state.projects.resource.as_ref().expect("resource");
+        assert!(matches!(
+            resource.state,
+            crate::state::ResourceGetState::Loading
+        ));
+        assert_eq!(resource.scroll, 0, "scroll reset on refire");
+    }
+
+    /// Navigation honesty: Esc ascends EXACTLY one level per press —
+    /// resource → project detail → list → quit — and Up/Down move the
+    /// owning cursor at each depth (the resource preview scrolls).
+    #[test]
+    fn projects_esc_ascends_exactly_one_level_per_press() {
+        let mut state = projects_state_with_list();
+        let era = state.era;
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::ResourcesList {
+                era,
+                project: "PlantFloor".into(),
+                result: Ok(vec!["views/root.json".into()]),
+            },
+        );
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE)); // resource
+        assert!(state.projects.resource.is_some());
+        assert!(state.projects.detail.is_some());
+
+        // Esc 1: resource → detail.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.projects.resource.is_none(), "resource closes");
+        assert!(state.projects.detail.is_some(), "detail stays");
+
+        // Esc 2: detail → list.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.projects.detail.is_none());
+        assert!(!state.should_quit, "still on the Projects screen");
+
+        // Esc 3: at the list — the global Esc quits.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.should_quit, "Esc at the list level quits");
+    }
+
+    /// Up/Down move the list cursor (clamped); inside the detail they
+    /// move the RESOURCES cursor; inside the resource detail they
+    /// SCROLL the preview (Up decreases the offset — the render
+    /// clamps the ceiling).
+    #[test]
+    fn projects_cursor_moves_per_depth_and_scrolls_the_preview() {
+        let mut state = projects_state_with_list();
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.projects.list_table.selected(), Some(1), "list cursor");
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            state.projects.list_table.selected(),
+            Some(1),
+            "clamped at the last row"
+        );
+        update(&mut state, key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.projects.list_table.selected(), Some(0), "k ascends");
+
+        // Enter the detail with two resources: Down moves the
+        // resources cursor.
+        let era = state.era;
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::ResourcesList {
+                era,
+                project: "PlantFloor".into(),
+                result: Ok(vec!["views/root.json".into(), "views/home.json".into()]),
+            },
+        );
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        let detail = state.projects.detail.as_ref().expect("detail");
+        assert_eq!(
+            detail.resources_table.selected(),
+            Some(1),
+            "resources cursor"
+        );
+
+        // Open the resource: Down increases the preview scroll, Up
+        // decreases it (floored at 0).
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            state.projects.resource.as_ref().expect("resource").scroll,
+            2,
+            "preview scrolled down 2"
+        );
+        update(&mut state, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            state.projects.resource.as_ref().expect("resource").scroll,
+            1,
+            "preview scrolled up 1"
+        );
+        update(&mut state, key(KeyCode::Up, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            state.projects.resource.as_ref().expect("resource").scroll,
+            0,
+            "floored at the top"
+        );
+    }
+
+    /// A landed project mutation triggers the list reload (the
+    /// providers-refresh pattern's projects twin); resource
+    /// mutations reload the OPEN detail's resources; other labels do
+    /// not trigger.
+    #[test]
+    fn project_and_resource_mutations_trigger_reloads() {
+        let mut state = projects_state_with_list();
+        let era = state.era;
+        assert!(!state.projects.list_busy);
+
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "project delete",
+                result: Ok("{\"deleted\": \"x\"}".into()),
+            },
+        );
+        assert!(state.projects.list_busy, "list reload armed");
+
+        // A resource mutation with an open detail reloads resources.
+        state.projects.list_busy = false;
+        // The ActionDone opened a result modal — dismiss it first
+        // (the screen's keys own the surface again).
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE)); // detail open
+        assert!(
+            state
+                .projects
+                .detail
+                .as_ref()
+                .expect("detail")
+                .resources
+                .is_none()
+        );
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "resource put",
+                result: Ok("{\"path\": \"v\"}".into()),
+            },
+        );
+        // The reload fired (era-stamped event injected as the worker
+        // would): the resources half still Loading until it lands —
+        // the trigger itself is invisible here, the landed event
+        // proves the pipeline below.
+        update(
+            &mut state,
+            AppEvent::ResourcesList {
+                era,
+                project: "PlantFloor".into(),
+                result: Ok(vec!["views/root.json".into()]),
+            },
+        );
+        assert_eq!(
+            state
+                .projects
+                .detail
+                .as_ref()
+                .expect("detail")
+                .resources
+                .as_ref()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        // Other labels do not trigger.
+        state.projects.list_busy = false;
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "version",
+                result: Ok("{}".into()),
+            },
+        );
+        assert!(!state.projects.list_busy, "non-project labels skip");
     }
 }

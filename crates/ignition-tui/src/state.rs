@@ -10,10 +10,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ignition_core::actions::projects::ProjectSummary;
+use ignition_core::actions::resources::ResourceGetResult;
 use ignition_core::actions::sessions::{SessionType, SessionsResult};
 use ignition_core::actions::tags::{AlarmRow, BrowseRow, TagProviderRow, TagReadRow};
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::client::logs::LogEntry;
+use ignition_core::client::projects::ProjectRecord;
 use ratatui::widgets::TableState;
 use tokio::sync::{mpsc, watch};
 
@@ -322,6 +325,27 @@ pub const TAG_ACTIONS: [&str; 13] = [
     "udt types",
     "udt def",
     "history query",
+];
+
+/// The Projects screen's actions menu entries (06-05) — the project
+/// family (CLI spellings: new/copy/rename/set/delete/import/export),
+/// the resource family's guarded verbs (put/delete — list/get live on
+/// the navigation itself), and the webdev family (deploy is
+/// deliberately UNGUARDED — the ign-cli project is CLI-owned, the
+/// 05-03 decision). Labels are display side; the route rows in
+/// [`crate::routes`] carry the clap-exact spellings.
+pub const PROJECT_ACTIONS: [&str; 11] = [
+    "new",
+    "copy",
+    "rename",
+    "set",
+    "delete",
+    "import",
+    "export",
+    "resource put",
+    "resource delete",
+    "webdev deploy",
+    "webdev status",
 ];
 
 /// What an accepted Input modal's buffer is for on the Tags screen
@@ -704,6 +728,175 @@ pub struct TagsData {
     pub pending_form: Option<TagsForm>,
 }
 
+/// The open project detail's find tri-state (06-05) — 06-02's
+/// Loading/Error pattern applied to the record pane.
+#[derive(Debug)]
+pub enum ProjectRecordState {
+    /// The one-shot find is in flight.
+    Loading,
+    /// The read-back record (the six summary fields PLUS the
+    /// defaultDb/tagProvider/userSource passthrough the detail pane
+    /// shows).
+    Loaded(ProjectRecord),
+    /// The find's error.
+    Error(String),
+}
+
+/// The open project detail pane (06-05): the record (one-shot find)
+/// plus the project's resource paths (one-shot export-surgery list —
+/// the surgery itself is invisible here, the actions layer owns it).
+#[derive(Debug)]
+pub struct ProjectDetail {
+    /// The project's name (the fetch target AND the pane's identity
+    /// for stale-result gating).
+    pub name: String,
+    /// The find's tri-state.
+    pub record: ProjectRecordState,
+    /// The project's resource paths (None while loading; an error
+    /// replaces them with the honest error state).
+    pub resources: Option<Vec<String>>,
+    /// Why the resources load errored, when it did.
+    pub resources_error: Option<String>,
+    /// The resources table cursor (the drill-down selector).
+    pub resources_table: TableState,
+}
+
+/// The open resource detail's get tri-state (06-05). Binary fencing
+/// rides the action's own exit-6 `resource_binary` refusal — surfaced
+/// as the Error state verbatim, never a blank pane.
+#[derive(Debug)]
+pub enum ResourceGetState {
+    /// The one-shot get is in flight.
+    Loading,
+    /// The flat `{project, path, content_kind, content}` shape.
+    Loaded(ResourceGetResult),
+    /// The get's error.
+    Error(String),
+}
+
+/// The open resource detail pane (06-05): the get result with a
+/// SCROLLABLE content preview (text content renders; the action
+/// fences binary out with its exit-6).
+#[derive(Debug)]
+pub struct ResourceDetail {
+    /// The owning project.
+    pub project: String,
+    /// The resource path (slashes kept).
+    pub path: String,
+    /// The get's tri-state.
+    pub state: ResourceGetState,
+    /// The content preview's line offset from the top (Up/Down
+    /// scroll at this depth — clamped at render).
+    pub scroll: u16,
+}
+
+impl ResourceDetail {
+    /// The content preview lines: JSON pretty-printed, text raw —
+    /// derived at render (state stays small; the pure derivation is
+    /// unit-pinned).
+    pub fn content_lines(result: &ResourceGetResult) -> Vec<String> {
+        if result.content_kind == "text" {
+            result
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        } else {
+            serde_json::to_string_pretty(&result.content)
+                .unwrap_or_else(|_| result.content.to_string())
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+}
+
+/// What an accepted Input modal's buffer is for on the Projects
+/// screen (06-05) — the project/resource/webdev families' own
+/// small-form router, carrying its own payloads (multi-step flows
+/// chain through these). Cleared by the shared cancel path so a
+/// stale form can never arm a later Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectsForm {
+    /// `project new` step 1 — the new project's NAME.
+    NewName,
+    /// `project new` step 2 — the optional display TITLE (empty
+    /// skips the field).
+    NewTitle { name: String },
+    /// `project copy` step 1 — the SOURCE project.
+    CopySrc,
+    /// `project copy` step 2 — the DESTINATION name.
+    CopyDst { src: String },
+    /// `project rename` step 1 — the CURRENT name (prefilled from
+    /// the selection).
+    RenameOld,
+    /// `project rename` step 2 — the NEW name.
+    RenameNew { old: String },
+    /// `project set` step 1 — the target project NAME (prefilled
+    /// from the selection).
+    SetName,
+    /// `project set` step 2 — the `FIELD=VALUE` line (one pair per
+    /// prompt; the `?` CLI form shows every flag).
+    SetLine { name: String },
+    /// `project delete` — the target NAME (a Confirm gate arms
+    /// next).
+    DeleteName,
+    /// `project import` step 1 — the export ZIP file path.
+    ImportFile,
+    /// `project import` step 2 — the name to import AS.
+    ImportName { file: String },
+    /// `project import` step 3 — the collision POLICY
+    /// (`abort`/`overwrite`; the overwrite arm is Confirm-gated,
+    /// abort fires unguarded).
+    ImportPolicy { file: String, name: String },
+    /// `project export` — the output FILE (prefilled with the
+    /// `<name>.zip` default).
+    ExportFile { name: String },
+    /// `resource put` step 1 — the target PROJECT.
+    ResourcePutProject,
+    /// `resource put` step 2 — the resource PATH.
+    ResourcePutPath { project: String },
+    /// `resource put` step 3 — the content FILE path (a Confirm gate
+    /// arms next).
+    ResourcePutFile { project: String, path: String },
+    /// `resource delete` step 1 — the target PROJECT.
+    ResourceDeleteProject,
+    /// `resource delete` step 2 — the resource PATH (a Confirm gate
+    /// arms next).
+    ResourceDeletePath { project: String },
+}
+
+/// The Projects screen's data (06-05): the object-list → detail
+/// navigation stack — the project list, the open project detail with
+/// its resources list, and the open resource detail (the get with
+/// content preview).
+#[derive(Debug, Default)]
+pub struct ProjectsData {
+    /// The project list: rows (None until loaded / after an error),
+    /// the honest error, the busy guard, the cursor.
+    pub list: Option<Vec<ProjectSummary>>,
+    /// Why the list load errored, when it did.
+    pub list_error: Option<String>,
+    /// A list load is in flight (the entry/reload busy guard).
+    pub list_busy: bool,
+    /// The project table cursor.
+    pub list_table: TableState,
+    /// The open project detail pane, if any (navigation level 1).
+    pub detail: Option<ProjectDetail>,
+    /// The open resource detail pane, if any (navigation level 2).
+    pub resource: Option<ResourceDetail>,
+    /// Resource-open sequence: every open bumps it and stamps its get
+    /// worker — a get for a left/replaced pane drops (the request-id
+    /// stale gate, the tags detail's shape).
+    pub resource_seq: u64,
+    /// The armed projects form (the Input modal's routing slot for
+    /// the project/resource/webdev families — [`ProjectsForm`]);
+    /// cleared by the shared cancel path.
+    pub pending_form: Option<ProjectsForm>,
+}
+
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
@@ -738,6 +931,9 @@ pub struct AppState {
     pub alarms: AlarmsData,
     /// Tags screen data (06-04) — provider list, browse stack, detail.
     pub tags: TagsData,
+    /// Projects screen data (06-05) — list, project detail,
+    /// resource detail.
+    pub projects: ProjectsData,
     /// The active profile's name (workers' target — what `p` switches).
     pub profile: Option<String>,
     /// The status-line banner — set by a landed profile switch

@@ -118,6 +118,53 @@ pub enum AppEvent {
         /// error.
         result: Result<Vec<ignition_core::actions::tags::TagReadRow>, String>,
     },
+    /// The Projects screen's list landed (06-05): `Ok` replaces the
+    /// project table, `Err` degrades to the honest error state. Stale
+    /// eras drop whole (Pitfall 9).
+    ProjectsList {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The project rows (gateway order), or the load's error.
+        result: Result<Vec<ignition_core::actions::projects::ProjectSummary>, String>,
+    },
+    /// The open project detail's find landed (06-05): `name` names
+    /// the detail pane the record belongs to (a closed/replaced
+    /// pane's late result drops whole — the name lookup IS the stale
+    /// gate on top of the era).
+    ProjectGet {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The project whose record this is (the pane's identity).
+        name: String,
+        /// The read-back record, or the find's error.
+        result: Result<ignition_core::client::projects::ProjectRecord, String>,
+    },
+    /// The open detail's resources list landed (06-05): `project`
+    /// names the detail the paths belong to (a popped detail's late
+    /// result drops at the name lookup).
+    ResourcesList {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The project whose resources these are (the pane's
+        /// identity).
+        project: String,
+        /// The member paths (zip order), or the list's error.
+        result: Result<Vec<String>, String>,
+    },
+    /// The open resource detail's get landed (06-05). `seq` is the
+    /// resource-open's request-id — a get for a pane the user already
+    /// left (or replaced) drops; the era gates profile switches on
+    /// top (the tags detail-read shape).
+    ResourceGet {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The resource-open sequence the get belongs to.
+        seq: u64,
+        /// The flat `{project, path, content_kind, content}` shape,
+        /// or the get's error (binary fencing rides the action's
+        /// exit-6 verbatim).
+        result: Result<ignition_core::actions::resources::ResourceGetResult, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`
