@@ -1518,6 +1518,7 @@ dependencies = [
 name = "ignition-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "crossterm",
  "futures-util",
  "ignition-core",
