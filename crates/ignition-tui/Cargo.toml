@@ -30,3 +30,7 @@ tempfile = { workspace = true }
 wiremock = { workspace = true }
 # fixture payloads for client-model test constructors (workspace graph)
 serde_json = { workspace = true }
+# implementing the ComposeRunner seam for the rig-stream worker test
+# (the trait is #[async_trait] — implementors need the macro; already
+# in the workspace graph)
+async-trait = { workspace = true }

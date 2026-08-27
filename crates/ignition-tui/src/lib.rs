@@ -108,6 +108,9 @@ async fn run_loop(
     if let Some(shutdown) = &state.tags.watch_shutdown {
         let _ = shutdown.send(true);
     }
+    if let Some(shutdown) = &state.rig.logs_shutdown {
+        let _ = shutdown.send(true);
+    }
     result
 }
 

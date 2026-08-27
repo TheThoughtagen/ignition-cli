@@ -82,6 +82,88 @@ fn build_client(
     Ok((name, url, Arc::new(api)))
 }
 
+// ---- The rig family's client construction (06-06) ----
+//
+// The rig verbs address the RIG'S OWN derived gateway URL (never the
+// profile's gateway — 04-03's lock): these helpers are the TUI
+// edition of main.rs's private `rig_gateway_client` + trial cred
+// sourcing, composed from the same public building blocks. They are
+// ALSO the confinement home for every `Credential`/`Secret`
+// construction outside the client itself — the rig workers pass raw
+// env-sourced strings in and typed pairs out, so the phase's
+// secrets-confinement grep keeps its single-file answer.
+
+/// A HEADER-LESS client pointed at the rig's own gateway URL — the
+/// commissioned-wait probe (`rig up`/`reset`) and `trial status`
+/// target (those endpoints answer unauthenticated; fresh-rig
+/// friendly). `ssl_verify=false`: localhost probes against
+/// self-signed rig https are the norm. `None` is impossible for a
+/// parseable URL — the caller already derived it.
+pub fn rig_client(url: &str) -> Option<ReqwestGatewayApi> {
+    rig_client_with(url, None)
+}
+
+/// The token-bearing twin: the tier-0 `IGNITION_TOKEN` credential
+/// rides the header (`snapshot`/`restore`'s only rung; `trial
+/// reset`'s first).
+pub fn rig_client_token(url: &str, token: &str) -> Option<ReqwestGatewayApi> {
+    rig_client_with(
+        url,
+        Some(config::Credential::Token(config::Secret::new(
+            token.to_string(),
+        ))),
+    )
+}
+
+/// The shared constructor behind both rig clients.
+fn rig_client_with(url: &str, credential: Option<config::Credential>) -> Option<ReqwestGatewayApi> {
+    let profile = config::Profile {
+        url: url.parse().ok()?,
+        label: None,
+        ssl_verify: false,
+        auth: config::AuthRef::default(),
+        webdev_secret: None,
+    };
+    ReqwestGatewayApi::new(&profile, credential).ok()
+}
+
+/// A non-empty env var, when set (main.rs's private twin — the rig
+/// family reads env inside its workers).
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The trial-reset ladder's typed pair (the basic rung's user +
+/// secret — constructed ONLY here, the confinement home).
+pub type TrialBasic = (String, config::Secret);
+
+/// The trial-reset ladder's credential parts, env-only (the cockpit
+/// has no `--user` flag form — the `?` hatch names the env vars):
+/// tier 0 = `IGNITION_TOKEN`; tier 1 = `IGNITION_USER` +
+/// `IGNITION_PASSWORD` (password env-only, NEVER a flag — the CLI's
+/// redaction discipline). BOTH rungs absent is the family's exit-3
+/// refusal (the CLI dispatch's both-absent shape).
+pub fn rig_trial_ladder() -> Result<(Option<String>, Option<TrialBasic>), CoreError> {
+    let token = env_non_empty("IGNITION_TOKEN");
+    let basic = env_non_empty("IGNITION_USER").zip(env_non_empty("IGNITION_PASSWORD"));
+    if token.is_none() && basic.is_none() {
+        return Err(CoreError::SecretUnavailable {
+            profile: "rig".to_string(),
+        });
+    }
+    let basic = basic.map(|(user, password)| (user, config::Secret::new(password)));
+    Ok((token, basic))
+}
+
+/// The token-ONLY rung (`snapshot`/`restore` — the backup endpoints
+/// require a token, live-verified 04-04): `IGNITION_TOKEN` or the
+/// exit-3 refusal.
+pub fn rig_token_only() -> Result<String, CoreError> {
+    env_non_empty("IGNITION_TOKEN").ok_or(CoreError::SecretUnavailable {
+        profile: "rig".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{rebuild, resolve};

@@ -165,6 +165,24 @@ pub enum AppEvent {
         /// exit-6 verbatim).
         result: Result<ignition_core::actions::resources::ResourceGetResult, String>,
     },
+    /// The rig status summary landed (06-06): `Ok` replaces the
+    /// pane's allowlist view, `Err` degrades to the honest error
+    /// state (a down rig is Ok-data — state is data, exit 0; the
+    /// ERROR state is for docker/discovery failures). Stale eras
+    /// drop whole (Pitfall 9).
+    RigStatus {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The allowlist status (services/volumes/ports_free), or
+        /// the load's error.
+        result: Result<ignition_core::actions::rig::RigStatusResult, String>,
+    },
+    /// One raw compose line from the rig logs stream worker (06-06).
+    /// NOT era-stamped — the 06-03 LogLine policy verbatim: the
+    /// ring's turnover is the acceptance policy, and the worker is
+    /// stopped by its shutdown watch on screen exit / pane toggle (a
+    /// last-gasp line merely joins the ring).
+    RigLogLine(String),
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

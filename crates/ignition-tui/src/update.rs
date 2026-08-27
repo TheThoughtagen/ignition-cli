@@ -12,8 +12,8 @@ use ignition_core::client::ReqwestGatewayApi;
 
 use crate::event::AppEvent;
 use crate::state::{
-    ACTIONS, AppState, LOG_ACTIONS, Modal, PROJECT_ACTIONS, PendingAction, PendingInput, Screen,
-    SessionRow, TAG_ACTIONS, TagsForm, session_rows,
+    ACTIONS, AppState, LOG_ACTIONS, Modal, PROJECT_ACTIONS, PendingAction, PendingInput,
+    RIG_ACTIONS, RigForm, Screen, SessionRow, TAG_ACTIONS, TagsForm, session_rows,
 };
 use crate::workers;
 
@@ -253,6 +253,12 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                     let project = detail.name.clone();
                     workers::ops::spawn_resources_list(state, &project);
                 }
+                // A landed rig mutation (up/down/reset/restore all
+                // change the compose world) refreshes the Rig pane's
+                // status summary (the same refresh-trigger pattern).
+                if matches!(label, "rig up" | "rig down" | "rig reset" | "rig restore") {
+                    workers::rig_stream::spawn_rig_status(state);
+                }
             }
         }
         // A profile switch landed: the era-gated banner confirmation
@@ -352,6 +358,31 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 };
             }
         }
+        // The rig status summary landed (06-06): replace the pane
+        // (Ok — a DOWN rig is data: empty services render as the
+        // down state) or degrade to the honest error state (Err —
+        // docker/discovery failures). Stale eras drop whole (Pitfall
+        // 9).
+        AppEvent::RigStatus { era, result } => {
+            if workers::is_current(state.era, era) {
+                state.rig.status_busy = false;
+                match result {
+                    Ok(status) => {
+                        state.rig.status = Some(status);
+                        state.rig.status_error = None;
+                    }
+                    Err(message) => {
+                        state.rig.status = None;
+                        state.rig.status_error = Some(message);
+                    }
+                }
+            }
+        }
+        // One raw compose line (06-06): append to the pane's ring
+        // under its cap. Not era-stamped (the LogLine policy verbatim:
+        // ring turnover is the acceptance policy; the worker's
+        // shutdown watch is the scope).
+        AppEvent::RigLogLine(line) => state.rig.push_log_line(line),
     }
 }
 
@@ -419,6 +450,7 @@ fn set_screen(state: &mut AppState, screen: Screen) {
         Screen::Logs => workers::tail::stop_tail(state),
         Screen::Alarms => workers::watch::stop_alarms(state),
         Screen::Tags => workers::watch::stop_tag_watch(state),
+        Screen::Rig => workers::rig_stream::stop_rig_logs(state),
         _ => {}
     }
     state.screen = screen;
@@ -435,6 +467,16 @@ fn set_screen(state: &mut AppState, screen: Screen) {
         // Entering Projects loads the project list (one-shot, busy
         // guarded — the screen's entry read).
         Screen::Projects => workers::ops::spawn_project_list(state),
+        // Entering Rig loads the status summary (one-shot, busy
+        // guarded) and resumes the logs stream when the pane flag is
+        // on (the tail/alarms re-arm convention; the ring restarts
+        // from the compose tail).
+        Screen::Rig => {
+            workers::rig_stream::spawn_rig_status(state);
+            if state.rig.logs_on {
+                workers::rig_stream::spawn_rig_logs(state);
+            }
+        }
         _ => {}
     }
 }
@@ -503,6 +545,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     workers::tail::stop_tail(state);
     workers::watch::stop_alarms(state);
     workers::watch::stop_tag_watch(state);
+    workers::rig_stream::stop_rig_logs(state);
     state.client = Some(crate::state::ClientHandle(api));
     state.profile_url = Some(url);
     state.profile = Some(resolved_name.clone());
@@ -511,6 +554,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     state.alarms = crate::state::AlarmsData::default();
     state.tags = crate::state::TagsData::default();
     state.projects = crate::state::ProjectsData::default();
+    state.rig = crate::state::RigData::default();
     state.close_modal();
     // Re-spawn under a new era (bumps) + post the banner through the
     // rail so the loop redraws on it.
@@ -523,6 +567,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
             workers::watch::spawn_tag_watch(state);
         }
         Screen::Projects => workers::ops::spawn_project_list(state),
+        Screen::Rig => workers::rig_stream::spawn_rig_status(state),
         _ => {}
     }
     if let Some(tx) = &state.events_tx {
@@ -568,6 +613,28 @@ fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
         Screen::Alarms => alarms_keys(state, code),
         Screen::Tags => tags_keys(state, code),
         Screen::Projects => projects_keys(state, code),
+        Screen::Rig => rig_keys(state, code),
+    }
+}
+
+// ---- Rig screen (06-06) ----
+
+/// The Rig keymap (06-06): `r` refreshes the status summary (the
+/// dashboard's `r` shape), `l` toggles the raw compose-logs pane
+/// (on = a fresh stream from the compose tail; off = stop), `a`
+/// opens the actions menu (the full RigCommand verb set).
+fn rig_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Char('r') => workers::rig_stream::spawn_rig_status(state),
+        KeyCode::Char('l') => {
+            if state.rig.logs_on {
+                state.rig.logs_on = false;
+                workers::rig_stream::stop_rig_logs(state);
+            } else {
+                workers::rig_stream::spawn_rig_logs(state);
+            }
+        }
+        KeyCode::Char('a') => state.open_modal(Modal::RigActions { selected: 0 }),
         _ => {}
     }
 }
@@ -2265,6 +2332,16 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
             let (project, path) = (project.clone(), path.clone());
             workers::ops::fire_resource_delete(state, project, path);
         }
+        // The confirmed rig mutations fire unguarded — the TUI owned
+        // the `--yes` (the CLI guard contract, caller-owns-guard);
+        // these three are the family's ENTIRE gated set (main.rs's
+        // `require_confirmation` match, mirrored exactly).
+        PendingAction::RigReset => workers::rig_stream::fire_rig_reset(state),
+        PendingAction::RigRestore { file } => {
+            let file = file.clone();
+            workers::rig_stream::fire_rig_restore(state, file);
+        }
+        PendingAction::RigTrialReset => workers::rig_stream::fire_rig_trial_reset(state),
     }
 }
 
@@ -2457,6 +2534,31 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         }
     }
 
+    // The Rig actions menu (06-06): the same nav shape, over the rig
+    // family verbs.
+    if let Some(Modal::RigActions { selected }) = state.modal.as_mut()
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        match code {
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(RIG_ACTIONS.len() - 1);
+                return;
+            }
+            KeyCode::Enter => {
+                let index = *selected;
+                state.close_modal();
+                clear_pending(state);
+                execute_rig_menu_action(state, index);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // The Actions menu: Up/Down move, Enter executes. Long waits run in
     // the worker with NO UI block — only the status line's in-flight
     // label shows while they run.
@@ -2510,6 +2612,12 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         // router, its own pending slot).
         if state.projects.pending_form.is_some() {
             accept_projects_form(state, &value);
+            return;
+        }
+        // The Rig screen's forms next (06-06's small-form router,
+        // its own pending slot).
+        if state.rig.pending_form.is_some() {
+            accept_rig_form(state, &value);
             return;
         }
         match (state.dashboard.pending_input.take(), value.is_empty()) {
@@ -2575,6 +2683,16 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
             state.open_modal(Modal::Result_ {
                 title: "CLI form".to_string(),
                 lines: vec![projects_cli_form(&form)],
+                scroll: 0,
+            });
+            return;
+        }
+        // The rig family's form carries the same escape hatch (the
+        // restore path names the env-sourced credential contract).
+        if let Some(form) = state.rig.pending_form.take() {
+            state.open_modal(Modal::Result_ {
+                title: "CLI form".to_string(),
+                lines: vec![rig_cli_form(&form)],
                 scroll: 0,
             });
             return;
@@ -2691,19 +2809,20 @@ fn clear_pending(state: &mut AppState) {
     state.dashboard.pending_input = None;
     state.tags.pending_form = None;
     state.projects.pending_form = None;
+    state.rig.pending_form = None;
 }
 
-/// The confirm-parity classifier (06-05 Task 3) — EXHAUSTIVE over
-/// [`PendingAction`] (every variant is Confirm-gated by
-/// construction: the enum IS the confirm-executed set), mapping each
-/// to the CLI operation string main.rs's `require_confirmation`
-/// guards. Adding a variant breaks this match until it is
-/// classified — the compile-time tripwire until 06-06's structural
-/// clap-walk test lands. The rig family's guards (reset / trial
-/// reset / restore) are the remaining CLI-guarded verbs; they arrive
-/// with 06-06's screen and are deliberately NOT PendingActions yet.
-// Test-only today (the parity tripwire's data source); 06-06's
-// structural test graduates it — the Phase-01 cfg_attr pattern.
+/// The confirm-parity classifier (06-05 Task 3, extended 06-06 with
+/// the rig family's three) — EXHAUSTIVE over [`PendingAction`] (every
+/// variant is Confirm-gated by construction: the enum IS the
+/// confirm-executed set), mapping each to the CLI operation string
+/// main.rs's `require_confirmation` guards. Adding a variant breaks
+/// this match until it is classified — the compile-time tripwire
+/// INSIDE the confirm-executed set; the structural clap-walk test in
+/// ignition-cli (06-06 Task 2) guards the other direction (a
+/// CLI-guarded verb with no TUI gate cannot hide).
+// Test-only (the parity tripwire's data source — same shape as the
+// 06-05 staging, now over the complete 14-verb set).
 #[cfg_attr(not(test), expect(dead_code))]
 fn gated_cli_verb(pending: &PendingAction) -> &'static str {
     match pending {
@@ -2720,6 +2839,97 @@ fn gated_cli_verb(pending: &PendingAction) -> &'static str {
         }
         PendingAction::ResourcePut { .. } => "resource put",
         PendingAction::ResourceDelete { .. } => "resource delete",
+        PendingAction::RigReset => "rig reset",
+        PendingAction::RigRestore { .. } => "rig restore",
+        PendingAction::RigTrialReset => "rig trial reset",
+    }
+}
+
+// ---- Rig actions menu + forms (06-06 Task 1) ----
+
+/// Execute a Rig-actions-menu entry `index` (Enter in the RigActions
+/// modal). The UNGUARDED verbs (up/down/status/logs/trial status/
+/// snapshot — main.rs's own set: `down` dispatches without
+/// `require_confirmation`; compose down keeps volumes) fire
+/// immediately; `restore` prompts for the gwbk path (a Confirm gate
+/// arms at accept); the guarded reset/trial-reset arms are reached
+/// only through execute_pending (their Confirm gates live on this
+/// screen's keymap peers — the menu Enter routes straight to the
+/// gate).
+fn execute_rig_menu_action(state: &mut AppState, index: usize) {
+    match RIG_ACTIONS.get(index).copied() {
+        Some("up") => workers::rig_stream::fire_rig_up(state),
+        Some("down") => workers::rig_stream::fire_rig_down(state),
+        Some("reset") => {
+            // The guarded teardown cycle: gate FIRST, fire on accept.
+            state.dashboard.pending = Some(PendingAction::RigReset);
+            state.open_modal(Modal::Confirm {
+                title: "rig reset".to_string(),
+                body: "tear the rig down AND remove its volumes, then bring it \
+                       back up fresh?"
+                    .to_string(),
+            });
+        }
+        Some("status") => workers::rig_stream::fire_rig_status(state),
+        Some("logs") => workers::rig_stream::spawn_rig_logs(state),
+        Some("trial status") => workers::rig_stream::fire_rig_trial_status(state),
+        Some("trial reset") => {
+            state.dashboard.pending = Some(PendingAction::RigTrialReset);
+            state.open_modal(Modal::Confirm {
+                title: "trial reset".to_string(),
+                body: "restart the EXPIRED trial window? (credentials ride \
+                       IGNITION_TOKEN or IGNITION_USER + IGNITION_PASSWORD)"
+                    .to_string(),
+            });
+        }
+        Some("snapshot") => workers::rig_stream::fire_rig_snapshot(state),
+        Some("restore") => {
+            state.rig.pending_form = Some(RigForm::RestoreFile);
+            state.open_modal(Modal::Input {
+                title: "restore — gwbk file".to_string(),
+                hint: Some(
+                    "the snapshot's .gwbk path\na Confirm gate arms next\npress ? for the CLI form"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Route an accepted rig Input form (Enter): the restore path arms
+/// its Confirm gate (empty cancels — the wait-module precedent).
+fn accept_rig_form(state: &mut AppState, value: &str) {
+    let Some(form) = state.rig.pending_form.take() else {
+        return;
+    };
+    match form {
+        RigForm::RestoreFile => {
+            if value.trim().is_empty() {
+                clear_pending(state);
+                return;
+            }
+            state.dashboard.pending = Some(PendingAction::RigRestore {
+                file: value.trim().to_string(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "rig restore".to_string(),
+                body: format!("restore {} onto the rig's gateway?", value.trim()),
+            });
+        }
+    }
+}
+
+/// Exact CLI synopsis for the active rig form (`?`'s payload — the
+/// LOCKED modal-depth escape hatch; the env-sourced credential
+/// contract is named here because the cockpit has no flag forms).
+fn rig_cli_form(form: &RigForm) -> String {
+    match form {
+        RigForm::RestoreFile => {
+            "ign rig restore --file <PATH> [--timeout <SECS>] --yes  (needs IGNITION_TOKEN)"
+                .to_string()
+        }
     }
 }
 
@@ -5703,6 +5913,253 @@ mod tests {
         assert!(state.projects.pending_form.is_none(), "form slot cleared");
     }
 
+    // ---- Rig screen (06-06) ----
+
+    /// An armed rig state (events rail on; no client needed — the rig
+    /// family is docker-side).
+    fn armed_rig_state() -> AppState {
+        let mut state = AppState::new();
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        state.screen = Screen::Rig;
+        state
+    }
+
+    /// Enter on the menu's `reset` (index 2) arms the Confirm gate —
+    /// nothing fires until `y` (the LOCKED accept ≡ --yes rule).
+    #[test]
+    fn rig_reset_requires_confirm_first() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(
+            state.modal,
+            Some(Modal::RigActions { selected: 0 })
+        ));
+
+        // Down ×2 → reset (menu order: up, down, reset, …).
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Confirm { title, .. }) if title == "rig reset"),
+            "reset opens the Confirm gate: {:?}",
+            state.modal
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::RigReset),
+            "the gate is armed"
+        );
+        assert!(state.dashboard.in_flight.is_none(), "nothing fired yet");
+
+        // Accept ≡ --yes: the reset moves to in-flight.
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(state.modal.is_none(), "confirm closed on accept");
+        assert_eq!(state.dashboard.in_flight, Some("rig reset"));
+
+        // Cancel path: nothing spawns, the gate clears (a stale
+        // Confirm can never arm a later y).
+        let mut state = armed_rig_state();
+        state.dashboard.pending = Some(PendingAction::RigReset);
+        state.open_modal(Modal::Confirm {
+            title: "rig reset".into(),
+            body: "b".into(),
+        });
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.dashboard.pending.is_none());
+        assert!(state.dashboard.in_flight.is_none());
+    }
+
+    /// `down` fires DIRECT — the CLI's deliberate non-guard (compose
+    /// down keeps volumes; main.rs dispatches RigCommand::Down without
+    /// require_confirmation) must NOT acquire a TUI gate.
+    #[test]
+    fn rig_down_fires_without_confirm() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            state.modal.is_none(),
+            "down needs NO confirm: {:?}",
+            state.modal
+        );
+        assert_eq!(state.dashboard.in_flight, Some("rig down"));
+        assert!(state.dashboard.pending.is_none());
+    }
+
+    /// `up` (index 0) fires direct too — Enter on the first menu
+    /// entry with no gate.
+    #[test]
+    fn rig_up_fires_without_confirm() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert_eq!(state.dashboard.in_flight, Some("rig up"));
+    }
+
+    /// `trial reset` (index 6) is confirm-gated; `trial status`
+    /// (index 5) fires direct — the exact main.rs split.
+    #[test]
+    fn rig_trial_split_guards_reset_only() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        for _ in 0..6 {
+            update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Confirm { title, .. }) if title == "trial reset")
+        );
+        assert_eq!(state.dashboard.pending, Some(PendingAction::RigTrialReset));
+
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        for _ in 0..5 {
+            update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert_eq!(state.dashboard.in_flight, Some("trial status"));
+    }
+
+    /// `restore` (index 8) prompts for the gwbk path FIRST; the
+    /// accepted path arms the Confirm gate; an EMPTY accept cancels.
+    #[test]
+    fn rig_restore_prompts_then_confirms() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        for _ in 0..8 {
+            update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Input { title, .. }) if title.contains("gwbk")),
+            "the path form opens: {:?}",
+            state.modal
+        );
+
+        // Empty accept cancels (the wait-module precedent).
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert!(state.dashboard.pending.is_none());
+
+        // A path arms the Confirm gate.
+        let mut state = armed_rig_state();
+        state.rig.pending_form = Some(crate::state::RigForm::RestoreFile);
+        state.open_modal(Modal::Input {
+            title: "restore — gwbk file".into(),
+            hint: None,
+            buffer: "snap.gwbk".into(),
+        });
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Confirm { title, .. }) if title == "rig restore")
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::RigRestore {
+                file: "snap.gwbk".into()
+            })
+        );
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("rig restore"));
+    }
+
+    /// `l` toggles the logs pane: on arms the shutdown rail (and
+    /// clears the ring); off stops it — the Streamed mapping's pane
+    /// lifecycle.
+    #[test]
+    fn rig_l_toggles_the_logs_pane() {
+        let mut state = armed_rig_state();
+        state.rig.logs.push_back("stale".into());
+
+        update(&mut state, key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(state.rig.logs_on, "pane on");
+        assert!(state.rig.logs.is_empty(), "ring cleared for the stream");
+        assert!(state.rig.logs_shutdown.is_some(), "stream rail armed");
+
+        update(&mut state, key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(!state.rig.logs_on, "pane off");
+        assert!(state.rig.logs_shutdown.is_none(), "stream stopped");
+    }
+
+    /// `r` refreshes the status through the busy guard (the
+    /// state-machine half; nothing spawns without a runtime).
+    #[test]
+    fn rig_r_refreshes_status_once() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(state.rig.status_busy, "refresh armed");
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(state.rig.status_busy, "busy guard refuses to stack");
+    }
+
+    /// A landed RigStatus fills the pane (Ok — a DOWN rig is data);
+    /// stale eras drop whole; the error degrades honestly.
+    #[test]
+    fn rig_status_event_fills_or_degrades() {
+        let mut state = armed_rig_state();
+        state.rig.status_busy = true;
+        let status = ignition_core::actions::rig::RigStatusResult {
+            rig: "fixture-rig".into(),
+            project: "fixture-rig".into(),
+            compose_file: "/rigs/docker/compose.yml".into(),
+            services: Vec::new(),
+            volumes: vec!["gw-data".into()],
+            ports_free: true,
+        };
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::RigStatus {
+                era,
+                result: Ok(status),
+            },
+        );
+        assert!(state.rig.status.is_some(), "down rig is Ok-data");
+        assert!(!state.rig.status_busy, "busy clears");
+
+        let mut stale = armed_rig_state();
+        stale.rig.status_busy = true;
+        let stale_era = stale.era.wrapping_sub(1);
+        update(
+            &mut stale,
+            AppEvent::RigStatus {
+                era: stale_era,
+                result: Err("docker absent".into()),
+            },
+        );
+        assert!(stale.rig.status.is_none(), "stale drop");
+        assert!(stale.rig.status_busy, "stale does not clear busy");
+
+        let mut errored = armed_rig_state();
+        let err_era = errored.era;
+        update(
+            &mut errored,
+            AppEvent::RigStatus {
+                era: err_era,
+                result: Err("no rig discovered".into()),
+            },
+        );
+        assert_eq!(
+            errored.rig.status_error.as_deref(),
+            Some("no rig discovered")
+        );
+    }
+
+    /// Streamed compose lines land in the pane's ring (the acceptance
+    /// policy: ring turnover, no era gate).
+    #[test]
+    fn rig_log_lines_land_in_the_ring() {
+        let mut state = armed_rig_state();
+        for line in ["one", "two"] {
+            update(&mut state, AppEvent::RigLogLine(line.to_string()));
+        }
+        assert_eq!(state.rig.logs.len(), 2);
+        assert_eq!(state.rig.logs.front().map(String::as_str), Some("one"));
+    }
+
     // ---- Destructive-verb confirm-parity audit (06-05 Task 3) ----
 
     /// One of every confirm-gated PendingAction shape — the audit's
@@ -5747,14 +6204,18 @@ mod tests {
                 project: "PlantFloor".into(),
                 path: "views/root.json".into(),
             },
+            PendingAction::RigReset,
+            PendingAction::RigRestore {
+                file: "snap.gwbk".into(),
+            },
+            PendingAction::RigTrialReset,
         ]
     }
 
     /// THE parity tripwire: the confirm-gated TUI set is exactly the
-    /// CLI's `--yes`-guarded verbs for every registry-mapped family
-    /// (main.rs `require_confirmation` sites minus the rig family,
-    /// which 06-06 owns) — 11 verbs across 6 families, each with its
-    /// family route-mapped onto the right screen.
+    /// CLI's `--yes`-guarded verbs (main.rs `require_confirmation`
+    /// sites, the complete 06-06 set) — 14 verbs across 7 families,
+    /// each with its family route-mapped onto the right screen.
     #[test]
     fn confirm_parity_matches_the_cli_guard_set() {
         let pendings = every_gated_pending();
@@ -5768,6 +6229,9 @@ mod tests {
             "resource delete",
             "resource put",
             "restart",
+            "rig reset",
+            "rig restore",
+            "rig trial reset",
             "sessions terminate",
             "tags config delete",
             "tags import --collision-policy overwrite",
@@ -5775,12 +6239,13 @@ mod tests {
         ];
         assert_eq!(
             verbs, expected,
-            "the gated set is exactly the CLI guard set for mapped families"
+            "the gated set is exactly the CLI guard set"
         );
 
         // Each gated verb's FAMILY is route-mapped (the coverage side
         // of the parity claim): sessions/logs/restart on the
-        // dashboard, tags on Tags, project/resource on Projects.
+        // dashboard, tags on Tags, project/resource on Projects,
+        // rig on Rig.
         let routes: Vec<&str> = crate::routes::routes()
             .iter()
             .map(|route| route.path)
@@ -5796,6 +6261,9 @@ mod tests {
             "project import",
             "resource put",
             "resource delete",
+            "rig reset",
+            "rig restore",
+            "rig trial reset",
         ] {
             assert!(
                 routes
@@ -5805,9 +6273,11 @@ mod tests {
             );
         }
 
-        // The deliberately UNGUARDED webdev verbs have NO
-        // PendingAction shape (they fire directly from the menu —
-        // behaviorally pinned in webdev_deploy_needs_no_confirm);
-        // the CLI guards nothing there either (05-03).
+        // The deliberately UNGUARDED verbs have NO PendingAction
+        // shape (they fire directly from the menu — behaviorally
+        // pinned in webdev_deploy_needs_no_confirm and
+        // rig_down_fires_without_confirm): the CLI guards nothing
+        // there either (05-03's webdev decision; 04-01's compose-down
+        // volumes-kept decision).
     }
 }

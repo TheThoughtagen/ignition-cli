@@ -74,6 +74,7 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(3),
         Modal::TagsActions { .. } => crate::state::TAG_ACTIONS.len().saturating_add(3),
         Modal::ProjectsActions { .. } => crate::state::PROJECT_ACTIONS.len().saturating_add(3),
+        Modal::RigActions { .. } => crate::state::RIG_ACTIONS.len().saturating_add(3),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
@@ -203,6 +204,23 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         // menu.
         Modal::ProjectsActions { selected } => {
             let text: Vec<Line> = crate::state::PROJECT_ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let marker = if index == *selected { "▸ " } else { "  " };
+                    Line::from(format!("{marker}{action}"))
+                })
+                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .collect();
+            frame.render_widget(
+                Paragraph::new(text).block(Block::bordered().title("actions")),
+                area,
+            );
+        }
+        // The Rig screen's menu (06-06): the rig family verbs, same
+        // shape as the dashboard's menu.
+        Modal::RigActions { selected } => {
+            let text: Vec<Line> = crate::state::RIG_ACTIONS
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
@@ -552,6 +570,34 @@ mod tests {
         }
         assert!(
             rows.iter().any(|row| row.contains("▸ new")),
+            "selection marker on entry 0"
+        );
+    }
+
+    /// The Rig actions menu (06-06) renders the full RigCommand verb
+    /// set with the selection marker.
+    #[test]
+    fn rig_actions_menu_renders_the_family() {
+        let mut state = AppState::new();
+        state.screen = Screen::Rig;
+        state.open_modal(Modal::RigActions { selected: 0 });
+        let rows = rendered_rows(&state);
+        let text = rows.join("\n");
+        for verb in [
+            "up",
+            "down",
+            "reset",
+            "status",
+            "logs",
+            "trial status",
+            "trial reset",
+            "snapshot",
+            "restore",
+        ] {
+            assert!(text.contains(verb), "menu lists {verb}: {text}");
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("▸ up")),
             "selection marker on entry 0"
         );
     }

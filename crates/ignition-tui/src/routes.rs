@@ -293,6 +293,62 @@ pub fn routes() -> &'static [CliRoute] {
             path: "webdev status",
             mapping: Mapping::Screen(Screen::Projects),
         },
+        // 06-06: the rig family — every RigCommand/TrialCommand leaf
+        // exactly as clap spells it (there is no bare `rig` row:
+        // RigArgs.command is required + arg_required_else_help; no
+        // bare `rig trial` row either: TrialArgs.command is required
+        // — only the children map). `rig logs` is THE raw-pane
+        // Streamed case the Mapping kind exists for (compose
+        // passthrough shown in-screen); every other verb lives on the
+        // Rig screen — up/down/status/logs/trial status/snapshot
+        // fire direct, reset/restore/trial reset Confirm-gated
+        // (main.rs's `require_confirmation` set EXACTLY — in
+        // particular `down` is deliberately UNGUARDED: compose down
+        // keeps volumes).
+        //
+        // Out-of-band note (06-06's rule, the STATE list's traceable
+        // tail): the flag-value/stream-form stdout exceptions —
+        // `logs -f` NDJSON (a FLAG on the Screen-mapped `logs` leaf)
+        // and `tags export -o -` (a FLAG VALUE on the Screen-mapped
+        // `tags export` leaf) — are NOT distinct leaves and carry no
+        // rows; the leaf-representable exception is `completions`
+        // ONLY (the coverage test's OutOfBand sanity pin).
+        CliRoute {
+            path: "rig up",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig down",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig reset",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig status",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig logs",
+            mapping: Mapping::Streamed,
+        },
+        CliRoute {
+            path: "rig trial status",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig trial reset",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig snapshot",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
+        CliRoute {
+            path: "rig restore",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
     ]
 }
 
@@ -505,5 +561,47 @@ mod tests {
                 "exactly the {prefix} leaves that exist"
             );
         }
+    }
+
+    /// The 06-06 rows cover EVERY rig leaf exactly as clap spells it
+    /// (RigCommand + the nested TrialCommand — both require their
+    /// subcommand, so no bare `rig`/`rig trial` row exists) — the
+    /// final family, completing the registry for the clap-walk
+    /// coverage test.
+    #[test]
+    fn rig_rows_cover_every_leaf() {
+        let expected = [
+            ("rig up", Screen::Rig),
+            ("rig down", Screen::Rig),
+            ("rig reset", Screen::Rig),
+            ("rig status", Screen::Rig),
+            ("rig trial status", Screen::Rig),
+            ("rig trial reset", Screen::Rig),
+            ("rig snapshot", Screen::Rig),
+            ("rig restore", Screen::Rig),
+        ];
+        for (path, screen) in expected {
+            let row = routes()
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("rig route row {path:?} missing"));
+            assert!(
+                matches!(row.mapping, super::Mapping::Screen(s) if s == screen),
+                "{path} maps to {screen:?}"
+            );
+        }
+        // And `rig logs` is the Streamed raw-pane case — the Mapping
+        // kind's reason to exist.
+        let logs = routes()
+            .iter()
+            .find(|route| route.path == "rig logs")
+            .unwrap_or_else(|| panic!("rig logs route row missing"));
+        assert_eq!(logs.mapping, super::Mapping::Streamed);
+        // Exactly the nine rig rows exist (no extras).
+        let count = routes()
+            .iter()
+            .filter(|route| route.path.starts_with("rig"))
+            .count();
+        assert_eq!(count, 9, "exactly the rig leaves that exist");
     }
 }

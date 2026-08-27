@@ -69,6 +69,7 @@ where
 
 pub mod ops;
 pub mod refresh;
+pub mod rig_stream;
 pub mod tail;
 pub mod watch;
 

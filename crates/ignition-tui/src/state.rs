@@ -174,6 +174,11 @@ pub enum Modal {
     /// resource, and webdev family verbs with a moving selection —
     /// the same shape as [`Modal::Actions`], its own list.
     ProjectsActions { selected: usize },
+    /// The Rig screen's actions menu (06-06): the rig family verbs
+    /// (up/down/reset/status/logs/trial status/trial reset/snapshot/
+    /// restore) with a moving selection — the same shape as
+    /// [`Modal::Actions`], its own list.
+    RigActions { selected: usize },
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
@@ -220,6 +225,18 @@ pub enum PendingAction {
     /// `ign resource delete <PROJECT> <PATH>` (Confirm ≡ `--yes` —
     /// guarded since 05-02, the put twin).
     ResourceDelete { project: String, path: String },
+    /// `ign rig reset` (Confirm ≡ `--yes` — the guarded teardown
+    /// cycle; the TUI mirrors main.rs's `require_confirmation` set
+    /// EXACTLY: reset, restore, and trial reset are the ONLY gated
+    /// rig verbs).
+    RigReset,
+    /// `ign rig restore --file <FILE>` (Confirm ≡ `--yes`).
+    RigRestore { file: String },
+    /// `ign rig trial reset` (Confirm ≡ `--yes`; credentials ride
+    /// the env ladder — IGNITION_TOKEN / IGNITION_USER +
+    /// IGNITION_PASSWORD — the CLI's `--user` flag has no cockpit
+    /// form, the `?` hatch names the env vars).
+    RigTrialReset,
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
@@ -248,6 +265,7 @@ impl Modal {
             Modal::LogsActions { .. } => "actions",
             Modal::TagsActions { .. } => "actions",
             Modal::ProjectsActions { .. } => "actions",
+            Modal::RigActions { .. } => "actions",
             Modal::Profiles { .. } => "profiles",
             Modal::ProfileAdd { .. } => "profile add",
             Modal::Ack { .. } => "ack alarm",
@@ -370,6 +388,22 @@ pub const PROJECT_ACTIONS: [&str; 11] = [
     "resource delete",
     "webdev deploy",
     "webdev status",
+];
+
+/// The Rig screen's actions menu entries (06-06) — the FULL
+/// RigCommand verb set (up/down/reset/status/logs + the trial pair +
+/// snapshot/restore). Labels are display side; the route rows in
+/// [`crate::routes`] carry the clap-exact spellings.
+pub const RIG_ACTIONS: [&str; 9] = [
+    "up",
+    "down",
+    "reset",
+    "status",
+    "logs",
+    "trial status",
+    "trial reset",
+    "snapshot",
+    "restore",
 ];
 
 /// What an accepted Input modal's buffer is for on the Tags screen
@@ -921,6 +955,69 @@ pub struct ProjectsData {
     pub pending_form: Option<ProjectsForm>,
 }
 
+/// What an accepted Input modal's buffer is for on the Rig screen
+/// (06-06) — the rig family's small-form router. The restore verb is
+/// the family's ONLY form (every other verb is a menu fire);
+/// cleared by the shared cancel path so a stale form can never arm a
+/// later Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RigForm {
+    /// `rig restore` — the gwbk FILE to restore (a Confirm gate arms
+    /// next; the action's own pre-checks fence missing/empty files).
+    RestoreFile,
+}
+
+/// The raw-line ring cap for the rig logs pane — the 06-03
+/// [`LOG_RING_CAP`] discipline applied to compose passthrough lines
+/// (a weekend-long `rig logs -f` pane cannot OOM the process).
+pub const RIG_LOG_RING_CAP: usize = 10_000;
+
+/// The Rig screen's data (06-06): the one-shot status summary (the
+/// allowlist [`RigStatusResult`] rendered as containers + state) and
+/// the raw compose-logs stream pane (a second ring, reusing the
+/// 06-03 pattern).
+#[derive(Debug, Default)]
+pub struct RigData {
+    /// The latest accepted status (None until the first load / after
+    /// an error — the pane renders its Loading state).
+    pub status: Option<ignition_core::actions::rig::RigStatusResult>,
+    /// Why the status load errored, when it did.
+    pub status_error: Option<String>,
+    /// A status load is in flight (the entry/refresh busy guard).
+    pub status_busy: bool,
+    /// Whether the logs pane is ON (the `l` toggle + the menu's
+    /// `logs` verb) — the pane's identity survives screen exits so
+    /// re-entry resumes the stream (the tail/alarms re-arm shape).
+    pub logs_on: bool,
+    /// The retained raw compose lines — a ring capped at
+    /// [`RIG_LOG_RING_CAP`] (evict front). Cleared on every stream
+    /// (re)spawn — compose `logs --tail` has no `since` resume, and
+    /// overlapping the tail would double-render.
+    pub logs: VecDeque<String>,
+    /// Total lines evicted from the ring's front (turnover
+    /// accounting — the status row's honesty counter).
+    pub logs_dropped: usize,
+    /// The stream worker's shutdown switch — `send(true)` on leaving
+    /// the screen and toggling the pane off (a dropped sender also
+    /// stops the worker).
+    pub logs_shutdown: Option<watch::Sender<bool>>,
+    /// The armed rig form (the Input modal's routing slot —
+    /// [`RigForm`]); cleared by the shared cancel path.
+    pub pending_form: Option<RigForm>,
+}
+
+impl RigData {
+    /// Append one streamed compose line, evicting from the front at
+    /// the cap — THE ring discipline (the 06-03 twin).
+    pub fn push_log_line(&mut self, line: String) {
+        while self.logs.len() >= RIG_LOG_RING_CAP {
+            self.logs.pop_front();
+            self.logs_dropped += 1;
+        }
+        self.logs.push_back(line);
+    }
+}
+
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
@@ -958,6 +1055,9 @@ pub struct AppState {
     /// Projects screen data (06-05) — list, project detail,
     /// resource detail.
     pub projects: ProjectsData,
+    /// Rig screen data (06-06) — the status summary + the raw logs
+    /// pane.
+    pub rig: RigData,
     /// The active profile's name (workers' target — what `p` switches).
     pub profile: Option<String>,
     /// The status-line banner — set by a landed profile switch
