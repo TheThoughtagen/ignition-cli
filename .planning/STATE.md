@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 executing: 06-03 SHIPPED (Logs screen — channel-sink tail into a 10k ring, render-side level filter, follow/scrollback, loggers menu with confirm-gated set/reset; Alarms screen — 5s full-UUID poll, 24h history, username-required ack; both streaming worker patterns proven for 06-04; 607 tests green, fmt/clippy clean). Next: 06-04 Tags.
+**Current focus:** Phase 6 executing: 06-04 SHIPPED (Tags screen — provider-first tree browse with one-level Esc ascent, on-demand detail reads, 2s whole-set live watch with generation-gated respawns, full actions menu with JSON-scalar write rule and Confirm gates on provider delete / config delete / import overwrite, complete non-alarm tags route rows; 645 tests green, fmt/clippy clean + two environment-sensitive ignition-core tests stabilized). Next: 06-05 Projects.
 
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit)
-**Current Plan:** 4 of 6
+**Current Plan:** 5
 **Total Plans in Phase:** 6
-**Status:** Ready to execute 06-04 (Tags — browser + live watch reusing the two streaming patterns)
+**Status:** Ready to execute
 **Last Activity:** 2026-08-27
 
-**Progress:** [█████████░] 90%
+**Progress:** [█████████░] 93%
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P01 | 222min | 3 tasks | 31 files |
 | Phase 06 P02 | 60min | 3 tasks | 16 files |
 | Phase 06 P03 | 36min | 3 tasks tasks | 11 files files |
+| Phase 06 P04 | 12min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -153,6 +154,11 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-03]: Screen-scoped workers (tail, alarms poll) live and die by their own shutdown watches armed in set_screen — NO era bump on screen transitions (the global era stays world-scoped = profile switches; a Tab-driven bump would retire the dashboard refresh worker); LogLine events are unera'd by plan-lock (ring turnover is the acceptance policy)
 - [Phase 06]: [Phase 06-03]: Tail spawn resumes at the ring's newest timestamp (since = ring.back()) — re-entry and level-filter restarts never duplicate-flood; the filter applies AT RENDER over retained entries AND as min_level on restart
 - [Phase 06]: [Phase 06-03]: Alarm ack is NOT confirm-gated with Enter disabled until username non-empty (the 3-arg wire form); ids pass AS SHOWN to the expanding action (05-08); ActionDone on 'alarms ack' triggers a busy-guarded one-shot active re-poll; history = 24h window through the LOCKED result modal (one-mechanism display)
+- [Phase 06]: Tag watch polls the complete watched set in one tags_read call every two seconds and restarts under a new generation when membership changes.
+- [Phase 06]: Provider delete, config delete, and import overwrite are the only Tags-screen Confirm-gated operations, matching CLI require_confirmation.
+- [Phase 06]: Rich tags operations use chained common-field inputs; ? opens the exact CLI synopsis rather than adding a general form framework.
+- [Phase 06]: TUI JSON-file inputs reject stdin because crossterm owns raw terminal input; files are read asynchronously inside workers.
+- [Phase 06]: tags export -o - remains a CLI-only flag-value exception, so no separate OutOfBand route row exists.
 
 ### Pending Todos
 
@@ -169,6 +175,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T20:15:40.619Z
-**Stopped At:** Completed 06-03-PLAN.md (Logs tail+ring+filter screen, loggers menu, Alarms poll/UUID/ack screen; 607 tests green)
+**Last session:** 2026-08-27T22:52:00.000Z
+**Stopped At:** Completed 06-04-PLAN.md (continuation executor finished verification, test stabilization, SUMMARY, docs commit)
 **Resume file:** None
