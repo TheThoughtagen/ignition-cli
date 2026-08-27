@@ -3,7 +3,8 @@
 //! [`ignition_core::actions::tags::tags_alarms_active`] (the WebDev
 //! route precondition rides inside the action — inherited for free),
 //! era-stamped onto every report like the dashboard's refresh worker.
-//! 06-04's tag watch reuses this shape.
+//! 06-04's tag workers (provider list, browse, detail read, live
+//! watch) reuse these shapes from the same module.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,11 @@ pub const ALARMS_PERIOD: Duration = Duration::from_secs(5);
 /// The project the alarm routes deploy into — the CLI family's own
 /// default (`--project default ign-cli`).
 pub const ALARMS_PROJECT: &str = "ign-cli";
+
+/// The project the tags family rides — the CLI's own `--project`
+/// default (`ign-cli`, the same deployed-route host the alarms
+/// family uses).
+pub const TAGS_PROJECT: &str = "ign-cli";
 
 /// The poll loop: one `tags_alarms_active` per period, sent as an
 /// [`AppEvent::Alarms`] stamped with the spawn-era; `select!` against
@@ -119,6 +125,98 @@ pub fn spawn_alarms_once(state: &mut AppState) {
     }
 }
 
+// ---- Tags screen workers (06-04) ----
+//
+// Three one-shots (provider list, browse, detail read) + the live
+// watch interval (06-04 Task 2). Every one composes ignition-core
+// action fns AS-IS — the webdev route preconditions ride inside the
+// actions, so a route-less gateway degrades to the honest Error
+// states with the action's own hint text.
+
+/// One-shot provider list (the Tags screen's entry load and the
+/// create/delete refresh trigger): reports [`AppEvent::TagsProviders`]
+/// era-stamped. Busy-guarded so repeated entries cannot stack.
+pub fn spawn_providers_once(state: &mut AppState) {
+    if state.tags.providers_busy {
+        return;
+    }
+    let Some(client) = state.client.as_ref().map(|handle| handle.0.clone()) else {
+        return;
+    };
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    state.tags.providers_busy = true;
+    let era = state.era;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let result = actions::tags::tag_provider_list(&*client)
+                .await
+                .map(|result| result.providers)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(AppEvent::TagsProviders { era, result });
+        });
+    }
+}
+
+/// One-shot browse of `path` (the descend worker — the CLI's
+/// `tags browse PATH` with the display defaults): reports
+/// [`AppEvent::TagsBrowse`] carrying the path (the stack level's
+/// identity; a popped level's late result drops at the lookup).
+pub fn spawn_browse(state: &mut AppState, path: &str) {
+    let Some(client) = state.client.as_ref().map(|handle| handle.0.clone()) else {
+        return;
+    };
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    let path = path.to_string();
+    let era = state.era;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let result = actions::tags::tags_browse(&*client, TAGS_PROJECT, &path, None, false)
+                .await
+                .map(|result| result.entries)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(AppEvent::TagsBrowse { era, path, result });
+        });
+    }
+}
+
+/// One-shot detail read (the pane's on-demand current value): reports
+/// [`AppEvent::TagDetailRead`] stamped with the detail-open's `seq` —
+/// the request-id gate that drops reads for left/replaced panes.
+pub fn spawn_detail_read(state: &mut AppState, seq: u64, path: &str) {
+    let Some(client) = state.client.as_ref().map(|handle| handle.0.clone()) else {
+        return;
+    };
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    let path = path.to_string();
+    let era = state.era;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let result = actions::tags::tags_read(&*client, TAGS_PROJECT, std::slice::from_ref(&path))
+                .await
+                .map_err(|err| err.to_string());
+            // The route is always batch; the detail pane read exactly
+            // one path — a missing row is the honest internal-class
+            // error, not a silent blank.
+            let result = match result {
+                Ok(rows) => match rows.results.into_iter().next() {
+                    Some(row) => Ok(row),
+                    None => Err(format!(
+                        "tags route read returned no row for {path:?} (unexpected shape)"
+                    )),
+                },
+                Err(message) => Err(message),
+            };
+            let _ = tx.send(AppEvent::TagDetailRead { era, seq, result });
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -187,5 +285,60 @@ mod tests {
 
         stop_alarms(&mut state);
         assert!(state.alarms.shutdown.is_none(), "rail cleared");
+    }
+
+    // ---- Tags screen workers (06-04 Task 1) ----
+
+    use super::{spawn_browse, spawn_detail_read, spawn_providers_once};
+
+    /// The tags one-shot rails stand alone without a runtime: the
+    /// provider load arms its busy guard (and refuses to stack);
+    /// browse/detail-read transitions never panic.
+    #[test]
+    fn tags_one_shot_rails_stand_alone_without_a_runtime() {
+        use crate::state::AppState;
+
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+
+        spawn_providers_once(&mut state);
+        assert!(state.tags.providers_busy, "provider load armed");
+        spawn_providers_once(&mut state);
+        assert!(state.tags.providers_busy, "busy guard refuses to stack");
+
+        spawn_browse(&mut state, "[default]");
+        spawn_detail_read(&mut state, 1, "[default]T1");
+    }
+
+    /// The detail read against a dead endpoint degrades to the Err
+    /// payload — era + seq stamped, data never a panic (the alarms
+    /// worker test's shape).
+    #[tokio::test]
+    async fn detail_read_degrades_to_err_on_a_dead_endpoint() {
+        use crate::state::AppState;
+
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.events_tx = Some(tx);
+        spawn_detail_read(&mut state, 7, "[default]T1");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("read settles within 5s")
+            .expect("worker holds the sender");
+        match event {
+            AppEvent::TagDetailRead { era, seq, result } => {
+                assert_eq!(era, state.era, "era-stamped");
+                assert_eq!(seq, 7, "seq-stamped (the request-id)");
+                assert!(result.is_err(), "dead endpoint degrades to Err");
+            }
+            other => panic!("expected TagDetailRead, got {other:?}"),
+        }
     }
 }

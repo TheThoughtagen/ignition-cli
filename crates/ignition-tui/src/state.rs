@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ignition_core::actions::sessions::{SessionType, SessionsResult};
-use ignition_core::actions::tags::AlarmRow;
+use ignition_core::actions::tags::{AlarmRow, BrowseRow, TagProviderRow, TagReadRow};
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::client::logs::LogEntry;
 use ratatui::widgets::TableState;
@@ -510,6 +510,82 @@ pub struct AlarmsData {
     pub shutdown: Option<watch::Sender<bool>>,
 }
 
+/// One level of the tag-tree browse stack (06-04): the browse path
+/// the level lists, its loaded entries, and the cursor saved when
+/// descending (restored on ascend — navigation honesty).
+#[derive(Debug, Default)]
+pub struct BrowseLevel {
+    /// The browse path this level lists (`[default]P5` — a provider's
+    /// root level is `[name]`).
+    pub path: String,
+    /// The loaded entries (None while loading; an error replaces them
+    /// with the honest error state).
+    pub entries: Option<Vec<BrowseRow>>,
+    /// Why the load errored, when it did.
+    pub error: Option<String>,
+    /// The cursor position saved on descend (restored on ascend).
+    pub selected: Option<usize>,
+}
+
+/// The detail pane's on-demand read state — 06-02's Loading/Error
+/// pattern applied to a single row (quality strings are DATA, never
+/// parsed into errors — the 05-04 convention).
+#[derive(Debug)]
+pub enum DetailRead {
+    /// The one-shot read is in flight.
+    Loading,
+    /// The landed row (value raw JSON, quality/timestamp verbatim).
+    Loaded(TagReadRow),
+    /// The read's error — require_routes denials surface here with
+    /// the action's own hint text (route preconditions live INSIDE
+    /// the actions layer; the TUI inherits them for free).
+    Error(String),
+}
+
+/// The open tag detail pane (06-04): node info from the browse row
+/// plus the on-demand current value.
+#[derive(Debug)]
+pub struct TagsDetail {
+    /// The tag's full bracket-qualified path.
+    pub path: String,
+    /// The leaf name.
+    pub name: String,
+    /// The wire tagType token verbatim.
+    pub tag_type: String,
+    /// The row's dataType, when it carried one.
+    pub data_type: Option<String>,
+    /// The on-demand read (fired when the pane opened; Enter refires).
+    pub read: DetailRead,
+}
+
+/// The Tags screen's data (06-04): the k9s-style object browser —
+/// the provider list, the descend/ascend browse stack, and the open
+/// detail pane with its on-demand read.
+#[derive(Debug, Default)]
+pub struct TagsData {
+    /// The provider list level: rows (None until loaded / after an
+    /// error), the honest error, the busy guard, the cursor.
+    pub providers: Option<Vec<TagProviderRow>>,
+    /// Why the provider load errored, when it did.
+    pub providers_error: Option<String>,
+    /// A provider load is in flight (the entry/reload busy guard).
+    pub providers_busy: bool,
+    /// The provider table cursor.
+    pub providers_table: TableState,
+    /// The browse stack (empty = the provider level is the surface;
+    /// the TOP of the stack is the current level).
+    pub stack: Vec<BrowseLevel>,
+    /// The current (top) level's cursor.
+    pub tree_table: TableState,
+    /// The open detail pane, if any.
+    pub detail: Option<TagsDetail>,
+    /// Detail-open sequence: every open bumps it and stamps its read
+    /// worker — a read for a left/replaced pane drops (the request-id
+    /// stale gate; the global era stays world-scoped per 06-03's
+    /// lock, so this counter is the detail pane's private era).
+    pub detail_seq: u64,
+}
+
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
@@ -542,6 +618,8 @@ pub struct AppState {
     pub logs: LogsData,
     /// Alarms screen data (06-03) — the polled table + ack target.
     pub alarms: AlarmsData,
+    /// Tags screen data (06-04) — provider list, browse stack, detail.
+    pub tags: TagsData,
     /// The active profile's name (workers' target — what `p` switches).
     pub profile: Option<String>,
     /// The status-line banner — set by a landed profile switch

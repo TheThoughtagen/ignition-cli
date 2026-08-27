@@ -71,6 +71,38 @@ pub enum AppEvent {
         /// The active rows (gateway order), or the poll's error.
         result: Result<Vec<ignition_core::actions::tags::AlarmRow>, String>,
     },
+    /// The Tags screen's provider list landed (06-04): `Ok` replaces
+    /// the provider table, `Err` degrades to the honest error state.
+    /// Stale eras drop whole (Pitfall 9).
+    TagsProviders {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The provider rows (gateway order), or the load's error.
+        result: Result<Vec<ignition_core::actions::tags::TagProviderRow>, String>,
+    },
+    /// One tag-tree browse landed (06-04): `path` names the stack
+    /// level the rows belong to (a popped level's late result drops
+    /// whole — the level lookup IS the stale gate). Stale eras drop.
+    TagsBrowse {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The browse path this result fills (the level's identity).
+        path: String,
+        /// The level's entries, or the browse's error.
+        result: Result<Vec<ignition_core::actions::tags::BrowseRow>, String>,
+    },
+    /// The detail pane's on-demand read (06-04). `seq` is the
+    /// detail-open's request-id — a read for a pane the user already
+    /// left (or replaced) drops; the era gates profile switches on
+    /// top of it.
+    TagDetailRead {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The detail-open sequence the read belongs to.
+        seq: u64,
+        /// The read row, or the read's error.
+        result: Result<ignition_core::actions::tags::TagReadRow, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

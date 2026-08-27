@@ -216,20 +216,25 @@ mod tests {
             "dashboard panels render Loading before the first refresh"
         );
 
-        // A placeholder screen (Tags, until 06-04) still renders the
-        // bordered block with its title.
+        // The Tags screen (06-04) renders the provider browser: the
+        // bordered pane titled for the provider level, Loading before
+        // the first list lands, the status row underneath.
         let mut tags = AppState::new();
         tags.screen = Screen::Tags;
         let rows = rendered_rows(&tags);
         assert!(
-            rows[1].starts_with("┌Tags — not yet wired"),
-            "placeholder block title: {}",
+            rows[1].starts_with("┌tags — providers"),
+            "tags pane title: {}",
             rows[1]
         );
-        assert_eq!(
-            rows[23],
-            "└".to_string() + &"─".repeat(78) + "┘",
-            "placeholder block bottom border"
+        assert!(
+            rows.iter().any(|row| row.contains("Loading")),
+            "tags provider list renders Loading before the first load"
+        );
+        assert!(
+            rows[23].contains("providers"),
+            "the status row names the level: {}",
+            rows[23]
         );
     }
 

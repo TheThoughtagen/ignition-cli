@@ -38,6 +38,80 @@ pub fn update(state: &mut AppState, event: AppEvent) {
         // cap. Not era-stamped (plan-locked: ring turnover is the
         // acceptance policy; the worker's shutdown watch is the scope).
         AppEvent::LogLine(entry) => state.logs.push_line(entry),
+        // The Tags provider list landed (06-04): replace the table
+        // (Ok) or degrade to the honest error state (Err). Stale eras
+        // drop whole; the selection clamps into the new rows and
+        // auto-lands on the first row (Enter-descend needs one).
+        AppEvent::TagsProviders { era, result } => {
+            if workers::is_current(state.era, era) {
+                state.tags.providers_busy = false;
+                match result {
+                    Ok(rows) => {
+                        if rows.is_empty() {
+                            state.tags.providers_table.select(None);
+                        } else if let Some(index) = state.tags.providers_table.selected() {
+                            state
+                                .tags
+                                .providers_table
+                                .select(Some(index.min(rows.len() - 1)));
+                        } else {
+                            state.tags.providers_table.select(Some(0));
+                        }
+                        state.tags.providers = Some(rows);
+                        state.tags.providers_error = None;
+                    }
+                    Err(message) => {
+                        state.tags.providers = None;
+                        state.tags.providers_error = Some(message);
+                    }
+                }
+            }
+        }
+        // One browse landed (06-04): the path names the stack level it
+        // fills — a popped level's late result finds no level and
+        // drops whole (the level lookup IS the stale gate on top of
+        // the era).
+        AppEvent::TagsBrowse { era, path, result } => {
+            if workers::is_current(state.era, era)
+                && let Some(level) = state.tags.stack.iter_mut().rev().find(|l| l.path == path)
+            {
+                match result {
+                    Ok(entries) => {
+                        if entries.is_empty() {
+                            state.tags.tree_table.select(None);
+                        } else if let Some(index) = state.tags.tree_table.selected() {
+                            state
+                                .tags
+                                .tree_table
+                                .select(Some(index.min(entries.len() - 1)));
+                        } else {
+                            state.tags.tree_table.select(Some(0));
+                        }
+                        level.entries = Some(entries);
+                        level.error = None;
+                    }
+                    Err(message) => {
+                        level.entries = None;
+                        level.error = Some(message);
+                    }
+                }
+            }
+        }
+        // The detail pane's read landed (06-04): applied only when the
+        // seq (the open's request-id) still matches — a read for a
+        // left/replaced pane drops; the era gates profile switches.
+        AppEvent::TagDetailRead { era, seq, result } => {
+            if workers::is_current(state.era, era)
+                && state.tags.detail.is_some()
+                && state.tags.detail_seq == seq
+                && let Some(detail) = state.tags.detail.as_mut()
+            {
+                detail.read = match result {
+                    Ok(row) => crate::state::DetailRead::Loaded(row),
+                    Err(message) => crate::state::DetailRead::Error(message),
+                };
+            }
+        }
         // One alarms poll result (06-03): replace the table (Ok) or
         // degrade to the honest error state (Err). Stale eras drop
         // whole (Pitfall 9); the selection clamps into the new rows.
@@ -136,8 +210,18 @@ fn handle_input(state: &mut AppState, event: Event) {
     }
 
     match key.code {
-        // `q` (no modal) and Esc both quit the cockpit.
-        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
+        // `q` (no modal) quits the cockpit.
+        KeyCode::Char('q') => state.should_quit = true,
+        // Esc ascends the Tags screen's navigation stack FIRST — one
+        // level per press, the navigation-honesty contract (detail →
+        // tree → … → providers); only at the bottom of the stack does
+        // it fall through to the global quit.
+        KeyCode::Esc => {
+            let ascended = state.screen == Screen::Tags && tags_ascend(state);
+            if !ascended {
+                state.should_quit = true;
+            }
+        }
         // Tab / Shift+Tab cycle screens (wrap-around). Screen-scoped
         // workers (the logs tail) start/stop on the transition.
         KeyCode::Tab => set_screen(state, state.screen.next()),
@@ -167,6 +251,10 @@ fn set_screen(state: &mut AppState, screen: Screen) {
     match state.screen {
         Screen::Logs => workers::tail::spawn_tail(state),
         Screen::Alarms => workers::watch::spawn_alarms(state),
+        // Entering Tags loads the provider list (one-shot, busy
+        // guarded — the screen's entry read; the browse/detail/
+        // watch workers are navigation-driven).
+        Screen::Tags => workers::watch::spawn_providers_once(state),
         _ => {}
     }
 }
@@ -240,6 +328,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     state.dashboard = crate::state::DashboardData::default();
     state.logs = crate::state::LogsData::default();
     state.alarms = crate::state::AlarmsData::default();
+    state.tags = crate::state::TagsData::default();
     state.close_modal();
     // Re-spawn under a new era (bumps) + post the banner through the
     // rail so the loop redraws on it.
@@ -247,6 +336,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     match state.screen {
         Screen::Logs => workers::tail::spawn_tail(state),
         Screen::Alarms => workers::watch::spawn_alarms(state),
+        Screen::Tags => workers::watch::spawn_providers_once(state),
         _ => {}
     }
     if let Some(tx) = &state.events_tx {
@@ -290,6 +380,7 @@ fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
         Screen::Dashboard => dashboard_keys(state, code),
         Screen::Logs => logs_keys(state, code),
         Screen::Alarms => alarms_keys(state, code),
+        Screen::Tags => tags_keys(state, code),
         _ => {}
     }
 }
@@ -426,6 +517,161 @@ fn history_window_24h() -> (i64, i64) {
         .map(|since| since.as_millis() as i64)
         .unwrap_or_default();
     (now_ms.saturating_sub(24 * 60 * 60 * 1000), now_ms)
+}
+
+// ---- Tags screen (06-04) ----
+
+/// The Tags keymap (06-04 Task 1): Up/Down (j/k) move the current
+/// level's cursor, Enter descends (provider → its tree; folder →
+/// deeper) or opens the tag detail (with the on-demand read), `a`
+/// opens the actions menu (Task 3), Esc ascends one level (handled
+/// in [`handle_input`] — the global key owns Esc).
+fn tags_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => move_tags_selection(state, -1),
+        KeyCode::Down | KeyCode::Char('j') => move_tags_selection(state, 1),
+        KeyCode::Enter => tags_enter(state),
+        _ => {}
+    }
+}
+
+/// Move the current level's cursor — the provider table at the root,
+/// the tree table inside the stack, nothing while the detail pane is
+/// open. Clamped (no wrap — a cursor that wraps lies about adjacency).
+fn move_tags_selection(state: &mut AppState, delta: i32) {
+    if state.tags.detail.is_some() {
+        return;
+    }
+    let len = if state.tags.stack.is_empty() {
+        state.tags.providers.as_ref().map_or(0, Vec::len)
+    } else {
+        state
+            .tags
+            .stack
+            .last()
+            .and_then(|level| level.entries.as_ref())
+            .map_or(0, Vec::len)
+    };
+    if len == 0 {
+        return;
+    }
+    let table = if state.tags.stack.is_empty() {
+        &mut state.tags.providers_table
+    } else {
+        &mut state.tags.tree_table
+    };
+    let next = match table.selected() {
+        None => 0,
+        Some(index) if delta < 0 => index.saturating_sub(1),
+        Some(index) => (index + 1).min(len - 1),
+    };
+    table.select(Some(next));
+}
+
+/// The currently selected provider row, if any.
+fn selected_provider_row(state: &AppState) -> Option<ignition_core::actions::tags::TagProviderRow> {
+    let rows = state.tags.providers.as_ref()?;
+    let index = state.tags.providers_table.selected()?;
+    rows.get(index).cloned()
+}
+
+/// The selected row of the CURRENT tree level (the stack's top).
+fn selected_tree_row(state: &AppState) -> Option<ignition_core::actions::tags::BrowseRow> {
+    let level = state.tags.stack.last()?;
+    let entries = level.entries.as_ref()?;
+    let index = state.tags.tree_table.selected()?;
+    entries.get(index).cloned()
+}
+
+/// Enter: descend or open the detail. Provider level → the provider's
+/// tree root (`[name]`); a folder row (has_children) → its path; a
+/// leaf row → the detail pane with the on-demand read. Inside the
+/// detail, Enter REFIRES the read (on-demand refresh).
+fn tags_enter(state: &mut AppState) {
+    if state.tags.detail.is_some() {
+        refire_detail_read(state);
+        return;
+    }
+    if state.tags.stack.is_empty() {
+        if let Some(provider) = selected_provider_row(state) {
+            let path = format!("[{}]", provider.name);
+            push_browse_level(state, &path);
+        }
+        return;
+    }
+    if let Some(row) = selected_tree_row(state) {
+        if row.has_children {
+            push_browse_level(state, &row.path);
+        } else {
+            open_detail(state, &row);
+        }
+    }
+}
+
+/// Push a new (loading) level for `path` and spawn its browse — the
+/// descend half of the navigation state machine. The cursor we leave
+/// behind rides the parent level (restored on ascend).
+fn push_browse_level(state: &mut AppState, path: &str) {
+    if let Some(level) = state.tags.stack.last_mut() {
+        level.selected = state.tags.tree_table.selected();
+    }
+    state.tags.stack.push(crate::state::BrowseLevel {
+        path: path.to_string(),
+        ..Default::default()
+    });
+    state.tags.tree_table.select(None);
+    workers::watch::spawn_browse(state, path);
+}
+
+/// Open the detail pane for a leaf row and fire its on-demand read
+/// under a fresh seq (the request-id gate).
+fn open_detail(state: &mut AppState, row: &ignition_core::actions::tags::BrowseRow) {
+    state.tags.detail_seq += 1;
+    let seq = state.tags.detail_seq;
+    state.tags.detail = Some(crate::state::TagsDetail {
+        path: row.path.clone(),
+        name: row.name.clone(),
+        tag_type: row.tag_type.clone(),
+        data_type: row.data_type.clone(),
+        read: crate::state::DetailRead::Loading,
+    });
+    let path = row.path.clone();
+    workers::watch::spawn_detail_read(state, seq, &path);
+}
+
+/// Refire the open detail pane's read (Enter in the detail): a fresh
+/// seq retires the in-flight read and a new Loading state arms.
+fn refire_detail_read(state: &mut AppState) {
+    let Some(detail) = state.tags.detail.as_mut() else {
+        return;
+    };
+    state.tags.detail_seq += 1;
+    let seq = state.tags.detail_seq;
+    detail.read = crate::state::DetailRead::Loading;
+    let path = detail.path.clone();
+    workers::watch::spawn_detail_read(state, seq, &path);
+}
+
+/// Esc's Tags-screen half: ascend EXACTLY one level — detail → tree
+/// (pop) → … → providers. Returns whether the key was consumed; at
+/// the provider level it returns false and the global Esc (quit)
+/// takes over (navigation honesty: provider list ← tree ← detail).
+fn tags_ascend(state: &mut AppState) -> bool {
+    if state.tags.detail.is_some() {
+        state.tags.detail = None;
+        return true;
+    }
+    match state.tags.stack.pop() {
+        Some(_) => {
+            // Restore the parent level's saved cursor (the provider
+            // level's cursor lives in its own TableState throughout).
+            if let Some(parent) = state.tags.stack.last() {
+                state.tags.tree_table.select(parent.selected);
+            }
+            true
+        }
+        None => false,
+    }
 }
 
 /// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
@@ -2211,5 +2457,378 @@ mod tests {
         let mut state = alarms_screen_with_rails();
         update(&mut state, key(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(state.dashboard.in_flight, Some("alarms history"));
+    }
+
+    // ---- Tags screen (06-04 Task 1) ----
+
+    fn provider_row(name: &str) -> ignition_core::actions::tags::TagProviderRow {
+        ignition_core::actions::tags::TagProviderRow {
+            name: name.to_string(),
+            enabled: true,
+            tag_count: Some(12),
+            health: Some("OK".into()),
+            managed: false,
+        }
+    }
+
+    fn browse_row(
+        path: &str,
+        name: &str,
+        tag_type: &str,
+        has_children: bool,
+    ) -> ignition_core::actions::tags::BrowseRow {
+        ignition_core::actions::tags::BrowseRow {
+            path: path.to_string(),
+            name: name.to_string(),
+            tag_type: tag_type.to_string(),
+            has_children,
+            data_type: Some("Int4".into()),
+        }
+    }
+
+    fn read_row(path: &str, value: serde_json::Value) -> ignition_core::actions::tags::TagReadRow {
+        ignition_core::actions::tags::TagReadRow {
+            path: path.to_string(),
+            value,
+            quality: "Good".into(),
+            timestamp: "Mon Aug 24 00:00:00 UTC 2026".into(),
+        }
+    }
+
+    /// A Tags-screen state with rails armed, entering via Tab×2
+    /// (Dashboard → Logs → Tags) so the transition hooks fire the
+    /// provider load like production.
+    fn tags_screen_with_rails() -> AppState {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        for _ in 0..2 {
+            update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(state.screen, Screen::Tags);
+        state
+    }
+
+    /// Entering Tags fires the provider load (busy guard armed); a
+    /// landed list fills the table with the cursor on the first row;
+    /// a stale-era list drops whole.
+    #[test]
+    fn tags_entry_loads_providers_and_events_fill_or_drop() {
+        let mut state = tags_screen_with_rails();
+        assert!(
+            state.tags.providers_busy,
+            "entering Tags fires the provider load"
+        );
+
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default"), provider_row("line0")]),
+            },
+        );
+        assert_eq!(
+            state.tags.providers.as_ref().map(|rows| rows.len()),
+            Some(2),
+            "table filled"
+        );
+        assert!(!state.tags.providers_busy, "busy clears");
+        assert_eq!(
+            state.tags.providers_table.selected(),
+            Some(0),
+            "cursor lands"
+        );
+
+        // Stale era: dropped whole (Pitfall 9).
+        state.tags.providers_busy = true;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era: era.wrapping_sub(1),
+                result: Ok(vec![]),
+            },
+        );
+        assert_eq!(
+            state.tags.providers.as_ref().map(|rows| rows.len()),
+            Some(2),
+            "stale list dropped"
+        );
+        assert!(state.tags.providers_busy, "stale does not clear busy");
+    }
+
+    /// A provider-load error degrades to the honest error state.
+    #[test]
+    fn tags_provider_error_degrades() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Err("gateway unreachable".into()),
+            },
+        );
+        assert!(state.tags.providers.is_none(), "rows dropped");
+        assert_eq!(
+            state.tags.providers_error.as_deref(),
+            Some("gateway unreachable")
+        );
+    }
+
+    /// THE descend state machine: Enter on a selected provider pushes
+    /// a loading `[name]` level; the matching-path browse fills it; a
+    /// wrong-path result (a popped level's late answer) drops.
+    #[test]
+    fn enter_on_provider_descends_and_browse_fills_the_matching_level() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default")]),
+            },
+        );
+
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.tags.stack.len(), 1, "one level pushed");
+        assert_eq!(state.tags.stack[0].path, "[default]", "provider root");
+        assert!(state.tags.stack[0].entries.is_none(), "level is Loading");
+
+        // A late result for a path nobody holds drops whole.
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[gone]".into(),
+                result: Ok(vec![browse_row("[gone]X", "X", "AtomicTag", false)]),
+            },
+        );
+        assert!(state.tags.stack[0].entries.is_none(), "wrong path dropped");
+
+        // The matching result fills the level.
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]".into(),
+                result: Ok(vec![
+                    browse_row("[default]P5", "P5", "Folder", true),
+                    browse_row("[default]T1", "T1", "AtomicTag", false),
+                ]),
+            },
+        );
+        assert_eq!(
+            state.tags.stack[0].entries.as_ref().map(|rows| rows.len()),
+            Some(2)
+        );
+        assert_eq!(state.tags.tree_table.selected(), Some(0));
+    }
+
+    /// A browse error degrades the level to the honest error state
+    /// (require_routes denials surface with the action's hint text).
+    #[test]
+    fn browse_error_degrades_the_level() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default")]),
+            },
+        );
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]".into(),
+                result: Err("routes_not_deployed (exit 6)".into()),
+            },
+        );
+        assert!(state.tags.stack[0].entries.is_none());
+        assert_eq!(
+            state.tags.stack[0].error.as_deref(),
+            Some("routes_not_deployed (exit 6)")
+        );
+    }
+
+    /// Enter on a FOLDER descends (pushes its path); Enter on a LEAF
+    /// opens the detail with the read Loading under a fresh seq.
+    #[test]
+    fn folders_descend_and_leaves_open_the_detail() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default")]),
+            },
+        );
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]".into(),
+                result: Ok(vec![
+                    browse_row("[default]P5", "P5", "Folder", true),
+                    browse_row("[default]T1", "T1", "AtomicTag", false),
+                ]),
+            },
+        );
+
+        // Enter on the folder (row 0): descend.
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.tags.stack.len(), 2, "folder descends");
+        assert_eq!(state.tags.stack[1].path, "[default]P5");
+
+        // Esc back, Down to the leaf, Enter: the detail opens.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.tags.stack.len(), 1, "ascended one level");
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        let seq = state.tags.detail_seq;
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        let detail = state.tags.detail.as_ref().expect("detail open");
+        assert_eq!(detail.path, "[default]T1");
+        assert!(
+            matches!(detail.read, crate::state::DetailRead::Loading),
+            "read fired under Loading"
+        );
+        assert_eq!(state.tags.detail_seq, seq + 1, "seq bumped on open");
+    }
+
+    /// The detail read lands only under its matching seq — a read for
+    /// a replaced pane drops (the request-id gate).
+    #[test]
+    fn detail_read_lands_only_under_its_seq() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        state.tags.detail_seq = 5;
+        state.tags.detail = Some(crate::state::TagsDetail {
+            path: "[default]T1".into(),
+            name: "T1".into(),
+            tag_type: "AtomicTag".into(),
+            data_type: None,
+            read: crate::state::DetailRead::Loading,
+        });
+
+        update(
+            &mut state,
+            AppEvent::TagDetailRead {
+                era,
+                seq: 4,
+                result: Ok(read_row("[default]OLD", serde_json::json!(0))),
+            },
+        );
+        assert!(
+            matches!(
+                state.tags.detail.as_ref().expect("detail").read,
+                crate::state::DetailRead::Loading
+            ),
+            "stale-seq read dropped"
+        );
+
+        update(
+            &mut state,
+            AppEvent::TagDetailRead {
+                era,
+                seq: 5,
+                result: Ok(read_row("[default]T1", serde_json::json!(42))),
+            },
+        );
+        match &state.tags.detail.as_ref().expect("detail").read {
+            crate::state::DetailRead::Loaded(row) => {
+                assert_eq!(row.value, serde_json::json!(42));
+                assert_eq!(row.quality, "Good");
+            }
+            other => panic!("read landed, got {other:?}"),
+        }
+    }
+
+    /// Navigation honesty: Esc ascends EXACTLY one level per press —
+    /// detail → tree (deeper → … → root) → providers → quit — and
+    /// the saved cursor restores on ascend.
+    #[test]
+    fn esc_ascends_exactly_one_level_per_press() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default")]),
+            },
+        );
+        // providers → [default] → [default]P5 → detail
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]".into(),
+                result: Ok(vec![browse_row("[default]P5", "P5", "Folder", true)]),
+            },
+        );
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]P5".into(),
+                result: Ok(vec![browse_row("[default]P5/T1", "T1", "AtomicTag", false)]),
+            },
+        );
+        // Move the root-level cursor to row 0 (saved on descend).
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.tags.detail.is_some());
+        assert_eq!(state.tags.stack.len(), 2);
+
+        // Esc 1: detail → the P5 level.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.tags.detail.is_none(), "detail closes, tree stays");
+        assert_eq!(state.tags.stack.len(), 2, "exactly one level of ascent");
+
+        // Esc 2: P5 → the provider root; the saved cursor restores.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.tags.stack.len(), 1);
+        assert_eq!(state.tags.tree_table.selected(), Some(0), "cursor restored");
+
+        // Esc 3: root → the provider list.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.tags.stack.is_empty());
+        assert!(!state.should_quit, "still on the Tags screen");
+
+        // Esc 4: at the bottom — the global Esc quits.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.should_quit, "Esc at the provider level quits");
+    }
+
+    /// Up/Down move the current level's cursor (clamped) and are
+    /// no-ops without rows; j/k mirror them.
+    #[test]
+    fn tags_cursor_moves_and_clamps() {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default"), provider_row("p2")]),
+            },
+        );
+
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.tags.providers_table.selected(), Some(1));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.tags.providers_table.selected(), Some(1), "clamped");
+        update(&mut state, key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.tags.providers_table.selected(), Some(0), "k ascends");
     }
 }
