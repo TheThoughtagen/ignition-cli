@@ -13,6 +13,7 @@
 
 pub mod context;
 pub mod event;
+pub mod routes;
 pub mod state;
 pub mod ui;
 pub mod update;
