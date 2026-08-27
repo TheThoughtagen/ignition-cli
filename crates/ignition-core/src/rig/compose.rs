@@ -1044,6 +1044,16 @@ mod tests {
             eprintln!("skipping: docker compose unavailable");
             return;
         }
+        // `compose version` is CLIENT-side; the `compose logs` below
+        // needs a LIVE daemon — its absent-project exit-0 contract only
+        // holds when the daemon answers. Probe the daemon (plain
+        // `docker version` exits nonzero when unreachable — e.g. an
+        // auto-stopped OrbStack) so a daemon-less machine skips as
+        // quietly as a docker-less one.
+        if runner.run_docker(&["version".to_string()]).await.code != 0 {
+            eprintln!("skipping: docker daemon unreachable");
+            return;
+        }
         let plan = parse_config(
             r#"{"name":"stream-fixture","services":{"sidecar":{"image":"alpine"}}}"#,
             &compose,

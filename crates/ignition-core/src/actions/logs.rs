@@ -645,7 +645,12 @@ mod tests {
             None,
             Some(1000), // since → first query startTime = 1000
             Duration::from_millis(5),
-            Some(Duration::from_millis(40)),
+            // Deadline budget generous on purpose: 40ms starved the
+            // second page under a full parallel workspace run (the
+            // rig serves pages from memory — only scheduler latency
+            // competes). 400ms gives ~10x headroom while keeping the
+            // isolated test under half a second.
+            Some(Duration::from_millis(400)),
             sink,
         )
         .await
