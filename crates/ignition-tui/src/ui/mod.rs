@@ -73,6 +73,7 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(3).min(11),
         Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(3),
         Modal::TagsActions { .. } => crate::state::TAG_ACTIONS.len().saturating_add(3),
+        Modal::ProjectsActions { .. } => crate::state::PROJECT_ACTIONS.len().saturating_add(3),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
@@ -184,6 +185,24 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         // verbs, same shape as the dashboard's menu.
         Modal::TagsActions { selected } => {
             let text: Vec<Line> = crate::state::TAG_ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let marker = if index == *selected { "▸ " } else { "  " };
+                    Line::from(format!("{marker}{action}"))
+                })
+                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .collect();
+            frame.render_widget(
+                Paragraph::new(text).block(Block::bordered().title("actions")),
+                area,
+            );
+        }
+        // The Projects screen's menu (06-05): the project, resource,
+        // and webdev family verbs, same shape as the dashboard's
+        // menu.
+        Modal::ProjectsActions { selected } => {
+            let text: Vec<Line> = crate::state::PROJECT_ACTIONS
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
@@ -503,6 +522,36 @@ mod tests {
         }
         assert!(
             rows.iter().any(|row| row.contains("▸ write")),
+            "selection marker on entry 0"
+        );
+    }
+
+    /// The Projects actions menu (06-05) renders every project/
+    /// resource/webdev verb with the selection marker.
+    #[test]
+    fn projects_actions_menu_renders_the_families() {
+        let mut state = AppState::new();
+        state.screen = Screen::Projects;
+        state.open_modal(Modal::ProjectsActions { selected: 0 });
+        let rows = rendered_rows(&state);
+        let text = rows.join("\n");
+        for verb in [
+            "new",
+            "copy",
+            "rename",
+            "set",
+            "delete",
+            "import",
+            "export",
+            "resource put",
+            "resource delete",
+            "webdev deploy",
+            "webdev status",
+        ] {
+            assert!(text.contains(verb), "menu lists {verb}: {text}");
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("▸ new")),
             "selection marker on entry 0"
         );
     }

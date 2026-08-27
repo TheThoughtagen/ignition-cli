@@ -170,6 +170,10 @@ pub enum Modal {
     /// family verbs with a moving selection — the same shape as
     /// [`Modal::Actions`], its own list.
     TagsActions { selected: usize },
+    /// The Projects screen's actions menu (06-05): the project,
+    /// resource, and webdev family verbs with a moving selection —
+    /// the same shape as [`Modal::Actions`], its own list.
+    ProjectsActions { selected: usize },
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
@@ -197,6 +201,25 @@ pub enum PendingAction {
     /// `--yes`; the ABORT policy is unguarded — its collisions refuse
     /// at the action's own zero-write pre-check).
     TagsImportOverwrite { file: String, provider: String },
+    /// `ign project delete NAME` (Confirm ≡ `--yes` — the guarded
+    /// project verb, main.rs's own set).
+    ProjectDelete { name: String },
+    /// `ign project import <NAME> --file <FILE>
+    /// --collision-policy overwrite` (Confirm ≡ `--yes`; the ABORT
+    /// policy needs no confirm — its collisions refuse at the
+    /// action's own zero-write pre-check).
+    ProjectImportOverwrite { name: String, file: String },
+    /// `ign resource put <PROJECT> <PATH> --file <FILE>` (Confirm ≡
+    /// `--yes` — guarded since 05-02: the member surgery implicitly
+    /// overwrite-imports the whole project).
+    ResourcePut {
+        project: String,
+        path: String,
+        file: String,
+    },
+    /// `ign resource delete <PROJECT> <PATH>` (Confirm ≡ `--yes` —
+    /// guarded since 05-02, the put twin).
+    ResourceDelete { project: String, path: String },
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
@@ -224,6 +247,7 @@ impl Modal {
             Modal::Actions { .. } => "actions",
             Modal::LogsActions { .. } => "actions",
             Modal::TagsActions { .. } => "actions",
+            Modal::ProjectsActions { .. } => "actions",
             Modal::Profiles { .. } => "profiles",
             Modal::ProfileAdd { .. } => "profile add",
             Modal::Ack { .. } => "ack alarm",

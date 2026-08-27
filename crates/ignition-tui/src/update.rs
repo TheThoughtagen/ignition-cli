@@ -12,8 +12,8 @@ use ignition_core::client::ReqwestGatewayApi;
 
 use crate::event::AppEvent;
 use crate::state::{
-    ACTIONS, AppState, LOG_ACTIONS, Modal, PendingAction, PendingInput, Screen, SessionRow,
-    TAG_ACTIONS, TagsForm, session_rows,
+    ACTIONS, AppState, LOG_ACTIONS, Modal, PROJECT_ACTIONS, PendingAction, PendingInput, Screen,
+    SessionRow, TAG_ACTIONS, TagsForm, session_rows,
 };
 use crate::workers;
 
@@ -1421,14 +1421,16 @@ fn accept_tags_form(state: &mut AppState, value: &str) {
 /// level's cursor (list row / resources row) or scroll the resource
 /// preview at the deepest level, Enter drills down (project list →
 /// project detail + resources → resource detail with the content
-/// preview; Enter in the resource detail refires the get), Esc
+/// preview; Enter in the resource detail refires the get), `a` opens
+/// the actions menu (the project/resource/webdev families), Esc
 /// ascends one level (handled in [`handle_input`] — the global key
-/// owns Esc). `a` (the actions menu) arrives with Task 2.
+/// owns Esc).
 fn projects_keys(state: &mut AppState, code: KeyCode) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => projects_up(state),
         KeyCode::Down | KeyCode::Char('j') => projects_down(state),
         KeyCode::Enter => projects_enter(state),
+        KeyCode::Char('a') => state.open_modal(Modal::ProjectsActions { selected: 0 }),
         _ => {}
     }
 }
@@ -1590,6 +1592,409 @@ fn projects_ascend(state: &mut AppState) -> bool {
         return true;
     }
     false
+}
+
+// ---- Projects actions menu (06-05 Task 2) ----
+
+/// The selected project's name at menu time — the set/delete/export/
+/// rename forms' prefill source (the detail's project, else the
+/// selected list row).
+fn projects_context_name(state: &AppState) -> Option<String> {
+    if let Some(detail) = &state.projects.detail {
+        return Some(detail.name.clone());
+    }
+    selected_project_row(state).map(|row| row.name)
+}
+
+/// The open resource context (project + path) — the resource put/
+/// delete forms' prefill source (only meaningful at the resource
+/// level or inside a detail with a selected resource).
+fn projects_context_resource(state: &AppState) -> Option<(String, String)> {
+    if let Some(resource) = &state.projects.resource {
+        return Some((resource.project.clone(), resource.path.clone()));
+    }
+    let detail = state.projects.detail.as_ref()?;
+    let path = selected_resource_path(state)?;
+    Some((detail.name.clone(), path))
+}
+
+/// Open a projects Input form: arm the form slot, then the modal
+/// (title, optional hint, optional prefill).
+fn open_projects_input(
+    state: &mut AppState,
+    form: crate::state::ProjectsForm,
+    title: String,
+    hint: Option<String>,
+    prefill: String,
+) {
+    state.projects.pending_form = Some(form);
+    state.open_modal(Modal::Input {
+        title,
+        hint,
+        buffer: prefill,
+    });
+}
+
+/// The `FIELD=VALUE` line for `project set` (common fields only —
+/// defaultDb/tagProvider/userSource stay on the CLI form, the LOCKED
+/// modal-depth decision): exactly one pair, the field one of the
+/// five common names, `enabled`/`inheritable` parsing as bools. A
+/// String error so the caller can open the error modal (the clap
+/// refusal's TUI twin).
+fn parse_set_line(line: &str) -> Result<ignition_core::actions::projects::SetOptions, String> {
+    let Some((field, value)) = line.split_once('=') else {
+        return Err(
+            "expected FIELD=VALUE (e.g. `title=Line 1 Overview`) — one pair per prompt, \
+             press ? for every flag"
+                .to_string(),
+        );
+    };
+    let field = field.trim();
+    let value = value.trim();
+    let mut opts = ignition_core::actions::projects::SetOptions::default();
+    match field {
+        "title" => opts.title = Some(value.to_string()),
+        "description" => opts.description = Some(value.to_string()),
+        "parent" => opts.parent = Some(value.to_string()),
+        "enabled" => {
+            opts.enabled = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("enabled must be true/false, got {value:?}"))?,
+            );
+        }
+        "inheritable" => {
+            opts.inheritable = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("inheritable must be true/false, got {value:?}"))?,
+            );
+        }
+        unknown => {
+            return Err(format!(
+                "unknown field {unknown:?} — common fields: title description parent \
+                 enabled inheritable (db/tagprov/usersrc stay on the CLI form)"
+            ));
+        }
+    }
+    Ok(opts)
+}
+
+/// Exact CLI synopsis for the active projects form. `?` opens this in
+/// the shared result pane rather than trying to reproduce every rich
+/// clap form in the cockpit (the LOCKED modal-depth escape hatch).
+fn projects_cli_form(form: &crate::state::ProjectsForm) -> String {
+    use crate::state::ProjectsForm;
+    match form {
+        ProjectsForm::NewName | ProjectsForm::NewTitle { .. } => {
+            "ign project new <NAME> [--title <TEXT>] [--description <TEXT>] \
+             [--parent <NAME>] [--inheritable] [--disabled]"
+                .to_string()
+        }
+        ProjectsForm::CopySrc => "ign project copy <SRC> <DST>".to_string(),
+        ProjectsForm::CopyDst { src } => format!("ign project copy {src:?} <DST>"),
+        ProjectsForm::RenameOld => "ign project rename <OLD_NAME> <NEW_NAME>".to_string(),
+        ProjectsForm::RenameNew { old } => {
+            format!("ign project rename {old:?} <NEW_NAME>")
+        }
+        ProjectsForm::SetName | ProjectsForm::SetLine { .. } => {
+            "ign project set <NAME> --title <TEXT> [--description <TEXT>] \
+             [--parent <NAME>] [--set-enabled|--disabled] [--inheritable <BOOL>]"
+                .to_string()
+        }
+        ProjectsForm::DeleteName => "ign project delete <NAME> --yes".to_string(),
+        ProjectsForm::ImportFile => {
+            "ign project import <NAME> --file <PATH> [--collision-policy abort|overwrite]"
+                .to_string()
+        }
+        ProjectsForm::ImportName { file } => format!(
+            "ign project import <NAME> --file {file:?} [--collision-policy abort|overwrite]"
+        ),
+        ProjectsForm::ImportPolicy { file, name } => format!(
+            "ign project import {name:?} --file {file:?} --collision-policy <abort|overwrite>"
+        ),
+        ProjectsForm::ExportFile { name } => {
+            format!("ign project export {name:?} [-o <FILE>]")
+        }
+        ProjectsForm::ResourcePutProject
+        | ProjectsForm::ResourcePutPath { .. }
+        | ProjectsForm::ResourcePutFile { .. } => {
+            "ign resource put <PROJECT> <PATH> --file <FILE> --yes".to_string()
+        }
+        ProjectsForm::ResourceDeleteProject | ProjectsForm::ResourceDeletePath { .. } => {
+            "ign resource delete <PROJECT> <PATH> --yes".to_string()
+        }
+    }
+}
+
+/// Execute a Projects-actions-menu entry `index` (Enter in the
+/// ProjectsActions modal). Unguarded reads spawn immediately; inputs
+/// prompt (with context prefills); the guarded verbs (project delete,
+/// project import-overwrite, resource put, resource delete) arm
+/// their Confirm gates at the form-accept step — the TUI's `--yes`
+/// mirrors of main.rs's `require_confirmation` set. Webdev deploy
+/// fires with NO confirm (the 05-03 CLI-owned-project decision).
+fn execute_projects_menu_action(state: &mut AppState, index: usize) {
+    match PROJECT_ACTIONS.get(index).copied() {
+        Some("new") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::NewName,
+            "new project — name".to_string(),
+            Some("the optional title prompts next\npress ? for the CLI form".to_string()),
+            String::new(),
+        ),
+        Some("copy") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::CopySrc,
+            "copy — source project".to_string(),
+            Some("the destination prompts next".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        Some("rename") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::RenameOld,
+            "rename — current name".to_string(),
+            Some("the new name prompts next".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        Some("set") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::SetName,
+            "set — project name".to_string(),
+            Some("the FIELD=VALUE line prompts next\npress ? for the CLI form".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        Some("delete") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::DeleteName,
+            "delete — project name".to_string(),
+            Some("guarded — a Confirm gate arms next".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        Some("import") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::ImportFile,
+            "import — export zip path".to_string(),
+            Some("the project name prompts next\npress ? for the CLI form".to_string()),
+            String::new(),
+        ),
+        Some("export") => {
+            let Some(name) = projects_context_name(state) else {
+                open_error_modal(
+                    state,
+                    "project export",
+                    "no project selected — pick a row first",
+                );
+                return;
+            };
+            let prefill = format!(
+                "{}.zip",
+                name.replace(['/', '\\'], "_") // the action's safe-fallback stem
+            );
+            open_projects_input(
+                state,
+                crate::state::ProjectsForm::ExportFile { name },
+                "export — output file".to_string(),
+                Some("streams the zip to this path".to_string()),
+                prefill,
+            );
+        }
+        Some("resource put") => {
+            let project_prefill =
+                projects_context_resource(state).map_or(String::new(), |(p, _)| p);
+            open_projects_input(
+                state,
+                crate::state::ProjectsForm::ResourcePutProject,
+                "resource put — project".to_string(),
+                Some("path + content file prompt next\npress ? for the CLI form".to_string()),
+                project_prefill,
+            );
+        }
+        Some("resource delete") => {
+            let project_prefill =
+                projects_context_resource(state).map_or(String::new(), |(p, _)| p);
+            open_projects_input(
+                state,
+                crate::state::ProjectsForm::ResourceDeleteProject,
+                "resource delete — project".to_string(),
+                Some("the resource path prompts next\na Confirm gate arms after".to_string()),
+                project_prefill,
+            );
+        }
+        Some("webdev deploy") => workers::ops::fire_webdev_deploy(state),
+        Some("webdev status") => workers::ops::fire_webdev_status(state),
+        _ => {}
+    }
+}
+
+/// Route an accepted projects Input form (Enter): each arm fires its
+/// one-shot (through [`workers::ops`] — the locked result-modal
+/// display) or chains the next prompt. An EMPTY value cancels (the
+/// wait-module precedent). File inputs are read INSIDE the spawned
+/// worker (I/O lives in workers; `-`/stdin is refused).
+fn accept_projects_form(state: &mut AppState, value: &str) {
+    use crate::state::ProjectsForm;
+    let Some(form) = state.projects.pending_form.take() else {
+        return;
+    };
+    // The optional-title step: empty = SKIP the field (not a cancel)
+    // — the form's own contract, ahead of the shared empty-cancel.
+    if let ProjectsForm::NewTitle { name } = form {
+        let title = (!value.trim().is_empty()).then(|| value.trim().to_string());
+        workers::ops::fire_project_new(state, name, title);
+        return;
+    }
+    if value.trim().is_empty() {
+        return; // empty accepts cancel — nothing armed, nothing fired
+    }
+    let value = value.trim().to_string();
+    match form {
+        ProjectsForm::NewName => open_projects_input(
+            state,
+            ProjectsForm::NewTitle { name: value },
+            "new project — title (optional)".to_string(),
+            Some("empty skips the field".to_string()),
+            String::new(),
+        ),
+        ProjectsForm::NewTitle { .. } => unreachable!("handled above"),
+        ProjectsForm::CopySrc => open_projects_input(
+            state,
+            ProjectsForm::CopyDst { src: value },
+            "copy — destination name".to_string(),
+            Some("must not already exist".to_string()),
+            String::new(),
+        ),
+        ProjectsForm::CopyDst { src } => workers::ops::fire_project_copy(state, src, value),
+        ProjectsForm::RenameOld => open_projects_input(
+            state,
+            ProjectsForm::RenameNew { old: value },
+            "rename — new name".to_string(),
+            None,
+            String::new(),
+        ),
+        ProjectsForm::RenameNew { old } => workers::ops::fire_project_rename(state, old, value),
+        ProjectsForm::SetName => open_projects_input(
+            state,
+            ProjectsForm::SetLine { name: value },
+            "set — FIELD=VALUE".to_string(),
+            Some(
+                "one pair: title description parent\nenabled inheritable — press ? for flags"
+                    .to_string(),
+            ),
+            String::new(),
+        ),
+        ProjectsForm::SetLine { name } => match parse_set_line(&value) {
+            Ok(opts) => workers::ops::fire_project_set(state, name, opts),
+            Err(reason) => open_error_modal(state, "project set", &reason),
+        },
+        ProjectsForm::DeleteName => {
+            // The guarded verb: the Confirm modal IS the TUI's
+            // `--yes` (main.rs's own guard set).
+            state.dashboard.pending = Some(PendingAction::ProjectDelete {
+                name: value.clone(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "project delete".to_string(),
+                body: format!("delete project {value:?}? every resource it holds is destroyed"),
+            });
+        }
+        ProjectsForm::ImportFile => open_projects_input(
+            state,
+            ProjectsForm::ImportName { file: value },
+            "import — project name".to_string(),
+            Some("the name to import the zip as".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        ProjectsForm::ImportName { file } => open_projects_input(
+            state,
+            ProjectsForm::ImportPolicy { file, name: value },
+            "import — collision policy".to_string(),
+            Some("abort | overwrite (overwrite is Confirm-gated)".to_string()),
+            "abort".to_string(),
+        ),
+        ProjectsForm::ImportPolicy { file, name } => {
+            match parse_import_policy(&value) {
+                Ok(ignition_core::actions::projects::CollisionPolicy::Abort) => {
+                    // Abort needs NO confirm: its collisions refuse at
+                    // the action's own zero-write pre-check.
+                    workers::ops::fire_project_import(
+                        state,
+                        name,
+                        file,
+                        ignition_core::actions::projects::CollisionPolicy::Abort,
+                    );
+                }
+                Ok(ignition_core::actions::projects::CollisionPolicy::Overwrite) => {
+                    // The guarded arm: overwrite REPLACES the entire
+                    // project (replace-not-merge — Pitfall 4).
+                    state.dashboard.pending =
+                        Some(PendingAction::ProjectImportOverwrite { name, file });
+                    state.open_modal(Modal::Confirm {
+                        title: "project import".to_string(),
+                        body: "import with collision-policy OVERWRITE? the ENTIRE project \
+                               is replaced — resources absent from the zip are deleted"
+                            .to_string(),
+                    });
+                }
+                Err(reason) => open_error_modal(state, "project import", &reason),
+            }
+        }
+        ProjectsForm::ExportFile { name } => workers::ops::fire_project_export(state, name, value),
+        ProjectsForm::ResourcePutProject => open_projects_input(
+            state,
+            ProjectsForm::ResourcePutPath { project: value },
+            "resource put — path".to_string(),
+            Some("slashes kept, e.g. views/root.json".to_string()),
+            projects_context_resource(state)
+                .map(|(_project, path)| path)
+                .unwrap_or_default(),
+        ),
+        ProjectsForm::ResourcePutPath { project } => open_projects_input(
+            state,
+            ProjectsForm::ResourcePutFile {
+                project,
+                path: value,
+            },
+            "resource put — content file".to_string(),
+            Some("guarded — a Confirm gate arms next".to_string()),
+            String::new(),
+        ),
+        ProjectsForm::ResourcePutFile { project, path } => {
+            // Guarded since 05-02: the surgery implicitly
+            // overwrite-imports the whole project.
+            state.dashboard.pending = Some(PendingAction::ResourcePut {
+                project: project.clone(),
+                path: path.clone(),
+                file: value.clone(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "resource put".to_string(),
+                body: format!(
+                    "write {value:?} into {project:?}/{path:?}? re-imports the project — \
+                     concurrent Designer edits are replaced"
+                ),
+            });
+        }
+        ProjectsForm::ResourceDeleteProject => open_projects_input(
+            state,
+            ProjectsForm::ResourceDeletePath { project: value },
+            "resource delete — path".to_string(),
+            Some("guarded — a Confirm gate arms next".to_string()),
+            projects_context_resource(state)
+                .map(|(_project, path)| path)
+                .unwrap_or_default(),
+        ),
+        ProjectsForm::ResourceDeletePath { project } => {
+            state.dashboard.pending = Some(PendingAction::ResourceDelete {
+                project,
+                path: value.clone(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "resource delete".to_string(),
+                body: format!("delete the resource {value:?}? re-imports the project"),
+            });
+        }
+    }
 }
 
 /// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
@@ -1832,6 +2237,34 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
                 });
             }
         }
+        // The confirmed project/resource mutations fire unguarded —
+        // the TUI owned the `--yes` (the CLI guard contract,
+        // caller-owns-guard).
+        PendingAction::ProjectDelete { name } => {
+            let name = name.clone();
+            workers::ops::fire_project_delete(state, name);
+        }
+        PendingAction::ProjectImportOverwrite { name, file } => {
+            let (name, file) = (name.clone(), file.clone());
+            workers::ops::fire_project_import(
+                state,
+                name,
+                file,
+                ignition_core::actions::projects::CollisionPolicy::Overwrite,
+            );
+        }
+        PendingAction::ResourcePut {
+            project,
+            path,
+            file,
+        } => {
+            let (project, path, file) = (project.clone(), path.clone(), file.clone());
+            workers::ops::fire_resource_put(state, project, path, file);
+        }
+        PendingAction::ResourceDelete { project, path } => {
+            let (project, path) = (project.clone(), path.clone());
+            workers::ops::fire_resource_delete(state, project, path);
+        }
     }
 }
 
@@ -1999,6 +2432,31 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         }
     }
 
+    // The Projects actions menu (06-05): the same nav shape, over the
+    // project/resource/webdev family verbs.
+    if let Some(Modal::ProjectsActions { selected }) = state.modal.as_mut()
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        match code {
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(PROJECT_ACTIONS.len() - 1);
+                return;
+            }
+            KeyCode::Enter => {
+                let index = *selected;
+                state.close_modal();
+                clear_pending(state);
+                execute_projects_menu_action(state, index);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // The Actions menu: Up/Down move, Enter executes. Long waits run in
     // the worker with NO UI block — only the status line's in-flight
     // label shows while they run.
@@ -2048,6 +2506,12 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
             accept_tags_form(state, &value);
             return;
         }
+        // The Projects screen's forms next (06-05's small-form
+        // router, its own pending slot).
+        if state.projects.pending_form.is_some() {
+            accept_projects_form(state, &value);
+            return;
+        }
         match (state.dashboard.pending_input.take(), value.is_empty()) {
             (Some(PendingInput::WaitModule), false) => {
                 if let Some(client) = client_arc(state) {
@@ -2095,14 +2559,26 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
     if matches!(state.modal, Some(Modal::Input { .. }))
         && code == KeyCode::Char('?')
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        && let Some(form) = state.tags.pending_form.take()
     {
-        state.open_modal(Modal::Result_ {
-            title: "CLI form".to_string(),
-            lines: vec![tags_cli_form(&form)],
-            scroll: 0,
-        });
-        return;
+        if let Some(form) = state.tags.pending_form.take() {
+            state.open_modal(Modal::Result_ {
+                title: "CLI form".to_string(),
+                lines: vec![tags_cli_form(&form)],
+                scroll: 0,
+            });
+            return;
+        }
+        // The projects family's rich forms carry the same escape
+        // hatch (import file, export path, resource put file — the
+        // plan's ? hint set).
+        if let Some(form) = state.projects.pending_form.take() {
+            state.open_modal(Modal::Result_ {
+                title: "CLI form".to_string(),
+                lines: vec![projects_cli_form(&form)],
+                scroll: 0,
+            });
+            return;
+        }
     }
 
     // Result modal: PgUp/PgDn scroll (clamped to the content).
@@ -2214,6 +2690,7 @@ fn clear_pending(state: &mut AppState) {
     state.dashboard.pending = None;
     state.dashboard.pending_input = None;
     state.tags.pending_form = None;
+    state.projects.pending_form = None;
 }
 
 #[cfg(test)]
@@ -4453,6 +4930,9 @@ mod tests {
             ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
         )));
         state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        // The webdev verbs key off the active profile (the secret's
+        // config slot).
+        state.profile = Some("dev".into());
         for _ in 0..4 {
             update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
         }
@@ -4860,5 +5340,335 @@ mod tests {
             },
         );
         assert!(!state.projects.list_busy, "non-project labels skip");
+    }
+
+    // ---- Projects actions menu (06-05 Task 2) ----
+
+    /// Open the Projects menu and run entry `index` (0-based).
+    fn run_projects_menu(state: &mut AppState, index: usize) {
+        update(state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::ProjectsActions { selected: 0 })),
+            "a opens the projects menu"
+        );
+        for _ in 0..index {
+            update(state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Type `text` into the open Input modal and accept it.
+    fn submit_projects_input(state: &mut AppState, text: &str) {
+        for ch in text.chars() {
+            update(state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Accept the current prefilled value without editing it.
+    fn accept_projects_input(state: &mut AppState) {
+        update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Replace an Input modal's prefill, then accept it.
+    fn replace_projects_input(state: &mut AppState, text: &str) {
+        let len = match &state.modal {
+            Some(Modal::Input { buffer, .. }) => buffer.chars().count(),
+            other => panic!("expected projects Input, got {other:?}"),
+        };
+        for _ in 0..len {
+            update(state, key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        submit_projects_input(state, text);
+    }
+
+    /// The `FIELD=VALUE` line parses every common field (bools
+    /// strict) and refuses junk with honest reasons (the clap
+    /// refusal's TUI twin).
+    #[test]
+    fn set_line_parses_and_refuses() {
+        let parse = super::parse_set_line;
+        let title = parse("title=Line 1 Overview").unwrap();
+        assert_eq!(
+            title.title,
+            Some("Line 1 Overview".into()),
+            "values keep their spaces"
+        );
+        assert_eq!(title.description, None);
+        assert_eq!(title.parent, None);
+        let parent = parse("parent=Base").unwrap();
+        assert_eq!(parent.parent, Some("Base".into()));
+        assert_eq!(parse("enabled=true").unwrap().enabled, Some(true));
+        assert_eq!(parse("inheritable=false").unwrap().inheritable, Some(false));
+        assert_eq!(
+            parse("description=Long text here").unwrap().description,
+            Some("Long text here".into())
+        );
+        let no_pair = parse("title").expect_err("missing = refuses");
+        assert!(
+            no_pair.contains("FIELD=VALUE"),
+            "names the shape: {no_pair}"
+        );
+        let bad_bool = parse("enabled=maybe").expect_err("bad bool refuses");
+        assert!(
+            bad_bool.contains("true/false"),
+            "names the rule: {bad_bool}"
+        );
+        let unknown = parse("defaultDb=MySQL").expect_err("uncommon field refuses");
+        assert!(
+            unknown.contains("CLI form"),
+            "rich fields point at the CLI form: {unknown}"
+        );
+    }
+
+    /// `project new`: the two-step chain (name → optional title);
+    /// an EMPTY title SKIPS the field (not a cancel) — the fire
+    /// carries only the name.
+    #[test]
+    fn new_chain_prompts_title_and_empty_skips() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 0); // new
+        submit_projects_input(&mut state, "scratch");
+        assert!(
+            matches!(&state.modal, Some(Modal::Input { title, .. }) if title.contains("title")),
+            "the optional-title prompt chains next"
+        );
+        submit_projects_input(&mut state, "My Title");
+        assert_eq!(state.dashboard.in_flight, Some("project new"));
+
+        // Empty title skips the field (the fire still happens).
+        let mut fresh = projects_state_with_list();
+        run_projects_menu(&mut fresh, 0);
+        submit_projects_input(&mut fresh, "scratch");
+        update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            fresh.dashboard.in_flight,
+            Some("project new"),
+            "empty title SKIPS, does not cancel"
+        );
+    }
+
+    /// `project delete`: name Input (prefilled from the selection) →
+    /// Confirm gate (nothing fires before `y`); Esc cancels with the
+    /// pending cleared; `y` fires the unguarded action (the TUI's
+    /// `--yes`, main.rs parity).
+    #[test]
+    fn project_delete_is_confirm_gated() {
+        let mut state = projects_state_with_list(); // cursor on PlantFloor
+
+        run_projects_menu(&mut state, 4); // delete
+        match &state.modal {
+            Some(Modal::Input { buffer, .. }) => {
+                assert_eq!(buffer, "PlantFloor", "selection prefills the name");
+            }
+            other => panic!("delete form open, got {other:?}"),
+        }
+        accept_projects_input(&mut state);
+        assert!(
+            matches!(state.modal, Some(Modal::Confirm { .. })),
+            "the Confirm gate arms"
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::ProjectDelete {
+                name: "PlantFloor".into()
+            })
+        );
+        assert!(state.dashboard.in_flight.is_none(), "nothing before y");
+
+        // Esc cancels: pending cleared, still nothing in flight.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.dashboard.pending.is_none());
+        assert!(state.dashboard.in_flight.is_none());
+
+        // The accept twin: y fires.
+        let mut fresh = projects_state_with_list();
+        run_projects_menu(&mut fresh, 4);
+        accept_projects_input(&mut fresh);
+        update(&mut fresh, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("project delete"));
+    }
+
+    /// `project import`: the three-step chain (file → name → policy).
+    /// ABORT fires directly (its collisions refuse at the action's
+    /// own zero-write pre-check); OVERWRITE arms the Confirm gate; a
+    /// bad policy line refuses and arms nothing.
+    #[test]
+    fn project_import_chain_abort_fires_and_overwrite_is_confirm_gated() {
+        // abort: the full chain lands in-flight with no Confirm.
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 5); // import
+        submit_projects_input(&mut state, "plant.zip"); // file
+        replace_projects_input(&mut state, "restored"); // name
+        accept_projects_input(&mut state); // default policy = abort
+        assert!(state.modal.is_none(), "abort fires unguarded");
+        assert_eq!(state.dashboard.in_flight, Some("project import"));
+
+        // overwrite: the same chain arms the Confirm gate instead.
+        let mut fresh = projects_state_with_list();
+        run_projects_menu(&mut fresh, 5);
+        submit_projects_input(&mut fresh, "plant.zip");
+        replace_projects_input(&mut fresh, "restored");
+        replace_projects_input(&mut fresh, "overwrite");
+        assert!(matches!(fresh.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(
+            fresh.dashboard.pending,
+            Some(PendingAction::ProjectImportOverwrite {
+                name: "restored".into(),
+                file: "plant.zip".into()
+            })
+        );
+        assert!(fresh.dashboard.in_flight.is_none(), "overwrite waits for y");
+        update(&mut fresh, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("project import"));
+
+        // A bad policy line: error modal, nothing armed or fired.
+        let mut bad = projects_state_with_list();
+        run_projects_menu(&mut bad, 5);
+        submit_projects_input(&mut bad, "plant.zip");
+        replace_projects_input(&mut bad, "restored");
+        replace_projects_input(&mut bad, "merge");
+        assert!(
+            matches!(&bad.modal, Some(Modal::Result_ { title, .. }) if title == "project import"),
+            "bad policy surfaces the error modal"
+        );
+        assert!(bad.dashboard.pending.is_none());
+        assert!(bad.dashboard.in_flight.is_none());
+    }
+
+    /// `project export` prefills the `<name>.zip` default for the
+    /// selected project and fires on accept.
+    #[test]
+    fn project_export_prefills_the_default_name() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 6); // export
+        match &state.modal {
+            Some(Modal::Input { buffer, .. }) => {
+                assert_eq!(buffer, "PlantFloor.zip", "the safe-stem default prefills");
+            }
+            other => panic!("export form open, got {other:?}"),
+        }
+        accept_projects_input(&mut state);
+        assert_eq!(state.dashboard.in_flight, Some("project export"));
+    }
+
+    /// `resource put`: the three-step chain (project → path → file) →
+    /// Confirm gate — guarded since 05-02 (the surgery implicitly
+    /// overwrite-imports the whole project). Cancel spawns nothing;
+    /// `y` fires.
+    #[test]
+    fn resource_put_is_confirm_gated() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 7); // resource put
+        submit_projects_input(&mut state, "PlantFloor"); // project
+        submit_projects_input(&mut state, "views/root.json"); // path
+        submit_projects_input(&mut state, "root.json.new"); // content file
+        assert!(
+            matches!(state.modal, Some(Modal::Confirm { .. })),
+            "the Confirm gate arms"
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::ResourcePut {
+                project: "PlantFloor".into(),
+                path: "views/root.json".into(),
+                file: "root.json.new".into()
+            })
+        );
+        assert!(state.dashboard.in_flight.is_none(), "nothing before y");
+
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.dashboard.pending.is_none(), "cancel clears the arm");
+
+        let mut fresh = projects_state_with_list();
+        run_projects_menu(&mut fresh, 7);
+        submit_projects_input(&mut fresh, "PlantFloor");
+        submit_projects_input(&mut fresh, "views/root.json");
+        submit_projects_input(&mut fresh, "root.json.new");
+        update(&mut fresh, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("resource put"));
+    }
+
+    /// `resource delete`: the two-step chain (project → path) →
+    /// Confirm gate — the put twin.
+    #[test]
+    fn resource_delete_is_confirm_gated() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 8); // resource delete
+        submit_projects_input(&mut state, "PlantFloor");
+        submit_projects_input(&mut state, "views/root.json");
+        assert!(matches!(state.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::ResourceDelete {
+                project: "PlantFloor".into(),
+                path: "views/root.json".into()
+            })
+        );
+        assert!(state.dashboard.in_flight.is_none());
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("resource delete"));
+    }
+
+    /// Webdev deploy needs NO confirm — the 05-03 decision (the
+    /// ign-cli project is CLI-owned; replace-not-merge IS the
+    /// contract) — and status is a plain read. Both fire directly
+    /// from the menu.
+    #[test]
+    fn webdev_deploy_needs_no_confirm_and_status_reads() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 9); // webdev deploy
+        assert!(state.modal.is_none(), "deploy fires WITHOUT a Confirm gate");
+        assert_eq!(state.dashboard.in_flight, Some("webdev deploy"));
+
+        let mut fresh = projects_state_with_list();
+        run_projects_menu(&mut fresh, 10); // webdev status
+        assert!(fresh.modal.is_none());
+        assert_eq!(fresh.dashboard.in_flight, Some("webdev status"));
+    }
+
+    /// Rich projects forms advertise and open their exact CLI
+    /// synopsis through `?`, preserving the locked modal-depth escape
+    /// hatch.
+    #[test]
+    fn projects_question_mark_opens_the_cli_form() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 5); // import (a rich-arg form)
+        match &state.modal {
+            Some(Modal::Input { hint, .. }) => assert!(
+                hint.as_deref()
+                    .is_some_and(|text| text.contains("press ? for the CLI form")),
+                "rich form advertises the CLI escape hatch: {hint:?}"
+            ),
+            other => panic!("import form open, got {other:?}"),
+        }
+
+        update(&mut state, key(KeyCode::Char('?'), KeyModifiers::NONE));
+        match &state.modal {
+            Some(Modal::Result_ { title, lines, .. }) => {
+                assert_eq!(title, "CLI form");
+                assert!(
+                    lines.iter().any(|line| line.contains("ign project import")),
+                    "exact command synopsis is shown: {lines:?}"
+                );
+            }
+            other => panic!("CLI help pane open, got {other:?}"),
+        }
+        assert!(
+            state.projects.pending_form.is_none(),
+            "opening help disarms the replaced input form"
+        );
+    }
+
+    /// Esc clears an armed projects form — a canceled form can never
+    /// arm a later Enter (the cancel-clears-everything contract).
+    #[test]
+    fn esc_clears_an_armed_projects_form() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 3); // set
+        assert!(state.projects.pending_form.is_some());
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert!(state.projects.pending_form.is_none(), "form slot cleared");
     }
 }

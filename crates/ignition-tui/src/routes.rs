@@ -229,6 +229,70 @@ pub fn routes() -> &'static [CliRoute] {
             path: "tags history query",
             mapping: Mapping::Screen(Screen::Tags),
         },
+        // 06-05: the project/resource/webdev families — every leaf
+        // exactly as clap spells it (ProjectCommand: list/new/copy/
+        // rename/set/delete/export/import; ResourceCommand: list/get/
+        // put/delete; WebdevCommand: deploy/status). `project list`
+        // IS the Projects screen's table; `resource list`/`resource
+        // get` are the detail drill-down; the act verbs ride the
+        // `a` actions menu (guarded ones Confirm-gated, webdev
+        // deploy deliberately ungated — the 05-03 decision).
+        CliRoute {
+            path: "project list",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project new",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project copy",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project rename",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project set",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project delete",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project export",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "project import",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "resource list",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "resource get",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "resource put",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "resource delete",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "webdev deploy",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "webdev status",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
     ]
 }
 
@@ -389,6 +453,56 @@ mod tests {
             assert!(
                 matches!(row.mapping, super::Mapping::Screen(s) if s == Screen::Tags),
                 "{path} maps to the Tags screen"
+            );
+        }
+    }
+
+    /// The 06-05 rows cover EVERY project/resource/webdev leaf
+    /// exactly as clap spells it (ProjectCommand/ResourceCommand/
+    /// WebdevCommand — command is required on all three, so there is
+    /// no bare `project`/`resource`/`webdev` leaf) — the family
+    /// completeness that feeds 06-06's clap-walk coverage test.
+    #[test]
+    fn project_resource_webdev_rows_cover_every_leaf() {
+        let expected = [
+            ("project list", Screen::Projects),
+            ("project new", Screen::Projects),
+            ("project copy", Screen::Projects),
+            ("project rename", Screen::Projects),
+            ("project set", Screen::Projects),
+            ("project delete", Screen::Projects),
+            ("project export", Screen::Projects),
+            ("project import", Screen::Projects),
+            ("resource list", Screen::Projects),
+            ("resource get", Screen::Projects),
+            ("resource put", Screen::Projects),
+            ("resource delete", Screen::Projects),
+            ("webdev deploy", Screen::Projects),
+            ("webdev status", Screen::Projects),
+        ];
+        for (path, screen) in expected {
+            let row = routes()
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("projects route row {path:?} missing"));
+            assert!(
+                matches!(row.mapping, super::Mapping::Screen(s) if s == screen),
+                "{path} maps to {screen:?}"
+            );
+        } // And exactly those rows exist (no extras under the three
+        // family prefixes).
+        for prefix in ["project", "resource", "webdev"] {
+            let count = routes()
+                .iter()
+                .filter(|route| route.path.starts_with(prefix))
+                .count();
+            let expected_count = expected
+                .iter()
+                .filter(|(path, _)| path.starts_with(prefix))
+                .count();
+            assert_eq!(
+                count, expected_count,
+                "exactly the {prefix} leaves that exist"
             );
         }
     }
