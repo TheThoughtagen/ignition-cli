@@ -5,6 +5,17 @@
 //! Per-screen data structs are added by their plans (06-02..06-06); the
 //! shell owns the navigation chrome only.
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use ignition_core::actions::sessions::{SessionType, SessionsResult};
+use ignition_core::client::ReqwestGatewayApi;
+use ratatui::widgets::TableState;
+use tokio::sync::{mpsc, watch};
+
+use crate::event::AppEvent;
+use crate::workers::refresh::Snapshot;
+
 /// Every screen the phase ships. ALL variants exist from day one so
 /// later plans never edit the enum — they only grow what each variant
 /// knows how to render.
@@ -111,6 +122,81 @@ impl Modal {
     }
 }
 
+/// The client handle the workers target — a newtype ONLY because
+/// `ReqwestGatewayApi` does not implement `Debug` and `AppState`
+/// derives it. Storing a handle is data, not I/O; the actions still
+/// run exclusively inside spawned workers.
+pub struct ClientHandle(pub Arc<ReqwestGatewayApi>);
+
+impl std::fmt::Debug for ClientHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientHandle(..)")
+    }
+}
+
+/// One flattened, selectable row of the sessions panel (the terminate
+/// target). The merged designers → perspective → vision order is THE
+/// contract between render (table rows) and update (selection index →
+/// terminate call) — both sides go through [`session_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    /// The family (selects the terminate route).
+    pub kind: SessionType,
+    /// Session/client id.
+    pub id: String,
+    /// Authenticated user.
+    pub user: String,
+    /// Open project.
+    pub project: String,
+}
+
+/// Flatten a sessions result into selectable rows, in the LOCKED
+/// order (designers, then perspective, then vision).
+pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
+    let mut rows: Vec<SessionRow> = result
+        .designers
+        .iter()
+        .map(|d| SessionRow {
+            kind: SessionType::Designer,
+            id: d.id.clone(),
+            user: d.user.clone(),
+            project: d.project.clone(),
+        })
+        .chain(result.perspective.iter().map(|p| SessionRow {
+            kind: SessionType::Perspective,
+            id: p.id.clone(),
+            user: p.username.clone(),
+            project: p.project.clone(),
+        }))
+        .chain(result.vision.iter().map(|v| SessionRow {
+            kind: SessionType::Vision,
+            id: v.id.clone(),
+            user: v.user.clone(),
+            project: v.project.clone(),
+        }))
+        .collect();
+    rows.shrink_to_fit();
+    rows
+}
+
+/// The dashboard screen's data (06-02).
+#[derive(Debug, Default)]
+pub struct DashboardData {
+    /// Latest accepted snapshot (None until the first worker report —
+    /// every panel then renders its Loading state).
+    pub snapshot: Option<Snapshot>,
+    /// When the last accepted snapshot landed — drives the "N s ago"
+    /// status line; the 250 ms tick keeps it live without extra state.
+    pub last_refresh: Option<Instant>,
+    /// A refresh is in flight — the `r` keystroke's busy guard
+    /// (keystrokes cannot stack duplicate refreshes).
+    pub busy: bool,
+    /// The sessions table cursor (selectable rows — the terminate
+    /// target). Cloned for `render_stateful_widget`; update owns the
+    /// mutations.
+    pub sessions_table: TableState,
+}
+
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
@@ -127,6 +213,16 @@ pub struct AppState {
     /// Worker generation counter — bumped when the world under the
     /// workers changes (screen exit, profile switch).
     pub era: u64,
+    /// The client workers target (None before resolve / in unit tests).
+    pub client: Option<ClientHandle>,
+    /// The AppEvent rail — a clone of the loop's sender, so update can
+    /// arm workers (spawn helpers take their copy from here).
+    pub events_tx: Option<mpsc::UnboundedSender<AppEvent>>,
+    /// The refresh worker's shutdown switch — `send(true)` on profile
+    /// switch (re-target) and on quit.
+    pub refresh_shutdown: Option<watch::Sender<bool>>,
+    /// Dashboard screen data (06-02).
+    pub dashboard: DashboardData,
 }
 
 impl AppState {

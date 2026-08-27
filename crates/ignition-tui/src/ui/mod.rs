@@ -137,7 +137,9 @@ mod tests {
     }
 
     /// The chrome renders: tab bar over every screen name + the active
-    /// screen's placeholder pane — with NO gateway at all.
+    /// screen's pane — with NO gateway at all (the Dashboard renders
+    /// its Loading panels; the still-placeholder screens render the
+    /// bordered "not yet wired" block).
     #[test]
     fn chrome_renders_tab_bar_and_placeholder_pane() {
         let state = AppState::new();
@@ -149,19 +151,22 @@ mod tests {
             "tab bar lists every screen"
         );
 
-        // Row 1: the active screen's bordered placeholder block.
-        let expected_title_row = {
-            let title = "Dashboard — not yet wired";
-            let mut row = format!("┌{title}");
-            while row.chars().count() < 79 {
-                row.push('─');
-            }
-            row.push('┐');
-            row
-        };
-        assert_eq!(rows[1], expected_title_row, "placeholder block title");
+        // The dashboard (no snapshot) shows Loading panels, never blank.
+        assert!(
+            rows.iter().any(|row| row.contains("Loading")),
+            "dashboard panels render Loading before the first refresh"
+        );
 
-        // The block closes at the bottom of the frame.
+        // A placeholder screen (Logs, until 06-03) still renders the
+        // bordered block with its title.
+        let mut logs = AppState::new();
+        logs.screen = Screen::Logs;
+        let rows = rendered_rows(&logs);
+        assert!(
+            rows[1].starts_with("┌Logs — not yet wired"),
+            "placeholder block title: {}",
+            rows[1]
+        );
         assert_eq!(
             rows[23],
             "└".to_string() + &"─".repeat(78) + "┘",
@@ -269,12 +274,12 @@ mod tests {
             "body sits inside the modal block: {body_row:?}"
         );
 
-        // Clear proof: no row mixes the pane's placeholder title with
-        // modal content — the modal's rect carries only its own glyphs.
+        // Clear proof: no row mixes a dashboard panel title with modal
+        // content — the modal's rect carries only its own glyphs.
         assert!(
             !rows
                 .iter()
-                .any(|row| row.contains("confirm") && row.contains("┌Dashboard — not yet wired")),
+                .any(|row| row.contains("confirm") && row.contains("status")),
             "modal rect wipes the underlying pane content"
         );
     }

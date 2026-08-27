@@ -26,7 +26,7 @@ use ignition_core::error::CoreError;
 use tokio::sync::mpsc;
 
 use crate::event::AppEvent;
-use crate::state::AppState;
+use crate::state::{AppState, ClientHandle};
 use crate::update::update;
 
 /// The cockpit's redraw staleness floor. The loop draws after EVERY
@@ -42,46 +42,85 @@ const TICK: Duration = Duration::from_millis(250);
 /// `ratatui::init()` runs through `ratatui::restore()` (Ok, Err, and
 /// the init-installed panic hook).
 pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
-    // The shell wires zero gateway calls; resolving first keeps the
-    // day-one contract honest (the cockpit opens only against a real
-    // profile) while 06-02's workers take the client from here.
-    let _context = context::resolve(profile_flag.as_deref())?;
+    // The cockpit owns a live client from the first frame: the
+    // dashboard's refresh worker spawns against it (06-02).
+    let (_profile_name, client) = context::resolve(profile_flag.as_deref())?;
 
     let mut terminal = ratatui::init();
-    let app_result = run_loop(&mut terminal).await;
+    let app_result = run_loop(&mut terminal, client).await;
     ratatui::restore();
     app_result
 }
 
+/// State wiring + worker spawn + the select loop, then worker teardown.
+async fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    client: std::sync::Arc<ignition_core::client::ReqwestGatewayApi>,
+) -> Result<(), CoreError> {
+    let mut state = AppState::new();
+    let mut crossterm_events = crossterm::event::EventStream::new();
+    let mut tick = tokio::time::interval(TICK);
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<AppEvent>();
+
+    // The dashboard's interval refresh worker (06-02): one spawn per
+    // world. The shell keeps the sender (the loop's rail stays armed
+    // even if this worker is the only sender); profile switch (06-02
+    // Task 3) re-spawns against a new client under a new era.
+    let (shutdown_tx, shutdown_rx) = workers::shutdown_channel();
+    state.client = Some(ClientHandle(client.clone()));
+    state.events_tx = Some(events_tx.clone());
+    state.refresh_shutdown = Some(shutdown_tx);
+    let era = workers::new_era(&mut state);
+    tokio::spawn(workers::refresh::refresh_worker(
+        client,
+        events_tx,
+        shutdown_rx,
+        era,
+        workers::refresh::REFRESH_PERIOD,
+    ));
+
+    let result = event_loop(
+        terminal,
+        &mut state,
+        &mut events_rx,
+        &mut crossterm_events,
+        &mut tick,
+    )
+    .await;
+
+    // Stop the refresh worker — the loop is done, the world is gone.
+    if let Some(shutdown) = &state.refresh_shutdown {
+        let _ = shutdown.send(true);
+    }
+    result
+}
+
 /// The select loop (research Pattern 1): crossterm `EventStream` (input)
-/// + a 250 ms tick + the AppEvent channel (worker results, later plans).
+/// + a 250 ms tick + the AppEvent channel (worker results).
 ///
 /// The EventStream arm matches EXHAUSTIVELY — a bare `Some(Ok(e)) =`
 /// pattern would permanently disable the arm after a terminal-stream
 /// error and the app would freeze for input (research Pitfall 3).
-async fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<(), CoreError> {
-    let mut state = AppState::new();
-    let mut crossterm_events = crossterm::event::EventStream::new();
-    let mut tick = tokio::time::interval(TICK);
-    // The shell spawns no workers, but the AppEvent arm is the loop's
-    // third rail — holding the sender keeps the channel open (recv()
-    // pends, the arm stays armed) so 06-02+ workers just clone it.
-    let events_tx = mpsc::unbounded_channel::<AppEvent>();
-    let mut events_rx = events_tx.1;
-
+async fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    state: &mut AppState,
+    events_rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    crossterm_events: &mut crossterm::event::EventStream,
+    tick: &mut tokio::time::Interval,
+) -> Result<(), CoreError> {
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                update(&mut state, AppEvent::Tick);
-                draw(terminal, &state)?;
+                update(state, AppEvent::Tick);
+                draw(terminal, state)?;
             }
             ev = crossterm_events.next() => match ev {
                 Some(Ok(event)) => {
-                    update(&mut state, AppEvent::Input(event));
+                    update(state, AppEvent::Input(event));
                     if state.should_quit {
                         return Ok(());
                     }
-                    draw(terminal, &state)?;
+                    draw(terminal, state)?;
                 }
                 // A terminal-stream error is fatal-but-clean: restore
                 // runs in run()'s tail, the error flows the normal
@@ -94,11 +133,11 @@ async fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<(), CoreErr
                 None => return Ok(()),
             },
             Some(app_event) = events_rx.recv() => {
-                update(&mut state, app_event);
+                update(state, app_event);
                 if state.should_quit {
                     return Ok(());
                 }
-                draw(terminal, &state)?;
+                draw(terminal, state)?;
             }
         }
     }

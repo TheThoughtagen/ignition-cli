@@ -32,6 +32,8 @@ pub fn is_current(state_era: u64, worker_era: u64) -> bool {
     state_era == worker_era
 }
 
+pub mod refresh;
+
 #[cfg(test)]
 mod tests {
     use super::{is_current, new_era, shutdown_channel};

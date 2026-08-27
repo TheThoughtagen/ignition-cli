@@ -8,7 +8,8 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 use crate::event::AppEvent;
-use crate::state::{AppState, Modal};
+use crate::state::{AppState, Modal, Screen};
+use crate::workers;
 
 /// Fold one event into the state. The select loop calls this exactly
 /// once per event; drawing happens in the loop, never here.
@@ -25,6 +26,16 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 title: "error".to_string(),
                 lines: vec![message],
             });
+        }
+        // The dashboard refresh: store, clear busy, record freshness.
+        // Stale-era snapshots are dropped whole (Pitfall 9) — a result
+        // from the pre-switch profile never lands, not even partially.
+        AppEvent::Refresh { era, snapshot } => {
+            if workers::is_current(state.era, era) {
+                state.dashboard.snapshot = Some(*snapshot);
+                state.dashboard.last_refresh = Some(std::time::Instant::now());
+                state.dashboard.busy = false;
+            }
         }
     }
 }
@@ -56,8 +67,49 @@ fn handle_input(state: &mut AppState, event: Event) {
         // Tab / Shift+Tab cycle screens (wrap-around).
         KeyCode::Tab => state.screen = state.screen.next(),
         KeyCode::BackTab => state.screen = state.screen.prev(),
+        // Everything else belongs to the active screen's keymap.
+        _ => handle_screen_keys(state, key.code),
+    }
+}
+
+/// Screen-local keymaps (no modal open). Screens not yet wired (06-03+)
+/// take no keys beyond the global set.
+fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
+    if state.screen == Screen::Dashboard {
+        dashboard_keys(state, code);
+    }
+}
+
+/// The dashboard keymap (06-02 Task 1): `r` refreshes now (busy
+/// guarded), Up/Down move the sessions-table cursor.
+fn dashboard_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Char('r') => workers::refresh::spawn_refresh_once(state),
+        KeyCode::Up => move_session_selection(state, -1),
+        KeyCode::Down => move_session_selection(state, 1),
         _ => {}
     }
+}
+
+/// Move the sessions-table cursor within the flattened row set. Clamped
+/// (no wrap — a table cursor that wraps is a lie about adjacency).
+fn move_session_selection(state: &mut AppState, delta: i32) {
+    let Some(snapshot) = &state.dashboard.snapshot else {
+        return;
+    };
+    let Some(sessions) = &snapshot.sessions else {
+        return;
+    };
+    let len = crate::state::session_rows(sessions).len();
+    if len == 0 {
+        return;
+    }
+    let next = match state.dashboard.sessions_table.selected() {
+        None => 0,
+        Some(idx) if delta < 0 => idx.saturating_sub(1),
+        Some(idx) => (idx + 1).min(len - 1),
+    };
+    state.dashboard.sessions_table.select(Some(next));
 }
 
 /// Keystrokes while a modal is open: Esc pops the modal (before any
@@ -242,5 +294,97 @@ mod tests {
         update(&mut state, AppEvent::Error("gateway unreachable".into()));
         assert!(matches!(state.modal, Some(Modal::Result_ { .. })));
         assert!(!state.should_quit);
+    }
+
+    /// A current-era Refresh fills DashboardData and clears the busy
+    /// guard (the 'r' keystroke's exit condition).
+    #[test]
+    fn refresh_fills_dashboard_data_and_clears_busy() {
+        let mut state = AppState::new();
+        state.dashboard.busy = true;
+        let era = state.era;
+
+        update(
+            &mut state,
+            AppEvent::Refresh {
+                era,
+                snapshot: Box::new(crate::workers::refresh::Snapshot::default()),
+            },
+        );
+
+        assert!(state.dashboard.snapshot.is_some(), "snapshot stored");
+        assert!(state.dashboard.last_refresh.is_some(), "freshness recorded");
+        assert!(!state.dashboard.busy, "busy clears");
+    }
+
+    /// A stale-era Refresh is dropped WHOLE — a snapshot from the
+    /// pre-switch profile never lands, not even partially (Pitfall 9).
+    #[test]
+    fn stale_era_refresh_is_dropped() {
+        let mut state = AppState::new();
+        state.dashboard.busy = true;
+        let stale_era = state.era.wrapping_sub(1);
+
+        update(
+            &mut state,
+            AppEvent::Refresh {
+                era: stale_era,
+                snapshot: Box::new(crate::workers::refresh::Snapshot::default()),
+            },
+        );
+
+        assert!(state.dashboard.snapshot.is_none(), "stale snapshot dropped");
+        assert!(state.dashboard.last_refresh.is_none());
+        assert!(state.dashboard.busy, "stale refresh does not clear busy");
+    }
+
+    /// `r` on the Dashboard triggers a refresh through the busy guard
+    /// (state-machine half; the spawn is runtime-gated).
+    #[test]
+    fn r_key_triggers_manual_refresh_once() {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        assert!(!state.dashboard.busy);
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(state.dashboard.busy, "manual refresh marks busy");
+
+        // Second `r` while busy: refused (no stack).
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(state.dashboard.busy);
+    }
+
+    /// Up/Down move the sessions cursor within the flattened rows,
+    /// clamped; without a snapshot they are no-ops.
+    #[test]
+    fn up_down_move_the_sessions_cursor() {
+        let mut state = AppState::new();
+
+        // No snapshot yet: no-op.
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(state.dashboard.sessions_table.selected().is_none());
+
+        // One selectable row.
+        let snapshot = crate::workers::refresh::Snapshot {
+            sessions: Some(ignition_core::actions::sessions::SessionsResult {
+                designers: vec![
+                    serde_json::from_value(serde_json::json!({"id": "d-1", "user": "admin"}))
+                        .expect("designer fixture"),
+                ],
+                perspective: Vec::new(),
+                vision: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        state.dashboard.snapshot = Some(snapshot);
+
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.dashboard.sessions_table.selected(), Some(0));
+
+        // Clamp at len-1 (one row → stays 0).
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.dashboard.sessions_table.selected(), Some(0));
     }
 }

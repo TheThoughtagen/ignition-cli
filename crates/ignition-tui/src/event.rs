@@ -19,6 +19,19 @@ pub enum AppEvent {
     /// A worker-reported failure (workers must send this instead of
     /// panicking — a panic inside `tokio::spawn` never unwinds the loop).
     Error(String),
+    /// A dashboard refresh snapshot (06-02). `era` is the worker's
+    /// spawn-era; update drops stale-era events (a profile switch
+    /// invalidates in-flight snapshots — Pitfall 9: no data from the
+    /// previous profile ever lands). The snapshot is boxed — the panel
+    /// payloads dwarf every other variant and the event moves through
+    /// the channel on every refresh.
+    Refresh {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// Per-panel data + per-panel errors (one failing endpoint
+        /// degrades its panel only — never the whole dashboard).
+        snapshot: Box<crate::workers::refresh::Snapshot>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

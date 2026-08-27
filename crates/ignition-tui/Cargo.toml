@@ -20,3 +20,8 @@ futures-util = { workspace = true }
 # isolated config files for the context unit tests (already in the
 # workspace graph — NOT a new dependency)
 tempfile = { workspace = true }
+# wiremock gateway for the refresh-worker/dashboard fixture tests (the
+# ignition-core test precedent; already in the workspace graph)
+wiremock = { workspace = true }
+# fixture payloads for client-model test constructors (workspace graph)
+serde_json = { workspace = true }
