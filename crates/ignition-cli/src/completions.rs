@@ -13,7 +13,7 @@
 use clap::CommandFactory;
 use clap_complete::aot::{Shell, generate};
 
-use crate::cli::Cli;
+use ignition_cli::cli::Cli;
 
 /// Generate the completion script for `shell` into a String (rendered to
 /// stdout by `render_ok` — the sanctioned exception).

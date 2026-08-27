@@ -16,7 +16,6 @@
 //!   data output; errors render to stderr in every mode — no crossover.
 //! - No direct exit calls anywhere outside clap's `Error::exit`.
 
-mod cli;
 mod completions;
 mod render;
 
@@ -31,13 +30,16 @@ use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::config::{self, AuthRef, Config, Credential, SecretStore};
 use ignition_core::error::CoreError;
 
-use crate::cli::{
+// The command tree lives in the crate's lib target (shared with the
+// integration tests — the TUI-coverage walk needs `Cli::command()`).
+use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
+use ignition_cli::cli;
+use ignition_cli::cli::{
     Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
     ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
     TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
     TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
-use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 
 /// What a dispatched subcommand produced. One variant per command; grows in
 /// later plans. The payload serializes as the envelope's `data` (see
@@ -864,7 +866,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 file,
                 collision_policy,
             } => {
-                if matches!(collision_policy, crate::cli::CollisionPolicy::Overwrite)
+                if matches!(collision_policy, cli::CollisionPolicy::Overwrite)
                     && let Err(err) =
                         require_confirmation(cli.yes, "project import --collision-policy overwrite")
                 {
@@ -1109,7 +1111,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
                 TagsCommand::Config(TagsConfigCommand::Delete { .. }) => Some("tags config delete"),
                 TagsCommand::Import {
-                    collision_policy: crate::cli::CollisionPolicy::Overwrite,
+                    collision_policy: cli::CollisionPolicy::Overwrite,
                     ..
                 } => Some("tags import --collision-policy overwrite"),
                 _ => None,
@@ -1368,8 +1370,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 RigCommand::Reset { .. } => Some("rig reset"),
                 RigCommand::Restore { .. } => Some("rig restore"),
                 RigCommand::Trial(trial_args) => match trial_args.command {
-                    crate::cli::TrialCommand::Reset { .. } => Some("rig trial reset"),
-                    crate::cli::TrialCommand::Status => None,
+                    cli::TrialCommand::Reset { .. } => Some("rig trial reset"),
+                    cli::TrialCommand::Status => None,
                 },
                 _ => None,
             };
@@ -1460,13 +1462,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     // which rung lands) and/or the tier-1 pair
                     // (--user / IGNITION_USER + IGNITION_PASSWORD).
                     RigCommand::Trial(ref trial_args) => match trial_args.command.clone() {
-                        crate::cli::TrialCommand::Status => match rig_gateway_client(&plan, None) {
+                        cli::TrialCommand::Status => match rig_gateway_client(&plan, None) {
                             Some(api) => actions::rig::trial_status(&api)
                                 .await
                                 .map(ActionOutput::RigTrialStatus),
                             None => Err(trial_no_gateway(&plan)),
                         },
-                        crate::cli::TrialCommand::Reset { user } => {
+                        cli::TrialCommand::Reset { user } => {
                             // Cred sourcing (rig family — no profile
                             // chain): tier-0 token = IGNITION_TOKEN;
                             // tier-1 pair = --user flag or IGNITION_USER
