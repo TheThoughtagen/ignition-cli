@@ -182,5 +182,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 3. Project Operations | 3/3 | Complete | 2026-08-22 |
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
 | 5. WebDev Backend & Tag Operations | 8/8 | Complete | 2026-08-26 |
-| 6. TUI Cockpit | 0/4 | Not started | - |
+| 6. TUI Cockpit | 0/6 | Not started | - |
 | 7. Ecosystem Interop & Advanced Ops | 0/4 | Not started | - |
