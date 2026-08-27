@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 executing: 06-01 cockpit foundation SHIPPED (async select-loop shell + Elm state/update + modal infra + context resolution + tail-sink Send fix + routes scaffold; 542 tests green, fmt/clippy clean; pty-proven lifecycle). Next: 06-02 Dashboard.
+**Current focus:** Phase 6 executing: 06-02 dashboard SHIPPED (4-panel live refresh + actions menu with confirm-gated verbs + session terminate + atomic profile switcher; poll.rs Probe now Send; 570 tests green, fmt/clippy clean). Next: 06-03 Logs.
 
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit)
-**Current Plan:** 2 of 6
-**Status:** 06-01 complete (cockpit shell live — screens 06-02..06-06 purely additive)
+**Current Plan:** 3 of 6
+**Status:** 06-02 complete (dashboard + actions menu + profile switcher live — 06-03..06-06 purely additive)
 **Last Activity:** 2026-08-27
 
-**Progress:** [████████░░] 83%
+**Progress:** [█████████░] 87%
 
 ## Performance Metrics
 
@@ -52,6 +52,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 05 P07 | 196min | 3 tasks | 10 files |
 | Phase 05 P08 | 60min | 2 tasks | 9 files |
 | Phase 06 P01 | 222min | 3 tasks | 31 files |
+| Phase 06 P02 | 60min | 3 tasks | 16 files |
 
 ## Accumulated Context
 
@@ -146,6 +147,9 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-01]: ign tui stdout contract — TuiExited renders NOTHING in every mode (intercepted in render_ok before mode dispatch); piped stdout = CoreError::InvalidInput exit 2 (usage-class; no dedicated Usage variant exists in the frozen taxonomy); profile resolution runs BEFORE ratatui::init so config/secret errors never flash the alt screen — the cockpit owns the alternate screen; errors after restore flow the frozen envelope + exit taxonomy untouched
 - [Phase 06]: [Phase 06-01]: Cockpit keymap + seam pins — Ctrl-C checked BEFORE modal routing (raw mode disables ISIG; the escape hatch cannot be escapable, even mid-input-modal); 'q' inserts into Input modal buffers, never quits behind a modal; Esc pops modal first, quits only second; Screen enum ships ALL six variants day one (next()/prev() wrap) so screen plans never edit it; logs::tail sink + Send (06-03's spawn seam); context::resolve/rebuild mirror main.rs's private resolution via public config fns only (choke files untouched, REQUIRED credential — authed surface) — Pitfall 4/5 designed out; must-have truths over plan sketches where they conflicted
 - [Phase 06]: [Phase 06-01]: Rule-3 fmt sweep — CI last ran 2026-08-22 so all Phase 5 plans (05-02..05-08) landed unvalidated and carried rustfmt drift; one style-only commit normalized 15 files (542 tests green, zero behavior change) — this plan's push is the first CI validation of the Phase 5 tail — CI's cargo fmt --all --check would have failed on push; drift was unvalidated, not CI-green
+- [Phase 06-02]: [Phase 06-02]: TUI worker patterns LOCKED — snapshot() composes action fns AS-IS via future::join4 with per-panel degrade (Option<T>+error, one dead endpoint never blanks the dashboard); spawn_action is the one-shot pattern (in-flight busy guard, era-stamped, pretty-JSON result modal, Handle::try_current-guarded so update() never panics in tests); poll.rs Probe gained +Send with outer scratch Cells→Mutexes (restart/logs/rig) — every locked HRTB contract intact, all core tests green, the TUI can tokio::spawn whole waits
+- [Phase 06-02]: [Phase 06-02]: Profile switch is ATOMIC by ordering (rebuild FIRST → use_profile persist → adopt+era-bump+respawn) — a failed rebuild leaves config.active unwritten and old workers running (truths-over-plan-sketch); ProfileChanged banner retires on the new world's first refresh; Esc clears armed modal payloads so a canceled Confirm can never arm a later y
+- [Phase 06-02]: [Phase 06-02]: ONE crate-wide #[cfg(test)] ENV_LOCK in ignition-tui lib.rs — per-module env locks do NOT serialize cross-module (a racing teardown made context::resolve fall back to the real machine config); routes.rs carries 15 dashboard/profile rows for 06-06's clap-walk completeness test (bare 'sessions' IS the list leaf)
 
 ### Pending Todos
 
@@ -162,6 +166,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T18:11:46.696Z
-**Stopped At:** Completed 06-01-PLAN.md (cockpit foundation: select loop, Elm state/update, modal infra, context, routes scaffold — screens 06-02..06-06 purely additive)
+**Last session:** 2026-08-27T19:21:01.201Z
+**Stopped At:** Completed 06-02-PLAN.md (dashboard + actions menu + session terminate + profile switcher; poll.rs Send fix; 570 tests green)
 **Resume file:** None
