@@ -67,6 +67,7 @@ where
 }
 
 pub mod refresh;
+pub mod tail;
 
 #[cfg(test)]
 mod tests {

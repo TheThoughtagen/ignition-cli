@@ -33,6 +33,10 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 scroll: 0,
             });
         }
+        // One streamed log entry (06-03): append to the ring under its
+        // cap. Not era-stamped (plan-locked: ring turnover is the
+        // acceptance policy; the worker's shutdown watch is the scope).
+        AppEvent::LogLine(entry) => state.logs.push_line(entry),
         // The dashboard refresh: store, clear busy, record freshness.
         // Stale-era snapshots are dropped whole (Pitfall 9) — a result
         // from the pre-switch profile never lands, not even partially.
@@ -98,13 +102,31 @@ fn handle_input(state: &mut AppState, event: Event) {
     match key.code {
         // `q` (no modal) and Esc both quit the cockpit.
         KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-        // Tab / Shift+Tab cycle screens (wrap-around).
-        KeyCode::Tab => state.screen = state.screen.next(),
-        KeyCode::BackTab => state.screen = state.screen.prev(),
+        // Tab / Shift+Tab cycle screens (wrap-around). Screen-scoped
+        // workers (the logs tail) start/stop on the transition.
+        KeyCode::Tab => set_screen(state, state.screen.next()),
+        KeyCode::BackTab => set_screen(state, state.screen.prev()),
         // `p` opens the profile switcher from ANY screen (no modal).
         KeyCode::Char('p') => open_profiles_modal(state),
         // Everything else belongs to the active screen's keymap.
         _ => handle_screen_keys(state, key.code),
+    }
+}
+
+/// Change the active screen, starting/stopping the screen-scoped
+/// workers on the transition: LEAVING the Logs screen stops the tail
+/// (must-have truth #3), entering it re-arms the tail resuming past
+/// the ring's newest entry (no duplicate flood).
+fn set_screen(state: &mut AppState, screen: Screen) {
+    if state.screen == screen {
+        return;
+    }
+    if state.screen == Screen::Logs {
+        workers::tail::stop_tail(state);
+    }
+    state.screen = screen;
+    if state.screen == Screen::Logs {
+        workers::tail::spawn_tail(state);
     }
 }
 
@@ -164,17 +186,24 @@ fn switch_profile(state: &mut AppState, name: &str) {
     let (resolved_name, url, api) = rebuilt;
     // Stop the old world's refresh worker BEFORE adopting (its results
     // are already stale — the era bump below formally retires them).
+    // The screen-scoped tail stops too, and its ring clears: the new
+    // world's Logs screen starts from the new gateway's buffer.
     if let Some(shutdown) = &state.refresh_shutdown {
         let _ = shutdown.send(true);
     }
+    workers::tail::stop_tail(state);
     state.client = Some(crate::state::ClientHandle(api));
     state.profile_url = Some(url);
     state.profile = Some(resolved_name.clone());
     state.dashboard = crate::state::DashboardData::default();
+    state.logs = crate::state::LogsData::default();
     state.close_modal();
     // Re-spawn under a new era (bumps) + post the banner through the
     // rail so the loop redraws on it.
     workers::refresh::spawn_refresh(state);
+    if state.screen == Screen::Logs {
+        workers::tail::spawn_tail(state);
+    }
     if let Some(tx) = &state.events_tx {
         let _ = tx.send(AppEvent::ProfileChanged {
             era: state.era,
@@ -209,11 +238,36 @@ fn submit_profile_add(state: &mut AppState) {
     }
 }
 
-/// Screen-local keymaps (no modal open). Screens not yet wired (06-03+)
+/// Screen-local keymaps (no modal open). Screens not yet wired (06-04+)
 /// take no keys beyond the global set.
 fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
-    if state.screen == Screen::Dashboard {
-        dashboard_keys(state, code);
+    match state.screen {
+        Screen::Dashboard => dashboard_keys(state, code),
+        Screen::Logs => logs_keys(state, code),
+        _ => {}
+    }
+}
+
+/// The Logs keymap (06-03): `l` cycles the level filter (restarting
+/// the tail with the new min_level — the filter also applies at render
+/// over the retained ring), `f` toggles follow, j/k/Up/Down/PgUp/PgDn
+/// scroll the filtered view (scrolling up disables follow), `G`/End
+/// jump back to the newest line and re-enable follow.
+fn logs_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Char('l') => {
+            state.logs.filter = state.logs.filter.next();
+            // Shutdown + respawn with the new min_level (the render-side
+            // filter keeps already-received entries visible).
+            workers::tail::spawn_tail(state);
+        }
+        KeyCode::Char('f') => state.logs.toggle_follow(),
+        KeyCode::Char('k') | KeyCode::Up => state.logs.scroll_up(1),
+        KeyCode::PageUp => state.logs.scroll_up(10),
+        KeyCode::Char('j') | KeyCode::Down => state.logs.scroll_down(1),
+        KeyCode::PageDown => state.logs.scroll_down(10),
+        KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::End => state.logs.jump_to_end(),
+        _ => {}
     }
 }
 
@@ -1306,5 +1360,144 @@ mod tests {
         assert!(config.profiles.contains_key("stage"));
 
         teardown_profiles(&vars);
+    }
+
+    // ---- Logs screen (06-03 Task 1) ----
+
+    fn log_entry(
+        timestamp: i64,
+        level: &str,
+        message: &str,
+    ) -> ignition_core::client::logs::LogEntry {
+        ignition_core::client::logs::LogEntry {
+            timestamp,
+            logger_name: "GatewayManager".into(),
+            level: level.into(),
+            message: message.into(),
+            stack: Vec::new(),
+            mdc: Default::default(),
+            extra: Default::default(),
+        }
+    }
+
+    /// Entering the Logs screen arms the tail rail; leaving stops it
+    /// (must-have truth #3 — the state-machine half; nothing spawns
+    /// outside a runtime).
+    #[test]
+    fn logs_screen_entry_and_exit_arm_and_stop_the_tail_rail() {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+
+        // Dashboard → Logs (one Tab): the rail arms.
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Logs);
+        assert!(
+            state.logs.tail_shutdown.is_some(),
+            "entering Logs arms the tail shutdown rail"
+        );
+
+        // Logs → Tags: the rail signals + clears.
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Tags);
+        assert!(
+            state.logs.tail_shutdown.is_none(),
+            "leaving Logs stops the tail worker"
+        );
+    }
+
+    /// The follow/scroll state machine: scrolling up disables follow,
+    /// `g`/End re-enables (offset 0), `f` toggles with a snap to
+    /// bottom on re-enable, scrolling back down to the bottom
+    /// re-enables follow.
+    #[test]
+    fn logs_follow_scroll_state_machine() {
+        let mut state = AppState::new();
+        state.screen = Screen::Logs;
+        for i in 0..30 {
+            state.logs.push_line(log_entry(i, "INFO", "fill"));
+        }
+        assert!(state.logs.follow, "follow starts on");
+
+        // PageUp: offset 10, follow off.
+        update(&mut state, key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(state.logs.scroll_offset, 10);
+        assert!(!state.logs.follow, "scrolling up disables follow");
+
+        // k: one more line up.
+        update(&mut state, key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.logs.scroll_offset, 11);
+
+        // j: back down one — still off (not at the bottom yet).
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(state.logs.scroll_offset, 10);
+        assert!(!state.logs.follow);
+
+        // `g`: jump to end, follow re-enabled.
+        update(&mut state, key(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(state.logs.scroll_offset, 0);
+        assert!(state.logs.follow);
+
+        // `f`: toggles follow OFF (stays where it is at the bottom).
+        update(&mut state, key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(!state.logs.follow);
+        // `f` again: back ON (snaps to bottom — already there).
+        update(&mut state, key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(state.logs.follow);
+
+        // Down-scrolling to the bottom re-enables follow.
+        update(&mut state, key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(!state.logs.follow);
+        update(&mut state, key(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(state.logs.scroll_offset, 0);
+        assert!(state.logs.follow, "reaching the bottom re-enables follow");
+
+        // Scroll is clamped: 30 entries → max offset 29, further
+        // PageUps clamp (never past the first line).
+        for _ in 0..10 {
+            update(&mut state, key(KeyCode::PageUp, KeyModifiers::NONE));
+        }
+        assert_eq!(state.logs.scroll_offset, 29, "clamped at first line");
+    }
+
+    /// `l` cycles the level filter through the full ring (All → … →
+    /// Error → All).
+    #[test]
+    fn logs_l_cycles_the_level_filter() {
+        let mut state = AppState::new();
+        state.screen = Screen::Logs;
+        let cycle = [
+            crate::state::LogLevelFilter::Trace,
+            crate::state::LogLevelFilter::Debug,
+            crate::state::LogLevelFilter::Info,
+            crate::state::LogLevelFilter::Warn,
+            crate::state::LogLevelFilter::Error,
+            crate::state::LogLevelFilter::All,
+        ];
+        for expected in cycle {
+            update(&mut state, key(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(state.logs.filter, expected);
+        }
+    }
+
+    /// LogLine events append to the ring under the cap (update-side
+    /// proof; era plays no part per the plan-locked decision).
+    #[test]
+    fn log_line_events_fill_the_ring() {
+        let mut state = AppState::new();
+        for i in 0..5 {
+            update(
+                &mut state,
+                AppEvent::LogLine(log_entry(i, "WARN", "streamed")),
+            );
+        }
+        assert_eq!(state.logs.ring.len(), 5);
+        assert_eq!(state.logs.dropped, 0);
+        assert_eq!(
+            state.logs.ring.back().map(|e| e.message.as_str()),
+            Some("streamed")
+        );
     }
 }

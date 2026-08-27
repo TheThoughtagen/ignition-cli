@@ -5,11 +5,13 @@
 //! Per-screen data structs are added by their plans (06-02..06-06); the
 //! shell owns the navigation chrome only.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
 use ignition_core::actions::sessions::{SessionType, SessionsResult};
 use ignition_core::client::ReqwestGatewayApi;
+use ignition_core::client::logs::LogEntry;
 use ratatui::widgets::TableState;
 use tokio::sync::{mpsc, watch};
 
@@ -266,6 +268,190 @@ pub struct DashboardData {
     pub in_flight: Option<&'static str>,
 }
 
+/// The display-level filter over the gateway's log levels. `All`
+/// disables filtering; the rest act as a MINIMUM threshold (filter =
+/// Warn renders Warn and above) applied AT RENDER over the retained
+/// ring — filtering the query alone would hide already-received
+/// entries (research anti-pattern). The same threshold rides the tail
+/// worker's restart as `min_level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogLevelFilter {
+    /// No filtering — every retained entry renders.
+    #[default]
+    All,
+    /// TRACE and above.
+    Trace,
+    /// DEBUG and above.
+    Debug,
+    /// INFO and above.
+    Info,
+    /// WARN and above.
+    Warn,
+    /// ERROR and above.
+    Error,
+}
+
+/// The LOCKED ring capacity — a weekend-long tail cannot OOM the
+/// process (must-have truth #2): the display buffer is a ring capped
+/// at 10,000 entries, evicting from the front.
+pub const LOG_RING_CAP: usize = 10_000;
+
+impl LogLevelFilter {
+    /// The `l`-key cycle: All → Trace → … → Error → All.
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Trace,
+            Self::Trace => Self::Debug,
+            Self::Debug => Self::Info,
+            Self::Info => Self::Warn,
+            Self::Warn => Self::Error,
+            Self::Error => Self::All,
+        }
+    }
+
+    /// The uppercase wire token for the tail's `min_level` (None when
+    /// unfiltered — the param stays absent, exactly like the CLI).
+    pub fn wire(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Trace => Some("TRACE"),
+            Self::Debug => Some("DEBUG"),
+            Self::Info => Some("INFO"),
+            Self::Warn => Some("WARN"),
+            Self::Error => Some("ERROR"),
+        }
+    }
+
+    /// The status-row label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// Whether an entry's wire level passes this threshold (render-side
+    /// filter). Unknown level strings rank with INFO — never hidden by
+    /// Trace..Info filters, hidden by Warn/Error (quality-is-data: the
+    /// level string is never parsed beyond ranking).
+    pub fn matches(self, level: &str) -> bool {
+        self.wire()
+            .is_none_or(|min| level_rank(level) >= level_rank(min))
+    }
+}
+
+/// Rank a wire level string for threshold comparisons (TRACE lowest).
+fn level_rank(level: &str) -> u8 {
+    match level {
+        "TRACE" => 1,
+        "DEBUG" => 2,
+        "INFO" => 3,
+        "WARN" => 4,
+        "ERROR" => 5,
+        "FATAL" => 6,
+        _ => 3, // unknown levels rank with INFO
+    }
+}
+
+/// The Logs screen's data (06-03): the ring-backed stream, the
+/// render-side level filter, and the follow/scroll state machine.
+#[derive(Debug)]
+pub struct LogsData {
+    /// The retained stream — a ring capped at [`LOG_RING_CAP`] entries
+    /// (evict front). Memory-bounded by construction.
+    pub ring: VecDeque<LogEntry>,
+    /// The render-side level filter (also the tail's `min_level`).
+    pub filter: LogLevelFilter,
+    /// How many FILTERED lines the view sits above the bottom (0 = at
+    /// the newest line). Scrolling up disables follow; `G`/End (or
+    /// scrolling back down to the bottom) re-enables it.
+    pub scroll_offset: usize,
+    /// Auto-scroll to bottom on new entries, unless the user scrolled
+    /// up (`f` toggles).
+    pub follow: bool,
+    /// Total entries evicted from the ring's front (ring turnover
+    /// accounting — the status row's honesty counter).
+    pub dropped: usize,
+    /// The tail worker's shutdown switch — `send(true)` on leaving the
+    /// screen, filter restart, and profile switch (a dropped sender
+    /// also stops the worker).
+    pub tail_shutdown: Option<watch::Sender<bool>>,
+}
+
+impl Default for LogsData {
+    fn default() -> Self {
+        Self {
+            ring: VecDeque::new(),
+            filter: LogLevelFilter::default(),
+            scroll_offset: 0,
+            follow: true,
+            dropped: 0,
+            tail_shutdown: None,
+        }
+    }
+}
+
+impl LogsData {
+    /// Append one streamed entry, evicting from the front at the cap —
+    /// THE ring discipline (a weekend-long tail stays memory-bounded).
+    pub fn push_line(&mut self, entry: LogEntry) {
+        while self.ring.len() >= LOG_RING_CAP {
+            self.ring.pop_front();
+            self.dropped += 1;
+        }
+        self.ring.push_back(entry);
+    }
+
+    /// How many retained entries pass the current filter — the scroll
+    /// bounds and the render window both key off this length.
+    pub fn filtered_len(&self) -> usize {
+        self.ring
+            .iter()
+            .filter(|e| self.filter.matches(&e.level))
+            .count()
+    }
+
+    /// Scroll `step` filtered lines towards the top (disables follow).
+    /// Clamped so the FIRST filtered line can reach the top of the
+    /// view, never further.
+    pub fn scroll_up(&mut self, step: usize) {
+        let len = self.filtered_len();
+        if len <= 1 {
+            return;
+        }
+        self.scroll_offset = (self.scroll_offset + step).min(len - 1);
+        self.follow = false;
+    }
+
+    /// Scroll `step` filtered lines back towards the bottom; reaching
+    /// the bottom re-enables follow.
+    pub fn scroll_down(&mut self, step: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(step);
+        if self.scroll_offset == 0 {
+            self.follow = true;
+        }
+    }
+
+    /// `G`/End: jump to the newest line and re-enable follow.
+    pub fn jump_to_end(&mut self) {
+        self.scroll_offset = 0;
+        self.follow = true;
+    }
+
+    /// `f`: toggle follow. Re-enabling snaps to the bottom (following
+    /// from mid-history is a lie about the newest line).
+    pub fn toggle_follow(&mut self) {
+        self.follow = !self.follow;
+        if self.follow {
+            self.scroll_offset = 0;
+        }
+    }
+}
+
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
@@ -294,6 +480,8 @@ pub struct AppState {
     pub refresh_shutdown: Option<watch::Sender<bool>>,
     /// Dashboard screen data (06-02).
     pub dashboard: DashboardData,
+    /// Logs screen data (06-03) — the ring, filter, follow/scroll.
+    pub logs: LogsData,
     /// The active profile's name (workers' target — what `p` switches).
     pub profile: Option<String>,
     /// The status-line banner — set by a landed profile switch

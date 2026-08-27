@@ -191,13 +191,13 @@ mod tests {
             "dashboard panels render Loading before the first refresh"
         );
 
-        // A placeholder screen (Logs, until 06-03) still renders the
+        // A placeholder screen (Tags, until 06-04) still renders the
         // bordered block with its title.
-        let mut logs = AppState::new();
-        logs.screen = Screen::Logs;
-        let rows = rendered_rows(&logs);
+        let mut tags = AppState::new();
+        tags.screen = Screen::Tags;
+        let rows = rendered_rows(&tags);
         assert!(
-            rows[1].starts_with("┌Logs — not yet wired"),
+            rows[1].starts_with("┌Tags — not yet wired"),
             "placeholder block title: {}",
             rows[1]
         );

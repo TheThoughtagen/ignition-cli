@@ -92,8 +92,14 @@ async fn run_loop(
     )
     .await;
 
-    // Stop the refresh worker — the loop is done, the world is gone.
+    // Stop every worker — the loop is done, the world is gone. The
+    // refresh worker by its rail; the screen-scoped tail by its own
+    // (dropping the sender also stops it, but the explicit signal is
+    // immediate).
     if let Some(shutdown) = &state.refresh_shutdown {
+        let _ = shutdown.send(true);
+    }
+    if let Some(shutdown) = &state.logs.tail_shutdown {
         let _ = shutdown.send(true);
     }
     result

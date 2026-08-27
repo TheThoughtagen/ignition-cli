@@ -19,6 +19,12 @@ pub enum AppEvent {
     /// A worker-reported failure (workers must send this instead of
     /// panicking — a panic inside `tokio::spawn` never unwinds the loop).
     Error(String),
+    /// One streamed log entry from the tail worker (06-03). NOT
+    /// era-stamped — the ring's turnover is the acceptance policy (the
+    /// plan-locked decision: per-line eras buy nothing; the worker is
+    /// stopped by its shutdown watch on screen exit / profile switch,
+    /// and any last-gasp lines merely join the ring).
+    LogLine(ignition_core::client::logs::LogEntry),
     /// A dashboard refresh snapshot (06-02). `era` is the worker's
     /// spawn-era; update drops stale-era events (a profile switch
     /// invalidates in-flight snapshots — Pitfall 9: no data from the
