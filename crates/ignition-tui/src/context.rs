@@ -33,12 +33,15 @@ fn secret_chain() -> Vec<Box<dyn SecretStore>> {
     ]
 }
 
-/// Resolve the profile flag → `(name, Arc<ReqwestGatewayApi>)` for the
-/// cockpit's opening context. `None` selection (no flag, no active
+/// Resolve the profile flag → `(name, url, Arc<ReqwestGatewayApi>)` for
+/// the cockpit's opening context (`url` is the profile's URL string —
+/// doctor's `profile_url`). `None` selection (no flag, no active
 /// profile) is [`CoreError::NoActiveProfile`] — the hint names how to
 /// add one; the cockpit is a gateway surface and cannot open without
 /// a target.
-pub fn resolve(profile_flag: Option<&str>) -> Result<(String, Arc<ReqwestGatewayApi>), CoreError> {
+pub fn resolve(
+    profile_flag: Option<&str>,
+) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
     let mut config = config::load(&config::config_path())?;
     let (name, profile) = resolve_from(&mut config, profile_flag)?;
     build_client(name, profile)
@@ -46,7 +49,7 @@ pub fn resolve(profile_flag: Option<&str>) -> Result<(String, Arc<ReqwestGateway
 
 /// Rebuild a client for a NAMED profile (06-02's profile switcher):
 /// reload config from disk, overlay, resolve the named profile's secret.
-pub fn rebuild(profile_name: &str) -> Result<(String, Arc<ReqwestGatewayApi>), CoreError> {
+pub fn rebuild(profile_name: &str) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
     let mut config = config::load(&config::config_path())?;
     let (name, profile) = resolve_from(&mut config, Some(profile_name))?;
     build_client(name, profile)
@@ -67,13 +70,16 @@ fn resolve_from(config: &mut Config, flag: Option<&str>) -> Result<(String, Prof
 
 /// REQUIRED credential (authed-read chain — a missing secret is
 /// `SecretUnavailable` exit 3, never degraded) + client construction.
+/// Returns the profile's URL string alongside the client (doctor's
+/// `profile_url` — the cockpit runs no doctor-less world).
 fn build_client(
     name: String,
     profile: Profile,
-) -> Result<(String, Arc<ReqwestGatewayApi>), CoreError> {
+) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
+    let url = profile.url.to_string();
     let credential = config::resolve_secret(&name, &profile.auth, &secret_chain())?;
     let api = ReqwestGatewayApi::new(&profile, Some(credential))?;
-    Ok((name, Arc::new(api)))
+    Ok((name, url, Arc::new(api)))
 }
 
 #[cfg(test)]
@@ -154,10 +160,11 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let (_dir, vars) = isolated_env();
 
-        let (name, _api) = resolve(Some("prod")).expect("flag profile resolves");
+        let (name, url, _api) = resolve(Some("prod")).expect("flag profile resolves");
         assert_eq!(name, "prod", "flag must beat the active profile");
+        assert_eq!(url, "http://localhost:9443/", "profile url rides along");
 
-        let (name, _api) = resolve(None).expect("active profile resolves");
+        let (name, _url, _api) = resolve(None).expect("active profile resolves");
         assert_eq!(name, "dev", "no flag falls back to config.active");
 
         teardown(&vars);
@@ -169,7 +176,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let (_dir, vars) = isolated_env();
 
-        let (name, _api) = rebuild("prod").expect("named profile resolves");
+        let (name, _url, _api) = rebuild("prod").expect("named profile resolves");
         assert_eq!(name, "prod");
 
         // An unknown name is the standard ProfileNotFound refusal.

@@ -15,6 +15,11 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
+# spawn_action's one-shot result serialization (pretty JSON to the
+# result modal — the LOCKED one-mechanism display); both already in the
+# workspace graph
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # isolated config files for the context unit tests (already in the

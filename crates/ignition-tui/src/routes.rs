@@ -44,6 +44,58 @@ pub fn routes() -> &'static [CliRoute] {
             path: "completions",
             mapping: Mapping::OutOfBand,
         },
+        // 06-02: the dashboard's read panels + its actions-menu verbs.
+        // `sessions` is the BARE form (SessionsArgs.command is Option —
+        // bare `ign sessions` IS the list action; there is no
+        // `sessions list` leaf).
+        CliRoute {
+            path: "version",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "status",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "modules",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "metrics",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "connections",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "sessions",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "sessions terminate",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "wait gateway",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "wait restart",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "wait module",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "doctor",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "restart",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 
@@ -53,7 +105,7 @@ mod tests {
     use crate::state::Screen;
 
     /// The scaffold compiles with all Mapping kinds represented and
-    /// rows are unique.
+    /// rows are unique; the dashboard's 06-02 families are present.
     #[test]
     fn routes_scaffold_has_unique_paths_and_all_mapping_kinds() {
         let routes = routes();
@@ -75,5 +127,31 @@ mod tests {
                 .iter()
                 .any(|route| matches!(route.mapping, Mapping::OutOfBand))
         );
+    }
+
+    /// The 06-02 dashboard rows exist with the clap-true leaf spellings
+    /// (bare `sessions` is the list; the terminate subcommand rides it).
+    #[test]
+    fn dashboard_rows_cover_the_06_02_families() {
+        let paths: Vec<&str> = routes().iter().map(|route| route.path).collect();
+        for expected in [
+            "version",
+            "status",
+            "modules",
+            "metrics",
+            "connections",
+            "sessions",
+            "sessions terminate",
+            "wait gateway",
+            "wait restart",
+            "wait module",
+            "doctor",
+            "restart",
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "dashboard route row {expected:?} missing"
+            );
+        }
     }
 }

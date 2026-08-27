@@ -69,6 +69,7 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::Confirm { body, .. } => body.lines().count().saturating_add(4).min(9),
         Modal::Input { .. } => 5,
         Modal::Result_ { lines, .. } => lines.len().saturating_add(4).min(9),
+        Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(3).min(11),
     } as u16;
     let area = frame.area().centered(Ratio(1, 2), Length(height.max(5)));
 
@@ -96,14 +97,38 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 area,
             );
         }
-        Modal::Result_ { title, lines } => {
+        Modal::Result_ {
+            title,
+            lines,
+            scroll,
+        } => {
             let text: Vec<Line> = lines
                 .iter()
                 .map(|line| Line::from(line.clone()))
-                .chain([Line::default(), Line::from("Esc to close")])
+                .chain([
+                    Line::default(),
+                    Line::from("PgUp/PgDn scroll · Esc to close"),
+                ])
                 .collect();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title(title.clone())),
+                Paragraph::new(text)
+                    .scroll((*scroll, 0))
+                    .block(Block::bordered().title(title.clone())),
+                area,
+            );
+        }
+        Modal::Actions { selected } => {
+            let text: Vec<Line> = crate::state::ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let marker = if index == *selected { "▸ " } else { "  " };
+                    Line::from(format!("{marker}{action}"))
+                })
+                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .collect();
+            frame.render_widget(
+                Paragraph::new(text).block(Block::bordered().title("actions")),
                 area,
             );
         }
@@ -304,11 +329,54 @@ mod tests {
         state.open_modal(Modal::Result_ {
             title: "error".into(),
             lines: vec!["gateway unreachable".into()],
+            scroll: 0,
         });
         let rows = rendered_rows(&state);
         assert!(
             rows.iter().any(|row| row.contains("gateway unreachable")),
             "result modal renders lines: {rows:?}"
+        );
+    }
+
+    /// The Actions menu modal renders every global verb with the
+    /// selection marker, plus the scroll hint on the result modal.
+    #[test]
+    fn actions_menu_and_scrolling_result_render() {
+        let mut state = AppState::new();
+        state.open_modal(Modal::Actions { selected: 1 });
+        let rows = rendered_rows(&state);
+        let text = rows.join("\n");
+        for verb in [
+            "version",
+            "connections",
+            "wait gateway",
+            "wait restart",
+            "wait module",
+            "doctor",
+            "restart",
+        ] {
+            assert!(text.contains(verb), "menu lists {verb}");
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("▸ connections")),
+            "selection marker on entry 1"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("┌actions")),
+            "menu is a bordered modal"
+        );
+
+        // The result modal advertises PgUp/PgDn.
+        let mut state = AppState::new();
+        state.open_modal(Modal::Result_ {
+            title: "wait gateway".into(),
+            lines: vec!["{}".into()],
+            scroll: 0,
+        });
+        let rows = rendered_rows(&state);
+        assert!(
+            rows.iter().any(|row| row.contains("PgUp/PgDn scroll")),
+            "result modal shows the scroll hint: {rows:?}"
         );
     }
 }

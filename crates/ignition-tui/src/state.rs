@@ -97,18 +97,48 @@ pub enum Focus {
 }
 
 /// The three modal infrastructure shapes. Later plans EXTEND these with
-/// acceptance callbacks (wired through update, never stored futures) —
-/// the shell ships the rendering + key routing only.
+/// acceptance payloads (wired through update, never stored futures) —
+/// 06-02 adds the dashboard Actions menu and makes Result_ scrollable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     /// Yes/no confirmation — the TUI-side answer to the CLI's `--yes`
-    /// guards (destructive verbs render this before their action).
+    /// guards (destructive verbs render this before their action). `y`
+    /// accepts (executes [`AppState::dashboard`]'s `pending` action),
+    /// Esc cancels.
     Confirm { title: String, body: String },
     /// A single-line text input, hand-rolled (no tui-input dep):
-    /// char-append/backspace editing, Esc cancels.
+    /// char-append/backspace editing, Esc cancels, Enter accepts (the
+    /// accepted buffer routes by `dashboard.pending_input`).
     Input { title: String, buffer: String },
-    /// Read-only result/report lines (errors land here too).
-    Result_ { title: String, lines: Vec<String> },
+    /// Read-only result/report lines (errors land here too). PgUp/PgDn
+    /// scroll — the LOCKED one-mechanism result display every action
+    /// verb shares (serde_json::to_string_pretty of the typed result).
+    Result_ {
+        title: String,
+        lines: Vec<String>,
+        scroll: u16,
+    },
+    /// The dashboard actions menu (06-02): the global verbs with a
+    /// moving selection (Up/Down + Enter).
+    Actions { selected: usize },
+}
+
+/// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
+/// (`y`) looks here; cancel (Esc) clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAction {
+    /// `ign restart` — the guarded global verb.
+    Restart,
+    /// `ign sessions terminate` on the selected row.
+    TerminateSession { kind: SessionType, id: String },
+}
+
+/// What an accepted Input modal's buffer is for — the small-form router
+/// (06-02 ships `wait module`'s id prompt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingInput {
+    /// The module id for `wait module`.
+    WaitModule,
 }
 
 impl Modal {
@@ -118,6 +148,7 @@ impl Modal {
             Modal::Confirm { title, .. }
             | Modal::Input { title, .. }
             | Modal::Result_ { title, .. } => title,
+            Modal::Actions { .. } => "actions",
         }
     }
 }
@@ -179,6 +210,19 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
     rows
 }
 
+/// The dashboard actions menu entries, in menu order — the LOCKED list
+/// of global verbs the dashboard hosts (update's executor and the modal
+/// renderer both key off this order).
+pub const ACTIONS: [&str; 7] = [
+    "version",
+    "connections",
+    "wait gateway",
+    "wait restart",
+    "wait module",
+    "doctor",
+    "restart",
+];
+
 /// The dashboard screen's data (06-02).
 #[derive(Debug, Default)]
 pub struct DashboardData {
@@ -192,9 +236,16 @@ pub struct DashboardData {
     /// (keystrokes cannot stack duplicate refreshes).
     pub busy: bool,
     /// The sessions table cursor (selectable rows — the terminate
-    /// target). Cloned for `render_stateful_widget`; update owns the
+    /// target). Copied for `render_stateful_widget`; update owns the
     /// mutations.
     pub sessions_table: TableState,
+    /// What a Confirm-modal accept executes (cleared on cancel).
+    pub pending: Option<PendingAction>,
+    /// What an Input-modal accept feeds (cleared on cancel).
+    pub pending_input: Option<PendingInput>,
+    /// The running one-shot action's label ("wait gateway") — the busy
+    /// guard per action; the status line renders it while in flight.
+    pub in_flight: Option<&'static str>,
 }
 
 /// The whole cockpit, in plain data. The era counter is the stale-worker
@@ -215,6 +266,8 @@ pub struct AppState {
     pub era: u64,
     /// The client workers target (None before resolve / in unit tests).
     pub client: Option<ClientHandle>,
+    /// The active profile's URL string (doctor's `profile_url`).
+    pub profile_url: Option<String>,
     /// The AppEvent rail — a clone of the loop's sender, so update can
     /// arm workers (spawn helpers take their copy from here).
     pub events_tx: Option<mpsc::UnboundedSender<AppEvent>>,

@@ -43,11 +43,12 @@ const TICK: Duration = Duration::from_millis(250);
 /// the init-installed panic hook).
 pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
     // The cockpit owns a live client from the first frame: the
-    // dashboard's refresh worker spawns against it (06-02).
-    let (_profile_name, client) = context::resolve(profile_flag.as_deref())?;
+    // dashboard's refresh worker spawns against it (06-02). The URL
+    // rides along for doctor's `profile_url`.
+    let (_profile_name, profile_url, client) = context::resolve(profile_flag.as_deref())?;
 
     let mut terminal = ratatui::init();
-    let app_result = run_loop(&mut terminal, client).await;
+    let app_result = run_loop(&mut terminal, profile_url, client).await;
     ratatui::restore();
     app_result
 }
@@ -55,6 +56,7 @@ pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
 /// State wiring + worker spawn + the select loop, then worker teardown.
 async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
+    profile_url: String,
     client: std::sync::Arc<ignition_core::client::ReqwestGatewayApi>,
 ) -> Result<(), CoreError> {
     let mut state = AppState::new();
@@ -68,6 +70,7 @@ async fn run_loop(
     // Task 3) re-spawns against a new client under a new era.
     let (shutdown_tx, shutdown_rx) = workers::shutdown_channel();
     state.client = Some(ClientHandle(client.clone()));
+    state.profile_url = Some(profile_url);
     state.events_tx = Some(events_tx.clone());
     state.refresh_shutdown = Some(shutdown_tx);
     let era = workers::new_era(&mut state);

@@ -65,7 +65,13 @@ impl Default for PollConfig {
 /// One probe call: a boxed future borrowing the probe closure, so the
 /// closure can carry mutable state (the tail's cursor and sink) across
 /// iterations without naming an unnameable future type.
-pub type Probe<'a, T> = Pin<Box<dyn Future<Output = Result<PollState<T>, CoreError>> + 'a>>;
+///
+/// `+ Send` (06-02): the Phase-6 TUI spawns whole `wait_*` actions on
+/// `tokio::spawn`, which requires the poll future (and therefore this
+/// box) to be Send. Every existing probe already captures only Send
+/// state (`&dyn GatewayApi`, `Cell`s, query values) — the bound was
+/// simply never demanded before anything spawned one.
+pub type Probe<'a, T> = Pin<Box<dyn Future<Output = Result<PollState<T>, CoreError>> + Send + 'a>>;
 
 /// The adaptive-interval step: ×1.5 growth clamped to `[floor, ceiling]`.
 /// Pure so the backoff sequence is unit-testable without sleeping.

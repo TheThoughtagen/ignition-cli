@@ -19,8 +19,8 @@
 //! GRACEFULLY: the poll's deadline expiry maps to `Ok` (exit 0 — the
 //! entries already streamed through the sink).
 
-use std::cell::Cell;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -240,8 +240,9 @@ pub async fn tail(
         sink,
     };
     // The stream count lives OUTSIDE the poll call (the probe bumps it
-    // through a shared borrow; poll consumes the state).
-    let streamed = Cell::new(0usize);
+    // through a shared borrow; poll consumes the state). A `Mutex` (not
+    // `Cell`) so the probe future is Send — the 06-02 TUI spawns tails.
+    let streamed = Mutex::new(0usize);
 
     let cfg = PollConfig {
         subject: "log tail (GET /data/api/v1/logs)".to_string(),
@@ -271,7 +272,7 @@ pub async fn tail(
             if let Some(last) = entries.last() {
                 state.cursor = last.timestamp;
             }
-            streamed.set(streamed.get() + entries.len());
+            *streamed.lock().expect("streamed count") += entries.len();
             Ok(PollState::<()>::Pending(observation))
         })
     })
@@ -281,13 +282,13 @@ pub async fn tail(
         // The probe never reports Done (T = ()) — the only Ok is
         // unreachable; kept for match totality.
         Ok(()) => Ok(TailResult {
-            streamed: streamed.get(),
+            streamed: *streamed.lock().expect("streamed count"),
         }),
         // Deadline expiry = GRACEFUL end (exit 0): poll retries genuine
         // Network errors until the deadline, so a None-source Network
         // error IS the timeout. The entries already streamed.
         Err(CoreError::Network { source: None, .. }) => Ok(TailResult {
-            streamed: streamed.get(),
+            streamed: *streamed.lock().expect("streamed count"),
         }),
         Err(err) => Err(err),
     }

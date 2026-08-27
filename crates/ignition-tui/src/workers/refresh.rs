@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ignition_core::actions::{inspect, sessions};
-use ignition_core::client::{GatewayApi, ReqwestGatewayApi};
+use ignition_core::client::ReqwestGatewayApi;
 use tokio::sync::{mpsc, watch};
 
 use crate::event::AppEvent;
@@ -52,14 +52,15 @@ fn degrade<T>(result: Result<T, ignition_core::error::CoreError>) -> (Option<T>,
 }
 
 /// Compose the four dashboard reads CONCURRENTLY, each degraded
-/// independently — the per-panel contract. Callable against any
-/// `GatewayApi` double (how the tests fixture it).
-pub async fn snapshot(api: &dyn GatewayApi) -> Snapshot {
+/// independently — the per-panel contract. Takes the worker's client
+/// handle by shared ref; the action fns are the free fns over
+/// `&dyn GatewayApi` (the key_link contract — `(&*api)` at every call).
+pub async fn snapshot(api: &Arc<ReqwestGatewayApi>) -> Snapshot {
     let (status, modules, metrics, sessions) = futures_util::future::join4(
-        inspect::status(&*api),
-        inspect::modules(&*api, false),
-        inspect::metrics(&*api, false),
-        sessions::sessions(&*api, None),
+        inspect::status(&**api),
+        inspect::modules(&**api, false),
+        inspect::metrics(&**api, false),
+        sessions::sessions(&**api, None),
     )
     .await;
     let (status, status_error) = degrade(status);
@@ -96,7 +97,7 @@ pub async fn refresh_worker(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let snap = snapshot(&*api).await;
+                let snap = snapshot(&api).await;
                 if tx.send(AppEvent::Refresh { era, snapshot: Box::new(snap) }).is_err() {
                     return; // the loop is gone — stop.
                 }
@@ -129,7 +130,7 @@ pub fn spawn_refresh_once(state: &mut AppState) {
     let era = state.era;
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            let snap = snapshot(&*client).await;
+            let snap = snapshot(&client).await;
             let _ = tx.send(AppEvent::Refresh {
                 era,
                 snapshot: Box::new(snap),
@@ -234,7 +235,10 @@ mod tests {
     async fn snapshot_composes_all_four_panels() {
         let server = wiremock::MockServer::start().await;
         mount_gateway(&server).await;
-        let api = ignition_core::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            &server.uri(),
+            None,
+        ));
 
         let snap = snapshot(&api).await;
 
@@ -267,7 +271,10 @@ mod tests {
     #[tokio::test]
     async fn dead_gateway_degrades_every_panel_with_errors() {
         // Nothing listens here — every call fails fast.
-        let api = ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None);
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            "http://127.0.0.1:1/",
+            None,
+        ));
         let snap = snapshot(&api).await;
         assert!(snap.status.is_none() && snap.status_error.is_some());
         assert!(snap.modules.is_none() && snap.modules_error.is_some());
@@ -280,12 +287,15 @@ mod tests {
     /// watch TERMINATES the loop.
     #[tokio::test]
     async fn refresh_worker_reports_and_terminates_on_shutdown() {
-        let api = ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None);
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            "http://127.0.0.1:1/",
+            None,
+        ));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let worker = tokio::spawn(refresh_worker(
-            std::sync::Arc::new(api),
+            api.clone(),
             tx,
             shutdown_rx,
             7,

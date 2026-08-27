@@ -32,6 +32,18 @@ pub enum AppEvent {
         /// degrades its panel only — never the whole dashboard).
         snapshot: Box<crate::workers::refresh::Snapshot>,
     },
+    /// A one-shot dashboard action finished (06-02). The worker already
+    /// serialized the typed result (`serde_json::to_string_pretty`) or
+    /// the error's display string — the result modal renders it
+    /// verbatim (the LOCKED one-mechanism result display).
+    ActionDone {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The menu label ("wait gateway") — the modal title.
+        label: &'static str,
+        /// Pretty JSON on success, the error message on failure.
+        result: Result<String, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

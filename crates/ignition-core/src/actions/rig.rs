@@ -27,8 +27,8 @@
 //! aborts); Network/GatewayRestarting propagate for poll's native
 //! retry; Auth can't fire (the probe is header-less).
 
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -243,9 +243,10 @@ async fn commissioned_wait(
         deadline: Duration::from_secs(wait_timeout_s),
         ..PollConfig::default()
     };
-    // The poll-owned state: a borrowed Cell (the 02-05 HRTB shape) that
-    // remembers a terminal-uncommissioned observation across probes.
-    let mut uncommissioned = Cell::new(false);
+    // The poll-owned state: a borrowed Mutex (the 02-05 HRTB shape;
+    // Mutex not Cell so the probe future is Send — the 06-02 TUI spawns
+    // waits) that remembers a terminal-uncommissioned observation.
+    let mut uncommissioned = Mutex::new(false);
     let url_owned = url.to_string();
     let outcome = poll::poll(cfg, &mut uncommissioned, |uncommissioned| {
         Box::pin(async {
@@ -255,7 +256,7 @@ async fn commissioned_wait(
                 // Probe-side translation (locked): never abort on the
                 // wizard redirect — remember it, keep waiting.
                 Err(CoreError::GatewayNotCommissioned { .. }) => {
-                    uncommissioned.set(true);
+                    *uncommissioned.get_mut().expect("commissioned flag") = true;
                     Ok(PollState::Pending(Some(format!(
                         "gateway uncommissioned — open {url_owned}/welcome"
                     ))))
@@ -271,7 +272,9 @@ async fn commissioned_wait(
         // The DEADLINE error only (the locked source:None marker from
         // 02-04) degrades to data when the terminal observation was
         // uncommissioned — any other error class stays an error.
-        Err(CoreError::Network { source: None, .. }) if uncommissioned.get() => {
+        Err(CoreError::Network { source: None, .. })
+            if *uncommissioned.lock().expect("commissioned flag") =>
+        {
             warnings.push(format!(
                 "gateway uncommissioned — open {url}/welcome in a browser and complete \
                  the commissioning wizard (no headless commissioning exists)"

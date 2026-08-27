@@ -32,6 +32,40 @@ pub fn is_current(state_era: u64, worker_era: u64) -> bool {
     state_era == worker_era
 }
 
+/// Spawn a ONE-SHOT action worker (06-02's pattern, verbatim from the
+/// plan): `tokio::spawn` with the current era → run the future (an
+/// ignition-core action fn, AS-IS) → send [`AppEvent::ActionDone`]
+/// carrying `serde_json::to_string_pretty` of the typed result (or the
+/// error's display string).
+///
+/// The `in_flight` label is the busy guard — one action at a time, so
+/// long waits never stack and the status line can name what runs.
+/// Outside a tokio runtime (state-machine unit tests) the guard + label
+/// transition stands alone and nothing spawns.
+pub fn spawn_action<T, F>(state: &mut crate::state::AppState, label: &'static str, fut: F)
+where
+    T: serde::Serialize + Send + 'static,
+    F: std::future::Future<Output = Result<T, ignition_core::error::CoreError>> + Send + 'static,
+{
+    if state.dashboard.in_flight.is_some() {
+        return; // one action at a time (the busy guard per action)
+    }
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    state.dashboard.in_flight = Some(label);
+    let era = state.era;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let result = match fut.await {
+                Ok(value) => serde_json::to_string_pretty(&value).map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.send(crate::event::AppEvent::ActionDone { era, label, result });
+        });
+    }
+}
+
 pub mod refresh;
 
 #[cfg(test)]

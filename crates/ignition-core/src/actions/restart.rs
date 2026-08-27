@@ -41,7 +41,7 @@
 //! NEVER use `restart-tasks/pending` as the progress signal (research:
 //! it is required-restart config, not restart status).
 
-use std::cell::Cell;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -189,14 +189,15 @@ pub async fn wait_restart(
     };
     /// Probe scratch (borrowing state — the HRTB shape): did any poll
     /// observe a non-RUNNING state, and where the terminal state goes.
-    /// The Cell lives OUTSIDE poll; the state mutably borrows it, so
+    /// The Mutex lives OUTSIDE poll; the state mutably borrows it, so
     /// the result survives poll consuming the state (the tail's
-    /// `streamed` pattern).
+    /// `streamed` pattern). A `Mutex` (not `Cell`) so the probe future
+    /// is Send — the 06-02 TUI spawns whole waits on tokio.
     struct Witness<'a> {
         seen_non_running: bool,
-        final_state: &'a mut Cell<String>,
+        final_state: &'a mut Mutex<String>,
     }
-    let mut final_state = Cell::new(String::new());
+    let mut final_state = Mutex::new(String::new());
     poll::poll(
         cfg,
         Witness {
@@ -208,7 +209,11 @@ pub async fn wait_restart(
                 let ping = api.status_ping().await?;
                 if ping.state == RUNNING {
                     if witness.seen_non_running || started.elapsed() >= floor {
-                        witness.final_state.set(ping.state);
+                        witness
+                            .final_state
+                            .get_mut()
+                            .expect("terminal state")
+                            .clone_from(&ping.state);
                         Ok(PollState::<()>::Done(()))
                     } else {
                         // All-RUNNING inside the grace floor: accepting
@@ -228,7 +233,7 @@ pub async fn wait_restart(
     .await?;
     Ok(WaitResult {
         target: "restart".to_string(),
-        state: final_state.take(),
+        state: std::mem::take(&mut *final_state.lock().expect("terminal state")),
         elapsed_secs: started.elapsed().as_secs(),
     })
 }
@@ -250,7 +255,7 @@ pub async fn wait_module(
         deadline: timeout,
         ..PollConfig::default()
     };
-    let mut final_state = Cell::new(String::new());
+    let mut final_state = Mutex::new(String::new());
     poll::poll(cfg, &mut final_state, |final_state| {
         Box::pin(async {
             let query = crate::client::query::ListQuery {
@@ -262,7 +267,10 @@ pub async fn wait_module(
             // must be THE module (id equality).
             if let Some(module) = modules.items.iter().find(|m| m.id == module_id) {
                 if module.state.as_deref() == Some(ACTIVE) {
-                    final_state.set(ACTIVE.to_string());
+                    final_state
+                        .get_mut()
+                        .expect("terminal state")
+                        .push_str(ACTIVE);
                     Ok(PollState::<()>::Done(()))
                 } else {
                     Ok(PollState::<()>::Pending(Some(format!(
@@ -281,7 +289,7 @@ pub async fn wait_module(
     .await?;
     Ok(WaitResult {
         target: format!("module {module_id}"),
-        state: final_state.take(),
+        state: std::mem::take(&mut *final_state.lock().expect("terminal state")),
         elapsed_secs: started.elapsed().as_secs(),
     })
 }
@@ -289,7 +297,8 @@ pub async fn wait_module(
 /// The shared RUNNING probe: poll `/StatusPing` until `state ==
 /// "RUNNING"` (STARTING/unknown = Pending with the observed state —
 /// unknown states surface verbatim, research Open Question 3). The
-/// terminal state rides the Cell the state borrows (poll's T is `()`).
+/// terminal state rides the Mutex the state borrows (poll's T is `()`;
+/// Mutex not Cell so the probe future is Send — the 06-02 TUI spawns it).
 async fn wait_state_running(
     api: &dyn GatewayApi,
     subject: String,
@@ -302,12 +311,15 @@ async fn wait_state_running(
         deadline: timeout,
         ..PollConfig::default()
     };
-    let mut final_state = Cell::new(String::new());
+    let mut final_state = Mutex::new(String::new());
     poll::poll(cfg, &mut final_state, |final_state| {
         Box::pin(async {
             let ping = api.status_ping().await?;
             if ping.state == RUNNING {
-                final_state.set(ping.state);
+                final_state
+                    .get_mut()
+                    .expect("terminal state")
+                    .clone_from(&ping.state);
                 Ok(PollState::<()>::Done(()))
             } else {
                 Ok(PollState::<()>::Pending(Some(ping.state)))
@@ -315,7 +327,9 @@ async fn wait_state_running(
         })
     })
     .await?;
-    Ok(final_state.take())
+    Ok(std::mem::take(
+        &mut *final_state.lock().expect("terminal state"),
+    ))
 }
 
 #[cfg(test)]

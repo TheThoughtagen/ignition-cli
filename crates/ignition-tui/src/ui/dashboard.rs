@@ -208,7 +208,9 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
 }
 
 /// The bottom status line: refresh freshness ("N s ago", live via the
-/// 250 ms tick) + the busy marker + key hints.
+/// 250 ms tick) + the busy markers + key hints. A running one-shot
+/// action names itself ("running: wait gateway") — long waits never
+/// block input, the label is the only footprint.
 fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
     let freshness = match state.dashboard.last_refresh {
         None => "refresh: pending".to_string(),
@@ -219,7 +221,12 @@ fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
     } else {
         ""
     };
-    let text = format!("{freshness}{busy} · r refresh");
+    let in_flight = state
+        .dashboard
+        .in_flight
+        .map(|label| format!(" · running: {label}"))
+        .unwrap_or_default();
+    let text = format!("{freshness}{busy}{in_flight} · a actions · r refresh · t terminate");
     frame.render_widget(Paragraph::new(Line::from(text)), area);
 }
 
@@ -315,7 +322,10 @@ mod tests {
     async fn populated_snapshot_renders_panel_rows() {
         let server = wiremock::MockServer::start().await;
         crate::workers::refresh::test_support::mount_gateway(&server).await;
-        let api = ignition_core::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            &server.uri(),
+            None,
+        ));
         let snap = crate::workers::refresh::snapshot(&api).await;
 
         let mut state = AppState::new();
@@ -335,7 +345,10 @@ mod tests {
     /// the never-frozen guarantee.
     #[tokio::test]
     async fn dead_gateway_renders_errors_not_blank() {
-        let api = ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None);
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            "http://127.0.0.1:1/",
+            None,
+        ));
         let snap = crate::workers::refresh::snapshot(&api).await;
 
         let mut state = AppState::new();
