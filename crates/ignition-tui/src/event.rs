@@ -103,6 +103,21 @@ pub enum AppEvent {
         /// The read row, or the read's error.
         result: Result<ignition_core::actions::tags::TagReadRow, String>,
     },
+    /// One live-watch poll landed (06-04): the whole watched set's
+    /// rows, one `tags_read` per 2 s period. `gen` is the watch
+    /// worker's OWN generation (set-change respawns retire prior
+    /// workers locally — the global era stays world-scoped per
+    /// 06-03's lock, so a respawn must NOT bump it); the era gates
+    /// profile switches on top.
+    TagWatch {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The watch worker generation (the local stale gate).
+        generation: u64,
+        /// The watched set's rows (request order), or the poll's
+        /// error.
+        result: Result<Vec<ignition_core::actions::tags::TagReadRow>, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

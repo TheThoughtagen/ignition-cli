@@ -112,6 +112,50 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 };
             }
         }
+        // One live-watch poll landed (06-04): the whole set's rows
+        // replace the table with per-row changed markers (value or
+        // quality diffs — a timestamp bump alone is not a change); an
+        // error degrades to the honest error state (the alarms
+        // convention). Stale eras (profile switch) AND stale gens
+        // (superseded worker after a set change) drop whole.
+        AppEvent::TagWatch {
+            era,
+            generation,
+            result,
+        } => {
+            if workers::is_current(state.era, era) && state.tags.watch_gen == generation {
+                match result {
+                    Ok(rows) => {
+                        let previous: std::collections::BTreeMap<
+                            &str,
+                            &ignition_core::actions::tags::TagReadRow,
+                        > = state
+                            .tags
+                            .watch_rows
+                            .iter()
+                            .map(|row| (row.path.as_str(), row))
+                            .collect();
+                        let changed = rows
+                            .iter()
+                            .filter(|row| {
+                                previous.get(row.path.as_str()).is_none_or(|prev| {
+                                    prev.value != row.value || prev.quality != row.quality
+                                })
+                            })
+                            .map(|row| row.path.clone())
+                            .collect();
+                        state.tags.watch_rows = rows;
+                        state.tags.watch_changed = changed;
+                        state.tags.watch_error = None;
+                    }
+                    Err(message) => {
+                        state.tags.watch_rows.clear();
+                        state.tags.watch_changed.clear();
+                        state.tags.watch_error = Some(message);
+                    }
+                }
+            }
+        }
         // One alarms poll result (06-03): replace the table (Ok) or
         // degrade to the honest error state (Err). Stale eras drop
         // whole (Pitfall 9); the selection clamps into the new rows.
@@ -235,9 +279,10 @@ fn handle_input(state: &mut AppState, event: Event) {
 
 /// Change the active screen, starting/stopping the screen-scoped
 /// workers on the transition: LEAVING the Logs screen stops the tail
-/// (must-have truth #3) and leaving Alarms stops the poll; entering
-/// re-arms them (the tail resuming past the ring's newest entry — no
-/// duplicate flood).
+/// (must-have truth #3), leaving Alarms stops the poll, and leaving
+/// Tags stops the live watch; entering re-arms them (the tail
+/// resuming past the ring's newest entry — no duplicate flood; the
+/// watch resuming the retained set).
 fn set_screen(state: &mut AppState, screen: Screen) {
     if state.screen == screen {
         return;
@@ -245,6 +290,7 @@ fn set_screen(state: &mut AppState, screen: Screen) {
     match state.screen {
         Screen::Logs => workers::tail::stop_tail(state),
         Screen::Alarms => workers::watch::stop_alarms(state),
+        Screen::Tags => workers::watch::stop_tag_watch(state),
         _ => {}
     }
     state.screen = screen;
@@ -252,9 +298,12 @@ fn set_screen(state: &mut AppState, screen: Screen) {
         Screen::Logs => workers::tail::spawn_tail(state),
         Screen::Alarms => workers::watch::spawn_alarms(state),
         // Entering Tags loads the provider list (one-shot, busy
-        // guarded — the screen's entry read; the browse/detail/
-        // watch workers are navigation-driven).
-        Screen::Tags => workers::watch::spawn_providers_once(state),
+        // guarded — the screen's entry read) and resumes the live
+        // watch over the retained set (empty set = a no-op stop).
+        Screen::Tags => {
+            workers::watch::spawn_providers_once(state);
+            workers::watch::spawn_tag_watch(state);
+        }
         _ => {}
     }
 }
@@ -322,6 +371,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     }
     workers::tail::stop_tail(state);
     workers::watch::stop_alarms(state);
+    workers::watch::stop_tag_watch(state);
     state.client = Some(crate::state::ClientHandle(api));
     state.profile_url = Some(url);
     state.profile = Some(resolved_name.clone());
@@ -336,7 +386,10 @@ fn switch_profile(state: &mut AppState, name: &str) {
     match state.screen {
         Screen::Logs => workers::tail::spawn_tail(state),
         Screen::Alarms => workers::watch::spawn_alarms(state),
-        Screen::Tags => workers::watch::spawn_providers_once(state),
+        Screen::Tags => {
+            workers::watch::spawn_providers_once(state);
+            workers::watch::spawn_tag_watch(state);
+        }
         _ => {}
     }
     if let Some(tx) = &state.events_tx {
@@ -521,16 +574,17 @@ fn history_window_24h() -> (i64, i64) {
 
 // ---- Tags screen (06-04) ----
 
-/// The Tags keymap (06-04 Task 1): Up/Down (j/k) move the current
-/// level's cursor, Enter descends (provider → its tree; folder →
-/// deeper) or opens the tag detail (with the on-demand read), `a`
-/// opens the actions menu (Task 3), Esc ascends one level (handled
-/// in [`handle_input`] — the global key owns Esc).
+/// The Tags keymap (06-04): Up/Down (j/k) move the current level's
+/// cursor, Enter descends (provider → its tree; folder → deeper) or
+/// opens the tag detail (with the on-demand read), `w` toggles live
+/// watch on the selected tag (06-04 Task 2), Esc ascends one level
+/// (handled in [`handle_input`] — the global key owns Esc).
 fn tags_keys(state: &mut AppState, code: KeyCode) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => move_tags_selection(state, -1),
         KeyCode::Down | KeyCode::Char('j') => move_tags_selection(state, 1),
         KeyCode::Enter => tags_enter(state),
+        KeyCode::Char('w') => toggle_watch(state),
         _ => {}
     }
 }
@@ -672,6 +726,30 @@ fn tags_ascend(state: &mut AppState) -> bool {
         }
         None => false,
     }
+}
+
+/// The watch-toggle's path source: the open detail's tag, else the
+/// selected row of the current tree level (the provider list level
+/// carries no watchable tag).
+fn watchable_path(state: &AppState) -> Option<String> {
+    if let Some(detail) = &state.tags.detail {
+        return Some(detail.path.clone());
+    }
+    selected_tree_row(state).map(|row| row.path)
+}
+
+/// `w`: toggle the selected tag in the live-watch set, then
+/// (re)spawn the watch worker for the new set — a set change is a
+/// shutdown + respawn under a bumped `gen` (the local stale gate);
+/// emptying the set stops the worker outright.
+fn toggle_watch(state: &mut AppState) {
+    let Some(path) = watchable_path(state) else {
+        return;
+    };
+    if !state.tags.watched.remove(&path) {
+        state.tags.watched.insert(path);
+    }
+    workers::watch::spawn_tag_watch(state);
 }
 
 /// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
@@ -2830,5 +2908,220 @@ mod tests {
         assert_eq!(state.tags.providers_table.selected(), Some(1), "clamped");
         update(&mut state, key(KeyCode::Char('k'), KeyModifiers::NONE));
         assert_eq!(state.tags.providers_table.selected(), Some(0), "k ascends");
+    }
+
+    // ---- Tags live watch (06-04 Task 2) ----
+
+    /// A Tags state sitting on a loaded tree level with the cursor on
+    /// a leaf row — the watch-flow fixture.
+    fn tags_state_on_tree() -> AppState {
+        let mut state = tags_screen_with_rails();
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Ok(vec![provider_row("default")]),
+            },
+        );
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]".into(),
+                result: Ok(vec![
+                    browse_row("[default]P5", "P5", "Folder", true),
+                    browse_row("[default]T1", "T1", "AtomicTag", false),
+                    browse_row("[default]T2", "T2", "AtomicTag", false),
+                ]),
+            },
+        );
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE)); // cursor → T1
+        state
+    }
+
+    /// `w` toggles the selected tag into the watched set and (re)spawns
+    /// the worker under a bumped gen; un-watching the last path STOPS
+    /// the worker outright (empty set). A set change retires the prior
+    /// gen — the local stale gate (the global era stays world-scoped
+    /// per 06-03's lock).
+    #[test]
+    fn w_toggles_watch_and_respawns_under_a_bumped_gen() {
+        let mut state = tags_state_on_tree();
+
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(state.tags.watched.contains("[default]T1"));
+        assert!(state.tags.watch_shutdown.is_some(), "worker rail armed");
+        let first_gen = state.tags.watch_gen;
+        assert_eq!(first_gen, 1, "gen bumped on the first spawn");
+
+        // Watch a second tag: the set changes → respawn retires gen 1.
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE)); // → T2
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(state.tags.watched.len(), 2);
+        assert_eq!(state.tags.watch_gen, 2, "set change bumps the gen");
+        assert!(
+            !crate::workers::is_current(state.tags.watch_gen, first_gen),
+            "the first worker's gen is stale (is_current check)"
+        );
+
+        // Un-watch both: the empty set stops the worker.
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE)); // T2 out
+        assert_eq!(state.tags.watched.len(), 1);
+        assert!(state.tags.watch_shutdown.is_some(), "still one path");
+        update(&mut state, key(KeyCode::Up, KeyModifiers::NONE)); // → T1
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE)); // T1 out
+        assert!(state.tags.watched.is_empty());
+        assert!(
+            state.tags.watch_shutdown.is_none(),
+            "empty set stops the worker"
+        );
+    }
+
+    /// `w` in the detail pane toggles the DETAIL's path; `w` at the
+    /// provider level (no tree row) is a no-op.
+    #[test]
+    fn w_in_detail_toggles_the_detail_path_and_provider_level_is_a_noop() {
+        let mut state = tags_state_on_tree();
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE)); // detail on T1
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(state.tags.watched.contains("[default]T1"));
+
+        // Provider level: no watchable path.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE)); // detail → tree
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE)); // tree → providers
+        let watched_before = state.tags.watched.clone();
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(state.tags.watched, watched_before, "no-op at the root");
+    }
+
+    /// TagWatch lands only under the current era+gen: rows replace the
+    /// table, the changed-marker keys on value/quality diffs (a
+    /// timestamp-only bump is NOT a change), and a stale-gen poll
+    /// (superseded worker) drops whole.
+    #[test]
+    fn tag_watch_event_updates_rows_marks_changes_and_drops_stale_gens() {
+        let mut state = tags_state_on_tree();
+        let era = state.era;
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        let generation = state.tags.watch_gen;
+
+        // First poll: both rows are NEW → both marked changed.
+        update(
+            &mut state,
+            AppEvent::TagWatch {
+                era,
+                generation,
+                result: Ok(vec![
+                    read_row("[default]T1", serde_json::json!(7)),
+                    read_row("[default]P5", serde_json::json!(null)),
+                ]),
+            },
+        );
+        assert_eq!(state.tags.watch_rows.len(), 2);
+        assert!(state.tags.watch_changed.contains("[default]T1"));
+
+        // Second poll: T1's value moved (marked), P5 identical (not).
+        update(
+            &mut state,
+            AppEvent::TagWatch {
+                era,
+                generation,
+                result: Ok(vec![
+                    read_row("[default]T1", serde_json::json!(8)),
+                    read_row("[default]P5", serde_json::json!(null)),
+                ]),
+            },
+        );
+        assert!(
+            state.tags.watch_changed.contains("[default]T1"),
+            "value moved"
+        );
+        assert!(
+            !state.tags.watch_changed.contains("[default]P5"),
+            "identical row is not a change"
+        );
+
+        // Stale gen (a superseded worker's in-flight poll): dropped.
+        let before = state.tags.watch_rows.clone();
+        update(
+            &mut state,
+            AppEvent::TagWatch {
+                era,
+                generation: generation.wrapping_sub(1),
+                result: Ok(vec![]),
+            },
+        );
+        assert_eq!(state.tags.watch_rows, before, "stale-gen poll dropped");
+
+        // Stale era (profile switch): dropped.
+        update(
+            &mut state,
+            AppEvent::TagWatch {
+                era: era.wrapping_sub(1),
+                generation,
+                result: Ok(vec![]),
+            },
+        );
+        assert_eq!(state.tags.watch_rows, before, "stale-era poll dropped");
+    }
+
+    /// A watch poll error degrades to the honest error state (rows
+    /// cleared) — the alarms convention.
+    #[test]
+    fn watch_error_degrades_the_table() {
+        let mut state = tags_state_on_tree();
+        let era = state.era;
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        let generation = state.tags.watch_gen;
+        update(
+            &mut state,
+            AppEvent::TagWatch {
+                era,
+                generation,
+                result: Ok(vec![read_row("[default]T1", serde_json::json!(1))]),
+            },
+        );
+        assert!(!state.tags.watch_rows.is_empty());
+
+        update(
+            &mut state,
+            AppEvent::TagWatch {
+                era,
+                generation,
+                result: Err("routes_not_deployed (exit 6)".into()),
+            },
+        );
+        assert!(state.tags.watch_rows.is_empty(), "rows dropped on error");
+        assert_eq!(
+            state.tags.watch_error.as_deref(),
+            Some("routes_not_deployed (exit 6)")
+        );
+    }
+
+    /// Leaving the Tags screen stops the watch worker; re-entering
+    /// resumes it over the RETAINED set (the tail's re-entry shape).
+    #[test]
+    fn leaving_tags_stops_the_watch_and_reentry_resumes_it() {
+        let mut state = tags_state_on_tree();
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(state.tags.watch_shutdown.is_some());
+
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Alarms);
+        assert!(
+            state.tags.watch_shutdown.is_none(),
+            "leaving Tags stops the watch worker"
+        );
+        assert_eq!(state.tags.watched.len(), 1, "the SET is retained");
+
+        // BackTab returns Alarms → Tags (Tab would land on Projects).
+        update(&mut state, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(state.screen, Screen::Tags);
+        assert!(
+            state.tags.watch_shutdown.is_some(),
+            "re-entry resumes the watch over the retained set"
+        );
     }
 }

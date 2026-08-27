@@ -5,6 +5,7 @@
 //! Per-screen data structs are added by their plans (06-02..06-06); the
 //! shell owns the navigation chrome only.
 
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -559,8 +560,8 @@ pub struct TagsDetail {
 }
 
 /// The Tags screen's data (06-04): the k9s-style object browser —
-/// the provider list, the descend/ascend browse stack, and the open
-/// detail pane with its on-demand read.
+/// the provider list, the descend/ascend browse stack, the open
+/// detail pane with its on-demand read, and the live-watch set.
 #[derive(Debug, Default)]
 pub struct TagsData {
     /// The provider list level: rows (None until loaded / after an
@@ -584,6 +585,26 @@ pub struct TagsData {
     /// stale gate; the global era stays world-scoped per 06-03's
     /// lock, so this counter is the detail pane's private era).
     pub detail_seq: u64,
+    /// The live-watch set (tag paths), BTree order — the worker's
+    /// whole request and the marker's source of truth.
+    pub watched: BTreeSet<String>,
+    /// The watch table's latest rows (request order — the set's).
+    pub watch_rows: Vec<TagReadRow>,
+    /// Paths whose value or quality CHANGED on the last poll (the
+    /// table's updated-marker; timestamps excluded — a clock bump
+    /// with an unchanged value is not a change).
+    pub watch_changed: BTreeSet<String>,
+    /// Why the last watch poll errored, when it did (rows degrade to
+    /// the honest error state, the alarms convention).
+    pub watch_error: Option<String>,
+    /// Watch-worker generation: every (re)spawn bumps it — a
+    /// set-change respawn's in-flight poll from the PRIOR worker
+    /// drops (the local stale gate; the global era stays world-scoped
+    /// per 06-03's lock).
+    pub watch_gen: u64,
+    /// The watch worker's shutdown switch — screen exit, empty set,
+    /// set-change respawn, profile switch.
+    pub watch_shutdown: Option<watch::Sender<bool>>,
 }
 
 /// The whole cockpit, in plain data. The era counter is the stale-worker

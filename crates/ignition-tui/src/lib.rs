@@ -93,9 +93,9 @@ async fn run_loop(
     .await;
 
     // Stop every worker — the loop is done, the world is gone. The
-    // refresh worker by its rail; the screen-scoped tail by its own
-    // (dropping the sender also stops it, but the explicit signal is
-    // immediate).
+    // refresh worker by its rail; the screen-scoped tail and watches
+    // by their own (dropping the sender also stops them, but the
+    // explicit signal is immediate).
     if let Some(shutdown) = &state.refresh_shutdown {
         let _ = shutdown.send(true);
     }
@@ -103,6 +103,9 @@ async fn run_loop(
         let _ = shutdown.send(true);
     }
     if let Some(shutdown) = &state.alarms.shutdown {
+        let _ = shutdown.send(true);
+    }
+    if let Some(shutdown) = &state.tags.watch_shutdown {
         let _ = shutdown.send(true);
     }
     result
