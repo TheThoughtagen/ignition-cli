@@ -71,6 +71,7 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::Input { .. } => 5,
         Modal::Result_ { lines, .. } => lines.len().saturating_add(4).min(9),
         Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(3).min(11),
+        Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(3),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
@@ -128,6 +129,23 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         }
         Modal::Actions { selected } => {
             let text: Vec<Line> = crate::state::ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let marker = if index == *selected { "▸ " } else { "  " };
+                    Line::from(format!("{marker}{action}"))
+                })
+                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .collect();
+            frame.render_widget(
+                Paragraph::new(text).block(Block::bordered().title("actions")),
+                area,
+            );
+        }
+        // The Logs screen's menu (06-03): the loggers family, same
+        // shape as the dashboard's menu.
+        Modal::LogsActions { selected } => {
+            let text: Vec<Line> = crate::state::LOG_ACTIONS
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
@@ -386,6 +404,24 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("PgUp/PgDn scroll")),
             "result modal shows the scroll hint: {rows:?}"
+        );
+    }
+
+    /// The Logs actions menu (06-03) renders the loggers family with
+    /// the selection marker.
+    #[test]
+    fn logs_actions_menu_renders_the_loggers_family() {
+        let mut state = AppState::new();
+        state.screen = Screen::Logs;
+        state.open_modal(Modal::LogsActions { selected: 2 });
+        let rows = rendered_rows(&state);
+        let text = rows.join("\n");
+        for verb in ["loggers list", "loggers set", "loggers reset"] {
+            assert!(text.contains(verb), "menu lists {verb}: {text}");
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("▸ loggers reset")),
+            "selection marker on entry 2"
         );
     }
 }

@@ -123,6 +123,10 @@ pub enum Modal {
     /// The dashboard actions menu (06-02): the global verbs with a
     /// moving selection (Up/Down + Enter).
     Actions { selected: usize },
+    /// The Logs screen's actions menu (06-03): the loggers family with
+    /// a moving selection — the same shape as [`Modal::Actions`], its
+    /// own list.
+    LogsActions { selected: usize },
     /// The profile switcher (06-02): every configured profile name
     /// (BTreeMap order), the currently-active one marked, a moving
     /// selection. Enter switches, `a` opens the add form.
@@ -142,21 +146,34 @@ pub enum Modal {
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
-/// (`y`) looks here; cancel (Esc) clears it.
+/// (`y`) looks here; cancel (Esc) clears it. The LOGGED verbs join the
+/// set (the loggers family's two `--yes`-guarded mutations, 06-03) —
+/// the TUI owns their confirmation, the action fns stay unguarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingAction {
     /// `ign restart` — the guarded global verb.
     Restart,
     /// `ign sessions terminate` on the selected row.
     TerminateSession { kind: SessionType, id: String },
+    /// `ign logs loggers set <logger> <LEVEL>` (Confirm ≡ `--yes`).
+    LoggersSet { logger: String, level: String },
+    /// `ign logs loggers reset` (Confirm ≡ `--yes`).
+    LoggersReset,
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
-/// (06-02 ships `wait module`'s id prompt).
+/// (06-02 ships `wait module`'s id prompt; 06-03 adds the loggers
+/// forms). The pending slots live on the dashboard's data but are
+/// COCKPIT-global in practice: exactly one modal is open at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingInput {
     /// The module id for `wait module`.
     WaitModule,
+    /// The optional substring search for `loggers list`.
+    LoggersSearch,
+    /// The `LOGGER LEVEL` line for `loggers set` (parsed before the
+    /// Confirm gate arms).
+    LoggersSetLine,
 }
 
 impl Modal {
@@ -167,6 +184,7 @@ impl Modal {
             | Modal::Input { title, .. }
             | Modal::Result_ { title, .. } => title,
             Modal::Actions { .. } => "actions",
+            Modal::LogsActions { .. } => "actions",
             Modal::Profiles { .. } => "profiles",
             Modal::ProfileAdd { .. } => "profile add",
         }
@@ -242,6 +260,11 @@ pub const ACTIONS: [&str; 7] = [
     "doctor",
     "restart",
 ];
+
+/// The Logs screen's actions menu entries (06-03) — the loggers
+/// family. Labels are display-side; the route rows in
+/// [`crate::routes`] carry the clap-exact spellings.
+pub const LOG_ACTIONS: [&str; 3] = ["loggers list", "loggers set", "loggers reset"];
 
 /// The dashboard screen's data (06-02).
 #[derive(Debug, Default)]

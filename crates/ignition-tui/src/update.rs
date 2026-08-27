@@ -12,7 +12,8 @@ use ignition_core::client::ReqwestGatewayApi;
 
 use crate::event::AppEvent;
 use crate::state::{
-    ACTIONS, AppState, Modal, PendingAction, PendingInput, Screen, SessionRow, session_rows,
+    ACTIONS, AppState, LOG_ACTIONS, Modal, PendingAction, PendingInput, Screen, SessionRow,
+    session_rows,
 };
 use crate::workers;
 
@@ -267,6 +268,66 @@ fn logs_keys(state: &mut AppState, code: KeyCode) {
         KeyCode::Char('j') | KeyCode::Down => state.logs.scroll_down(1),
         KeyCode::PageDown => state.logs.scroll_down(10),
         KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::End => state.logs.jump_to_end(),
+        // The loggers family lives behind the actions menu (the tail
+        // keeps streaming independently — the menu verbs are one-shot
+        // workers on a separate spawn).
+        KeyCode::Char('a') => state.open_modal(Modal::LogsActions { selected: 0 }),
+        _ => {}
+    }
+}
+
+/// Parse the `loggers set` input line: exactly `LOGGER LEVEL`, the
+/// level one of the seven wire tokens (case-insensitive — normalized
+/// uppercase). A String error so the caller can open the error modal
+/// (the clap value_enum refusal's TUI twin).
+const WIRE_LEVELS: [&str; 7] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "OFF"];
+
+fn parse_logger_level_line(line: &str) -> Result<(String, String), String> {
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(logger), Some(level), None) => {
+            let level = level.to_ascii_uppercase();
+            if WIRE_LEVELS.contains(&level.as_str()) {
+                Ok((logger.to_string(), level))
+            } else {
+                Err(format!(
+                    "unknown level {level:?} — expected one of {}",
+                    WIRE_LEVELS.join(" ")
+                ))
+            }
+        }
+        _ => Err("expected `LOGGER LEVEL` (e.g. `GatewayManager WARN`)".to_string()),
+    }
+}
+
+/// Execute a Logs-actions-menu entry `index` (Enter in the LogsActions
+/// modal): `loggers list` prompts for the optional search, `loggers
+/// set` prompts for the `LOGGER LEVEL` line, `loggers reset` goes
+/// straight to the Confirm gate. The two mutations are `--yes`-guarded
+/// in the CLI (main.rs) — the Confirm modal IS the TUI's `--yes`.
+fn execute_logs_menu_action(state: &mut AppState, index: usize) {
+    match LOG_ACTIONS.get(index).copied() {
+        Some("loggers list") => {
+            state.dashboard.pending_input = Some(PendingInput::LoggersSearch);
+            state.open_modal(Modal::Input {
+                title: "logger search (optional)".to_string(),
+                buffer: String::new(),
+            });
+        }
+        Some("loggers set") => {
+            state.dashboard.pending_input = Some(PendingInput::LoggersSetLine);
+            state.open_modal(Modal::Input {
+                title: "LOGGER LEVEL".to_string(),
+                buffer: String::new(),
+            });
+        }
+        Some("loggers reset") => {
+            state.dashboard.pending = Some(PendingAction::LoggersReset);
+            state.open_modal(Modal::Confirm {
+                title: "loggers reset".to_string(),
+                body: "reset ALL logger levels to their defaults?".to_string(),
+            });
+        }
         _ => {}
     }
 }
@@ -418,6 +479,24 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
                 });
             }
         }
+        // The confirmed loggers mutations fire unguarded — the TUI owned
+        // the `--yes` (the CLI guard contract, caller-owns-guard).
+        PendingAction::LoggersSet { logger, level } => {
+            if let Some(client) = client_arc(state) {
+                let logger = logger.clone();
+                let level = level.clone();
+                workers::spawn_action(state, "loggers set", async move {
+                    ignition_core::actions::logs::set_logger_level(&*client, &logger, &level).await
+                });
+            }
+        }
+        PendingAction::LoggersReset => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "loggers reset", async move {
+                    ignition_core::actions::logs::reset_logger_levels(&*client).await
+                });
+            }
+        }
     }
 }
 
@@ -497,6 +576,31 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         return;
     }
 
+    // The Logs actions menu: the same nav shape as the dashboard's
+    // menu, over the loggers family.
+    if let Some(Modal::LogsActions { selected }) = state.modal.as_mut()
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        match code {
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(LOG_ACTIONS.len() - 1);
+                return;
+            }
+            KeyCode::Enter => {
+                let index = *selected;
+                state.close_modal();
+                clear_pending(state);
+                execute_logs_menu_action(state, index);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // The Actions menu: Up/Down move, Enter executes. Long waits run in
     // the worker with NO UI block — only the status line's in-flight
     // label shows while they run.
@@ -554,6 +658,28 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                     });
                 }
             }
+            // The optional search: empty = no filter (the bare list).
+            (Some(PendingInput::LoggersSearch), _) => {
+                if let Some(client) = client_arc(state) {
+                    let search = if value.is_empty() { None } else { Some(value) };
+                    workers::spawn_action(state, "loggers list", async move {
+                        ignition_core::actions::logs::loggers(&*client, search.as_deref()).await
+                    });
+                }
+            }
+            // The `LOGGER LEVEL` line: parsed BEFORE the Confirm gate
+            // arms; a bad line opens the error modal and arms nothing.
+            (Some(PendingInput::LoggersSetLine), false) => match parse_logger_level_line(&value) {
+                Ok((logger, level)) => {
+                    let body = format!("set {logger} to {level}?");
+                    state.dashboard.pending = Some(PendingAction::LoggersSet { logger, level });
+                    state.open_modal(Modal::Confirm {
+                        title: "loggers set".to_string(),
+                        body,
+                    });
+                }
+                Err(reason) => open_error_modal(state, "loggers set", &reason),
+            },
             _ => clear_pending(state),
         }
         return;
@@ -1499,5 +1625,181 @@ mod tests {
             state.logs.ring.back().map(|e| e.message.as_str()),
             Some("streamed")
         );
+    }
+
+    // ---- Logs actions menu / loggers family (06-03 Task 2) ----
+
+    /// The `LOGGER LEVEL` line parses (case-normalized) and refuses
+    /// junk with honest reasons (the clap value_enum refusal's twin).
+    #[test]
+    fn logger_level_line_parses_and_refuses() {
+        let parse = super::parse_logger_level_line;
+        assert_eq!(
+            parse("GatewayManager warn").unwrap(),
+            ("GatewayManager".to_string(), "WARN".to_string())
+        );
+        assert_eq!(
+            parse("  Thread$1  ERROR  ").unwrap(),
+            ("Thread$1".to_string(), "ERROR".to_string())
+        );
+        assert!(parse("GatewayManager").is_err(), "missing level");
+        assert!(parse("a b c").is_err(), "extra token");
+        assert!(parse("").is_err(), "empty");
+        let bad = parse("GatewayManager LOUD").expect_err("unknown level");
+        assert!(bad.contains("unknown level"), "names the problem: {bad}");
+        assert!(bad.contains("TRACE"), "names the valid set: {bad}");
+    }
+
+    /// A Logs-screen state with rails armed (the menu-flow fixture —
+    /// nothing actually spawns outside a runtime). Enters via Tab so
+    /// the screen-transition hooks arm the tail rail like production.
+    fn logs_screen_with_rails() -> AppState {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Logs);
+        state
+    }
+
+    /// `a` opens the Logs menu; Enter on `loggers reset` opens the
+    /// Confirm gate and spawns NOTHING; Esc cancels with the pending
+    /// cleared (the --yes contract, cancel-spawns-nothing).
+    #[test]
+    fn logs_menu_reset_is_confirm_gated_and_cancel_spawns_nothing() {
+        let mut state = logs_screen_with_rails();
+
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(
+            state.modal,
+            Some(Modal::LogsActions { selected: 0 }),
+            "a opens the loggers menu"
+        );
+
+        // Down ×2 → `loggers reset` (third entry).
+        for _ in 0..2 {
+            update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Confirm { .. })),
+            "reset opens the Confirm gate"
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::LoggersReset),
+            "pending armed"
+        );
+        assert!(
+            state.dashboard.in_flight.is_none(),
+            "nothing spawns before y"
+        );
+
+        // Esc cancels: pending cleared, still nothing in flight.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert!(state.dashboard.pending.is_none());
+        assert!(state.dashboard.in_flight.is_none());
+    }
+
+    /// Confirm-accept on reset ≡ `--yes`: the mutation moves to
+    /// in-flight.
+    #[test]
+    fn logs_menu_reset_accept_fires_the_unguarded_action() {
+        let mut state = logs_screen_with_rails();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        for _ in 0..2 {
+            update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(state.modal.is_none(), "confirm closed on accept");
+        assert_eq!(
+            state.dashboard.in_flight,
+            Some("loggers reset"),
+            "reset in flight after y"
+        );
+    }
+
+    /// `loggers set`: Input prompt → parse → Confirm gate → y fires.
+    /// A bad line opens the error modal and arms NOTHING.
+    #[test]
+    fn logs_menu_set_prompts_parses_then_confirms() {
+        let mut state = logs_screen_with_rails();
+
+        // Down ×1 → `loggers set`.
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(state.modal, Some(Modal::Input { .. })));
+        assert_eq!(
+            state.dashboard.pending_input,
+            Some(PendingInput::LoggersSetLine)
+        );
+
+        // Type the line (case-mixed — normalized), Enter → Confirm.
+        for ch in "GatewayManager warn".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(state.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::LoggersSet {
+                logger: "GatewayManager".into(),
+                level: "WARN".into()
+            })
+        );
+
+        // y ≡ --yes: the unguarded action fn moves to in-flight.
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("loggers set"));
+
+        // The bad-line twin: junk level → error modal, nothing armed.
+        let mut fresh = logs_screen_with_rails();
+        update(&mut fresh, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut fresh, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
+        for ch in "GatewayManager LOUD".chars() {
+            update(&mut fresh, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&fresh.modal, Some(Modal::Result_ { title, .. }) if title == "loggers set"),
+            "bad line surfaces the error modal"
+        );
+        assert!(fresh.dashboard.pending.is_none(), "nothing armed");
+        assert!(fresh.dashboard.in_flight.is_none());
+    }
+
+    /// `loggers list`: the optional search — any value (including
+    /// empty) spawns the one-shot list; the tail rail stays armed
+    /// throughout (the streams are independent workers).
+    #[test]
+    fn logs_menu_list_spawns_with_or_without_search() {
+        let mut state = logs_screen_with_rails();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE)); // entry 0 = list
+        assert!(matches!(state.modal, Some(Modal::Input { .. })));
+
+        for ch in "Thread".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("loggers list"));
+        assert!(
+            state.logs.tail_shutdown.is_some(),
+            "the tail keeps streaming independently"
+        );
+
+        // Empty input = no filter (the bare list), also spawns.
+        let mut fresh = logs_screen_with_rails();
+        update(&mut fresh, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("loggers list"));
     }
 }

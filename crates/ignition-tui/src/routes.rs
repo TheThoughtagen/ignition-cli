@@ -110,6 +110,33 @@ pub fn routes() -> &'static [CliRoute] {
             path: "profile add",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 06-03: the logs family. `logs` is the BARE form (LogsArgs is
+        // Option<LogsCmd> at cli.rs — `follow` is a FLAG on it, not a
+        // subcommand; there is NO `logs follow` leaf) — the tail screen
+        // IS bare `ign logs`. `logs download` and the loggers subtree
+        // map to the same screen (download/loggers run from the
+        // screen's actions menu; the registry's Streamed kind stays
+        // reserved for raw-pane cases like rig logs, 06-06).
+        CliRoute {
+            path: "logs",
+            mapping: Mapping::Screen(Screen::Logs),
+        },
+        CliRoute {
+            path: "logs download",
+            mapping: Mapping::Screen(Screen::Logs),
+        },
+        CliRoute {
+            path: "logs loggers",
+            mapping: Mapping::Screen(Screen::Logs),
+        },
+        CliRoute {
+            path: "logs loggers set",
+            mapping: Mapping::Screen(Screen::Logs),
+        },
+        CliRoute {
+            path: "logs loggers reset",
+            mapping: Mapping::Screen(Screen::Logs),
+        },
     ]
 }
 
@@ -165,6 +192,43 @@ mod tests {
             assert!(
                 paths.contains(&expected),
                 "dashboard route row {expected:?} missing"
+            );
+        }
+    }
+
+    /// The 06-03 logs rows cover the FULL LogsCmd/LoggersCmd tree as
+    /// clap spells it: bare `logs` (the tail screen), `logs download`,
+    /// bare `logs loggers` (the list), and the `set`/`reset` leaves —
+    /// all on the Logs screen. There is no `logs follow` leaf (a
+    /// flag, not a subcommand) and no `logs loggers get` leaf (the
+    /// bare form IS the list) — the walk is exhaustive over the
+    /// leaves that exist.
+    #[test]
+    fn logs_rows_cover_the_06_03_family() {
+        let rows: Vec<&super::CliRoute> = routes()
+            .iter()
+            .filter(|route| route.path.starts_with("logs"))
+            .collect();
+        let expected = [
+            ("logs", Screen::Logs),
+            ("logs download", Screen::Logs),
+            ("logs loggers", Screen::Logs),
+            ("logs loggers set", Screen::Logs),
+            ("logs loggers reset", Screen::Logs),
+        ];
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "exactly the logs leaves that exist: {rows:?}"
+        );
+        for (path, screen) in expected {
+            let row = rows
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("logs route row {path:?} missing"));
+            assert!(
+                matches!(row.mapping, super::Mapping::Screen(s) if s == screen),
+                "{path} maps to {screen:?}"
             );
         }
     }
