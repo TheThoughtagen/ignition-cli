@@ -241,11 +241,22 @@ pub async fn webdev_precondition(api: &dyn GatewayApi, project: &str) -> Result<
             status: 401,
             endpoint: Some(endpoint),
         }),
-        RouteProbe::Denied { code, message } => Err(CoreError::WebdevRouteError {
+        RouteProbe::Denied {
             code,
             message,
-            endpoint: Some(endpoint),
-        }),
+            traceback,
+        } => {
+            let mut full = message;
+            if let Some(traceback) = traceback {
+                full.push_str("\nroute traceback: ");
+                full.push_str(&traceback);
+            }
+            Err(CoreError::WebdevRouteError {
+                code,
+                message: full,
+                endpoint: Some(endpoint),
+            })
+        }
     }
 }
 
@@ -787,6 +798,7 @@ mod tests {
                     "scriptExec" => RouteProbe::Denied {
                         code: "secret_mismatch".into(),
                         message: "mismatch".into(),
+                        traceback: None,
                     },
                     _ => RouteProbe::AuthGated,
                 })

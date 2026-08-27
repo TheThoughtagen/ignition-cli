@@ -897,9 +897,16 @@ impl GatewayApi for ReqwestGatewayApi {
         let text = response.text().await.unwrap_or_default();
         match webdev::parse_route_body(&text)? {
             RouteBody::Ok(data) => Ok(data),
-            RouteBody::Denied { code, message } => {
-                Err(webdev::denial_to_error(&code, &message, url))
-            }
+            RouteBody::Denied {
+                code,
+                message,
+                traceback,
+            } => Err(webdev::denial_to_error(
+                &code,
+                &message,
+                traceback.as_deref(),
+                url,
+            )),
         }
     }
 
@@ -937,7 +944,15 @@ impl GatewayApi for ReqwestGatewayApi {
                         })?;
                     Ok(RouteProbe::Present { route_version })
                 }
-                RouteBody::Denied { code, message } => Ok(RouteProbe::Denied { code, message }),
+                RouteBody::Denied {
+                    code,
+                    message,
+                    traceback,
+                } => Ok(RouteProbe::Denied {
+                    code,
+                    message,
+                    traceback,
+                }),
             };
         }
         match status.as_u16() {

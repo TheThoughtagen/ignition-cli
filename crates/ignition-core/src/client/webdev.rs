@@ -110,6 +110,10 @@ pub enum RouteProbe {
         code: String,
         /// The route's human message.
         message: String,
+        /// The route's Python traceback, when the denial carries one
+        /// (the envelope's optional `error.traceback` — surfaced so
+        /// route-side exceptions are not a black box, 05-08).
+        traceback: Option<String>,
     },
 }
 
@@ -119,8 +123,13 @@ pub enum RouteProbe {
 pub(crate) enum RouteBody {
     /// `ok:true` — `data` (Null when the route sent none).
     Ok(Value),
-    /// `ok:false` — the route's structured refusal.
-    Denied { code: String, message: String },
+    /// `ok:false` — the route's structured refusal (traceback when
+    /// the envelope carried one).
+    Denied {
+        code: String,
+        message: String,
+        traceback: Option<String>,
+    },
 }
 
 /// Parse a 200 body as the route envelope. A body that is not the
@@ -151,7 +160,15 @@ pub(crate) fn parse_route_body(body: &str) -> Result<RouteBody, CoreError> {
             .and_then(Value::as_str)
             .unwrap_or("(the route sent no message)")
             .to_string();
-        Ok(RouteBody::Denied { code, message })
+        let traceback = value
+            .pointer("/error/traceback")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(RouteBody::Denied {
+            code,
+            message,
+            traceback,
+        })
     }
 }
 
@@ -164,8 +181,17 @@ pub(crate) fn parse_route_body(body: &str) -> Result<RouteBody, CoreError> {
 /// route bug, 05-06); every other code — known-but-unmapped like
 /// `secret_required`, or unknown from a future route — rides
 /// [`CoreError::WebdevRouteError`] with code + message verbatim, the
-/// stable contract agents branch on.
-pub(crate) fn denial_to_error(code: &str, message: &str, endpoint: String) -> CoreError {
+/// stable contract agents branch on. A denial that carried a
+/// traceback gets it appended to the message
+/// (`"\nroute traceback: {tb}"`) — the route-side exception is
+/// visible instead of a black box (05-08); without one the message
+/// is byte-identical to the pre-traceback era.
+pub(crate) fn denial_to_error(
+    code: &str,
+    message: &str,
+    traceback: Option<&str>,
+    endpoint: String,
+) -> CoreError {
     match code {
         "not_found" => CoreError::NotFound {
             endpoint: Some(endpoint),
@@ -173,11 +199,18 @@ pub(crate) fn denial_to_error(code: &str, message: &str, endpoint: String) -> Co
         "no_alarm_journal" => CoreError::AlarmJournalMissing {
             endpoint: Some(endpoint),
         },
-        _ => CoreError::WebdevRouteError {
-            code: code.to_string(),
-            message: message.to_string(),
-            endpoint: Some(endpoint),
-        },
+        _ => {
+            let mut full = message.to_string();
+            if let Some(traceback) = traceback {
+                full.push_str("\nroute traceback: ");
+                full.push_str(traceback);
+            }
+            CoreError::WebdevRouteError {
+                code: code.to_string(),
+                message: full,
+                endpoint: Some(endpoint),
+            }
+        }
     }
 }
 
@@ -322,9 +355,31 @@ mod tests {
         )
         .expect("denial parses")
         {
-            RouteBody::Denied { code, message } => {
+            RouteBody::Denied {
+                code,
+                message,
+                traceback,
+            } => {
                 assert_eq!(code, "secret_mismatch");
                 assert_eq!(message, "nope");
+                assert!(traceback.is_none(), "no traceback on the wire");
+            }
+            other => panic!("wrong verdict: {other:?}"),
+        }
+
+        // A denial carrying the optional traceback keeps it (the
+        // black-box fix's parse half).
+        match parse_route_body(
+            r#"{"ok":false,"error":{"code":"route_error","message":"boom","traceback":"Traceback (most recent call last):\n  ValueError: nope"}}"#,
+        )
+        .expect("denial with traceback parses")
+        {
+            RouteBody::Denied { code, traceback, .. } => {
+                assert_eq!(code, "route_error");
+                assert_eq!(
+                    traceback.as_deref(),
+                    Some("Traceback (most recent call last):\n  ValueError: nope")
+                );
             }
             other => panic!("wrong verdict: {other:?}"),
         }
@@ -348,18 +403,39 @@ mod tests {
 
     /// The taxonomy mapping: `not_found` reuses the existing slug;
     /// everything else (known secret codes included) rides
-    /// `webdev_route_error` verbatim.
+    /// `webdev_route_error` verbatim; a traceback appends to the
+    /// message (`\nroute traceback: {tb}`) while its absence keeps
+    /// the message byte-identical.
     #[test]
     fn denial_mapping_reuses_not_found_and_rides_the_rest() {
-        let not_found = denial_to_error("not_found", "no such path", "/x".into());
+        let not_found = denial_to_error("not_found", "no such path", None, "/x".into());
         assert_eq!(not_found.code(), "not_found");
         assert_eq!(not_found.exit_code(), 6);
 
-        let secret = denial_to_error("secret_required", "missing header", "/x".into());
+        let secret = denial_to_error("secret_required", "missing header", None, "/x".into());
         assert_eq!(secret.code(), "webdev_route_error");
         assert_eq!(secret.exit_code(), 6);
         assert!(secret.to_string().contains("secret_required"));
-        assert!(secret.to_string().contains("missing header"));
+        assert!(
+            secret.to_string().contains("missing header"),
+            "no traceback → the message rides VERBATIM (no suffix)"
+        );
+
+        // THE black-box fix: a denial with a traceback shows it —
+        // the "Invalid UUID string" class is diagnosable from CLI
+        // output alone.
+        let blown = denial_to_error(
+            "route_error",
+            "error processing action",
+            Some("java.lang.IllegalArgumentException: Invalid UUID string: 3f2504e0"),
+            "/x".into(),
+        );
+        assert_eq!(blown.code(), "webdev_route_error");
+        let text = blown.to_string();
+        assert!(
+            text.contains("\nroute traceback: java.lang.IllegalArgumentException: Invalid UUID string: 3f2504e0"),
+            "the traceback rides the message: {text}"
+        );
 
         // The alarms route's journal-missing denial maps to the
         // actionable slug (default rigs ALWAYS hit it — the missing
@@ -367,6 +443,7 @@ mod tests {
         let journal = denial_to_error(
             "no_alarm_journal",
             "No alarm journal profile specified",
+            None,
             "/system/webdev/ign-cli/cli/alarms".into(),
         );
         assert_eq!(journal.code(), "alarm_journal_missing");

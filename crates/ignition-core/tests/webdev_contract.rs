@@ -152,6 +152,7 @@ async fn probe_200_denial_carries_code_and_message() {
         RouteProbe::Denied {
             code: "secret_mismatch".to_string(),
             message: "scriptExec secret mismatch".to_string(),
+            traceback: None,
         }
     );
 }

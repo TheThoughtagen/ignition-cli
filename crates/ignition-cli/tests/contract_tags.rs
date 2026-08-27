@@ -1324,6 +1324,70 @@ async fn tags_alarms_journal_missing_refusal_golden() {
     );
 }
 
+/// THE traceback-surfacing golden (the black-box fix, 05-08): a
+/// `route_error` denial whose envelope carries `error.traceback`
+/// (the "Invalid UUID string" class the CLI used to swallow) → the
+/// stderr envelope's message CONTAINS the traceback text. A denial
+/// WITHOUT one stays byte-identical (the journal-missing golden
+/// above is that proof — its envelope has no traceback key).
+#[tokio::test]
+async fn tags_route_error_traceback_surfaces_in_the_message() {
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/alarms"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "history"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "route_error",
+                    "message": "error handling the action",
+                    "traceback": "Traceback (most recent call last):\n  File \"doPost.py\", line 42, in doPost\nIllegalArgumentException: Invalid UUID string: 3f2504e0"
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "alarms",
+            "history",
+            "--start",
+            "1787000000000",
+            "--end",
+            "1787659200000",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "route_error exits 6");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "webdev_route_error");
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("error handling the action"),
+        "the route's own message rides first: {message}"
+    );
+    assert!(
+        message.contains("\nroute traceback: Traceback (most recent call last):"),
+        "the traceback is APPENDED with its marker: {message}"
+    );
+    assert!(
+        message.contains("Invalid UUID string: 3f2504e0"),
+        "the route-side exception text is visible: {message}"
+    );
+}
+
 /// Alarm history SUCCESS golden: journal rows render as the aligned
 /// columns/rows table (the journal wire shape is dataset-dependent —
 /// the header IS the column list).
