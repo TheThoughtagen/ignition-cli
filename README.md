@@ -126,6 +126,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign project delete <NAME>` | Delete a project | **destructive**: exit 2 (`confirmation_required`) without `--yes`; the wire DELETE always carries the server's own `confirm=true` query param (both guard layers); a nonexistent name exits 6 (`not_found`); audit-logged server-side |
 | `ign project export <NAME> [-o FILE]` | Export a project as a ZIP archive | the ZIP STREAMS to disk chunk-by-chunk (no memory buffering; 120 s per-request timeout); default filename from `Content-Disposition`, else `<name>.zip`; stdout stays data-only — JSON carries `{project, file, bytes, scope}` (see scope metadata below) |
 | `ign project import <NAME> --file PATH\|--file - [--collision-policy abort\|overwrite]` | Import a project from a ZIP (`-` reads stdin) | default policy **abort**: importing over an existing name exits 6 (`project_exists`) BEFORE any upload; **overwrite** is destructive — exit 2 without `--yes` and it REPLACES the entire project (resources absent from the ZIP are deleted; merge is Designer-only); a non-ZIP, >512 MB, or structurally-corrupt (truncated) input exits 2 (`invalid_import_file`) before any network I/O — every member is validated up front because the gateway would otherwise accept a truncated ZIP and wipe the target (live-witnessed); a gateway import refusal riding HTTP 200 (`{success:false}`) exits 6 (`import_denied`) with the gateway's problem text; 300 s per-request timeout |
+| `ign project diff <PROFILE_A> <PROFILE_B> --project <NAME>` | Compare a project across two gateway profiles — per-resource `added`/`removed`/`changed`/`same` statuses (read-only, no guard) | **statuses are B-relative-to-A**: `added` = in B only, `removed` = in A only, `changed` = differing content after `resource.json` normalization (`attributes.lastModification`/`…Signature` stripped, keys canonicalized — identical content exported from two gateways reports `same`); each side exports once and NOTHING is imported; the envelope's `profile` stays the ACTIVE profile while the data carries `profile_a`/`profile_b`; the root `project.json` rides `project_meta` (title/enabled/parent deltas), never the resource entries; diffing a profile against itself exits 2 `invalid_input`; scope is project-only (see the tag-promotion pipe below); a missing project on either side exits 6 `not_found` |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
 | `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource member (upsert: created if absent, replaced if present) | **destructive**: the whole project is re-imported (`overwrite=true`) after the member surgery — exit 2 (`confirmation_required`) without `--yes`; content is sniffed (json/text); binary input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; concurrent Designer edits are REPLACED (see the resource section) |
@@ -510,6 +511,47 @@ default — the CLI pre-checks with `find` and refuses with
 the ENTIRE project — resources absent from the ZIP are deleted).
 `merge` is the Designer import popup's mode and is not available via
 REST; the CLI rejects it at the flag level by simply not offering it.
+
+### Cross-gateway diff & sync
+
+`ign project diff <PROFILE_A> <PROFILE_B> --project <NAME>` compares
+one project's resources across two gateway profiles — the dev→test→
+prod promotion workflow's first half. **Direction semantics:** the
+output is always **B-relative-to-A** — `added` means the resource
+exists only in B, `removed` only in A, `changed` in both with
+differing content (after normalization), `same` in both. Human mode
+prints grouped ADDED/REMOVED/CHANGED sections plus the
+`N same, N added, N removed, N changed` summary; JSON carries
+`{scope, profile_a, profile_b, project, project_meta, summary,
+entries}` with every key always present.
+
+**Normalization.** Every gateway-written `resource.json` carries
+`attributes.lastModification` and `attributes.lastModificationSignature`,
+which differ between gateways even for identical content — a byte
+compare would report everything CHANGED. The diff strips exactly
+those two fields and compares canonicalized (key-sorted) JSON; every
+other byte — script bodies, view JSON, descriptors' semantic fields —
+compares as-is.
+
+**Scope honesty.** Diff and sync carry `scope: "project"` in their
+output metadata: they operate on project resources ONLY. Tag
+providers are gateway configuration on a different seam — promote
+them with the shipped pipe across profiles instead:
+
+```bash
+ign --profile dev tags export [default]P5 -o - | ign --profile prod tags import --file - --provider P5
+```
+
+**Two-sided secrets.** Each side resolves its own credential through
+the same locked chain (env tokens → keyring → basic env pair), which
+means `IGNITION_TOKEN` (and the basic env pair) applies to BOTH sides
+unless per-profile keyring entries exist. For real two-gateway use,
+store per-profile tokens in the keyring (`ign profile add --keyring`)
+so each side authenticates as itself.
+
+**Envelope.** The output envelope keeps its single `profile` field —
+the ACTIVE profile, exactly as every other command resolves it —
+while `data.profile_a`/`data.profile_b` name both sides explicitly.
 
 ### Resource editing — the surgical loop (export-zip surgery)
 

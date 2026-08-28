@@ -371,6 +371,90 @@ pub struct ImportResult {
     pub outcome: serde_json::Value,
 }
 
+// ---- Cross-gateway diff & sync (07-01, SYNC-01/02) -----------------------
+//
+// The promotion pair: see exactly what differs between two gateways'
+// copy of a project, then push selected resources across. Both
+// orchestrate over TWO `GatewayApi` handles (source A, target B) and
+// ride the pure diff engine in [`crate::client::resources`]
+// (normalized member compare — the volatility guard) plus the 05-02
+// surgery helpers (replace_member's descriptor-merge landing rules
+// ride free).
+
+/// One `project.json` semantic-field difference — `(field, a, b)`
+/// surfaced as named keys (the flat agent shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectMetaDelta {
+    /// The compared field (`title` | `enabled` | `parent`).
+    pub field: String,
+    /// Profile A's value (stringified; `null` when absent).
+    pub a: String,
+    /// Profile B's value (stringified; `null` when absent).
+    pub b: String,
+}
+
+/// `ign project diff` output model — the flat agent shape, ALL keys
+/// always. `scope` is the literal `"project"` (the scope-honesty
+/// mandate: tag providers live on a different seam, README documents
+/// the promotion pipe); `profile_a`/`profile_b` ride the DATA while
+/// the envelope keeps its single active-profile field (the frozen
+/// one-field envelope).
+#[derive(Debug, Serialize)]
+pub struct ProjectDiffResult {
+    /// Always `"project"` — the diff's scope contract.
+    pub scope: &'static str,
+    /// The baseline profile (A).
+    pub profile_a: String,
+    /// The compared profile (B — statuses are B-relative-to-A).
+    pub profile_b: String,
+    /// The project compared.
+    pub project: String,
+    /// Root `project.json` semantic-field differences (title/enabled/
+    /// parent) — empty when none.
+    pub project_meta: Vec<ProjectMetaDelta>,
+    /// The four member counts.
+    pub summary: crate::client::resources::DiffSummary,
+    /// One row per resource member, path-sorted.
+    pub entries: Vec<crate::client::resources::MemberDiffEntry>,
+}
+
+/// `ign project diff A B --project NAME` — export both sides (A
+/// first), run the normalized member compare plus the project.json
+/// meta delta. A missing project on either side surfaces through
+/// export's existing not-found path; the same profile twice is a
+/// usage-class refusal (exit 2) before any network I/O.
+pub async fn project_diff(
+    api_a: &dyn GatewayApi,
+    api_b: &dyn GatewayApi,
+    project: &str,
+    profile_a: &str,
+    profile_b: &str,
+) -> Result<ProjectDiffResult, CoreError> {
+    if profile_a == profile_b {
+        return Err(CoreError::InvalidInput {
+            reason: "diffing a profile against itself is a no-op — name two \
+                     different profiles"
+                .to_string(),
+        });
+    }
+    let zip_a = crate::actions::resources::export_zip_bytes(api_a, project).await?;
+    let zip_b = crate::actions::resources::export_zip_bytes(api_b, project).await?;
+    let diff = crate::client::resources::diff_members(&zip_a, &zip_b)?;
+    let project_meta = crate::client::resources::project_meta_delta(&zip_a, &zip_b)?
+        .into_iter()
+        .map(|(field, a, b)| ProjectMetaDelta { field, a, b })
+        .collect();
+    Ok(ProjectDiffResult {
+        scope: "project",
+        profile_a: profile_a.to_string(),
+        profile_b: profile_b.to_string(),
+        project: project.to_string(),
+        project_meta,
+        summary: diff.summary,
+        entries: diff.entries,
+    })
+}
+
 /// `ign project list` — every runnable project with inheritance info
 /// (the standard `limit=-1` UI convention).
 pub async fn projects(api: &dyn GatewayApi) -> Result<ProjectsResult, CoreError> {
@@ -1259,5 +1343,22 @@ mod tests {
         assert_eq!(super::sanitize_basename("."), None);
         assert_eq!(super::sanitize_basename("   "), None);
         assert_eq!(super::safe_fallback_stem("a/b\\c"), "a_b_c");
+    }
+
+    /// THE same-profile refusal (07-01): diffing a profile against
+    /// itself is usage-class (exit 2 `invalid_input`) BEFORE any
+    /// export fires — zero network work on the refused call.
+    #[tokio::test]
+    async fn project_diff_same_profile_refuses_before_any_export() {
+        let rig = ProjectsRig::default();
+        let err = super::project_diff(&rig, &rig, "p", "dev", "dev")
+            .await
+            .expect_err("the same-profile refusal");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_input");
+        assert!(
+            rig.exports.lock().unwrap().is_empty(),
+            "zero exports — the refusal leads"
+        );
     }
 }

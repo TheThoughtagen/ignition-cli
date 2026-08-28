@@ -584,3 +584,231 @@ async fn project_import_html_401_classifies_auth() {
     );
     assert_eq!(err.exit_code(), 5);
 }
+
+// ---- Cross-gateway diff (07-01, SYNC-01) ----
+//
+// TWO MockServer instances — one per gateway side — with real-zip
+// export fixtures; the crown pins are the REQUEST-SEQUENCE proof
+// (exactly ONE export GET per side, ZERO import POSTs anywhere: a
+// diff is a read and must never mutate) and the end-to-end
+// normalization pass (same-content/differing-attribute members
+// report `same` through the whole action, not just the units).
+
+/// Build a real export zip: `project.json` + one member per pair, in
+/// order (the diff engine walks the archive — honest fixtures).
+fn diff_export_zip(project_json: &[u8], members: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer
+        .start_file("project.json", options)
+        .expect("project.json starts");
+    writer.write_all(project_json).expect("project.json writes");
+    for (name, bytes) in members {
+        writer.start_file(*name, options).expect("member starts");
+        writer.write_all(bytes).expect("member writes");
+    }
+    writer.finish().expect("zip finalizes").into_inner()
+}
+
+/// A live-shaped folder descriptor carrying the two volatility fields.
+fn volatile_descriptor(timestamp: &str) -> Vec<u8> {
+    format!(
+        r#"{{"scope":"G","version":1,"files":["script.py"],"attributes":{{"lastModification":{{"actor":"a","timestamp":"{timestamp}"}},"lastModificationSignature":"sig-{timestamp}"}}}}"#
+    )
+    .into_bytes()
+}
+
+/// Mount the export GET (200 + the zip body) with `expect(n)` and a
+/// zero-expect import POST guard on the same server.
+async fn mount_export_pin(server: &wiremock::MockServer, project: &str, zip: Vec<u8>, n: u64) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/export/{project}"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
+        .expect(n)
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/import/{project}"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// THE diff sequence pin: exactly ONE export GET per side, ZERO
+/// imports anywhere — and the normalization pass holds END-TO-END
+/// (same-content members with differing lastModification attributes
+/// report `same` through the whole action), alongside the raw
+/// direction semantics (added = in B only; changed = differing bytes).
+#[tokio::test]
+async fn project_diff_two_exports_zero_imports_normalized_same() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    let zip_a = diff_export_zip(
+        br#"{"title":"T","enabled":true}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/resource.json",
+                volatile_descriptor("2026-08-28T10:00:00Z").as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('old')",
+            ),
+        ],
+    );
+    let zip_b = diff_export_zip(
+        br#"{"title":"T","enabled":true}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/resource.json",
+                volatile_descriptor("2026-08-28T11:30:00Z").as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('new')",
+            ),
+            (
+                "com.example/resources/views/Fresh/view.json",
+                br#"{"scope":"G"}"#.as_slice(),
+            ),
+        ],
+    );
+    mount_export_pin(&server_a, "p", zip_a, 1).await;
+    mount_export_pin(&server_b, "p", zip_b, 1).await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let result = ignition_core::actions::projects::project_diff(
+        &api_a,
+        &api_b,
+        "p",
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect("diff orchestrates Ok");
+
+    // The flat agent shape: ALL keys always, scope literal.
+    assert_eq!(result.scope, "project");
+    assert_eq!(result.profile_a, "gateway-a");
+    assert_eq!(result.profile_b, "gateway-b");
+    assert_eq!(result.project, "p");
+    assert!(
+        result.project_meta.is_empty(),
+        "identical project.json metas"
+    );
+    assert_eq!(
+        result.summary.same, 1,
+        "the volatile descriptor normalized to same"
+    );
+    assert_eq!(result.summary.added, 1);
+    assert_eq!(result.summary.removed, 0);
+    assert_eq!(result.summary.changed, 1, "the script bytes differ");
+    let by_path = |path: &str| {
+        result
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("entry {path:?} present"))
+            .status
+    };
+    assert_eq!(
+        by_path("ignition/script-python/uat/resource.json"),
+        ignition_core::client::resources::MemberStatus::Same
+    );
+    assert_eq!(
+        by_path("ignition/script-python/uat/script.py"),
+        ignition_core::client::resources::MemberStatus::Changed
+    );
+    assert_eq!(
+        by_path("com.example/views/Fresh/view.json"),
+        ignition_core::client::resources::MemberStatus::Added
+    );
+}
+
+/// A differing project.json title rides `project_meta` (never the
+/// member entries) end-to-end — the exclusion contract through the
+/// action.
+#[tokio::test]
+async fn project_diff_surfaces_project_meta_delta() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    mount_export_pin(
+        &server_a,
+        "p",
+        diff_export_zip(br#"{"title":"Old","enabled":true}"#, &[]),
+        1,
+    )
+    .await;
+    mount_export_pin(
+        &server_b,
+        "p",
+        diff_export_zip(br#"{"title":"New","enabled":true}"#, &[]),
+        1,
+    )
+    .await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let result = ignition_core::actions::projects::project_diff(
+        &api_a,
+        &api_b,
+        "p",
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect("diff orchestrates Ok");
+    assert_eq!(
+        result.entries.len(),
+        0,
+        "no resource members in either export"
+    );
+    assert_eq!(result.project_meta.len(), 1);
+    assert_eq!(result.project_meta[0].field, "title");
+    assert_eq!(result.project_meta[0].a, "Old");
+    assert_eq!(result.project_meta[0].b, "New");
+}
+
+/// A missing project on side B surfaces through export's existing
+/// not-found path (exit 6) — side A's export already fired (the
+/// honest order: A first, then B).
+#[tokio::test]
+async fn project_diff_missing_project_on_b_is_not_found() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    mount_export_pin(&server_a, "p", diff_export_zip(br#"{"title":"T"}"#, &[]), 1).await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/export/p"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"message": "No project p"})),
+        )
+        .expect(1)
+        .mount(&server_b)
+        .await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let err = ignition_core::actions::projects::project_diff(
+        &api_a,
+        &api_b,
+        "p",
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect_err("the missing side-B project must fail");
+    assert!(
+        matches!(err, CoreError::NotFound { .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 6);
+    assert_eq!(err.code(), "not_found");
+}

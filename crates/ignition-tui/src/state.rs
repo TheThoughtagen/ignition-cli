@@ -399,9 +399,10 @@ pub struct ProjectAction {
 /// test-pinned); the resource family's guarded verbs (put/delete —
 /// list/get live on the navigation itself), webdev deploy deliberately
 /// UNGUARDED (the ign-cli project is CLI-owned, the 05-03 decision).
-/// The verb keys are the clap-exact spellings; the route rows in
+/// 07-01 adds the cross-gateway `project diff` read. The verb keys
+/// are the clap-exact spellings; the route rows in
 /// [`crate::routes`] stay untouched.
-pub const PROJECT_ACTIONS: [ProjectAction; 11] = [
+pub const PROJECT_ACTIONS: [ProjectAction; 12] = [
     ProjectAction {
         group: "project",
         verb: "new",
@@ -443,6 +444,12 @@ pub const PROJECT_ACTIONS: [ProjectAction; 11] = [
         verb: "export",
         label: "export",
         description: "stream the project to a zip",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "project diff",
+        label: "diff",
+        description: "compare across two profiles",
     },
     ProjectAction {
         group: "resource",
@@ -1010,6 +1017,13 @@ pub enum ProjectsForm {
     /// `resource delete` step 2 — the resource PATH (a Confirm gate
     /// arms next).
     ResourceDeletePath { project: String },
+    /// `project diff` step 1 — profile A (the baseline).
+    DiffProfileA,
+    /// `project diff` step 2 — profile B (the diff is B relative to
+    /// A).
+    DiffProfileB { a: String },
+    /// `project diff` step 3 — the project NAME.
+    DiffProject { a: String, b: String },
 }
 
 /// The Projects screen's data (06-05): the object-list → detail
@@ -1194,11 +1208,12 @@ mod tests {
         );
     }
 
-    /// The Projects menu's structure contract (06-10): the 11 verbs
+    /// The Projects menu's structure contract (06-10): the verbs
     /// in their LOCKED flat order (the selection index space — the
     /// update.rs executor arms key off these exact spellings), every
     /// verb unique, groups contiguous (the render's header detection
     /// depends on it), and exactly the three noun groups.
+    /// 07-01 adds the cross-gateway diff read after export.
     #[test]
     fn project_actions_are_grouped_and_ordered() {
         assert_eq!(
@@ -1211,6 +1226,7 @@ mod tests {
                 "delete",
                 "import",
                 "export",
+                "project diff",
                 "resource put",
                 "resource delete",
                 "webdev deploy",

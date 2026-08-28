@@ -309,6 +309,18 @@ pub enum ProjectCommand {
         #[arg(long, value_enum, default_value_t = CollisionPolicy::Abort)]
         collision_policy: CollisionPolicy,
     },
+    /// Compare a project across two gateway profiles — statuses are
+    /// B-relative-to-A (`added` = in B only, `removed` = in A only,
+    /// `changed` = differing after resource.json normalization)
+    Diff {
+        /// Baseline profile (A)
+        profile_a: String,
+        /// Compared profile (B — the diff is B relative to A)
+        profile_b: String,
+        /// Project name
+        #[arg(long, value_name = "NAME")]
+        project: String,
+    },
 }
 
 /// Resource subcommands (03-03, PROJ-05). `delete` is the family's

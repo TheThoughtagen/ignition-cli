@@ -144,7 +144,10 @@ pub struct ResourceDeleteResult {
 /// existing classification (404 → `not_found`, exit 6). The
 /// `tempfile` dependency (promoted from dev — already in the
 /// workspace graph) owns uniqueness and cleanup-on-drop.
-async fn export_zip_bytes(api: &dyn GatewayApi, project: &str) -> Result<Vec<u8>, CoreError> {
+///
+/// 07-01: promoted pub — the cross-gateway diff/sync actions ride the
+/// SAME export-to-bytes seam (two clients, one helper).
+pub async fn export_zip_bytes(api: &dyn GatewayApi, project: &str) -> Result<Vec<u8>, CoreError> {
     let temp = tempfile::NamedTempFile::new()
         .map_err(|err| CoreError::Internal(format!("cannot create temp export file: {err}")))?;
     api.project_export_to_file(project, temp.path()).await?;

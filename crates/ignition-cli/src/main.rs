@@ -114,6 +114,10 @@ enum ActionOutput {
     /// `ign project import` — buffered upload with collision policy;
     /// data carries {name, collision_policy, bytes, scope, outcome}.
     ProjectImport(actions::projects::ImportResult),
+    /// `ign project diff` — the cross-gateway normalized member
+    /// compare; data carries {scope, profile_a, profile_b, project,
+    /// project_meta, summary, entries}.
+    ProjectDiff(actions::projects::ProjectDiffResult),
     /// `ign resource list` — a project's resources (passthrough
     /// entries).
     ResourcesList(actions::resources::ResourcesResult),
@@ -242,6 +246,7 @@ impl ActionOutput {
             ActionOutput::ProjectDelete(result) => render_success(profile, result, compact),
             ActionOutput::ProjectExport(result) => render_success(profile, result, compact),
             ActionOutput::ProjectImport(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectDiff(result) => render_success(profile, result, compact),
             ActionOutput::ResourcesList(result) => render_success(profile, result, compact),
             ActionOutput::ResourceGet(result) => render_success(profile, result, compact),
             ActionOutput::ResourcePut(result) => render_success(profile, result, compact),
@@ -912,6 +917,37 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Err(err) => Err(err),
                 };
                 (profile, result)
+            }
+            // Diff (07-01, SYNC-01): cross-gateway compare — a READ,
+            // no guard. The envelope's active profile resolves
+            // UNCHANGED (flag > active, env overlay scoped to it);
+            // both positional sides then resolve through the
+            // two-client shape (each side its own client + secret
+            // chain — see resolve_two_clients).
+            ProjectCommand::Diff {
+                profile_a,
+                profile_b,
+                project: project_name,
+            } => {
+                let (active, sides) = resolve_two_clients(
+                    &mut config,
+                    cli.profile.as_deref(),
+                    &profile_a,
+                    &profile_b,
+                );
+                let result = match sides {
+                    Ok((api_a, api_b)) => actions::projects::project_diff(
+                        &api_a,
+                        &api_b,
+                        &project_name,
+                        &profile_a,
+                        &profile_b,
+                    )
+                    .await
+                    .map(ActionOutput::ProjectDiff),
+                    Err(err) => Err(err),
+                };
+                (active, result)
             }
         },
         // Resources (05-02 re-point): the surgical edit loop riding
@@ -1713,6 +1749,49 @@ fn resolve_gateway_api(
             let result = credential
                 .and_then(|credential| ReqwestGatewayApi::new(&profile, Some(credential)));
             (Some(name), result)
+        }
+        Err(err) => (None, Err(err)),
+    }
+}
+
+/// Resolve ONE named profile side to a built client — the per-profile
+/// construction path shared with [`resolve_gateway_api`]: REQUIRED
+/// credential through the ONE locked secret chain (no degradation, no
+/// fork), then `ReqwestGatewayApi::new` from the resolved profile.
+fn named_profile_client(config: &mut Config, name: &str) -> Result<ReqwestGatewayApi, CoreError> {
+    let Some((_resolved, profile)) = config::resolve_selection(config, Some(name))? else {
+        return Err(CoreError::Internal(
+            "a named profile selection resolved to nothing".to_string(),
+        ));
+    };
+    let credential = config::resolve_secret(name, &profile.auth, &secret_chain())?;
+    ReqwestGatewayApi::new(&profile, Some(credential))
+}
+
+/// THE two-client resolution shape (07-01, 07-RESEARCH Pattern): the
+/// ENVELOPE's active profile resolves exactly as every other command
+/// (flag > active, `IGNITION_URL` env overlay scoped to that
+/// selection — resolution UNCHANGED), then each positional side
+/// resolves through the same `resolve_selection` machinery and builds
+/// its own client. Each side's secret chain resolves INDEPENDENTLY
+/// through the one locked chain: `IGNITION_TOKEN` (and the basic env
+/// pair) applies to BOTH sides unless per-profile keyring entries
+/// exist — the README's two-sided-secret caveat.
+fn resolve_two_clients(
+    config: &mut Config,
+    flag: Option<&str>,
+    name_a: &str,
+    name_b: &str,
+) -> (
+    Option<String>,
+    Result<(ReqwestGatewayApi, ReqwestGatewayApi), CoreError>,
+) {
+    match resolve_profile_context(config, flag) {
+        Ok(None) => (None, Err(CoreError::NoActiveProfile)),
+        Ok(Some((active, _))) => {
+            let sides = named_profile_client(config, name_a)
+                .and_then(|api_a| named_profile_client(config, name_b).map(|api_b| (api_a, api_b)));
+            (Some(active), sides)
         }
         Err(err) => (None, Err(err)),
     }

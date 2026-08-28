@@ -20,8 +20,8 @@ use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
 };
 use ignition_core::actions::projects::{
-    ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult, ProjectRenameResult,
-    ProjectSetResult, ProjectsResult,
+    ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult, ProjectDiffResult,
+    ProjectRenameResult, ProjectSetResult, ProjectsResult,
 };
 use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
@@ -205,6 +205,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ProjectDelete(result) => render_project_delete_human(result),
         ActionOutput::ProjectExport(result) => render_project_export_human(result),
         ActionOutput::ProjectImport(result) => render_project_import_human(result),
+        ActionOutput::ProjectDiff(result) => render_project_diff_human(result),
         ActionOutput::ResourcesList(result) => render_resources_list_human(result),
         ActionOutput::ResourceGet(result) => render_resource_get_human(result),
         ActionOutput::ResourcePut(result) => render_resource_put_human(result),
@@ -664,6 +665,46 @@ fn render_project_import_human(result: &ImportResult) {
     println!(
         "imported {} ({} bytes, policy {})",
         result.name, result.bytes, result.collision_policy
+    );
+}
+
+/// `ign project diff` human lines: the direction header (B
+/// relative to A — the LOCKED semantics, stated on every render),
+/// the `project.json` semantic-field deltas, the grouped
+/// ADDED/REMOVED/CHANGED sections (one path per line; `same` members
+/// ride the summary only), and the four-count summary line.
+fn render_project_diff_human(result: &ProjectDiffResult) {
+    use ignition_core::client::resources::MemberStatus;
+    println!(
+        "project {} · {} → {} · statuses are B-relative-to-A (scope {})",
+        result.project, result.profile_a, result.profile_b, result.scope
+    );
+    if result.project_meta.is_empty() {
+        println!("project.json: no title/enabled/parent differences");
+    } else {
+        for delta in &result.project_meta {
+            println!("project.json {}: {} → {}", delta.field, delta.a, delta.b);
+        }
+    }
+    for (word, status) in [
+        ("ADDED", MemberStatus::Added),
+        ("REMOVED", MemberStatus::Removed),
+        ("CHANGED", MemberStatus::Changed),
+    ] {
+        let matching: Vec<&str> = result
+            .entries
+            .iter()
+            .filter(|entry| entry.status == status)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        println!("{word} ({})", matching.len());
+        for path in matching {
+            println!("  {path}");
+        }
+    }
+    println!(
+        "{} same, {} added, {} removed, {} changed",
+        result.summary.same, result.summary.added, result.summary.removed, result.summary.changed
     );
 }
 

@@ -301,6 +301,25 @@ pub fn fire_webdev_status(state: &mut AppState) {
     });
 }
 
+/// `ign project diff` (07-01) — the cross-gateway read. The TWO
+/// per-side clients are rebuilt INSIDE the worker from the named
+/// profiles (`context::rebuild` — the same public building blocks
+/// the opening resolution composes; each side's secret chain
+/// resolves independently), so the cockpit's own single-client world
+/// is untouched. NO confirm gate — a read.
+pub fn fire_project_diff(
+    state: &mut AppState,
+    profile_a: String,
+    profile_b: String,
+    project: String,
+) {
+    super::spawn_action(state, "project diff", async move {
+        let (_name_a, _url_a, api_a) = crate::context::rebuild(&profile_a)?;
+        let (_name_b, _url_b, api_b) = crate::context::rebuild(&profile_b)?;
+        actions::projects::project_diff(&*api_a, &*api_b, &project, &profile_a, &profile_b).await
+    });
+}
+
 /// The state's client Arc, cloned out of the handle (the watch.rs
 /// helper's shape).
 fn client_arc(state: &AppState) -> Option<Arc<ReqwestGatewayApi>> {

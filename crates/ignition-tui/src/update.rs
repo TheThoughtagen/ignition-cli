@@ -1847,6 +1847,14 @@ fn projects_cli_form(form: &crate::state::ProjectsForm) -> String {
         ProjectsForm::ResourceDeleteProject | ProjectsForm::ResourceDeletePath { .. } => {
             "ign resource delete <PROJECT> <PATH> --yes".to_string()
         }
+        ProjectsForm::DiffProfileA | ProjectsForm::DiffProfileB { .. } => {
+            "ign project diff <PROFILE_A> <PROFILE_B> --project <NAME>  \
+             (statuses are B-relative-to-A)"
+                .to_string()
+        }
+        ProjectsForm::DiffProject { a, b } => {
+            format!("ign project diff {a:?} {b:?} --project <NAME>  (statuses are B-relative-to-A)")
+        }
     }
 }
 
@@ -1925,6 +1933,13 @@ fn execute_projects_menu_action(state: &mut AppState, index: usize) {
                 prefill,
             );
         }
+        Some("project diff") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::DiffProfileA,
+            "diff — profile A (baseline)".to_string(),
+            Some("profile B + project prompt next\npress ? for the CLI form".to_string()),
+            state.profile.clone().unwrap_or_default(),
+        ),
         Some("resource put") => {
             let project_prefill =
                 projects_context_resource(state).map_or(String::new(), |(p, _)| p);
@@ -2119,6 +2134,33 @@ fn accept_projects_form(state: &mut AppState, value: &str) {
                 title: "resource delete".to_string(),
                 body: format!("delete the resource {value:?}? re-imports the project"),
             });
+        }
+        // The cross-gateway read (07-01): three chained inputs, then
+        // the two-client worker. NO Confirm gate — a read.
+        ProjectsForm::DiffProfileA => open_projects_input(
+            state,
+            ProjectsForm::DiffProfileB { a: value },
+            "diff — profile B (compared against A)".to_string(),
+            Some("statuses will be B-relative-to-A\nthe project prompts next".to_string()),
+            String::new(),
+        ),
+        ProjectsForm::DiffProfileB { a } => open_projects_input(
+            state,
+            ProjectsForm::DiffProject { a, b: value },
+            "diff — project name".to_string(),
+            Some("compared across the two profiles".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        ProjectsForm::DiffProject { a, b } => {
+            if a == b {
+                open_error_modal(
+                    state,
+                    "project diff",
+                    "diffing a profile against itself is a no-op — name two different profiles",
+                );
+                return;
+            }
+            workers::ops::fire_project_diff(state, a, b, value);
         }
     }
 }
@@ -6252,7 +6294,7 @@ mod tests {
     #[test]
     fn resource_put_is_confirm_gated() {
         let mut state = projects_state_with_list();
-        run_projects_menu(&mut state, 7); // resource put
+        run_projects_menu(&mut state, 8); // resource put
         submit_projects_input(&mut state, "PlantFloor"); // project
         submit_projects_input(&mut state, "views/root.json"); // path
         submit_projects_input(&mut state, "root.json.new"); // content file
@@ -6274,7 +6316,7 @@ mod tests {
         assert!(state.dashboard.pending.is_none(), "cancel clears the arm");
 
         let mut fresh = projects_state_with_list();
-        run_projects_menu(&mut fresh, 7);
+        run_projects_menu(&mut fresh, 8);
         submit_projects_input(&mut fresh, "PlantFloor");
         submit_projects_input(&mut fresh, "views/root.json");
         submit_projects_input(&mut fresh, "root.json.new");
@@ -6287,7 +6329,7 @@ mod tests {
     #[test]
     fn resource_delete_is_confirm_gated() {
         let mut state = projects_state_with_list();
-        run_projects_menu(&mut state, 8); // resource delete
+        run_projects_menu(&mut state, 9); // resource delete
         submit_projects_input(&mut state, "PlantFloor");
         submit_projects_input(&mut state, "views/root.json");
         assert!(matches!(state.modal, Some(Modal::Confirm { .. })));
@@ -6310,14 +6352,42 @@ mod tests {
     #[test]
     fn webdev_deploy_needs_no_confirm_and_status_reads() {
         let mut state = projects_state_with_list();
-        run_projects_menu(&mut state, 9); // webdev deploy
+        run_projects_menu(&mut state, 10); // webdev deploy
         assert!(state.modal.is_none(), "deploy fires WITHOUT a Confirm gate");
         assert_eq!(state.dashboard.in_flight, Some("webdev deploy"));
 
         let mut fresh = projects_state_with_list();
-        run_projects_menu(&mut fresh, 10); // webdev status
+        run_projects_menu(&mut fresh, 11); // webdev status
         assert!(fresh.modal.is_none());
         assert_eq!(fresh.dashboard.in_flight, Some("webdev status"));
+    }
+
+    /// `project diff` (07-01): the three-step chain (profile A →
+    /// profile B → project) fires the two-client read with NO
+    /// Confirm gate (a read); the same-profile pair refuses with the
+    /// error modal and fires nothing. The profile-A step prefills
+    /// the ACTIVE profile — the chain replaces it.
+    #[test]
+    fn project_diff_chains_inputs_and_fires_ungated() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 7); // project diff
+        replace_projects_input(&mut state, "gateway-a"); // profile A
+        submit_projects_input(&mut state, "gateway-b"); // profile B
+        submit_projects_input(&mut state, "PlantFloor"); // project
+        assert!(state.modal.is_none(), "a read needs no Confirm gate");
+        assert_eq!(state.dashboard.in_flight, Some("project diff"));
+
+        // The same-profile refusal: error modal, nothing fired.
+        let mut same = projects_state_with_list();
+        run_projects_menu(&mut same, 7);
+        replace_projects_input(&mut same, "dev");
+        submit_projects_input(&mut same, "dev");
+        submit_projects_input(&mut same, "PlantFloor");
+        assert!(
+            matches!(&same.modal, Some(Modal::Result_ { title, .. }) if title == "project diff"),
+            "the same-profile pair surfaces the error modal"
+        );
+        assert!(same.dashboard.in_flight.is_none());
     }
 
     /// Rich projects forms advertise and open their exact CLI

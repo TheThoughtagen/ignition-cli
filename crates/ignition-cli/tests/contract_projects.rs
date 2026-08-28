@@ -1017,3 +1017,223 @@ async fn project_delete_nonexistent_exits_6() {
         Value::String(format!("{}/data/api/v1/projects/nope", server.uri()))
     );
 }
+
+// ---- Cross-gateway diff goldens (07-01, SYNC-01) ----
+
+/// Write the TWO-profile config the cross-gateway verbs ride: `dev`
+/// is ACTIVE and points (via the `IGNITION_URL` env overlay the
+/// harness always sets) at side A's mock; `other` carries side B's
+/// URL directly in the file.
+fn write_two_profile_config(config: &Path, url_b: &str) {
+    std::fs::write(
+        config,
+        format!(
+            "active = \"dev\"\n\n[profiles.dev]\nurl = \"http://ignored-a.example.com\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n\n[profiles.other]\nurl = \"{url_b}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
+        ),
+    )
+    .expect("write config");
+}
+
+/// The diff-side export fixture: a real zip with a volatile
+/// descriptor, a script, and (per side) an extra view member.
+fn diff_export_zip(project_json: &[u8], members: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer
+        .start_file("project.json", options)
+        .expect("project.json starts");
+    writer.write_all(project_json).expect("project.json writes");
+    for (name, bytes) in members {
+        writer.start_file(*name, options).expect("member starts");
+        writer.write_all(bytes).expect("member writes");
+    }
+    writer.finish().expect("zip finalizes").into_inner()
+}
+
+/// A live-shaped descriptor with the two volatility fields (the
+/// normalization proof's fixture).
+fn volatile_descriptor(timestamp: &str) -> Vec<u8> {
+    format!(
+        r#"{{"scope":"G","version":1,"files":["script.py"],"attributes":{{"lastModification":{{"actor":"a","timestamp":"{timestamp}"}},"lastModificationSignature":"sig-{timestamp}"}}}}"#
+    )
+    .into_bytes()
+}
+
+/// `ign project diff dev other --project p` goldens in all three
+/// modes: the human grouped sections + summary line, and the JSON
+/// agent shape with `scope`/`profile_a`/`profile_b` and every
+/// summary key ALWAYS present. The envelope's profile is the ACTIVE
+/// profile (`dev`) — the two sides ride the data. Volatility proof:
+/// the differing-attribute descriptor reports `same`.
+#[tokio::test]
+async fn project_diff_render_modes_golden() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    let zip_a = diff_export_zip(
+        br#"{"title":"Old","enabled":true}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/resource.json",
+                volatile_descriptor("2026-08-28T10:00:00Z").as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('old')",
+            ),
+        ],
+    );
+    let zip_b = diff_export_zip(
+        br#"{"title":"New","enabled":true}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/resource.json",
+                volatile_descriptor("2026-08-28T11:30:00Z").as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('new')",
+            ),
+            (
+                "com.example/resources/views/Fresh/view.json",
+                br#"{"scope":"G"}"#.as_slice(),
+            ),
+        ],
+    );
+    for (server, zip) in [(&server_a, zip_a), (&server_b, zip_b)] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/projects/export/p"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
+            .expect(1..)
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    let (_dir, config) = isolated_config();
+    write_two_profile_config(&config, &server_b.uri());
+
+    // Human: direction header, meta delta, grouped sections, summary.
+    let out = ign(
+        &config,
+        &server_a.uri(),
+        &["project", "diff", "dev", "other", "--project", "p"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+project p · dev → other · statuses are B-relative-to-A (scope project)
+project.json title: Old → New
+ADDED (1)
+  com.example/views/Fresh/view.json
+REMOVED (0)
+CHANGED (1)
+  ignition/script-python/uat/script.py
+1 same, 1 added, 0 removed, 1 changed
+"#]],
+    );
+
+    // Compact: the full agent shape — scope/profile_a/profile_b and
+    // every summary key always present, entries path-sorted.
+    let out = ign(
+        &config,
+        &server_a.uri(),
+        &[
+            "project",
+            "diff",
+            "dev",
+            "other",
+            "--project",
+            "p",
+            "--compact",
+        ],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"scope":"project","profile_a":"dev","profile_b":"other","project":"p","project_meta":[{"field":"title","a":"Old","b":"New"}],"summary":{"same":1,"added":1,"removed":0,"changed":1},"entries":[{"path":"com.example/views/Fresh/view.json","status":"added"},{"path":"ignition/script-python/uat/resource.json","status":"same"},{"path":"ignition/script-python/uat/script.py","status":"changed"}]}}"#]],
+    );
+}
+
+/// The same-profile refusal: exit 2 `invalid_input` — the check
+/// fires inside the ACTION (after active-profile resolution, before
+/// any export), so the envelope honestly echoes the active profile
+/// while ZERO network fired (dead URL, no mocks).
+#[tokio::test]
+async fn project_diff_same_profile_exits_2_golden() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "project",
+            "diff",
+            "dev",
+            "dev",
+            "--project",
+            "p",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":"dev","error":{"code":"invalid_input","message":"invalid input: diffing a profile against itself is a no-op — name two different profiles","endpoint":null,"hint":"fix the input source — a readable file path via --file, or `-` to pipe the content on stdin"}}
+
+"#]],
+    );
+}
+
+/// An unknown side-profile name is the standard profile_not_found
+/// refusal (exit 3) BEFORE any export fires.
+#[tokio::test]
+async fn project_diff_unknown_side_profile_exits_3() {
+    let server_a = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/export/p"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server_a)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_two_profile_config(&config, &server_a.uri());
+    let out = ign(
+        &config,
+        &server_a.uri(),
+        &[
+            "project",
+            "diff",
+            "dev",
+            "ghost",
+            "--project",
+            "p",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3), "config class");
+    assert!(out.stdout.is_empty());
+    let envelope: Value = serde_json::from_str(&stderr_envelope(&out))
+        .unwrap_or_else(|err| panic!("stderr envelope parses: {err}"));
+    assert_eq!(
+        envelope["error"]["code"],
+        Value::String("profile_not_found".into()),
+        "full envelope: {}",
+        stderr_envelope(&out)
+    );
+}
