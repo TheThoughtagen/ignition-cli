@@ -37,11 +37,39 @@ pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
-/// One `label value` line with `-` for None (the projects screen's
-/// field_line shape).
-fn field_line(label: &str, value: Option<&str>) -> Line<'static> {
-    Line::from(format!("{label:<8} {}", value.unwrap_or("-")))
+/// One indented `label value` row under a section header — the
+/// label column padded to nine so values clear the longest label
+/// (`compose`) by two spaces (the projects screen's field_line
+/// shape, widened for the section indent).
+fn field_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(format!("  {label:<9} {value}"))
 }
+
+/// A bold section header (the dashboard table-header convention —
+/// structure and grouping, not color).
+fn section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Fit a path-ish value into `width` columns from the TAIL (the
+/// discriminating end of a compose path) with a leading ellipsis
+/// when chars must drop — long real-world paths stay identifiable
+/// instead of clipping invisibly at the pane border.
+fn fit_tail(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len <= width {
+        return value.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    format!("…{}", value.chars().skip(len - keep).collect::<String>())
+}
+
+/// Where a field_line's value starts: the 2-space section indent +
+/// the 9-wide label column + one separator space.
+const VALUE_COLUMN: usize = 12;
 
 /// The published-ports cell for one service row: `host→target/tcp`
 /// pairs, comma-joined (`-` when the service publishes nothing).
@@ -64,14 +92,16 @@ fn ports_cell(service: &StatusService) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join(",")
+        .join(", ")
 }
 
-/// The status summary pane: identity (rig/compose file), the derived
-/// up/down state, ports occupancy, volumes, and one line per compose
-/// service (name state health ports). The tri-state: Loading before
-/// the first load, the honest error when it failed, the allowlist
-/// when it landed.
+/// The status summary pane: the UP/DOWN headline with its port
+/// occupancy, then blank-separated sections — identity
+/// (rig/compose file), one row per compose service (name state
+/// health ports), and the named volumes — with the label column
+/// aligned and long values fitted to the pane width. The tri-state:
+/// Loading before the first load, the honest error when it failed,
+/// the allowlist when it landed.
 fn render_summary(state: &AppState, frame: &mut Frame, area: Rect) {
     let rig = &state.rig;
     let title = match &rig.status {
@@ -104,58 +134,87 @@ fn render_summary(state: &AppState, frame: &mut Frame, area: Rect) {
             );
         }
         (Some(status), _) => {
-            frame.render_widget(Paragraph::new(summary_lines(status)), inner);
+            frame.render_widget(
+                Paragraph::new(summary_lines(status, inner.width as usize)),
+                inner,
+            );
         }
     }
 }
 
-/// The summary's display lines from the allowlist result.
-fn summary_lines(status: &RigStatusResult) -> Vec<Line<'static>> {
-    let volumes = if status.volumes.is_empty() {
-        "-".to_string()
-    } else {
-        status.volumes.join(", ")
-    };
+/// The summary's display lines from the allowlist result — the
+/// 06-UAT readability fix: the derived state gets its own prominent
+/// headline line, then GROUPED sections (state facts / identity /
+/// services / volumes) separated by blank rows, with the label
+/// column aligned and the compose path tail-fitted to the pane so
+/// long real-world paths stay identifiable. Layout and grouping
+/// only — no new color usage (the monochrome-theme overhaul is
+/// backlog).
+fn summary_lines(status: &RigStatusResult, width: usize) -> Vec<Line<'static>> {
+    let down = status.services.is_empty();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![
-        field_line("compose", Some(&status.compose_file)),
-        field_line(
-            "state",
-            Some(if status.services.is_empty() {
-                "down"
-            } else {
-                "up"
-            }),
-        ),
-        field_line(
-            "ports",
-            Some(if status.ports_free { "free" } else { "held" }),
-        ),
-        field_line("volumes", Some(&volumes)),
+        // State prominence: the one-line answer first — derived state
+        // plus its port-occupancy subordinate fact on a single bold
+        // headline (compact enough that the full section skeleton
+        // still fits the 80x24 logs-on split).
+        Line::from(Span::styled(
+            format!(
+                "STATE  {} · PORTS  {}",
+                if down { "DOWN" } else { "UP" },
+                if status.ports_free { "free" } else { "held" }
+            ),
+            bold,
+        )),
+        Line::from(""),
+        section("identity"),
+        field_line("rig", &status.rig),
     ];
+    // The allowlist carries rig and project separately; today both
+    // are the resolved project name, so the row renders only when
+    // they actually differ (a COMPOSE_PROJECT_NAME rename is exactly
+    // when the distinction matters).
+    if status.project != status.rig {
+        lines.push(field_line("project", &status.project));
+    }
+    lines.push(field_line(
+        "compose",
+        &fit_tail(
+            &status.compose_file,
+            width.saturating_sub(VALUE_COLUMN).max(8),
+        ),
+    ));
+    lines.push(Line::from(""));
+    lines.push(section("services"));
     if status.services.is_empty() {
         lines.push(Line::from(Span::styled(
-            "no running services — the rig is down (exit-0 data, `up` brings it back)".to_string(),
+            "  none running — the rig is down (exit-0 data, `up` brings it back)".to_string(),
             Style::default().add_modifier(Modifier::DIM),
         )));
-        return lines;
+    } else {
+        for service in &status.services {
+            let health = service.health.clone().unwrap_or_else(|| "-".into());
+            let exit = service
+                .exit_code
+                .map(|code| format!(" exit:{code}"))
+                .unwrap_or_default();
+            lines.push(Line::from(format!(
+                "  {:<14} {:<9} {:<9} {}{exit}",
+                service.name,
+                service.state,
+                health,
+                ports_cell(service),
+            )));
+        }
     }
-    lines.push(Line::from(Span::styled(
-        "services".to_string(),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    for service in &status.services {
-        let health = service.health.clone().unwrap_or_else(|| "-".into());
-        let exit = service
-            .exit_code
-            .map(|code| format!(" exit:{code}"))
-            .unwrap_or_default();
-        lines.push(Line::from(format!(
-            "  {:<14} {:<9} {:<9} {}{exit}",
-            service.name,
-            service.state,
-            health,
-            ports_cell(service),
-        )));
+    lines.push(Line::from(""));
+    lines.push(section("volumes"));
+    if status.volumes.is_empty() {
+        lines.push(Line::from("  -"));
+    } else {
+        for volume in &status.volumes {
+            lines.push(Line::from(format!("  {volume}")));
+        }
     }
     lines
 }
@@ -244,8 +303,17 @@ mod tests {
             .collect()
     }
 
-    /// A landed status renders the summary: the rig-named pane title,
-    /// the derived state, the service row, the status hints.
+    /// Strip the pane borders + padding from a rendered row so
+    /// structural assertions compare the CONTENT (exact rows,
+    /// blanks) rather than border furniture.
+    fn inner(row: &str) -> String {
+        row.trim().trim_matches('│').trim().to_string()
+    }
+
+    /// A landed status renders the grouped summary: the rig-named
+    /// pane title, the prominent state headline, the blank-separated
+    /// sections (identity / services / volumes), the service row,
+    /// the status hints.
     #[test]
     fn landed_status_renders_the_summary() {
         let mut state = AppState::new();
@@ -258,9 +326,29 @@ mod tests {
             "pane titled for the rig: {}",
             rows[0]
         );
-        assert!(text.contains("state    up"), "derived up: {text}");
-        assert!(text.contains("ports    held"), "occupancy: {text}");
-        assert!(text.contains("gw-data"), "volumes: {text}");
+        assert!(
+            rows.iter()
+                .any(|row| inner(row) == "STATE  UP · PORTS  held"),
+            "the state headline carries derived state + occupancy: {text}"
+        );
+        for header in ["identity", "services", "volumes"] {
+            let index = rows
+                .iter()
+                .position(|row| inner(row) == header)
+                .unwrap_or_else(|| panic!("section header {header} renders: {text}"));
+            assert!(
+                index > 0 && inner(&rows[index - 1]).is_empty(),
+                "blank row separates {header} from the previous group: {text}"
+            );
+        }
+        assert!(
+            text.contains("fixture-rig") && text.contains("/rigs/docker/compose.yml"),
+            "identity rows render: {text}"
+        );
+        assert!(
+            text.contains("gw-data"),
+            "volumes render as their own rows: {text}"
+        );
         assert!(
             text.contains("ignition") && text.contains("running") && text.contains("healthy"),
             "service row renders: {text}"
@@ -280,7 +368,7 @@ mod tests {
     }
 
     /// A DOWN rig renders the honest data state (empty services —
-    /// never an error pane).
+    /// never an error pane) on the same section skeleton.
     #[test]
     fn down_rig_renders_as_data() {
         let mut state = AppState::new();
@@ -290,8 +378,46 @@ mod tests {
         state.rig.status = Some(fixture);
         let rows = rendered(&state);
         let text = rows.join("\n");
-        assert!(text.contains("state    down"), "down is state: {text}");
-        assert!(text.contains("rig is down"), "the down hint: {text}");
+        assert!(
+            rows.iter()
+                .any(|row| inner(row) == "STATE  DOWN · PORTS  free"),
+            "down is the headline state with free occupancy: {text}"
+        );
+        assert!(
+            text.contains("rig is down"),
+            "the down hint renders under the services section: {text}"
+        );
+    }
+
+    /// A real-world compose path (75+ chars) tail-fits to the pane
+    /// width with a leading ellipsis — the discriminating end stays
+    /// visible instead of clipping at the border.
+    #[test]
+    fn long_compose_path_tail_fits_the_pane() {
+        let mut state = AppState::new();
+        let mut fixture = status_fixture();
+        fixture.compose_file =
+            "/Users/pmannion/Documents/whiskeyhouse/ignition-git-module/docker/docker-compose.yml"
+                .into();
+        state.rig.status = Some(fixture);
+        let rows = rendered(&state);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("compose"))
+            .expect("the compose row renders");
+        let content = inner(row);
+        assert!(
+            content.starts_with("compose   …"),
+            "the fitted value leads with an ellipsis: {content}"
+        );
+        assert!(
+            content.chars().count() <= 78,
+            "the row fits the 78-column inner width: {content}"
+        );
+        assert!(
+            content.ends_with("docker/docker-compose.yml"),
+            "the path's discriminating tail survives: {content}"
+        );
     }
 
     /// The Loading + error tri-states render.
