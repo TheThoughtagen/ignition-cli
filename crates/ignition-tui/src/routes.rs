@@ -361,6 +361,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "rig restore",
             mapping: Mapping::Screen(Screen::Rig),
         },
+        // 07-02: the standalone backup pair joins the dashboard's
+        // global verbs (gateway-level — the restart/doctor host).
+        // Download fires direct (a streamed read); restore is
+        // Confirm-gated (the 8th --yes-guarded CLI verb's mirror).
+        CliRoute {
+            path: "backup download",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "backup restore",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 

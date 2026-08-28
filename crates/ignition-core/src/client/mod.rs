@@ -314,14 +314,19 @@ pub trait GatewayApi: Send + Sync {
     /// gate): the gateway 403s resets on a NON-expired trial — the
     /// action layer pre-checks expiry.
     async fn trial_reset_wire(&self) -> Result<TrialWire, CoreError>;
-    /// GET `/data/api/v1/backup?type=roaming` (authed,
+    /// GET `/data/api/v1/backup?type={roaming|all}` (authed,
     /// [`backup::BACKUP_TIMEOUT`] = 300 s, `Accept:
     /// application/octet-stream`) — the portable gwbk STREAMED to
     /// `out` chunk-by-chunk through the 03-02 `download_to_file`
     /// pipeline (the ONE streaming body-consumption site — never a
     /// `Vec<u8>`, Pitfall 2). Byte count + metadata ride out in
-    /// [`ExportMeta`] (04-04, RIG-04).
-    async fn backup_download(&self, out: &Path) -> Result<ExportMeta, CoreError>;
+    /// [`ExportMeta`] (04-04, RIG-04; 07-02 param-ized the type —
+    /// `Roaming` stays the caller default).
+    async fn backup_download(
+        &self,
+        out: &Path,
+        backup_type: backup::BackupType,
+    ) -> Result<ExportMeta, CoreError>;
     /// POST `/data/api/v1/backup` (authed, [`backup::BACKUP_TIMEOUT`]
     /// = 300 s) — the RESTORE: the gwbk bytes as a RAW
     /// `application/octet-stream` body (NOT multipart — the postman
@@ -1168,13 +1173,17 @@ impl GatewayApi for ReqwestGatewayApi {
         })
     }
 
-    async fn backup_download(&self, out: &Path) -> Result<ExportMeta, CoreError> {
-        // Pure reuse: the roaming query rides the path constant, the
+    async fn backup_download(
+        &self,
+        out: &Path,
+        backup_type: backup::BackupType,
+    ) -> Result<ExportMeta, CoreError> {
+        // Pure reuse: the type query rides the path builder, the
         // Accept header rides the helper's optional param, and the
         // 300 s class rides the RequestBuilder — the 03-02 chunk loop
         // stays THE one streaming body-consumption site (04-04).
         self.download_to_file(
-            backup::BACKUP_DOWNLOAD_PATH,
+            &backup::backup_download_path(backup_type),
             out,
             backup::BACKUP_TIMEOUT,
             Some(backup::BACKUP_ACCEPT),

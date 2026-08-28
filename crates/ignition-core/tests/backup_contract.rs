@@ -55,7 +55,10 @@ async fn backup_download_streams_bytes_identical() {
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("rig.gwbk");
-    let meta = api.backup_download(&out).await.expect("download streams");
+    let meta = api
+        .backup_download(&out, ignition_core::client::backup::BackupType::Roaming)
+        .await
+        .expect("download streams");
     assert_eq!(meta.bytes, fixture.len() as u64, "chunk-counted total");
     assert_eq!(
         meta.content_type.as_deref(),
@@ -141,9 +144,159 @@ async fn backup_unauth_401_html_classifies_auth() {
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
     let dir = tempfile::tempdir().expect("tempdir");
     let err = api
-        .backup_download(&dir.path().join("x.gwbk"))
+        .backup_download(
+            &dir.path().join("x.gwbk"),
+            ignition_core::client::backup::BackupType::default(),
+        )
         .await
         .expect_err("401 HTML classifies Auth");
     assert_eq!(err.exit_code(), 5);
     assert_eq!(err.code(), "auth_rejected");
+}
+
+/// 07-02's type param: `BackupType::All` sends `?type=all` (the
+/// gateway-specific full backup) — the `?type=roaming` default is
+/// pinned above; this is the other wire value.
+#[tokio::test]
+async fn backup_download_all_type_sends_all_query() {
+    let mock = IgnitionMock::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(BACKUP_PATH))
+        .and(wiremock::matchers::query_param("type", "all"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(b"PK-all-type".to_vec(), "application/octet-stream"),
+        )
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("all.gwbk");
+    api.backup_download(&out, ignition_core::client::backup::BackupType::All)
+        .await
+        .expect("all-type download streams");
+    assert_eq!(std::fs::read(&out).unwrap(), b"PK-all-type");
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// The standalone ACTION layer's default naming (07-02, BKUP-01): no
+/// `-o` → stream to `<stem>-backup.gwbk.part`, rename to the
+/// Content-Disposition basename when the gateway sends one (the
+/// project-export convention). The `.part` never survives.
+#[tokio::test]
+async fn backup_download_action_renames_to_disposition_basename() {
+    let mock = IgnitionMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(BACKUP_PATH))
+        .and(wiremock::matchers::query_param("type", "roaming"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"gw-2026-08-28.gwbk\"",
+                )
+                .set_body_raw(b"PK-dispo".to_vec(), "application/octet-stream"),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let previous = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(cwd.path()).expect("enter cwd");
+    let result = ignition_core::actions::backup::backup_download(
+        &api,
+        None,
+        "dev",
+        ignition_core::client::backup::BackupType::default(),
+    )
+    .await;
+    std::env::set_current_dir(previous).expect("restore cwd");
+    let result = result.expect("default-naming download");
+    assert_eq!(
+        result.file, "gw-2026-08-28.gwbk",
+        "disposition basename wins"
+    );
+    assert_eq!(result.r#type, "roaming");
+    assert!(
+        !cwd.path().join("dev-backup.gwbk.part").exists(),
+        "the .part never survives"
+    );
+    assert_eq!(
+        std::fs::read(cwd.path().join("gw-2026-08-28.gwbk")).unwrap(),
+        b"PK-dispo"
+    );
+}
+
+/// The standalone ACTION layer's restore pre-checks (the `rig
+/// restore` shape): a nonexistent gwbk refuses `invalid_input` (exit
+/// 2) BEFORE any network work — the mock receives zero requests.
+#[tokio::test]
+async fn backup_restore_action_prechecks_before_network() {
+    let mock = IgnitionMock::start().await;
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "fixture starts empty"
+    );
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.gwbk");
+    let err = ignition_core::actions::backup::backup_restore(&api, &missing)
+        .await
+        .expect_err("nonexistent gwbk refuses");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.code(), "invalid_input");
+
+    let empty = dir.path().join("empty.gwbk");
+    std::fs::write(&empty, b"").expect("write empty");
+    let err = ignition_core::actions::backup::backup_restore(&api, &empty)
+        .await
+        .expect_err("empty gwbk refuses");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.code(), "invalid_input");
+
+    // ZERO requests hit the wire for either refusal.
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "usage-class refusals do no network work"
+    );
+}
+
+/// The standalone ACTION layer's restore success: the raw POST
+/// through the existing trait method, flat `{restored: true}` shape.
+#[tokio::test]
+async fn backup_restore_action_posts_and_reports_restored() {
+    let mock = IgnitionMock::start().await;
+    let fixture = gwbk_fixture();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(BACKUP_PATH))
+        .and(wiremock::matchers::query_param("restoreDisabled", "false"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gwbk = dir.path().join("ok.gwbk");
+    std::fs::write(&gwbk, &fixture).expect("write fixture gwbk");
+    let result = ignition_core::actions::backup::backup_restore(&api, &gwbk)
+        .await
+        .expect("restore accepted");
+    assert!(result.restored);
+    let requests = mock.server.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 1, "exactly the restore POST");
+    assert_eq!(requests[0].body, fixture, "raw gwbk bytes, exactly");
 }

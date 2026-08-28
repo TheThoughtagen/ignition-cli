@@ -424,6 +424,7 @@ mod tests {
         async fn backup_download(
             &self,
             _out: &std::path::Path,
+            _backup_type: crate::client::backup::BackupType,
         ) -> Result<crate::client::projects::ExportMeta, CoreError> {
             unreachable!("not part of this action")
         }
@@ -739,6 +740,7 @@ mod tests {
             async fn backup_download(
                 &self,
                 _out: &std::path::Path,
+                _backup_type: crate::client::backup::BackupType,
             ) -> Result<crate::client::projects::ExportMeta, CoreError> {
                 unreachable!("not part of this action")
             }

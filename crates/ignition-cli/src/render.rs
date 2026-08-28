@@ -14,6 +14,7 @@
 //! modes are untouched — the envelope's top-level `profile` field is their
 //! mechanism.
 
+use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
 use ignition_core::actions::logs::{
@@ -221,6 +222,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::RigLogs(result) => render_rig_logs_human(result),
         ActionOutput::RigSnapshot(result) => render_rig_snapshot_human(result),
         ActionOutput::RigRestore(result) => render_rig_restore_human(result),
+        ActionOutput::BackupDownload(result) => render_backup_download_human(result),
+        ActionOutput::BackupRestore(result) => render_backup_restore_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -861,6 +864,21 @@ fn render_rig_restore_human(result: &RestoreResult) {
     );
     for warning in &result.warnings {
         println!("warning: {warning}");
+    }
+}
+
+/// `ign backup download` human line — the file + the type that rode
+/// the wire (07-02, BKUP-01).
+fn render_backup_download_human(result: &BackupDownloadResult) {
+    println!("Downloaded {} ({})", result.file, result.r#type);
+}
+
+/// `ign backup restore` human line — acceptance + the restart-block
+/// honesty (the README owns the full window; humans get the one-liner
+/// here, JSON stays the flat {restored: true}).
+fn render_backup_restore_human(result: &BackupRestoreResult) {
+    if result.restored {
+        println!("Restored — the gateway restarts now (blocked for ~minutes)");
     }
 }
 

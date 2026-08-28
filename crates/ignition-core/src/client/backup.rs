@@ -26,12 +26,44 @@ use std::time::Duration;
 /// GET/POST path of the backup capability.
 pub(crate) const BACKUP_PATH: &str = "/data/api/v1/backup";
 
-/// The download path with its query — `type=roaming` = the PORTABLE
-/// backup (cross-rig; `all` includes gateway-specific state). The
-/// query rides the path string into `download_to_file`'s single
-/// `path` parameter (the url join preserves it — no helper signature
-/// churn for one fixed param).
-pub(crate) const BACKUP_DOWNLOAD_PATH: &str = "/data/api/v1/backup?type=roaming";
+/// The `type` query param of the download — `roaming` = the PORTABLE
+/// backup (cross-gateway; the rig snapshot + standalone default), `all`
+/// includes gateway-specific state (07-02's `--type` param, research
+/// Focus 7: the ONE honest signature change — the baked query const
+/// became a builder over this enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupType {
+    /// `?type=roaming` — portable across gateways (the default).
+    Roaming,
+    /// `?type=all` — includes gateway-specific state.
+    All,
+}
+
+impl BackupType {
+    /// The wire value of the `type` query param.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Roaming => "roaming",
+            Self::All => "all",
+        }
+    }
+}
+
+impl Default for BackupType {
+    /// Roaming is the default — the portable backup (pinned by the
+    /// path-builder unit test so the default query cannot drift).
+    fn default() -> Self {
+        Self::Roaming
+    }
+}
+
+/// The download path with its query — the type param rides the path
+/// string into `download_to_file`'s single `path` parameter (the url
+/// join preserves it — no helper signature churn for one param; the
+/// 04-04 const became this builder when 07-02 param-ized the type).
+pub(crate) fn backup_download_path(backup_type: BackupType) -> String {
+    format!("{BACKUP_PATH}?type={}", backup_type.wire())
+}
 
 /// The `Accept` header the download sends — the postman collection's
 /// exact value (the server answers the gwbk bytes).
@@ -62,7 +94,7 @@ pub(crate) fn restore_query() -> [(String, String); 4] {
 mod tests {
     use std::time::Duration;
 
-    use super::{BACKUP_DOWNLOAD_PATH, BACKUP_TIMEOUT, restore_query};
+    use super::{BACKUP_TIMEOUT, BackupType, backup_download_path, restore_query};
 
     /// Pitfall 6 pin: BOTH directions ride the 300 s per-request class
     /// (the same constant serves download and restore — one budget,
@@ -72,11 +104,24 @@ mod tests {
         assert_eq!(BACKUP_TIMEOUT, Duration::from_secs(300));
     }
 
-    /// The download query rides the path constant — pinned so the
-    /// `type=roaming` half cannot silently drift out of the URL.
+    /// The download query rides the path builder — pinned so the
+    /// default (roaming) and the `all` variant cannot silently drift
+    /// out of the URL (the 04-04 const-pin, builder edition).
     #[test]
-    fn download_path_carries_roaming_query() {
-        assert_eq!(BACKUP_DOWNLOAD_PATH, "/data/api/v1/backup?type=roaming");
+    fn download_path_carries_the_type_query() {
+        assert_eq!(
+            backup_download_path(BackupType::default()),
+            "/data/api/v1/backup?type=roaming",
+            "roaming remains the DEFAULT query"
+        );
+        assert_eq!(
+            backup_download_path(BackupType::Roaming),
+            "/data/api/v1/backup?type=roaming"
+        );
+        assert_eq!(
+            backup_download_path(BackupType::All),
+            "/data/api/v1/backup?type=all"
+        );
     }
 
     /// All four restore params, all explicit false, exactly once —

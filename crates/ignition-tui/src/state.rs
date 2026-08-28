@@ -251,6 +251,10 @@ pub enum PendingAction {
         /// space/comma-separated list, split at accept).
         resources: Vec<String>,
     },
+    /// `ign backup restore <FILE>` (Confirm ≡ `--yes` — 07-02: the
+    /// 8th guarded CLI verb; REPLACES this gateway's state from the
+    /// gwbk, then the gateway restarts and blocks ~minutes).
+    BackupRestore { file: String },
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
@@ -266,6 +270,9 @@ pub enum PendingInput {
     /// The `LOGGER LEVEL` line for `loggers set` (parsed before the
     /// Confirm gate arms).
     LoggersSetLine,
+    /// The gwbk path for `backup restore` (a Confirm gate arms at
+    /// accept — 07-02).
+    BackupRestoreFile,
 }
 
 impl Modal {
@@ -351,7 +358,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 7] = [
+pub const ACTIONS: [&str; 9] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -359,6 +366,9 @@ pub const ACTIONS: [&str; 7] = [
     "wait for module ready",
     "doctor",
     "restart",
+    // 07-02: the standalone backup pair (gateway-level verbs).
+    "backup download",
+    "backup restore",
 ];
 
 /// The Logs screen's actions menu entries (06-03) — the loggers
@@ -1227,6 +1237,7 @@ mod tests {
     /// The dashboard menu's wait labels are display PROSE (06-10) —
     /// the executor arms in update.rs match these exact strings, and
     /// routes.rs carries the clap-exact spellings (never these).
+    /// 07-02 appends the backup pair (clap-exact — no prose needed).
     #[test]
     fn dashboard_actions_use_display_prose_wait_labels() {
         assert_eq!(
@@ -1239,6 +1250,8 @@ mod tests {
                 "wait for module ready",
                 "doctor",
                 "restart",
+                "backup download",
+                "backup restore",
             ]
         );
     }

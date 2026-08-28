@@ -800,8 +800,15 @@ pub async fn rig_snapshot(
         .map_err(|err| CoreError::Internal(format!("cannot create {}: {err}", dir.display())))?;
 
     // 2. The gwbk FIRST — the primary artifact, streamed to disk.
+    //    Roaming explicitly (07-02 param-ized the type): the rig's
+    //    snapshot stays the portable backup, byte-identical behavior.
     let gwbk_name = format!("{rig_name}.gwbk");
-    let meta = gateway.backup_download(&dir.join(&gwbk_name)).await?;
+    let meta = gateway
+        .backup_download(
+            &dir.join(&gwbk_name),
+            crate::client::backup::BackupType::Roaming,
+        )
+        .await?;
 
     // 3. Per-project exports (the 03-02 machinery reused verbatim).
     let page = gateway
@@ -2175,6 +2182,7 @@ mod tests {
         async fn backup_download(
             &self,
             out: &Path,
+            _backup_type: crate::client::backup::BackupType,
         ) -> Result<crate::client::projects::ExportMeta, CoreError> {
             self.record("backup_download".into());
             Ok(Self::serve_download(

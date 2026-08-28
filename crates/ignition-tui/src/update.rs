@@ -2415,6 +2415,40 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 body: "restart the gateway now? (takes it down for ~1 min)".to_string(),
             });
         }
+        // 07-02: the standalone backup pair. Download fires direct
+        // with CLI defaults (roaming, default output naming); restore
+        // prompts for the gwbk path, its Confirm gate arming at
+        // accept (the 8th guarded CLI verb's mirror).
+        Some("backup download") => {
+            if let Some(client) = client_arc(state) {
+                let stem = state
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| "gateway".to_string());
+                workers::spawn_action(state, "backup download", async move {
+                    ignition_core::actions::backup::backup_download(
+                        &*client,
+                        None,
+                        &stem,
+                        ignition_core::client::backup::BackupType::Roaming,
+                    )
+                    .await
+                });
+            }
+        }
+        Some("backup restore") => {
+            state.dashboard.pending_input = Some(PendingInput::BackupRestoreFile);
+            state.open_modal(Modal::Input {
+                title: "backup restore — gwbk file".to_string(),
+                hint: Some(
+                    "the gwbk path (ign backup download / rig snapshot)\n\
+                     REPLACES this gateway's state — a Confirm gate arms next\n\
+                     CLI: ign backup restore <FILE> --yes"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
         _ => {}
     }
 }
@@ -2547,6 +2581,20 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
             project.clone(),
             resources.clone(),
         ),
+        // The confirmed standalone restore fires unguarded — the TUI
+        // owned the `--yes` (07-02, the 8th guarded CLI verb).
+        PendingAction::BackupRestore { file } => {
+            if let Some(client) = client_arc(state) {
+                let file = file.clone();
+                workers::spawn_action(state, "backup restore", async move {
+                    ignition_core::actions::backup::backup_restore(
+                        &*client,
+                        std::path::Path::new(&file),
+                    )
+                    .await
+                });
+            }
+        }
     }
 }
 
@@ -2852,6 +2900,21 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                 }
                 Err(reason) => open_error_modal(state, "loggers set", &reason),
             },
+            // The gwbk path: the Confirm gate arms at accept (07-02 —
+            // the restore REPLACES this gateway's state).
+            (Some(PendingInput::BackupRestoreFile), false) => {
+                state.dashboard.pending = Some(PendingAction::BackupRestore {
+                    file: value.trim().to_string(),
+                });
+                state.open_modal(Modal::Confirm {
+                    title: "backup restore".to_string(),
+                    body: format!(
+                        "restore {} onto THIS gateway? (replaces its state; \
+                         the gateway restarts and blocks ~minutes)",
+                        value.trim()
+                    ),
+                });
+            }
             _ => clear_pending(state),
         }
         return;
@@ -3070,6 +3133,7 @@ fn gated_cli_verb(pending: &PendingAction) -> &'static str {
         PendingAction::RigRestore { .. } => "rig restore",
         PendingAction::RigTrialReset => "rig trial reset",
         PendingAction::ProjectSync { .. } => "project sync",
+        PendingAction::BackupRestore { .. } => "backup restore",
     }
 }
 
@@ -3691,10 +3755,11 @@ mod tests {
             "k steps back up like Up"
         );
 
-        // G bottoms out at the last entry (restart, index 6).
+        // G bottoms out at the last entry (backup restore, index 8 —
+        // the 07-02 pair appended after restart).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 6 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 8 })),
             "G jumps to the last entry"
         );
 
@@ -6884,20 +6949,24 @@ mod tests {
                 project: "PlantFloor".into(),
                 resources: vec!["views/root.json".into()],
             },
+            PendingAction::BackupRestore {
+                file: "snap.gwbk".into(),
+            },
         ]
     }
 
     /// THE parity tripwire: the confirm-gated TUI set is exactly the
     /// CLI's `--yes`-guarded verbs (main.rs `require_confirmation`
-    /// sites, the 06-06 set + 07-01's sync) — 15 verbs across 8
-    /// families, each with its family route-mapped onto the right
-    /// screen.
+    /// sites, the 06-06 set + 07-01's sync + 07-02's backup
+    /// restore) — 16 verbs, each with its family route-mapped onto
+    /// the right screen.
     #[test]
     fn confirm_parity_matches_the_cli_guard_set() {
         let pendings = every_gated_pending();
         let mut verbs: Vec<&'static str> = pendings.iter().map(super::gated_cli_verb).collect();
         verbs.sort_unstable();
         let expected = [
+            "backup restore",
             "logs loggers reset",
             "logs loggers set",
             "project delete",
@@ -6942,6 +7011,7 @@ mod tests {
             "rig reset",
             "rig restore",
             "rig trial reset",
+            "backup restore",
         ] {
             assert!(
                 routes

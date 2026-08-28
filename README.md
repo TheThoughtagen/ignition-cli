@@ -172,6 +172,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign rig [--rig NAME] trial reset [--user NAME]` | Reset an EXPIRED trial to a fresh ~2 h window via the mechanism ladder | **destructive**: exit 2 (`confirmation_required`) without `--yes`, BEFORE any discovery; ladder = tier 0 `POST /data/api/v1/trial` with `X-Ignition-API-Token` (token from `IGNITION_TOKEN`) → tier 1 native gateway login (internal-IdP OIDC challenge dance → session cookie + CSRF header), creds `--user`/`IGNITION_USER` + `IGNITION_PASSWORD` (password NEVER a flag); success REQUIRES the read-back flip (`expired` false on re-fetch — a bare 2xx never suffices); a NON-expired trial refuses exit 6 `trial_not_expired` (the gateway 403s resets while active — live-verified); no creds at all → exit 3 |
 | `ign rig [--rig NAME] snapshot [-o DIR]` | Snapshot the rig's gateway: native gwbk (`GET /backup?type=roaming`, STREAMED to disk) + per-project exports + `manifest.json` — composed in a timestamped dir | addresses the rig's derived gateway URL; requires `IGNITION_TOKEN` (the backup route 401s unauthenticated — live-verified shape); default dir `./ign-rig-snapshots/<rig>-<yyyyMMdd-HHmmss>/`; data `{dir, gwbk_bytes, projects, manifest_path}` — the manifest names BOTH composition exclusions (see §rig snapshot/restore) |
 | `ign rig [--rig NAME] restore --file PATH [--timeout S]` | Restore a gwbk onto the rig's gateway (raw octet-stream POST), wait for the witnessed post-restore RUNNING | **destructive**: exit 2 without `--yes`, BEFORE any discovery; the restore is synchronous and the gateway RESTARTS after — success is a WITNESSED StatusPing→RUNNING (deadline floored at 300 s), never a bare 2xx; data always carries the token-clobber warning (`API tokens may have been reset by restore…`, see §rig snapshot/restore); requires `IGNITION_TOKEN` |
+| `ign backup download [-o FILE] [--type roaming\|all]` | Download a gwbk from ANY profiled gateway (streamed to disk — the standalone sibling of `rig snapshot`'s gwbk leg) | `--type roaming` (default) = the portable backup; `all` includes gateway-specific state; default filename from `Content-Disposition`, else `<profile>-backup.gwbk`; read, unguarded; JSON data `{file, type}` |
+| `ign backup restore <FILE> --yes` | Restore a gwbk onto THIS gateway (the ACTIVE profile's — `rig restore`'s standalone sibling without the rig wait) | **destructive — the 8th `--yes`-guarded verb**: exit 2 (`confirmation_required`, profile null, ZERO network) without `--yes`; REPLACES this gateway's state, then the gateway restarts and blocks for minutes (the 2xx is acceptance — see §Backups); a nonexistent/empty/non-regular file exits 2 `invalid_input` pre-network; JSON data `{restored: true}` |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -487,6 +489,38 @@ gateway). The gate snapshots a
 pre-witness project, creates a post-snapshot marker, restores, and
 asserts BOTH halves: witness SURVIVED, marker GONE.
 
+### Gateway backups (`ign backup`)
+
+The standalone gwbk surface on ANY profiled gateway — the same wire
+`rig snapshot`/`rig restore` ride (Phase 4), without the rig
+machinery:
+
+- **`ign backup download [-o FILE] [--type roaming|all]`** — a
+  streamed read (never buffered in memory; 300 s per-request
+  timeout). `roaming` is the portable backup (cross-gateway — the
+  default); `all` includes gateway-specific state. Default filename
+  follows the export convention: the gateway's
+  `Content-Disposition` basename when it sends one, else
+  `<profile>-backup.gwbk` (streamed to a `.part` first, renamed on
+  completion — a failed download leaves no half-written impostor).
+- **`ign backup restore <FILE> --yes`** — REPLACES this gateway's
+  state from the gwbk. Destructive: the 8th `--yes`-guarded verb
+  (guard BEFORE resolution — a refusal does zero work). The restore
+  POST is synchronous; **the gateway then RESTARTS and blocks for
+  minutes** — the 2xx is acceptance, not readiness (`ign wait
+  restart` is the readiness witness if you want one; `rig restore`
+  bundles that wait for rigs). API tokens inside the backup may
+  clobber current ones — see the `rig restore` token warning, same
+  mechanics here.
+- **There is NO `ign backup list`** — no native listing endpoint
+  exists (exactly GET/POST on `/data/api/v1/backup`). Honesty over
+  verb theater: your filesystem is the list. The EAM archive store
+  (`storage/archived-backups`) is a DIFFERENT thing — it belongs to
+  the EAM controller's fleet backups, not this gateway's gwbk files.
+
+The trial clock is NOT captured by a gwbk (see the rig snapshot
+exclusions — same mechanics).
+
 ### Project export/import specifics
 
 
@@ -671,7 +705,9 @@ big one: it takes
 the whole gateway down for ~1 min — and `rig reset`, which deletes
 the rig's volumes, plus `rig trial reset`, which restarts the trial
 window, and `rig restore`, which REPLACES the gateway's state with a
-gwbk) refuse without `--yes`
+gwbk, and `backup restore` — `rig restore`'s standalone sibling on
+any profiled gateway, same whole-state replacement) refuse without
+`--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
 pass `--yes` once and humans get a speed bump. `restart` is guarded in

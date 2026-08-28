@@ -35,10 +35,11 @@ use ignition_core::error::CoreError;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs,
-    ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, SessionsArgs, SessionsCmd,
-    TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
-    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    BackupArgs, BackupCommand, Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs,
+    ProfileCmd, ProjectArgs, ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand,
+    SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
+    TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
+    WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -147,6 +148,12 @@ enum ActionOutput {
     RigLogs(actions::rig::RigLogsResult),
     RigSnapshot(actions::rig::SnapshotResult),
     RigRestore(actions::rig::RestoreResult),
+    /// `ign backup download` — the standalone gwbk streamed to disk
+    /// (07-02, BKUP-01); data carries {file, type}.
+    BackupDownload(actions::backup::BackupDownloadResult),
+    /// `ign backup restore` — the guarded standalone restore; data
+    /// carries the flat {restored: true}.
+    BackupRestore(actions::backup::BackupRestoreResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -265,6 +272,8 @@ impl ActionOutput {
             ActionOutput::RigLogs(result) => render_success(profile, result, compact),
             ActionOutput::RigSnapshot(result) => render_success(profile, result, compact),
             ActionOutput::RigRestore(result) => render_success(profile, result, compact),
+            ActionOutput::BackupDownload(result) => render_success(profile, result, compact),
+            ActionOutput::BackupRestore(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -1681,6 +1690,49 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             };
             (echo, result)
         }
+        // Backups (07-02, BKUP-01): the Phase 4 gwbk wire on any
+        // profiled gateway. Download is a streamed read (unguarded);
+        // restore is the 8th --yes-guarded destructive verb — the
+        // guard fires BEFORE resolution (the sessions-terminate
+        // shape: exit 2, profile null, zero network on refusal),
+        // naming the whole-gateway consequence + restart block.
+        Commands::Backup(BackupArgs { command }) => match command {
+            BackupCommand::Download { output, r#type } => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => {
+                        let stem = name.as_deref().unwrap_or("gateway");
+                        actions::backup::backup_download(
+                            &api,
+                            output.as_deref(),
+                            stem,
+                            r#type.into(),
+                        )
+                        .await
+                        .map(ActionOutput::BackupDownload)
+                    }
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            BackupCommand::Restore { file } => {
+                if let Err(err) = require_confirmation(
+                    cli.yes,
+                    "backup restore (overwrites this gateway's state from the gwbk — \
+                     gateway restarts and blocks ~minutes)",
+                ) {
+                    return (None, Err(err));
+                }
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::backup::backup_restore(&api, &file)
+                        .await
+                        .map(ActionOutput::BackupRestore),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+        },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {

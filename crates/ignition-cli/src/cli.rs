@@ -148,6 +148,11 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Rig(RigArgs),
 
+    /// Manage gateway backups (gwbk) on any profiled gateway:
+    /// download (streamed) and restore (guarded)
+    #[command(arg_required_else_help = true)]
+    Backup(BackupArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -847,6 +852,58 @@ pub enum TrialCommand {
         #[arg(long, value_name = "NAME")]
         user: Option<String>,
     },
+}
+
+/// Backup subcommands (07-02, BKUP-01) — the standalone surface of
+/// the Phase 4 gwbk wire. `restore` is the family's destructive verb
+/// (the 8th `--yes`-guarded set member: it REPLACES this gateway's
+/// state); `download` is a streamed read, unguarded.
+#[derive(Debug, clap::Args)]
+pub struct BackupArgs {
+    #[command(subcommand)]
+    pub command: BackupCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackupCommand {
+    /// Download a gwbk backup (streamed to disk)
+    Download {
+        /// Output file (default: the gateway's Content-Disposition
+        /// name, else <profile>-backup.gwbk)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Backup type: roaming = portable across gateways (default);
+        /// all includes gateway-specific state
+        #[arg(long, value_enum, default_value_t = CliBackupType::Roaming)]
+        r#type: CliBackupType,
+    },
+    /// Restore a gwbk onto THIS gateway — destructive, refused
+    /// without --yes; the gateway restarts and blocks for minutes
+    /// after the restore
+    Restore {
+        /// The gwbk file to restore (from `ign backup download` or
+        /// `ign rig snapshot`)
+        file: PathBuf,
+    },
+}
+
+/// CLI value-enum mirror of the core `BackupType` (ignition-core
+/// stays clap-free; `From` converts at the dispatch seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CliBackupType {
+    /// Portable backup (cross-gateway)
+    Roaming,
+    /// Includes gateway-specific state
+    All,
+}
+
+impl From<CliBackupType> for ignition_core::client::backup::BackupType {
+    fn from(value: CliBackupType) -> Self {
+        match value {
+            CliBackupType::Roaming => Self::Roaming,
+            CliBackupType::All => Self::All,
+        }
+    }
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand
