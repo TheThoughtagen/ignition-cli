@@ -145,12 +145,12 @@ Plans:
 **Plans**: 6 plans (sequential waves — every plan extends the shared TUI state/update/event/routes core)
 
 Plans:
-- [ ] 06-01-PLAN.md — Foundation: ratatui 0.30.2 + crossterm 0.29 deps, AppEvent select loop, AppState/update (Elm), profile→client context, UI chrome + modal infra, routes scaffold, logs::tail +Send fix, minimal `ign tui` arm
-- [ ] 06-02-PLAN.md — Dashboard screen (status/modules/metrics/sessions, 5s refresh worker) + global actions menu (version/wait/doctor/restart) + profile switcher with era-based worker re-targeting
-- [ ] 06-03-PLAN.md — Logs screen (tail worker, 10k ring, level filter, scrollback, loggers actions) + Alarms panel (5s poll, full UUIDs, history, username-required ack modal)
-- [ ] 06-04-PLAN.md — Tags screen: provider/tree browse, detail + read, live watch table (2s tags_read poll), write modal, providers/config/export/import actions
-- [ ] 06-05-PLAN.md — Projects screen: project list → detail → resource drill-down + project/resource/webdev action menus with CLI confirm-parity
-- [ ] 06-06-PLAN.md — Rig screen (status, guarded actions, raw logs pane) + complete routes registry + tui_coverage.rs CI proof (clap tree-walk, bidirectional) + README
+- [x] 06-01-PLAN.md — Foundation: ratatui 0.30.2 + crossterm 0.29 deps, AppEvent select loop, AppState/update (Elm), profile→client context, UI chrome + modal infra, routes scaffold, logs::tail +Send fix, minimal `ign tui` arm
+- [x] 06-02-PLAN.md — Dashboard screen (status/modules/metrics/sessions, 5s refresh worker) + global actions menu (version/wait/doctor/restart) + profile switcher with era-based worker re-targeting
+- [x] 06-03-PLAN.md — Logs screen (tail worker, 10k ring, level filter, scrollback, loggers actions) + Alarms panel (5s poll, full UUIDs, history, username-required ack modal)
+- [x] 06-04-PLAN.md — Tags screen: provider/tree browse, detail + read, live watch table (2s tags_read poll), write modal, providers/config/export/import actions
+- [x] 06-05-PLAN.md — Projects screen: project list → detail → resource drill-down + project/resource/webdev action menus with CLI confirm-parity
+- [x] 06-06-PLAN.md — Rig screen (status, guarded actions, raw logs pane) + complete routes registry + tui_coverage.rs CI proof (clap tree-walk, bidirectional) + README
 
 ### Phase 7: Ecosystem Interop & Advanced Ops
 **Goal:** The CLI plugs into the WhiskeyHouse ecosystem and handles the advanced workflows — cross-gateway promotion, backups/EAM, opt-in script execution, and round-trip editing with nvim/ignition-lint/git-module — completing the toolset.
@@ -182,5 +182,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 3. Project Operations | 3/3 | Complete | 2026-08-22 |
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
 | 5. WebDev Backend & Tag Operations | 8/8 | Complete | 2026-08-26 |
-| 6. TUI Cockpit | 0/6 | Not started | - |
+| 6. TUI Cockpit | 6/6 | Complete | 2026-08-28 |
 | 7. Ecosystem Interop & Advanced Ops | 0/4 | Not started | - |
