@@ -2422,28 +2422,59 @@ fn move_session_selection(state: &mut AppState, delta: i32) {
     state.dashboard.sessions_table.select(Some(next));
 }
 
+/// Shared menu-modal navigation (06-10): the arrows plus the vim
+/// motion set — `j`/`k` step like Down/Up, `g`/`G` jump to the
+/// first/last entry — over a `len`-entry list. Returns `true` when
+/// the key was consumed (the caller keeps Enter and friends for
+/// itself). Matches the screen-level keymaps (Logs/Tags/Projects are
+/// the reference implementations).
+fn menu_nav(selected: &mut usize, len: usize, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            *selected = selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if len > 0 {
+                *selected = (*selected + 1).min(len - 1);
+            }
+            true
+        }
+        KeyCode::Char('g') => {
+            *selected = 0;
+            true
+        }
+        KeyCode::Char('G') => {
+            if len > 0 {
+                *selected = len - 1;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The Result modal's Ctrl-d/Ctrl-u half-page step. `update` is
+/// frame-blind by design (pure sync, grep-enforced), so the fixed
+/// screen-level convention applies — the Logs screen pages by the
+/// same 10-line step.
+const RESULT_HALF_PAGE: u16 = 10;
+
 /// Keystrokes while a modal is open: the modal-specific acceptors
 /// first (Actions menu nav, Confirm `y`, Input Enter, Result_ scroll),
 /// then the Input buffer editing, then Esc (closes, clearing pending).
 fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
-    // The profile switcher: Up/Down move, Enter switches, `a` opens
-    // the add form.
+    // The profile switcher: the shared menu nav (arrows + vim
+    // motions, 06-10), Enter switches, `a` opens the add form.
     if let Some(Modal::Profiles {
         names, selected, ..
     }) = state.modal.as_mut()
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
+        if menu_nav(selected, names.len(), code) {
+            return;
+        }
         match code {
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
-                return;
-            }
-            KeyCode::Down => {
-                if !names.is_empty() {
-                    *selected = (*selected + 1).min(names.len() - 1);
-                }
-                return;
-            }
             KeyCode::Char('a') => {
                 state.open_modal(Modal::ProfileAdd {
                     name: String::new(),
@@ -2515,129 +2546,89 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         }
     }
 
-    // The Logs actions menu: the same nav shape as the dashboard's
-    // menu, over the loggers family.
+    // The Logs actions menu: the shared menu nav (arrows + vim
+    // motions), Enter executes — over the loggers family.
     if let Some(Modal::LogsActions { selected }) = state.modal.as_mut()
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
-        match code {
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
-                return;
-            }
-            KeyCode::Down => {
-                *selected = (*selected + 1).min(LOG_ACTIONS.len() - 1);
-                return;
-            }
-            KeyCode::Enter => {
-                let index = *selected;
-                state.close_modal();
-                clear_pending(state);
-                execute_logs_menu_action(state, index);
-                return;
-            }
-            _ => {}
+        if menu_nav(selected, LOG_ACTIONS.len(), code) {
+            return;
+        }
+        if code == KeyCode::Enter {
+            let index = *selected;
+            state.close_modal();
+            clear_pending(state);
+            execute_logs_menu_action(state, index);
+            return;
         }
     }
 
-    // The Tags actions menu (06-04): the same nav shape, over the
-    // remaining tags family verbs.
+    // The Tags actions menu (06-04): the shared menu nav, Enter
+    // executes — over the remaining tags family verbs.
     if let Some(Modal::TagsActions { selected }) = state.modal.as_mut()
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
-        match code {
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
-                return;
-            }
-            KeyCode::Down => {
-                *selected = (*selected + 1).min(TAG_ACTIONS.len() - 1);
-                return;
-            }
-            KeyCode::Enter => {
-                let index = *selected;
-                state.close_modal();
-                clear_pending(state);
-                execute_tags_menu_action(state, index);
-                return;
-            }
-            _ => {}
+        if menu_nav(selected, TAG_ACTIONS.len(), code) {
+            return;
+        }
+        if code == KeyCode::Enter {
+            let index = *selected;
+            state.close_modal();
+            clear_pending(state);
+            execute_tags_menu_action(state, index);
+            return;
         }
     }
 
-    // The Projects actions menu (06-05): the same nav shape, over the
-    // project/resource/webdev family verbs.
+    // The Projects actions menu (06-05): the shared menu nav, Enter
+    // executes — over the project/resource/webdev family verbs.
     if let Some(Modal::ProjectsActions { selected }) = state.modal.as_mut()
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
-        match code {
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
-                return;
-            }
-            KeyCode::Down => {
-                *selected = (*selected + 1).min(PROJECT_ACTIONS.len() - 1);
-                return;
-            }
-            KeyCode::Enter => {
-                let index = *selected;
-                state.close_modal();
-                clear_pending(state);
-                execute_projects_menu_action(state, index);
-                return;
-            }
-            _ => {}
+        if menu_nav(selected, PROJECT_ACTIONS.len(), code) {
+            return;
+        }
+        if code == KeyCode::Enter {
+            let index = *selected;
+            state.close_modal();
+            clear_pending(state);
+            execute_projects_menu_action(state, index);
+            return;
         }
     }
 
-    // The Rig actions menu (06-06): the same nav shape, over the rig
-    // family verbs.
+    // The Rig actions menu (06-06): the shared menu nav, Enter
+    // executes — over the rig family verbs.
     if let Some(Modal::RigActions { selected }) = state.modal.as_mut()
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
-        match code {
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
-                return;
-            }
-            KeyCode::Down => {
-                *selected = (*selected + 1).min(RIG_ACTIONS.len() - 1);
-                return;
-            }
-            KeyCode::Enter => {
-                let index = *selected;
-                state.close_modal();
-                clear_pending(state);
-                execute_rig_menu_action(state, index);
-                return;
-            }
-            _ => {}
+        if menu_nav(selected, RIG_ACTIONS.len(), code) {
+            return;
+        }
+        if code == KeyCode::Enter {
+            let index = *selected;
+            state.close_modal();
+            clear_pending(state);
+            execute_rig_menu_action(state, index);
+            return;
         }
     }
 
-    // The Actions menu: Up/Down move, Enter executes. Long waits run in
-    // the worker with NO UI block — only the status line's in-flight
-    // label shows while they run.
+    // The Actions menu: the shared menu nav (arrows + vim motions),
+    // Enter executes. Long waits run in the worker with NO UI block —
+    // only the status line's in-flight label shows while they run.
     if let Some(Modal::Actions { selected }) = state.modal.as_mut()
         && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
-        match code {
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
-                return;
-            }
-            KeyCode::Down => {
-                *selected = (*selected + 1).min(ACTIONS.len() - 1);
-                return;
-            }
-            KeyCode::Enter => {
-                let index = *selected;
-                state.close_modal();
-                clear_pending(state);
-                execute_menu_action(state, index);
-                return;
-            }
-            _ => {}
+        if menu_nav(selected, ACTIONS.len(), code) {
+            return;
+        }
+        if code == KeyCode::Enter {
+            let index = *selected;
+            state.close_modal();
+            clear_pending(state);
+            execute_menu_action(state, index);
+            return;
         }
     }
 
@@ -2755,15 +2746,46 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         }
     }
 
-    // Result modal: PgUp/PgDn scroll (clamped to the content).
+    // Result modal: PgUp/PgDn scroll (clamped to the content) plus
+    // the vim motion set (06-10) — j/k line scroll, Ctrl-d/Ctrl-u
+    // half-page (the frame-blind step the Logs screen pages by),
+    // g/G top/bottom. Arrows and PgUp/PgDn keep working unchanged.
     if let Some(Modal::Result_ { lines, scroll, .. }) = state.modal.as_mut() {
+        let max = lines.len() as u16;
+        let plain = !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL)
+            && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
         match code {
             KeyCode::PageUp => {
                 *scroll = scroll.saturating_sub(1);
                 return;
             }
             KeyCode::PageDown => {
-                *scroll = (*scroll + 1).min(lines.len() as u16);
+                *scroll = (*scroll + 1).min(max);
+                return;
+            }
+            KeyCode::Char('k') if plain => {
+                *scroll = scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Char('j') if plain => {
+                *scroll = (*scroll + 1).min(max);
+                return;
+            }
+            KeyCode::Char('u') if ctrl => {
+                *scroll = scroll.saturating_sub(RESULT_HALF_PAGE);
+                return;
+            }
+            KeyCode::Char('d') if ctrl => {
+                *scroll = (*scroll + RESULT_HALF_PAGE).min(max);
+                return;
+            }
+            KeyCode::Char('g') if plain => {
+                *scroll = 0;
+                return;
+            }
+            KeyCode::Char('G') if plain => {
+                *scroll = max;
                 return;
             }
             _ => {}
@@ -3458,6 +3480,131 @@ mod tests {
 
         update(&mut state, key(KeyCode::PageDown, KeyModifiers::NONE));
         assert!(matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 1));
+    }
+
+    /// Menu modals carry the full vim motion set (06-10): `j`/`k`
+    /// step the selection exactly like Down/Up, `G` bottoms out, `g`
+    /// homes — pinned on the dashboard Actions menu, with the
+    /// profiles list (the other list-bearing modal) pinned for j/k.
+    #[test]
+    fn menu_modals_take_vim_motions() {
+        let mut state = AppState::new();
+        state.open_modal(Modal::Actions { selected: 0 });
+
+        // j advances like Down (twice, to leave room for k).
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Actions { selected: 2 })),
+            "j advances the selection like Down"
+        );
+
+        // k steps back up like Up.
+        update(&mut state, key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Actions { selected: 1 })),
+            "k steps back up like Up"
+        );
+
+        // G bottoms out at the last entry (restart, index 6).
+        update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Actions { selected: 6 })),
+            "G jumps to the last entry"
+        );
+
+        // g homes to the first entry.
+        update(&mut state, key(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::Actions { selected: 0 })),
+            "g jumps to the first entry"
+        );
+
+        // The profiles list modal: j/k move over the profile names.
+        let mut profiles = AppState::new();
+        profiles.open_modal(Modal::Profiles {
+            names: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            active: Some("alpha".into()),
+            selected: 0,
+        });
+        update(&mut profiles, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(
+            matches!(&profiles.modal, Some(Modal::Profiles { selected, .. }) if *selected == 1),
+            "j steps the profile list"
+        );
+        update(&mut profiles, key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(
+            matches!(&profiles.modal, Some(Modal::Profiles { selected, .. }) if *selected == 0),
+            "k steps the profile list back"
+        );
+    }
+
+    /// The Result modal carries the full vim motion set (06-10): j/k
+    /// line-scroll, Ctrl-d/Ctrl-u half-page (the 10-line step,
+    /// clamped), g/G top/bottom — while PgUp/PgDn keep working.
+    #[test]
+    fn result_modal_takes_vim_motions() {
+        let lines: Vec<String> = (0..30).map(|i| format!("line-{i}")).collect();
+        let mut state = AppState::new();
+        state.open_modal(Modal::Result_ {
+            title: "wait gateway".into(),
+            lines: lines.clone(),
+            scroll: 0,
+        });
+
+        // j line-scrolls down; k line-scrolls back up.
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 2),
+            "j scrolls down a line at a time"
+        );
+        update(&mut state, key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 1),
+            "k scrolls back up a line"
+        );
+
+        // Ctrl-d half-pages down by the 10-line step; Ctrl-u half-pages
+        // back up (floors at 0).
+        update(&mut state, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 11),
+            "Ctrl-d moves by the half-page step (1 + 10)"
+        );
+        update(&mut state, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 1),
+            "Ctrl-u moves back by the half-page step"
+        );
+        update(&mut state, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 0),
+            "Ctrl-u floors at the top"
+        );
+
+        // G bottoms out (scroll == content length, the PgDown clamp
+        // convention); g homes.
+        update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == lines.len() as u16),
+            "G bottoms out at the content length"
+        );
+        update(&mut state, key(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == 0),
+            "g homes to the top"
+        );
+
+        // Ctrl-d clamps at the bottom instead of running past.
+        update(&mut state, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        update(&mut state, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        update(&mut state, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        update(&mut state, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { scroll, .. }) if *scroll == lines.len() as u16),
+            "Ctrl-d clamps at the content length"
+        );
     }
 
     // ---- Profile switcher (06-02 Task 3) — isolated-config tests ----
