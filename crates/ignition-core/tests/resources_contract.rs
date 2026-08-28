@@ -450,7 +450,10 @@ async fn root_level_put_synthesizes_module_folder_shape() {
     let descriptor = read_member(&out, "perspective-properties.json/resource.json")
         .expect("container descriptor lands");
     let parsed: serde_json::Value = serde_json::from_slice(&descriptor).expect("descriptor json");
-    assert_eq!(parsed["files"], serde_json::json!(["perspective-properties.json"]));
+    assert_eq!(
+        parsed["files"],
+        serde_json::json!(["perspective-properties.json"])
+    );
     assert_eq!(parsed["scope"], serde_json::json!("G"));
 
     // THE broken-shape fence: no file member is literally named
@@ -478,7 +481,10 @@ async fn root_level_put_synthesizes_module_folder_shape() {
         "list surfaces the root-level user path: {members:?}"
     );
     assert_eq!(members[0], SCRIPT_USER_PATH.to_string());
-    assert_eq!(members[1], "com.example/views/Dashboard/view.json".to_string());
+    assert_eq!(
+        members[1],
+        "com.example/views/Dashboard/view.json".to_string()
+    );
 }
 
 /// THE root-level delete pin: the no-slash user path removes exactly
@@ -494,8 +500,9 @@ async fn root_level_delete_removes_the_member() {
         b"{}",
     )
     .expect("root-level put stages");
-    let out = ignition_core::client::resources::remove_member(&staged, "perspective-properties.json")
-        .expect("root-level delete rewrites");
+    let out =
+        ignition_core::client::resources::remove_member(&staged, "perspective-properties.json")
+            .expect("root-level delete rewrites");
     let gone = read_member(&out, "perspective-properties.json");
     assert!(
         matches!(gone, Err(CoreError::NotFound { .. })),

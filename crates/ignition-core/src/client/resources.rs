@@ -18,8 +18,12 @@
 //! `com.inductiveautomation.perspective`, `ignition`, …). The
 //! user-facing path form — the Phase-3 UX-unchanged contract — is
 //! `<collection>/<rest>`: the `resources/` segment is stripped on the
-//! way OUT and re-inserted on the way IN. `project.json` is never a
-//! resource. Directory entries (when a writer emits them) are
+//! way OUT and re-inserted on the way IN. A no-slash user path (a
+//! project-root file, e.g. `perspective-properties.json`) rides a
+//! module named after the path itself: `<X>` ↔ `<X>/resources/<X>`
+//! (06-08, live-proven — the only adoptable shape for root-level
+//! files; see [`member_path`]). `project.json` is never a resource.
+//! Directory entries (when a writer emits them) are
 //! skipped on list and preserved verbatim on rewrite.
 //!
 //! [`ResourceEntry`] keeps the Phase-3 list shape (`path` typed,
@@ -49,21 +53,36 @@ pub struct ResourceEntry {
 }
 
 /// Map a user-facing resource path to its zip member path:
-/// `<collection>/<rest>` → `<collection>/resources/<rest>`.
-/// A degenerate no-slash path maps to `<path>/resources`, which can
-/// never match a member (resources always have a rest) — the honest
-/// answer for such input is not-found downstream.
+/// `<collection>/<rest>` → `<collection>/resources/<rest>`; a
+/// no-slash path (a project-root file in user terms, e.g.
+/// `perspective-properties.json`) round-trips through a module named
+/// after the path itself — `<X>` → `<X>/resources/<X>`.
+///
+/// The root-level mapping is LIVE-PROVEN surgery shape (06-08, virgin
+/// 8.3.3 rig): the file lands inside its own module's resources
+/// container with the container descriptor naming it — the gateway
+/// imports it exit-0 and re-exports it at exactly that member path.
+/// The intuitive alternative — a file member at the zip root or one
+/// literally named `<X>/resources` — is dead wire: root files are
+/// silently not adopted (no parent descriptor can exist), and a file
+/// named `resources` collides with the module's reserved resources
+/// container (HTTP 500, "module folder must have folder flag set").
 fn member_path(user_path: &str) -> String {
     match user_path.split_once('/') {
         Some((collection, rest)) => format!("{collection}/resources/{rest}"),
-        None => format!("{user_path}/resources"),
+        None => format!("{user_path}/resources/{user_path}"),
     }
 }
 
 /// Map a zip member path back to the user-facing form — `None` for
 /// every member that is not `<collection>/resources/<rest>` with a
 /// nonempty rest (`project.json`, misplaced root files, directory
-/// entries).
+/// entries). The root-level inverse of [`member_path`]: a member
+/// `<X>/resources/<X>` maps to the no-slash user path `<X>` (the
+/// rest equals the collection), so put/get/list/delete round-trip
+/// through one spelling. Note the deliberate alias: the explicit
+/// user path `<X>/<X>` forwards to the same member and reads back
+/// as `<X>` — one member, the no-slash spelling wins.
 fn user_path(member: &str) -> Option<String> {
     let mut segments = member.split('/');
     let collection = segments.next()?;
@@ -73,6 +92,9 @@ fn user_path(member: &str) -> Option<String> {
     let rest = segments.collect::<Vec<_>>().join("/");
     if rest.is_empty() {
         return None;
+    }
+    if rest == collection {
+        return Some(collection.to_string());
     }
     Some(format!("{collection}/{rest}"))
 }
@@ -446,7 +468,8 @@ mod tests {
     }
 
     /// Missing member → the existing not-found shape (exit 6) — for
-    /// both a full miss and the degenerate no-slash form; a non-zip
+    /// both a full miss and the no-slash root-level form (whose
+    /// member can exist only after a root-level put); a non-zip
     /// input is an internal error (the export contract was violated).
     #[test]
     fn missing_member_and_garbage_zip_error_shapes() {
@@ -460,10 +483,11 @@ mod tests {
         assert_eq!(err.exit_code(), 6);
         assert_eq!(err.code(), "not_found");
 
-        let degenerate = read_member(&zip, "ignition").expect_err("no-slash path must fail");
+        let root_level =
+            read_member(&zip, "ignition").expect_err("absent root-level member must fail");
         assert!(
-            matches!(degenerate, CoreError::NotFound { endpoint: None }),
-            "the degenerate form maps to a member that cannot exist: {degenerate}"
+            matches!(root_level, CoreError::NotFound { endpoint: None }),
+            "the root-level member form is absent until a put creates it: {root_level}"
         );
 
         let garbage = resource_members(b"not a zip at all").expect_err("garbage must fail");
