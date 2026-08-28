@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 COMPLETE — 06-11 shipped (rig summary re-rendered as grouped blank-separated sections with a STATE UP/DOWN headline and width-fitted compose path; README keymap synced with every gap-closure key — Tags 'r', modal vim motions, prose noun-grouped menu; workspace green, fmt/clippy clean). All 13 06-UAT gaps addressed or backlog-owned (color/monochrome themes are backlog by triage). Next: /gsd-verify-work 6, then plan Phase 7 (interop).
+**Current focus:** Phase 7 in progress — 07-01 shipped (cross-gateway `ign project diff` + guarded `ign project sync`: pure normalized-compare engine stripping lastModification/Signature with key-order-independent canonicalization, two-client resolution shape keeping the envelope on the active profile, sync guard-before-resolution with zero-request refusal, TUI rows + confirm parity at 15 verbs, e2e witness needing IGNITION_LIVE_URL_B; workspace 746 tests green, fmt/clippy clean, zero new deps). Next: 07-02 (backup standalone + EAM).
 
 ## Current Position
 
-**Phase:** 6 of 7 (TUI Cockpit — gap closure)
-**Current Plan:** 11
-**Total Plans in Phase:** 11 (6 original + 5 gap-closure from 06-UAT)
-**Status:** Phase complete — ready for verification
+**Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
+**Current Plan:** 2
+**Total Plans in Phase:** 4
+**Status:** Ready to execute
 **Last Activity:** 2026-08-28
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 92%
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P08 | 52min | 2 tasks | 2 files |
 | Phase 06 P10 | 41min | 3 tasks | 3 files |
 | Phase 06 P11 | 20min | 2 tasks | 2 files |
+| Phase 07 P01 | 79min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -184,6 +185,10 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-10]: Menu labels are display prose (ACTIONS 'wait for gateway up' etc.; PROJECT_ACTIONS noun-grouped project/resource/webdev with 'label — consequence' rows, ONE flat index space keyed on the clap-exact verb) — worker labels and routes.rs rows keep clap-exact spellings; both-sides matching + group contiguity test-pinned; descriptions budgeted to the 38-col half-width modal
 - [Phase 06]: [Phase 06-11]: Rig summary = STATE headline (UP/DOWN · PORTS) + blank-separated identity/services/volumes sections — actual RigStatusResult fields drive the grouping (the plan's trial/snapshot sketch sections don't exist); summary_lines is width-aware, tail-fitting the compose path with a leading …; project row only when it differs from rig — 06-UAT test 13 readability fix; content-driven layout per the 06-10 lesson
 - [Phase 06]: [Phase 06-11]: README keymap bullet is the single home for per-screen keys + modal motion sets — Tags 'r' (deepest-visible refire), j/k/g/G in list-bearing menus, j/k + Ctrl-d/Ctrl-u 10-line half-page in the Result modal (PgUp/PgDn stay line-wise); exit table cross-checked session_not_prunable present — new keys are only real if documented; wording pinned against the code
+- [Phase 07-01]: Cross-gateway diff/sync direction LOCKED: diff output is B-relative-to-A (added = in B only, removed = in A only); sync direction always explicit A→B — LABEL RECONCILIATION at the action mapping: upserts = diff's removed+changed, --delete removals = diff's added (the plan prose's 'added+changed' used sync-direction labels; pushing the diff's added set would read members A does not have)
+- [Phase 07-01]: Two-client resolution shape: envelope profile = the ACTIVE profile (resolution unchanged — the frozen one-field envelope); data carries profile_a/profile_b; each side builds its own client via resolve_selection + the ONE locked secret chain (IGNITION_TOKEN applies to BOTH sides unless per-profile keyring entries exist — README caveat)
+- [Phase 07-01]: Diff normalization owns its canonical form: strip exactly attributes.lastModification + lastModificationSignature, recursively key-sort before serialize (key-order-independence pinned — a workspace preserve_order flip cannot change canonical output); 64-bit FNV-1a member digests, zero new dependencies
+- [Phase 07-01]: Sync guard ordering: selection validation (usage errors lead) → --yes guard firing BEFORE resolve_two_clients (exit 2, profile null, zero requests binary-pinned; operation string names the whole-project overwrite-import on the actual profile B) → resolution; empty effective selection (--all-changed, nothing changed) performs NO import (zero-write honesty)
 
 ### Pending Todos
 
@@ -200,6 +205,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T12:31:31.781Z
-**Stopped At:** Completed 06-11-PLAN.md — Phase 6 gap closure complete (rig render + README keymap sync); next: /gsd-verify-work 6
+**Last session:** 2026-08-28T16:52:26.589Z
+**Stopped At:** Completed 07-01-PLAN.md — cross-gateway project diff + guarded sync shipped (normalized compare, two-client resolution, TUI rows, e2e witness); next: 07-02
 **Resume file:** None
