@@ -457,11 +457,13 @@ fn set_screen(state: &mut AppState, screen: Screen) {
     match state.screen {
         Screen::Logs => workers::tail::spawn_tail(state),
         Screen::Alarms => workers::watch::spawn_alarms(state),
-        // Entering Tags loads the provider list (one-shot, busy
-        // guarded — the screen's entry read) and resumes the live
+        // Entering Tags re-fires the DEEPEST visible one-shot (06-09:
+        // a populated stack or open detail invalidates on re-entry —
+        // one-shot results earned elsewhere never linger; the root's
+        // provider load stays busy-guarded) and resumes the live
         // watch over the retained set (empty set = a no-op stop).
         Screen::Tags => {
-            workers::watch::spawn_providers_once(state);
+            refire_tags_current_level(state);
             workers::watch::spawn_tag_watch(state);
         }
         // Entering Projects loads the project list (one-shot, busy
@@ -562,8 +564,10 @@ fn switch_profile(state: &mut AppState, name: &str) {
     match state.screen {
         Screen::Logs => workers::tail::spawn_tail(state),
         Screen::Alarms => workers::watch::spawn_alarms(state),
+        // The cleared TagsData re-fires its deepest visible read —
+        // the fresh provider list (06-09's re-entry convention).
         Screen::Tags => {
-            workers::watch::spawn_providers_once(state);
+            refire_tags_current_level(state);
             workers::watch::spawn_tag_watch(state);
         }
         Screen::Projects => workers::ops::spawn_project_list(state),
@@ -778,15 +782,17 @@ fn history_window_24h() -> (i64, i64) {
 /// The Tags keymap (06-04): Up/Down (j/k) move the current level's
 /// cursor, Enter descends (provider → its tree; folder → deeper) or
 /// opens the tag detail (with the on-demand read), `w` toggles live
-/// watch on the selected tag, `a` opens the actions menu (the
-/// remaining tags verbs), Esc ascends one level (handled in
-/// [`handle_input`] — the global key owns Esc).
+/// watch on the selected tag, `r` re-fires the deepest visible read
+/// (06-09's freshness repair — the stale-error recovery path), `a`
+/// opens the actions menu (the remaining tags verbs), Esc ascends
+/// one level (handled in [`handle_input`] — the global key owns Esc).
 fn tags_keys(state: &mut AppState, code: KeyCode) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => move_tags_selection(state, -1),
         KeyCode::Down | KeyCode::Char('j') => move_tags_selection(state, 1),
         KeyCode::Enter => tags_enter(state),
         KeyCode::Char('w') => toggle_watch(state),
+        KeyCode::Char('r') => refire_tags_current_level(state),
         KeyCode::Char('a') => state.open_modal(Modal::TagsActions { selected: 0 }),
         _ => {}
     }
@@ -907,6 +913,30 @@ fn refire_detail_read(state: &mut AppState) {
     detail.read = crate::state::DetailRead::Loading;
     let path = detail.path.clone();
     workers::watch::spawn_detail_read(state, seq, &path);
+}
+
+/// Re-fire the Tags screen's deepest visible one-shot read (06-09's
+/// freshness repair — the UAT's stale-402 gap): the open detail's
+/// read, the current (top) stack level's browse, or the provider
+/// list at the root. The refire clears the level's error as it arms
+/// so a stale pane visibly reloads instead of lingering until
+/// Esc+Enter re-navigation. Screen entry and profile-switch
+/// re-entry route here too — coming back to the screen invalidates
+/// whatever the one-shots earned before.
+fn refire_tags_current_level(state: &mut AppState) {
+    if state.tags.detail.is_some() {
+        refire_detail_read(state);
+        return;
+    }
+    if let Some(level) = state.tags.stack.last_mut() {
+        level.entries = None;
+        level.error = None;
+        let path = level.path.clone();
+        workers::watch::spawn_browse(state, &path);
+        return;
+    }
+    state.tags.providers_error = None;
+    workers::watch::spawn_providers_once(state);
 }
 
 /// Esc's Tags-screen half: ascend EXACTLY one level — detail → tree
@@ -4384,6 +4414,113 @@ mod tests {
             state.tags.stack[0].error.as_deref(),
             Some("routes_not_deployed (exit 6)")
         );
+    }
+
+    // ---- 'r' refresh (06-09 Task 1) ----
+
+    /// `r` at the provider root re-fires the provider list: a stale
+    /// error clears as the load re-arms, and the busy guard holds
+    /// (an in-flight load never stacks a second).
+    #[test]
+    fn r_at_the_provider_root_refires_and_clears_the_stale_error() {
+        let mut state = tags_screen_with_rails();
+        assert!(state.tags.providers_busy, "entry load in flight");
+
+        // Busy: `r` respects the guard — the in-flight load is the
+        // refresh already (nothing observable changes).
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(state.tags.providers_busy, "no second load stacks");
+
+        // The load lands as an ERROR (the UAT's stale-402 shape).
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsProviders {
+                era,
+                result: Err("the WebDev module is unlicensed".into()),
+            },
+        );
+        assert!(!state.tags.providers_busy);
+        assert!(state.tags.providers_error.is_some(), "the honest error");
+
+        // `r` clears the stale error and re-arms the load.
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(state.tags.providers_busy, "re-armed");
+        assert!(state.tags.providers_error.is_none(), "stale error cleared");
+    }
+
+    /// `r` with a stacked browse level refires THAT level's read —
+    /// the entries drop to Loading (and a stale error clears) while
+    /// the level itself (and the stack) stays.
+    #[test]
+    fn r_refires_the_current_browse_level() {
+        let mut state = tags_state_on_tree();
+        // Degrade the level to the honest error (the UAT's stale 402).
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::TagsBrowse {
+                era,
+                path: "[default]".into(),
+                result: Err("routes_not_deployed".into()),
+            },
+        );
+        assert!(state.tags.stack.last().unwrap().error.is_some());
+
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        let level = state.tags.stack.last().unwrap();
+        assert_eq!(level.path, "[default]", "the level itself stays");
+        assert!(level.entries.is_none(), "entries drop to Loading");
+        assert!(level.error.is_none(), "the stale error cleared");
+    }
+
+    /// `r` with an open detail refires the read under a NEW seq (the
+    /// request-id gate retires the in-flight read; Enter's refire
+    /// twin).
+    #[test]
+    fn r_refires_the_open_detail_under_a_new_seq() {
+        let mut state = tags_state_on_tree(); // cursor on T1
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE)); // open detail
+        let era = state.era;
+        let seq = state.tags.detail_seq;
+        update(
+            &mut state,
+            AppEvent::TagDetailRead {
+                era,
+                seq,
+                result: Ok(read_row("[default]T1", serde_json::json!(42))),
+            },
+        );
+        assert!(matches!(
+            state.tags.detail.as_ref().unwrap().read,
+            crate::state::DetailRead::Loaded(_)
+        ));
+
+        update(&mut state, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(state.tags.detail_seq, seq + 1, "a fresh seq");
+        assert!(
+            matches!(
+                state.tags.detail.as_ref().unwrap().read,
+                crate::state::DetailRead::Loading
+            ),
+            "the read re-armed"
+        );
+    }
+
+    /// Screen re-entry with a populated stack refires the DEEPEST
+    /// visible level — Tab away and back invalidates the stale
+    /// browse (the recovery path that needs no key discovery).
+    #[test]
+    fn screen_re_entry_refires_the_deepest_stack_level() {
+        let mut state = tags_state_on_tree();
+        update(&mut state, key(KeyCode::BackTab, KeyModifiers::SHIFT)); // → Logs
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE)); // → Tags
+        let level = state.tags.stack.last().expect("stack retained");
+        assert!(level.entries.is_none(), "the deepest level refired");
+        assert!(level.error.is_none());
+        // The root provider load is NOT re-fired while stacked — the
+        // deepest visible read owns the surface (and its busy guard).
+        assert!(!state.tags.providers_busy, "providers not re-armed");
     }
 
     /// Enter on a FOLDER descends (pushes its path); Enter on a LEAF
