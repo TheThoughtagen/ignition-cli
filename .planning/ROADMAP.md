@@ -167,13 +167,15 @@ Plans:
   2. User can download and restore gateway backups (gwbk) via native API, list EAM task history, and create guarded EAM tasks
   3. `ign script run` executes gateway scripts via the scriptExec route — opt-in only (disabled by default)
   4. User can export with `--decode-scripts` / import with `--encode-scripts` for round-trip nvim/VS Code editing, run `ign lint` delegating to ignition-lint on PATH (with install hint if absent), and browse git-module tag exports offline via `--from-export`
-**Plans**: 4 plans (TBD)
+**Plans**: 4 plans (sequential waves 1→4 — every plan grows the cli.rs/main.rs/routes.rs choke files, the Phase 1–4 pattern; no parallelism is honest)
+
+*Planner refinement:* all seven research Open Questions resolved at planning — lint = doctor posture default (exit 0 when the child ran, findings + child_exit_code as data) + `--strict` literal passthrough; project diff = member-status only (zero new deps, no `similar`); tag-provider scope = `scope: "project"` metadata + README-documented tags-export pipe (no flag, no provider sync); script run input = all three forms (`--code`, `--file`, `--file -`); EAM create guard ladder = `eam_backup` unguarded (OnDemand default), restart/send\*/license types `--yes`, restore/install/upgrade REFUSED (additive `eam_task_type_refused` slug, EXT-03 pointer), any non-OnDemand schedule mode `--yes`; sidecar addressing = counter-named sidecars + JSON-pointer manifest with span-level splicing (byte-equality on unedited members is the acceptance test); EAM controller flip = README-documented manual config-resource PUT, no verb. New additive slugs this phase: `eam_not_controller`, `eam_task_type_refused`, `script_exec_not_configured`, `lint_tool_absent`. Every new verb lands its TUI routes row in the same plan (tui_coverage clap-walk gate).
 
 Plans:
-- [ ] 07-01: cross-gateway diff + selective sync (explicit scope semantics)
-- [ ] 07-02: gwbk backup download/restore + EAM task history/create
-- [ ] 07-03: `script run` (opt-in, guarded) over scriptExec route
-- [ ] 07-04: script decode/encode round-trip, `ign lint` delegation, `--from-export` tag browsing
+- [ ] 07-01-PLAN.md — cross-gateway `project diff` (normalized member compare, B-relative-to-A, two-client resolution shape) + guarded `project sync` (A→B, --delete opt-in) (SYNC-01/02)
+- [ ] 07-02-PLAN.md — standalone `ign backup download/restore` (--type param, 8th guarded verb) + EAM family (`eam history/tasks`, guarded `task new`/`task force`, `eam_not_controller` state-gate slug) (BKUP-01/02)
+- [ ] 07-03-PLAN.md — `ign script run` over the shipped scriptExec route (structural opt-in, three input forms, `script_exec_not_configured` slug) (SCRPT-01)
+- [ ] 07-04-PLAN.md — interop trio: Flint codec `--decode-scripts`/`--encode-scripts` round-trip, `ign lint` delegation (doctor posture + `--strict`), `tags browse --from-export` offline (INTR-01/02/03)
 
 ## Progress
 
