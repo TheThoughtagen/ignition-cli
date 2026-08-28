@@ -151,11 +151,11 @@ Plans:
 - [x] 06-04-PLAN.md — Tags screen: provider/tree browse, detail + read, live watch table (2s tags_read poll), write modal, providers/config/export/import actions
 - [x] 06-05-PLAN.md — Projects screen: project list → detail → resource drill-down + project/resource/webdev action menus with CLI confirm-parity
 - [x] 06-06-PLAN.md — Rig screen (status, guarded actions, raw logs pane) + complete routes registry + tui_coverage.rs CI proof (clap tree-walk, bidirectional) + README
-- [ ] 06-07-PLAN.md — Gap closure: 8.3.3 metrics decode (f64 gauges), designer-prune 409 → exit-6 session_not_prunable, contextual ign tui TTY hint
-- [ ] 06-08-PLAN.md — Gap closure: root-level resource put (project-root file member zip surgery, structure-pinned + live-rig round-trip)
-- [ ] 06-09-PLAN.md — Gap closure: Tags freshness — 'r' current-level refresh, write→detail refire trigger, error-pane recovery hints
-- [ ] 06-10-PLAN.md — Gap closure: modal geometry (fit + frame-clamp), vim motions in all modals, prose menu labels + noun-grouped Projects menu
-- [ ] 06-11-PLAN.md — Gap closure: rig status summary readability + README TUI keymap sync
+- [x] 06-07-PLAN.md — Gap closure: 8.3.3 metrics decode (f64 gauges), designer-prune 409 → exit-6 session_not_prunable, contextual ign tui TTY hint
+- [x] 06-08-PLAN.md — Gap closure: root-level resource put (project-root file member zip surgery, structure-pinned + live-rig round-trip)
+- [x] 06-09-PLAN.md — Gap closure: Tags freshness — 'r' current-level refresh, write→detail refire trigger, error-pane recovery hints
+- [x] 06-10-PLAN.md — Gap closure: modal geometry (fit + frame-clamp), vim motions in all modals, prose menu labels + noun-grouped Projects menu
+- [x] 06-11-PLAN.md — Gap closure: rig status summary readability + README TUI keymap sync
 
 ### Phase 7: Ecosystem Interop & Advanced Ops
 **Goal:** The CLI plugs into the WhiskeyHouse ecosystem and handles the advanced workflows — cross-gateway promotion, backups/EAM, opt-in script execution, and round-trip editing with nvim/ignition-lint/git-module — completing the toolset.
@@ -187,5 +187,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 3. Project Operations | 3/3 | Complete | 2026-08-22 |
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
 | 5. WebDev Backend & Tag Operations | 8/8 | Complete | 2026-08-26 |
-| 6. TUI Cockpit | 6/6 | Complete | 2026-08-28 |
+| 6. TUI Cockpit | 11/11 | Complete | 2026-08-28 |
 | 7. Ecosystem Interop & Advanced Ops | 0/4 | Not started | - |

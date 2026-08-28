@@ -1,130 +1,142 @@
 ---
 phase: 06-tui-cockpit
-verified: 2026-08-28T00:45:00Z
+verified: 2026-08-28T07:15:00Z
 status: passed
-score: 5/5 must-haves verified
+score: 18/18 must-haves verified (5 original truths regression-clean + 13 UAT gap closures)
+re_verification:
+  previous_status: passed
+  previous_score: 5/5
+  gaps_closed:
+    - "Metrics decode on 8.3.3 exponent-form doubles (UAT test 4, major) — 06-07"
+    - "Designer-prune 409 → exit-6 session_not_prunable (UAT test 6, minor) — 06-07"
+    - "Contextual ign tui TTY hint (UAT test 2, minor) — 06-07"
+    - "Root-level resource put member shape (UAT test 6 fixture blocker, major) — 06-08"
+    - "Tags 'r' refresh + stale-error invalidation (UAT test 10, major) — 06-09"
+    - "Tags write→detail refire (UAT test 11, minor) — 06-09"
+    - "Error-pane recovery hints on Tags — 06-09"
+    - "Modal footer-hint clipping (cosmetic) — 06-10"
+    - "Frame-clamped modal geometry (minor) — 06-10"
+    - "Vim motions in all modals (minor) — 06-10"
+    - "Prose wait-prefix menu labels (minor) — 06-10"
+    - "Noun-grouped Projects menu with consequence descriptions (minor) — 06-10"
+    - "Readable rig status summary (UAT test 13, minor) — 06-11"
+    - "README TUI keymap synchronized with gap-closure keys — 06-11"
+  gaps_remaining: []
+  regressions: []
 human_verification_anticipated:
-  - test: "Open `ign tui` against the live research rig and drive all six screens"
-    expected: "Cockpit renders, Tab cycles, no flicker/freeze; handled by the configured end-of-phase /gsd-verify-work step"
+  - test: "Re-drive the previously-failing UAT scenarios against the live 8.3.3 rig (metrics panel populates, stale tags error clears via r, modal footer visible, rig summary readable)"
+    expected: "Each former UAT issue now passes in the cockpit; handled by the configured end-of-phase /gsd-verify-work step"
     why_human: "Visual feel and live-gateway interactivity cannot be asserted programmatically"
 ---
 
 # Phase 6: TUI Cockpit Verification Report
 
 **Phase Goal:** A user can open `ign tui` and drive every CLI capability through a k9s/lazygit-style cockpit — the primary human interface, structurally complete because TUI and CLI share the same actions layer.
-**Verified:** 2026-08-28T00:45:00Z
+**Verified:** 2026-08-28T07:15:00Z
 **Status:** passed
-**Re-verification:** No — initial verification
+**Re-verification:** Yes — after UAT gap closure (06-UAT.md found 13 gaps; plans 06-07→06-11 closed them)
 
 ## Goal Achievement
 
-### Observable Truths (ROADMAP Success Criteria)
+This verification confirms two layers: (A) the original 5 ROADMAP truths remain regression-clean, and (B) all 13 UAT-discovered gaps are genuinely closed in the codebase — not merely claimed in summaries.
+
+### A. Original Observable Truths (regression check)
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | `ign tui` opens a cockpit with object-list → detail navigation, and a CI test asserts every CLI action has a TUI mapping (full coverage, not aspirational) | ✓ VERIFIED | `main.rs:1641` dispatches `Commands::Tui` → `ignition_tui::run` after a TTY pre-check; `ui/mod.rs:32-37` dispatches all six real screens; `tui_coverage.rs` walks the live clap tree via `CommandFactory` (165 lines, 3 tests) and asserts **bidirectional set equality** with `routes()` — **ran it: 3/3 passed** |
-| 2 | Live status dashboard (modules, sessions, metrics) with periodic refresh; profile switch from within the TUI | ✓ VERIFIED | `refresh.rs:60-63` composes `inspect::status/modules/metrics` + `sessions::sessions` via join, `REFRESH_PERIOD = 5s`; per-panel `Option<T>+error` degrade (dead-gateway test green); `'p'` key → profiles modal → `profile::use_profile` at `update.rs:531` with atomic rebuild-first ordering + era-stamped worker re-targeting |
-| 3 | Tail gateway logs with level filtering, UI never blocking on gateway I/O | ✓ VERIFIED | `tail.rs` streams `actions::logs::tail` with `Send` sink sending `AppEvent::LogLine`; ring = `VecDeque` capped `LOG_RING_CAP = 10_000` (state.rs:510); render-side filter (`filter.matches`, logs.rs:82) + `min_level` on restart; tail resumes at `ring.back()` timestamp (tail.rs:97); `set_screen` stops the tail on exit (update.rs:450); `update()` is sync — all 31 `.await`s live inside `spawn_action`-armed async blocks |
-| 4 | Browse tags, live-watch tag values, view + acknowledge alarms in an alarm panel | ✓ VERIFIED | `tags.rs` (635 lines) tree browser + watch table; `watch.rs` polls the complete watched set in one `tags_read` per `WATCH_PERIOD = 2s` with generation restart on membership change; `alarms.rs` table + history + username-required ack modal (`tags_alarms_ack` at update.rs:2448, Enter disabled until username non-empty); short-prefix ids pass as-shown to the expanding action (05-08 inherited) |
-| 5 | Browse projects/resources and trigger project actions from the TUI | ✓ VERIFIED | `projects.rs` (541 lines) list → `project_find` detail → resources list → resource get with scrollable preview; `ops.rs` (424 lines) fires `actions::projects/resources/webdev` verbs incl. copy/rename; Confirm gates mirror main.rs exactly via exhaustive `gated_cli_verb` (update.rs:2827) with a parity test walking every `PendingAction` |
+| 1 | `ign tui` cockpit with full CLI-action coverage, CI-enforced | ✓ VERIFIED | `tui_coverage.rs` clap-tree walk **re-ran: 3/3 passed** after the prose-label change — routes.rs keeps clap-exact rows (`wait gateway` etc. at routes.rs:80-88) while display labels went prose |
+| 2 | Live status dashboard w/ periodic refresh + profile switch | ✓ VERIFIED | refresh worker tests green; metrics panel now f64-fed (gap 1); profile switch tests green (186 TUI tests) |
+| 3 | Tail logs w/ level filtering, non-blocking | ✓ VERIFIED | tail/watch worker + ring tests green in the workspace sweep |
+| 4 | Browse tags, live-watch, alarms ack | ✓ VERIFIED | Tags screen tests green + new freshness tests (gap 5-6); alarms ack trigger remains the pinned pattern |
+| 5 | Browse projects/resources, project actions | ✓ VERIFIED | Projects tests green; menu regrouped (gap 11) with `.verb` dispatch at update.rs:1864; gated-verb parity tests **re-ran: 8+1 passed** |
 
-**Score:** 5/5 truths verified
+### B. UAT Gap Closures (full 3-level verification)
 
-### Required Artifacts
+| # | Gap (UAT test) | Status | Code Evidence (all three levels: exists / substantive / wired) |
+|---|----------------|--------|----------------------------------------------------------------|
+| 1 | Metrics decode on 8.3.3 exponent-form doubles (test 4, major) | ✓ VERIFIED | `metrics.rs:49-53` heap/max `f64` + `serialize_bytes_f64` (whole→integer JSON, 2^53 guard); fixture test `current_gauges_decodes_exponent_form_java_doubles` pins the EXACT raw 8.3.3 body `2.85746728E8` via `from_str` (macro-proof), + integer/decimal/round-trip forms — **ran: passing**; display consumers wired (`dashboard.rs:288 fmt_mib(f64)`, `render.rs:365-366 as i64` casts keep goldens byte-identical); sibling wire audit comment in-model |
+| 2 | Designer-prune 409 → exit-6 session_not_prunable (test 6, minor) | ✓ VERIFIED | `classify.rs:88` route-scoped arm `S::CONFLICT if is_designer_prune_url(url)` with exact URL-detection unit tests (singular vs plural `/designers`); `error.rs:323` SessionNotPrunable in the exit-6 group (`:397`), slug `:365`, hint "close the Designer first — prune removes stale entries only" `:562-563`; wiremock pair — 409-empty-body→slug assertion AND off-route-409-stays-Internal — **ran: 2/2 passing**; README exit table row 6 updated |
+| 3 | Contextual `ign tui` TTY hint (test 2, minor) | ✓ VERIFIED | `error.rs:30` `TUI_TTY_REFUSAL_REASON` const + `tui_tty_refusal()` constructor (:616) + content-addressed hint branch (:428-432) "run `ign tui` in an interactive terminal…"; raise site wired (`main.rs:1645`); snapbox golden `tui_under_a_pipe_refuses_with_the_interactive_terminal_hint` pins exit-2 envelope + new hint — **ran: passing** |
+| 4 | Root-level resource put member shape (test 6 fixture blocker, major) | ✓ VERIFIED | `resources.rs:70-76` `member_path` no-slash → `<X>/resources/<X>` (module named after the file) with symmetric `user_path` inverse + documented alias; 3 structure pins in `resources_contract.rs` (:431, :495, :528 — member shape, delete removal, wiremock import-body crown) — **ran: 3/3 passing**; nested-member tests unregressed; live rig round-trip evidence pasted in 06-08-SUMMARY (put→get→list→delete on gap08cli, gateway re-export adoption oracle) |
+| 5 | Tags 'r' refresh, deepest-visible refire (test 10, major) | ✓ VERIFIED | `update.rs:816` `Char('r')` in tags_keys → `refire_tags_current_level` (:947) — substantive deepest-first logic: detail read > stack-top browse (entries+error cleared, re-spawn) > providers; screen re-entry (:487) and profile-switch re-entry (:591) route through the same helper — stale 402-class errors invalidate without key discovery; 4 refresh tests green |
+| 6 | Tags write→detail refire (test 11, minor) | ✓ VERIFIED | `state.rs:872` `last_write_path` armed at accept (:1318), consumed on ANY landing (:240); ActionDone trigger (:239-252) refires detail read only on SUCCESS + matching path (alarms-ack pattern's twin); watch table left to its 2s poll (commented); matching + non-matching + failed-write tests green |
+| 7 | Error-pane recovery hints (test 10 missing-item) | ✓ VERIFIED | `tags.rs:30` `refresh_hint()` DIM line on all three error renders (:118, :194, :260); 3 render-test assertions "press r to refresh" green |
+| 8 | Modal footer-hint clipping (test 5, cosmetic) | ✓ VERIFIED | `ui/mod.rs:103-126` content-driven formulas: menus = `len + 4` (entries + hint + blank + 2 borders), Confirm/Input/Result exact row counts, ProjectsActions = shared `projects_action_lines` builder length + 2 — the builder renders the footer hint as its last line, so geometry can never undercount it again |
+| 9 | Frame-clamped modal geometry (test 5, minor) | ✓ VERIFIED | `ui/mod.rs:132` `height.clamp(5, frame.area().height - 2)` — never clips chrome on small terminals (5-row floor), grows on large; small-frame render tests green |
+| 10 | Vim motions in every modal (test 5, minor) | ✓ VERIFIED | `update.rs:2434` shared `menu_nav` (Up/k, Down/j, g, G) wired into ALL six list modals (:2477, :2557, :2574, :2591, :2608, :2626); Result-modal arm (:2760-2795) adds j/k line, Ctrl-d/Ctrl-u `RESULT_HALF_PAGE`=10, g/G with plain/ctrl modifier guards; arrows + PgUp/PgDn byte-identical behavior preserved |
+| 11 | Prose menu labels (test 5, minor) | ✓ VERIFIED | `state.rs:343-345` "wait for gateway up / wait for restart complete / wait for module ready"; executor arms match on the same strings (update.rs:2226/2238/2251); **routes.rs NOT modified** — coverage test 3/3 green proves clap parity intact; structure-pin tests at state.rs:1188-1190 |
+| 12 | Noun-grouped Projects menu (test 12, minor) | ✓ VERIFIED | `state.rs` `ProjectAction{group, verb, label, description}` const with project/resource/webdev groups (contiguity/order/uniqueness test-pinned); `ui/mod.rs:31` `projects_action_lines` renders bold group headers, blank-separated sections, dim `label — description` rows (descriptions budgeted to the 38-col interior); dispatch decoupled via `.verb` (update.rs:1864); gated-verb parity tests green — confirm gating unchanged |
+| 13 | Rig status readable + README keymap sync (test 13, minor) | ✓ VERIFIED | `ui/rig.rs:153` `summary_lines` — bold `STATE {UP/DOWN} · PORTS {free/held}` headline (:163), blank-separated bold sections identity/services/volumes (:170/:188/:211), width-aware `fit_tail` for the compose path (:61), render tests for UP + DOWN shapes at 80×24; README keymap documents Tags `r` deepest-visible refire, modal vim motions (j/k/g/G menus; j/k + Ctrl-d/Ctrl-u Result), grouped prose menu; exit-table `session_not_prunable` row cross-checked (:36) |
 
-| Artifact | Expected | Status | Details |
-|----------|----------|--------|---------|
-| `crates/ignition-tui/src/lib.rs` | run() entry: init/restore lifecycle | ✓ VERIFIED | 171 lines; `ratatui::init`/`restore` pair with panic-safe restore |
-| `crates/ignition-tui/src/event.rs` | AppEvent enum + era types | ✓ VERIFIED | 192 lines; Refresh/ProfileChanged/ActionDone/LogLine/TagWatch variants confirmed |
-| `crates/ignition-tui/src/state.rs` | Elm model, all 6 Screen variants, Modal | ✓ VERIFIED | 1086 lines; `Screen` enum ships Dashboard/Logs/Tags/Alarms/Projects/Rig from day one |
-| `crates/ignition-tui/src/update.rs` | Pure sync update() | ✓ VERIFIED | 6283 lines; `pub fn update` sync, awaits confined to spawned async blocks; 172 unit tests |
-| `crates/ignition-tui/src/context.rs` | profile → client via public config fns | ✓ VERIFIED | 292 lines; only `config::load/apply_env_overlay/resolve_selection` |
-| `crates/ignition-tui/src/routes.rs` | COMPLETE registry, no gaps/orphans | ✓ VERIFIED | 607 lines; 63+ rows; machine-proven complete by the coverage test |
-| `crates/ignition-tui/src/ui/{mod,dashboard,profiles,logs,alarms,tags,projects,rig}.rs` | Per-screen renderers | ✓ VERIFIED | 626/377/172/355/314/635/541/362 lines — all substantive, all dispatched |
-| `crates/ignition-tui/src/workers/{mod,refresh,tail,watch,ops,rig_stream}.rs` | Worker rail | ✓ VERIFIED | 107/370/266/544/424/402 lines; era stamping + watch shutdown + `Handle::try_current` spawn guard |
-| `crates/ignition-cli/tests/tui_coverage.rs` | Structural CI proof | ✓ VERIFIED | 165 lines, 3 tests, `CommandFactory` walk — **ran green** |
-| `crates/ignition-core/src/actions/logs.rs` | tail with `Send` sink | ✓ VERIFIED | `dyn FnMut(&LogEntry) + Send` at lines 217/234 |
+**Score:** 18/18 (5 original truths + 13 gap closures)
 
-### Key Link Verification
+### Key Link Verification (gap-closure-critical wiring)
 
-| From | To | Via | Status | Details |
-|------|----|----|--------|---------|
-| main.rs | ignition-tui::run | Tui dispatch arm | ✓ WIRED | main.rs:1641-1655 |
-| main.rs | stdout | TTY pre-check | ✓ WIRED | `is_terminal` :1642 → `CoreError::InvalidInput` (usage-class, no panic) |
-| lib.rs | terminal lifecycle | init/restore pair | ✓ WIRED | :59/:61 |
-| update.rs | nothing async | purity | ✓ WIRED | sync fn; awaits only inside `spawn_action` async blocks |
-| actions/logs.rs | tokio::spawn-able tail | Send sink | ✓ WIRED | verified |
-| context.rs | ignition_core::config | public fns only | ✓ WIRED | verified |
-| refresh.rs | core actions | free fns over &dyn GatewayApi | ✓ WIRED | inspect + sessions joins |
-| profiles modal | profile switch | use_profile in update | ✓ WIRED | update.rs:531, atomic rebuild-first |
-| state era | worker results | stale-era drop | ✓ WIRED | `is_current` gate + tests |
-| tail.rs | AppEvent channel | send(LogLine) | ✓ WIRED | tail.rs:43 |
-| logs screen exit | tail worker | watch shutdown | ✓ WIRED | set_screen → stop_tail (update.rs:450) |
-| alarms.rs → ack | tags_alarms_ack | username modal → worker | ✓ WIRED | update.rs:2448 |
-| ring → display | render-side level filter | VecDeque | ✓ WIRED | logs.rs:82 |
-| watch.rs | tag values | interval tags_read over watched set | ✓ WIRED | 2s period, generation restart |
-| tags.rs | browse action | one-shot worker | ✓ WIRED | spawn_action armed |
-| ops.rs | core actions | projects/resources/webdev fns | ✓ WIRED | 11 verbs + webdev deploy/status |
-| gated verbs | Confirm modal | accept ≡ --yes before spawn | ✓ WIRED | exhaustive `gated_cli_verb` + parity test |
-| tui_coverage.rs | clap tree | CommandFactory walk | ✓ WIRED | `Cli::command()` |
-| tui_coverage.rs | routes registry | bidirectional equality | ✓ WIRED | **test passes** |
-| rig logs pane | compose stream | run_streaming sink → ring | ✓ WIRED | rig_stream.rs, own 10k ring |
+| From | To | Via | Status |
+|------|----|----|--------|
+| metrics.rs f64 wire | exponent JSON | serde decode + fixture | ✓ WIRED — test passing |
+| classify.rs 409 arm | CoreError exit-6 slug | route-scoped guard | ✓ WIRED — wiremock pair passing |
+| main.rs TTY raise | tui_tty_refusal hint | constructor + const | ✓ WIRED — golden passing |
+| resources.rs member_path | zip import | `<X>/resources/<X>` shape | ✓ WIRED — 3 structure pins passing |
+| tags_keys 'r' | refire_tags_current_level | deepest-first helper | ✓ WIRED |
+| set_screen/profile re-entry | same helper | invalidation on entry | ✓ WIRED (:487, :591) |
+| ActionDone "tags write" | detail read refire | last_write_path match+consume | ✓ WIRED — tests passing |
+| ui/mod.rs modal_height | frame area | clamp(5, frame-2) | ✓ WIRED |
+| menu_nav | 6 modal handlers | j/k/g/G | ✓ WIRED |
+| state.rs prose labels | update.rs executor arms | identical strings both sides | ✓ WIRED — coverage 3/3 |
+| state.rs PROJECT_ACTIONS .verb | update dispatch (:1864) | decoupled dispatch key | ✓ WIRED — parity tests green |
+| rig.rs summary_lines | render_summary | sectioned layout + width | ✓ WIRED — render tests passing |
+| README | shipped keys | keymap bullets | ✓ WIRED — verified against code |
+
+### Dynamic Evidence (executed during this verification)
+
+- `cargo test --workspace --features tui` → **38 suites, ~721 tests, 0 failures** (698 at initial verification + gap-closure tests)
+- Gap tests by name: exponent fixture 1/1, designer-prune 2/2, TTY golden 1/1, root-level 3/3, tags refresh+write 12/12 (filtered)
+- `cargo test -p ignition-cli --features tui --test tui_coverage` → **3/3** (prose-label change did not break clap parity)
+- Gated-verb parity → **8+1 passing** (confirm gating unchanged through the menu regroup)
+- `cargo fmt --all --check` → clean; `cargo clippy --workspace --features tui --all-targets -- -D warnings` → clean
 
 ### Requirements Coverage
 
 | Requirement | Status | Blocking Issue |
 |-------------|--------|----------------|
-| TUI-01 — cockpit exposing every CLI action, list→detail nav | ✓ SATISFIED | Coverage machine-enforced by passing CI test |
-| TUI-02 — live dashboard w/ periodic refresh | ✓ SATISFIED | 5s worker, per-panel degrade |
-| TUI-03 — tail logs with level filtering | ✓ SATISFIED | Ring + filter + non-blocking rail |
-| TUI-04 — browse tags + live watch | ✓ SATISFIED | 2s watched-set poll |
-| TUI-05 — view + ack alarms | ✓ SATISFIED | Username-required modal, prefix expansion |
-| TUI-06 — projects/resources browse + profile switch | ✓ SATISFIED | Drill-down + 'p' modal + era re-targeting |
+| TUI-01 — cockpit exposing every CLI action | ✓ SATISFIED | coverage test green post-refactor |
+| TUI-02 — live dashboard w/ refresh | ✓ SATISFIED | + 8.3.3 metrics fix (gap 1) |
+| TUI-03 — tail logs w/ filtering | ✓ SATISFIED | regression-clean |
+| TUI-04 — browse tags + live watch | ✓ SATISFIED | + 'r' refresh + write-refire (gaps 5-6) |
+| TUI-05 — view + ack alarms | ✓ SATISFIED | regression-clean (ack loop itself UAT-skipped — no alarm fixture on rig; mechanics test-pinned) |
+| TUI-06 — projects/resources browse + profile switch | ✓ SATISFIED | + root-level put (gap 4) + grouped menu (gap 12) |
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| — | — | none | — | Zero TODO/FIXME/XXX/HACK/placeholder/unimplemented hits across all 19 TUI source files + coverage test |
+| — | — | none | — | Zero TODO/FIXME/XXX/HACK/unimplemented!/todo! across all TUI sources + the 4 touched core client/error files |
 
-The two "placeholder" string hits in `ui/mod.rs` are a historical doc comment and a chrome test name (`chrome_renders_tab_bar_and_placeholder_pane`, the 06-01-era design) — the live render path dispatches real screens only.
+### UAT Skips & Backlog (not gaps — explicitly owned)
 
-### Dynamic Evidence (executed during verification)
-
-- `cargo test -p ignition-cli --features tui --test tui_coverage` → **3/3 passed** (the SC1 structural proof)
-- `cargo test -p ignition-tui` → **172/172 passed**
-- `cargo test --workspace --features tui` → **698 passed, 0 failed across 38 suites** (matches STATE.md claim exactly)
-- `cargo fmt --all --check` → clean; `cargo clippy --workspace --features tui --all-targets -- -D warnings` → clean
+- UAT tests 6 (session terminate) and 9 (alarms ack) were **skipped by user choice** — no fixture achievable on the rig; mechanics verified via honest-error paths and remain test-pinned
+- UX feedback themes (monochrome color, richer editor experience) triaged as **backlog** per UAT triage — out of gap-closure scope by design
 
 ### Human Verification Required
 
-Per project config (`human_verify_mode: end-of-phase`), the interactive/visual layer routes to the dedicated `/gsd-verify-work 6` step that follows. Items for that pass:
+The UAT cycle already provided the human pass for the original build. The gap closures warrant a short human re-confirm of the formerly-failing scenarios (routed to the configured end-of-phase `/gsd-verify-work 6` step):
 
-### 1. Cockpit opens and navigates against a live gateway
-**Test:** Run `ign tui` against the research rig; Tab/Shift+Tab through all six screens; open list → detail on each.
-**Expected:** Fluid rendering, no flicker or frozen input, details populate.
-**Why human:** Visual feel and live-data interactivity.
+### 1. Former UAT failures now pass in the cockpit
+**Test:** Against the live 8.3.3 rig: watch the metrics panel populate; on Tags, earn an error then press `r`; put a root-level file via the Projects screen; open any Actions menu; view the Rig summary.
+**Expected:** Metrics render (no internal error); stale error visibly reloads; root-level put lands; "Enter to run · Esc to cancel" footer fully visible at any terminal size; rig summary reads as grouped sections.
+**Why human:** Visual rendering, live-gateway behavior, terminal-size feel.
 
-### 2. Non-blocking I/O under load
-**Test:** With the Logs screen tailing and the dashboard refreshing, rapidly switch screens and type.
-**Expected:** Input stays responsive while entries stream.
-**Why human:** Real-time behavior under streaming load.
-
-### 3. Profile switch re-targets live
-**Test:** Press `p`, switch to a second profile with a different gateway.
-**Expected:** Dashboard re-populates from the new gateway; stale-era results never flash.
-**Why human:** Live cross-gateway behavior.
-
-### 4. Alarm ack round-trip
-**Test:** Open Alarms, ack an active alarm with a username.
-**Expected:** Row clears / re-poll reflects the ack; 3-arg wire form honored.
-**Why human:** End-to-end state change on a live gateway.
+### 2. Vim motions feel right in modals
+**Test:** j/k/g/G in menus; j/k + Ctrl-d/Ctrl-u in a long Result modal.
+**Expected:** Selection/scroll moves as on the screens; arrows/PgUp/PgDn unchanged.
+**Why human:** Key-feel and scroll behavior across modal kinds.
 
 ### Gaps Summary
 
-None. Every observable truth has hard programmatic evidence: the structural-completeness claim (SC1) is machine-enforced by a passing CI test that walks the compiled clap tree, all six screens render real content behind a non-blocking worker rail, and the full workspace suite (698 tests) plus fmt/clippy gates are green. The phase's remaining uncertainty is confined to visual/live feel, which the project's configured end-of-phase UAT step owns.
+None. All 13 UAT gaps are closed with real, wired, test-pinned code — verified at all three levels (exists, substantive, wired) with dynamic evidence (38 green suites, ~721 tests, fmt/clippy clean, coverage + parity tripwires green). The structural-completeness guarantee survived the label refactor because routes.rs kept clap-exact rows while display labels went prose — the exact design the coverage test enforces. Remaining uncertainty is confined to visual/live feel of the closed gaps, owned by the end-of-phase UAT step.
 
 ---
 
-_Verified: 2026-08-28T00:45:00Z_
+_Verified: 2026-08-28T07:15:00Z_
 _Verifier: Claude (gsd-verifier)_
