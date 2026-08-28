@@ -24,6 +24,16 @@ use ignition_core::actions::tags::{BrowseRow, TagProviderRow, TagReadRow};
 
 use crate::state::{AppState, DetailRead};
 
+/// The error panes' recovery hint (06-09): `r` re-fires the deepest
+/// visible read, so an honestly-earned stale error (the UAT's
+/// trial-reset 402) always names its one-key way out.
+fn refresh_hint() -> Line<'static> {
+    Line::from(Span::styled(
+        "press r to refresh",
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+}
+
 /// Render the tags body: the browser pane, the live-watch pane (only
 /// while a set is watched — the pane IS the set's visibility), and
 /// the one-row status line.
@@ -105,6 +115,7 @@ fn render_providers(state: &AppState, frame: &mut Frame, area: Rect) {
                             .take(inner.width as usize - 1)
                             .collect::<String>(),
                     ),
+                    refresh_hint(),
                 ]),
                 inner,
             );
@@ -180,6 +191,7 @@ fn render_tree(state: &AppState, frame: &mut Frame, area: Rect) {
                             .take(inner.width as usize - 1)
                             .collect::<String>(),
                     ),
+                    refresh_hint(),
                 ]),
                 inner,
             );
@@ -245,6 +257,7 @@ fn render_detail(state: &AppState, frame: &mut Frame, area: Rect) {
                     .take(inner.width as usize - 1)
                     .collect::<String>(),
             ));
+            lines.push(refresh_hint());
         }
         DetailRead::Loaded(row) => {
             lines.push(Line::from(format!("value   {}", row.value)));
@@ -444,6 +457,25 @@ mod tests {
         let text = rows.join("\n");
         assert!(text.contains("provider load error"), "banner: {text}");
         assert!(text.contains("routes_not_deployed"), "detail: {text}");
+        assert!(text.contains("press r to refresh"), "recovery hint: {text}");
+    }
+
+    /// A browse-level error pane renders the recovery hint (06-09) —
+    /// the stale-402 pane names its one-key way out.
+    #[test]
+    fn browse_error_pane_hints_the_refresh_key() {
+        let mut state = AppState::new();
+        state.tags.stack.push(BrowseLevel {
+            path: "[default]".into(),
+            entries: None,
+            error: Some("the WebDev module is unlicensed (HTTP 402)".into()),
+            selected: None,
+        });
+        let rows = rendered(&state);
+        let text = rows.join("\n");
+        assert!(text.contains("browse error"), "error banner: {text}");
+        assert!(text.contains("(HTTP 402)"), "error detail: {text}");
+        assert!(text.contains("press r to refresh"), "recovery hint: {text}");
     }
 
     /// THE known-fullPath row proof: a seeded tree level renders its
@@ -540,6 +572,7 @@ mod tests {
         let text = rows.join("\n");
         assert!(text.contains("read error"), "error banner: {text}");
         assert!(text.contains("routes_not_deployed"), "error detail: {text}");
+        assert!(text.contains("press r to refresh"), "recovery hint: {text}");
     }
 
     // ---- live watch (06-04 Task 2) ----
