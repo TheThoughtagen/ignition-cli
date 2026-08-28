@@ -1635,17 +1635,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         }
         #[cfg(feature = "tui")]
         // TTY guard BEFORE anything: ratatui::init panics on non-terminal
-        // stdout (Pitfall 10) — refuse usage-class instead. The cockpit
+        // stdout (Pitfall 10) — refuse usage-class instead (06-07: the
+        // constructor pairs the reason with its terminal-contextual hint,
+        // not the --file/stdin resource-put default). The cockpit
         // itself (loop, lifecycle, restore) lives in ignition-tui; this
         // arm stays thin (choke-file discipline).
         Commands::Tui => {
             if !std::io::stdout().is_terminal() {
-                return (
-                    None,
-                    Err(CoreError::InvalidInput {
-                        reason: "ign tui requires a terminal (stdout is not a TTY)".to_string(),
-                    }),
-                );
+                return (None, Err(CoreError::tui_tty_refusal()));
             }
             match ignition_tui::run(cli.profile.clone()).await {
                 Ok(()) => (None, Ok(ActionOutput::TuiExited)),

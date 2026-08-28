@@ -146,3 +146,51 @@ fn completions_ignore_json_flag() {
         .stdout(contains("_ign"))
         .stdout(contains("complete -F _ign"));
 }
+
+// ---------------------------------------------------------------------------
+// TUI TTY refusal (06-07, 06-UAT test 2)
+// ---------------------------------------------------------------------------
+
+/// `ign tui` under a pipe (assert_cmd's captured stdout IS the pipe —
+/// the exact `ign tui | cat` condition): usage-class exit 2 with the
+/// frozen invalid_input slug, the INTERACTIVE-TERMINAL hint (not the
+/// --file/stdin resource-put default), and zero alt-screen escapes on
+/// stdout (the guard fires before ratatui::init).
+#[test]
+fn tui_under_a_pipe_refuses_with_the_interactive_terminal_hint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    // A resolvable one-profile config: profile selection is local-only,
+    // so the guard is reached without any gateway (URL is never called).
+    std::fs::write(
+        &config,
+        "active = \"dev\"\n\n[profiles.dev]\nurl = \"http://127.0.0.1:1\"\nauth = { token_env = \"IGNITION_TOKEN\" }\n",
+    )
+    .expect("write config");
+
+    let out = {
+        let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
+        cmd.env("IGNITION_CLI_CONFIG", &config)
+            .env("IGNITION_TOKEN", "mock:name-key")
+            .args(["--compact", "tui"])
+            .output()
+            .expect("spawn ign")
+    };
+    assert_eq!(out.status.code(), Some(2), "usage class");
+    assert!(
+        out.stdout.is_empty(),
+        "no alt-screen escapes, no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // stderr envelope from the first '{' (log-tolerant chassis pattern),
+    // trailing newline trimmed (str! goldens are newline-normalized).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let start = stderr.find('{').expect("envelope on stderr");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr[start..].trim_end().to_string(),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"invalid_input","message":"invalid input: ign tui requires a terminal (stdout is not a TTY)","endpoint":null,"hint":"run `ign tui` in an interactive terminal (the cockpit needs a TTY on stdout — not a pipe or redirect)"}}
+"#]],
+    );
+}

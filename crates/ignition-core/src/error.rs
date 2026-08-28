@@ -20,6 +20,15 @@
 
 use serde::Serialize;
 
+/// The `ign tui` TTY-refusal reason (06-07). The InvalidInput hint is
+/// content-addressed off this exact string: the frozen taxonomy keeps
+/// ONE usage-input variant (no hint field, no new variant), but the
+/// TTY refusal's fix is terminal-related, not `--file`/stdin —
+/// [`CoreError::hint`] special-cases this one reason while every other
+/// raise site keeps the resource-put default. Construct via
+/// [`CoreError::tui_tty_refusal`] so the reason/hint pair cannot drift.
+pub const TUI_TTY_REFUSAL_REASON: &str = "ign tui requires a terminal (stdout is not a TTY)";
+
 /// Every failure `ign` can report. One variant per contract class; `code()`,
 /// `exit_code()`, `hint()` are total functions over it.
 #[derive(Debug, thiserror::Error)]
@@ -415,10 +424,18 @@ impl CoreError {
                    text above is the gateway's own; `ign project export` of the \
                    current state is the honest baseline for hand-editing ({problem})"
             )),
-            Self::InvalidInput { .. } => Some(
-                "fix the input source — a readable file path via --file, or `-` \
-                   to pipe the content on stdin"
-                    .to_string(),
+            Self::InvalidInput { reason } => Some(
+                if reason == TUI_TTY_REFUSAL_REASON {
+                    // The ONE contextual InvalidInput hint (06-07): the
+                    // TTY refusal's fix is terminal-related — the
+                    // --file/stdin default is meaningless for a pipe.
+                    "run `ign tui` in an interactive terminal (the cockpit \
+                     needs a TTY on stdout — not a pipe or redirect)"
+                } else {
+                    "fix the input source — a readable file path via --file, or `-` \
+                     to pipe the content on stdin"
+                }
+                .to_string(),
             ),
             Self::ProfileNotFound { known, .. } => Some(if known.is_empty() {
                 "no profiles configured yet; run `ign profile add` to create \
@@ -589,6 +606,16 @@ impl CoreError {
             | Self::SessionNotPrunable { endpoint, .. }
             | Self::ImportDenied { endpoint, .. } => endpoint.clone(),
             _ => None,
+        }
+    }
+
+    /// The `ign tui` TTY refusal (06-07): InvalidInput carrying the
+    /// ONE reason whose hint is terminal-contextual — see
+    /// [`TUI_TTY_REFUSAL_REASON`]. Same slug, same exit 2 (frozen
+    /// taxonomy; only the hint differs).
+    pub fn tui_tty_refusal() -> Self {
+        Self::InvalidInput {
+            reason: TUI_TTY_REFUSAL_REASON.to_string(),
         }
     }
 
@@ -992,6 +1019,31 @@ mod tests {
         assert!(
             hint.contains("stale entries"),
             "prune hint must name stale-only semantics: {hint}"
+        );
+
+        // The TTY refusal's hint is contextual (06-07): the ONE
+        // InvalidInput reason whose fix is terminal-related. Every
+        // other reason keeps the --file/stdin resource-put hint (pinned
+        // here so the special case can never leak or regress).
+        let tty = CoreError::tui_tty_refusal();
+        assert_eq!(tty.code(), "invalid_input", "slug unchanged");
+        assert_eq!(tty.exit_code(), 2, "usage class unchanged");
+        let hint = tty.hint().expect("hint required");
+        assert!(
+            hint.contains("interactive terminal"),
+            "TTY hint must name the fix: {hint}"
+        );
+        assert!(
+            !hint.contains("--file"),
+            "TTY hint must not carry the resource-put hint: {hint}"
+        );
+        let put = CoreError::InvalidInput {
+            reason: "cannot read put.json".into(),
+        };
+        let hint = put.hint().expect("hint required");
+        assert!(
+            hint.contains("--file") && hint.contains("stdin"),
+            "resource-put hint unchanged: {hint}"
         );
 
         // Totality: no class silently loses its hint later.
