@@ -9,13 +9,13 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 
 ## Current Position
 
-**Phase:** 6 of 7 (TUI Cockpit)
-**Current Plan:** 6
-**Total Plans in Phase:** 6
-**Status:** Phase complete — ready for verification
+**Phase:** 6 of 7 (TUI Cockpit — gap closure)
+**Current Plan:** 09 complete (06-09-SUMMARY.md); outstanding: 07, 08, 10, 11
+**Total Plans in Phase:** 11 (6 original + 5 gap-closure from 06-UAT)
+**Status:** Gap closure in progress — 1 of 5 gap plans complete
 **Last Activity:** 2026-08-28
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 89%
 
 ## Performance Metrics
 
@@ -56,6 +56,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P04 | 12min | 3 tasks | 8 files |
 | Phase 06 P05 | 29min | 3 tasks tasks | 8 files files |
 | Phase 06 P06 | 28min | 3 tasks | 17 files |
+| Phase 06 P09 | ~15min (6min code + 9min continuation verify) | 3 tasks tasks | 3 files files |
 
 ## Accumulated Context
 
@@ -167,6 +168,8 @@ Recent decisions affecting current work:
 - [Phase 06]: Structural coverage proof — tui_coverage.rs walks the live clap tree (CommandFactory) and asserts bidirectional equality with routes(); a future CLI command without a TUI mapping FAILS CI (Phase 7's script run must land its surface in the same plan)
 - [Phase 06]: ignition-cli gained a lib target (pub mod cli) so tests import the command tree in-process; dispatch/render stay binary-only (choke-file discipline preserved)
 - [Phase 06]: rig credentials are env-only in the cockpit (IGNITION_TOKEN / IGNITION_USER + IGNITION_PASSWORD, no --user form); the rig logs pane clears its ring per stream (compose tail has no since-resume); confirm parity exact — reset/restore/trial-reset gated, down deliberately ungated
+- [Phase 06]: [Phase 06-09]: Tags freshness = deepest-visible refire — ONE helper (refire_tags_current_level) serves 'r', set_screen(Tags) re-entry, AND profile-switch re-entry; refire order detail > top stack browse > providers, and each level's error clears AS THE REFIRE ARMS so a stale 402 visibly reloads — one invalidation convention for all three entry points beats three ad-hoc paths; error-clear-on-arm makes recovery visible immediately
+- [Phase 06]: [Phase 06-09]: Write→read-back trigger — TagsData.last_write_path armed at the write-form ACCEPT site (ActionDone carries only the label), consumed on ANY landing; only SUCCESS + matching open-detail path refires the read under a fresh seq (alarms-ack pattern's twin); watch table deliberately not nudged (2s poll owns it); workers/watch.rs untouched — existing spawn seams were the whole refire surface — armed-target-consume-on-landing prevents a stale target refiring an unrelated write's pane; failed writes keep the displayed value (still the truth)
 
 ### Pending Todos
 
@@ -183,6 +186,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T00:08:37.425Z
-**Stopped At:** Completed 06-06-PLAN.md — Phase 6 complete (all 6 plans), ready for verification
+**Last session:** 2026-08-28T10:42:15.434Z
+**Stopped At:** Completed 06-09-PLAN.md (Tags freshness gap closure — continuation session: verified 3 pre-existing task commits, all gates green, SUMMARY + state updated; 07/08/10/11 outstanding)
 **Resume file:** None
