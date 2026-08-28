@@ -333,6 +333,68 @@ async fn vision_terminate_and_designer_prune_hit_singular_paths() {
     }
 }
 
+/// Pruning a LIVE Designer session (06-UAT test 6, wire-verified on
+/// 8.3.3): the prune DELETE answers 409 with an EMPTY body → the
+/// additive target-state slug `session_not_prunable` (exit 6) with the
+/// close-the-Designer hint — not the old exit-1 Internal.
+#[tokio::test]
+async fn designer_prune_live_session_409_is_session_not_prunable() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path("/data/api/v1/designer/d-live-1"))
+        // No body set — the wire capture is 409 with an empty body.
+        .respond_with(wiremock::ResponseTemplate::new(409))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api
+        .prune_designer("d-live-1")
+        .await
+        .expect_err("409 on a live designer must fail");
+    match &err {
+        CoreError::SessionNotPrunable { id, endpoint } => {
+            assert_eq!(id, "d-live-1", "the refused id rides the error");
+            assert_eq!(
+                endpoint.as_deref(),
+                Some(format!("{}/data/api/v1/designer/d-live-1", server.uri()).as_str()),
+                "endpoint names the refused DELETE"
+            );
+        }
+        other => panic!("wrong class: {other}"),
+    }
+    assert_eq!(err.exit_code(), 6, "target-state class");
+    assert_eq!(err.code(), "session_not_prunable");
+    let hint = err.hint().expect("hint required");
+    assert!(
+        hint.contains("close the Designer"),
+        "hint names the action: {hint}"
+    );
+}
+
+/// Route-scoping proof: a 409 on any route OUTSIDE the singular
+/// designer-prune path keeps the Internal fallback (exit 1) — the
+/// mapping above is scoped, not a blanket 409 arm.
+#[tokio::test]
+async fn conflict_409_off_the_prune_route_stays_internal() {
+    let mock = IgnitionMock::start().await;
+    // The PLURAL list path — one character away from the prune route.
+    mock.html_error("GET", DESIGNERS_PATH, 409).await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let err = api
+        .designers(&Default::default())
+        .await
+        .expect_err("409 must fail");
+    assert!(
+        matches!(&err, CoreError::Internal { .. }),
+        "off-route 409 keeps Internal: {err}"
+    );
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.code(), "internal");
+}
+
 /// Terminating a nonexistent VISION id → 404 → NotFound (exit 6) — the
 /// same class as the Perspective route (one taxonomy, no additions).
 #[tokio::test]

@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -302,6 +302,22 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// Pruning a LIVE Designer session entry — the gateway's prune
+    /// route answers 409 (empty body, wire-verified on 8.3.3,
+    /// 06-UAT test 6): prune removes STALE entries only, so the
+    /// command is invalid while the Designer is still open. Exit 6 —
+    /// target state (additive slug in the frozen taxonomy's
+    /// established growth pattern; classify()'s ROUTE-SCOPED 409 arm
+    /// constructs this — the first classify-constructed refusal added
+    /// since the 02-01 set).
+    #[error("designer session {id} is live — the gateway refused the prune")]
+    SessionNotPrunable {
+        /// The Designer session id that was refused.
+        id: String,
+        /// URL of the refused DELETE, when known.
+        endpoint: Option<String>,
+    },
+
     /// Docker/compose rig failure. Exit 7. Reserved — first used in Phase 4;
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
@@ -337,6 +353,7 @@ impl CoreError {
             Self::WebdevRouteError { .. } => "webdev_route_error",
             Self::TagCollision { .. } => "tag_collision",
             Self::AlarmJournalMissing { .. } => "alarm_journal_missing",
+            Self::SessionNotPrunable { .. } => "session_not_prunable",
             Self::Rig(_) => "rig_error",
         }
     }
@@ -368,6 +385,7 @@ impl CoreError {
             | Self::WebdevRouteError { .. }
             | Self::TagCollision { .. }
             | Self::AlarmJournalMissing { .. }
+            | Self::SessionNotPrunable { .. }
             | Self::ImportDenied { .. } => 6,
             Self::Rig(_) => 7,
         }
@@ -524,6 +542,9 @@ impl CoreError {
                   the README 'Alarm history' section"
                     .to_string(),
             ),
+            Self::SessionNotPrunable { .. } => Some(
+                "close the Designer first — prune removes stale entries only".to_string(),
+            ),
             Self::WebdevRouteError { code, .. } => Some(if code == "secret_required" || code == "secret_mismatch" {
                 "the scriptExec route is secret-gated — deploy it with `ign \
                   webdev deploy --with-script-exec` (the secret is generated \
@@ -565,6 +586,7 @@ impl CoreError {
             | Self::WebdevRouteError { endpoint, .. }
             | Self::TagCollision { endpoint, .. }
             | Self::AlarmJournalMissing { endpoint }
+            | Self::SessionNotPrunable { endpoint, .. }
             | Self::ImportDenied { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
@@ -818,6 +840,14 @@ mod tests {
                 6,
                 "import_denied",
             ),
+            (
+                CoreError::SessionNotPrunable {
+                    id: "d-live-1".into(),
+                    endpoint: Some("http://gw:8088/data/api/v1/designer/d-live-1".into()),
+                },
+                6,
+                "session_not_prunable",
+            ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {
@@ -946,6 +976,22 @@ mod tests {
         assert!(
             hint.contains("README"),
             "journal hint points at the README section: {hint}"
+        );
+
+        // The live-designer prune refusal (06-07): the hint names the
+        // action — close the Designer — and the stale-only semantics.
+        let prunable = CoreError::SessionNotPrunable {
+            id: "d-live-1".into(),
+            endpoint: None,
+        };
+        let hint = prunable.hint().expect("hint required");
+        assert!(
+            hint.contains("close the Designer"),
+            "prune hint must name the action: {hint}"
+        );
+        assert!(
+            hint.contains("stale entries"),
+            "prune hint must name stale-only semantics: {hint}"
         );
 
         // Totality: no class silently loses its hint later.

@@ -69,6 +69,26 @@ pub(crate) async fn classify(
         S::NOT_FOUND => Err(CoreError::NotFound {
             endpoint: Some(url.to_string()),
         }),
+        // 409 on the DESIGNER-PRUNE route only — route-scoped via the
+        // URL (the singular prune path `/data/api/v1/designer/{id}` is
+        // distinct from the plural `/designers` list; see
+        // [`is_designer_prune_url`]). A LIVE Designer session answers
+        // the prune DELETE with 409 + empty body (wire-verified 8.3.3,
+        // 06-UAT test 6): prune removes STALE entries only, a
+        // target-state refusal — not an internal error. Every other
+        // route's 409 keeps the Internal fallback below.
+        //
+        // The Perspective terminate 404 ("No valid sessions found to
+        // close" — the id-vs-scope mismatch of a Designer-embedded
+        // session) is deliberately NOT distinguished: classify never
+        // reads bodies outside the Internal fallback, and that 404
+        // body's shape is unverified on the wire (only the openapi
+        // DECLARES the message) — the honest generic `not_found`
+        // stands until a capture proves a distinguishable marker.
+        S::CONFLICT if is_designer_prune_url(url) => Err(CoreError::SessionNotPrunable {
+            id: designer_prune_id(url),
+            endpoint: Some(url.to_string()),
+        }),
         _ => {
             // Unclassifiable: if the body is the Jetty HTML error page,
             // surface its own title/message instead of a bare status.
@@ -91,6 +111,30 @@ pub(crate) async fn classify(
             )))
         }
     }
+}
+
+/// Is `url` the SINGULAR designer-prune route
+/// (`…/data/api/v1/designer/{id}`)? The trailing `/designer/` segment
+/// cannot match the plural `/data/api/v1/designers` list — the `s`
+/// closes the path segment before any slash appears.
+fn is_designer_prune_url(url: &str) -> bool {
+    url.contains("/data/api/v1/designer/")
+}
+
+/// The pruned session id — the path segment after the prune-route
+/// prefix (query-safe: anything from `?` on is not part of the id; the
+/// prune DELETE carries no query params today, this is just honest
+/// plumbing).
+fn designer_prune_id(url: &str) -> String {
+    url.split_once("/data/api/v1/designer/")
+        .map(|(_, tail)| {
+            tail.split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// Extract `(status, message)` from the fixed Jetty error-page template
@@ -123,7 +167,7 @@ fn html_error_parts(body: &str) -> Option<(u16, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::html_error_parts;
+    use super::{designer_prune_id, html_error_parts, is_designer_prune_url};
 
     /// The EXACT Jetty error page captured from the live 8.3.6 gateway
     /// (02-RESEARCH §Code Examples) — the golden fixture for the sniffer.
@@ -169,5 +213,39 @@ mod tests {
         assert_eq!(html_error_parts("<html><body>welcome</body></html>"), None);
         assert_eq!(html_error_parts(""), None);
         assert_eq!(html_error_parts("{\"message\":\"json\"}"), None);
+    }
+
+    /// Route-scoping of the 409 arm (06-07): the SINGULAR prune path
+    /// matches — the plural designers LIST path does not (its `s`
+    /// closes the segment), and neither does any other route.
+    #[test]
+    fn designer_prune_route_detection_is_exact() {
+        assert!(is_designer_prune_url(
+            "http://gw:8088/data/api/v1/designer/d-live-1"
+        ));
+        assert!(
+            !is_designer_prune_url("http://gw:8088/data/api/v1/designers"),
+            "the plural list route must NOT match"
+        );
+        assert!(
+            !is_designer_prune_url("http://gw:8088/data/api/v1/designers?limit=1"),
+            "the list route with query params must NOT match"
+        );
+        assert!(!is_designer_prune_url(
+            "http://gw:8088/data/perspective/api/v1/sessions"
+        ));
+    }
+
+    /// The pruned id rides the trailing path segment (query-safe).
+    #[test]
+    fn designer_prune_id_extracts_the_trailing_segment() {
+        assert_eq!(
+            designer_prune_id("http://gw:8088/data/api/v1/designer/d-live-1"),
+            "d-live-1"
+        );
+        assert_eq!(
+            designer_prune_id("http://gw:8088/data/api/v1/designer/10443A91?x=1"),
+            "10443A91"
+        );
     }
 }
