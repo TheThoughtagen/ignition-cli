@@ -1858,7 +1858,10 @@ fn projects_cli_form(form: &crate::state::ProjectsForm) -> String {
 /// mirrors of main.rs's `require_confirmation` set. Webdev deploy
 /// fires with NO confirm (the 05-03 CLI-owned-project decision).
 fn execute_projects_menu_action(state: &mut AppState, index: usize) {
-    match PROJECT_ACTIONS.get(index).copied() {
+    // The dispatch keys on the entry's VERB (the clap-exact spelling,
+    // test-pinned against the const) — the display label and
+    // description are render-side only (06-10's noun-grouped menu).
+    match PROJECT_ACTIONS.get(index).map(|action| action.verb) {
         Some("new") => open_projects_input(
             state,
             crate::state::ProjectsForm::NewName,
@@ -2220,7 +2223,7 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 });
             }
         }
-        Some("wait gateway") => {
+        Some("wait for gateway up") => {
             if let Some(client) = client_arc(state) {
                 workers::spawn_action(state, "wait gateway", async move {
                     ignition_core::actions::restart::wait_gateway(
@@ -2232,7 +2235,7 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 });
             }
         }
-        Some("wait restart") => {
+        Some("wait for restart complete") => {
             if let Some(client) = client_arc(state) {
                 workers::spawn_action(state, "wait restart", async move {
                     ignition_core::actions::restart::wait_restart(
@@ -2245,7 +2248,7 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 });
             }
         }
-        Some("wait module") => {
+        Some("wait for module ready") => {
             state.dashboard.pending_input = Some(PendingInput::WaitModule);
             state.open_modal(Modal::Input {
                 title: "module id".to_string(),
@@ -3370,6 +3373,41 @@ mod tests {
         update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
         update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(state.dashboard.in_flight, Some("version"));
+    }
+
+    /// The display-prose wait labels (06-10) match their executor
+    /// arms on BOTH sides: Enter on "wait for gateway up" /
+    /// "wait for restart complete" spawns the `wait gateway` /
+    /// `wait restart` workers — the menu label is prose, the worker
+    /// label stays the clap-exact verb.
+    #[test]
+    fn actions_menu_prose_wait_labels_reach_their_executor_arms() {
+        // Index 2 = "wait for gateway up".
+        let mut state = state_with_selected_session();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Char('g'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            state.dashboard.in_flight,
+            Some("wait gateway"),
+            "the prose label routes to the wait-gateway worker"
+        );
+
+        // Index 3 = "wait for restart complete".
+        let mut fresh = state_with_selected_session();
+        update(&mut fresh, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        update(&mut fresh, key(KeyCode::Char('g'), KeyModifiers::NONE));
+        for _ in 0..3 {
+            update(&mut fresh, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        update(&mut fresh, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            fresh.dashboard.in_flight,
+            Some("wait restart"),
+            "the prose label routes to the wait-restart worker"
+        );
     }
 
     /// Actions menu: `wait module` prompts for the id; Enter with a

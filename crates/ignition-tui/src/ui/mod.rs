@@ -21,6 +21,41 @@ use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 
 use crate::state::{AppState, Modal, Screen};
 
+/// The Projects actions menu's lines (06-05, regrouped 06-10):
+/// noun-group sections (bold headers, blank-separated — driven by the
+/// entries' `group` field), entries as `▸ label — consequence` with
+/// the description dimmed, and the shared footer hint. Both the
+/// render and the height formula walk THIS builder, so the modal's
+/// geometry always fits its content exactly (descriptions count as
+/// content).
+fn projects_action_lines(selected: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut last_group = "";
+    for (index, action) in crate::state::PROJECT_ACTIONS.iter().enumerate() {
+        if action.group != last_group {
+            if !lines.is_empty() {
+                lines.push(Line::default()); // blank between groups
+            }
+            last_group = action.group;
+            lines.push(Line::from(Span::styled(
+                action.group.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        }
+        let marker = if index == selected { "▸ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{marker}{}", action.label)),
+            Span::styled(
+                format!(" — {}", action.description),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from("Enter to run · Esc to cancel"));
+    lines
+}
+
 /// Render the whole cockpit: top tab bar (every screen, active
 /// highlighted) + the active screen's body + the modal overlay.
 pub fn render(state: &AppState, frame: &mut Frame) {
@@ -76,7 +111,12 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(4),
         Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(4),
         Modal::TagsActions { .. } => crate::state::TAG_ACTIONS.len().saturating_add(4),
-        Modal::ProjectsActions { .. } => crate::state::PROJECT_ACTIONS.len().saturating_add(4),
+        // The noun-grouped menu (06-10): its lines come from the
+        // shared builder so descriptions and headers count as
+        // content, plus the two border rows.
+        Modal::ProjectsActions { selected } => {
+            projects_action_lines(*selected).len().saturating_add(2)
+        }
         Modal::RigActions { .. } => crate::state::RIG_ACTIONS.len().saturating_add(4),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
@@ -208,21 +248,15 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 area,
             );
         }
-        // The Projects screen's menu (06-05): the project, resource,
-        // and webdev family verbs, same shape as the dashboard's
-        // menu.
+        // The Projects screen's menu (06-05, regrouped 06-10): the
+        // noun-grouped render — bold section headers, `label —
+        // consequence` entries with the description dimmed — from the
+        // shared line builder (the height formula walks the same
+        // lines).
         Modal::ProjectsActions { selected } => {
-            let text: Vec<Line> = crate::state::PROJECT_ACTIONS
-                .iter()
-                .enumerate()
-                .map(|(index, action)| {
-                    let marker = if index == *selected { "▸ " } else { "  " };
-                    Line::from(format!("{marker}{action}"))
-                })
-                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
-                .collect();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title("actions")),
+                Paragraph::new(projects_action_lines(*selected))
+                    .block(Block::bordered().title("actions")),
                 area,
             );
         }
@@ -264,8 +298,7 @@ mod tests {
     /// The sized twin of [`rendered_rows`] — the modal-geometry tests
     /// render at deliberate frame sizes (06-10).
     fn rendered_rows_sized(state: &AppState, width: u16, height: u16) -> Vec<String> {
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal.draw(|frame| render(state, frame)).expect("draw");
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -479,9 +512,9 @@ mod tests {
         for verb in [
             "version",
             "connections",
-            "wait gateway",
-            "wait restart",
-            "wait module",
+            "wait for gateway up",
+            "wait for restart complete",
+            "wait for module ready",
             "doctor",
             "restart",
         ] {
@@ -638,8 +671,11 @@ mod tests {
         );
     }
 
-    /// The Projects actions menu (06-05) renders every project/
-    /// resource/webdev verb with the selection marker.
+    /// The Projects actions menu (06-05, regrouped 06-10) renders the
+    /// noun-grouped structure: bold section headers (project /
+    /// resource / webdev), every verb reachable with a human label
+    /// and a dimmed one-line consequence, the selection marker on
+    /// entry 0, and the footer hint.
     #[test]
     fn projects_actions_menu_renders_the_families() {
         let mut state = AppState::new();
@@ -647,24 +683,34 @@ mod tests {
         state.open_modal(Modal::ProjectsActions { selected: 0 });
         let rows = rendered_rows(&state);
         let text = rows.join("\n");
-        for verb in [
-            "new",
-            "copy",
-            "rename",
-            "set",
-            "delete",
-            "import",
-            "export",
-            "resource put",
-            "resource delete",
-            "webdev deploy",
-            "webdev status",
+        for header in ["project", "resource", "webdev"] {
+            assert!(text.contains(header), "section header {header}: {text}");
+        }
+        // Label + consequence pairs — the UAT's "delete vs resource
+        // delete" confusion answered by the sections + descriptions.
+        for entry in [
+            "new — create an empty project",
+            "copy — duplicate under a new name",
+            "rename — change the project's name",
+            "set — change one field (title, …)",
+            "delete — remove the whole project",
+            "import — load a project from a zip",
+            "export — stream the project to a zip",
+            "put — create or replace one file",
+            "delete — remove one file from it",
+            "deploy — publish to the gateway",
+            "status — report the routes",
         ] {
-            assert!(text.contains(verb), "menu lists {verb}: {text}");
+            assert!(text.contains(entry), "menu lists {entry}: {text}");
         }
         assert!(
             rows.iter().any(|row| row.contains("▸ new")),
             "selection marker on entry 0"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Enter to run · Esc to cancel")),
+            "the footer hint renders fully (the grouped geometry): {text}"
         );
     }
 

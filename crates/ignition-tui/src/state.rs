@@ -332,13 +332,17 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 
 /// The dashboard actions menu entries, in menu order — the LOCKED list
 /// of global verbs the dashboard hosts (update's executor and the modal
-/// renderer both key off this order).
+/// renderer both key off this order). The wait labels are display
+/// prose (06-10: "wait restart" scanned like a restart variant); the
+/// route rows in [`crate::routes`] and the worker labels carry the
+/// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
+/// worker).
 pub const ACTIONS: [&str; 7] = [
     "version",
     "connections",
-    "wait gateway",
-    "wait restart",
-    "wait module",
+    "wait for gateway up",
+    "wait for restart complete",
+    "wait for module ready",
     "doctor",
     "restart",
 ];
@@ -369,25 +373,101 @@ pub const TAG_ACTIONS: [&str; 13] = [
     "history query",
 ];
 
-/// The Projects screen's actions menu entries (06-05) — the project
-/// family (CLI spellings: new/copy/rename/set/delete/import/export),
-/// the resource family's guarded verbs (put/delete — list/get live on
-/// the navigation itself), and the webdev family (deploy is
-/// deliberately UNGUARDED — the ign-cli project is CLI-owned, the
-/// 05-03 decision). Labels are display side; the route rows in
-/// [`crate::routes`] carry the clap-exact spellings.
-pub const PROJECT_ACTIONS: [&str; 11] = [
-    "new",
-    "copy",
-    "rename",
-    "set",
-    "delete",
-    "import",
-    "export",
-    "resource put",
-    "resource delete",
-    "webdev deploy",
-    "webdev status",
+/// One Projects-screen actions-menu entry (06-05, regrouped 06-10):
+/// the noun group it renders under (a section header), the executor
+/// dispatch verb (the arm key — identical on both sides, the
+/// clap-exact spelling), a human display label, and a one-line
+/// consequence description (rendered dimmed after the label).
+pub struct ProjectAction {
+    /// Section header this entry renders under ("project" /
+    /// "resource" / "webdev").
+    pub group: &'static str,
+    /// The dispatch key — must match update's executor arm exactly.
+    pub verb: &'static str,
+    /// Human display label.
+    pub label: &'static str,
+    /// One-line consequence description.
+    pub description: &'static str,
+}
+
+/// The Projects screen's actions menu (06-05, regrouped 06-10) —
+/// noun-grouped (project / resource / webdev) with human labels and
+/// consequence descriptions, answering the UAT's "delete vs resource
+/// delete" confusion: the section carries the scope, the description
+/// carries the consequence. ONE flat index space in group order (the
+/// `group` field drives the rendered section headers — contiguity is
+/// test-pinned); the resource family's guarded verbs (put/delete —
+/// list/get live on the navigation itself), webdev deploy deliberately
+/// UNGUARDED (the ign-cli project is CLI-owned, the 05-03 decision).
+/// The verb keys are the clap-exact spellings; the route rows in
+/// [`crate::routes`] stay untouched.
+pub const PROJECT_ACTIONS: [ProjectAction; 11] = [
+    ProjectAction {
+        group: "project",
+        verb: "new",
+        label: "new",
+        description: "create an empty project",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "copy",
+        label: "copy",
+        description: "duplicate under a new name",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "rename",
+        label: "rename",
+        description: "change the project's name",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "set",
+        label: "set",
+        description: "change one field (title, …)",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "delete",
+        label: "delete",
+        description: "remove the whole project",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "import",
+        label: "import",
+        description: "load a project from a zip",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "export",
+        label: "export",
+        description: "stream the project to a zip",
+    },
+    ProjectAction {
+        group: "resource",
+        verb: "resource put",
+        label: "put",
+        description: "create or replace one file",
+    },
+    ProjectAction {
+        group: "resource",
+        verb: "resource delete",
+        label: "delete",
+        description: "remove one file from it",
+    },
+    ProjectAction {
+        group: "webdev",
+        verb: "webdev deploy",
+        label: "deploy",
+        description: "publish to the gateway",
+    },
+    ProjectAction {
+        group: "webdev",
+        verb: "webdev status",
+        label: "status",
+        description: "report the routes",
+    },
 ];
 
 /// The Rig screen's actions menu entries (06-06) — the FULL
@@ -1088,5 +1168,76 @@ impl AppState {
     pub fn close_modal(&mut self) {
         self.modal = None;
         self.focus = Focus::Normal;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACTIONS, PROJECT_ACTIONS};
+
+    /// The dashboard menu's wait labels are display PROSE (06-10) —
+    /// the executor arms in update.rs match these exact strings, and
+    /// routes.rs carries the clap-exact spellings (never these).
+    #[test]
+    fn dashboard_actions_use_display_prose_wait_labels() {
+        assert_eq!(
+            ACTIONS,
+            [
+                "version",
+                "connections",
+                "wait for gateway up",
+                "wait for restart complete",
+                "wait for module ready",
+                "doctor",
+                "restart",
+            ]
+        );
+    }
+
+    /// The Projects menu's structure contract (06-10): the 11 verbs
+    /// in their LOCKED flat order (the selection index space — the
+    /// update.rs executor arms key off these exact spellings), every
+    /// verb unique, groups contiguous (the render's header detection
+    /// depends on it), and exactly the three noun groups.
+    #[test]
+    fn project_actions_are_grouped_and_ordered() {
+        assert_eq!(
+            PROJECT_ACTIONS.iter().map(|a| a.verb).collect::<Vec<_>>(),
+            [
+                "new",
+                "copy",
+                "rename",
+                "set",
+                "delete",
+                "import",
+                "export",
+                "resource put",
+                "resource delete",
+                "webdev deploy",
+                "webdev status",
+            ]
+        );
+        let mut verbs = PROJECT_ACTIONS.iter().map(|a| a.verb).collect::<Vec<_>>();
+        verbs.sort_unstable();
+        verbs.dedup();
+        assert_eq!(verbs.len(), PROJECT_ACTIONS.len(), "every verb unique");
+
+        let groups: Vec<&str> = {
+            let mut seen: Vec<&str> = Vec::new();
+            for action in &PROJECT_ACTIONS {
+                if seen.last() != Some(&action.group) {
+                    seen.push(action.group);
+                }
+            }
+            seen
+        };
+        assert_eq!(groups, ["project", "resource", "webdev"]);
+        // Contiguity: the collapsed group walk visits exactly 3
+        // groups — a mid-list group change-back would lengthen it.
+        let changes = PROJECT_ACTIONS
+            .windows(2)
+            .filter(|w| w[0].group != w[1].group)
+            .count();
+        assert_eq!(changes, 2, "exactly two group boundaries");
     }
 }
