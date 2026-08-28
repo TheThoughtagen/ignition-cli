@@ -142,7 +142,7 @@ Plans:
   3. User can tail gateway logs with level filtering, without the UI ever blocking on gateway I/O
   4. User can browse tags, live-watch tag values, and view + acknowledge alarms in an alarm panel
   5. User can browse projects/resources and trigger project actions from the TUI
-**Plans**: 6 plans (sequential waves — every plan extends the shared TUI state/update/event/routes core)
+**Plans**: 11 plans (6 sequential waves + 5 UAT gap-closure plans 07–11)
 
 Plans:
 - [x] 06-01-PLAN.md — Foundation: ratatui 0.30.2 + crossterm 0.29 deps, AppEvent select loop, AppState/update (Elm), profile→client context, UI chrome + modal infra, routes scaffold, logs::tail +Send fix, minimal `ign tui` arm
@@ -151,6 +151,11 @@ Plans:
 - [x] 06-04-PLAN.md — Tags screen: provider/tree browse, detail + read, live watch table (2s tags_read poll), write modal, providers/config/export/import actions
 - [x] 06-05-PLAN.md — Projects screen: project list → detail → resource drill-down + project/resource/webdev action menus with CLI confirm-parity
 - [x] 06-06-PLAN.md — Rig screen (status, guarded actions, raw logs pane) + complete routes registry + tui_coverage.rs CI proof (clap tree-walk, bidirectional) + README
+- [ ] 06-07-PLAN.md — Gap closure: 8.3.3 metrics decode (f64 gauges), designer-prune 409 → exit-6 session_not_prunable, contextual ign tui TTY hint
+- [ ] 06-08-PLAN.md — Gap closure: root-level resource put (project-root file member zip surgery, structure-pinned + live-rig round-trip)
+- [ ] 06-09-PLAN.md — Gap closure: Tags freshness — 'r' current-level refresh, write→detail refire trigger, error-pane recovery hints
+- [ ] 06-10-PLAN.md — Gap closure: modal geometry (fit + frame-clamp), vim motions in all modals, prose menu labels + noun-grouped Projects menu
+- [ ] 06-11-PLAN.md — Gap closure: rig status summary readability + README TUI keymap sync
 
 ### Phase 7: Ecosystem Interop & Advanced Ops
 **Goal:** The CLI plugs into the WhiskeyHouse ecosystem and handles the advanced workflows — cross-gateway promotion, backups/EAM, opt-in script execution, and round-trip editing with nvim/ignition-lint/git-module — completing the toolset.
