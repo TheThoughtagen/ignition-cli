@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit — gap closure)
-**Current Plan:** 09 complete (06-09-SUMMARY.md); outstanding: 07, 08, 10, 11
+**Current Plan:** 11
 **Total Plans in Phase:** 11 (6 original + 5 gap-closure from 06-UAT)
-**Status:** Gap closure in progress — 1 of 5 gap plans complete
+**Status:** Ready to execute
 **Last Activity:** 2026-08-28
 
-**Progress:** [█████████░] 89%
+**Progress:** [█████████░] 94%
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P05 | 29min | 3 tasks tasks | 8 files files |
 | Phase 06 P06 | 28min | 3 tasks | 17 files |
 | Phase 06 P09 | ~15min (6min code + 9min continuation verify) | 3 tasks tasks | 3 files files |
+| Phase 06 P07 | 52min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -170,6 +171,9 @@ Recent decisions affecting current work:
 - [Phase 06]: rig credentials are env-only in the cockpit (IGNITION_TOKEN / IGNITION_USER + IGNITION_PASSWORD, no --user form); the rig logs pane clears its ring per stream (compose tail has no since-resume); confirm parity exact — reset/restore/trial-reset gated, down deliberately ungated
 - [Phase 06]: [Phase 06-09]: Tags freshness = deepest-visible refire — ONE helper (refire_tags_current_level) serves 'r', set_screen(Tags) re-entry, AND profile-switch re-entry; refire order detail > top stack browse > providers, and each level's error clears AS THE REFIRE ARMS so a stale 402 visibly reloads — one invalidation convention for all three entry points beats three ad-hoc paths; error-clear-on-arm makes recovery visible immediately
 - [Phase 06]: [Phase 06-09]: Write→read-back trigger — TagsData.last_write_path armed at the write-form ACCEPT site (ActionDone carries only the label), consumed on ANY landing; only SUCCESS + matching open-detail path refires the read under a fresh seq (alarms-ack pattern's twin); watch table deliberately not nudged (2s poll owns it); workers/watch.rs untouched — existing spawn seams were the whole refire surface — armed-target-consume-on-landing prevents a stale target refiring an unrelated write's pane; failed writes keep the displayed value (still the truth)
+- [Phase 06]: [Phase 06-07]: CurrentGauges heap/max are f64 on the wire (8.3.3 serializes Java doubles in exponent form, e.g. 2.85746728E8); serialize_bytes_f64 keeps whole byte counts as JSON integers (2^53 guard) so agent-visible --json output keeps the pre-f64 shape
+- [Phase 06]: [Phase 06-07]: session_not_prunable is an additive exit-6 slug wired through classify()'s ROUTE-SCOPED 409 arm (singular /designer/{id} matches, plural /designers list cannot — off-route wiremock pin); perspective-terminate 404 stays generic not_found (body shape unverified on the wire, skip rationale at the arm)
+- [Phase 06]: [Phase 06-07]: TTY refusal hint is content-addressed — pub TUI_TTY_REFUSAL_REASON const + CoreError::tui_tty_refusal() constructor pair the reason with its interactive-terminal hint; no new variant, no hint field, slug/exit 2 frozen, resource-put --file/stdin hint pinned unchanged both directions
 
 ### Pending Todos
 
@@ -186,6 +190,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T10:42:15.434Z
-**Stopped At:** Completed 06-09-PLAN.md (Tags freshness gap closure — continuation session: verified 3 pre-existing task commits, all gates green, SUMMARY + state updated; 07/08/10/11 outstanding)
+**Last session:** 2026-08-28T11:23:51.365Z
+**Stopped At:** Completed 06-07-PLAN.md (gap closure: f64 gauges, 409 session_not_prunable, TTY hint — 713 tests green)
 **Resume file:** None
