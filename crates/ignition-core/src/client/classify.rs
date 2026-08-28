@@ -59,6 +59,26 @@ pub(crate) async fn classify(
     }
 
     match status {
+        // The EAM controller state gate (07-02, the trial_not_expired
+        // pattern's classify edition): a 403 on a /data/eam/ path
+        // whose body carries the controller message is a STATE
+        // refusal — the token is fine, the module's role is not
+        // (live-proven 8.3.3: every /data/eam/api/v1/* endpoint
+        // answers exactly this). Path-scoped + content-scoped so a
+        // generic under-permitted 403 elsewhere (or on an EAM path
+        // with a different message) keeps the honest Auth mapping.
+        S::FORBIDDEN if is_eam_url(url) => {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("configured as a controller") {
+                return Err(CoreError::EamNotController {
+                    endpoint: Some(url.to_string()),
+                });
+            }
+            Err(CoreError::Auth {
+                status: status.as_u16(),
+                endpoint: Some(url.to_string()),
+            })
+        }
         S::UNAUTHORIZED | S::FORBIDDEN => Err(CoreError::Auth {
             status: status.as_u16(),
             endpoint: Some(url.to_string()),
@@ -111,6 +131,13 @@ pub(crate) async fn classify(
             )))
         }
     }
+}
+
+/// Is `url` on the EAM runtime surface (`/data/eam/`)? The
+/// controller-403 classification is scoped to this prefix — the
+/// module-scoped seam (the designer-prune route scoping precedent).
+fn is_eam_url(url: &str) -> bool {
+    url.contains("/data/eam/")
 }
 
 /// Is `url` the SINGULAR designer-prune route
@@ -167,7 +194,25 @@ fn html_error_parts(body: &str) -> Option<(u16, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{designer_prune_id, html_error_parts, is_designer_prune_url};
+    use super::{designer_prune_id, html_error_parts, is_designer_prune_url, is_eam_url};
+
+    /// The EAM controller-403 scoping (07-02): the runtime prefix
+    /// matches; the config-resource definition paths do NOT (they
+    /// answer normally on stock gateways — definitions are plain
+    /// config resources).
+    #[test]
+    fn eam_url_detection_is_the_runtime_prefix() {
+        assert!(is_eam_url(
+            "http://gw:8088/data/eam/api/v1/eam-tasks/history"
+        ));
+        assert!(is_eam_url(
+            "http://gw:8088/data/eam/api/v1/eam-tasks/force/eam/t1"
+        ));
+        assert!(!is_eam_url(
+            "http://gw:8088/data/api/v1/resources/list/com.inductiveautomation.eam/eam-tasks"
+        ));
+        assert!(!is_eam_url("http://gw:8088/data/api/v1/gateway-info"));
+    }
 
     /// The EXACT Jetty error page captured from the live 8.3.6 gateway
     /// (02-RESEARCH §Code Examples) — the golden fixture for the sniffer.

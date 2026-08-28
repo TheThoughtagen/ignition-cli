@@ -358,7 +358,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 9] = [
+pub const ACTIONS: [&str; 11] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -366,9 +366,12 @@ pub const ACTIONS: [&str; 9] = [
     "wait for module ready",
     "doctor",
     "restart",
-    // 07-02: the standalone backup pair (gateway-level verbs).
+    // 07-02: the standalone backup pair + the EAM read pair
+    // (gateway-level verbs).
     "backup download",
     "backup restore",
+    "eam history",
+    "eam tasks",
 ];
 
 /// The Logs screen's actions menu entries (06-03) — the loggers
@@ -1252,6 +1255,8 @@ mod tests {
                 "restart",
                 "backup download",
                 "backup restore",
+                "eam history",
+                "eam tasks",
             ]
         );
     }

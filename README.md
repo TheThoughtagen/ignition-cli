@@ -33,7 +33,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -174,6 +174,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign rig [--rig NAME] restore --file PATH [--timeout S]` | Restore a gwbk onto the rig's gateway (raw octet-stream POST), wait for the witnessed post-restore RUNNING | **destructive**: exit 2 without `--yes`, BEFORE any discovery; the restore is synchronous and the gateway RESTARTS after — success is a WITNESSED StatusPing→RUNNING (deadline floored at 300 s), never a bare 2xx; data always carries the token-clobber warning (`API tokens may have been reset by restore…`, see §rig snapshot/restore); requires `IGNITION_TOKEN` |
 | `ign backup download [-o FILE] [--type roaming\|all]` | Download a gwbk from ANY profiled gateway (streamed to disk — the standalone sibling of `rig snapshot`'s gwbk leg) | `--type roaming` (default) = the portable backup; `all` includes gateway-specific state; default filename from `Content-Disposition`, else `<profile>-backup.gwbk`; read, unguarded; JSON data `{file, type}` |
 | `ign backup restore <FILE> --yes` | Restore a gwbk onto THIS gateway (the ACTIVE profile's — `rig restore`'s standalone sibling without the rig wait) | **destructive — the 8th `--yes`-guarded verb**: exit 2 (`confirmation_required`, profile null, ZERO network) without `--yes`; REPLACES this gateway's state, then the gateway restarts and blocks for minutes (the 2xx is acceptance — see §Backups); a nonexistent/empty/non-regular file exits 2 `invalid_input` pre-network; JSON data `{restored: true}` |
+| `ign eam history [--limit N] [--search TEXT]` | EAM task run history — `ISO  taskName  [level]  target  detail` rows (newest first) | rides the RUNTIME seam: a stock (non-controller) gateway refuses exit 6 `eam_not_controller` with the manual-flip hint (definitions still list — see below); `--limit` defaults to 200 and is ALWAYS sent explicitly (the server default is unlimited); outcomes are DATA (`Failed` + GNET-not-connected detail read exit 0); JSON data `{items, count}` — items passthrough under the gateway's own camelCase keys (`taskName`, `taskStart` epoch-ms, `taskType`) |
+| `ign eam tasks [NAME]` | Task definitions: bare form lists (`name  type  schedule  state`); with a name shows the full definition + its scheduled state | rides the config-resource seam (`com.inductiveautomation.eam/eam-tasks`) — definitions answer on STOCK gateways (no controller needed); JSON list data `{tasks: [{name, task_type, schedule_mode, current_state}]}` (all keys always; `current_state` null on list records — find answers carry it); detail data `{name, definition, state}`; an unknown name exits 6 `not_found` |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -520,6 +522,49 @@ machinery:
 
 The trial clock is NOT captured by a gwbk (see the rig snapshot
 exclusions — same mechanics).
+
+## EAM tasks (`ign eam`)
+
+The Enterprise Administration Module's task surface — the read-heavy
+family with guarded writes (create/force arrive with `eam task …`).
+
+**The controller state gate.** On a stock gateway the EAM module is
+installed but its `module-settings` singleton carries
+`installMode: "NotInstalled"` — every RUNTIME endpoint
+(`/data/eam/api/v1/*`) answers 403 with "This operation can only be
+performed when EAM is configured as a controller." That is a STATE
+refusal, not an auth failure: the CLI classifies it to
+`eam_not_controller` (exit 6) with the manual-flip hint, never a
+misleading `auth_rejected`. **Definitions are different**: they are
+plain config resources
+(`resources/com.inductiveautomation.eam/eam-tasks`) and answer on
+stock gateways — `ign eam tasks` works everywhere; `ign eam history`
+needs the controller.
+
+**The manual flip (deliberately NOT a CLI verb — a gateway-ROLE
+decision):** config-resource PUT on
+`com.inductiveautomation.eam/module-settings` with
+`installMode: "Controller"`, array body carrying the current record's
+`signature` (find it first: `GET …/resources/find/
+com.inductiveautomation.eam/module-settings`). Live-proven during
+07-RESEARCH; the CLI surfaces the state and refuses honestly instead
+of automating the role change.
+
+**Execution honesty (research Pitfall 3).** Even on a controller,
+task EXECUTION needs (1) a Gateway-Network-connected agent target
+(even `_controller` self-targets fail with "Gateway network for
+agent … not connected" until GNET is configured) and (2) a live
+trial/license ("Trial timer is expired" blocks runs). These outcomes
+surface as DATA in history rows (`level: Failed` + the gateway's own
+`detail` text) — exit 0 reads, never hidden.
+
+**Deferred reads:** the `scheduled`/`retry` list views and the
+`suspend`/`resume`/`cancel` verbs are v1 backlog (each verb carries
+TUI + golden + README cost; history + definitions are the MVP read
+surface). The EAM archive store (`storage/archived-backups` — a
+controller's fleet-backup inventory, needs `serverids`) is a
+different thing from this gateway's gwbk files and stays out of MVP
+scope.
 
 ### Project export/import specifics
 

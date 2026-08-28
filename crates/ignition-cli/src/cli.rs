@@ -153,6 +153,12 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Backup(BackupArgs),
 
+    /// EAM task orchestration (Enterprise Administration Module):
+    /// history/definitions reads, guarded task create + force —
+    /// every verb honestly reports the controller-mode state gate
+    #[command(arg_required_else_help = true)]
+    Eam(EamArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -904,6 +910,36 @@ impl From<CliBackupType> for ignition_core::client::backup::BackupType {
             CliBackupType::All => Self::All,
         }
     }
+}
+
+/// EAM subcommands (07-02, BKUP-02) — the read-heavy surface with
+/// guarded writes. Every runtime verb honestly reports the
+/// controller-mode state gate (`eam_not_controller` on a stock
+/// gateway — the README documents the manual flip).
+#[derive(Debug, clap::Args)]
+pub struct EamArgs {
+    #[command(subcommand)]
+    pub command: EamCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EamCommand {
+    /// EAM task run history (the gateway's own newest-first order)
+    History {
+        /// Max entries (default 200 — ALWAYS sent explicitly; the
+        /// server default is unlimited)
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+        /// Substring search over task names
+        #[arg(long, value_name = "TEXT")]
+        search: Option<String>,
+    },
+    /// Task definitions: bare `ign eam tasks` lists; with a name
+    /// shows one definition + its scheduled state
+    Tasks {
+        /// One task definition's detail (omit to list all)
+        name: Option<String>,
+    },
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

@@ -7,6 +7,7 @@
 pub mod backup;
 pub mod connections;
 pub mod doctor;
+pub mod eam;
 pub mod inspect;
 pub mod logs;
 pub mod profile;

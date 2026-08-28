@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -331,6 +331,40 @@ pub enum CoreError {
     /// trivially constructible so the taxonomy enumerates completely today.
     #[error("rig error: {0}")]
     Rig(String),
+
+    /// The gateway's EAM module is not configured as a controller —
+    /// every `/data/eam/api/v1/*` runtime endpoint answers 403 with
+    /// "This operation can only be performed when EAM is configured
+    /// as a controller" on a stock gateway (live-proven 8.3.3,
+    /// 07-RESEARCH): a STATE refusal, not auth — the token is fine,
+    /// the module's role is not. Message-classified at the classify
+    /// seam, path-scoped to `/data/eam/` so generic 403s elsewhere
+    /// cannot shift (the trial_not_expired pattern, classify
+    /// edition). Exit 6 — target state.
+    #[error(
+        "EAM is not configured as a controller on this gateway — every EAM runtime \
+         operation refuses until the module's installMode is flipped"
+    )]
+    EamNotController {
+        /// URL of the refused request, when known.
+        endpoint: Option<String>,
+    },
+
+    /// An `eam task new` whose type is in the REFUSED set —
+    /// `eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade`
+    /// are fleet-destructive (they push backups/modules/upgrades to
+    /// every AGENT target), and the CLI refuses them outright over
+    /// guard-everything: honest refusal with the v2 scope pointer
+    /// (the planner-locked create ladder's top rung). Exit 6 —
+    /// target state (additive slug alongside Task 2's).
+    #[error(
+        "EAM task type {task_type} is fleet-destructive — refused (restore/install/upgrade \
+         are EXT-03 (v2) scope; run them from the EAM console)"
+    )]
+    EamTaskTypeRefused {
+        /// The refused `profile.type` token.
+        task_type: String,
+    },
 }
 
 impl CoreError {
@@ -364,6 +398,8 @@ impl CoreError {
             Self::AlarmJournalMissing { .. } => "alarm_journal_missing",
             Self::SessionNotPrunable { .. } => "session_not_prunable",
             Self::Rig(_) => "rig_error",
+            Self::EamNotController { .. } => "eam_not_controller",
+            Self::EamTaskTypeRefused { .. } => "eam_task_type_refused",
         }
     }
 
@@ -395,7 +431,9 @@ impl CoreError {
             | Self::TagCollision { .. }
             | Self::AlarmJournalMissing { .. }
             | Self::SessionNotPrunable { .. }
-            | Self::ImportDenied { .. } => 6,
+            | Self::ImportDenied { .. }
+            | Self::EamNotController { .. }
+            | Self::EamTaskTypeRefused { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -575,6 +613,21 @@ impl CoreError {
                   diagnoses the deployment"
                     .to_string()
             }),
+            Self::EamNotController { .. } => Some(
+                "flip the gateway's EAM role: config-resource PUT on \
+                  com.inductiveautomation.eam/module-settings with \
+                  installMode \"Controller\" (array body carrying the current \
+                  signature) — a manual gateway-role decision this CLI \
+                  deliberately does not automate; see the README 'EAM tasks' \
+                  section"
+                    .to_string(),
+            ),
+            Self::EamTaskTypeRefused { .. } => Some(
+                "restore/install/upgrade tasks dispatch fleet-wide (every \
+                  agent target); run them from the Ignition EAM console — \
+                  EXT-03 (v2) will scope them into the CLI"
+                    .to_string(),
+            ),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -604,7 +657,8 @@ impl CoreError {
             | Self::TagCollision { endpoint, .. }
             | Self::AlarmJournalMissing { endpoint }
             | Self::SessionNotPrunable { endpoint, .. }
-            | Self::ImportDenied { endpoint, .. } => endpoint.clone(),
+            | Self::ImportDenied { endpoint, .. }
+            | Self::EamNotController { endpoint } => endpoint.clone(),
             _ => None,
         }
     }
@@ -875,6 +929,20 @@ mod tests {
                 6,
                 "session_not_prunable",
             ),
+            (
+                CoreError::EamNotController {
+                    endpoint: Some("http://gw:8088/data/eam/api/v1/eam-tasks/history".into()),
+                },
+                6,
+                "eam_not_controller",
+            ),
+            (
+                CoreError::EamTaskTypeRefused {
+                    task_type: "eam_remoteUpgrade".into(),
+                },
+                6,
+                "eam_task_type_refused",
+            ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {
@@ -1044,6 +1112,40 @@ mod tests {
         assert!(
             hint.contains("--file") && hint.contains("stdin"),
             "resource-put hint unchanged: {hint}"
+        );
+
+        // The EAM controller state gate (07-02): the hint names the
+        // manual flip recipe + the README section (role decisions
+        // stay one config-PUT away from the CLI, never one flag).
+        let controller = CoreError::EamNotController { endpoint: None };
+        let hint = controller.hint().expect("hint required");
+        assert!(
+            hint.contains("installMode"),
+            "controller hint names the flip: {hint}"
+        );
+        assert!(
+            hint.contains("Controller"),
+            "controller hint names the target role: {hint}"
+        );
+        assert!(
+            hint.contains("README"),
+            "controller hint points at the README section: {hint}"
+        );
+
+        // The refused task-type ladder top (07-02 Task 3): the hint
+        // names the EAM console + the v2 scope pointer.
+        let refused = CoreError::EamTaskTypeRefused {
+            task_type: "eam_restoreBackup".into(),
+        };
+        assert_eq!(refused.exit_code(), 6, "target state");
+        let hint = refused.hint().expect("hint required");
+        assert!(
+            hint.contains("EAM console"),
+            "refused hint names where to run it: {hint}"
+        );
+        assert!(
+            hint.contains("fleet-wide") || hint.contains("EXT-03"),
+            "refused hint names the fleet consequence / scope: {hint}"
         );
 
         // Totality: no class silently loses its hint later.

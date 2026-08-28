@@ -1839,6 +1839,26 @@ mod tests {
         async fn backup_restore(&self, _gwbk: &std::path::Path) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
+        async fn eam_task_history(
+            &self,
+            _limit: Option<u32>,
+            _search: Option<&str>,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::eam::EamHistoryItem>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_definitions(
+            &self,
+        ) -> Result<crate::client::query::ListEnvelope<crate::client::eam::EamTaskRecord>, CoreError>
+        {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_find(
+            &self,
+            _name: &str,
+        ) -> Result<crate::client::eam::EamTaskRecord, CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     /// The unit-explicit row mapping: tagCount/health pointered out

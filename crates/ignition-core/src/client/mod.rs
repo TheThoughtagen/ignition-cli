@@ -35,6 +35,7 @@ use std::time::Duration;
 pub mod backup;
 mod classify;
 pub mod connections;
+pub mod eam;
 pub mod idp;
 pub mod logs;
 pub mod metrics;
@@ -50,6 +51,7 @@ pub mod version;
 pub mod webdev;
 
 use crate::client::connections::GatewayConnection;
+use crate::client::eam::{EamHistoryItem, EamTaskRecord};
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::projects::{
@@ -336,6 +338,30 @@ pub trait GatewayApi: Send + Sync {
     /// the actions layer owns the post-restore RUNNING wait. The
     /// upload direction buffers by design (the import precedent).
     async fn backup_restore(&self, gwbk: &Path) -> Result<(), CoreError>;
+    /// GET `/data/eam/api/v1/eam-tasks/history` (authed) — task run
+    /// history, the standard `{items, metadata}` envelope. `limit`
+    /// defaults to [`eam::EAM_HISTORY_DEFAULT_LIMIT`] (200 — EAM
+    /// history grows unboundedly; an explicit limit ALWAYS rides the
+    /// wire, the logs discipline). A stock (non-controller) gateway
+    /// 403s → [`CoreError::EamNotController`] via classify
+    /// (path-scoped message classification — never a misleading
+    /// `auth_rejected`).
+    async fn eam_task_history(
+        &self,
+        limit: Option<u32>,
+        search: Option<&str>,
+    ) -> Result<ListEnvelope<EamHistoryItem>, CoreError>;
+    /// GET `/data/api/v1/resources/list/com.inductiveautomation.eam/
+    /// eam-tasks` (authed) — task DEFINITIONS through the standard
+    /// config-resource family (the tag-provider pattern; available
+    /// on stock gateways — no controller needed for definitions).
+    async fn eam_task_definitions(&self) -> Result<ListEnvelope<EamTaskRecord>, CoreError>;
+    /// GET `/data/api/v1/resources/find/com.inductiveautomation.eam/
+    /// eam-tasks/{name}` (authed) — one definition's full record
+    /// incl. the `scheduledTaskState` healthcheck
+    /// (`currentState`/`nextScheduled`/`owner` under `details`) and
+    /// the mutation `signature`. 404 → `NotFound` via classify.
+    async fn eam_task_find(&self, name: &str) -> Result<EamTaskRecord, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -1214,6 +1240,39 @@ impl GatewayApi for ReqwestGatewayApi {
             .body(body);
         let request = self.apply_auth(request);
         self.send_and_classify(request, &url).await.map(|_| ())
+    }
+
+    async fn eam_task_history(
+        &self,
+        limit: Option<u32>,
+        search: Option<&str>,
+    ) -> Result<ListEnvelope<EamHistoryItem>, CoreError> {
+        let query = query::ListQuery {
+            limit: limit
+                .map(i64::from)
+                .unwrap_or(eam::EAM_HISTORY_DEFAULT_LIMIT),
+            search: search.map(str::to_string),
+            ..query::ListQuery::default()
+        };
+        self.get_json(eam::EAM_HISTORY_PATH, Some(&query.to_query_pairs()), true)
+            .await
+    }
+
+    async fn eam_task_definitions(&self) -> Result<ListEnvelope<EamTaskRecord>, CoreError> {
+        // Standard list params (limit=-1 = the UI's "everything") —
+        // definition counts are small; the connections-family
+        // resource lists' exact shape.
+        self.get_json(
+            &eam::eam_tasks_list_path(),
+            Some(&query::ListQuery::default().to_query_pairs()),
+            true,
+        )
+        .await
+    }
+
+    async fn eam_task_find(&self, name: &str) -> Result<EamTaskRecord, CoreError> {
+        self.get_json(&eam::eam_task_find_path(name), None, true)
+            .await
     }
 }
 

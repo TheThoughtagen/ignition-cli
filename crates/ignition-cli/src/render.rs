@@ -16,6 +16,7 @@
 
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
+use ignition_core::actions::eam::{EamHistoryResult, EamTaskDetailResult, EamTasksResult};
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
 use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
@@ -224,6 +225,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::RigRestore(result) => render_rig_restore_human(result),
         ActionOutput::BackupDownload(result) => render_backup_download_human(result),
         ActionOutput::BackupRestore(result) => render_backup_restore_human(result),
+        ActionOutput::EamHistory(result) => render_eam_history_human(result),
+        ActionOutput::EamTasks(result) => render_eam_tasks_human(result),
+        ActionOutput::EamTaskDetail(result) => render_eam_task_detail_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -880,6 +884,64 @@ fn render_backup_restore_human(result: &BackupRestoreResult) {
     if result.restored {
         println!("Restored — the gateway restarts now (blocked for ~minutes)");
     }
+}
+/// `ign eam history` human table — the wire-faithful item rows:
+/// taskName carries the forced marker, level/detail are DATA (a
+/// Failed run is an exit-0 read — research Pitfall 3). Epoch-ms
+/// times render ISO-UTC (the logs convention).
+fn render_eam_history_human(result: &EamHistoryResult) {
+    if result.items.is_empty() {
+        println!("no EAM task history");
+        return;
+    }
+    for item in &result.items {
+        let start = iso_utc(item.task_start);
+        let level = item.level.as_deref().unwrap_or("-");
+        println!(
+            "{}  {}  [{}]  target={}  {}",
+            start,
+            item.task_name,
+            level,
+            item.target.as_deref().unwrap_or("-"),
+            item.detail.as_deref().unwrap_or("")
+        );
+    }
+    println!("({} run(s))", result.count);
+}
+
+/// `ign eam tasks` human table — the agent-stable summary keys.
+fn render_eam_tasks_human(result: &EamTasksResult) {
+    if result.tasks.is_empty() {
+        println!("no EAM task definitions");
+        return;
+    }
+    for task in &result.tasks {
+        println!(
+            "{}  type={}  schedule={}  state={}",
+            task.name,
+            task.task_type.as_deref().unwrap_or("-"),
+            task.schedule_mode.as_deref().unwrap_or("-"),
+            task.current_state.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+/// `ign eam tasks <NAME>` human shape — the definition pretty-printed
+/// with the scheduled state beside it.
+fn render_eam_task_detail_human(result: &EamTaskDetailResult) {
+    println!(
+        "{}  state={}",
+        result.name,
+        result
+            .state
+            .get("currentState")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result.definition).unwrap_or_default()
+    );
 }
 
 /// `ign rig trial status` human lines: the license banner first (the

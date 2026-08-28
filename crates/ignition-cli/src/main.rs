@@ -35,11 +35,11 @@ use ignition_core::error::CoreError;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    BackupArgs, BackupCommand, Cli, Commands, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs,
-    ProfileCmd, ProjectArgs, ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand,
-    SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
-    TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
-    WebdevCommand,
+    BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, LogLevel, LoggersCmd, LogsArgs,
+    LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand, ResourceArgs, ResourceCommand,
+    RigArgs, RigCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand,
+    TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd,
+    WebdevArgs, WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -154,6 +154,13 @@ enum ActionOutput {
     /// `ign backup restore` — the guarded standalone restore; data
     /// carries the flat {restored: true}.
     BackupRestore(actions::backup::BackupRestoreResult),
+    /// `ign eam history` — task run history (items passthrough +
+    /// count).
+    EamHistory(actions::eam::EamHistoryResult),
+    /// `ign eam tasks` — the definition summaries.
+    EamTasks(actions::eam::EamTasksResult),
+    /// `ign eam tasks <NAME>` — one definition + its state.
+    EamTaskDetail(actions::eam::EamTaskDetailResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -274,6 +281,9 @@ impl ActionOutput {
             ActionOutput::RigRestore(result) => render_success(profile, result, compact),
             ActionOutput::BackupDownload(result) => render_success(profile, result, compact),
             ActionOutput::BackupRestore(result) => render_success(profile, result, compact),
+            ActionOutput::EamHistory(result) => render_success(profile, result, compact),
+            ActionOutput::EamTasks(result) => render_success(profile, result, compact),
+            ActionOutput::EamTaskDetail(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -1728,6 +1738,38 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(api) => actions::backup::backup_restore(&api, &file)
                         .await
                         .map(ActionOutput::BackupRestore),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+        },
+        // EAM (07-02, BKUP-02): the read-heavy family. history rides
+        // the RUNTIME seam (the controller 403 classifies
+        // eam_not_controller — never auth_rejected); tasks ride the
+        // config-resource seam (definitions answer on stock
+        // gateways). Both are reads, unguarded.
+        Commands::Eam(EamArgs { command }) => match command {
+            EamCommand::History { limit, search } => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => actions::eam::eam_history(&api, limit, search.as_deref())
+                        .await
+                        .map(ActionOutput::EamHistory),
+                    Err(err) => Err(err),
+                };
+                (name, result)
+            }
+            EamCommand::Tasks { name: task_name } => {
+                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let result = match api {
+                    Ok(api) => match task_name {
+                        Some(task_name) => actions::eam::eam_task_detail(&api, &task_name)
+                            .await
+                            .map(ActionOutput::EamTaskDetail),
+                        None => actions::eam::eam_tasks(&api)
+                            .await
+                            .map(ActionOutput::EamTasks),
+                    },
                     Err(err) => Err(err),
                 };
                 (name, result)

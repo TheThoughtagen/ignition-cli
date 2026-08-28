@@ -2436,6 +2436,22 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 });
             }
         }
+        // The EAM read pair fires direct (unguarded reads through
+        // the shared Result modal).
+        Some("eam history") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "eam history", async move {
+                    ignition_core::actions::eam::eam_history(&*client, None, None).await
+                });
+            }
+        }
+        Some("eam tasks") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "eam tasks", async move {
+                    ignition_core::actions::eam::eam_tasks(&*client).await
+                });
+            }
+        }
         Some("backup restore") => {
             state.dashboard.pending_input = Some(PendingInput::BackupRestoreFile);
             state.open_modal(Modal::Input {
@@ -3755,11 +3771,11 @@ mod tests {
             "k steps back up like Up"
         );
 
-        // G bottoms out at the last entry (backup restore, index 8 —
-        // the 07-02 pair appended after restart).
+        // G bottoms out at the last entry (eam tasks, index 10 —
+        // the 07-02 backup + EAM pairs appended after restart).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 8 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 10 })),
             "G jumps to the last entry"
         );
 

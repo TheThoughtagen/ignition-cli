@@ -373,6 +373,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "backup restore",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 07-02: the EAM read pair rides the dashboard's global
+        // actions menu (results via the shared Result modal — no
+        // dedicated screen); `eam tasks <NAME>` is the SAME leaf
+        // (an Option positional on the tasks form).
+        CliRoute {
+            path: "eam history",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "eam tasks",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 
