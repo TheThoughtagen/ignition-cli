@@ -58,6 +58,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P06 | 28min | 3 tasks | 17 files |
 | Phase 06 P09 | ~15min (6min code + 9min continuation verify) | 3 tasks tasks | 3 files files |
 | Phase 06 P07 | 52min | 3 tasks | 10 files |
+| Phase 06 P08 | 52min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -174,6 +175,8 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-07]: CurrentGauges heap/max are f64 on the wire (8.3.3 serializes Java doubles in exponent form, e.g. 2.85746728E8); serialize_bytes_f64 keeps whole byte counts as JSON integers (2^53 guard) so agent-visible --json output keeps the pre-f64 shape
 - [Phase 06]: [Phase 06-07]: session_not_prunable is an additive exit-6 slug wired through classify()'s ROUTE-SCOPED 409 arm (singular /designer/{id} matches, plural /designers list cannot — off-route wiremock pin); perspective-terminate 404 stays generic not_found (body shape unverified on the wire, skip rationale at the arm)
 - [Phase 06]: [Phase 06-07]: TTY refusal hint is content-addressed — pub TUI_TTY_REFUSAL_REASON const + CoreError::tui_tty_refusal() constructor pair the reason with its interactive-terminal hint; no new variant, no hint field, slug/exit 2 frozen, resource-put --file/stdin hint pinned unchanged both directions
+- [Phase 06]: [Phase 06-08]: Root-level resource surgery LOCKED live — no-slash user path <X> maps to member <X>/resources/<X> (module named after the file) with the container descriptor via existing synthesis; virgin-rig proof: import exit-0 and the gateway re-exports at the exact member path. Dead wire (all virgin-project-proven): file member named <X>/resources = 500 module-folder-flag (reserved container), descriptor at module root = 500, zip-root files = silent no-op. UAT layout matrix superseded (state-contaminated); failed imports are ATOMIC; container descriptors ARE legal and adopt module-root files
+- [Phase 06]: [Phase 06-08]: user_path carries the deliberate alias — explicit <X>/<X> forwards to the same member as <X> and reads back as the no-slash spelling (one member, no-slash wins); adoption oracle for import experiments = fresh re-export after overwrite-import
 
 ### Pending Todos
 
@@ -190,6 +193,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T11:23:51.365Z
-**Stopped At:** Completed 06-07-PLAN.md (gap closure: f64 gauges, 409 session_not_prunable, TTY hint — 713 tests green)
+**Last session:** 2026-08-28T11:24:17.914Z
+**Stopped At:** Completed 06-08-PLAN.md — root-level resource put gap closed (live-proven surgery shape, 713 tests green)
 **Resume file:** None
