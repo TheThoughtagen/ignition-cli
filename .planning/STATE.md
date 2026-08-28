@@ -5,7 +5,7 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 gap closure — 06-10 shipped (modal/menu UX: content-driven frame-clamped modal geometry so footer hints never clip, vim motions j/k/g/G + Ctrl-d/Ctrl-u in every modal via one menu_nav helper, prose wait labels, noun-grouped Projects menu with consequence descriptions; routes.rs + confirm parity untouched, 716 tests green, fmt/clippy clean). Next: 06-11 (rig status render + README keymap sync), then /gsd-verify-work 6.
+**Current focus:** Phase 6 COMPLETE — 06-11 shipped (rig summary re-rendered as grouped blank-separated sections with a STATE UP/DOWN headline and width-fitted compose path; README keymap synced with every gap-closure key — Tags 'r', modal vim motions, prose noun-grouped menu; workspace green, fmt/clippy clean). All 13 06-UAT gaps addressed or backlog-owned (color/monochrome themes are backlog by triage). Next: /gsd-verify-work 6, then plan Phase 7 (interop).
 
 ## Current Position
 
@@ -15,7 +15,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 **Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-28
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P07 | 52min | 3 tasks | 10 files |
 | Phase 06 P08 | 52min | 2 tasks | 2 files |
 | Phase 06 P10 | 41min | 3 tasks | 3 files |
+| Phase 06 P11 | 20min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -181,6 +182,8 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-10]: Modal geometry is CONTENT-DRIVEN and frame-clamped — height formulas count actual rendered rows (len + 4 for menus), the render site clamps to frame-2 (5-row floor); menus with grouped/extra rows use a shared line-builder the height formula walks, so geometry always fits content
 - [Phase 06]: [Phase 06-10]: One menu_nav helper (arrows + j/k/g/G) powers ALL list-bearing modals; the Result modal's Ctrl-d/Ctrl-u step is a fixed 10 lines (update is frame-blind; the Logs screen's page step is the convention) — PageUp/PageDown behavior byte-identical
 - [Phase 06]: [Phase 06-10]: Menu labels are display prose (ACTIONS 'wait for gateway up' etc.; PROJECT_ACTIONS noun-grouped project/resource/webdev with 'label — consequence' rows, ONE flat index space keyed on the clap-exact verb) — worker labels and routes.rs rows keep clap-exact spellings; both-sides matching + group contiguity test-pinned; descriptions budgeted to the 38-col half-width modal
+- [Phase 06]: [Phase 06-11]: Rig summary = STATE headline (UP/DOWN · PORTS) + blank-separated identity/services/volumes sections — actual RigStatusResult fields drive the grouping (the plan's trial/snapshot sketch sections don't exist); summary_lines is width-aware, tail-fitting the compose path with a leading …; project row only when it differs from rig — 06-UAT test 13 readability fix; content-driven layout per the 06-10 lesson
+- [Phase 06]: [Phase 06-11]: README keymap bullet is the single home for per-screen keys + modal motion sets — Tags 'r' (deepest-visible refire), j/k/g/G in list-bearing menus, j/k + Ctrl-d/Ctrl-u 10-line half-page in the Result modal (PgUp/PgDn stay line-wise); exit table cross-checked session_not_prunable present — new keys are only real if documented; wording pinned against the code
 
 ### Pending Todos
 
@@ -197,6 +200,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T12:08:05.812Z
-**Stopped At:** Completed 06-10-PLAN.md — modal/menu UX gap closure (frame-clamped geometry, vim motions, prose labels, grouped Projects menu)
+**Last session:** 2026-08-28T12:31:31.781Z
+**Stopped At:** Completed 06-11-PLAN.md — Phase 6 gap closure complete (rig render + README keymap sync); next: /gsd-verify-work 6
 **Resume file:** None
