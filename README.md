@@ -215,11 +215,17 @@ Behavior contract:
 - **Keybindings.** `q`/Ctrl-C quit (Ctrl-C works even behind a modal;
   `q` never quits behind a modal — it types) · Tab/Shift-Tab cycle
   screens · Enter/Esc navigate (Esc ascends one level on the browser
-  screens) · `a` opens the screen's actions menu · `p` opens the
-  profile switcher. Per-screen: `r` refresh (Dashboard/Rig), `l`
-  level filter (Logs) / logs pane toggle (Rig), `f` follow, `w` watch
-  a tag (Tags), `h` alarm history (Alarms), `t` terminate a session
-  (Dashboard).
+  screens) · `a` opens the screen's actions menu (grouped and
+  prose-labeled — the Projects menu clusters project/resource/webdev
+  verbs with each row naming its consequence) · `p` opens the profile
+  switcher. Per-screen: `r` refresh (Dashboard/Rig; on Tags it
+  refires the deepest-visible pane so a stale error visibly
+  reloads), `l` level filter (Logs) / logs pane toggle (Rig), `f`
+  follow, `w` watch a tag (Tags), `h` alarm history (Alarms), `t`
+  terminate a session (Dashboard). Modals take vim motions: in every
+  list-bearing menu `j`/`k` step and `g`/`G` jump to first/last; the
+  Result modal scrolls line-wise with `j`/`k` (arrows and PgUp/PgDn
+  unchanged) and half-pages with Ctrl-d/Ctrl-u.
 - **Coverage is CI-enforced.** A structural test
   (`crates/ignition-cli/tests/tui_coverage.rs`) walks the live clap
   command tree and asserts bidirectional equality with the TUI route
