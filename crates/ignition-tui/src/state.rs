@@ -784,6 +784,12 @@ pub struct TagsData {
     /// The armed tags form (the Input modal's routing slot for the
     /// tags family — [`TagsForm`]); cleared by the shared cancel path.
     pub pending_form: Option<TagsForm>,
+    /// The path of the most recently FIRED `tags write` (06-09): the
+    /// ActionDone refresh trigger's comparison target — ActionDone
+    /// carries only the label, so the form's accept site arms this
+    /// and the landing consumes it once (a FAILED write leaves the
+    /// displayed value correct, so only success refires).
+    pub last_write_path: Option<String>,
 }
 
 /// The open project detail's find tri-state (06-05) — 06-02's

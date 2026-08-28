@@ -207,6 +207,7 @@ pub fn update(state: &mut AppState, event: AppEvent) {
         AppEvent::ActionDone { era, label, result } => {
             if workers::is_current(state.era, era) {
                 state.dashboard.in_flight = None;
+                let succeeded = result.is_ok();
                 let lines: Vec<String> = match result {
                     Ok(json) => json.lines().map(str::to_string).collect(),
                     Err(message) => message.lines().map(str::to_string).collect(),
@@ -227,6 +228,26 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 // tags twin).
                 if matches!(label, "providers create" | "providers delete") {
                     workers::watch::spawn_providers_once(state);
+                }
+                // The write→read-back round-trip (06-09): a SUCCESSFUL
+                // write changed the gateway's value for the written
+                // path — the open detail pane re-reads NOW when it
+                // shows that path (the ack-refresh pattern's detail
+                // twin). The armed target is consumed on ANY landing;
+                // the watch table needs no nudge — a watched path
+                // refreshes on the 2 s poll naturally.
+                if label == "tags write" {
+                    let written = state.tags.last_write_path.take();
+                    if succeeded
+                        && let Some(path) = written
+                        && state
+                            .tags
+                            .detail
+                            .as_ref()
+                            .is_some_and(|detail| detail.path == path)
+                    {
+                        refire_detail_read(state);
+                    }
                 }
                 // A landed project-family mutation (or a webdev
                 // deploy — it creates/replaces the ign-cli project)
@@ -1290,6 +1311,11 @@ fn accept_tags_form(state: &mut AppState, value: &str) {
         TagsForm::WriteValue { path } => match parse_write_value(&value) {
             Ok(parsed) => {
                 if let Some(client) = client_arc(state) {
+                    // Arm the detail-refresh trigger (06-09):
+                    // ActionDone carries only the label — the write's
+                    // target path rides here for the landing's
+                    // comparison.
+                    state.tags.last_write_path = Some(path.clone());
                     workers::spawn_action(state, "tags write", async move {
                         ignition_core::actions::tags::tags_write(
                             &*client,
@@ -5024,6 +5050,110 @@ mod tests {
         run_tags_menu(&mut fresh, 0);
         submit_tags_input(&mut fresh, "42");
         assert_eq!(fresh.dashboard.in_flight, Some("tags write"));
+    }
+
+    /// The write→read-back round-trip (06-09): accepting the write
+    /// form arms the target path, and a landed SUCCESSFUL `tags write`
+    /// re-fires the open detail's read when the paths match. A
+    /// different path — or a FAILED write — leaves the pane
+    /// untouched.
+    #[test]
+    fn a_landed_tags_write_refreshes_the_matching_detail() {
+        // Open the detail on T1 and land its read.
+        let mut state = tags_state_on_tree(); // cursor on T1
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        let era = state.era;
+        let seq = state.tags.detail_seq;
+        update(
+            &mut state,
+            AppEvent::TagDetailRead {
+                era,
+                seq,
+                result: Ok(read_row("[default]T1", serde_json::json!(7))),
+            },
+        );
+        assert!(matches!(
+            state.tags.detail.as_ref().unwrap().read,
+            crate::state::DetailRead::Loaded(_)
+        ));
+
+        // The real form path arms the trigger: menu write → accept.
+        run_tags_menu(&mut state, 0);
+        submit_tags_input(&mut state, "42");
+        assert_eq!(state.dashboard.in_flight, Some("tags write"));
+        assert_eq!(
+            state.tags.last_write_path.as_deref(),
+            Some("[default]T1"),
+            "the accept arms the write's target path"
+        );
+
+        // The write lands — the detail read re-fires under a new seq.
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "tags write",
+                result: Ok("{\"results\": [{\"path\": \"[default]T1\"}]}".into()),
+            },
+        );
+        assert_eq!(state.tags.detail_seq, seq + 1, "a fresh seq");
+        assert!(
+            matches!(
+                state.tags.detail.as_ref().unwrap().read,
+                crate::state::DetailRead::Loading
+            ),
+            "the read re-armed (the write→read-back round-trip)"
+        );
+        assert!(
+            state.tags.last_write_path.is_none(),
+            "the armed target is consumed by the landing"
+        );
+
+        // Land the re-fired read; a DIFFERENT path's write leaves the
+        // pane as-is.
+        update(
+            &mut state,
+            AppEvent::TagDetailRead {
+                era,
+                seq: seq + 1,
+                result: Ok(read_row("[default]T1", serde_json::json!(42))),
+            },
+        );
+        state.tags.last_write_path = Some("[default]T2".into());
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "tags write",
+                result: Ok("{}".into()),
+            },
+        );
+        assert!(
+            matches!(
+                state.tags.detail.as_ref().unwrap().read,
+                crate::state::DetailRead::Loaded(_)
+            ),
+            "a different path does not refire the pane"
+        );
+
+        // A FAILED write for the pane's own path also stays — the old
+        // value is still the truth.
+        state.tags.last_write_path = Some("[default]T1".into());
+        update(
+            &mut state,
+            AppEvent::ActionDone {
+                era,
+                label: "tags write",
+                result: Err("gateway refused".into()),
+            },
+        );
+        assert!(
+            matches!(
+                state.tags.detail.as_ref().unwrap().read,
+                crate::state::DetailRead::Loaded(_)
+            ),
+            "a failed write does not refire"
+        );
     }
 
     /// `providers delete`: name Input → Confirm gate (nothing fires
