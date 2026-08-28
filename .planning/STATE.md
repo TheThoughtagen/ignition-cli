@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 executing: 06-05 SHIPPED (Projects screen — list → find-detail → resources drill-down with scrollable content preview, name/seq stale gates over the era; full project/resource/webdev action menus with exact CLI confirm-parity — project delete/import-overwrite/resource put/resource delete Confirm-gated, webdev deploy deliberately ungated; all 14 family route rows registered; gated_cli_verb exhaustive tripwire staged for 06-06; 676 tests green, fmt/clippy clean, secrets confined to context.rs). Next: 06-06 (Rig screen + structural coverage proof — the final plan).
+**Current focus:** Phase 6 COMPLETE (06-06 shipped: Rig screen — allowlist status pane with down-is-data, all nine rig verbs on the `a` menu with EXACT CLI confirm parity (reset/restore/trial-reset gated, down deliberately ungated), raw `rig logs -f` pane as the lone Streamed mapping riding a second 10k ring; the COMPLETE 63-row routes registry; tui_coverage.rs — the structural SC1 proof walking the live clap tree via CommandFactory and asserting bidirectional equality, drift-proven both directions; ignition-cli lib target added for the in-process walk; README TUI section; 698 tests green, fmt/clippy clean, auth-value confinement mechanically exact). Next: /gsd-verify-work 6, then plan Phase 7.
 
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit)
 **Current Plan:** 6
 **Total Plans in Phase:** 6
-**Status:** Ready to execute
-**Last Activity:** 2026-08-27
+**Status:** Phase complete — ready for verification
+**Last Activity:** 2026-08-28
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P03 | 36min | 3 tasks tasks | 11 files files |
 | Phase 06 P04 | 12min | 3 tasks | 8 files |
 | Phase 06 P05 | 29min | 3 tasks tasks | 8 files files |
+| Phase 06 P06 | 28min | 3 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -163,6 +164,9 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-05]: Projects screen browse = list → project_find detail (no 'project get' leaf exists — the find IS the read-back source; the detail uniquely shows defaultDb/tagProvider/userSource passthrough) → resources list → resource get with scrollable preview; stale results gate on pane NAME identity (ProjectGet/ResourcesList) or seq (ResourceGet) over the era — the Tags path-lookup shape, no per-pane eras
 - [Phase 06]: [Phase 06-05]: ONE ProjectsActions menu hosts all three families (11 verbs incl. copy/rename so every route row is honestly reachable); Confirm gates mirror main.rs exactly — project delete, project import-overwrite, resource put, resource delete gated (cancel spawns nothing, y fires unguarded); webdev deploy deliberately UNGATED firing with CLI defaults (ign-cli, no scriptExec — 05-03 CLI-owned-project decision)
 - [Phase 06]: [Phase 06-05]: confirm-parity tripwire — gated_cli_verb EXHAUSTIVELY classifies every PendingAction to its main.rs require_confirmation operation string (#[cfg_attr(not(test), expect(dead_code))] until 06-06's structural test); gated set = 11 verbs / 6 mapped families, rig reset/trial-reset/restore remain 06-06's; project set parses ONE FIELD=VALUE pair per prompt (spaces allowed after the first =; db/tagprov/usersrc stay CLI-form per the LOCKED modal-depth decision); set/import/export/resource forms read files INSIDE workers, stdin refused
+- [Phase 06]: Structural coverage proof — tui_coverage.rs walks the live clap tree (CommandFactory) and asserts bidirectional equality with routes(); a future CLI command without a TUI mapping FAILS CI (Phase 7's script run must land its surface in the same plan)
+- [Phase 06]: ignition-cli gained a lib target (pub mod cli) so tests import the command tree in-process; dispatch/render stay binary-only (choke-file discipline preserved)
+- [Phase 06]: rig credentials are env-only in the cockpit (IGNITION_TOKEN / IGNITION_USER + IGNITION_PASSWORD, no --user form); the rig logs pane clears its ring per stream (compose tail has no since-resume); confirm parity exact — reset/restore/trial-reset gated, down deliberately ungated
 
 ### Pending Todos
 
@@ -179,6 +183,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-27T23:29:51.531Z
-**Stopped At:** Completed 06-05-PLAN.md (Projects screen shipped — browser + full project/resource/webdev action surface with CLI confirm-parity; 676 tests green)
+**Last session:** 2026-08-28T00:08:37.425Z
+**Stopped At:** Completed 06-06-PLAN.md — Phase 6 complete (all 6 plans), ready for verification
 **Resume file:** None
