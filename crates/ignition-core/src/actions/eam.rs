@@ -12,10 +12,274 @@
 //! Pitfall 3).
 
 use serde::Serialize;
+use serde_json::{Map, Value};
 
 use crate::client::GatewayApi;
 use crate::client::eam::{EamHistoryItem, EamTaskRecord};
 use crate::error::CoreError;
+
+/// The planner-locked create ladder's verdict (07-02 Task 3) — a
+/// PURE function over `(task_type, schedule_mode)` so main.rs
+/// (pre-resolution, zero network) and the TUI (Confirm gating) and
+/// the action (authoritative re-check) all classify IDENTICALLY.
+///
+/// | verdict | meaning |
+/// |---|---|
+/// | `Unguarded` | `eam_backup` + OnDemand — fires only when forced, never mutates targets autonomously |
+/// | `NeedsYes` | mutating types (restart/send*/licenses) OR any non-OnDemand schedule (arms autonomous actions) |
+/// | `Refused` | `eam_restoreBackup`/`eam_installModules`/`eam_remoteUpgrade` — fleet-destructive, EXT-03 (v2) scope |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCreateVerdict {
+    /// No `--yes` needed (OnDemand backup).
+    Unguarded,
+    /// `require_confirmation` must fire.
+    NeedsYes,
+    /// Outright refusal (`EamTaskTypeRefused`).
+    Refused,
+}
+
+/// The openapi taxonomy's REFUSED set — fleet-destructive types the
+/// CLI refuses outright (push backups/modules/upgrades to every
+/// agent target).
+const REFUSED_TYPES: [&str; 3] = [
+    "eam_restoreBackup",
+    "eam_installModules",
+    "eam_remoteUpgrade",
+];
+
+/// The taxonomy's mutating-but-allowed set — they act on target
+/// agents when dispatched, so their DEFINITIONS need `--yes`.
+const MUTATING_TYPES: [&str; 7] = [
+    "eam_restart",
+    "eam_sendProject",
+    "eam_sendResource",
+    "eam_sendTags",
+    "eam_activateLicense",
+    "eam_updateLicense",
+    "eam_unactivateLicense",
+];
+
+/// THE guard ladder (pure): refused types first (highest rung);
+/// then any non-OnDemand schedule (arms autonomous actions); then
+/// the mutating type set; `eam_backup` + OnDemand lands unguarded.
+/// An UNKNOWN type classifies `NeedsYes` — fail-safe (a `--yes`
+/// costs nothing; an unrecognized fleet verb firing unguarded could
+/// cost plenty; the server's own validation remains the backstop).
+pub fn task_create_guard(task_type: &str, schedule_mode: &str) -> TaskCreateVerdict {
+    if REFUSED_TYPES.contains(&task_type) {
+        return TaskCreateVerdict::Refused;
+    }
+    if !schedule_mode.eq("OnDemand") {
+        return TaskCreateVerdict::NeedsYes;
+    }
+    if MUTATING_TYPES.contains(&task_type) || task_type != "eam_backup" {
+        return TaskCreateVerdict::NeedsYes;
+    }
+    TaskCreateVerdict::Unguarded
+}
+
+/// `ign eam task new` output model — all keys always.
+#[derive(Debug, Serialize)]
+pub struct EamTaskCreateResult {
+    /// The created definition's name.
+    pub name: String,
+    /// The `profile.type` token.
+    pub task_type: String,
+    /// The `profile.scheduleMode` token.
+    pub schedule_mode: String,
+    /// The composed definition body that rode the array POST
+    /// (verbatim — the agent's read-back of what was created).
+    pub definition: Value,
+}
+
+/// `ign eam task force` output model — all keys always.
+#[derive(Debug, Serialize)]
+pub struct EamTaskForceResult {
+    /// The dispatched task's name.
+    pub task: String,
+    /// The owner the force POST targeted (from the healthcheck's
+    /// `scheduledTaskState.details.owner`, fallback `"eam"`).
+    pub owner: String,
+    /// Always `true` on this shape — the 2xx IS dispatch acceptance
+    /// (execution outcomes land in history as data).
+    pub dispatched: bool,
+    /// The newest matching history entry after dispatch (null when
+    /// none is visible yet) — its `level`/`detail` honestly surface
+    /// GNET-not-connected / trial-expired outcomes.
+    pub history: Option<EamHistoryItem>,
+}
+
+/// One `--setting K=V` parsed with scalar auto-typing (the 05-04
+/// tags-write `--value` precedent): a value that parses cleanly as
+/// bool (`true`/`false`) or integer serializes as a JSON bool /
+/// number; anything else stays a string. Arrays/objects are OUT of
+/// scope for K=V (the `--definition` path owns them).
+pub fn parse_setting(raw: &str) -> Result<(String, Value), CoreError> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "--setting expects K=V (got {raw:?}) — a value that parses as \
+                 bool/int rides typed, anything else stays a string; arrays and \
+                 objects need --definition <PATH>"
+            ),
+        });
+    };
+    if key.is_empty() || value.is_empty() {
+        return Err(CoreError::InvalidInput {
+            reason: format!("--setting expects non-empty K and V (got {raw:?})"),
+        });
+    }
+    Ok((key.to_string(), auto_type(value)))
+}
+
+/// The scalar auto-typing rule: `true`/`false` → JSON bool; a clean
+/// i64 parse → JSON number; anything else → the string verbatim.
+fn auto_type(value: &str) -> Value {
+    if value == "true" {
+        return Value::Bool(true);
+    }
+    if value == "false" {
+        return Value::Bool(false);
+    }
+    if let Ok(int) = value.parse::<i64>() {
+        return Value::Number(int.into());
+    }
+    Value::String(value.to_string())
+}
+
+/// Deep-merge `overlay` onto `base` (objects merge recursively —
+/// base keys win only when the overlay carries nothing at that
+/// path; arrays and scalars REPLACE, never merge — the documented
+/// settings-merge semantics for `--definition`).
+fn deep_merge(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, overlay_value) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(base_value @ Value::Object(_)) if overlay_value.is_object() => {
+                        deep_merge(base_value, overlay_value);
+                    }
+                    _ => {
+                        base_map.insert(key.clone(), overlay_value.clone());
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+/// `ign eam task new` — compose the definition, run the ladder's
+/// authoritative re-check, POST the array body.
+///
+/// Composition: `{name, config: {profile: {type, scheduleMode,
+/// targetGateways: [--target...], ...--setting K=V}}}`; a
+/// `--definition` file's top-level object deep-merges over the
+/// composed `profile` (the typed/array settings path — mutually
+/// exclusive with `--setting` at clap). The refusal ladder runs
+/// AGAIN here (main.rs already guarded by verdict; the re-check
+/// keeps the pure fn authoritative in core — the double-check is
+/// cheap).
+pub async fn eam_task_create(
+    api: &dyn GatewayApi,
+    name: &str,
+    task_type: &str,
+    targets: &[String],
+    settings: &[String],
+    definition: Option<&Value>,
+    schedule_mode: &str,
+) -> Result<EamTaskCreateResult, CoreError> {
+    // The ladder is authoritative HERE (the CLI's pre-resolution
+    // guard is the fast path; this is the correctness path).
+    if let TaskCreateVerdict::Refused = task_create_guard(task_type, schedule_mode) {
+        return Err(CoreError::EamTaskTypeRefused {
+            task_type: task_type.to_string(),
+        });
+    }
+
+    // Compose profile: type + scheduleMode + targetGateways + the
+    // K=V settings (auto-typed), then the --definition overlay.
+    let mut profile = Map::new();
+    profile.insert("type".to_string(), Value::String(task_type.to_string()));
+    profile.insert(
+        "scheduleMode".to_string(),
+        Value::String(schedule_mode.to_string()),
+    );
+    profile.insert(
+        "targetGateways".to_string(),
+        Value::Array(targets.iter().map(|t| Value::String(t.clone())).collect()),
+    );
+    for raw in settings {
+        let (key, value) = parse_setting(raw)?;
+        profile.insert(key, value);
+    }
+    if let Some(overlay) = definition {
+        let Value::Object(profile_value) = Value::Object(profile) else {
+            unreachable!("profile is an object by construction")
+        };
+        let mut merged = Value::Object(profile_value);
+        deep_merge(&mut merged, overlay);
+        profile = match merged {
+            Value::Object(map) => map,
+            _ => unreachable!("deep merge of objects stays an object"),
+        };
+    }
+
+    // The full definition record (the wire shape the find read-back
+    // answers; config wraps the profile).
+    let composed = serde_json::json!({
+        "name": name,
+        "config": {"profile": Value::Object(profile)},
+    });
+    api.eam_task_create(&composed).await?;
+    Ok(EamTaskCreateResult {
+        name: name.to_string(),
+        task_type: task_type.to_string(),
+        schedule_mode: schedule_mode.to_string(),
+        definition: composed,
+    })
+}
+
+/// `ign eam task force` — find (owner resolution via the
+/// healthcheck's `scheduledTaskState.details.owner`, live-captured
+/// fallback `"eam"`) → force POST (2xx = dispatched) → history
+/// re-read (the newest matching entry, `level`/`detail` as data).
+/// One extra round trip for the owner, correctness over latency
+/// (the 05-04 precondition precedent).
+pub async fn eam_task_force(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<EamTaskForceResult, CoreError> {
+    let record = api.eam_task_find(name).await?;
+    let owner = record
+        .scheduled_task_state
+        .as_ref()
+        .and_then(|state| state.get("details"))
+        .and_then(|details| details.get("owner"))
+        .and_then(Value::as_str)
+        .unwrap_or("eam")
+        .to_string();
+
+    api.eam_task_force(&owner, name).await?;
+
+    let history = api
+        .eam_task_history(Some(20), Some(name))
+        .await
+        .ok()
+        .and_then(|page| {
+            page.items.into_iter().find(|item| {
+                let forced = format!("{name} (forced)");
+                item.task_name == name || item.task_name == forced
+            })
+        });
+
+    Ok(EamTaskForceResult {
+        task: name.to_string(),
+        owner,
+        dispatched: true,
+        history,
+    })
+}
 
 /// `ign eam history` output model — all keys always.
 #[derive(Debug, Serialize)]
@@ -126,7 +390,161 @@ fn summary_from(record: &EamTaskRecord) -> EamTaskSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{EamTaskRecord, summary_from};
+    use super::{
+        EamTaskRecord, TaskCreateVerdict, auto_type, deep_merge, parse_setting, summary_from,
+        task_create_guard,
+    };
+
+    /// The ladder EXHAUSTIVELY over the openapi taxonomy's 11 types
+    /// × the schedule modes — the planner-locked breadth pinned as a
+    /// pure function.
+    #[test]
+    fn guard_ladder_is_exhaustive_over_the_taxonomy() {
+        // eam_backup + OnDemand = the ONLY unguarded cell.
+        assert_eq!(
+            task_create_guard("eam_backup", "OnDemand"),
+            TaskCreateVerdict::Unguarded
+        );
+
+        // The refused trio — the ladder's top rung fires regardless
+        // of schedule.
+        for refused in [
+            "eam_restoreBackup",
+            "eam_installModules",
+            "eam_remoteUpgrade",
+        ] {
+            assert_eq!(
+                task_create_guard(refused, "OnDemand"),
+                TaskCreateVerdict::Refused,
+                "{refused} refuses even OnDemand"
+            );
+            assert_eq!(
+                task_create_guard(refused, "Scheduled"),
+                TaskCreateVerdict::Refused,
+                "{refused} refuses under any schedule"
+            );
+        }
+
+        // The mutating seven — --yes under OnDemand.
+        for mutating in [
+            "eam_restart",
+            "eam_sendProject",
+            "eam_sendResource",
+            "eam_sendTags",
+            "eam_activateLicense",
+            "eam_updateLicense",
+            "eam_unactivateLicense",
+        ] {
+            assert_eq!(
+                task_create_guard(mutating, "OnDemand"),
+                TaskCreateVerdict::NeedsYes,
+                "{mutating} needs --yes"
+            );
+        }
+
+        // ANY non-OnDemand schedule arms autonomous actions — even
+        // eam_backup (the openapi schedule tokens + unknown modes).
+        for mode in ["Immediate", "Scheduled", "AtTime", "AtDelay", "weird-mode"] {
+            assert_eq!(
+                task_create_guard("eam_backup", mode),
+                TaskCreateVerdict::NeedsYes,
+                "scheduleMode {mode} arms the task"
+            );
+        }
+
+        // Unknown types classify fail-safe (guarded, never silently
+        // unguarded — the server's validation is the backstop).
+        assert_eq!(
+            task_create_guard("eam_unknownFutureType", "OnDemand"),
+            TaskCreateVerdict::NeedsYes
+        );
+    }
+
+    /// The K=V scalar auto-typing rule: bool/int ride typed,
+    /// everything else stays a string; malformed input refuses
+    /// `invalid_input`.
+    #[test]
+    fn setting_parsing_auto_types_scalars() {
+        assert_eq!(
+            parse_setting("concurrentBackups=2").unwrap(),
+            ("concurrentBackups".to_string(), serde_json::json!(2))
+        );
+        assert_eq!(
+            parse_setting("forceBackups=true").unwrap(),
+            ("forceBackups".to_string(), serde_json::json!(true))
+        );
+        assert_eq!(
+            parse_setting("forceBackups=false").unwrap(),
+            ("forceBackups".to_string(), serde_json::json!(false))
+        );
+        // Negative + big ints ride typed.
+        assert_eq!(
+            parse_setting("n=-7").unwrap(),
+            ("n".to_string(), serde_json::json!(-7))
+        );
+        // Strings stay strings — including numeric-looking text
+        // with units and values that aren't clean ints.
+        assert_eq!(
+            parse_setting("note=hello world").unwrap(),
+            ("note".to_string(), serde_json::json!("hello world"))
+        );
+        assert_eq!(
+            parse_setting("v=1.5").unwrap(),
+            ("v".to_string(), serde_json::json!("1.5")),
+            "floats are NOT auto-typed (the tags-write rule: bool/int only)"
+        );
+
+        let err = parse_setting("noequalsign").expect_err("refuses");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_input");
+        assert!(err.to_string().contains("--definition"));
+        assert!(parse_setting("=v").is_err(), "empty key refuses");
+        assert!(parse_setting("k=").is_err(), "empty value refuses");
+    }
+
+    /// The auto-typing helper's direct pins.
+    #[test]
+    fn auto_type_covers_bool_int_string() {
+        assert_eq!(auto_type("true"), serde_json::json!(true));
+        assert_eq!(auto_type("false"), serde_json::json!(false));
+        assert_eq!(auto_type("42"), serde_json::json!(42));
+        assert_eq!(auto_type("text"), serde_json::json!("text"));
+        assert_eq!(auto_type("True"), serde_json::json!("True"), "case matters");
+    }
+
+    /// The --definition merge semantics: objects merge recursively,
+    /// arrays and scalars REPLACE.
+    #[test]
+    fn deep_merge_merges_objects_replaces_arrays() {
+        let mut base = serde_json::json!({
+            "type": "eam_backup",
+            "scheduleMode": "OnDemand",
+            "targetGateways": ["gw-a"],
+            "settingsNested": {"a": 1, "b": {"x": 1}}
+        });
+        deep_merge(
+            &mut base,
+            &serde_json::json!({
+                "targetGateways": ["gw-b", "gw-c"],
+                "targetGroups": [],
+                "concurrentBackups": 2,
+                "forceBackups": true,
+                "settingsNested": {"b": {"y": 2}}
+            }),
+        );
+        assert_eq!(
+            base,
+            serde_json::json!({
+                "type": "eam_backup",
+                "scheduleMode": "OnDemand",
+                "targetGateways": ["gw-b", "gw-c"],
+                "targetGroups": [],
+                "concurrentBackups": 2,
+                "forceBackups": true,
+                "settingsNested": {"a": 1, "b": {"x": 1, "y": 2}}
+            })
+        );
+    }
 
     /// The summary projection carries the profile type/scheduleMode
     /// and degrades to nulls when the list shape carries neither the

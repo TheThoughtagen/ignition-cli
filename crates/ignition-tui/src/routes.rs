@@ -385,6 +385,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "eam tasks",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 07-02 Task 3: the guarded writes (there is no bare `eam
+        // task` row — EamTaskCommand is required, the `rig trial`
+        // shape). `new` walks the chained dashboard form; `force` is
+        // Confirm-gated per the CLI's guard set.
+        CliRoute {
+            path: "eam task new",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "eam task force",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 

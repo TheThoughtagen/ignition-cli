@@ -176,6 +176,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign backup restore <FILE> --yes` | Restore a gwbk onto THIS gateway (the ACTIVE profile's — `rig restore`'s standalone sibling without the rig wait) | **destructive — the 8th `--yes`-guarded verb**: exit 2 (`confirmation_required`, profile null, ZERO network) without `--yes`; REPLACES this gateway's state, then the gateway restarts and blocks for minutes (the 2xx is acceptance — see §Backups); a nonexistent/empty/non-regular file exits 2 `invalid_input` pre-network; JSON data `{restored: true}` |
 | `ign eam history [--limit N] [--search TEXT]` | EAM task run history — `ISO  taskName  [level]  target  detail` rows (newest first) | rides the RUNTIME seam: a stock (non-controller) gateway refuses exit 6 `eam_not_controller` with the manual-flip hint (definitions still list — see below); `--limit` defaults to 200 and is ALWAYS sent explicitly (the server default is unlimited); outcomes are DATA (`Failed` + GNET-not-connected detail read exit 0); JSON data `{items, count}` — items passthrough under the gateway's own camelCase keys (`taskName`, `taskStart` epoch-ms, `taskType`) |
 | `ign eam tasks [NAME]` | Task definitions: bare form lists (`name  type  schedule  state`); with a name shows the full definition + its scheduled state | rides the config-resource seam (`com.inductiveautomation.eam/eam-tasks`) — definitions answer on STOCK gateways (no controller needed); JSON list data `{tasks: [{name, task_type, schedule_mode, current_state}]}` (all keys always; `current_state` null on list records — find answers carry it); detail data `{name, definition, state}`; an unknown name exits 6 `not_found` |
+| `ign eam task new <NAME> <TYPE> [--target NAME]... [--setting K=V]... [--definition PATH] [--schedule-mode MODE]` | Create a task definition — the typed guard ladder | **the planner-locked ladder**: `eam_backup` + OnDemand (the default schedule) fires UNGUARDED (it never auto-fires and only acts when forced); MUTATING types (`eam_restart`, `eam_sendProject`, `eam_sendResource`, `eam_sendTags`, `eam_activateLicense`, `eam_updateLicense`, `eam_unactivateLicense`) and ANY non-OnDemand `--schedule-mode` (`Immediate`/`Scheduled`/`AtTime`/`AtDelay` — they arm autonomous actions) need `--yes` (exit 2 pre-resolution, zero network); the FLEET-DESTRUCTIVE trio (`eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade`) REFUSES outright — exit 6 `eam_task_type_refused` naming the EXT-03 (v2) scope (run them from the EAM console); `--setting K=V` auto-types scalars (bool/int ride typed, else string); `--definition PATH` deep-merges a full-JSON settings file over the composed profile (objects merge, arrays/scalars replace) — mutually exclusive with `--setting`; the POST body is the config-resource ARRAY shape; JSON data carries the composed definition verbatim |
+| `ign eam task force <NAME> --yes` | Force-dispatch a task NOW (find → owner → POST → history read-back) | **destructive — always `--yes`-guarded** (dispatches to the agent targets immediately; exit 2 pre-resolution without); the owner resolves from the healthcheck's `scheduledTaskState.details.owner` (fallback `eam`); a 2xx is DISPATCH acceptance — the run's OUTCOME lands in history as data (`Failed` + GNET-not-connected detail is the honest shape of an unconfigured agent; trial expiry blocks runs); JSON data `{task, owner, dispatched, history}` |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -566,6 +568,57 @@ controller's fleet-backup inventory, needs `serverids`) is a
 different thing from this gateway's gwbk files and stays out of MVP
 scope.
 
+### The `eam task new` guard ladder
+
+| type class | examples | guard |
+|---|---|---|
+| benign | `eam_backup` | none with the default `OnDemand` schedule (it never auto-fires; force owns the dispatch) |
+| mutating | `eam_restart`, `eam_sendProject`, `eam_sendResource`, `eam_sendTags`, `eam_activateLicense`, `eam_updateLicense`, `eam_unactivateLicense` | `--yes` — they act on their agent targets when dispatched |
+| fleet-destructive | `eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade` | REFUSED outright (exit 6 `eam_task_type_refused`) — they push backups/modules/upgrades to every agent; run them from the Ignition EAM console (EXT-03 v2 scope) |
+
+ANY `--schedule-mode` other than `OnDemand` additionally requires
+`--yes` (it arms autonomous gateway actions — even `eam_backup`).
+An unknown type classifies fail-safe (`--yes`); the server's own
+validation is the backstop.
+
+### Settings forms (`--setting` vs `--definition`)
+
+- `--setting K=V` auto-types scalars: a value that parses cleanly
+  as `true`/`false` or an integer serializes as a JSON bool/number;
+  anything else stays a string. Arrays and objects are OUT of scope
+  for K=V.
+- `--definition PATH` is the typed/array path: a full-JSON file
+  whose top-level object deep-merges over the composed profile
+  (objects merge recursively; arrays and scalars REPLACE). Example
+  (the live-captured `eam_backup` settings shape):
+
+  ```json
+  {
+    "targetGateways": ["gw-a", "gw-b"],
+    "targetGroups": [],
+    "concurrentBackups": 2,
+    "forceBackups": true
+  }
+  ```
+
+  (`--setting` + `--definition` together is a usage error.)
+
+### `eam task force` semantics
+
+`force` = find (owner from `scheduledTaskState.details.owner`,
+fallback `eam`) → `POST /eam-tasks/force/{owner}/{name}` (204 =
+dispatched) → a history re-read. The history entry rides the result
+so the OUTCOME is visible immediately: `level`/`detail` are data —
+a `Failed` run with "Gateway network for agent … not connected" or
+"Trial timer is expired" is the honest report of the gateway's
+execution prerequisites (GNET agent + live trial), never hidden.
+
+**`eam_restoreBackup` vs `ign backup restore`** — different axes:
+`ign backup restore` restores THIS gateway from gwbk bytes; the EAM
+`eam_restoreBackup` type dispatches an ARCHIVED backup to fleet
+AGENTS (and is therefore refused in `task new` — run it from the
+EAM console).
+
 ### Project export/import specifics
 
 
@@ -751,8 +804,12 @@ the whole gateway down for ~1 min — and `rig reset`, which deletes
 the rig's volumes, plus `rig trial reset`, which restarts the trial
 window, and `rig restore`, which REPLACES the gateway's state with a
 gwbk, and `backup restore` — `rig restore`'s standalone sibling on
-any profiled gateway, same whole-state replacement) refuse without
-`--yes`
+any profiled gateway, same whole-state replacement — plus the EAM
+writes: `eam task new` for MUTATING types or any non-OnDemand
+schedule (the typed ladder above; `eam_backup` + OnDemand needs no
+`--yes` and the fleet-destructive trio refuses outright instead of
+guarding), and `eam task force`, which dispatches NOW) refuse
+without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
 pass `--yes` once and humans get a speed bump. `restart` is guarded in

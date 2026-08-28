@@ -35,11 +35,11 @@ use ignition_core::error::CoreError;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, LogLevel, LoggersCmd, LogsArgs,
-    LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand, ResourceArgs, ResourceCommand,
-    RigArgs, RigCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand,
-    TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd,
-    WebdevArgs, WebdevCommand,
+    BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, EamTaskCommand, LogLevel,
+    LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
+    ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode, SessionsArgs, SessionsCmd,
+    TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
+    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -161,6 +161,12 @@ enum ActionOutput {
     EamTasks(actions::eam::EamTasksResult),
     /// `ign eam tasks <NAME>` — one definition + its state.
     EamTaskDetail(actions::eam::EamTaskDetailResult),
+    /// `ign eam task new` — the guarded create; data carries the
+    /// composed definition verbatim.
+    EamTaskCreate(actions::eam::EamTaskCreateResult),
+    /// `ign eam task force` — the guarded dispatch + the honest
+    /// history read-back.
+    EamTaskForce(actions::eam::EamTaskForceResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -284,6 +290,8 @@ impl ActionOutput {
             ActionOutput::EamHistory(result) => render_success(profile, result, compact),
             ActionOutput::EamTasks(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskDetail(result) => render_success(profile, result, compact),
+            ActionOutput::EamTaskCreate(result) => render_success(profile, result, compact),
+            ActionOutput::EamTaskForce(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -1774,6 +1782,101 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 };
                 (name, result)
             }
+            // Task writes (07-02 Task 3): the typed guard ladder.
+            // `new` computes the PURE verdict from the parsed args
+            // PRE-RESOLUTION — zero network on refusal; `Refused`
+            // never reaches a client either way (the action
+            // re-checks and errors — the double-check keeps the
+            // ladder authoritative in core). `force` is ALWAYS
+            // guarded (it dispatches NOW).
+            EamCommand::Task(task_command) => match task_command {
+                EamTaskCommand::New {
+                    name: task_name,
+                    r#type,
+                    target,
+                    setting,
+                    definition,
+                    schedule_mode,
+                } => {
+                    use actions::eam::TaskCreateVerdict;
+                    match actions::eam::task_create_guard(&r#type, schedule_mode.wire()) {
+                        TaskCreateVerdict::Refused => {
+                            return (
+                                None,
+                                Err(CoreError::EamTaskTypeRefused {
+                                    task_type: r#type.clone(),
+                                }),
+                            );
+                        }
+                        TaskCreateVerdict::NeedsYes => {
+                            // The operation string names WHICH rung
+                            // fired (the consequence, not a generic
+                            // hint — the resource-put message
+                            // pattern).
+                            let operation = if schedule_mode != ScheduleMode::OnDemand {
+                                format!(
+                                    "eam task new (scheduleMode {} arms autonomous \
+                                     gateway actions)",
+                                    schedule_mode.wire()
+                                )
+                            } else {
+                                format!(
+                                    "eam task new ({} mutates the agent \
+                                     targets it dispatches to)",
+                                    r#type
+                                )
+                            };
+                            if let Err(err) = require_confirmation(cli.yes, &operation) {
+                                return (None, Err(err));
+                            }
+                        }
+                        TaskCreateVerdict::Unguarded => {}
+                    }
+                    // The --definition file reads BEFORE resolution
+                    // (the tags-config create byte-source
+                    // precedent: malformed JSON is exit 2 with zero
+                    // network work).
+                    let definition_value = match definition.as_deref() {
+                        Some(path) => match read_json_input(path).await {
+                            Ok(value) => Some(value),
+                            Err(err) => return (None, Err(err)),
+                        },
+                        None => None,
+                    };
+                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => actions::eam::eam_task_create(
+                            &api,
+                            &task_name,
+                            &r#type,
+                            &target,
+                            &setting,
+                            definition_value.as_ref(),
+                            schedule_mode.wire(),
+                        )
+                        .await
+                        .map(ActionOutput::EamTaskCreate),
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                EamTaskCommand::Force { name: task_name } => {
+                    if let Err(err) = require_confirmation(
+                        cli.yes,
+                        "eam task force (dispatches the task to agent targets NOW)",
+                    ) {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => actions::eam::eam_task_force(&api, &task_name)
+                            .await
+                            .map(ActionOutput::EamTaskForce),
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+            },
         },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {

@@ -303,6 +303,12 @@ mod tests {
         ) -> Result<crate::client::eam::EamTaskRecord, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn eam_task_create(&self, _definition: &serde_json::Value) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_force(&self, _owner: &str, _name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
             Ok(GatewayInfo {
                 name: Some("ign-mock".into()),
@@ -630,6 +636,12 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<crate::client::eam::EamTaskRecord, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_create(&self, _definition: &serde_json::Value) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_force(&self, _owner: &str, _name: &str) -> Result<(), CoreError> {
             unreachable!("not part of this action")
         }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {

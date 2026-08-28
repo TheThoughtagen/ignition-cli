@@ -16,7 +16,9 @@
 
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
-use ignition_core::actions::eam::{EamHistoryResult, EamTaskDetailResult, EamTasksResult};
+use ignition_core::actions::eam::{
+    EamHistoryResult, EamTaskCreateResult, EamTaskDetailResult, EamTaskForceResult, EamTasksResult,
+};
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
 use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
@@ -228,6 +230,8 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamHistory(result) => render_eam_history_human(result),
         ActionOutput::EamTasks(result) => render_eam_tasks_human(result),
         ActionOutput::EamTaskDetail(result) => render_eam_task_detail_human(result),
+        ActionOutput::EamTaskCreate(result) => render_eam_task_create_human(result),
+        ActionOutput::EamTaskForce(result) => render_eam_task_force_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -923,6 +927,39 @@ fn render_eam_tasks_human(result: &EamTasksResult) {
             task.schedule_mode.as_deref().unwrap_or("-"),
             task.current_state.as_deref().unwrap_or("-"),
         );
+    }
+}
+
+/// `ign eam task new` human line — created + the composed
+/// definition pretty-printed (the read-back of what rides the wire).
+fn render_eam_task_create_human(result: &EamTaskCreateResult) {
+    println!(
+        "created {} ({} / {})",
+        result.name, result.task_type, result.schedule_mode
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result.definition).unwrap_or_default()
+    );
+}
+
+/// `ign eam task force` human shape — dispatch acceptance + the
+/// honest history read-back (a Failed level with GNET detail is the
+/// truth of an unconfigured agent, printed as data).
+fn render_eam_task_force_human(result: &EamTaskForceResult) {
+    println!(
+        "dispatched {} (owner {}) — run outcomes:",
+        result.task, result.owner
+    );
+    match &result.history {
+        Some(item) => {
+            println!(
+                "  [{}] {}",
+                item.level.as_deref().unwrap_or("-"),
+                item.detail.as_deref().unwrap_or("(no detail)")
+            );
+        }
+        None => println!("  (no history entry visible yet)"),
     }
 }
 

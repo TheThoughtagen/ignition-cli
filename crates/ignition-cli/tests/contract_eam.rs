@@ -214,3 +214,288 @@ async fn controller_refusal_golden() {
         "the hint names the manual flip: {hint}"
     );
 }
+
+// ---- Task 3: the guarded writes' binary goldens ----
+
+/// THE ladder-at-the-binary pins: verdicts computed from parsed
+/// args PRE-RESOLUTION — zero requests on every refusal, profile
+/// null, the consequence named per rung.
+#[tokio::test]
+async fn task_new_guard_ladder_refusals_do_zero_work() {
+    let server = wiremock::MockServer::start().await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    // Mutating type without --yes: exit 2, the TYPE names the
+    // consequence.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["eam", "task", "new", "r1", "eam_restart", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let body: serde_json::Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("envelope parses");
+    assert_eq!(body["profile"], serde_json::Value::Null, "pre-resolution");
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::Value::String("confirmation_required".into())
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("eam_restart") && message.contains("mutates"),
+        "the type + consequence are named: {message}"
+    );
+
+    // Non-OnDemand schedule without --yes: exit 2, the SCHEDULE
+    // names the consequence (even for eam_backup).
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "eam",
+            "task",
+            "new",
+            "s1",
+            "eam_backup",
+            "--schedule-mode",
+            "immediate",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let body: serde_json::Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("envelope parses");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("Immediate") && message.contains("autonomous"),
+        "the schedule rung is named: {message}"
+    );
+
+    // The refused trio: exit 6 eam_task_type_refused — profile null,
+    // ZERO requests (never reaches a client).
+    for refused in [
+        "eam_restoreBackup",
+        "eam_installModules",
+        "eam_remoteUpgrade",
+    ] {
+        let out = ign(
+            &config,
+            &server.uri(),
+            &["eam", "task", "new", "d1", refused, "--compact"],
+        );
+        assert_eq!(out.status.code(), Some(6));
+        let body: serde_json::Value =
+            serde_json::from_str(&stderr_envelope(&out)).expect("envelope parses");
+        assert_eq!(body["profile"], serde_json::Value::Null);
+        assert_eq!(
+            body["error"]["code"],
+            serde_json::Value::String("eam_task_type_refused".into())
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("EXT-03"),
+            "the v2 scope pointer rides the refusal"
+        );
+    }
+
+    // Force without --yes: exit 2, dispatch consequence named.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["eam", "task", "force", "t1", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let body: serde_json::Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("envelope parses");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("eam task force") && message.contains("NOW"),
+        "the dispatch consequence is named: {message}"
+    );
+
+    // ZERO network on every refusal above.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "guard-ladder refusals do no network work"
+    );
+}
+
+/// `--setting` + `--definition` conflict: clap's own usage error
+/// (exit 2) — the mutually-exclusive forms refuse at parse time.
+#[test]
+fn task_new_setting_definition_conflict_is_a_usage_error() {
+    let (_config_dir, config) = isolated_config();
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "eam",
+            "task",
+            "new",
+            "t",
+            "eam_backup",
+            "--setting",
+            "k=1",
+            "--definition",
+            "def.json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "clap's conflict message leads: {stderr}"
+    );
+}
+
+/// The unguarded create SUCCESS golden: eam_backup + OnDemand needs
+/// no --yes — the array POST rides, data carries the composed
+/// definition verbatim.
+#[tokio::test]
+async fn task_new_backup_ondemand_fires_unguarded() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "eam",
+            "task",
+            "new",
+            "nightly-backup",
+            "eam_backup",
+            "--target",
+            "gw-a",
+            "--setting",
+            "concurrentBackups=2",
+            "--setting",
+            "forceBackups=true",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[
+            r#"{"ok":true,"profile":"dev","data":{"name":"nightly-backup","task_type":"eam_backup","schedule_mode":"OnDemand","definition":{"config":{"profile":{"concurrentBackups":2,"forceBackups":true,"scheduleMode":"OnDemand","targetGateways":["gw-a"],"type":"eam_backup"}},"name":"nightly-backup"}}}"#
+        ]],
+    );
+    // The typed settings rode the wire (no stringly-typed leaks).
+    let requests = server.received_requests().await.unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
+    assert_eq!(body[0]["config"]["profile"]["concurrentBackups"], 2);
+    assert_eq!(body[0]["config"]["profile"]["forceBackups"], true);
+}
+
+/// The force SUCCESS golden: --yes passes the guard, the 3-request
+/// sequence rides, data carries owner + dispatched + the honest
+/// history entry.
+#[tokio::test]
+async fn task_force_success_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/nightly%2Dbackup",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "nightly-backup",
+                "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}},
+                "scheduledTaskState": {"currentState": "IDLE", "details": {"owner": "eam"}}
+            })),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/eam/api/v1/eam-tasks/force/eam/nightly-backup",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/eam/api/v1/eam-tasks/history"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [
+                {
+                    "taskId": 9,
+                    "taskName": "nightly-backup (forced)",
+                    "taskStart": 1787930000000_i64,
+                    "taskEnd": 1787930009000_i64,
+                    "target": "_controller",
+                    "level": "Failed",
+                    "detail": "Gateway network for agent '_controller' is currently not connected",
+                    "taskType": "eam_backup"
+                }
+            ],
+            "metadata": {"total": 1, "matching": 1, "limit": 20, "offset": 0}
+        })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "eam",
+            "task",
+            "force",
+            "nightly-backup",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[
+            r#"{"ok":true,"profile":"dev","data":{"task":"nightly-backup","owner":"eam","dispatched":true,"history":{"taskId":9,"taskName":"nightly-backup (forced)","taskStart":1787930000000,"taskEnd":1787930009000,"target":"_controller","level":"Failed","detail":"Gateway network for agent '_controller' is currently not connected","taskType":"eam_backup"}}}"#
+        ]],
+    );
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["eam", "task", "force", "nightly-backup", "--yes"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+dispatched nightly-backup (owner eam) — run outcomes:
+  [Failed] Gateway network for agent '_controller' is currently not connected"#]],
+    );
+}

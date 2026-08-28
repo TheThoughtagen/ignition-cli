@@ -12,8 +12,8 @@ use ignition_core::client::ReqwestGatewayApi;
 
 use crate::event::AppEvent;
 use crate::state::{
-    ACTIONS, AppState, LOG_ACTIONS, Modal, PROJECT_ACTIONS, PendingAction, PendingInput,
-    RIG_ACTIONS, RigForm, Screen, SessionRow, TAG_ACTIONS, TagsForm, session_rows,
+    ACTIONS, AppState, DashboardForm, LOG_ACTIONS, Modal, PROJECT_ACTIONS, PendingAction,
+    PendingInput, RIG_ACTIONS, RigForm, Screen, SessionRow, TAG_ACTIONS, TagsForm, session_rows,
 };
 use crate::workers;
 
@@ -2452,6 +2452,35 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 });
             }
         }
+        // The guarded writes: `new` walks the chained form (name →
+        // type → targets → schedule — empty schedule = OnDemand);
+        // the pure ladder gates at the chain's end (unguarded fires
+        // direct, NeedsYes arms the Confirm, Refused opens the
+        // error modal — the CLI's own verdict, imported). `force`
+        // prompts the name, always Confirm-gated.
+        Some("eam task new") => {
+            state.dashboard.pending_form = Some(DashboardForm::EamNewName);
+            state.open_modal(Modal::Input {
+                title: "eam task new — name".to_string(),
+                hint: Some(
+                    "the task definition's name\nCLI: ign eam task new <NAME> <TYPE> \\
+                     [--target NAME]... [--setting K=V] [--schedule-mode MODE]"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
+        Some("eam task force") => {
+            state.dashboard.pending_input = Some(PendingInput::EamTaskForceName);
+            state.open_modal(Modal::Input {
+                title: "eam task force — name".to_string(),
+                hint: Some(
+                    "dispatches the task to its agent targets NOW\nCLI: ign eam task force <NAME> --yes"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
         Some("backup restore") => {
             state.dashboard.pending_input = Some(PendingInput::BackupRestoreFile);
             state.open_modal(Modal::Input {
@@ -2611,6 +2640,211 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
                 });
             }
         }
+        // The confirmed EAM create fires unguarded — the TUI owned
+        // the ladder's `--yes` (settings ride empty: the cockpit
+        // form covers the common shape; the CLI owns --setting/
+        // --definition — the modal-depth decision).
+        PendingAction::EamTaskNew {
+            name,
+            task_type,
+            targets,
+            schedule_mode,
+        } => {
+            if let Some(client) = client_arc(state) {
+                let name = name.clone();
+                let task_type = task_type.clone();
+                let schedule_mode = schedule_mode.clone();
+                let targets: Vec<String> = targets
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                workers::spawn_action(state, "eam task new", async move {
+                    ignition_core::actions::eam::eam_task_create(
+                        &*client,
+                        &name,
+                        &task_type,
+                        &targets,
+                        &[],
+                        None,
+                        &schedule_mode,
+                    )
+                    .await
+                });
+            }
+        }
+        // The confirmed force fires unguarded (dispatch acceptance;
+        // outcomes land in history as data).
+        PendingAction::EamTaskForce { name } => {
+            if let Some(client) = client_arc(state) {
+                let name = name.clone();
+                workers::spawn_action(state, "eam task force", async move {
+                    ignition_core::actions::eam::eam_task_force(&*client, &name).await
+                });
+            }
+        }
+    }
+}
+
+/// Route an accepted dashboard form step (Enter): the `eam task new`
+/// chain walks name → type → targets → schedule (empty schedule =
+/// OnDemand), then the PURE ladder gates the fire — unguarded fires
+/// direct, NeedsYes arms the Confirm, Refused opens the error modal
+/// (the CLI's own verdict, imported — the parity tripwire's data
+/// source).
+fn accept_dashboard_form(state: &mut AppState, value: &str) {
+    use ignition_core::actions::eam::{TaskCreateVerdict, task_create_guard};
+
+    let Some(form) = state.dashboard.pending_form.take() else {
+        return;
+    };
+    let value = value.trim();
+    match form {
+        DashboardForm::EamNewName => {
+            if value.is_empty() {
+                clear_pending(state);
+                return;
+            }
+            state.dashboard.pending_form = Some(DashboardForm::EamNewType {
+                name: value.to_string(),
+            });
+            state.open_modal(Modal::Input {
+                title: "eam task new — type".to_string(),
+                hint: Some(
+                    "e.g. eam_backup (unguarded), eam_restart (--yes), \\
+                     eam_sendProject (--yes)\nrestore/install/upgrade types refuse"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
+        DashboardForm::EamNewType { name } => {
+            if value.is_empty() {
+                clear_pending(state);
+                return;
+            }
+            state.dashboard.pending_form = Some(DashboardForm::EamNewTargets {
+                name,
+                task_type: value.to_string(),
+            });
+            state.open_modal(Modal::Input {
+                title: "eam task new — targets".to_string(),
+                hint: Some(
+                    "comma/space-separated GNET agent names (empty = none)\neam_backup validates: targets OR controllerIsTargetKey"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
+        DashboardForm::EamNewTargets { name, task_type } => {
+            state.dashboard.pending_form = Some(DashboardForm::EamNewSchedule {
+                name,
+                task_type,
+                targets: value.to_string(),
+            });
+            state.open_modal(Modal::Input {
+                title: "eam task new — schedule mode".to_string(),
+                hint: Some(
+                    "empty or OnDemand (never auto-fires)\nImmediate/Scheduled/AtTime/AtDelay need --yes"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
+        DashboardForm::EamNewSchedule {
+            name,
+            task_type,
+            targets,
+        } => {
+            let schedule_mode = if value.is_empty() {
+                "OnDemand".to_string()
+            } else {
+                // Case-insensitive acceptance of the wire tokens
+                // (the exact tokens the hint names).
+                let normalized = lowercase_first(value);
+                match normalized.as_str() {
+                    "ondemand" => "OnDemand".to_string(),
+                    "immediate" => "Immediate".to_string(),
+                    "scheduled" => "Scheduled".to_string(),
+                    "attime" => "AtTime".to_string(),
+                    "atdelay" => "AtDelay".to_string(),
+                    _ => normalized,
+                }
+            };
+            match task_create_guard(&task_type, &schedule_mode) {
+                TaskCreateVerdict::Unguarded => {
+                    fire_eam_task_new(state, &name, &task_type, &targets, &schedule_mode);
+                }
+                TaskCreateVerdict::Refused => {
+                    open_error_modal(
+                        state,
+                        "eam task new",
+                        &ignition_core::error::CoreError::EamTaskTypeRefused {
+                            task_type: task_type.clone(),
+                        }
+                        .to_string(),
+                    );
+                }
+                TaskCreateVerdict::NeedsYes => {
+                    state.dashboard.pending = Some(PendingAction::EamTaskNew {
+                        name,
+                        task_type,
+                        targets,
+                        schedule_mode,
+                    });
+                    state.open_modal(Modal::Confirm {
+                        title: "eam task new".to_string(),
+                        body: "create this task definition? (mutating type / armed schedule —                                it acts on its agent targets when dispatched)"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Fire the unguarded create directly (the ladder's only unguarded
+/// cell — backup + OnDemand).
+fn fire_eam_task_new(
+    state: &mut AppState,
+    name: &str,
+    task_type: &str,
+    targets: &str,
+    schedule_mode: &str,
+) {
+    if let Some(client) = client_arc(state) {
+        let name = name.to_string();
+        let task_type = task_type.to_string();
+        let schedule_mode = schedule_mode.to_string();
+        let targets: Vec<String> = targets
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+            .collect();
+        workers::spawn_action(state, "eam task new", async move {
+            ignition_core::actions::eam::eam_task_create(
+                &*client,
+                &name,
+                &task_type,
+                &targets,
+                &[],
+                None,
+                &schedule_mode,
+            )
+            .await
+        });
+    }
+}
+
+/// Lowercase the first char (the schedule-token normalizer —
+/// std-only, ASCII tokens only).
+fn lowercase_first(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_lowercase().to_string() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -2868,6 +3102,12 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
             accept_tags_form(state, &value);
             return;
         }
+        // The dashboard's multi-step form chain first (07-02: the
+        // `eam task new` ladder walk).
+        if state.dashboard.pending_form.is_some() {
+            accept_dashboard_form(state, &value);
+            return;
+        }
         // The Projects screen's forms next (06-05's small-form
         // router, its own pending slot).
         if state.projects.pending_form.is_some() {
@@ -2916,6 +3156,21 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                 }
                 Err(reason) => open_error_modal(state, "loggers set", &reason),
             },
+            // The force target: the Confirm gate arms at accept
+            // (07-02 Task 3 — dispatches NOW).
+            (Some(PendingInput::EamTaskForceName), false) => {
+                state.dashboard.pending = Some(PendingAction::EamTaskForce {
+                    name: value.trim().to_string(),
+                });
+                state.open_modal(Modal::Confirm {
+                    title: "eam task force".to_string(),
+                    body: format!(
+                        "dispatch {} to its agent targets NOW? (run outcomes land \
+                         in history as data)",
+                        value.trim()
+                    ),
+                });
+            }
             // The gwbk path: the Confirm gate arms at accept (07-02 —
             // the restore REPLACES this gateway's state).
             (Some(PendingInput::BackupRestoreFile), false) => {
@@ -3113,6 +3368,7 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
 fn clear_pending(state: &mut AppState) {
     state.dashboard.pending = None;
     state.dashboard.pending_input = None;
+    state.dashboard.pending_form = None;
     state.tags.pending_form = None;
     state.projects.pending_form = None;
     state.rig.pending_form = None;
@@ -3150,6 +3406,8 @@ fn gated_cli_verb(pending: &PendingAction) -> &'static str {
         PendingAction::RigTrialReset => "rig trial reset",
         PendingAction::ProjectSync { .. } => "project sync",
         PendingAction::BackupRestore { .. } => "backup restore",
+        PendingAction::EamTaskNew { .. } => "eam task new",
+        PendingAction::EamTaskForce { .. } => "eam task force",
     }
 }
 
@@ -3771,11 +4029,11 @@ mod tests {
             "k steps back up like Up"
         );
 
-        // G bottoms out at the last entry (eam tasks, index 10 —
-        // the 07-02 backup + EAM pairs appended after restart).
+        // G bottoms out at the last entry (eam task force, index 12 —
+        // the 07-02 backup + EAM families appended after restart).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 10 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 12 })),
             "G jumps to the last entry"
         );
 
@@ -6910,6 +7168,89 @@ mod tests {
         assert_eq!(state.rig.logs.front().map(String::as_str), Some("one"));
     }
 
+    // ---- 07-02: the eam task new chain's verdict gating ----
+
+    /// A dashboard state with a client + event channel armed (the
+    /// direct-fire paths need the client handle; the 06-02 test
+    /// precedent).
+    fn armed_dashboard_state() -> AppState {
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        state
+    }
+
+    /// Walk the `eam task new` chain to its final schedule step (the
+    /// shared prefix of the gating tests): open the first Input,
+    /// type-then-Enter each value (chars land in the open modal's
+    /// buffer; Enter accepts and the chain opens the next).
+    fn walk_eam_new_chain(state: &mut AppState, task_type: &str) {
+        state.dashboard.pending_form = Some(crate::state::DashboardForm::EamNewName);
+        state.open_modal(Modal::Input {
+            title: "eam task new — name".to_string(),
+            hint: None,
+            buffer: String::new(),
+        });
+        for value in ["nightly-backup", task_type, "gw-a"] {
+            for c in value.chars() {
+                update(state, key(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            update(state, key(KeyCode::Enter, KeyModifiers::NONE));
+        }
+    }
+
+    /// The verdict gates the chain's END exactly like the CLI:
+    /// eam_backup + OnDemand fires DIRECT (no Confirm — the busy
+    /// guard's in_flight label is the witness).
+    #[test]
+    fn eam_task_new_backup_ondemand_fires_direct() {
+        let mut state = armed_dashboard_state();
+        walk_eam_new_chain(&mut state, "eam_backup");
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !matches!(state.modal, Some(Modal::Confirm { .. })),
+            "unguarded: no Confirm arms"
+        );
+        assert_eq!(
+            state.dashboard.in_flight,
+            Some("eam task new"),
+            "the create fired directly"
+        );
+        assert!(state.dashboard.pending_form.is_none(), "chain consumed");
+    }
+
+    /// eam_restart (the mutating set) arms the Confirm — the TUI's
+    /// mirror of the CLI's `--yes`.
+    #[test]
+    fn eam_task_new_mutating_type_arms_confirm() {
+        let mut state = AppState::new();
+        walk_eam_new_chain(&mut state, "eam_restart");
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(state.modal, Some(Modal::Confirm { .. })));
+        assert!(matches!(
+            state.dashboard.pending,
+            Some(PendingAction::EamTaskNew { .. })
+        ));
+    }
+
+    /// The refused trio opens the ERROR modal (never a Confirm, never
+    /// a fire) — the ladder's top rung, TUI edition.
+    #[test]
+    fn eam_task_new_refused_type_opens_the_error_modal() {
+        let mut state = AppState::new();
+        walk_eam_new_chain(&mut state, "eam_remoteUpgrade");
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&state.modal, Some(Modal::Result_ { title, lines, .. }) if title == "eam task new"
+                && lines.iter().any(|line| line.contains("fleet-destructive"))),
+            "the refusal lands in the error modal with its consequence: {:?}",
+            state.modal
+        );
+        assert!(state.dashboard.pending.is_none(), "nothing arms");
+    }
+
     // ---- Destructive-verb confirm-parity audit (06-05 Task 3) ----
 
     /// One of every confirm-gated PendingAction shape — the audit's
@@ -6968,6 +7309,15 @@ mod tests {
             PendingAction::BackupRestore {
                 file: "snap.gwbk".into(),
             },
+            PendingAction::EamTaskNew {
+                name: "nightly-backup".into(),
+                task_type: "eam_restart".into(),
+                targets: "gw-a".into(),
+                schedule_mode: "OnDemand".into(),
+            },
+            PendingAction::EamTaskForce {
+                name: "nightly-backup".into(),
+            },
         ]
     }
 
@@ -6983,6 +7333,8 @@ mod tests {
         verbs.sort_unstable();
         let expected = [
             "backup restore",
+            "eam task force",
+            "eam task new",
             "logs loggers reset",
             "logs loggers set",
             "project delete",
@@ -7028,6 +7380,7 @@ mod tests {
             "rig restore",
             "rig trial reset",
             "backup restore",
+            "eam task",
         ] {
             assert!(
                 routes

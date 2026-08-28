@@ -940,6 +940,79 @@ pub enum EamCommand {
         /// One task definition's detail (omit to list all)
         name: Option<String>,
     },
+    /// Task definition writes (create; force-dispatch) — `eam task`
+    /// requires a subcommand (the `rig trial` shape)
+    #[command(subcommand)]
+    Task(EamTaskCommand),
+}
+
+/// `eam task …` — the guarded writes (07-02 Task 3). `new` carries
+/// the typed guard ladder (backup+OnDemand unguarded; mutating
+/// types and any non-OnDemand schedule need --yes;
+/// restore/install/upgrade types refuse outright — see README);
+/// `force` dispatches NOW, always guarded.
+#[derive(Debug, Subcommand)]
+pub enum EamTaskCommand {
+    /// Create a task definition (scheduleMode defaults to OnDemand —
+    /// never auto-fires)
+    New {
+        /// Task definition name
+        name: String,
+        /// Task type (the openapi taxonomy: eam_backup, eam_restart,
+        /// eam_sendProject, … — restore/install/upgrade refuse)
+        r#type: String,
+        /// Target gateway name (repeatable; the GNET agent id)
+        #[arg(long, value_name = "NAME")]
+        target: Vec<String>,
+        /// Setting as K=V with scalar auto-typing — bool/int ride
+        /// typed, anything else stays a string (repeatable;
+        /// arrays/objects need --definition)
+        #[arg(long, value_name = "K=V")]
+        setting: Vec<String>,
+        /// Full-JSON settings file deep-merged over the composed
+        /// profile (the typed/array settings path)
+        #[arg(long, value_name = "PATH", conflicts_with = "setting")]
+        definition: Option<PathBuf>,
+        /// Schedule mode (default OnDemand — never auto-fires;
+        /// Immediate/Scheduled/AtTime/AtDelay require --yes)
+        #[arg(long, value_enum, default_value_t = ScheduleMode::OnDemand)]
+        schedule_mode: ScheduleMode,
+    },
+    /// Force-dispatch a task NOW — destructive, refused without
+    /// --yes (it dispatches to the agent targets immediately)
+    Force {
+        /// Task definition name to dispatch
+        name: String,
+    },
+}
+
+/// Schedule modes (the openapi taxonomy's user-facing subset —
+/// SuspendedByFailover is system-owned, not a CLI value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScheduleMode {
+    /// Never fires on its own (force dispatches it)
+    OnDemand,
+    /// Fires immediately on create (requires --yes)
+    Immediate,
+    /// Fires on a schedule (requires --yes)
+    Scheduled,
+    /// Fires at an absolute time (requires --yes)
+    AtTime,
+    /// Fires after a delay (requires --yes)
+    AtDelay,
+}
+
+impl ScheduleMode {
+    /// The wire token.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::OnDemand => "OnDemand",
+            Self::Immediate => "Immediate",
+            Self::Scheduled => "Scheduled",
+            Self::AtTime => "AtTime",
+            Self::AtDelay => "AtDelay",
+        }
+    }
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

@@ -451,6 +451,12 @@ mod tests {
         ) -> Result<crate::client::eam::EamTaskRecord, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn eam_task_create(&self, _definition: &serde_json::Value) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_force(&self, _owner: &str, _name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
             self.queries.lock().unwrap().push(filter.clone());
             let items = self.pages.lock().unwrap().pop_front().unwrap_or_default();
@@ -789,6 +795,15 @@ mod tests {
                 &self,
                 _name: &str,
             ) -> Result<crate::client::eam::EamTaskRecord, CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn eam_task_create(
+                &self,
+                _definition: &serde_json::Value,
+            ) -> Result<(), CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn eam_task_force(&self, _owner: &str, _name: &str) -> Result<(), CoreError> {
                 unreachable!("not part of this action")
             }
             async fn logs(&self, _filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {

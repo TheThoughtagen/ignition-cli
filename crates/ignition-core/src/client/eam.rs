@@ -47,7 +47,6 @@ pub(crate) const EAM_HISTORY_DEFAULT_LIMIT: i64 = 200;
 /// POST path — force-dispatch a task now (Task 3; owner = the task
 /// healthcheck's `scheduledTaskState.details.owner`, live-captured
 /// fallback `"eam"`). 204 is the live-proven success shape.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn eam_force_path(owner: &str, name: &str) -> String {
     format!("{EAM_BASE}/eam-tasks/force/{owner}/{name}")
 }
@@ -73,7 +72,6 @@ pub(crate) fn eam_task_find_path(name: &str) -> String {
 
 /// POST path — create task definitions (the body is a JSON ARRAY of
 /// definition records; the tag-provider create shape).
-#[expect(dead_code)] // Task 3's create method is the first caller
 pub(crate) fn eam_tasks_create_path() -> String {
     format!("/data/api/v1/resources/{EAM_TASKS_RESOURCE}")
 }

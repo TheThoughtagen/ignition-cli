@@ -255,6 +255,43 @@ pub enum PendingAction {
     /// 8th guarded CLI verb; REPLACES this gateway's state from the
     /// gwbk, then the gateway restarts and blocks ~minutes).
     BackupRestore { file: String },
+    /// `ign eam task new …` (Confirm ≡ `--yes` — 07-02 Task 3: arms
+    /// ONLY when the pure ladder says NeedsYes — mutating types or
+    /// non-OnDemand schedules; backup+OnDemand fires unguarded like
+    /// the CLI, refused types never arm at all).
+    EamTaskNew {
+        /// Definition name.
+        name: String,
+        /// The `profile.type` token.
+        task_type: String,
+        /// Comma/space-separated target gateway names.
+        targets: String,
+        /// The schedule-mode wire token.
+        schedule_mode: String,
+    },
+    /// `ign eam task force <NAME>` (Confirm ≡ `--yes` — always
+    /// guarded: it dispatches to the agent targets NOW).
+    EamTaskForce { name: String },
+}
+
+/// The dashboard's multi-step form router (07-02: the `eam task new`
+/// chain — name → type → targets → schedule). Cleared by the shared
+/// cancel path so a stale chain can never arm a later Enter (the
+/// rig/projects form discipline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DashboardForm {
+    /// `eam task new` step 1 — the definition NAME.
+    EamNewName,
+    /// `eam task new` step 2 — the TYPE token.
+    EamNewType { name: String },
+    /// `eam task new` step 3 — comma/space-separated TARGETS.
+    EamNewTargets { name: String, task_type: String },
+    /// `eam task new` step 4 — the SCHEDULE MODE (empty = OnDemand).
+    EamNewSchedule {
+        name: String,
+        task_type: String,
+        targets: String,
+    },
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
@@ -273,6 +310,9 @@ pub enum PendingInput {
     /// The gwbk path for `backup restore` (a Confirm gate arms at
     /// accept — 07-02).
     BackupRestoreFile,
+    /// The task name for `eam task force` (a Confirm gate arms at
+    /// accept — 07-02 Task 3).
+    EamTaskForceName,
 }
 
 impl Modal {
@@ -358,7 +398,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 11] = [
+pub const ACTIONS: [&str; 13] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -366,12 +406,14 @@ pub const ACTIONS: [&str; 11] = [
     "wait for module ready",
     "doctor",
     "restart",
-    // 07-02: the standalone backup pair + the EAM read pair
+    // 07-02: the standalone backup pair + the EAM family
     // (gateway-level verbs).
     "backup download",
     "backup restore",
     "eam history",
     "eam tasks",
+    "eam task new",
+    "eam task force",
 ];
 
 /// The Logs screen's actions menu entries (06-03) — the loggers
@@ -597,6 +639,8 @@ pub struct DashboardData {
     pub pending: Option<PendingAction>,
     /// What an Input-modal accept feeds (cleared on cancel).
     pub pending_input: Option<PendingInput>,
+    /// The dashboard's multi-step form chain (cleared on cancel).
+    pub pending_form: Option<DashboardForm>,
     /// The running one-shot action's label ("wait gateway") — the busy
     /// guard per action; the status line renders it while in flight.
     pub in_flight: Option<&'static str>,
@@ -1257,6 +1301,8 @@ mod tests {
                 "backup restore",
                 "eam history",
                 "eam tasks",
+                "eam task new",
+                "eam task force",
             ]
         );
     }

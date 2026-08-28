@@ -618,6 +618,12 @@ mod tests {
         ) -> Result<crate::client::eam::EamTaskRecord, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn eam_task_create(&self, _definition: &serde_json::Value) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn eam_task_force(&self, _owner: &str, _name: &str) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
     }
 
     /// Temp config with one `dev` profile (no auth — the action never

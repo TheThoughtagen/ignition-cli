@@ -362,6 +362,20 @@ pub trait GatewayApi: Send + Sync {
     /// (`currentState`/`nextScheduled`/`owner` under `details`) and
     /// the mutation `signature`. 404 → `NotFound` via classify.
     async fn eam_task_find(&self, name: &str) -> Result<EamTaskRecord, CoreError>;
+    /// POST `/data/api/v1/resources/com.inductiveautomation.eam/
+    /// eam-tasks` (authed) with a JSON **ARRAY** body of one
+    /// definition record — the config-resource create shape (the
+    /// tag-provider precedent). Ok classification IS the success
+    /// contract (create's response body is unverified — the
+    /// project-create precedent; callers that want data re-find).
+    /// Audit-logged server-side.
+    async fn eam_task_create(&self, definition: &serde_json::Value) -> Result<(), CoreError>;
+    /// POST `/data/eam/api/v1/eam-tasks/force/{owner}/{name}` (authed,
+    /// empty body) — dispatch a task NOW. Live-proven success shape:
+    /// **204** (any 2xx is done — the route-status style; execution
+    /// OUTCOMES surface later in history as data, never on this
+    /// response). Runtime seam: the controller gate classifies.
+    async fn eam_task_force(&self, owner: &str, name: &str) -> Result<(), CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -1273,6 +1287,25 @@ impl GatewayApi for ReqwestGatewayApi {
     async fn eam_task_find(&self, name: &str) -> Result<EamTaskRecord, CoreError> {
         self.get_json(&eam::eam_task_find_path(name), None, true)
             .await
+    }
+
+    async fn eam_task_create(&self, definition: &serde_json::Value) -> Result<(), CoreError> {
+        // The ARRAY body is the wire contract (a bare object 400s —
+        // the tag-provider create precedent); the caller's composed
+        // definition rides as the single element. Ok classification
+        // IS the success contract.
+        self.post_json(&eam::eam_tasks_create_path(), &[definition])
+            .await
+            .map(|_| ())
+    }
+
+    async fn eam_task_force(&self, owner: &str, name: &str) -> Result<(), CoreError> {
+        // Empty body, authed POST — 204 is the live-proven success
+        // shape; classify()'s 2xx pass-through IS the oracle (any
+        // 2xx = dispatched; outcomes land in history as data).
+        self.post_empty(&eam::eam_force_path(owner, name), &[], true)
+            .await
+            .map(|_| ())
     }
 }
 

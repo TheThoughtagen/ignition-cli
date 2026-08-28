@@ -304,3 +304,317 @@ async fn non_eam_403_with_the_message_stays_auth() {
     assert_eq!(err.exit_code(), 5);
     assert_eq!(err.code(), "auth_rejected");
 }
+
+// ---- Task 3: the guarded writes ----
+
+const TASKS_CREATE_PATH: &str = "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks";
+
+/// THE create body pin (a) — K=V auto-typing: `--target gw-a
+/// --setting concurrentBackups=2 --setting forceBackups=true`
+/// composes the ARRAY body with `targetGateways: ["gw-a"]`,
+/// `concurrentBackups: 2` (JSON number), `forceBackups: true` (JSON
+/// bool) — NO stringly-typed leaks. The body is pinned VERBATIM
+/// (serde_json maps are key-sorted — the deterministic order the
+/// recorded-request discipline pins).
+#[tokio::test]
+async fn task_create_posts_array_body_with_typed_settings() {
+    let mock = IgnitionMock::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(TASKS_CREATE_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_create(
+        &api,
+        "nightly-backup",
+        "eam_backup",
+        &["gw-a".to_string()],
+        &[
+            "concurrentBackups=2".to_string(),
+            "forceBackups=true".to_string(),
+        ],
+        None,
+        "OnDemand",
+    )
+    .await
+    .expect("create posts");
+    assert_eq!(result.task_type, "eam_backup");
+
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
+    assert_eq!(
+        body,
+        serde_json::json!([{
+            "config": {"profile": {
+                "concurrentBackups": 2,
+                "forceBackups": true,
+                "scheduleMode": "OnDemand",
+                "targetGateways": ["gw-a"],
+                "type": "eam_backup"
+            }},
+            "name": "nightly-backup"
+        }]),
+        "the ARRAY body, composed definition verbatim — settings TYPED"
+    );
+}
+
+/// THE create body pin (b) — the `--definition` file path: a
+/// full-JSON overlay carrying the live-captured eam_backup settings
+/// shape (`targetGateways`/`targetGroups` arrays, `concurrentBackups`
+/// int, `forceBackups` bool) deep-merged over the composed base
+/// `{name, profile: {type, scheduleMode}}`.
+#[tokio::test]
+async fn task_create_deep_merges_the_definition_file() {
+    let mock = IgnitionMock::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(TASKS_CREATE_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let overlay = serde_json::json!({
+        "targetGateways": ["gw-a", "gw-b"],
+        "targetGroups": [],
+        "concurrentBackups": 3,
+        "forceBackups": false
+    });
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    ignition_core::actions::eam::eam_task_create(
+        &api,
+        "fleet-backup",
+        "eam_backup",
+        &[],
+        &[],
+        Some(&overlay),
+        "OnDemand",
+    )
+    .await
+    .expect("create posts");
+
+    let requests = guard.received_requests().await;
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
+    assert_eq!(
+        body,
+        serde_json::json!([{
+            "config": {"profile": {
+                "concurrentBackups": 3,
+                "forceBackups": false,
+                "scheduleMode": "OnDemand",
+                "targetGateways": ["gw-a", "gw-b"],
+                "targetGroups": [],
+                "type": "eam_backup"
+            }},
+            "name": "fleet-backup"
+        }]),
+        "the overlay's typed/array settings deep-merged over the base"
+    );
+}
+
+/// The refused ladder rung at the ACTION layer: a fleet-destructive
+/// type NEVER reaches a client (zero requests) — exit 6,
+/// `eam_task_type_refused`, the message names the EXT-03 scope.
+#[tokio::test]
+async fn task_create_refused_type_never_reaches_the_wire() {
+    let mock = IgnitionMock::start().await;
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    for refused in [
+        "eam_restoreBackup",
+        "eam_installModules",
+        "eam_remoteUpgrade",
+    ] {
+        let err = ignition_core::actions::eam::eam_task_create(
+            &api,
+            "danger",
+            refused,
+            &["gw-a".to_string()],
+            &[],
+            None,
+            "OnDemand",
+        )
+        .await
+        .expect_err("fleet-destructive types refuse");
+        assert_eq!(err.exit_code(), 6);
+        assert_eq!(err.code(), "eam_task_type_refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(refused) && message.contains("fleet-destructive"),
+            "the message names the type + consequence: {message}"
+        );
+        assert!(
+            message.contains("EXT-03"),
+            "the message points at the v2 scope: {message}"
+        );
+    }
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "refusals do no network work"
+    );
+}
+
+/// A malformed `--setting` refuses `invalid_input` (exit 2) before
+/// any network work.
+#[tokio::test]
+async fn task_create_malformed_setting_refuses_pre_network() {
+    let mock = IgnitionMock::start().await;
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let err = ignition_core::actions::eam::eam_task_create(
+        &api,
+        "t",
+        "eam_backup",
+        &[],
+        &["noequalsign".to_string()],
+        None,
+        "OnDemand",
+    )
+    .await
+    .expect_err("malformed K=V refuses");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.code(), "invalid_input");
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+/// THE force sequence pin: find GET → force POST (owner from the
+/// healthcheck's `scheduledTaskState.details.owner`) → history GET —
+/// exactly 3 requests, the 204 accepted, and the honest history
+/// read-back surfaces the Forced/Failed outcome as data.
+#[tokio::test]
+async fn task_force_is_the_three_request_sequence() {
+    let mock = IgnitionMock::start().await;
+    // 1. find — carries the owner under the healthcheck details.
+    mock.list_json(
+        "GET",
+        "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/nightly%2Dbackup",
+        serde_json::json!({
+            "name": "nightly-backup",
+            "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}},
+            "scheduledTaskState": {
+                "currentState": "IDLE",
+                "details": {"owner": "eam"}
+            }
+        }),
+    )
+    .await;
+    // 2. force — the live-proven 204.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/eam/api/v1/eam-tasks/force/eam/nightly-backup",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // 3. history re-read — the forced run's entry.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(HISTORY_PATH))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    {
+                        "taskId": 9,
+                        "taskName": "nightly-backup (forced)",
+                        "taskStart": 1787930000000_i64,
+                        "taskEnd": 1787930009000_i64,
+                        "target": "_controller",
+                        "level": "Failed",
+                        "detail": "Gateway network for agent '_controller' is currently not connected",
+                        "taskType": "eam_backup"
+                    }
+                ],
+                "metadata": {"total": 1, "matching": 1, "limit": 20, "offset": 0}
+            })),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_force(&api, "nightly-backup")
+        .await
+        .expect("the sequence completes");
+    assert_eq!(result.owner, "eam", "owner resolved from the healthcheck");
+    assert!(result.dispatched);
+    let entry = result.history.expect("the forced entry is visible");
+    assert_eq!(entry.task_name, "nightly-backup (forced)");
+    assert_eq!(
+        entry.level.as_deref(),
+        Some("Failed"),
+        "the outcome is data"
+    );
+
+    let requests = mock.server.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 3, "find → force → history, exactly");
+    let sequence: Vec<(&str, String)> = requests
+        .iter()
+        .map(|request| (request.method.as_str(), request.url.path().to_string()))
+        .collect();
+    assert_eq!(
+        sequence,
+        vec![
+            (
+                "GET",
+                "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/nightly%2Dbackup"
+                    .to_string()
+            ),
+            (
+                "POST",
+                "/data/eam/api/v1/eam-tasks/force/eam/nightly-backup".to_string()
+            ),
+            ("GET", "/data/eam/api/v1/eam-tasks/history".to_string()),
+        ],
+        "the request SEQUENCE is the contract"
+    );
+}
+
+/// Owner fallback: a find answer WITHOUT the healthcheck owner
+/// forces against the live-captured default `"eam"`.
+#[tokio::test]
+async fn task_force_owner_falls_back_to_eam() {
+    let mock = IgnitionMock::start().await;
+    mock.list_json(
+        "GET",
+        "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/bare",
+        serde_json::json!({"name": "bare", "config": {}}),
+    )
+    .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/eam/api/v1/eam-tasks/force/eam/bare",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(HISTORY_PATH))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [],
+                "metadata": {"total": 0, "matching": 0, "limit": 20, "offset": 0}
+            })),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_force(&api, "bare")
+        .await
+        .expect("fallback owner forces");
+    assert_eq!(result.owner, "eam");
+    assert!(result.history.is_none(), "no entry yet — null, honestly");
+}
