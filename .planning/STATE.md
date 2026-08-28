@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 7 in progress — 07-01 shipped (cross-gateway `ign project diff` + guarded `ign project sync`: pure normalized-compare engine stripping lastModification/Signature with key-order-independent canonicalization, two-client resolution shape keeping the envelope on the active profile, sync guard-before-resolution with zero-request refusal, TUI rows + confirm parity at 15 verbs, e2e witness needing IGNITION_LIVE_URL_B; workspace 746 tests green, fmt/clippy clean, zero new deps). Next: 07-02 (backup standalone + EAM).
+**Current focus:** Phase 7 in progress — 07-02 shipped (standalone `ign backup download --type|restore` — the 8th --yes-guarded verb, BackupType param-ized onto the one trait method; EAM family: history/tasks reads with the dual-scoped eam_not_controller classify arm, the pure task_create_guard ladder (backup-unguarded / mutating+non-OnDemand --yes / fleet trio refused), force = find→204→history 3-request sequence with GNET/trial outcomes as data; 793 tests green, fmt/clippy clean, zero new deps). Next: 07-03 (script run — route contract already pinned).
 
 ## Current Position
 
 **Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
-**Current Plan:** 2
+**Current Plan:** 3
 **Total Plans in Phase:** 4
 **Status:** Ready to execute
 **Last Activity:** 2026-08-28
 
-**Progress:** [█████████░] 92%
+**Progress:** [██████████] 95%
 
 ## Performance Metrics
 
@@ -62,6 +62,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P10 | 41min | 3 tasks | 3 files |
 | Phase 06 P11 | 20min | 2 tasks | 2 files |
 | Phase 07 P01 | 79min | 3 tasks | 14 files |
+| Phase 07 P02 | 133min | 3 tasks | 31 files |
 
 ## Accumulated Context
 
@@ -189,6 +190,10 @@ Recent decisions affecting current work:
 - [Phase 07-01]: Two-client resolution shape: envelope profile = the ACTIVE profile (resolution unchanged — the frozen one-field envelope); data carries profile_a/profile_b; each side builds its own client via resolve_selection + the ONE locked secret chain (IGNITION_TOKEN applies to BOTH sides unless per-profile keyring entries exist — README caveat)
 - [Phase 07-01]: Diff normalization owns its canonical form: strip exactly attributes.lastModification + lastModificationSignature, recursively key-sort before serialize (key-order-independence pinned — a workspace preserve_order flip cannot change canonical output); 64-bit FNV-1a member digests, zero new dependencies
 - [Phase 07-01]: Sync guard ordering: selection validation (usage errors lead) → --yes guard firing BEFORE resolve_two_clients (exit 2, profile null, zero requests binary-pinned; operation string names the whole-project overwrite-import on the actual profile B) → resolution; empty effective selection (--all-changed, nothing changed) performs NO import (zero-write honesty)
+- [Phase 07-02]: BackupType param-ized the ONE backup_download trait method (roaming default builder-pinned; rig snapshot passes Roaming — byte-identical); standalone backup restore = the 8th --yes-guarded verb (guard-before-resolution, consequence+restart-block named), THIN (no bundled wait — rig restore owns the witnessed wait) — Research Focus 7's one honest signature change; the wait split keeps the standalone verb honest on non-rig gateways where the caller owns readiness
+- [Phase 07-02]: eam_not_controller classified at the classify seam, dual-scoped (path prefix /data/eam/ AND body content 'configured as a controller') — generic 403s stay auth_rejected; NO controller verb and NO ign backup list (README honesty over verb theater; the installMode flip is a README recipe) — The state gate is a role refusal not auth (research Pitfall 2); role decisions stay one config-PUT away, never one CLI flag
+- [Phase 07-02]: EAM create guard ladder LOCKED as ONE pure fn task_create_guard: backup+OnDemand unguarded / 7 mutating types + ANY non-OnDemand schedule need --yes / restore-install-upgrade REFUSE (eam_task_type_refused naming EXT-03 v2) / unknown types fail-safe NeedsYes — shared by CLI pre-resolution, action re-check, and TUI Confirm (parity tripwire at 18 verbs); settings: profile spreads K=V auto-typed scalars (bool/int only, floats stay strings), --definition deep-merges over config.profile (objects merge, arrays/scalars replace) — Planner-locked breadth; one authority prevents CLI/TUI/core drift; fail-safe on unknown types costs a flag, not a fleet
+- [Phase 07-02]: eam task force = find (owner from scheduledTaskState.details.owner, fallback eam) -> 204 force POST -> history re-read (3-request sequence wiremock-pinned); outcomes (Failed + GNET-not-connected / trial-expired) ride as DATA in the result — never hidden, never errors — Research Pitfall 3: execution prerequisites are gateway state, honest data; one extra round trip for owner correctness (the 05-04 precondition precedent)
 
 ### Pending Todos
 
@@ -205,6 +210,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T16:52:26.589Z
-**Stopped At:** Completed 07-01-PLAN.md — cross-gateway project diff + guarded sync shipped (normalized compare, two-client resolution, TUI rows, e2e witness); next: 07-02
+**Last session:** 2026-08-28T19:09:50.889Z
+**Stopped At:** Completed 07-02-PLAN.md — standalone backup verbs + EAM family shipped (8th guarded restore, eam_not_controller state gate, typed task-new ladder, force sequence, e2e fork; 793 tests green, fmt/clippy clean, zero new deps); next: 07-03
 **Resume file:** None
