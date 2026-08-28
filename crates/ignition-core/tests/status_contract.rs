@@ -225,8 +225,8 @@ async fn metrics_current_parses_the_live_capture() {
     let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
     let gauges = api.metrics_current().await.expect("live gauges must parse");
     assert!((gauges.cpu - 4.88).abs() < f64::EPSILON, "percent");
-    assert_eq!(gauges.heap_memory, 240000000);
-    assert_eq!(gauges.max_memory, 1073741824);
+    assert_eq!(gauges.heap_memory, 240000000.0);
+    assert_eq!(gauges.max_memory, 1073741824.0);
 }
 
 /// threads parses the exact live capture (running 32 / waiting 39 /

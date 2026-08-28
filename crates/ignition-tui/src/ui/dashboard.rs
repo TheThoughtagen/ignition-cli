@@ -70,8 +70,8 @@ fn render_status(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
             if let [used, max, ..] = result.overview.memory.as_slice() {
                 lines.push(Line::from(format!(
                     "heap     {} / {}",
-                    fmt_mib(*used),
-                    fmt_mib(*max)
+                    fmt_mib(*used as f64),
+                    fmt_mib(*max as f64)
                 )));
             }
             if let Some(license) = &result.overview.license {
@@ -281,9 +281,12 @@ fn fmt_duration(ms: i64) -> String {
     }
 }
 
-/// Bytes → MiB with one decimal.
-fn fmt_mib(bytes: i64) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+/// Bytes → MiB with one decimal. f64 input (06-07): the gauges are
+/// f64 on the wire (8.3.3 exponent form); the `/overview` i64 callers
+/// cast at their site. Arithmetic is unchanged — `{:.1}` of the same
+/// quotient — so rendered output is byte-identical for whole bytes.
+fn fmt_mib(bytes: f64) -> String {
+    format!("{:.1} MiB", bytes / (1024.0 * 1024.0))
 }
 
 #[cfg(test)]

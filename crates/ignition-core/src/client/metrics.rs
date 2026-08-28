@@ -23,22 +23,54 @@ pub(crate) const CHARTS_PATH: &str = "/data/api/v1/systemPerformance/charts";
 /// GET path of the thread-execution counts capability.
 pub(crate) const THREADS_PATH: &str = "/data/api/v1/systemPerformance/threads";
 
-/// GET `/data/api/v1/systemPerformance/currentGauges` — live capture:
-/// `{cpu: 4.88, heapMemory: 240000000, maxMemory: 1073741824}`.
+/// GET `/data/api/v1/systemPerformance/currentGauges` — live captures:
+/// 8.3.6 `{cpu: 4.88, heapMemory: 240000000, maxMemory: 1073741824}`;
+/// 8.3.3 (b2026012009) serializes the heap gauge as a Java DOUBLE in
+/// scientific notation — raw wire (captured 2026-08-28):
+/// `{"cpu":1.2755618546264424,"heapMemory":2.85746728E8,"maxMemory":1073741824}`.
+/// serde_json refuses exponent/decimal forms for i64, so the memory
+/// gauges decode as f64 (byte counts ≤ ~9e15 are exact in f64 — no
+/// JVM-heap-scale precision loss); whole values serialize back as JSON
+/// INTEGERS ([`serialize_bytes_f64`]) so agent-visible `--json` output
+/// keeps the pre-f64 integer shape.
+///
+/// Sibling audit (06-07): `ThreadCounts` fields are Java longs on every
+/// captured build (plain JSON integers, never doubles — left alone);
+/// charts [`Datapoint::value`] is already f64; `histId`/`timestamp`
+/// are longs serialized as integers. The two memory gauges are the
+/// only double-typed gauge fields on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CurrentGauges {
     /// CPU utilization in PERCENT (0–100). NOT the 0–1 fraction
     /// `/overview` reports — two endpoints, two scales, both documented.
     pub cpu: f64,
-    /// Heap memory in use, bytes.
-    #[serde(rename = "heapMemory")]
-    pub heap_memory: i64,
-    /// Max heap (`-Xmx`), bytes.
-    #[serde(rename = "maxMemory")]
-    pub max_memory: i64,
+    /// Heap memory in use, bytes. f64 on the wire — 8.3.3 sends the
+    /// Java double in exponent form.
+    #[serde(rename = "heapMemory", serialize_with = "serialize_bytes_f64")]
+    pub heap_memory: f64,
+    /// Max heap (`-Xmx`), bytes. f64 on the wire (same 8.3.3 form).
+    #[serde(rename = "maxMemory", serialize_with = "serialize_bytes_f64")]
+    pub max_memory: f64,
     /// Unknown keys (`nonHeapMemory`, …) round-trip.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Serialize an f64 byte count as a JSON INTEGER whenever the value is
+/// whole (2^53 guard: f64's exact-integer floor) — heap byte counts
+/// are semantically integral; the f64 typing exists only because 8.3.3
+/// gateways serialize the gauges as Java doubles in exponent form.
+/// Keeps agent-visible JSON (and the round-trip unit test) on the
+/// pre-f64 integer shape for every whole value.
+fn serialize_bytes_f64<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_992.0 {
+        serializer.serialize_i64(*value as i64)
+    } else {
+        serializer.serialize_f64(*value)
+    }
 }
 
 /// GET `/data/api/v1/systemPerformance/threads` — live capture:
@@ -142,12 +174,43 @@ mod tests {
         let gauges: CurrentGauges =
             serde_json::from_value(body).expect("live gauges shape must parse");
         assert!((gauges.cpu - 4.88).abs() < f64::EPSILON, "percent");
-        assert_eq!(gauges.heap_memory, 240000000);
-        assert_eq!(gauges.max_memory, 1073741824);
+        assert_eq!(gauges.heap_memory, 240000000.0);
+        assert_eq!(gauges.max_memory, 1073741824.0);
 
         let round = serde_json::to_value(&gauges).expect("serialize");
         assert_eq!(round["cpu"], 4.88, "cpu stays percent");
         assert_eq!(round["heapMemory"], 240000000i64, "gateway-native key");
+        assert_eq!(round["maxMemory"], 1073741824i64);
+    }
+
+    /// 8.3.3 (b2026012009) serializes the heap gauge as a Java double
+    /// in SCIENTIFIC NOTATION (06-UAT test 4, wire-verified 2026-08-28)
+    /// — the exact raw body, parsed the way the wire parses it
+    /// (`from_str`, not `json!` — the macro pre-normalizes numbers, so
+    /// it cannot prove the exponent TEXT decodes). Exponent,
+    /// integer, and decimal-mantissa forms all decode; whole values
+    /// round-trip as JSON INTEGERS (the pre-f64 agent shape).
+    #[test]
+    fn current_gauges_decodes_exponent_form_java_doubles() {
+        let raw =
+            r#"{"cpu":1.2755618546264424,"heapMemory":2.85746728E8,"maxMemory":1073741824}"#;
+        let gauges: CurrentGauges =
+            serde_json::from_str(raw).expect("8.3.3 exponent-form gauges must parse");
+        assert_eq!(gauges.heap_memory, 285746728.0);
+        assert_eq!(gauges.max_memory, 1073741824.0);
+
+        // Decimal-mantissa exponent form decodes the same way.
+        let decimal: CurrentGauges = serde_json::from_str(
+            r#"{"cpu":1.2,"heapMemory":2.8574672E8,"maxMemory":1.073741824E9}"#,
+        )
+        .expect("decimal-mantissa exponent form must parse");
+        assert_eq!(decimal.heap_memory, 285746720.0);
+        assert_eq!(decimal.max_memory, 1073741824.0);
+
+        // Whole values serialize back as JSON integers — 285746728,
+        // never 285746728.0 (agent shape unchanged by the f64 typing).
+        let round = serde_json::to_value(&gauges).expect("serialize");
+        assert_eq!(round["heapMemory"], 285746728i64);
         assert_eq!(round["maxMemory"], 1073741824i64);
     }
 

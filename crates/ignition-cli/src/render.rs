@@ -360,8 +360,10 @@ fn render_metrics_human(result: &MetricsResult) {
     println!(
         "cpu {:.1}%  heap {}/{}",
         gauges.cpu,
-        human_bytes(gauges.heap_memory),
-        human_bytes(gauges.max_memory)
+        // f64 gauges (8.3.3 exponent form); whole byte counts cast
+        // exact (≤2^53) — the datapoint.value precedent below.
+        human_bytes(gauges.heap_memory as i64),
+        human_bytes(gauges.max_memory as i64)
     );
     let threads = &result.threads;
     println!(
