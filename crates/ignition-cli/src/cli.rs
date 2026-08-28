@@ -321,6 +321,29 @@ pub enum ProjectCommand {
         #[arg(long, value_name = "NAME")]
         project: String,
     },
+    /// Promote selected resources from profile A into profile B
+    /// (direction is ALWAYS A→B) — destructive on B: the whole
+    /// project is overwrite-imported, refused without --yes
+    Sync {
+        /// Source profile (A)
+        profile_a: String,
+        /// Target profile (B)
+        profile_b: String,
+        /// Project name
+        #[arg(long, value_name = "NAME")]
+        project: String,
+        /// Resource user path to promote (repeatable)
+        #[arg(long, value_name = "PATH")]
+        resource: Vec<String>,
+        /// Promote every resource the diff reports added or changed
+        /// (never removed ones — deletion needs --delete)
+        #[arg(long)]
+        all_changed: bool,
+        /// Also remove B's resources the diff reports removed
+        /// (default: upsert-only, nothing is ever deleted)
+        #[arg(long)]
+        delete: bool,
+    },
 }
 
 /// Resource subcommands (03-03, PROJ-05). `delete` is the family's

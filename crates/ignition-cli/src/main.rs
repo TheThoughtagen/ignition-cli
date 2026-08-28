@@ -118,6 +118,10 @@ enum ActionOutput {
     /// compare; data carries {scope, profile_a, profile_b, project,
     /// project_meta, summary, entries}.
     ProjectDiff(actions::projects::ProjectDiffResult),
+    /// `ign project sync` — the guarded cross-gateway promotion; data
+    /// carries {scope, profile_a, profile_b, project, synced,
+    /// removed}.
+    ProjectSync(actions::projects::ProjectSyncResult),
     /// `ign resource list` — a project's resources (passthrough
     /// entries).
     ResourcesList(actions::resources::ResourcesResult),
@@ -247,6 +251,7 @@ impl ActionOutput {
             ActionOutput::ProjectExport(result) => render_success(profile, result, compact),
             ActionOutput::ProjectImport(result) => render_success(profile, result, compact),
             ActionOutput::ProjectDiff(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectSync(result) => render_success(profile, result, compact),
             ActionOutput::ResourcesList(result) => render_success(profile, result, compact),
             ActionOutput::ResourceGet(result) => render_success(profile, result, compact),
             ActionOutput::ResourcePut(result) => render_success(profile, result, compact),
@@ -945,6 +950,70 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     )
                     .await
                     .map(ActionOutput::ProjectDiff),
+                    Err(err) => Err(err),
+                };
+                (active, result)
+            }
+            // Sync (07-01, SYNC-02): the guarded promotion — usage
+            // errors lead (a selection-less sync refuses exit 2 with
+            // profile null BEFORE the guard, the resource-put
+            // precedent), then the --yes guard fires BEFORE
+            // resolve_two_clients: a refusal is exit 2 with profile
+            // null and does ZERO config/secret/network work, its
+            // operation string naming the whole-project
+            // overwrite-import consequence on B (the shared
+            // ConfirmationRequired hint stays frozen).
+            ProjectCommand::Sync {
+                profile_a,
+                profile_b,
+                project: project_name,
+                resource,
+                all_changed,
+                delete,
+            } => {
+                if resource.is_empty() && !all_changed {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "sync needs a selection — pass --resource PATH \
+                                     (repeatable) and/or --all-changed"
+                                .to_string(),
+                        }),
+                    );
+                }
+                if let Err(err) = require_confirmation(
+                    cli.yes,
+                    &format!(
+                        "project sync (overwrite-import the whole project on {profile_b} — \
+                         replaces concurrent Designer edits)"
+                    ),
+                ) {
+                    return (None, Err(err));
+                }
+                let (active, sides) = resolve_two_clients(
+                    &mut config,
+                    cli.profile.as_deref(),
+                    &profile_a,
+                    &profile_b,
+                );
+                let result = match sides {
+                    Ok((api_a, api_b)) => {
+                        let selection = actions::projects::SyncSelection {
+                            resources: resource,
+                            all_changed,
+                        };
+                        actions::projects::project_sync(
+                            &api_a,
+                            &api_b,
+                            &project_name,
+                            &selection,
+                            delete,
+                            &profile_a,
+                            &profile_b,
+                        )
+                        .await
+                        .map(ActionOutput::ProjectSync)
+                    }
                     Err(err) => Err(err),
                 };
                 (active, result)

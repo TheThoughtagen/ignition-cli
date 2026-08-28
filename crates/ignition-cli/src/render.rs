@@ -21,7 +21,7 @@ use ignition_core::actions::logs::{
 };
 use ignition_core::actions::projects::{
     ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult, ProjectDiffResult,
-    ProjectRenameResult, ProjectSetResult, ProjectsResult,
+    ProjectRenameResult, ProjectSetResult, ProjectSyncResult, ProjectsResult,
 };
 use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
@@ -206,6 +206,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ProjectExport(result) => render_project_export_human(result),
         ActionOutput::ProjectImport(result) => render_project_import_human(result),
         ActionOutput::ProjectDiff(result) => render_project_diff_human(result),
+        ActionOutput::ProjectSync(result) => render_project_sync_human(result),
         ActionOutput::ResourcesList(result) => render_resources_list_human(result),
         ActionOutput::ResourceGet(result) => render_resource_get_human(result),
         ActionOutput::ResourcePut(result) => render_resource_put_human(result),
@@ -706,6 +707,32 @@ fn render_project_diff_human(result: &ProjectDiffResult) {
         "{} same, {} added, {} removed, {} changed",
         result.summary.same, result.summary.added, result.summary.removed, result.summary.changed
     );
+}
+
+/// `ign project sync` human lines: the direction header (always A→B),
+/// the promoted paths, and — only when any — the removed ones.
+fn render_project_sync_human(result: &ProjectSyncResult) {
+    println!(
+        "synced {} resource(s) {} → {} · project {} (scope {})",
+        result.synced.len(),
+        result.profile_a,
+        result.profile_b,
+        result.project,
+        result.scope
+    );
+    for path in &result.synced {
+        println!("  + {path}");
+    }
+    if !result.removed.is_empty() {
+        println!(
+            "removed {} resource(s) on {}:",
+            result.removed.len(),
+            result.profile_b
+        );
+        for path in &result.removed {
+            println!("  - {path}");
+        }
+    }
 }
 
 /// `ign resource list` human rows: one resource path per line — the

@@ -127,6 +127,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign project export <NAME> [-o FILE]` | Export a project as a ZIP archive | the ZIP STREAMS to disk chunk-by-chunk (no memory buffering; 120 s per-request timeout); default filename from `Content-Disposition`, else `<name>.zip`; stdout stays data-only — JSON carries `{project, file, bytes, scope}` (see scope metadata below) |
 | `ign project import <NAME> --file PATH\|--file - [--collision-policy abort\|overwrite]` | Import a project from a ZIP (`-` reads stdin) | default policy **abort**: importing over an existing name exits 6 (`project_exists`) BEFORE any upload; **overwrite** is destructive — exit 2 without `--yes` and it REPLACES the entire project (resources absent from the ZIP are deleted; merge is Designer-only); a non-ZIP, >512 MB, or structurally-corrupt (truncated) input exits 2 (`invalid_import_file`) before any network I/O — every member is validated up front because the gateway would otherwise accept a truncated ZIP and wipe the target (live-witnessed); a gateway import refusal riding HTTP 200 (`{success:false}`) exits 6 (`import_denied`) with the gateway's problem text; 300 s per-request timeout |
 | `ign project diff <PROFILE_A> <PROFILE_B> --project <NAME>` | Compare a project across two gateway profiles — per-resource `added`/`removed`/`changed`/`same` statuses (read-only, no guard) | **statuses are B-relative-to-A**: `added` = in B only, `removed` = in A only, `changed` = differing content after `resource.json` normalization (`attributes.lastModification`/`…Signature` stripped, keys canonicalized — identical content exported from two gateways reports `same`); each side exports once and NOTHING is imported; the envelope's `profile` stays the ACTIVE profile while the data carries `profile_a`/`profile_b`; the root `project.json` rides `project_meta` (title/enabled/parent deltas), never the resource entries; diffing a profile against itself exits 2 `invalid_input`; scope is project-only (see the tag-promotion pipe below); a missing project on either side exits 6 `not_found` |
+| `ign project sync <PROFILE_A> <PROFILE_B> --project <NAME> --resource PATH... [--all-changed] [--delete]` | Promote selected resources from A into B (direction is ALWAYS A→B — source A, target B) | **destructive on B**: the whole project is overwrite-imported — exit 2 (`confirmation_required`, profile null, ZERO requests) without `--yes`; at least one of `--resource` (repeatable) or `--all-changed` required (else exit 2 pre-resolution); `--all-changed` promotes everything A has that B lacks or differs on (the diff's `removed`+`changed` under B-relative-to-A labels); default is upsert-ONLY — B's extra resources are never deleted unless `--delete` is passed (then the diff's `added` set — B-only — is removed; an explicit `--resource` path absent in A is a deletion request under `--delete`, `not_found` without); replace_member's descriptor-merge landing rules ride free; B's `project.json` is never touched; `--all-changed` with nothing changed performs NO import (zero-write honesty); JSON data `{scope, profile_a, profile_b, project, synced, removed}` |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
 | `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource member (upsert: created if absent, replaced if present) | **destructive**: the whole project is re-imported (`overwrite=true`) after the member surgery — exit 2 (`confirmation_required`) without `--yes`; content is sniffed (json/text); binary input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; concurrent Designer edits are REPLACED (see the resource section) |
@@ -553,6 +554,33 @@ so each side authenticates as itself.
 the ACTIVE profile, exactly as every other command resolves it —
 while `data.profile_a`/`data.profile_b` name both sides explicitly.
 
+**Sync.** `ign project sync <A> <B> --project <NAME> --resource
+PATH... [--all-changed] [--delete] --yes` is the second half: the
+selected resources from A land in B. The mechanism is the resource
+family's surgery generalized to two clients — export both sides,
+splice A's member bytes into B's zip (`replace_member`'s put-new
+descriptor landing rules ride free), then ONE overwrite-import into
+B. Semantics: direction is always explicit A→B; the default is
+upsert-only (nothing on B is ever deleted unless `--delete` is
+passed); `--all-changed` promotes everything A has that B lacks or
+differs on. The `--yes` guard is mandatory — sync implicitly
+overwrite-imports the WHOLE project on B (replacing concurrent
+Designer edits, the resource-put consequence pattern) — and fires
+before either client resolves: a refusal is exit 2 with profile null
+and performs zero requests of any kind. An empty effective selection
+(`--all-changed` with nothing changed) performs NO import — zero
+writes, empty `synced`/`removed` lists.
+
+**e2e witness.** The promotion loop is live-runnable against two
+real gateways: `crates/ignition-cli/tests/e2e_projects.rs`
+(`project_sync_two_gateways_witness`, `-- --ignored`, needs
+`IGNITION_LIVE_URL` + `IGNITION_LIVE_URL_B` +
+`IGNITION_LIVE_TOKEN` + `IGNITION_LIVE_MUTATIONS=1`) puts a
+differing resource on A, diffs it, syncs it, and re-reads it on B
+(the adoption oracle — never trusting the import's success body).
+`IGNITION_LIVE_TOKEN` applies to both sides in the harness (the
+two-sided-secret caveat above).
+
 ### Resource editing — the surgical loop (export-zip surgery)
 
 `ign resource` changes ONE view/script/query member — the
@@ -631,7 +659,9 @@ File-mode exports (the default, `-o FILE`) keep the normal envelope.
 
 Commands that change gateway state (`sessions terminate`,
 `logs loggers set`/`reset`, `project delete`, `project import
---collision-policy overwrite`, `resource put`, `resource delete`
+--collision-policy overwrite`, `project sync` (the cross-gateway
+promotion — overwrite-imports the whole project on its TARGET
+profile), `resource put`, `resource delete`
 (both re-import the whole project — their refusal messages name the
 consequence), `tags provider delete`, `tags config delete`, and
 `tags import --collision-policy overwrite` (abort-policy imports need

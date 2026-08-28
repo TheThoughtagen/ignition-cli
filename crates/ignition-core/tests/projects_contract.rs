@@ -640,6 +640,20 @@ async fn mount_export_pin(server: &wiremock::MockServer, project: &str, zip: Vec
         .await;
 }
 
+/// Export-only mount (the sync tests' side B: the import rides a
+/// separately-scoped guard, and wiremock matches the FIRST mounted
+/// mock — a bundled zero-expect import guard would shadow it).
+async fn mount_export_alone(server: &wiremock::MockServer, project: &str, zip: Vec<u8>, n: u64) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!(
+            "/data/api/v1/projects/export/{project}"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
+        .expect(n)
+        .mount(server)
+        .await;
+}
+
 /// THE diff sequence pin: exactly ONE export GET per side, ZERO
 /// imports anywhere — and the normalization pass holds END-TO-END
 /// (same-content members with differing lastModification attributes
@@ -811,4 +825,280 @@ async fn project_diff_missing_project_on_b_is_not_found() {
     );
     assert_eq!(err.exit_code(), 6);
     assert_eq!(err.code(), "not_found");
+}
+
+/// THE sync sequence pin (07-01, SYNC-02): export A GET, export B
+/// GET, then EXACTLY ONE import POST to B's server with
+/// `content-type: application/zip` and `overwrite=true` — never an
+/// import on A. The import body, round-tripped through the SAME
+/// public surgery helpers, carries A's member bytes (member-level
+/// honesty — byte-equality of zips is not the contract) and — with
+/// `--delete` ABSENT — still carries B's extra member untouched
+/// (default upsert-only promotion semantics).
+#[tokio::test]
+async fn project_sync_reads_then_overwrite_imports_into_b() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    let zip_a = diff_export_zip(
+        br#"{"title":"T","enabled":true}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/resource.json",
+                volatile_descriptor("2026-08-28T10:00:00Z").as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('new')",
+            ),
+        ],
+    );
+    let zip_b = diff_export_zip(
+        br#"{"title":"B","enabled":true}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/resource.json",
+                volatile_descriptor("2026-08-28T11:30:00Z").as_slice(),
+            ),
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('old')",
+            ),
+            (
+                "com.example/resources/views/BOnly/view.json",
+                br#"{"scope":"A"}"#.as_slice(),
+            ),
+        ],
+    );
+    mount_export_pin(&server_a, "p", zip_a, 1).await;
+    mount_export_alone(&server_b, "p", zip_b, 1).await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/zip",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server_b)
+        .await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let selection = ignition_core::actions::projects::SyncSelection {
+        resources: vec!["ignition/script-python/uat/script.py".to_string()],
+        all_changed: false,
+    };
+    let result = ignition_core::actions::projects::project_sync(
+        &api_a,
+        &api_b,
+        "p",
+        &selection,
+        false,
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect("sync orchestrates Ok");
+    assert_eq!(result.scope, "project");
+    assert_eq!(result.profile_a, "gateway-a");
+    assert_eq!(result.profile_b, "gateway-b");
+    assert_eq!(
+        result.synced,
+        vec!["ignition/script-python/uat/script.py".to_string()]
+    );
+    assert!(result.removed.is_empty(), "upsert-only by default");
+
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import POST — into B");
+    assert_eq!(
+        ignition_core::client::resources::read_member(
+            &requests[0].body,
+            "ignition/script-python/uat/script.py"
+        )
+        .expect("surgical body re-reads"),
+        b"print('new')".to_vec(),
+        "A's member bytes landed in the import body"
+    );
+    assert_eq!(
+        ignition_core::client::resources::read_member(
+            &requests[0].body,
+            "com.example/views/BOnly/view.json"
+        )
+        .expect("B's extra member rides untouched"),
+        br#"{"scope":"A"}"#.to_vec(),
+        "--delete absent ⇒ removed-status members are NOT deleted"
+    );
+    // B's project.json rides verbatim (sync never touches project
+    // meta — only resource members splice).
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&requests[0].body))
+        .expect("import body is a zip");
+    let mut project_json = String::new();
+    use std::io::Read as _;
+    archive
+        .by_name("project.json")
+        .expect("project.json rides")
+        .read_to_string(&mut project_json)
+        .expect("reads");
+    assert_eq!(project_json, r#"{"title":"B","enabled":true}"#);
+}
+
+/// `--all-changed --delete`: the changed member upserts AND the
+/// removed-status member (in B, not A) is dropped from the import
+/// body — the opt-in deletion half.
+#[tokio::test]
+async fn project_sync_all_changed_delete_removes_b_only_members() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    let zip_a = diff_export_zip(
+        br#"{"title":"T"}"#,
+        &[(
+            "ignition/resources/script-python/uat/script.py",
+            b"print('new')",
+        )],
+    );
+    let zip_b = diff_export_zip(
+        br#"{"title":"T"}"#,
+        &[
+            (
+                "ignition/resources/script-python/uat/script.py",
+                b"print('old')",
+            ),
+            (
+                "com.example/resources/views/BOnly/view.json",
+                br#"{"scope":"A"}"#.as_slice(),
+            ),
+        ],
+    );
+    mount_export_pin(&server_a, "p", zip_a, 1).await;
+    mount_export_alone(&server_b, "p", zip_b, 1).await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server_b)
+        .await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let selection = ignition_core::actions::projects::SyncSelection {
+        resources: Vec::new(),
+        all_changed: true,
+    };
+    let result = ignition_core::actions::projects::project_sync(
+        &api_a,
+        &api_b,
+        "p",
+        &selection,
+        true,
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect("sync orchestrates Ok");
+    assert_eq!(
+        result.synced,
+        vec!["ignition/script-python/uat/script.py".to_string()]
+    );
+    assert_eq!(
+        result.removed,
+        vec!["com.example/views/BOnly/view.json".to_string()]
+    );
+
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    let gone = ignition_core::client::resources::read_member(
+        &requests[0].body,
+        "com.example/views/BOnly/view.json",
+    );
+    assert!(
+        matches!(gone, Err(CoreError::NotFound { .. })),
+        "the B-only member is GONE from the import body"
+    );
+    assert_eq!(
+        ignition_core::client::resources::read_member(
+            &requests[0].body,
+            "ignition/script-python/uat/script.py"
+        )
+        .expect("upserted member reads"),
+        b"print('new')".to_vec()
+    );
+}
+
+/// An explicit `--resource` path ABSENT in A (without `--delete`) is
+/// the missing-member not_found shape — and ZERO imports fire.
+#[tokio::test]
+async fn project_sync_explicit_missing_resource_is_not_found() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    mount_export_pin(&server_a, "p", diff_export_zip(br#"{"title":"T"}"#, &[]), 1).await;
+    mount_export_pin(&server_b, "p", diff_export_zip(br#"{"title":"T"}"#, &[]), 1).await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let selection = ignition_core::actions::projects::SyncSelection {
+        resources: vec!["ignition/script-python/uat/nope".to_string()],
+        all_changed: false,
+    };
+    let err = ignition_core::actions::projects::project_sync(
+        &api_a,
+        &api_b,
+        "p",
+        &selection,
+        false,
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect_err("the missing source resource must fail");
+    assert!(
+        matches!(err, CoreError::NotFound { .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 6);
+}
+
+/// Zero-write honesty: `--all-changed` with NOTHING changed performs
+/// NO import (a whole-project overwrite-import of an unchanged zip
+/// is not a gateway no-op) — empty lists, exit 0.
+#[tokio::test]
+async fn project_sync_all_changed_with_nothing_changed_imports_nothing() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    let zip = diff_export_zip(
+        br#"{"title":"T"}"#,
+        &[(
+            "ignition/resources/script-python/uat/script.py",
+            b"print('same')",
+        )],
+    );
+    mount_export_pin(&server_a, "p", zip.clone(), 1).await;
+    mount_export_pin(&server_b, "p", zip, 1).await;
+
+    let api_a = ReqwestGatewayApi::for_tests(&server_a.uri(), None);
+    let api_b = ReqwestGatewayApi::for_tests(&server_b.uri(), None);
+    let selection = ignition_core::actions::projects::SyncSelection {
+        resources: Vec::new(),
+        all_changed: true,
+    };
+    let result = ignition_core::actions::projects::project_sync(
+        &api_a,
+        &api_b,
+        "p",
+        &selection,
+        false,
+        "gateway-a",
+        "gateway-b",
+    )
+    .await
+    .expect("the empty selection is a clean no-op");
+    assert!(result.synced.is_empty());
+    assert!(result.removed.is_empty());
 }

@@ -320,6 +320,32 @@ pub fn fire_project_diff(
     });
 }
 
+/// `ign project sync` (07-01) — the CONFIRMED promotion arm (the TUI
+/// owned the `--yes`; the action runs unguarded). Per-side clients
+/// rebuilt INSIDE the worker exactly like the diff twin; the form's
+/// explicit resource list is the selection (`--all-changed` and
+/// `--delete` stay CLI forms, `?`-named).
+pub fn fire_project_sync(
+    state: &mut AppState,
+    profile_a: String,
+    profile_b: String,
+    project: String,
+    resources: Vec<String>,
+) {
+    super::spawn_action(state, "project sync", async move {
+        let (_name_a, _url_a, api_a) = crate::context::rebuild(&profile_a)?;
+        let (_name_b, _url_b, api_b) = crate::context::rebuild(&profile_b)?;
+        let selection = actions::projects::SyncSelection {
+            resources,
+            all_changed: false,
+        };
+        actions::projects::project_sync(
+            &*api_a, &*api_b, &project, &selection, false, &profile_a, &profile_b,
+        )
+        .await
+    });
+}
+
 /// The state's client Arc, cloned out of the handle (the watch.rs
 /// helper's shape).
 fn client_arc(state: &AppState) -> Option<Arc<ReqwestGatewayApi>> {

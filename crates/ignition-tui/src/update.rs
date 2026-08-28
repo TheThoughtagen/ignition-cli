@@ -1855,6 +1855,19 @@ fn projects_cli_form(form: &crate::state::ProjectsForm) -> String {
         ProjectsForm::DiffProject { a, b } => {
             format!("ign project diff {a:?} {b:?} --project <NAME>  (statuses are B-relative-to-A)")
         }
+        ProjectsForm::SyncProfileA | ProjectsForm::SyncProfileB { .. } => {
+            "ign project sync <PROFILE_A> <PROFILE_B> --project <NAME> \
+             --resource <PATH>... [--all-changed] [--delete] --yes  \
+             (direction is always A→B; default upsert-only)"
+                .to_string()
+        }
+        ProjectsForm::SyncProject { a, b } => format!(
+            "ign project sync {a:?} {b:?} --project <NAME> --resource <PATH>... \
+             [--all-changed] [--delete] --yes"
+        ),
+        ProjectsForm::SyncResources { a, b, project } => {
+            format!("ign project sync {a:?} {b:?} --project {project:?} --resource <PATH>... --yes")
+        }
     }
 }
 
@@ -1938,6 +1951,13 @@ fn execute_projects_menu_action(state: &mut AppState, index: usize) {
             crate::state::ProjectsForm::DiffProfileA,
             "diff — profile A (baseline)".to_string(),
             Some("profile B + project prompt next\npress ? for the CLI form".to_string()),
+            state.profile.clone().unwrap_or_default(),
+        ),
+        Some("project sync") => open_projects_input(
+            state,
+            crate::state::ProjectsForm::SyncProfileA,
+            "sync — source profile (A)".to_string(),
+            Some("target profile + project + paths follow\na Confirm gate arms before the fire\npress ? for the CLI form".to_string()),
             state.profile.clone().unwrap_or_default(),
         ),
         Some("resource put") => {
@@ -2161,6 +2181,78 @@ fn accept_projects_form(state: &mut AppState, value: &str) {
                 return;
             }
             workers::ops::fire_project_diff(state, a, b, value);
+        }
+        // The guarded promotion (07-01): four chained inputs, then
+        // the Confirm gate (the TUI's --yes mirror — main.rs's own
+        // guarded set).
+        ProjectsForm::SyncProfileA => open_projects_input(
+            state,
+            ProjectsForm::SyncProfileB { a: value },
+            "sync — target profile (B)".to_string(),
+            Some("resources promote A → B\nthe project prompts next".to_string()),
+            String::new(),
+        ),
+        ProjectsForm::SyncProfileB { a } => open_projects_input(
+            state,
+            ProjectsForm::SyncProject { a, b: value },
+            "sync — project name".to_string(),
+            Some("the resource paths prompt next".to_string()),
+            projects_context_name(state).unwrap_or_default(),
+        ),
+        ProjectsForm::SyncProject { a, b } => open_projects_input(
+            state,
+            ProjectsForm::SyncResources {
+                a,
+                b,
+                project: value,
+            },
+            "sync — resource paths".to_string(),
+            Some(
+                "space or comma separated (e.g. views/root.json ignition/props)\n\
+                 --all-changed/--delete stay CLI forms (press ?)"
+                    .to_string(),
+            ),
+            projects_context_resource(state)
+                .map(|(_project, path)| path)
+                .unwrap_or_default(),
+        ),
+        ProjectsForm::SyncResources { a, b, project } => {
+            if a == b {
+                open_error_modal(
+                    state,
+                    "project sync",
+                    "syncing a profile onto itself is a no-op — name two different profiles",
+                );
+                return;
+            }
+            let resources: Vec<String> = value
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            if resources.is_empty() {
+                open_error_modal(
+                    state,
+                    "project sync",
+                    "name at least one resource path to promote (space or comma separated)",
+                );
+                return;
+            }
+            let body = format!(
+                "promote the resources into {b}'s copy of {project:?}? the WHOLE project \
+                 is overwrite-imported on {b} — concurrent Designer edits are replaced"
+            );
+            state.dashboard.pending = Some(PendingAction::ProjectSync {
+                profile_a: a,
+                profile_b: b,
+                project,
+                resources,
+            });
+            state.open_modal(Modal::Confirm {
+                title: "project sync".to_string(),
+                body,
+            });
         }
     }
 }
@@ -2443,6 +2535,18 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
             workers::rig_stream::fire_rig_restore(state, file);
         }
         PendingAction::RigTrialReset => workers::rig_stream::fire_rig_trial_reset(state),
+        PendingAction::ProjectSync {
+            profile_a,
+            profile_b,
+            project,
+            resources,
+        } => workers::ops::fire_project_sync(
+            state,
+            profile_a.clone(),
+            profile_b.clone(),
+            project.clone(),
+            resources.clone(),
+        ),
     }
 }
 
@@ -2965,6 +3069,7 @@ fn gated_cli_verb(pending: &PendingAction) -> &'static str {
         PendingAction::RigReset => "rig reset",
         PendingAction::RigRestore { .. } => "rig restore",
         PendingAction::RigTrialReset => "rig trial reset",
+        PendingAction::ProjectSync { .. } => "project sync",
     }
 }
 
@@ -6294,7 +6399,7 @@ mod tests {
     #[test]
     fn resource_put_is_confirm_gated() {
         let mut state = projects_state_with_list();
-        run_projects_menu(&mut state, 8); // resource put
+        run_projects_menu(&mut state, 9); // resource put
         submit_projects_input(&mut state, "PlantFloor"); // project
         submit_projects_input(&mut state, "views/root.json"); // path
         submit_projects_input(&mut state, "root.json.new"); // content file
@@ -6316,7 +6421,7 @@ mod tests {
         assert!(state.dashboard.pending.is_none(), "cancel clears the arm");
 
         let mut fresh = projects_state_with_list();
-        run_projects_menu(&mut fresh, 8);
+        run_projects_menu(&mut fresh, 9);
         submit_projects_input(&mut fresh, "PlantFloor");
         submit_projects_input(&mut fresh, "views/root.json");
         submit_projects_input(&mut fresh, "root.json.new");
@@ -6329,7 +6434,7 @@ mod tests {
     #[test]
     fn resource_delete_is_confirm_gated() {
         let mut state = projects_state_with_list();
-        run_projects_menu(&mut state, 9); // resource delete
+        run_projects_menu(&mut state, 10); // resource delete
         submit_projects_input(&mut state, "PlantFloor");
         submit_projects_input(&mut state, "views/root.json");
         assert!(matches!(state.modal, Some(Modal::Confirm { .. })));
@@ -6352,12 +6457,12 @@ mod tests {
     #[test]
     fn webdev_deploy_needs_no_confirm_and_status_reads() {
         let mut state = projects_state_with_list();
-        run_projects_menu(&mut state, 10); // webdev deploy
+        run_projects_menu(&mut state, 11); // webdev deploy
         assert!(state.modal.is_none(), "deploy fires WITHOUT a Confirm gate");
         assert_eq!(state.dashboard.in_flight, Some("webdev deploy"));
 
         let mut fresh = projects_state_with_list();
-        run_projects_menu(&mut fresh, 11); // webdev status
+        run_projects_menu(&mut fresh, 12); // webdev status
         assert!(fresh.modal.is_none());
         assert_eq!(fresh.dashboard.in_flight, Some("webdev status"));
     }
@@ -6388,6 +6493,48 @@ mod tests {
             "the same-profile pair surfaces the error modal"
         );
         assert!(same.dashboard.in_flight.is_none());
+    }
+
+    /// `project sync` (07-01): the four-step chain (profile A → B →
+    /// project → resource paths) arms the CONFIRM gate (the TUI's
+    /// `--yes` mirror); nothing fires before `y`, and the accept
+    /// fires the two-client worker. The path list splits on spaces
+    /// and commas.
+    #[test]
+    fn project_sync_chains_inputs_and_is_confirm_gated() {
+        let mut state = projects_state_with_list();
+        run_projects_menu(&mut state, 8); // project sync
+        replace_projects_input(&mut state, "gateway-a"); // source A
+        submit_projects_input(&mut state, "gateway-b"); // target B
+        replace_projects_input(&mut state, "PlantFloor"); // project (prefilled)
+        submit_projects_input(&mut state, "views/root.json, ignition/props"); // paths
+        assert!(
+            matches!(state.modal, Some(Modal::Confirm { .. })),
+            "the Confirm gate arms before any fire"
+        );
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::ProjectSync {
+                profile_a: "gateway-a".into(),
+                profile_b: "gateway-b".into(),
+                project: "PlantFloor".into(),
+                resources: vec!["views/root.json".into(), "ignition/props".into()],
+            })
+        );
+        assert!(state.dashboard.in_flight.is_none(), "nothing before y");
+
+        // Cancel spawns nothing; `y` fires the promotion.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.dashboard.pending.is_none());
+
+        let mut fresh = projects_state_with_list();
+        run_projects_menu(&mut fresh, 8);
+        replace_projects_input(&mut fresh, "gateway-a");
+        submit_projects_input(&mut fresh, "gateway-b");
+        replace_projects_input(&mut fresh, "PlantFloor");
+        submit_projects_input(&mut fresh, "views/root.json");
+        update(&mut fresh, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(fresh.dashboard.in_flight, Some("project sync"));
     }
 
     /// Rich projects forms advertise and open their exact CLI
@@ -6731,13 +6878,20 @@ mod tests {
                 file: "snap.gwbk".into(),
             },
             PendingAction::RigTrialReset,
+            PendingAction::ProjectSync {
+                profile_a: "dev".into(),
+                profile_b: "prod".into(),
+                project: "PlantFloor".into(),
+                resources: vec!["views/root.json".into()],
+            },
         ]
     }
 
     /// THE parity tripwire: the confirm-gated TUI set is exactly the
     /// CLI's `--yes`-guarded verbs (main.rs `require_confirmation`
-    /// sites, the complete 06-06 set) — 14 verbs across 7 families,
-    /// each with its family route-mapped onto the right screen.
+    /// sites, the 06-06 set + 07-01's sync) — 15 verbs across 8
+    /// families, each with its family route-mapped onto the right
+    /// screen.
     #[test]
     fn confirm_parity_matches_the_cli_guard_set() {
         let pendings = every_gated_pending();
@@ -6748,6 +6902,7 @@ mod tests {
             "logs loggers set",
             "project delete",
             "project import --collision-policy overwrite",
+            "project sync",
             "resource delete",
             "resource put",
             "restart",
@@ -6781,6 +6936,7 @@ mod tests {
             "tags import",
             "project delete",
             "project import",
+            "project sync",
             "resource put",
             "resource delete",
             "rig reset",

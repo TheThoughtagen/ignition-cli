@@ -1237,3 +1237,221 @@ async fn project_diff_unknown_side_profile_exits_3() {
         stderr_envelope(&out)
     );
 }
+
+// ---- Cross-gateway sync goldens (07-01, SYNC-02) ----
+
+/// THE guard golden: sync without `--yes` exits 2 with the
+/// `confirmation_required` envelope and profile NULL — and ZERO HTTP
+/// requests of any kind (both mock servers expect nothing; the guard
+/// fires before either client resolves).
+#[tokio::test]
+async fn project_sync_without_yes_exits_2_zero_requests_golden() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    for server in [&server_a, &server_b] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .named("no export may ride the wire on refusal")
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .named("no import may ride the wire on refusal")
+            .mount(server)
+            .await;
+    }
+
+    let (_dir, config) = isolated_config();
+    write_two_profile_config(&config, &server_b.uri());
+    let out = ign(
+        &config,
+        &server_a.uri(),
+        &[
+            "project",
+            "sync",
+            "dev",
+            "other",
+            "--project",
+            "p",
+            "--all-changed",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"confirmation_required","message":"project sync (overwrite-import the whole project on other — replaces concurrent Designer edits) is destructive; rerun with --yes to confirm","endpoint":null,"hint":"this operation is destructive; re-run with --yes or set IGNITION_YES=1"}}
+
+"#]],
+    );
+    assert!(
+        server_a
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+            && server_b
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+        "the refusal performed ZERO requests on either side"
+    );
+}
+
+/// The selection-less refusal: neither `--resource` nor
+/// `--all-changed` exits 2 `invalid_input` with profile null BEFORE
+/// the guard (usage-class errors lead — the resource-put precedent).
+#[tokio::test]
+async fn project_sync_selection_less_exits_2_golden() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "project",
+            "sync",
+            "dev",
+            "other",
+            "--project",
+            "p",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class");
+    assert!(out.stdout.is_empty());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"invalid_input","message":"invalid input: sync needs a selection — pass --resource PATH (repeatable) and/or --all-changed","endpoint":null,"hint":"fix the input source — a readable file path via --file, or `-` to pipe the content on stdin"}}
+
+"#]],
+    );
+}
+
+/// The success golden: `sync --resource --yes` promotes A's member
+/// into B (the import body round-trips through the public helpers
+/// carrying A's bytes), and the compact JSON pins the flat agent
+/// shape `{scope, profile_a, profile_b, project, synced, removed}`.
+#[tokio::test]
+async fn project_sync_success_golden() {
+    let server_a = wiremock::MockServer::start().await;
+    let server_b = wiremock::MockServer::start().await;
+    let zip_a = diff_export_zip(
+        br#"{"title":"T"}"#,
+        &[(
+            "ignition/resources/script-python/uat/script.py",
+            b"print('new')",
+        )],
+    );
+    let zip_b = diff_export_zip(
+        br#"{"title":"T"}"#,
+        &[(
+            "ignition/resources/script-python/uat/script.py",
+            b"print('old')",
+        )],
+    );
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/export/p"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip_a, "application/zip"))
+        .expect(1..)
+        .mount(&server_a)
+        .await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/zip",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1..)
+        .mount_as_scoped(&server_b)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/export/p"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip_b, "application/zip"))
+        .expect(1..)
+        .mount(&server_b)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_two_profile_config(&config, &server_b.uri());
+    let out = ign(
+        &config,
+        &server_a.uri(),
+        &[
+            "project",
+            "sync",
+            "dev",
+            "other",
+            "--project",
+            "p",
+            "--resource",
+            "ignition/script-python/uat/script.py",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"scope":"project","profile_a":"dev","profile_b":"other","project":"p","synced":["ignition/script-python/uat/script.py"],"removed":[]}}"#]],
+    );
+
+    // Human mode: the direction header + the promoted path.
+    let out = ign(
+        &config,
+        &server_a.uri(),
+        &[
+            "project",
+            "sync",
+            "dev",
+            "other",
+            "--project",
+            "p",
+            "--resource",
+            "ignition/script-python/uat/script.py",
+            "--yes",
+        ],
+    );
+    assert!(out.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+synced 1 resource(s) dev → other · project p (scope project)
+  + ignition/script-python/uat/script.py
+"#]],
+    );
+
+    // Member-level honesty on the import body (the 05-02 lesson):
+    // A's bytes landed, exactly ONE import per run.
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 2, "one import per invocation");
+    for request in &requests {
+        assert_eq!(
+            ignition_core::client::resources::read_member(
+                &request.body,
+                "ignition/script-python/uat/script.py"
+            )
+            .expect("surgical body re-reads"),
+            b"print('new')".to_vec(),
+            "A's member bytes ride every import"
+        );
+    }
+}

@@ -455,6 +455,139 @@ pub async fn project_diff(
     })
 }
 
+/// What `project sync` promotes from A into B (07-01, SYNC-02) — at
+/// least one half is required (the CLI validates pre-resolution; the
+/// action re-validates for its other callers).
+#[derive(Debug, Default, Clone)]
+pub struct SyncSelection {
+    /// Explicit `--resource` user paths (repeatable; combines with
+    /// `all_changed`).
+    pub resources: Vec<String>,
+    /// `--all-changed`: take the diff's `added`+`changed` paths —
+    /// never `removed` (deletion is the separate `--delete`
+    /// opt-in's job).
+    pub all_changed: bool,
+}
+
+/// `ign project sync` output model — the flat agent shape, ALL keys
+/// always (empty vecs when none). Direction is ALWAYS explicit A→B
+/// (source A, target B).
+#[derive(Debug, Serialize)]
+pub struct ProjectSyncResult {
+    /// Always `"project"` — the sync's scope contract.
+    pub scope: &'static str,
+    /// The source profile (A).
+    pub profile_a: String,
+    /// The target profile (B).
+    pub profile_b: String,
+    /// The project promoted.
+    pub project: String,
+    /// The user paths promoted A→B (upserted).
+    pub synced: Vec<String>,
+    /// The user paths removed from B (`--delete` only).
+    pub removed: Vec<String>,
+}
+
+/// `ign project sync A B --project NAME` — the guarded promotion.
+/// Order is the contract: export A then B → resolve the selection
+/// (explicit `--resource` paths must exist in A unless `--delete`
+/// wants them removed from B; `--all_changed` rides the diff) →
+/// splice A's member bytes into B's zip via the surgery helpers
+/// (`replace_member`'s descriptor-merge landing rules ride free —
+/// 05-07's put-new hazard is handled) → optional `remove_member`
+/// passes for deletions → `validate_import` + ONE overwrite-import
+/// into B. B's root `project.json` is never touched (only resource
+/// members splice). An EMPTY effective selection performs NO import
+/// (zero writes) and reports empty lists.
+pub async fn project_sync(
+    api_a: &dyn GatewayApi,
+    api_b: &dyn GatewayApi,
+    project: &str,
+    selection: &SyncSelection,
+    delete: bool,
+    profile_a: &str,
+    profile_b: &str,
+) -> Result<ProjectSyncResult, CoreError> {
+    if selection.resources.is_empty() && !selection.all_changed {
+        return Err(CoreError::InvalidInput {
+            reason: "sync needs a selection — pass --resource PATH (repeatable) \
+                     and/or --all-changed"
+                .to_string(),
+        });
+    }
+    let zip_a = crate::actions::resources::export_zip_bytes(api_a, project).await?;
+    let zip_b = crate::actions::resources::export_zip_bytes(api_b, project).await?;
+
+    // Resolve the selection: upserts (A's bytes land in B) and — only
+    // under --delete — removals (B loses what A no longer has).
+    let mut upserts: Vec<String> = Vec::new();
+    let mut removals: Vec<String> = Vec::new();
+    for path in &selection.resources {
+        match crate::client::resources::read_member(&zip_a, path) {
+            Ok(_) => upserts.push(path.clone()),
+            // An explicit path absent in A is a DELETION request under
+            // --delete (removed from B below); without --delete it is
+            // the missing-member shape.
+            Err(CoreError::NotFound { .. }) if delete => removals.push(path.clone()),
+            Err(other) => return Err(other),
+        }
+    }
+    if selection.all_changed {
+        // LABEL RECONCILIATION (must_haves over the plan sketch): the
+        // diff speaks B-relative-to-A (`added` = in B only, `removed`
+        // = in A only) while sync speaks A→B promotion. For A's
+        // resources to LAND in B, the upsert set is everything A has
+        // that B lacks or differs on — the diff's `removed` (A-only)
+        // and `changed` (differing) — and the `--delete` removal set
+        // is B's extras, the diff's `added` (B-only). Pushing the
+        // diff's `added` set would read members A does not have.
+        for entry in crate::client::resources::diff_members(&zip_a, &zip_b)?.entries {
+            match entry.status {
+                crate::client::resources::MemberStatus::Removed
+                | crate::client::resources::MemberStatus::Changed => {
+                    upserts.push(entry.path);
+                }
+                crate::client::resources::MemberStatus::Added if delete => {
+                    removals.push(entry.path);
+                }
+                _ => {}
+            }
+        }
+    }
+    upserts.sort();
+    upserts.dedup();
+    removals.sort();
+    removals.dedup();
+
+    // The surgery: splice A's members into B's zip, then drop the
+    // removals. replace_member's put-new descriptor rules ride free.
+    let mut surgical = zip_b;
+    for path in &upserts {
+        let bytes = crate::client::resources::read_member(&zip_a, path)?;
+        surgical = crate::client::resources::replace_member(&surgical, path, &bytes)?;
+    }
+    for path in &removals {
+        surgical = crate::client::resources::remove_member(&surgical, path)?;
+    }
+
+    // Zero-write honesty: an empty selection (nothing to upsert,
+    // nothing to remove) performs NO import — a whole-project
+    // overwrite-import of an unchanged zip is not a no-op on the
+    // gateway, so it must never fire without work to do.
+    if !upserts.is_empty() || !removals.is_empty() {
+        validate_import(&surgical)?;
+        api_b.project_import(project, surgical, true).await?;
+    }
+    Ok(ProjectSyncResult {
+        scope: "project",
+        profile_a: profile_a.to_string(),
+        profile_b: profile_b.to_string(),
+        project: project.to_string(),
+        synced: upserts,
+        removed: removals,
+    })
+}
+
 /// `ign project list` — every runnable project with inheritance info
 /// (the standard `limit=-1` UI convention).
 pub async fn projects(api: &dyn GatewayApi) -> Result<ProjectsResult, CoreError> {
@@ -1360,5 +1493,26 @@ mod tests {
             rig.exports.lock().unwrap().is_empty(),
             "zero exports — the refusal leads"
         );
+    }
+
+    /// THE selection-less sync refusal (07-01): no `--resource` and
+    /// no `--all-changed` is usage-class exit 2 before any export.
+    #[tokio::test]
+    async fn project_sync_selection_less_refuses_before_any_export() {
+        let rig = ProjectsRig::default();
+        let err = super::project_sync(
+            &rig,
+            &rig,
+            "p",
+            &super::SyncSelection::default(),
+            false,
+            "a",
+            "b",
+        )
+        .await
+        .expect_err("the selection-less refusal");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_input");
+        assert!(rig.exports.lock().unwrap().is_empty());
     }
 }

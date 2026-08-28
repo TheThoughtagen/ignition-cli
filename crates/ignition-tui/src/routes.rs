@@ -278,6 +278,10 @@ pub fn routes() -> &'static [CliRoute] {
             mapping: Mapping::Screen(Screen::Projects),
         },
         CliRoute {
+            path: "project sync",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
             path: "resource list",
             mapping: Mapping::Screen(Screen::Projects),
         },
@@ -526,7 +530,8 @@ mod tests {
     /// WebdevCommand — command is required on all three, so there is
     /// no bare `project`/`resource`/`webdev` leaf) — the family
     /// completeness that feeds 06-06's clap-walk coverage test.
-    /// 07-01 adds the `project diff` leaf (the cross-gateway read).
+    /// 07-01 adds the `project diff` leaf (the cross-gateway read)
+    /// and `project sync` (the guarded promotion).
     #[test]
     fn project_resource_webdev_rows_cover_every_leaf() {
         let expected = [
@@ -539,6 +544,7 @@ mod tests {
             ("project export", Screen::Projects),
             ("project import", Screen::Projects),
             ("project diff", Screen::Projects),
+            ("project sync", Screen::Projects),
             ("resource list", Screen::Projects),
             ("resource get", Screen::Projects),
             ("resource put", Screen::Projects),

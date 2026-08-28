@@ -237,6 +237,20 @@ pub enum PendingAction {
     /// IGNITION_PASSWORD — the CLI's `--user` flag has no cockpit
     /// form, the `?` hatch names the env vars).
     RigTrialReset,
+    /// `ign project sync <A> <B> --project <NAME> --resource
+    /// <PATH>...` (Confirm ≡ `--yes` — 07-01: the promotion
+    /// overwrite-imports the whole project on B).
+    ProjectSync {
+        /// Source profile (A).
+        profile_a: String,
+        /// Target profile (B).
+        profile_b: String,
+        /// The project promoted.
+        project: String,
+        /// The resource user paths to promote (the form's
+        /// space/comma-separated list, split at accept).
+        resources: Vec<String>,
+    },
 }
 
 /// What an accepted Input modal's buffer is for — the small-form router
@@ -399,10 +413,11 @@ pub struct ProjectAction {
 /// test-pinned); the resource family's guarded verbs (put/delete —
 /// list/get live on the navigation itself), webdev deploy deliberately
 /// UNGUARDED (the ign-cli project is CLI-owned, the 05-03 decision).
-/// 07-01 adds the cross-gateway `project diff` read. The verb keys
-/// are the clap-exact spellings; the route rows in
-/// [`crate::routes`] stay untouched.
-pub const PROJECT_ACTIONS: [ProjectAction; 12] = [
+/// 07-01 adds the cross-gateway `project diff` read and the
+/// Confirm-gated `project sync` promotion. The verb keys are the
+/// clap-exact spellings; the route rows in [`crate::routes`] stay
+/// untouched.
+pub const PROJECT_ACTIONS: [ProjectAction; 13] = [
     ProjectAction {
         group: "project",
         verb: "new",
@@ -450,6 +465,12 @@ pub const PROJECT_ACTIONS: [ProjectAction; 12] = [
         verb: "project diff",
         label: "diff",
         description: "compare across two profiles",
+    },
+    ProjectAction {
+        group: "project",
+        verb: "project sync",
+        label: "sync",
+        description: "promote A's resources to B",
     },
     ProjectAction {
         group: "resource",
@@ -1024,6 +1045,20 @@ pub enum ProjectsForm {
     DiffProfileB { a: String },
     /// `project diff` step 3 — the project NAME.
     DiffProject { a: String, b: String },
+    /// `project sync` step 1 — profile A (the SOURCE).
+    SyncProfileA,
+    /// `project sync` step 2 — profile B (the TARGET).
+    SyncProfileB { a: String },
+    /// `project sync` step 3 — the project NAME.
+    SyncProject { a: String, b: String },
+    /// `project sync` step 4 — the resource PATHS to promote
+    /// (space/comma separated; a Confirm gate arms next — the rich
+    /// `--all-changed`/`--delete` forms stay CLI-side via `?`).
+    SyncResources {
+        a: String,
+        b: String,
+        project: String,
+    },
 }
 
 /// The Projects screen's data (06-05): the object-list → detail
@@ -1213,7 +1248,8 @@ mod tests {
     /// update.rs executor arms key off these exact spellings), every
     /// verb unique, groups contiguous (the render's header detection
     /// depends on it), and exactly the three noun groups.
-    /// 07-01 adds the cross-gateway diff read after export.
+    /// 07-01 adds the cross-gateway diff read after export, and the
+    /// Confirm-gated sync promotion after that.
     #[test]
     fn project_actions_are_grouped_and_ordered() {
         assert_eq!(
@@ -1227,6 +1263,7 @@ mod tests {
                 "import",
                 "export",
                 "project diff",
+                "project sync",
                 "resource put",
                 "resource delete",
                 "webdev deploy",

@@ -702,3 +702,165 @@ async fn openapi_capture_writes_phase3_extract() {
         extract["path_count"]
     );
 }
+
+/// Non-empty `IGNITION_LIVE_URL_B` — the SECOND gateway (side B of
+/// the cross-gateway pair). Absent → the sync witness skips quietly
+/// (the 02-01 convention: an unset env is a green no-op).
+fn live_url_b() -> Option<String> {
+    std::env::var("IGNITION_LIVE_URL_B")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// THE cross-gateway sync witness (07-01, SYNC-02): with two live
+/// gateways from env, put a differing resource on A, `project diff`
+/// it (the resource reports `removed` — B-relative-to-A: in A only),
+/// `project sync --resource --yes` it A→B, then re-read on B (the
+/// 06-08 adoption oracle — never trust the import's success body) and
+/// assert the member bytes match A's. `IGNITION_LIVE_TOKEN` applies
+/// to BOTH sides (the documented two-sided-secret caveat) — use
+/// per-profile keyring entries for genuinely distinct credentials.
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_URL_B + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn project_sync_two_gateways_witness() {
+    let Some(env) = live_env_mutations() else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN / IGNITION_LIVE_MUTATIONS not all set");
+        return;
+    };
+    let Some(url_b) = live_url_b() else {
+        skip("IGNITION_LIVE_URL_B not set (no second gateway)");
+        return;
+    };
+
+    // The two-profile config with BOTH URLs baked in — no
+    // IGNITION_URL overlay (it would clobber one side).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "active = \"dev\"\n\n[profiles.dev]\nurl = \"{}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n\n[profiles.other]\nurl = \"{}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n",
+            env.url, url_b
+        ),
+    )
+    .expect("write config");
+
+    let ign_two = |args: &[&str]| -> Output {
+        let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+        command
+            .env("IGNITION_CLI_CONFIG", &config)
+            .env("IGNITION_TOKEN", &env.token);
+        command.args(args).output().expect("spawn ign")
+    };
+
+    let name = timestamped_name("-sync");
+    let path = "ignition/script-python/uat/synced";
+
+    // 1. The project exists on BOTH gateways.
+    expect_ok(
+        "project new on A",
+        &ign_two(&["--profile", "dev", "project", "new", &name, "--compact"]),
+    );
+    expect_ok(
+        "project new on B",
+        &ign_two(&["--profile", "other", "project", "new", &name, "--compact"]),
+    );
+
+    // 2. A carries the differing resource; B does not.
+    let body_dir = tempfile::tempdir().expect("body dir");
+    let body_file = body_dir.path().join("synced.json");
+    let body = br#"{"scope":"G","code":"print('promoted by sync')"}"#;
+    std::fs::write(&body_file, body).expect("write body");
+    expect_ok(
+        "resource put on A",
+        &ign_two(&[
+            "--profile",
+            "dev",
+            "resource",
+            "put",
+            &name,
+            path,
+            "--file",
+            body_file.to_str().unwrap(),
+            "--yes",
+            "--compact",
+        ]),
+    );
+
+    // 3. The diff names it `removed` (in A only, B-relative-to-A).
+    let diff_out = ign_two(&[
+        "project",
+        "diff",
+        "dev",
+        "other",
+        "--project",
+        &name,
+        "--compact",
+    ]);
+    expect_ok("project diff", &diff_out);
+    let diff = data_envelope(&diff_out);
+    let entries = diff["data"]["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(path))
+        .unwrap_or_else(|| panic!("diff carries the resource: {diff}"));
+    assert_eq!(entry["status"], Value::String("removed".into()));
+
+    // 4. The guarded promotion.
+    let sync_out = ign_two(&[
+        "project",
+        "sync",
+        "dev",
+        "other",
+        "--project",
+        &name,
+        "--resource",
+        path,
+        "--yes",
+        "--compact",
+    ]);
+    expect_ok("project sync", &sync_out);
+    let synced = data_envelope(&sync_out);
+    assert_eq!(
+        synced["data"]["synced"],
+        Value::Array(vec![Value::String(path.into())]),
+        "the synced list names exactly the promoted path: {synced}"
+    );
+
+    // 5. THE adoption oracle: B's re-read carries A's bytes (a fresh
+    // export under the get — never the import's success body).
+    let get_out = ign_two(&[
+        "--profile",
+        "other",
+        "resource",
+        "get",
+        &name,
+        path,
+        "--compact",
+    ]);
+    expect_ok("resource get on B", &get_out);
+    let got = data_envelope(&get_out);
+    let expected: Value = serde_json::from_slice(body).expect("body parses");
+    assert_eq!(
+        got["data"]["content"], expected,
+        "B adopted A's member content: {got}"
+    );
+
+    // 6. Best-effort cleanup on both sides.
+    for profile in ["dev", "other"] {
+        let _ = ign_two(&[
+            "--profile",
+            profile,
+            "project",
+            "delete",
+            &name,
+            "--yes",
+            "--compact",
+        ])
+        .status
+        .success();
+    }
+}
