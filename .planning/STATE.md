@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 6 COMPLETE (06-06 shipped: Rig screen — allowlist status pane with down-is-data, all nine rig verbs on the `a` menu with EXACT CLI confirm parity (reset/restore/trial-reset gated, down deliberately ungated), raw `rig logs -f` pane as the lone Streamed mapping riding a second 10k ring; the COMPLETE 63-row routes registry; tui_coverage.rs — the structural SC1 proof walking the live clap tree via CommandFactory and asserting bidirectional equality, drift-proven both directions; ignition-cli lib target added for the in-process walk; README TUI section; 698 tests green, fmt/clippy clean, auth-value confinement mechanically exact). Next: /gsd-verify-work 6, then plan Phase 7.
+**Current focus:** Phase 6 gap closure — 06-10 shipped (modal/menu UX: content-driven frame-clamped modal geometry so footer hints never clip, vim motions j/k/g/G + Ctrl-d/Ctrl-u in every modal via one menu_nav helper, prose wait labels, noun-grouped Projects menu with consequence descriptions; routes.rs + confirm parity untouched, 716 tests green, fmt/clippy clean). Next: 06-11 (rig status render + README keymap sync), then /gsd-verify-work 6.
 
 ## Current Position
 
 **Phase:** 6 of 7 (TUI Cockpit — gap closure)
 **Current Plan:** 11
 **Total Plans in Phase:** 11 (6 original + 5 gap-closure from 06-UAT)
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-28
 
-**Progress:** [█████████░] 94%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -59,6 +59,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P09 | ~15min (6min code + 9min continuation verify) | 3 tasks tasks | 3 files files |
 | Phase 06 P07 | 52min | 3 tasks | 10 files |
 | Phase 06 P08 | 52min | 2 tasks | 2 files |
+| Phase 06 P10 | 41min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -177,6 +178,9 @@ Recent decisions affecting current work:
 - [Phase 06]: [Phase 06-07]: TTY refusal hint is content-addressed — pub TUI_TTY_REFUSAL_REASON const + CoreError::tui_tty_refusal() constructor pair the reason with its interactive-terminal hint; no new variant, no hint field, slug/exit 2 frozen, resource-put --file/stdin hint pinned unchanged both directions
 - [Phase 06]: [Phase 06-08]: Root-level resource surgery LOCKED live — no-slash user path <X> maps to member <X>/resources/<X> (module named after the file) with the container descriptor via existing synthesis; virgin-rig proof: import exit-0 and the gateway re-exports at the exact member path. Dead wire (all virgin-project-proven): file member named <X>/resources = 500 module-folder-flag (reserved container), descriptor at module root = 500, zip-root files = silent no-op. UAT layout matrix superseded (state-contaminated); failed imports are ATOMIC; container descriptors ARE legal and adopt module-root files
 - [Phase 06]: [Phase 06-08]: user_path carries the deliberate alias — explicit <X>/<X> forwards to the same member as <X> and reads back as the no-slash spelling (one member, no-slash wins); adoption oracle for import experiments = fresh re-export after overwrite-import
+- [Phase 06]: [Phase 06-10]: Modal geometry is CONTENT-DRIVEN and frame-clamped — height formulas count actual rendered rows (len + 4 for menus), the render site clamps to frame-2 (5-row floor); menus with grouped/extra rows use a shared line-builder the height formula walks, so geometry always fits content
+- [Phase 06]: [Phase 06-10]: One menu_nav helper (arrows + j/k/g/G) powers ALL list-bearing modals; the Result modal's Ctrl-d/Ctrl-u step is a fixed 10 lines (update is frame-blind; the Logs screen's page step is the convention) — PageUp/PageDown behavior byte-identical
+- [Phase 06]: [Phase 06-10]: Menu labels are display prose (ACTIONS 'wait for gateway up' etc.; PROJECT_ACTIONS noun-grouped project/resource/webdev with 'label — consequence' rows, ONE flat index space keyed on the clap-exact verb) — worker labels and routes.rs rows keep clap-exact spellings; both-sides matching + group contiguity test-pinned; descriptions budgeted to the 38-col half-width modal
 
 ### Pending Todos
 
@@ -193,6 +197,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T11:24:17.914Z
-**Stopped At:** Completed 06-08-PLAN.md — root-level resource put gap closed (live-proven surgery shape, 713 tests green)
+**Last session:** 2026-08-28T12:08:05.812Z
+**Stopped At:** Completed 06-10-PLAN.md — modal/menu UX gap closure (frame-clamped geometry, vim motions, prose labels, grouped Projects menu)
 **Resume file:** None
