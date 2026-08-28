@@ -64,24 +64,33 @@ fn render_tab_bar(state: &AppState, frame: &mut Frame, area: ratatui::layout::Re
 /// never hand-rolled rect math) over a `Clear`ed region, so whatever the
 /// screen drew underneath disappears.
 fn render_modal(modal: &Modal, frame: &mut Frame) {
-    // Height grows with the content the infrastructure shapes carry;
-    // the Ratio(1,2)-wide centered geometry is the LOCKED look.
+    // Height is CONTENT-DRIVEN: every formula counts the rows the
+    // modal actually renders — entries + the footer hint + the blank
+    // separator + the two border rows (len + 4 for menu modals; the
+    // equivalent exact counts for the other shapes). No separate min
+    // caps: they caused the UAT's clipped footer hints (06-10).
     let height = match modal {
-        Modal::Confirm { body, .. } => body.lines().count().saturating_add(4).min(9),
+        Modal::Confirm { body, .. } => body.lines().count().saturating_add(4),
         Modal::Input { hint, .. } => 5 + hint.as_deref().map_or(0, |text| text.lines().count()),
-        Modal::Result_ { lines, .. } => lines.len().saturating_add(4).min(9),
-        Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(3).min(11),
-        Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(3),
-        Modal::TagsActions { .. } => crate::state::TAG_ACTIONS.len().saturating_add(3),
-        Modal::ProjectsActions { .. } => crate::state::PROJECT_ACTIONS.len().saturating_add(3),
-        Modal::RigActions { .. } => crate::state::RIG_ACTIONS.len().saturating_add(3),
+        Modal::Result_ { lines, .. } => lines.len().saturating_add(4),
+        Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(4),
+        Modal::LogsActions { .. } => crate::state::LOG_ACTIONS.len().saturating_add(4),
+        Modal::TagsActions { .. } => crate::state::TAG_ACTIONS.len().saturating_add(4),
+        Modal::ProjectsActions { .. } => crate::state::PROJECT_ACTIONS.len().saturating_add(4),
+        Modal::RigActions { .. } => crate::state::RIG_ACTIONS.len().saturating_add(4),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
         // The ack form owns its geometry (screen-owned render).
         Modal::Ack { .. } => 9,
     } as u16;
-    let area = frame.area().centered(Ratio(1, 2), Length(height.max(5)));
+    // CLAMPED to the frame: a modal never exceeds the terminal — a
+    // small frame clips content INSIDE the bordered box (the Result
+    // modal's scroll handles overflow there), never the chrome — and
+    // large terminals see the full content-driven height. The 5-row
+    // floor keeps a bordered box renderable even on tiny frames.
+    let height = height.clamp(5, frame.area().height.saturating_sub(2).max(5));
+    let area = frame.area().centered(Ratio(1, 2), Length(height));
 
     frame.render_widget(Clear, area);
     match modal {
@@ -249,7 +258,14 @@ mod tests {
     /// rows as strings (trimmed of trailing spaces) — the headless
     /// harness pattern (research test pattern; NO insta dep).
     fn rendered_rows(state: &AppState) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        rendered_rows_sized(state, 80, 24)
+    }
+
+    /// The sized twin of [`rendered_rows`] — the modal-geometry tests
+    /// render at deliberate frame sizes (06-10).
+    fn rendered_rows_sized(state: &AppState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal.draw(|frame| render(state, frame)).expect("draw");
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -491,6 +507,84 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("PgUp/PgDn scroll")),
             "result modal shows the scroll hint: {rows:?}"
+        );
+    }
+
+    /// Modal geometry is content-driven and frame-clamped (06-10): at
+    /// a large terminal every menu modal shows its FULL footer hint —
+    /// the UAT's clipped "Enter to run · Esc to cancel" rows on the
+    /// Actions (7 entries) and LogsActions (3 entries) menus — and at
+    /// a tiny 12-row frame the same modal still renders with visible
+    /// borders and no panic (height clamped to the frame).
+    #[test]
+    fn menu_modals_fit_content_and_clamp_to_small_frames() {
+        // Large frame: the FULL footer hint row renders verbatim on
+        // both menus the UAT caught clipping.
+        let mut state = AppState::new();
+        state.open_modal(Modal::Actions { selected: 0 });
+        let rows = rendered_rows(&state);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Enter to run · Esc to cancel")),
+            "Actions footer fully visible at 80x24: {rows:?}"
+        );
+
+        let mut logs = AppState::new();
+        logs.screen = Screen::Logs;
+        logs.open_modal(Modal::LogsActions { selected: 0 });
+        let rows = rendered_rows(&logs);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Enter to run · Esc to cancel")),
+            "LogsActions footer fully visible at 80x24: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("loggers reset")),
+            "the last entry also renders: {rows:?}"
+        );
+
+        // Small frame (12 rows): no panic, borders visible — the
+        // content-driven height (11 rows) clamps to the frame.
+        let rows = rendered_rows_sized(&state, 80, 12);
+        assert!(
+            rows.iter().any(|row| row.contains("┌actions")),
+            "top border + title render at 12 rows: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains('└')),
+            "bottom border renders at 12 rows: {rows:?}"
+        );
+    }
+
+    /// Long Result content rides the scroll mechanism INSIDE the
+    /// clamped box: the modal itself clamps to the frame (chrome
+    /// intact, the head of the content visible) while the tail stays
+    /// reachable by scroll — the footer hint rides below the content
+    /// and appears once scrolled there.
+    #[test]
+    fn result_modal_clamps_long_content_to_the_frame() {
+        let mut state = AppState::new();
+        state.open_modal(Modal::Result_ {
+            title: "wait gateway".into(),
+            lines: (0..40).map(|i| format!("line-{i}")).collect(),
+            scroll: 0,
+        });
+        let rows = rendered_rows(&state);
+        assert!(
+            rows.iter().any(|row| row.contains("┌wait gateway")),
+            "bordered title renders: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("line-0")),
+            "the head of the content renders: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("line-39")),
+            "the tail stays behind the scroll offset, not spilling past the frame: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains('└')),
+            "the clamped box keeps its bottom border inside the frame: {rows:?}"
         );
     }
 
