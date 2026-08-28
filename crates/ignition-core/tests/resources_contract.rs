@@ -404,6 +404,162 @@ async fn nonexistent_project_surfaces_export_not_found() {
     }
 }
 
+/// THE root-level put structure pin (06-08, closing UAT test 6): a
+/// no-slash user path (`perspective-properties.json` — a project-root
+/// file in user terms) must land at the module-folder member shape
+/// the gateway ADOPTS — LIVE-PROVEN on the 8.3.3 rig (T2 experiment,
+/// 2026-08-28): member `<X>/resources/<X>` plus the container
+/// descriptor `<X>/resources/resource.json` imports exit-0, and the
+/// gateway re-exports both at exactly those member paths with the
+/// content verbatim. The OLD shape — a file member literally named
+/// `<X>/resources` — is the 500 ("module folder must have folder
+/// flag set", reproduced on a virgin project): the gateway reads the
+/// second segment as the module's reserved resources CONTAINER and
+/// refuses a file there.
+///
+/// This test runs the surgery in-memory and inspects the OUTPUT zip
+/// structure directly (gateway-free, CI-green without a rig):
+/// - the member exists at `<X>/resources/<X>` and reads back through
+///   the SAME user path (put→get symmetry);
+/// - the container descriptor exists, lists the basename, scope G;
+/// - NO file member is named `<X>/resources` (the broken degenerate
+///   mapping) — pinned by walking the raw archive names;
+/// - the appended structure carries NO directory entries (the
+///   live-proven shape is pure file members; no folder-flag games);
+/// - neighbors and their order survive untouched.
+#[tokio::test]
+async fn root_level_put_synthesizes_module_folder_shape() {
+    let zip = sample_export_zip();
+    let body = br#"{"updateMode":"Notify"}"#.to_vec();
+    let out = ignition_core::client::resources::replace_member(
+        &zip,
+        "perspective-properties.json",
+        &body,
+    )
+    .expect("root-level put rewrites");
+
+    // Put→get symmetry through the user path.
+    assert_eq!(
+        read_member(&out, "perspective-properties.json").expect("reads back via user path"),
+        body,
+        "the no-slash user path round-trips to the module-folder member"
+    );
+
+    // THE landing shape: the parent (the module's resources container)
+    // carries a descriptor listing the new basename.
+    let descriptor = read_member(&out, "perspective-properties.json/resource.json")
+        .expect("container descriptor lands");
+    let parsed: serde_json::Value = serde_json::from_slice(&descriptor).expect("descriptor json");
+    assert_eq!(parsed["files"], serde_json::json!(["perspective-properties.json"]));
+    assert_eq!(parsed["scope"], serde_json::json!("G"));
+
+    // THE broken-shape fence: no file member is literally named
+    // `<X>/resources`, and no directory entries ride the appended
+    // structure (the gateway-accepted shape is pure file members).
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(&out)).expect("surgical output is a zip");
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).expect("entry walks");
+        let name = entry.name();
+        assert!(
+            name != "perspective-properties.json/resources",
+            "no file member may be named the reserved container path (the 500 shape)"
+        );
+        if name.starts_with("perspective-properties.json/") {
+            assert!(!entry.is_dir(), "appended structure is file members only");
+        }
+    }
+
+    // List shows the no-slash name first-class; neighbors keep their
+    // order ahead of the append.
+    let members = resource_members(&out).expect("re-list");
+    assert!(
+        members.contains(&"perspective-properties.json".to_string()),
+        "list surfaces the root-level user path: {members:?}"
+    );
+    assert_eq!(members[0], SCRIPT_USER_PATH.to_string());
+    assert_eq!(members[1], "com.example/views/Dashboard/view.json".to_string());
+}
+
+/// THE root-level delete pin: the no-slash user path removes exactly
+/// the module-folder member; the container descriptor stays for the
+/// gateway's own reconciliation (the 05-07 live-proven delete rule —
+/// unchanged by the new mapping).
+#[tokio::test]
+async fn root_level_delete_removes_the_member() {
+    let zip = sample_export_zip();
+    let staged = ignition_core::client::resources::replace_member(
+        &zip,
+        "perspective-properties.json",
+        b"{}",
+    )
+    .expect("root-level put stages");
+    let out = ignition_core::client::resources::remove_member(&staged, "perspective-properties.json")
+        .expect("root-level delete rewrites");
+    let gone = read_member(&out, "perspective-properties.json");
+    assert!(
+        matches!(gone, Err(CoreError::NotFound { .. })),
+        "the member is gone through the user path: {gone:?}"
+    );
+    assert!(
+        read_member(&out, "perspective-properties.json/resource.json").is_ok(),
+        "the container descriptor rides — the gateway prunes the stale entry"
+    );
+    // Removing an absent root-level path is the family's not-found.
+    let missing =
+        ignition_core::client::resources::remove_member(&out, "perspective-properties.json")
+            .expect_err("absent root-level member must fail");
+    assert_eq!(missing.exit_code(), 6);
+}
+
+/// THE wire-shape crown pin (gateway-free): the full put ACTION over
+/// wiremock — export then overwrite-import — carries the
+/// module-folder structure in the import BODY, the exact bytes the
+/// gateway's import validation sees. Member-level honesty via the
+/// same surgery helpers on the received request.
+#[tokio::test]
+async fn resource_put_root_level_member_lands_module_folder_shape() {
+    let server = wiremock::MockServer::start().await;
+    mount_export(&server, "p", sample_export_zip(), 1).await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/import/p"))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let body = br#"{"updateMode":"Notify"}"#.to_vec();
+    actions::resource_put(&api, "p", "perspective-properties.json", body.clone())
+        .await
+        .expect("root-level put orchestrates Ok");
+
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import POST");
+    assert_eq!(
+        read_member(&requests[0].body, "perspective-properties.json")
+            .expect("surgical body carries the member under the user path"),
+        body
+    );
+    let members = resource_members(&requests[0].body).expect("surgical body lists");
+    assert!(members.contains(&"perspective-properties.json".to_string()));
+    // THE broken-shape fence at the wire level: the reserved container
+    // path never appears as a FILE member in the uploaded zip.
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&requests[0].body))
+        .expect("import body is a zip");
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).expect("walks");
+        assert!(
+            entry.name() != "perspective-properties.json/resources",
+            "the 500 shape must never ride the wire"
+        );
+    }
+}
+
 /// The family classifies like every other: 401 Jetty HTML on the
 /// export (header-less under default security) → `Auth` (exit 5) —
 /// classify runs before any body consumption, zip or otherwise.
