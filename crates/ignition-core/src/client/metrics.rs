@@ -192,8 +192,7 @@ mod tests {
     /// round-trip as JSON INTEGERS (the pre-f64 agent shape).
     #[test]
     fn current_gauges_decodes_exponent_form_java_doubles() {
-        let raw =
-            r#"{"cpu":1.2755618546264424,"heapMemory":2.85746728E8,"maxMemory":1073741824}"#;
+        let raw = r#"{"cpu":1.2755618546264424,"heapMemory":2.85746728E8,"maxMemory":1073741824}"#;
         let gauges: CurrentGauges =
             serde_json::from_str(raw).expect("8.3.3 exponent-form gauges must parse");
         assert_eq!(gauges.heap_memory, 285746728.0);
