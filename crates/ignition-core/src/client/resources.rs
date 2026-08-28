@@ -388,6 +388,251 @@ pub fn remove_member(zip_bytes: &[u8], member: &str) -> Result<Vec<u8>, CoreErro
     Ok(zip)
 }
 
+// ---- Pure diff engine (07-01, SYNC-01) -----------------------------------
+//
+// Cross-gateway project diff, member-level with resource.json
+// NORMALIZATION — the live-evidenced volatility guard (07-RESEARCH
+// Pitfall 1): every gateway-written descriptor carries
+// `attributes.lastModification` (+`…Signature`), so a byte-compare
+// flags identical content exported from two gateways as CHANGED.
+// Normalization strips exactly those two attribute fields, keeps
+// everything semantic (`scope`/`version`/`files`, the REST of
+// `attributes`), and re-serializes into a canonical form this module
+// OWNS — see [`normalize_descriptor`]. All pure, zero new
+// dependencies, unit-testable without a gateway (the 05-02 pattern).
+
+/// 64-bit FNV-1a — the member digest. No sha2 dependency: collision
+/// risk (2^-64 per pair on 64-bit hashes) is acceptable for diff UX;
+/// this is change detection, not security.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Rebuild a JSON value with every object's entries sorted by key —
+/// the canonicalizer [`normalize_descriptor`] owns. serde_json's
+/// default map IS sorted (BTreeMap) today, but a workspace-wide
+/// `preserve_order` feature flip would make it insertion-ordered:
+/// sorting explicitly means canonical output never depends on the
+/// ambient map behavior (the cross-version guard — pinned by the
+/// key-order-independence unit test).
+fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize(value)))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(entries.into_iter().collect::<serde_json::Map<_, _>>())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize).collect())
+        }
+        other => other,
+    }
+}
+
+/// Normalize one `resource.json` descriptor for comparison: parse,
+/// strip the two live-evidenced volatility fields
+/// (`attributes.lastModification` and
+/// `attributes.lastModificationSignature` — keep every other
+/// attribute and all semantic keys), recursively sort object keys,
+/// re-serialize compact. `None` for non-JSON or a non-object root —
+/// the caller hashes the raw bytes instead (the descriptor is exotic
+/// or corrupt; content honesty over a false equality).
+pub fn normalize_descriptor(json: &[u8]) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    if !value.is_object() {
+        return None; // non-object roots hash raw (the caller's rule)
+    }
+    if let Some(attributes) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("attributes"))
+        .and_then(|attributes| attributes.as_object_mut())
+    {
+        attributes.remove("lastModification");
+        attributes.remove("lastModificationSignature");
+    }
+    serde_json::to_vec(&canonicalize(value)).ok()
+}
+
+/// User path → FNV-1a digest for every resource member in the export
+/// zip. Members whose basename is `resource.json` hash their
+/// NORMALIZED form ([`normalize_descriptor`]); everything else hashes
+/// raw bytes. `project.json`, directory entries, and
+/// non-`resources`-shaped members carry no user path and are skipped
+/// (the same walk [`resource_members`] rides) — which is exactly how
+/// [`diff_members`] excludes the root project.json from resource
+/// entries.
+pub fn member_hashes(zip_bytes: &[u8]) -> Result<BTreeMap<String, u64>, CoreError> {
+    let mut archive = open_archive(zip_bytes)?;
+    let mut hashes = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| CoreError::Internal(format!("cannot walk project export zip: {err}")))?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_string();
+        let Some(user) = user_path(&name) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|err| {
+            CoreError::Internal(format!("cannot decompress zip member {name:?}: {err}"))
+        })?;
+        let content = if name.rsplit('/').next() == Some(FOLDER_DESCRIPTOR) {
+            normalize_descriptor(&bytes).unwrap_or(bytes)
+        } else {
+            bytes
+        };
+        hashes.insert(user, fnv1a(&content));
+    }
+    Ok(hashes)
+}
+
+/// One member's diff status — B-relative-to-A semantics (the LOCKED
+/// direction): `added` = in B only, `removed` = in A only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberStatus {
+    /// Present in B, absent in A.
+    Added,
+    /// Present in A, absent in B.
+    Removed,
+    /// Present in both, normalized hashes differ.
+    Changed,
+    /// Present in both, normalized hashes equal.
+    Same,
+}
+
+/// One row of the diff: the user path + its status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberDiffEntry {
+    /// The user-facing resource path.
+    pub path: String,
+    /// B-relative-to-A status.
+    pub status: MemberStatus,
+}
+
+/// The four counts — the summary line and the JSON `summary` object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct DiffSummary {
+    /// Members equal (after normalization) in both.
+    pub same: usize,
+    /// Members only in B.
+    pub added: usize,
+    /// Members only in A.
+    pub removed: usize,
+    /// Members differing (after normalization) between A and B.
+    pub changed: usize,
+}
+
+/// The member-level diff result: counts + one entry per resource
+/// member, sorted by path. The root `project.json` is EXCLUDED (it is
+/// not a resource; [`project_meta_delta`] surfaces it separately).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MemberDiff {
+    /// The four counts.
+    pub summary: DiffSummary,
+    /// Every resource member with its status, path-sorted.
+    pub entries: Vec<MemberDiffEntry>,
+}
+
+/// THE compare primitive: B-relative-to-A member statuses over two
+/// export zips — `added` = path in B not A, `removed` = in A not B,
+/// `changed` = both with differing normalized hashes, `same` = both
+/// with equal ones. Entries ride path-sorted (the BTreeMap union
+/// iterates sorted). The root `project.json` never appears (the
+/// [`member_hashes`] walk skips it).
+pub fn diff_members(zip_a: &[u8], zip_b: &[u8]) -> Result<MemberDiff, CoreError> {
+    let hashes_a = member_hashes(zip_a)?;
+    let hashes_b = member_hashes(zip_b)?;
+    let paths: std::collections::BTreeSet<&String> =
+        hashes_a.keys().chain(hashes_b.keys()).collect();
+    let mut summary = DiffSummary::default();
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let status = match (hashes_a.get(path), hashes_b.get(path)) {
+            (Some(hash_a), Some(hash_b)) => {
+                if hash_a == hash_b {
+                    MemberStatus::Same
+                } else {
+                    MemberStatus::Changed
+                }
+            }
+            (None, Some(_)) => MemberStatus::Added,
+            (Some(_), None) => MemberStatus::Removed,
+            (None, None) => unreachable!("the union only carries present keys"),
+        };
+        match status {
+            MemberStatus::Same => summary.same += 1,
+            MemberStatus::Added => summary.added += 1,
+            MemberStatus::Removed => summary.removed += 1,
+            MemberStatus::Changed => summary.changed += 1,
+        }
+        entries.push(MemberDiffEntry {
+            path: (*path).clone(),
+            status,
+        });
+    }
+    Ok(MemberDiff { summary, entries })
+}
+
+/// The root `project.json` member, parsed — `Ok(None)` when the member
+/// is absent; a parse failure is ALSO `Ok(None)` (the caller treats a
+/// missing/unparseable project.json as "no meta to compare" — the
+/// diff is about resources).
+fn root_project_json(zip_bytes: &[u8]) -> Result<Option<serde_json::Value>, CoreError> {
+    let mut archive = open_archive(zip_bytes)?;
+    let Ok(mut file) = archive.by_name("project.json") else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|err| {
+        CoreError::Internal(format!(
+            "cannot decompress zip member \"project.json\": {err}"
+        ))
+    })?;
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+/// A missing/null JSON value rendered as text for the delta triples.
+fn value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Compare the root `project.json`'s SEMANTIC fields — `title`,
+/// `enabled`, `parent` only — returning one `(field, a_value,
+/// b_value)` triple per differing field (stringified values; absent
+/// renders as `null`). Missing member or parse failure → empty vec:
+/// the diff is about resources, project meta rides separately.
+pub fn project_meta_delta(
+    zip_a: &[u8],
+    zip_b: &[u8],
+) -> Result<Vec<(String, String, String)>, CoreError> {
+    let a = root_project_json(zip_a)?.unwrap_or(serde_json::Value::Null);
+    let b = root_project_json(zip_b)?.unwrap_or(serde_json::Value::Null);
+    let mut deltas = Vec::new();
+    for field in ["title", "enabled", "parent"] {
+        let (value_a, value_b) = (&a[field], &b[field]);
+        if value_a != value_b {
+            deltas.push((field.to_string(), value_text(value_a), value_text(value_b)));
+        }
+    }
+    Ok(deltas)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -779,5 +1024,305 @@ mod tests {
         let bare: ResourceEntry =
             serde_json::from_value(serde_json::json!({"path": "x"})).expect("extras-free parses");
         assert!(bare.extra.is_empty());
+    }
+
+    // ---- Pure diff engine units (07-01) ----
+
+    use super::{
+        DiffSummary, MemberDiff, MemberDiffEntry, MemberStatus, diff_members, member_hashes,
+        normalize_descriptor, project_meta_delta,
+    };
+
+    /// The diff-side fixture builder: a custom `project.json` (the
+    /// meta-delta tests need differing titles) + one member per pair.
+    fn diff_zip(project_json: &[u8], members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer
+            .start_file("project.json", options)
+            .expect("project.json starts");
+        writer.write_all(project_json).expect("project.json writes");
+        for (name, bytes) in members {
+            writer.start_file(*name, options).expect("member starts");
+            writer.write_all(bytes).expect("member writes");
+        }
+        writer.finish().expect("zip finalizes").into_inner()
+    }
+
+    /// A live-shaped folder descriptor: scope/version/files plus the
+    /// two volatility attributes every gateway-written resource.json
+    /// carries (07-RESEARCH Pitfall 1).
+    fn descriptor(plain_body: &str, modified_a: &str) -> Vec<u8> {
+        format!(
+            r#"{{"scope":"G","version":1,"files":["script.py"],"attributes":{{"lastModification":{{"actor":"admin","timestamp":"{modified_a}","signature":"sig-{modified_a}"}},"lastModificationSignature":"sig-{modified_a}","notes":"{plain_body}"}}}}"#
+        )
+        .into_bytes()
+    }
+
+    const DESC_MEMBER: &str = "ignition/resources/script-python/uat/resource.json";
+    const SCRIPT_MEMBER_2: &str = "ignition/resources/script-python/uat/script.py";
+    const VIEW_MEMBER_2: &str = "com.example/resources/views/Dash/view.json";
+
+    /// (a) THE volatility pin: identical descriptor CONTENT with
+    /// DIFFERING `lastModification` attributes reports `same` — the
+    /// normalized compare, not a byte compare.
+    #[test]
+    fn diff_same_content_differing_modification_attributes_is_same() {
+        let a = diff_zip(
+            br#"{"title":"T","enabled":true}"#,
+            &[(
+                DESC_MEMBER,
+                descriptor("kept", "2026-08-28T10:00:00Z").as_slice(),
+            )],
+        );
+        let b = diff_zip(
+            br#"{"title":"T","enabled":true}"#,
+            &[(
+                DESC_MEMBER,
+                descriptor("kept", "2026-08-28T11:30:00Z").as_slice(),
+            )],
+        );
+        let diff = diff_members(&a, &b).expect("diff parses");
+        assert_eq!(
+            diff,
+            MemberDiff {
+                summary: DiffSummary {
+                    same: 1,
+                    added: 0,
+                    removed: 0,
+                    changed: 0
+                },
+                entries: vec![MemberDiffEntry {
+                    path: "ignition/script-python/uat/resource.json".to_string(),
+                    status: MemberStatus::Same,
+                }],
+            }
+        );
+    }
+
+    /// (b)+(c)+(d) THE direction pin: a member only in B is `added`,
+    /// one only in A is `removed`, differing script BYTES are
+    /// `changed` — B-relative-to-A, entries path-sorted.
+    #[test]
+    fn diff_direction_semantics_added_removed_changed() {
+        let a = diff_zip(
+            br#"{"title":"T"}"#,
+            &[
+                (SCRIPT_MEMBER_2, b"print('old')"),
+                (VIEW_MEMBER_2, br#"{"scope":"A"}"#.as_slice()),
+            ],
+        );
+        let b = diff_zip(
+            br#"{"title":"T"}"#,
+            &[
+                (SCRIPT_MEMBER_2, b"print('new')"),
+                (
+                    "com.example/resources/views/Fresh/view.json",
+                    br#"{"scope":"G"}"#.as_slice(),
+                ),
+            ],
+        );
+        let diff = diff_members(&a, &b).expect("diff parses");
+        assert_eq!(
+            diff.entries,
+            vec![
+                MemberDiffEntry {
+                    path: "com.example/views/Dash/view.json".to_string(),
+                    status: MemberStatus::Removed,
+                },
+                MemberDiffEntry {
+                    path: "com.example/views/Fresh/view.json".to_string(),
+                    status: MemberStatus::Added,
+                },
+                MemberDiffEntry {
+                    path: "ignition/script-python/uat/script.py".to_string(),
+                    status: MemberStatus::Changed,
+                },
+            ],
+            "B-relative-to-A, path-sorted"
+        );
+        assert_eq!(
+            diff.summary,
+            DiffSummary {
+                same: 0,
+                added: 1,
+                removed: 1,
+                changed: 1
+            }
+        );
+    }
+
+    /// (e) Empty-vs-populated: everything in A reports `removed`
+    /// (and symmetrically everything in B would be `added`).
+    #[test]
+    fn diff_empty_vs_populated_is_all_removed() {
+        let a = diff_zip(br#"{"title":"T"}"#, &[(SCRIPT_MEMBER_2, b"print('old')")]);
+        let b = diff_zip(br#"{"title":"T"}"#, &[]);
+        let diff = diff_members(&a, &b).expect("diff parses");
+        assert_eq!(diff.summary.removed, 1);
+        assert_eq!(
+            diff.summary.added + diff.summary.changed + diff.summary.same,
+            0
+        );
+        assert_eq!(diff.entries[0].status, MemberStatus::Removed);
+
+        // The mirror: populated-vs-empty is all `added`.
+        let mirror = diff_members(&b, &a).expect("diff parses");
+        assert_eq!(mirror.summary.added, 1);
+        assert_eq!(mirror.entries[0].status, MemberStatus::Added);
+    }
+
+    /// (f) THE exclusion pin: a differing `project.json` title rides
+    /// the META delta as one triple and NEVER appears in the member
+    /// entries — `diff_members` excludes the root project.json (it is
+    /// not a resource).
+    #[test]
+    fn diff_excludes_root_project_json_and_surfaces_meta_delta() {
+        let a = diff_zip(
+            br#"{"title":"Old","enabled":true}"#,
+            &[(SCRIPT_MEMBER_2, b"x")],
+        );
+        let b = diff_zip(
+            br#"{"title":"New","enabled":true}"#,
+            &[(SCRIPT_MEMBER_2, b"x")],
+        );
+        let diff = diff_members(&a, &b).expect("diff parses");
+        assert_eq!(diff.summary.same, 1, "the only resource member is same");
+        assert!(
+            !diff
+                .entries
+                .iter()
+                .any(|entry| entry.path == "project.json"),
+            "the root project.json is never a resource entry"
+        );
+        assert_eq!(
+            project_meta_delta(&a, &b).expect("meta delta parses"),
+            vec![("title".to_string(), "Old".to_string(), "New".to_string())],
+            "the title difference rides the meta delta exactly"
+        );
+
+        // Semantic fields beyond the trio never ride: a differing
+        // description is NOT a delta (scope discipline).
+        let c = diff_zip(
+            br#"{"title":"New","enabled":true,"description":"differs"}"#,
+            &[(SCRIPT_MEMBER_2, b"x")],
+        );
+        assert!(
+            project_meta_delta(&b, &c)
+                .expect("meta delta parses")
+                .is_empty(),
+            "only title/enabled/parent compare"
+        );
+    }
+
+    /// (g) THE key-order-independence pin (the cross-version
+    /// canonicalization guard): the SAME logical descriptor
+    /// serialized with two DIFFERENT key orders — top-level AND
+    /// nested-object keys shuffled — normalizes to byte-identical
+    /// output, so the members hash equal and report `same`. Canonical
+    /// output must never depend on input key order or serde_json's
+    /// ambient map behavior (a future `preserve_order` flip).
+    #[test]
+    fn normalize_descriptor_is_key_order_independent() {
+        let order_a = br#"{"scope":"G","version":1,"files":["a.py","b.py"],"attributes":{"lastModification":{"actor":"x","timestamp":"t"},"keep":{"z":1,"a":2}}}"#;
+        let order_b = br#"{"attributes":{"keep":{"a":2,"z":1},"lastModification":{"timestamp":"t","actor":"x"}},"files":["a.py","b.py"],"version":1,"scope":"G"}"#;
+        let normalized_a = normalize_descriptor(order_a).expect("a normalizes");
+        let normalized_b = normalize_descriptor(order_b).expect("b normalizes");
+        assert_eq!(
+            normalized_a, normalized_b,
+            "canonical output depends only on content, never key order"
+        );
+        // …and the member-level consequence: the two zips diff `same`.
+        let zip_a = diff_zip(br#"{"title":"T"}"#, &[(DESC_MEMBER, &normalized_a)]);
+        let zip_b = diff_zip(br#"{"title":"T"}"#, &[(DESC_MEMBER, &normalized_b)]);
+        let diff = diff_members(&zip_a, &zip_b).expect("diff parses");
+        assert_eq!(diff.summary.same, 1);
+        assert_eq!(diff.summary.changed, 0);
+
+        // The strip is EXACTLY the two volatility fields — other
+        // attribute content differing still means `changed`.
+        let keep_a = br#"{"scope":"G","attributes":{"notes":"one"}}"#;
+        let keep_b = br#"{"scope":"G","attributes":{"notes":"two"}}"#;
+        assert_ne!(
+            normalize_descriptor(keep_a).expect("normalizes"),
+            normalize_descriptor(keep_b).expect("normalizes"),
+            "non-volatility attribute differences survive normalization"
+        );
+    }
+
+    /// Non-JSON / non-object descriptors return `None` — the caller
+    /// hashes the RAW bytes (exotic descriptors compare bytewise,
+    /// honest over a false equality).
+    #[test]
+    fn normalize_descriptor_refuses_non_json_and_non_object() {
+        assert!(normalize_descriptor(b"print('not json')").is_none());
+        assert!(normalize_descriptor(br#"[1,2,3]"#).is_none());
+        assert!(normalize_descriptor(b"").is_none());
+        // A plain object without attributes normalizes fine (the
+        // strip is conditional).
+        assert!(normalize_descriptor(br#"{"scope":"G"}"#).is_some());
+    }
+
+    /// `member_hashes` maps USER paths (project.json skipped,
+    /// directory entries skipped) and normalizes descriptor members —
+    /// the map's key set is exactly `resource_members`' list.
+    #[test]
+    fn member_hashes_key_set_matches_resource_members() {
+        let a = diff_zip(
+            br#"{"title":"T"}"#,
+            &[
+                (DESC_MEMBER, descriptor("x", "t1").as_slice()),
+                (SCRIPT_MEMBER_2, b"print('x')"),
+                (VIEW_MEMBER_2, br#"{"scope":"A"}"#.as_slice()),
+            ],
+        );
+        let hashes = member_hashes(&a).expect("hashes parse");
+        assert_eq!(
+            hashes.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "com.example/views/Dash/view.json",
+                "ignition/script-python/uat/resource.json",
+                "ignition/script-python/uat/script.py",
+            ],
+            "user paths, project.json skipped, path-sorted"
+        );
+        assert!(hashes.values().all(|hash| *hash != 0));
+    }
+
+    /// The serialized agent shapes: statuses render as lowercase
+    /// strings and the summary carries all four keys always.
+    #[test]
+    fn diff_shapes_serialize_stably() {
+        let entry = MemberDiffEntry {
+            path: "x/y".to_string(),
+            status: MemberStatus::Added,
+        };
+        assert_eq!(
+            serde_json::to_value(&entry).expect("serializes"),
+            serde_json::json!({"path": "x/y", "status": "added"})
+        );
+        let summary = serde_json::to_value(DiffSummary {
+            same: 1,
+            added: 2,
+            removed: 3,
+            changed: 4,
+        })
+        .expect("serializes");
+        assert_eq!(
+            summary,
+            serde_json::json!({"same": 1, "added": 2, "removed": 3, "changed": 4})
+        );
+        for (status, word) in [
+            (MemberStatus::Added, "added"),
+            (MemberStatus::Removed, "removed"),
+            (MemberStatus::Changed, "changed"),
+            (MemberStatus::Same, "same"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).expect("serializes"),
+                serde_json::Value::String(word.to_string())
+            );
+        }
     }
 }
