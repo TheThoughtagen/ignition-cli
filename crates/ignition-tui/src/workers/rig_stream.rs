@@ -8,11 +8,12 @@
 //! NO gateway client from the cockpit's profile world is used: the
 //! rig verbs address the rig's OWN derived gateway URL via
 //! [`crate::context`]'s rig constructors (04-03's lock, TUI edition)
-//! — and every `Credential`/`Secret` construction stays confined
-//! there. The Confirm-gated verbs (reset / restore / trial reset —
-//! main.rs's `require_confirmation` set EXACTLY) fire ONLY from
-//! update's execute_pending; `down` is deliberately UNGUARDED, like
-//! the CLI (compose down keeps volumes).
+//! — and every auth-value construction stays confined there (the
+//! phase's single-file secrets-confinement answer). The Confirm-gated
+//! verbs (reset / restore / trial reset — main.rs's
+//! `require_confirmation` set EXACTLY) fire ONLY from update's
+//! execute_pending; `down` is deliberately UNGUARDED, like the CLI
+//! (compose down keeps volumes).
 
 use ignition_core::actions;
 use ignition_core::config;

@@ -3,7 +3,8 @@
 One binary that lets a developer (or an AI agent) fully operate and inspect an
 Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the
 gateway webpage or Designer. Every subcommand is non-interactive by default
-and scriptable with JSON output; the TUI cockpit arrives in a later phase.
+and scriptable with JSON output; `ign tui` (below) is the interactive
+cockpit over the same actions layer.
 
 ## Output contract (for agents)
 
@@ -178,6 +179,54 @@ All gateway commands honor the envelope (`--json`/`--compact`) with the
 Config > Modules, and Performance & Diagnostics pages; `sessions`,
 `connections`, the `logs` tree, and the `project` tree replace its
 Sessions, Connections, Logs console, logger-config, and Projects pages.
+
+## TUI cockpit (`ign tui`)
+
+An interactive ratatui cockpit over the SAME actions layer the CLI
+dispatches through — every screen is the CLI family rendered live, not
+a parallel implementation:
+
+| Screen | What it shows |
+|--------|---------------|
+| Dashboard | Status/modules/metrics/sessions panels on a 5 s refresh; the global verbs (`version`, `connections`, `wait …`, `doctor`, `restart`) and the profile switcher (`p`) |
+| Logs | Live tail (`ign logs -f`) with the level filter (`l`), follow/scrollback, and the loggers family behind `a` |
+| Tags | The k9s-style browser: providers → tree → detail with on-demand reads; live watch (`w`); the tags family behind `a`; the Alarms tab carries active/history/ack |
+| Projects | Project list → detail (record + resources) → resource preview; the project/resource/webdev families behind `a` |
+| Rig | The compose rig's status summary, the full rig verb menu behind `a`, and a raw `rig logs -f` pane (`l`) |
+
+Behavior contract:
+
+- **Interactive-only.** `ign tui` requires a TTY — piped stdout
+  refuses with a usage error (exit 2) before the alternate screen is
+  ever touched. Profile resolution failures (no profile, missing
+  secret) also surface BEFORE the terminal flips: the normal stderr
+  envelope and exit taxonomy, not a flash of alt-screen.
+- **Silent stdout on success.** The alternate screen owns all display;
+  a clean exit prints NOTHING on stdout (no envelope, no summary
+  line). Errors after the terminal is restored render to **stderr**
+  per the frozen taxonomy — the envelope contract is the CLI's.
+- **Confirm parity.** Exactly the CLI's `--yes`-guarded verbs open a
+  Confirm modal first (`y` ≡ `--yes`, Esc spawns nothing): restart,
+  sessions terminate, loggers set/reset, tags provider/config delete,
+  tags import-overwrite, project delete/import-overwrite, resource
+  put/delete, rig reset/restore, rig trial reset. Everything else
+  fires directly — including `rig down` and `webdev deploy`, which
+  the CLI deliberately leaves unguarded.
+- **Keybindings.** `q`/Ctrl-C quit (Ctrl-C works even behind a modal;
+  `q` never quits behind a modal — it types) · Tab/Shift-Tab cycle
+  screens · Enter/Esc navigate (Esc ascends one level on the browser
+  screens) · `a` opens the screen's actions menu · `p` opens the
+  profile switcher. Per-screen: `r` refresh (Dashboard/Rig), `l`
+  level filter (Logs) / logs pane toggle (Rig), `f` follow, `w` watch
+  a tag (Tags), `h` alarm history (Alarms), `t` terminate a session
+  (Dashboard).
+- **Coverage is CI-enforced.** A structural test
+  (`crates/ignition-cli/tests/tui_coverage.rs`) walks the live clap
+  command tree and asserts bidirectional equality with the TUI route
+  registry: every CLI leaf (plus the bare-invocable `sessions`,
+  `logs`, `logs loggers` forms) has a TUI mapping and no orphan rows
+  exist — adding a CLI command without a cockpit surface FAILS CI.
+  The only unmapped leaf is `completions` (out-of-band by design).
 
 ## Rigs (Docker compose lifecycle)
 
