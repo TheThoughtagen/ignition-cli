@@ -218,13 +218,26 @@ Downloaded mock-gateway.gwbk (roaming)"#]],
 }
 
 /// Download COMPACT JSON golden: the action envelope {file, type}.
+/// Runs in an isolated cwd — the default-naming download writes its
+/// file wherever the process stands.
 #[tokio::test]
 async fn backup_download_json_golden() {
     let server = wiremock::MockServer::start().await;
     mount_backup_download(&server).await;
     let (_config_dir, config) = isolated_config();
     write_profile_config(&config, &server.uri());
-    let out = ign(&config, &server.uri(), &["backup", "download", "--compact"]);
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let out = {
+        let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+        command
+            .env("IGNITION_CLI_CONFIG", &config)
+            .env("IGNITION_TOKEN", "mock:name-key")
+            .env("IGNITION_URL", server.uri())
+            .current_dir(cwd.path())
+            .args(["backup", "download", "--compact"])
+            .output()
+            .expect("spawn ign")
+    };
     assert_eq!(
         out.status.code(),
         Some(0),
