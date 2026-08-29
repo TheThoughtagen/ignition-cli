@@ -34,6 +34,7 @@ use ignition_core::actions::rig::{
     RestoreResult, RigDownResult, RigLogsResult, RigResetResult, RigStatusResult, RigUpResult,
     SnapshotResult, TrialResetResult, TrialStatusResult,
 };
+use ignition_core::actions::script::ScriptRunResult;
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::actions::tags::{
     TagProvidersResult, TagsAlarmsAckResult, TagsAlarmsActiveResult, TagsAlarmsHistoryResult,
@@ -232,6 +233,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskDetail(result) => render_eam_task_detail_human(result),
         ActionOutput::EamTaskCreate(result) => render_eam_task_create_human(result),
         ActionOutput::EamTaskForce(result) => render_eam_task_force_human(result),
+        ActionOutput::ScriptRun(result) => render_script_run_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -961,6 +963,20 @@ fn render_eam_task_force_human(result: &EamTaskForceResult) {
         }
         None => println!("  (no history entry visible yet)"),
     }
+}
+
+/// `ign script run` human shape — the stdout block VERBATIM (the
+/// route captured exactly what the script printed), then the value
+/// and the route-measured wall time (the plan's three-part render:
+/// stdout block, `result:` line, `elapsed:` line).
+fn render_script_run_human(result: &ScriptRunResult) {
+    println!("stdout:");
+    print!("{}", result.stdout);
+    if !result.stdout.is_empty() && !result.stdout.ends_with('\n') {
+        println!();
+    }
+    println!("result: {}", result.result);
+    println!("elapsed: {} ms", result.elapsed_ms);
 }
 
 /// `ign eam tasks <NAME>` human shape — the definition pretty-printed

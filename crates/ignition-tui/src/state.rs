@@ -313,6 +313,11 @@ pub enum PendingInput {
     /// The task name for `eam task force` (a Confirm gate arms at
     /// accept — 07-02 Task 3).
     EamTaskForceName,
+    /// The Python source for `script run` (fires UNGATED at accept
+    /// — 07-03: no --yes exists on the CLI verb; the deploy flag IS
+    /// the opt-in. Code-only — the TUI refuses the --file/stdin
+    /// forms per the crossterm raw-input rule).
+    ScriptCode,
 }
 
 impl Modal {
@@ -398,7 +403,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 13] = [
+pub const ACTIONS: [&str; 14] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -414,6 +419,8 @@ pub const ACTIONS: [&str; 13] = [
     "eam tasks",
     "eam task new",
     "eam task force",
+    // 07-03: the scriptExec verb (ungated — CLI parity).
+    "script run",
 ];
 
 /// The Logs screen's actions menu entries (06-03) — the loggers
@@ -1284,7 +1291,8 @@ mod tests {
     /// The dashboard menu's wait labels are display PROSE (06-10) —
     /// the executor arms in update.rs match these exact strings, and
     /// routes.rs carries the clap-exact spellings (never these).
-    /// 07-02 appends the backup pair (clap-exact — no prose needed).
+    /// 07-02 appends the backup pair (clap-exact — no prose needed);
+    /// 07-03 appends script run (same).
     #[test]
     fn dashboard_actions_use_display_prose_wait_labels() {
         assert_eq!(
@@ -1303,6 +1311,7 @@ mod tests {
                 "eam tasks",
                 "eam task new",
                 "eam task force",
+                "script run",
             ]
         );
     }

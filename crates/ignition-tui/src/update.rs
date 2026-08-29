@@ -2494,6 +2494,25 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 buffer: String::new(),
             });
         }
+        // 07-03: the scriptExec verb — an Input modal for the code
+        // (CODE-ONLY: the TUI refuses the --file/stdin forms per the
+        // crossterm raw-input rule), firing UNGATED at accept (CLI
+        // parity — no --yes exists; the deploy flag IS the opt-in).
+        // A not-deployed route surfaces the action's own
+        // script_exec_not_configured refusal in the result modal.
+        Some("script run") => {
+            state.dashboard.pending_input = Some(PendingInput::ScriptCode);
+            state.open_modal(Modal::Input {
+                title: "script run — python code".to_string(),
+                hint: Some(
+                    "one line of Jython (semicolons chain statements)\n\
+                     needs the scriptExec route: ign webdev deploy --with-script-exec\n\
+                     CLI: ign script run --code PY (stdin/--file are CLI-only)"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
         _ => {}
     }
 }
@@ -3185,6 +3204,12 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                         value.trim()
                     ),
                 });
+            }
+            // The script source: fires UNGATED at accept (07-03 — CLI
+            // parity; no --yes exists on script run). Empty input
+            // falls through to clear_pending (nothing fires).
+            (Some(PendingInput::ScriptCode), false) => {
+                workers::ops::fire_script_run(state, value);
             }
             _ => clear_pending(state),
         }
@@ -4029,11 +4054,12 @@ mod tests {
             "k steps back up like Up"
         );
 
-        // G bottoms out at the last entry (eam task force, index 12 —
-        // the 07-02 backup + EAM families appended after restart).
+        // G bottoms out at the last entry (script run, index 13 —
+        // the 07-02 backup + EAM families appended after restart,
+        // 07-03's script verb after those).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 12 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 13 })),
             "G jumps to the last entry"
         );
 

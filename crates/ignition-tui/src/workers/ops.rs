@@ -301,6 +301,23 @@ pub fn fire_webdev_status(state: &mut AppState) {
     });
 }
 
+/// `ign script run <CODE>` (07-03, SCRPT-01) — gateway-side Python
+/// through the secret-gated scriptExec route. UNGATED (CLI parity —
+/// no --yes exists: the deploy flag IS the opt-in). The config is
+/// loaded INSIDE the worker (the fire_webdev_status precedent) so
+/// the action's secret gate sees the persisted store; a missing
+/// secret surfaces the action's own `script_exec_not_configured`
+/// refusal in the result modal.
+pub fn fire_script_run(state: &mut AppState, code: String) {
+    let (Some(client), Some(profile)) = (client_arc(state), state.profile.clone()) else {
+        return;
+    };
+    super::spawn_action(state, "script run", async move {
+        let config = ignition_core::config::load(&ignition_core::config::config_path())?;
+        actions::script::script_run(&*client, &config, &profile, "ign-cli", &code).await
+    });
+}
+
 /// `ign project diff` (07-01) — the cross-gateway read. The TWO
 /// per-side clients are rebuilt INSIDE the worker from the named
 /// profiles (`context::rebuild` — the same public building blocks

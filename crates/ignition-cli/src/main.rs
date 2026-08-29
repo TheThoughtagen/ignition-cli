@@ -37,9 +37,10 @@ use ignition_cli::cli;
 use ignition_cli::cli::{
     BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, EamTaskCommand, LogLevel,
     LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
-    ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode, SessionsArgs, SessionsCmd,
-    TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
-    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand,
+    SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
+    TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
+    WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -167,6 +168,10 @@ enum ActionOutput {
     /// `ign eam task force` — the guarded dispatch + the honest
     /// history read-back.
     EamTaskForce(actions::eam::EamTaskForceResult),
+    /// `ign script run` — the scriptExec answer under unit-explicit
+    /// keys {stdout, result, elapsedMs} (ALL keys always; the
+    /// secret never rides any output path).
+    ScriptRun(actions::script::ScriptRunResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -292,6 +297,7 @@ impl ActionOutput {
             ActionOutput::EamTaskDetail(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskCreate(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskForce(result) => render_success(profile, result, compact),
+            ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -1877,6 +1883,47 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     (name, result)
                 }
             },
+        },
+        // `ign script run` (07-03, SCRPT-01): usage errors LEAD —
+        // the three-form input reader runs BEFORE any resolution
+        // (both --code and --file, or neither, refuse invalid_input
+        // exit 2 with profile null, zero work — the 03-03 put
+        // convention). NO --yes guard exists: the opt-in is
+        // STRUCTURAL (the scriptExec route deploys only via
+        // `ign webdev deploy --with-script-exec`); the action's own
+        // secret gate refuses `script_exec_not_configured` (exit 6)
+        // when the route was never deployed.
+        Commands::Script(ScriptArgs { command }) => match command {
+            ScriptCommand::Run {
+                code,
+                file,
+                project,
+            } => {
+                let script =
+                    match actions::script::read_script_input(code.as_deref(), file.as_deref()) {
+                        Ok(script) => script,
+                        Err(err) => return (None, Err(err)),
+                    };
+                match resolve_profile_context(&mut config, cli.profile.as_deref()) {
+                    Ok(None) => (None, Err(CoreError::NoActiveProfile)),
+                    Ok(Some((name, profile))) => {
+                        let client = config::resolve_secret(&name, &profile.auth, &secret_chain())
+                            .and_then(|credential| {
+                                ReqwestGatewayApi::new(&profile, Some(credential))
+                            });
+                        let result = match client {
+                            Ok(api) => {
+                                actions::script::script_run(&api, &config, &name, &project, &script)
+                                    .await
+                                    .map(ActionOutput::ScriptRun)
+                            }
+                            Err(err) => Err(err),
+                        };
+                        (Some(name), result)
+                    }
+                    Err(err) => (None, Err(err)),
+                }
+            }
         },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {

@@ -159,6 +159,13 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Eam(EamArgs),
 
+    /// Run gateway-side Python (Jython) through the secret-gated
+    /// scriptExec route — the opt-in is STRUCTURAL (`ign webdev
+    /// deploy --with-script-exec` deploys the route + persists its
+    /// secret); there is no --yes on this verb by design
+    #[command(arg_required_else_help = true)]
+    Script(ScriptArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -1013,6 +1020,40 @@ impl ScheduleMode {
             Self::AtDelay => "AtDelay",
         }
     }
+}
+
+/// Script subcommands (07-03, SCRPT-01) — the smallest family: ONE
+/// verb over the already-shipped, already-secured scriptExec route.
+/// `script` requires a subcommand (the `rig trial` shape — no bare
+/// row); the opt-in is STRUCTURAL (the route deploys only via
+/// `ign webdev deploy --with-script-exec`, which persists the
+/// secret at 0600), so `run` carries NO `--yes` guard by design —
+/// the deploy flag IS the opt-in and agents need the verb
+/// non-interactive (the research-adopted decision).
+#[derive(Debug, clap::Args)]
+pub struct ScriptArgs {
+    #[command(subcommand)]
+    pub command: ScriptCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScriptCommand {
+    /// Execute gateway-side Python (Jython) — non-interactive, the
+    /// route's entire purpose
+    Run {
+        /// Inline Python source (a one-liner's best form)
+        #[arg(long, value_name = "PY")]
+        code: Option<String>,
+        /// Python source file (`-` reads stdin — the agent pipe
+        /// path); giving both --code and --file refuses
+        /// `invalid_input` (exit 2) pre-resolution
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// The deployed routes' project (default ign-cli — where
+        /// `ign webdev deploy` put scriptExec)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

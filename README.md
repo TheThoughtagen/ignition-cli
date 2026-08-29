@@ -178,6 +178,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign eam tasks [NAME]` | Task definitions: bare form lists (`name  type  schedule  state`); with a name shows the full definition + its scheduled state | rides the config-resource seam (`com.inductiveautomation.eam/eam-tasks`) — definitions answer on STOCK gateways (no controller needed); JSON list data `{tasks: [{name, task_type, schedule_mode, current_state}]}` (all keys always; `current_state` null on list records — find answers carry it); detail data `{name, definition, state}`; an unknown name exits 6 `not_found` |
 | `ign eam task new <NAME> <TYPE> [--target NAME]... [--setting K=V]... [--definition PATH] [--schedule-mode MODE]` | Create a task definition — the typed guard ladder | **the planner-locked ladder**: `eam_backup` + OnDemand (the default schedule) fires UNGUARDED (it never auto-fires and only acts when forced); MUTATING types (`eam_restart`, `eam_sendProject`, `eam_sendResource`, `eam_sendTags`, `eam_activateLicense`, `eam_updateLicense`, `eam_unactivateLicense`) and ANY non-OnDemand `--schedule-mode` (`Immediate`/`Scheduled`/`AtTime`/`AtDelay` — they arm autonomous actions) need `--yes` (exit 2 pre-resolution, zero network); the FLEET-DESTRUCTIVE trio (`eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade`) REFUSES outright — exit 6 `eam_task_type_refused` naming the EXT-03 (v2) scope (run them from the EAM console); `--setting K=V` auto-types scalars (bool/int ride typed, else string); `--definition PATH` deep-merges a full-JSON settings file over the composed profile (objects merge, arrays/scalars replace) — mutually exclusive with `--setting`; the POST body is the config-resource ARRAY shape; JSON data carries the composed definition verbatim |
 | `ign eam task force <NAME> --yes` | Force-dispatch a task NOW (find → owner → POST → history read-back) | **destructive — always `--yes`-guarded** (dispatches to the agent targets immediately; exit 2 pre-resolution without); the owner resolves from the healthcheck's `scheduledTaskState.details.owner` (fallback `eam`); a 2xx is DISPATCH acceptance — the run's OUTCOME lands in history as data (`Failed` + GNET-not-connected detail is the honest shape of an unconfigured agent; trial expiry blocks runs); JSON data `{task, owner, dispatched, history}` |
+| `ign script run --code PY\|--file PATH\|- [--project NAME]` | Execute gateway-side Python (Jython) through the secret-gated `scriptExec` route — non-interactive, the route's entire purpose | **the opt-in is STRUCTURAL, not a flag**: `scriptExec` deploys only via `ign webdev deploy --with-script-exec` (which generates + persists the secret); without it the verb exits 6 `script_exec_not_configured` with ZERO HTTP, hint naming the deploy flag; **no `--yes` by design** — the deploy flag IS the opt-in and agents need it non-interactive; `--code`/`--file` are mutually exclusive (both or neither → exit 2 `invalid_input` before any resolution; `--file -` reads stdin — the agent pipe path); each run probes the route's version handshake then execs (two round trips); JSON data `{stdout, result, elapsedMs}` — ALL keys always; a route-side Python exception surfaces its traceback verbatim (exit 6 `webdev_route_error`); NO server-side execution timeout exists — a long-running script holds the HTTP connection (the client's per-request timeout class applies); the secret NEVER appears in any output mode (see the scriptExec posture below) |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -1029,3 +1030,38 @@ flag), not to protect against gateway insiders. The route keeps its
 config at require-auth=false deliberately: an auth layer would lock
 the CLI's own token-authenticated calls out (API tokens 401 on WebDev
 require-auth — live-verified).
+
+#### The `ign script run` verb contract
+
+`ign script run` (07-03) is the route's entire consumer surface, and
+its security posture is the deploy flag — nothing more:
+
+- **Input forms**: `--code PY` (inline — a one-liner's best form),
+  `--file PATH`, `--file -` (stdin — the agent pipe path). Giving
+  both `--code` and `--file`, or neither, refuses `invalid_input`
+  (exit 2) before any resolution work.
+- **The opt-in is structural**: a profile with no persisted
+  `webdev_secret` can only mean the route was never deployed through
+  the flag — the verb refuses exit 6 `script_exec_not_configured`
+  with zero HTTP requests, its hint naming
+  `ign webdev deploy --with-script-exec` verbatim. There is
+  deliberately NO `--yes` guard here: the deploy flag is the opt-in,
+  and requiring a second confirmation would only tax the
+  non-interactive agents the route exists for.
+- **Result shape**: `{stdout, result, elapsedMs}` — all keys always
+  (empty string / null / 0 when the answer carried nothing; agents
+  never key-hunt). `stdout` is the script's captured output verbatim;
+  `result` is a final expression's value or the `_result` global's
+  statements; `elapsedMs` is the route-measured wall time.
+- **Timeout honesty**: v1.0.0's route has NO server-side execution
+  timeout — a long-running script simply holds the HTTP connection
+  while it runs (the client rides its existing per-request timeout
+  class). Budget long scripts accordingly.
+- **Redaction guarantee**: the secret appears in exactly one place
+  (the baked zip member) — never in the JSON envelope, the human
+  render, logs, or any error path (the refusal and result canaries
+  are contract-pinned at both the action and binary levels).
+- **Threat-model cross-reference**: the shared-secret honesty note
+  above applies to every `script run` invocation — the gate makes
+  the surface opt-in and auditable; it does not defend against
+  gateway insiders who can read the project's resources.

@@ -397,6 +397,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "eam task force",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 07-03: `ign script run` (SCRPT-01) — the row lands FRESH
+        // in this plan (grep-verified: no pre-existing row). There
+        // is no bare `script` row (ScriptCommand is required, the
+        // `rig trial` shape); the verb rides the dashboard's global
+        // actions menu — an Input modal (code-only; the TUI refuses
+        // the --file/stdin forms per the crossterm raw-input rule),
+        // UNGATED (CLI parity — no --yes exists on script run: the
+        // deploy flag IS the opt-in).
+        CliRoute {
+            path: "script run",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 
