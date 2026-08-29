@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 7 in progress — 07-02 shipped (standalone `ign backup download --type|restore` — the 8th --yes-guarded verb, BackupType param-ized onto the one trait method; EAM family: history/tasks reads with the dual-scoped eam_not_controller classify arm, the pure task_create_guard ladder (backup-unguarded / mutating+non-OnDemand --yes / fleet trio refused), force = find→204→history 3-request sequence with GNET/trial outcomes as data; 793 tests green, fmt/clippy clean, zero new deps). Next: 07-03 (script run — route contract already pinned).
+**Current focus:** Phase 7 in progress — 07-03 shipped (`ign script run` (SCRPT-01): three input forms (--code/--file/--file -), the structural secret gate (missing webdev_secret → additive script_exec_not_configured exit 6, zero HTTP, deploy-flag hint), probe+exec sequence over scriptExec, {stdout, result, elapsedMs} all-keys envelope, traceback surfacing, redaction canaries at action+binary level, TUI row fresh in-plan (tui_coverage green), NO --yes by design — the deploy flag IS the opt-in; 808 tests green, fmt/clippy clean, zero new deps). Next: 07-04 (the final plan — delegation bridges).
 
 ## Current Position
 
 **Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
-**Current Plan:** 3
+**Current Plan:** 4
 **Total Plans in Phase:** 4
 **Status:** Ready to execute
-**Last Activity:** 2026-08-28
+**Last Activity:** 2026-08-29
 
-**Progress:** [██████████] 95%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 06 P11 | 20min | 2 tasks | 2 files |
 | Phase 07 P01 | 79min | 3 tasks | 14 files |
 | Phase 07 P02 | 133min | 3 tasks | 31 files |
+| Phase 07 P03 | 54min | 2 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -194,6 +195,8 @@ Recent decisions affecting current work:
 - [Phase 07-02]: eam_not_controller classified at the classify seam, dual-scoped (path prefix /data/eam/ AND body content 'configured as a controller') — generic 403s stay auth_rejected; NO controller verb and NO ign backup list (README honesty over verb theater; the installMode flip is a README recipe) — The state gate is a role refusal not auth (research Pitfall 2); role decisions stay one config-PUT away, never one CLI flag
 - [Phase 07-02]: EAM create guard ladder LOCKED as ONE pure fn task_create_guard: backup+OnDemand unguarded / 7 mutating types + ANY non-OnDemand schedule need --yes / restore-install-upgrade REFUSE (eam_task_type_refused naming EXT-03 v2) / unknown types fail-safe NeedsYes — shared by CLI pre-resolution, action re-check, and TUI Confirm (parity tripwire at 18 verbs); settings: profile spreads K=V auto-typed scalars (bool/int only, floats stay strings), --definition deep-merges over config.profile (objects merge, arrays/scalars replace) — Planner-locked breadth; one authority prevents CLI/TUI/core drift; fail-safe on unknown types costs a flag, not a fleet
 - [Phase 07-02]: eam task force = find (owner from scheduledTaskState.details.owner, fallback eam) -> 204 force POST -> history re-read (3-request sequence wiremock-pinned); outcomes (Failed + GNET-not-connected / trial-expired) ride as DATA in the result — never hidden, never errors — Research Pitfall 3: execution prerequisites are gateway state, honest data; one extra round trip for owner correctness (the 05-04 precondition precedent)
+- [Phase 07-03]: [Phase 07-03]: ign script run ships UNGATED by design — the opt-in is STRUCTURAL (scriptExec deploys only via ign webdev deploy --with-script-exec; a missing persisted secret = script_exec_not_configured exit 6 with zero HTTP, hint naming the deploy flag verbatim); no clap conflicts_with on --code/--file so read_script_input surfaces the invalid_input envelope (exit 2, profile null) instead of a clap usage render
+- [Phase 07-03]: [Phase 07-03]: script run's precondition is the version action WITH the secret header riding webdev_route_call's existing denial mapping (secret_mismatch → webdev_route_error family, redeploy/--rotate-secret advice already in the hint — no new slug, no version-compare magic); result maps under {stdout, result, elapsedMs} ALL keys always; TUI row is code-only (single Input, stdin refused per the crossterm rule) firing through a worker-side config load (the fire_webdev_status precedent)
 
 ### Pending Todos
 
@@ -210,6 +213,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-28T19:09:50.889Z
-**Stopped At:** Completed 07-02-PLAN.md — standalone backup verbs + EAM family shipped (8th guarded restore, eam_not_controller state gate, typed task-new ladder, force sequence, e2e fork; 793 tests green, fmt/clippy clean, zero new deps); next: 07-03
+**Last session:** 2026-08-29T03:10:38.456Z
+**Stopped At:** Completed 07-03-PLAN.md — ign script run shipped (SCRPT-01: three input forms, structural secret gate, {stdout, result, elapsedMs}, TUI row fresh, 808 tests green, fmt/clippy clean, zero new deps); next: 07-04 (final plan)
 **Resume file:** None
