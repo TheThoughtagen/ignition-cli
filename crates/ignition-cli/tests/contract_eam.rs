@@ -59,7 +59,7 @@ async fn mount_history(server: &wiremock::MockServer) {
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [
                 {
-                    "taskId": 2,
+                    "taskId": "c3d5ebc2-0b91-40fc-8417-3af372071547",
                     "taskName": "nightly-backup (forced)",
                     "taskStart": 1787930000000_i64,
                     "taskEnd": 1787930009000_i64,
@@ -69,7 +69,7 @@ async fn mount_history(server: &wiremock::MockServer) {
                     "taskType": "eam_backup"
                 },
                 {
-                    "taskId": 1,
+                    "taskId": "d4e6fcd3-1c92-410d-8528-4ba483082658",
                     "taskName": "nightly-backup",
                     "taskStart": 1787920000000_i64,
                     "taskEnd": 1787920005000_i64,
@@ -147,7 +147,56 @@ async fn eam_history_json_golden() {
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
         snapbox::str![[
-            r#"{"ok":true,"profile":"dev","data":{"items":[{"taskId":2,"taskName":"nightly-backup (forced)","taskStart":1787930000000,"taskEnd":1787930009000,"target":"_controller","level":"Failed","detail":"Gateway network for agent '_controller' is currently not connected","taskType":"eam_backup"},{"taskId":1,"taskName":"nightly-backup","taskStart":1787920000000,"taskEnd":1787920005000,"target":"_controller","level":"Success","detail":null,"taskType":"eam_backup"}],"count":2}}"#
+            r#"{"ok":true,"profile":"dev","data":{"items":[{"taskId":"c3d5ebc2-0b91-40fc-8417-3af372071547","taskName":"nightly-backup (forced)","taskStart":1787930000000,"taskEnd":1787930009000,"target":"_controller","level":"Failed","detail":"Gateway network for agent '_controller' is currently not connected","taskType":"eam_backup"},{"taskId":"d4e6fcd3-1c92-410d-8528-4ba483082658","taskName":"nightly-backup","taskStart":1787920000000,"taskEnd":1787920005000,"target":"_controller","level":"Success","detail":null,"taskType":"eam_backup"}],"count":2}}"#
+        ]],
+    );
+}
+
+/// THE raw-capture contract (07-05 gap 1): a wiremock body shaped
+/// EXACTLY like the live 8.3.3 capture in
+/// `.planning/debug/eam-history-raw.json` — UUID-string `taskId`,
+/// `" (forced)"` taskName, `Failed` level, the GNET-not-connected
+/// detail, the `{items, metadata}` envelope — decodes and renders
+/// exit 0 with the entry passthrough (the old numeric-`taskId`
+/// model died here with a decode `internal_error`).
+#[tokio::test]
+async fn eam_history_decodes_the_raw_capture() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(HISTORY_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "items": [
+                    {
+                        "taskId": "a2f4dab1-9a8f-4feb-9306-29e261f60453",
+                        "taskName": "cli-research-backup (forced)",
+                        "taskStart": 1788012345678_i64,
+                        "taskEnd": 1788012345890_i64,
+                        "target": "_controller",
+                        "level": "Failed",
+                        "detail": "Attempt 1: Gateway network for agent '_controller' is currently not connected, the connection status is 'NotDefined'",
+                        "taskType": "backup"
+                    }
+                ],
+                "metadata": {"total": 1, "matching": 1, "limit": 200, "offset": 0}
+            }),
+        ))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+    let out = ign(&config, &server.uri(), &["eam", "history", "--compact"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[
+            r#"{"ok":true,"profile":"dev","data":{"items":[{"taskId":"a2f4dab1-9a8f-4feb-9306-29e261f60453","taskName":"cli-research-backup (forced)","taskStart":1788012345678,"taskEnd":1788012345890,"target":"_controller","level":"Failed","detail":"Attempt 1: Gateway network for agent '_controller' is currently not connected, the connection status is 'NotDefined'","taskType":"backup"}],"count":1}}"#
         ]],
     );
 }
@@ -442,7 +491,7 @@ async fn task_force_success_golden() {
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [
                 {
-                    "taskId": 9,
+                    "taskId": "e5f7ade4-2da3-421e-9639-5cb594193769",
                     "taskName": "nightly-backup (forced)",
                     "taskStart": 1787930000000_i64,
                     "taskEnd": 1787930009000_i64,
@@ -480,9 +529,7 @@ async fn task_force_success_golden() {
     );
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[
-            r#"{"ok":true,"profile":"dev","data":{"task":"nightly-backup","owner":"eam","dispatched":true,"history":{"taskId":9,"taskName":"nightly-backup (forced)","taskStart":1787930000000,"taskEnd":1787930009000,"target":"_controller","level":"Failed","detail":"Gateway network for agent '_controller' is currently not connected","taskType":"eam_backup"}}}"#
-        ]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"task":"nightly-backup","owner":"eam","dispatched":true,"history":{"taskId":"e5f7ade4-2da3-421e-9639-5cb594193769","taskName":"nightly-backup (forced)","taskStart":1787930000000,"taskEnd":1787930009000,"target":"_controller","level":"Failed","detail":"Gateway network for agent '_controller' is currently not connected","taskType":"eam_backup"}}}"#]],
     );
 
     let out = ign(

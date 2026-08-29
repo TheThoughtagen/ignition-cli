@@ -81,9 +81,11 @@ pub(crate) fn eam_tasks_create_path() -> String {
 /// e.g. `Failed`, times epoch-ms as the gateway serialized them).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EamHistoryItem {
-    /// `taskId` — the run's id.
+    /// `taskId` — the run's id, a UUID STRING on 8.3.3 controllers
+    /// (wire-faithful; the live capture serializes
+    /// `"a2f4dab1-9a8f-4feb-9306-29e261f60453"`).
     #[serde(rename = "taskId", default)]
-    pub task_id: i64,
+    pub task_id: String,
     /// `taskName` — the definition name (+ `" (forced)"` on forced
     /// runs).
     #[serde(rename = "taskName", default)]
@@ -142,11 +144,13 @@ mod tests {
 
     /// History items parse under the live-captured wire keys — the
     /// forced-suffix taskName and the Failed level ride VERBATIM
-    /// (research Pitfall 3: execution outcomes are DATA).
+    /// (research Pitfall 3: execution outcomes are DATA). `taskId`
+    /// is the captured UUID STRING (8.3.3 wire-faithful — the
+    /// 07-UAT gap-1 shape, raw capture in .planning/debug).
     #[test]
     fn history_item_parses_the_live_shape() {
         let item: EamHistoryItem = serde_json::from_value(serde_json::json!({
-            "taskId": 42,
+            "taskId": "a2f4dab1-9a8f-4feb-9306-29e261f60453",
             "taskName": "nightly-backup (forced)",
             "taskStart": 1787930000000_i64,
             "taskEnd": 1787930009000_i64,
@@ -156,7 +160,7 @@ mod tests {
             "taskType": "eam_backup"
         }))
         .expect("live-captured shape parses");
-        assert_eq!(item.task_id, 42);
+        assert_eq!(item.task_id, "a2f4dab1-9a8f-4feb-9306-29e261f60453");
         assert_eq!(item.task_name, "nightly-backup (forced)");
         assert_eq!(item.level.as_deref(), Some("Failed"));
         assert!(
@@ -167,7 +171,7 @@ mod tests {
 
         // A running task: no taskEnd, no detail.
         let running: EamHistoryItem = serde_json::from_value(serde_json::json!({
-            "taskId": 43,
+            "taskId": "b3c5ebc2-0b90-40fc-8417-3af372071546",
             "taskName": "nightly-backup",
             "taskStart": 1787930000000_i64
         }))
