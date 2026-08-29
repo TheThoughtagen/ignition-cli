@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 7 gap closure (5/6 plans) — 07-05 closed all three 07-UAT EAM gaps live against gateway A (:9088): history decodes wire-faithful UUID-string taskIds (raw-capture-shaped contract added); `eam task new` composes the live `config.settings` shape (`config.profile={type,scheduleMode}` only, `--definition` merges over settings, zero `--target` defaults `["_controller"]` — live create exits 0, `uat-backup-demo` listed); path-scoped 422 on `/data/api/v1/resources/` classifies exit-2 `invalid_input` with the gateway's `messages` verbatim; TYPE help enumerates the benign/mutating/refused taxonomy + example. 857 tests green workspace-wide, fmt/clippy clean, no new deps/slugs. Gateway A untouched for 07-06 (cli-research-backup asset + uat-backup-demo). Next: 07-06-PLAN.md → re-verify → /gsd-complete-milestone.
+**Current focus:** Phase 7 gap closure COMPLETE (6/6 plans) — 07-06 closed the last two 07-UAT gaps live against gateway A (:9088): the EAM force 409 classifies as additive exit-6 `eam_task_in_flight` (path-scoped arm on `/data/eam/api/v1/eam-tasks/force/`, the gateway's Jetty page text verbatim + '(forced)' fallback; the leftover `cli-research-backup (forced)` run PRESERVED as the standing fixture); provider-ROOT tag paths (bracket + bare) refuse as `provider_root_unsupported` via a route-level fix (pre-call bracket detection + 'No RpcContext' translation, everything else re-raises into unchanged route_error) shipped in the version-locked 1.1.0 bundle — the stale-1.0.0 `route_version_mismatch` refusal, the redeploy, both refusals, and the subtree regression probe all live-captured. 863 tests green workspace-wide, fmt/clippy clean, taxonomy additive-only (2 new slugs, two-place rule synced). Next: 07-VERIFICATION / re-verify → /gsd-complete-milestone.
 
 ## Current Position
 
 **Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
-**Current Plan:** 5
+**Current Plan:** 6
 **Total Plans in Phase:** 6
-**Status:** In progress — gap closure (07-05 complete, 07-06 pending)
+**Status:** Phase complete — ready for verification + milestone close-out
 **Last Activity:** 2026-08-29
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -66,6 +66,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 07 P03 | 54min | 2 tasks | 14 files |
 | Phase 07 P04 | 122min | 3 tasks | 18 files |
 | Phase 07 P05 | 327min (load-throttled machine) | 3 tasks tasks | 7 files files |
+| Phase 07 P06 | 96min | 2 tasks | 15 files |
 
 ## Accumulated Context
 
@@ -203,6 +204,7 @@ Recent decisions affecting current work:
 - [Phase 07-04]: [Phase 07-04]: ign lint posture LOCKED — doctor posture default (exit 0 whenever the child RAN; findings + child_exit_code + parsed report ride as data, all keys always) with --strict passing the child's masked (0..127) code LITERALLY, decided in main() AFTER the envelope renders (the one sanctioned success-path EXIT exception); PATH discovery (first executable, no which dep) + tokio ARG-VECTOR spawn (--report-format json --target per path, -- passthrough verbatim); absent tool = additive lint_tool_absent exit 6 with uv/pip install hint; the TUI lint worker is the first CLIENTLESS dashboard worker (local delegation)
 - [Phase 07-04]: [Phase 07-04]: tags browse --from-export is OFFLINE BY CONSTRUCTION — the flag short-circuits before profile/secret/client/route resolution entirely (profile null, dead-URL-proven); three layouts parse (git-module dirs with individual-file format + _types_ + %XX fs-name decoding + System/dot/.tag-config skips, legacy <provider>.json whole trees, the CLI interchange file); provider = file stem for file inputs (the only derivable provenance); rows emit the EXISTING BrowseRow shape so tree + flat JSON renders ride verbatim; NO new TUI leaf (the flag-exception convention, noted beside the tags export -o - comment)
 - [Phase 07]: [Phase 07-05]: EAM wire truth corrected from live captures — taskId is a UUID STRING (i64 model died on every live history read); create composes the profile/settings split (profile={type,scheduleMode} ONLY, settings={targetGateways,targetGroups,+K=V}, --definition deep-merges over SETTINGS, zero --target defaults ["_controller"]); a 422 on /data/api/v1/resources/ classifies exit-2 invalid_input carrying the gateway's messages verbatim (path-scoped body-reading arm, the EamNotController precedent); TYPE help enumerates the guard-ladder taxonomy with NO possible_values (unknown future types stay accepted, fail-safe to --yes) — All three blockers made working 07-02 features fail against the real controller; the README settings shape was always right — the composition landed it in the wrong node
+- [Phase 07]: 07-06 gap closure: force 409 → additive exit-6 eam_task_in_flight (path-scoped classify arm, Jetty page text verbatim, '(forced)' fallback, EAM-console hint); provider-ROOT tag paths → provider_root_unsupported (route-level option c: bracket-form pre-call detection + bare-form 'No RpcContext' translation; everything else re-raises into unchanged route_error); route bundle 1.0.0→1.1.0 equality-locked so stale deployments refuse route_version_mismatch (live-proven both directions on gateway A)
 
 ### Pending Todos
 
@@ -219,6 +221,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-29T21:41:13.173Z
-**Stopped At:** Completed 07-05-PLAN.md — all three EAM UAT gaps closed and live-verified on gateway A (UUID taskIds, config.settings create composition + 422 invalid_input, TYPE taxonomy help); 857 tests green, fmt/clippy clean; gateway A untouched for 07-06
+**Last session:** 2026-08-29T23:19:07.666Z
+**Stopped At:** Completed 07-06-PLAN.md — both UAT gaps (4, 5) closed and live-verified on gateway A; 863 tests green, fmt/clippy clean; phase 7 COMPLETE (6/6)
 **Resume file:** None

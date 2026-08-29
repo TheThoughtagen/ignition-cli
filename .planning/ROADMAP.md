@@ -20,7 +20,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore (2026-08-23)
 - [x] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar (2026-08-25; all five live e2e gates green on a real 8.3.3 rig; UAT gaps closed & re-verified 7/7 on 2026-08-26)
 - [x] **Phase 6: TUI Cockpit** (Complete 2026-08-28 — 11/11 plans: 6 original + 5 gap-closure from 06-UAT) - Ratatui cockpit exposing every CLI action: dashboard, log tail, tag browser with live watch, alarm panel, project browser, rig screen; CLI<->TUI coverage CI-enforced (tui_coverage clap-tree walk); gap closure shipped: tags freshness refire, TTY hint, f64 gauges, root-level puts, modal geometry/vim motions/prose menus (06-10), grouped rig status render + README keymap sync (06-11); monochrome/color UX themes backlog-owned per UAT triage
-- [x] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows (4/4 plans COMPLETE 2026-08-29; 07-UAT diagnosed 5 gaps → gap closure 07-05/07-06)
+- [x] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows (6/6 plans COMPLETE 2026-08-29 — 4 original + 07-05/07-06 gap closure; all five 07-UAT gaps closed and live-verified on gateway A)
 
 ## Phase Details
 
@@ -176,8 +176,8 @@ Plans:
 - [x] 07-02-PLAN.md — standalone `ign backup download/restore` (--type param, 8th guarded verb) + EAM family (`eam history/tasks`, guarded `task new`/`task force`, `eam_not_controller` state-gate slug) (BKUP-01/02)
 - [x] 07-03-PLAN.md — `ign script run` over the shipped scriptExec route (structural opt-in, three input forms, `script_exec_not_configured` slug) (SCRPT-01)
 - [x] 07-04-PLAN.md — interop trio: Flint codec `--decode-scripts`/`--encode-scripts` round-trip, `ign lint` delegation (doctor posture + `--strict`), `tags browse --from-export` offline (INTR-01/02/03)
-- [ ] 07-05-PLAN.md — [GAP CLOSURE] EAM live-shape trio: history decode wire-faithful (UUID taskIds), `eam task new` composes the controller-required `config.settings` (+ honest 422 → invalid_input), TYPE help enumerates the guard-ladder taxonomy (UAT gaps 1/2/3)
-- [ ] 07-06-PLAN.md — [GAP CLOSURE] honest refusals: force-route 409 → additive `eam_task_in_flight` (session_not_prunable precedent), provider-ROOT tag paths → `provider_root_unsupported` route-level refusal + route-bundle 1.1.0 bump (UAT gaps 4/5)
+- [x] 07-05-PLAN.md — [GAP CLOSURE] EAM live-shape trio: history decode wire-faithful (UUID taskIds), `eam task new` composes the controller-required `config.settings` (+ honest 422 → invalid_input), TYPE help enumerates the guard-ladder taxonomy (UAT gaps 1/2/3)
+- [x] 07-06-PLAN.md — [GAP CLOSURE] honest refusals: force-route 409 → additive `eam_task_in_flight` (session_not_prunable precedent), provider-ROOT tag paths → `provider_root_unsupported` route-level refusal + route-bundle 1.1.0 bump (UAT gaps 4/5)
 
 ## Progress
 
@@ -192,4 +192,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
 | 5. WebDev Backend & Tag Operations | 8/8 | Complete | 2026-08-26 |
 | 6. TUI Cockpit | 11/11 | Complete | 2026-08-28 |
-| 7. Ecosystem Interop & Advanced Ops | 4/6 | Gap closure (07-UAT diagnosed) | — |
+| 7. Ecosystem Interop & Advanced Ops | 6/6 | Complete | 2026-08-29 |
