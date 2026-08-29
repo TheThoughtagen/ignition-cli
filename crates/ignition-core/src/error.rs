@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `script_exec_not_configured` (07-03)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -365,6 +365,24 @@ pub enum CoreError {
         /// The refused `profile.type` token.
         task_type: String,
     },
+
+    /// The scriptExec route is not configured for this profile — no
+    /// webdev secret is persisted, which can only mean `ign webdev
+    /// deploy --with-script-exec` has never run (deploy persists the
+    /// secret 0600 BEFORE upload, so a deployed route without a
+    /// stored secret is not a reachable state). `ign script run`'s
+    /// opt-in is STRUCTURAL — the deploy flag — so the verb carries
+    /// no `--yes` guard and refuses here instead (07-03, SCRPT-01:
+    /// the TrialNotExpired precedent — action-constructed, not
+    /// classify). Exit 6 — target state.
+    #[error(
+        "scriptExec is not configured for profile {profile:?} — the secret-gated route deploys \
+         only via the explicit opt-in"
+    )]
+    ScriptExecNotConfigured {
+        /// The profile whose secret store is empty.
+        profile: String,
+    },
 }
 
 impl CoreError {
@@ -400,6 +418,7 @@ impl CoreError {
             Self::Rig(_) => "rig_error",
             Self::EamNotController { .. } => "eam_not_controller",
             Self::EamTaskTypeRefused { .. } => "eam_task_type_refused",
+            Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
         }
     }
 
@@ -433,7 +452,8 @@ impl CoreError {
             | Self::SessionNotPrunable { .. }
             | Self::ImportDenied { .. }
             | Self::EamNotController { .. }
-            | Self::EamTaskTypeRefused { .. } => 6,
+            | Self::EamTaskTypeRefused { .. }
+            | Self::ScriptExecNotConfigured { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -626,6 +646,12 @@ impl CoreError {
                 "restore/install/upgrade tasks dispatch fleet-wide (every \
                   agent target); run them from the Ignition EAM console — \
                   EXT-03 (v2) will scope them into the CLI"
+                    .to_string(),
+            ),
+            Self::ScriptExecNotConfigured { .. } => Some(
+                "run `ign webdev deploy --with-script-exec` to deploy the route and \
+                  generate + persist its secret (the deploy flag IS the opt-in — \
+                  `ign script run` has no --yes by design)"
                     .to_string(),
             ),
             Self::Rig(_) => Some(
@@ -943,6 +969,13 @@ mod tests {
                 6,
                 "eam_task_type_refused",
             ),
+            (
+                CoreError::ScriptExecNotConfigured {
+                    profile: "dev".into(),
+                },
+                6,
+                "script_exec_not_configured",
+            ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {
@@ -1146,6 +1179,19 @@ mod tests {
         assert!(
             hint.contains("fleet-wide") || hint.contains("EXT-03"),
             "refused hint names the fleet consequence / scope: {hint}"
+        );
+
+        // The scriptExec structural gate (07-03): the hint names the
+        // deploy flag VERBATIM — the flag IS the opt-in (no --yes
+        // exists on script run).
+        let unconfigured = CoreError::ScriptExecNotConfigured {
+            profile: "dev".into(),
+        };
+        assert_eq!(unconfigured.exit_code(), 6, "target state");
+        let hint = unconfigured.hint().expect("hint required");
+        assert!(
+            hint.contains("ign webdev deploy --with-script-exec"),
+            "the hint names the deploy flag verbatim: {hint}"
         );
 
         // Totality: no class silently loses its hint later.

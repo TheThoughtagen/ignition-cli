@@ -40,12 +40,15 @@ use crate::error::CoreError;
 use crate::webdev as bundle;
 
 /// The secret-bearing scriptExec route name (deploy/status append it
-/// only when explicitly requested / configured).
-const SCRIPT_EXEC_ROUTE: &str = "scriptExec";
+/// only when explicitly requested / configured). `pub(crate)` since
+/// 07-03: the script action reuses the EXACT spelling (one constant,
+/// no drift).
+pub(crate) const SCRIPT_EXEC_ROUTE: &str = "scriptExec";
 
 /// The header the scriptExec gate compares (case-insensitive
-/// server-side; the CLI sends the canonical form).
-const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
+/// server-side; the CLI sends the canonical form). `pub(crate)` since
+/// 07-03 — the script action's calls carry it too.
+pub(crate) const SECRET_HEADER: &str = "X-Ignition-CLI-Secret";
 
 /// `ign webdev deploy` result — ALL keys always (the agent shape);
 /// the import answer rides as the opaque-success object verbatim.

@@ -15,6 +15,7 @@ pub mod projects;
 pub mod resources;
 pub mod restart;
 pub mod rig;
+pub mod script;
 pub mod sessions;
 pub mod tags;
 pub mod version;
