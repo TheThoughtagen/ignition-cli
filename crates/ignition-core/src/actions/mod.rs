@@ -9,6 +9,7 @@ pub mod connections;
 pub mod doctor;
 pub mod eam;
 pub mod inspect;
+pub mod lint;
 pub mod logs;
 pub mod profile;
 pub mod projects;

@@ -20,6 +20,7 @@ use ignition_core::actions::eam::{
     EamHistoryResult, EamTaskCreateResult, EamTaskDetailResult, EamTaskForceResult, EamTasksResult,
 };
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
+use ignition_core::actions::lint::LintResult;
 use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
 };
@@ -235,6 +236,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskCreate(result) => render_eam_task_create_human(result),
         ActionOutput::EamTaskForce(result) => render_eam_task_force_human(result),
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
+        ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -990,6 +992,33 @@ fn render_eam_task_force_human(result: &EamTaskForceResult) {
 /// `ign script run` human shape — the stdout block VERBATIM (the
 /// route captured exactly what the script printed), then the value
 /// and the route-measured wall time (the plan's three-part render:
+/// `ign lint` human lines (07-04, INTR-02): the doctor-posture
+/// summary — issue count + child exit, the parsed report's summary
+/// object (compact), then the child's stderr diagnostics passthrough
+/// (preview). JSON mode carries the full shape.
+fn render_lint_human(result: &LintResult) {
+    println!(
+        "lint: {} issue(s), child exit {}",
+        result.issues_found,
+        result
+            .child_exit_code
+            .map_or("signal".to_string(), |code| code.to_string())
+    );
+    if let Some(report) = &result.report
+        && let Some(summary) = report.get("summary")
+    {
+        let compact = serde_json::to_string(summary).unwrap_or_default();
+        println!("summary: {compact}");
+    } else {
+        println!("(no JSON report parsed — stdout rides the JSON data)");
+    }
+    if !result.stderr_preview.is_empty() {
+        for line in result.stderr_preview.lines() {
+            println!("{line}");
+        }
+    }
+}
+
 /// stdout block, `result:` line, `elapsed:` line).
 fn render_script_run_human(result: &ScriptRunResult) {
     println!("stdout:");

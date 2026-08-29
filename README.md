@@ -33,7 +33,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `script_exec_not_configured` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `script_exec_not_configured`, `lint_tool_absent` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -179,6 +179,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign eam task new <NAME> <TYPE> [--target NAME]... [--setting K=V]... [--definition PATH] [--schedule-mode MODE]` | Create a task definition — the typed guard ladder | **the planner-locked ladder**: `eam_backup` + OnDemand (the default schedule) fires UNGUARDED (it never auto-fires and only acts when forced); MUTATING types (`eam_restart`, `eam_sendProject`, `eam_sendResource`, `eam_sendTags`, `eam_activateLicense`, `eam_updateLicense`, `eam_unactivateLicense`) and ANY non-OnDemand `--schedule-mode` (`Immediate`/`Scheduled`/`AtTime`/`AtDelay` — they arm autonomous actions) need `--yes` (exit 2 pre-resolution, zero network); the FLEET-DESTRUCTIVE trio (`eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade`) REFUSES outright — exit 6 `eam_task_type_refused` naming the EXT-03 (v2) scope (run them from the EAM console); `--setting K=V` auto-types scalars (bool/int ride typed, else string); `--definition PATH` deep-merges a full-JSON settings file over the composed profile (objects merge, arrays/scalars replace) — mutually exclusive with `--setting`; the POST body is the config-resource ARRAY shape; JSON data carries the composed definition verbatim |
 | `ign eam task force <NAME> --yes` | Force-dispatch a task NOW (find → owner → POST → history read-back) | **destructive — always `--yes`-guarded** (dispatches to the agent targets immediately; exit 2 pre-resolution without); the owner resolves from the healthcheck's `scheduledTaskState.details.owner` (fallback `eam`); a 2xx is DISPATCH acceptance — the run's OUTCOME lands in history as data (`Failed` + GNET-not-connected detail is the honest shape of an unconfigured agent; trial expiry blocks runs); JSON data `{task, owner, dispatched, history}` |
 | `ign script run --code PY\|--file PATH\|- [--project NAME]` | Execute gateway-side Python (Jython) through the secret-gated `scriptExec` route — non-interactive, the route's entire purpose | **the opt-in is STRUCTURAL, not a flag**: `scriptExec` deploys only via `ign webdev deploy --with-script-exec` (which generates + persists the secret); without it the verb exits 6 `script_exec_not_configured` with ZERO HTTP, hint naming the deploy flag; **no `--yes` by design** — the deploy flag IS the opt-in and agents need it non-interactive; `--code`/`--file` are mutually exclusive (both or neither → exit 2 `invalid_input` before any resolution; `--file -` reads stdin — the agent pipe path); each run probes the route's version handshake then execs (two round trips); JSON data `{stdout, result, elapsedMs}` — ALL keys always; a route-side Python exception surfaces its traceback verbatim (exit 6 `webdev_route_error`); NO server-side execution timeout exists — a long-running script holds the HTTP connection (the client's per-request timeout class applies); the secret NEVER appears in any output mode (see the scriptExec posture below) |
+| `ign lint PATH... [--strict] [-- ARGS...]` | Lint local project files by delegating to `ignition-lint` (PATH-discovered; no gateway, `profile: null`) | **doctor posture**: exit 0 whenever the tool RAN — findings, `child_exit_code`, and the parsed JSON report ride as data (ALL keys always; `report` null + `stdout` verbatim when unparseable; `stderr_preview` capped at 4000 chars); `--strict` exits with the tool's own code for CI (envelope prints first — the one sanctioned success-path exit exception; 1 = findings at the `--fail-on` threshold); PATHS map to `--target <path>` pairs + `--report-format json` on an ARG VECTOR (never a shell string); anything after `--` passes through verbatim; no tool on PATH → exit 6 `lint_tool_absent` with the install hint (`uv tool install ignition-lint-toolkit`); pair with `project export --decode-scripts` to lint the decoded sidecars |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -1106,3 +1107,47 @@ its security posture is the deploy flag — nothing more:
   above applies to every `script run` invocation — the gate makes
   the surface opt-in and auditable; it does not defend against
   gateway insiders who can read the project's resources.
+
+## Linting (`ign lint`)
+
+`ign lint PATH... [--strict] [-- <extra ignition-lint args>]` delegates
+to [ignition-lint](https://github.com/TheThoughtagen/ignition-lint) —
+the external linter for Ignition project resources (Perspective view
+structure, naming conventions, embedded scripts). The verb is LOCAL:
+no gateway, no profile (the envelope carries `profile: null`), and the
+tool is discovered on `PATH` (first executable `ignition-lint` wins).
+
+**The doctor posture (default).** The command exits **0 whenever the
+tool RAN** — findings are DATA, never a crash:
+
+```json
+{"ok":true,"profile":null,"data":{"ran":true,"tool":"/path/ignition-lint",
+ "child_exit_code":1,"issues_found":2,
+ "report":{"issues":[...],"summary":{"errors":1,"warnings":1}},
+ "stdout":"<the tool's raw stdout>","stderr_preview":"<first 4000 chars>"}}
+```
+
+All keys always ride (`report` is `null` when stdout was not the
+tool's JSON; `stdout` stays verbatim either way). The child's exit
+code travels as `child_exit_code` so agents can branch without
+parsing.
+
+**`--strict` for CI.** With `--strict` the CLI exits with the
+linter's own code LITERALLY (exit 1 = findings at/above the tool's
+`--fail-on` threshold, default `error`) — the envelope still prints
+first, then the exit mirrors the child (masked to the 0–127 shell
+range; a signal-killed tool exits 1). This is the one sanctioned
+success-path exit exception.
+
+**No tool installed?** Exit 6 `lint_tool_absent` with the install
+hint: `uv tool install ignition-lint-toolkit` (or
+`pip install ignition-lint-toolkit`).
+
+**Argument mapping.** Every PATH rides as `--target <path>` on the
+tool's arg vector alongside `--report-format json` (the data
+contract); anything after `--` passes through verbatim for the
+tool's own flags (`--profile perspective`, `--checks naming`,
+`--fail-on warning`, …). Spawning is an arg VECTOR — never a shell
+string. Pair it with `project export --decode-scripts`: lint the
+decoded `.py` sidecars, then re-import with `--encode-scripts`.
+

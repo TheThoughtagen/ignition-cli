@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `script_exec_not_configured` (07-03)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -383,6 +383,14 @@ pub enum CoreError {
         /// The profile whose secret store is empty.
         profile: String,
     },
+
+    /// `ign lint` found no `ignition-lint` executable on PATH — the
+    /// delegation has nothing to delegate to (07-04, INTR-02). The
+    /// hint carries the install command + repo. Exit 6 — target
+    /// state (additive slug; the environment lacks the tool, the
+    /// command is fine).
+    #[error("ignition-lint is not installed (no executable found on PATH)")]
+    LintToolAbsent,
 }
 
 impl CoreError {
@@ -419,6 +427,7 @@ impl CoreError {
             Self::EamNotController { .. } => "eam_not_controller",
             Self::EamTaskTypeRefused { .. } => "eam_task_type_refused",
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
+            Self::LintToolAbsent => "lint_tool_absent",
         }
     }
 
@@ -453,7 +462,8 @@ impl CoreError {
             | Self::ImportDenied { .. }
             | Self::EamNotController { .. }
             | Self::EamTaskTypeRefused { .. }
-            | Self::ScriptExecNotConfigured { .. } => 6,
+            | Self::ScriptExecNotConfigured { .. }
+            | Self::LintToolAbsent => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -652,6 +662,13 @@ impl CoreError {
                 "run `ign webdev deploy --with-script-exec` to deploy the route and \
                   generate + persist its secret (the deploy flag IS the opt-in — \
                   `ign script run` has no --yes by design)"
+                    .to_string(),
+            ),
+            Self::LintToolAbsent => Some(
+                "install the linter: `uv tool install ignition-lint-toolkit` \
+                 (or `pip install ignition-lint-toolkit`) — \
+                 github.com/TheThoughtagen/ignition-lint; then re-run with \
+                 ignition-lint on PATH"
                     .to_string(),
             ),
             Self::Rig(_) => Some(
@@ -976,6 +993,7 @@ mod tests {
                 6,
                 "script_exec_not_configured",
             ),
+            (CoreError::LintToolAbsent, 6, "lint_tool_absent"),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {

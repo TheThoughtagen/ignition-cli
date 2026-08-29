@@ -318,6 +318,18 @@ pub fn fire_script_run(state: &mut AppState, code: String) {
     });
 }
 
+/// `ign lint <PATHS>` (07-04, INTR-02) — the LOCAL delegation: NO
+/// client, NO profile (spawn_action without a client arc — the
+/// first clientless dashboard worker). Ungated, unstrict (the
+/// doctor posture: findings + child exit land in the result modal
+/// as data; `--strict` and `--` passthrough stay CLI forms).
+pub fn fire_lint(state: &mut AppState, paths: String) {
+    let paths: Vec<String> = paths.split_whitespace().map(str::to_string).collect();
+    super::spawn_action(state, "lint", async move {
+        actions::lint::lint_run(&paths, false, &[]).await
+    });
+}
+
 /// `ign project diff` (07-01) — the cross-gateway read. The TWO
 /// per-side clients are rebuilt INSIDE the worker from the named
 /// profiles (`context::rebuild` — the same public building blocks

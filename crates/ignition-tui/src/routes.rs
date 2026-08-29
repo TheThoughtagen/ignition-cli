@@ -409,6 +409,15 @@ pub fn routes() -> &'static [CliRoute] {
             path: "script run",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 07-04: `ign lint` — the local delegation (no gateway: the
+        // worker needs NO client). Ungated, unstrict (the doctor
+        // posture IS the TUI display contract — findings land in the
+        // result modal as data); `--strict` and `--` passthrough
+        // stay CLI forms (`?`-named in the input modal).
+        CliRoute {
+            path: "lint",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
     ]
 }
 

@@ -318,6 +318,10 @@ pub enum PendingInput {
     /// the opt-in. Code-only — the TUI refuses the --file/stdin
     /// forms per the crossterm raw-input rule).
     ScriptCode,
+    /// The space-separated paths for `lint` (fires UNGATED at accept
+    /// — 07-04: the doctor-posture delegation; findings land in the
+    /// result modal as data).
+    LintPaths,
 }
 
 impl Modal {
@@ -403,7 +407,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 14] = [
+pub const ACTIONS: [&str; 15] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -421,6 +425,9 @@ pub const ACTIONS: [&str; 14] = [
     "eam task force",
     // 07-03: the scriptExec verb (ungated — CLI parity).
     "script run",
+    // 07-04: the local ignition-lint delegation (ungated; the
+    // doctor posture — findings are data).
+    "lint",
 ];
 
 /// The Logs screen's actions menu entries (06-03) — the loggers
@@ -1312,6 +1319,7 @@ mod tests {
                 "eam task new",
                 "eam task force",
                 "script run",
+                "lint",
             ]
         );
     }

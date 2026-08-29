@@ -35,8 +35,8 @@ use ignition_core::error::CoreError;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, EamTaskCommand, LogLevel,
-    LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
+    BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, EamTaskCommand, LintArgs,
+    LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
     ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand,
     SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
     TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
@@ -176,6 +176,11 @@ enum ActionOutput {
     /// keys {stdout, result, elapsedMs} (ALL keys always; the
     /// secret never rides any output path).
     ScriptRun(actions::script::ScriptRunResult),
+    /// `ign lint` — the doctor-posture delegation result; exit 0
+    /// whenever the child ran, findings + child_exit_code + the
+    /// parsed report as data (`--strict`'s passthrough is decided
+    /// in `main` AFTER the envelope renders).
+    Lint(actions::lint::LintResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -303,6 +308,7 @@ impl ActionOutput {
             ActionOutput::EamTaskCreate(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskForce(result) => render_success(profile, result, compact),
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
+            ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -357,6 +363,16 @@ fn main() -> ExitCode {
     match result {
         Ok(out) => {
             render_ok(&out, profile.as_deref(), mode);
+            // The ONE sanctioned success-path EXIT exception (07-04,
+            // INTR-02): `ign lint --strict` exits with the child's
+            // code LITERALLY for CI pipelines — the envelope rendered
+            // above first (documented with the lint section; exit 1 =
+            // findings at/above the tool's --fail-on threshold).
+            if let ActionOutput::Lint(lint) = &out
+                && let Some(code) = lint.strict_exit_code()
+            {
+                return ExitCode::from(code);
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -1972,6 +1988,22 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
             }
         },
+        // `ign lint` (07-04, INTR-02): LOCAL delegation — no gateway,
+        // no credential, no profile resolution at all (the docker-verb
+        // precedent for non-gateway commands; envelope profile null).
+        // The strict-mode exit passthrough is decided in `main` AFTER
+        // the envelope renders — the one sanctioned success-path EXIT
+        // exception (README "Linting").
+        Commands::Lint(LintArgs {
+            paths,
+            strict,
+            passthrough,
+        }) => {
+            let result = actions::lint::lint_run(&paths, strict, &passthrough)
+                .await
+                .map(ActionOutput::Lint);
+            (None, result)
+        }
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {

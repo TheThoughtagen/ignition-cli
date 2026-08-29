@@ -3211,6 +3211,11 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
             (Some(PendingInput::ScriptCode), false) => {
                 workers::ops::fire_script_run(state, value);
             }
+            // The lint paths: fires UNGATED at accept (07-04 — the
+            // doctor posture; empty falls through to clear_pending).
+            (Some(PendingInput::LintPaths), false) => {
+                workers::ops::fire_lint(state, value);
+            }
             _ => clear_pending(state),
         }
         return;
@@ -4054,12 +4059,12 @@ mod tests {
             "k steps back up like Up"
         );
 
-        // G bottoms out at the last entry (script run, index 13 —
-        // the 07-02 backup + EAM families appended after restart,
-        // 07-03's script verb after those).
+        // G bottoms out at the last entry (lint, index 14 — the
+        // 07-02 backup + EAM families appended after restart,
+        // 07-03's script verb after those, 07-04's lint after that).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 13 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 14 })),
             "G jumps to the last entry"
         );
 

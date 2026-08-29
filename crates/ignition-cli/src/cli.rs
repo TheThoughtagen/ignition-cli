@@ -166,6 +166,12 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Script(ScriptArgs),
 
+    /// Lint local project files by delegating to ignition-lint (PATH
+    /// discovery) — doctor posture: findings are DATA, exit 0
+    /// whenever the tool ran; --strict passes the tool's exit code
+    /// through for CI
+    Lint(LintArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -1050,6 +1056,26 @@ impl ScheduleMode {
 pub struct ScriptArgs {
     #[command(subcommand)]
     pub command: ScriptCommand,
+}
+
+/// `ign lint` args (07-04, INTR-02) — the ignition-lint delegation:
+/// PATHS map to `--target <path>` pairs on the child's arg vector;
+/// `--` passthrough args ride verbatim after them (power users:
+/// `--profile`, `--checks`, `--fail-on`, …).
+#[derive(Debug, clap::Args)]
+pub struct LintArgs {
+    /// Paths to lint (one --target pair each)
+    #[arg(value_name = "PATH", required = true)]
+    pub paths: Vec<String>,
+    /// Exit with the linter's own exit code (CI mode). Default is
+    /// the doctor posture: findings + child_exit_code + the parsed
+    /// report ride as data and the command exits 0 whenever the
+    /// tool RAN
+    #[arg(long)]
+    pub strict: bool,
+    /// Extra args passed to ignition-lint verbatim (after --)
+    #[arg(last = true, value_name = "ARGS")]
+    pub passthrough: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
