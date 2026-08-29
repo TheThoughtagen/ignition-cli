@@ -46,7 +46,7 @@ def doPost(request, session):
 	# walker, envelope) is duplicated across the five cli/* routes
 	# deliberately. Do not "fix" the duplication by importing.
 
-	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	ROUTE_VERSION = '1.1.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
 	MIN_CLI = '1.0'
 
 	# Deploy-time substitution target: the marker inside the string below is

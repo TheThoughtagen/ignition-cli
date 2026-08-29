@@ -2026,3 +2026,108 @@ fn from_export_missing_path_refuses() {
         snapbox::str![[r#"{"ok":false,"profile":null,"error":{"code":"invalid_input","message":"invalid input: cannot read /definitely/not/here: [..]","endpoint":null,"hint":"fix the input source — a readable file path via --file, or `-` to pipe the content on stdin"}}"#]],
     );
 }
+
+// ---- 07-06: provider-ROOT tag paths refuse honestly ----
+
+/// Mount the tagConfig route answering the provider-root DENIAL
+/// envelope (HTTP 200 — WebDev denials ride 200) for ONE action;
+/// the tags-route precondition probe included.
+async fn mount_tagconfig_denial(server: &wiremock::MockServer, action: &str) {
+    mount_tags_probe(server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": action}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "provider_root_unsupported",
+                    "message": "provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder",
+                },
+            })),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// Gap 5, the Rust mapping half: wiremock cannot execute the route's
+/// Python (the route-side refusal is source-pinned in
+/// ignition-core's webdev tests), so this contract pins the
+/// denial_to_error seam — the route's `provider_root_unsupported`
+/// body denial maps to the dedicated exit-6 slug whose fixed Display
+/// names the subtree workaround. The bracket provider ROOT
+/// (`[default]` alone — the route's pre-call detection shape).
+#[tokio::test]
+async fn tags_config_get_provider_root_refuses_honestly() {
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_denial(&server, "getConfig").await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "get", "[default]", "--compact"],
+    );
+    assert_eq!(out.status.code(), Some(6), "target state, not route_error");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body = stderr_envelope(&out);
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::Value::String("provider_root_unsupported".into())
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("subtree like [provider]folder"),
+        "the fixed Display names the subtree workaround: {message}"
+    );
+    let hint = body["error"]["hint"].as_str().expect("hint");
+    assert!(
+        hint.contains("[provider]folder"),
+        "the hint names the supported form: {hint}"
+    );
+}
+
+/// The export-path variant (the bare `default` form — the shape the
+/// route's RpcContext translation produces on the wire): same
+/// denial envelope, same dedicated mapping, and NO default file
+/// lands (the refusal precedes any write).
+#[tokio::test]
+async fn tags_export_provider_root_refuses_honestly() {
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_denial(&server, "exportTags").await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &["tags", "export", "default", "--compact"],
+        "",
+        Some(cwd.path()),
+    );
+    assert_eq!(out.status.code(), Some(6), "target state, not route_error");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body = stderr_envelope(&out);
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::Value::String("provider_root_unsupported".into())
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("subtree like [provider]folder"),
+        "the fixed Display names the subtree workaround"
+    );
+    assert!(
+        !cwd.path().join("default.json").exists(),
+        "the refusal precedes any file write"
+    );
+}

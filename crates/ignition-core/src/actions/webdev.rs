@@ -823,7 +823,7 @@ mod tests {
                 Ok(match route {
                     "tags" => RouteProbe::Absent,
                     "tagConfig" => present("9.9.9").expect("fixture"),
-                    "alarms" => present("1.0.0").expect("fixture"),
+                    "alarms" => present(BUNDLE_VERSION).expect("fixture"),
                     "tagHistory" => RouteProbe::Unlicensed,
                     "scriptExec" => RouteProbe::Denied {
                         code: "secret_mismatch".into(),
@@ -901,7 +901,7 @@ mod tests {
             .expect_err("older refuses");
         assert_eq!(err.code(), "route_version_mismatch");
         assert!(
-            err.to_string().contains("0.9.0") && err.to_string().contains("1.0.0"),
+            err.to_string().contains("0.9.0") && err.to_string().contains(BUNDLE_VERSION),
             "both versions named: {err}"
         );
 

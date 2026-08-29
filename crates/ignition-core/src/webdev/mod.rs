@@ -21,7 +21,7 @@
 
 /// Version of the embedded route bundle — the `version` handshake action
 /// in every route answers with this value (as `routeVersion`).
-pub const ROUTE_BUNDLE_VERSION: &str = "1.0.0";
+pub const ROUTE_BUNDLE_VERSION: &str = "1.1.0";
 
 /// Minimum CLI version the deployed routes require (handshake `minCli`).
 pub const MIN_CLI: &str = "1.0";
@@ -228,5 +228,33 @@ mod tests {
                 "member outside the Designer-native layout: {name}"
             );
         }
+    }
+
+    /// (6) The tagConfig route source keeps its provider-ROOT refusal
+    /// (07-06): the pre-call bracket detection + RpcContext
+    /// translation both refuse `provider_root_unsupported` —
+    /// wiremock cannot execute the route's Python, so this source
+    /// pin is the route-side regression guard (alongside the
+    /// Rust-side denial mapping contract).
+    #[test]
+    fn tagconfig_route_source_refuses_provider_roots() {
+        let (_, source) = ROUTE_FILES
+            .iter()
+            .find(|(name, _)| {
+                *name == "com.inductiveautomation.webdev/resources/cli/tagConfig/doPost.py"
+            })
+            .expect("tagConfig doPost.py in the manifest");
+        assert!(
+            source.contains("provider_root_unsupported"),
+            "the tagConfig route must keep its provider-root refusal"
+        );
+        assert!(
+            source.contains("def is_provider_root("),
+            "the bracket-form detector must stay nested inside doPost (byte-0 rule)"
+        );
+        assert!(
+            source.contains("'No RpcContext' in traceback.format_exc()"),
+            "the bare-form RpcContext translation must stay"
+        );
     }
 }

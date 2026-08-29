@@ -24,7 +24,7 @@ def doPost(request, session):
 	# Every scripting call below is the LIVE-PROVEN form from the Phase 5
 	# research probe (05-RESEARCH.md). Do not "modernize" them.
 
-	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	ROUTE_VERSION = '1.1.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
 	MIN_CLI = '1.0'
 
 	import json, traceback

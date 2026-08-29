@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -350,6 +350,25 @@ pub enum CoreError {
         endpoint: Option<String>,
     },
 
+    /// A provider-ROOT tag path (`[default]` alone, or a bare first
+    /// segment that resolves to a provider) met the tagConfig route
+    /// — `system.tag.getConfiguration`/`exportTags` need an RPC
+    /// context WebDev threads don't carry (live-proven 8.3.3
+    /// b2026012009, both gateways; 07-UAT test 12). The route
+    /// refuses honestly (pre-call bracket detection + RpcContext
+    /// translation for the bare form) instead of surfacing the
+    /// IllegalStateException as a generic route error; subtree
+    /// paths (`[default]folder`) are the supported form. Exit 6 —
+    /// target state: a platform limitation, not a bug.
+    #[error(
+        "provider-root tag paths are not supported by the deployed route (the gateway needs an \
+         RPC context WebDev threads don't carry) — target a subtree like [provider]folder"
+    )]
+    ProviderRootUnsupported {
+        /// URL of the tagConfig route request, when known.
+        endpoint: Option<String>,
+    },
+
     /// An `eam task new` whose type is in the REFUSED set —
     /// `eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade`
     /// are fleet-destructive (they push backups/modules/upgrades to
@@ -444,6 +463,7 @@ impl CoreError {
             Self::SessionNotPrunable { .. } => "session_not_prunable",
             Self::Rig(_) => "rig_error",
             Self::EamNotController { .. } => "eam_not_controller",
+            Self::ProviderRootUnsupported { .. } => "provider_root_unsupported",
             Self::EamTaskTypeRefused { .. } => "eam_task_type_refused",
             Self::EamTaskInFlight { .. } => "eam_task_in_flight",
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
@@ -481,6 +501,7 @@ impl CoreError {
             | Self::SessionNotPrunable { .. }
             | Self::ImportDenied { .. }
             | Self::EamNotController { .. }
+            | Self::ProviderRootUnsupported { .. }
             | Self::EamTaskTypeRefused { .. }
             | Self::EamTaskInFlight { .. }
             | Self::ScriptExecNotConfigured { .. }
@@ -666,11 +687,18 @@ impl CoreError {
             }),
             Self::EamNotController { .. } => Some(
                 "flip the gateway's EAM role: config-resource PUT on \
-                  com.inductiveautomation.eam/module-settings with \
-                  installMode \"Controller\" (array body carrying the current \
-                  signature) — a manual gateway-role decision this CLI \
-                  deliberately does not automate; see the README 'EAM tasks' \
-                  section"
+                   com.inductiveautomation.eam/module-settings with \
+                   installMode \"Controller\" (array body carrying the current \
+                   signature) — a manual gateway-role decision this CLI \
+                   deliberately does not automate; see the README 'EAM tasks' \
+                   section"
+                    .to_string(),
+            ),
+            Self::ProviderRootUnsupported { .. } => Some(
+                "target a subtree path like [provider]folder — provider-ROOT \
+                   forms ([default] alone, or a bare provider name) need an \
+                   RPC context WebDev threads don't carry (8.3.3); subtree \
+                   paths are the supported form"
                     .to_string(),
             ),
             Self::EamTaskTypeRefused { .. } => Some(
@@ -729,6 +757,7 @@ impl CoreError {
             | Self::SessionNotPrunable { endpoint, .. }
             | Self::ImportDenied { endpoint, .. }
             | Self::EamNotController { endpoint }
+            | Self::ProviderRootUnsupported { endpoint }
             | Self::EamTaskInFlight { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
@@ -1006,6 +1035,13 @@ mod tests {
                 },
                 6,
                 "eam_not_controller",
+            ),
+            (
+                CoreError::ProviderRootUnsupported {
+                    endpoint: Some("/system/webdev/ign-cli/cli/tagConfig".into()),
+                },
+                6,
+                "provider_root_unsupported",
             ),
             (
                 CoreError::EamTaskTypeRefused {

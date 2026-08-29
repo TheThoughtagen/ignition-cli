@@ -199,6 +199,14 @@ pub(crate) fn denial_to_error(
         "no_alarm_journal" => CoreError::AlarmJournalMissing {
             endpoint: Some(endpoint),
         },
+        // The tagConfig route's provider-root refusal (07-06): the
+        // route detects the bracket form pre-call and translates the
+        // bare form's 'No RpcContext' throw — the honest
+        // platform-limitation slug over a generic route error (the
+        // no_alarm_journal seam precedent).
+        "provider_root_unsupported" => CoreError::ProviderRootUnsupported {
+            endpoint: Some(endpoint),
+        },
         _ => {
             let mut full = message.to_string();
             if let Some(traceback) = traceback {
@@ -451,6 +459,23 @@ mod tests {
         assert!(
             journal.hint().unwrap().contains("journal profile"),
             "hint names the chain: {journal}"
+        );
+
+        // The tagConfig route's provider-root denial (07-06): the
+        // dedicated slug + exit 6, the message names the subtree
+        // workaround (the fixed Display — the route's own message
+        // stays consistent with it).
+        let root = denial_to_error(
+            "provider_root_unsupported",
+            "provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder",
+            None,
+            "/system/webdev/ign-cli/cli/tagConfig".into(),
+        );
+        assert_eq!(root.code(), "provider_root_unsupported");
+        assert_eq!(root.exit_code(), 6);
+        assert!(
+            root.to_string().contains("subtree like [provider]folder"),
+            "the fixed Display names the subtree workaround: {root}"
         );
     }
 

@@ -30,8 +30,12 @@ def doPost(request, session):
 	#   - alarms are a LIST of dicts; a name-keyed dict is silently ignored.
 	#   - tagType (not 'type') is the discriminator.
 	#   - exportTags is KWARGS-ONLY (tagPaths=...); the positional form fails.
+	#   - provider-ROOT paths ('[default]' alone / a bare provider name) refuse
+	#     'provider_root_unsupported' (getConfiguration/exportTags need an
+	#     RpcContext WebDev threads don't carry, 8.3.3) -- subtree paths like
+	#     [provider]folder are the supported form.
 
-	ROUTE_VERSION = '1.0.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	ROUTE_VERSION = '1.1.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
 	MIN_CLI = '1.0'
 
 	import json, traceback
@@ -93,6 +97,23 @@ def doPost(request, session):
 				'dataType': None,
 			}
 
+	def is_provider_root(p):
+		# Bracket-form provider ROOT only (07-06): '[default]' / '[prov]' --
+		# the remainder after ']' empty or just slashes. system.tag
+		# getConfiguration/exportTags need an RpcContext WebDev threads do
+		# not carry for a provider root (8.3.3 b2026012009) -- refuse
+		# honestly instead of surfacing the IllegalStateException. The BARE
+		# form ('default') cannot be pre-detected without provider-name
+		# knowledge; the gateway resolves it to the provider root and the
+		# call-site translation below catches the same 'No RpcContext'.
+		p = str(p)
+		if not p.startswith('['):
+			return False
+		end = p.find(']')
+		if end == -1:
+			return False
+		return p[end + 1:].strip('/') == ''
+
 	try:
 		if action == 'version':
 			return ok({'routeVersion': ROUTE_VERSION, 'minCli': MIN_CLI})
@@ -100,7 +121,20 @@ def doPost(request, session):
 		if action == 'getConfig':
 			tagPath = data['tagPath']  # STRING -- the list form poisons TagPathParser
 			recursive = bool(data.get('recursive', False))
-			tags = system.tag.getConfiguration(tagPath, recursive)
+			# Provider-root pre-call refusal (07-06): zero gateway work, deterministic.
+			if is_provider_root(tagPath):
+				return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
+			try:
+				tags = system.tag.getConfiguration(tagPath, recursive)
+			except:
+				# RpcContext translation (07-06): a BARE provider-matching
+				# first segment resolved to the provider root inside
+				# TagPathParser and threw -- the same honest refusal. Every
+				# other exception re-raises into the outer bare-exect
+				# (generic route_error semantics unchanged).
+				if 'No RpcContext' in traceback.format_exc():
+					return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
+				raise
 			if tags and tags[0]:
 				return ok({'config': jv(tags[0])})
 			return err('not_found', 'not found: ' + str(tagPath))
@@ -135,7 +169,19 @@ def doPost(request, session):
 			return err('not_found', 'udt not found: [%s]_types_/%s' % (prov, name))
 
 		if action == 'exportTags':
-			payload = system.tag.exportTags(tagPaths=data['paths'])  # kwargs ONLY (positional fails)
+			paths = data['paths']
+			# Provider-root pre-flight scan (07-06): refuse naming the
+			# offending path BEFORE any gateway work.
+			for p in paths:
+				if is_provider_root(p):
+					return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder: ' + str(p))
+			try:
+				payload = system.tag.exportTags(tagPaths=paths)  # kwargs ONLY (positional fails)
+			except:
+				# RpcContext translation (07-06): the bare provider form.
+				if 'No RpcContext' in traceback.format_exc():
+					return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
+				raise
 			return ok({'payload': str(payload)})
 
 		return err('unknown_action', 'unknown action: ' + str(action))

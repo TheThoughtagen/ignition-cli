@@ -225,7 +225,7 @@ import: {"success":true}
 async fn webdev_status_all_present_golden() {
     let server = wiremock::MockServer::start().await;
     for route in ALWAYS_ON {
-        mount_probe_present(&server, route, "1.0.0").await;
+        mount_probe_present(&server, route, ignition_core::webdev::ROUTE_BUNDLE_VERSION).await;
     }
 
     let (_dir, config) = isolated_config();
@@ -241,10 +241,10 @@ async fn webdev_status_all_present_golden() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-tags         present          1.0.0
-tagConfig    present          1.0.0
-alarms       present          1.0.0
-tagHistory   present          1.0.0
+tags         present          1.1.0
+tagConfig    present          1.1.0
+alarms       present          1.1.0
+tagHistory   present          1.1.0
 ok: all always-on routes present with matching versions
 "#]],
     );
@@ -253,7 +253,7 @@ ok: all always-on routes present with matching versions
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":[{"route":"tags","status":"present","deployed_version":"1.0.0","expected_version":"1.0.0"},{"route":"tagConfig","status":"present","deployed_version":"1.0.0","expected_version":"1.0.0"},{"route":"alarms","status":"present","deployed_version":"1.0.0","expected_version":"1.0.0"},{"route":"tagHistory","status":"present","deployed_version":"1.0.0","expected_version":"1.0.0"}],"ok":true}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":[{"route":"tags","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"},{"route":"tagConfig","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"},{"route":"alarms","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"},{"route":"tagHistory","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"}],"ok":true}}"#]],
     );
 }
 
@@ -290,7 +290,10 @@ async fn webdev_status_absent_is_data_exit_zero() {
             .unwrap_or_else(|| panic!("{route} row"));
         assert_eq!(row["status"], "absent", "{route}: {row}");
         assert_eq!(row["deployed_version"], Value::Null);
-        assert_eq!(row["expected_version"], "1.0.0");
+        assert_eq!(
+            row["expected_version"],
+            ignition_core::webdev::ROUTE_BUNDLE_VERSION
+        );
     }
 
     let out = ign(&config, &server.uri(), &["webdev", "status"]);
@@ -316,7 +319,7 @@ async fn webdev_status_version_mismatch_rows() {
     let server = wiremock::MockServer::start().await;
     mount_probe_present(&server, "tags", "0.9.0").await;
     for route in &ALWAYS_ON[1..] {
-        mount_probe_present(&server, route, "1.0.0").await;
+        mount_probe_present(&server, route, ignition_core::webdev::ROUTE_BUNDLE_VERSION).await;
     }
 
     let (_dir, config) = isolated_config();
@@ -334,7 +337,10 @@ async fn webdev_status_version_mismatch_rows() {
         .unwrap();
     assert_eq!(tags["status"], "version_mismatch");
     assert_eq!(tags["deployed_version"], "0.9.0");
-    assert_eq!(tags["expected_version"], "1.0.0");
+    assert_eq!(
+        tags["expected_version"],
+        ignition_core::webdev::ROUTE_BUNDLE_VERSION
+    );
 }
 
 /// Read the stored webdev secret back out of an isolated config
