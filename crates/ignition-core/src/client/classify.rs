@@ -111,6 +111,30 @@ pub(crate) async fn classify(
             id: designer_prune_id(url),
             endpoint: Some(url.to_string()),
         }),
+        // 409 on the EAM FORCE route only (07-06 gap 4, the
+        // session_not_prunable precedent's force-route edition): a
+        // leftover '(forced)' run occupies the task's slot — the
+        // gateway answers 409 with its own Jetty error page ("Task
+        // 'X (forced)' already exists! It must be completed or
+        // deleted before another task of this type can be force
+        // executed."; live-captured 8.3.3, 07-UAT test 7). The
+        // page's MESSAGE rides the refusal verbatim; a 409 without
+        // the page keeps the '(forced)' fallback detail. Every other
+        // route's 409 keeps the Internal fallback below.
+        S::CONFLICT if is_eam_force_url(url) => {
+            let body = resp.text().await.unwrap_or_default();
+            let detail = html_error_parts(&body)
+                .map(|(_, message)| message)
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| {
+                    "the previous '(forced)' run must be completed or deleted first".to_string()
+                });
+            Err(CoreError::EamTaskInFlight {
+                task: eam_force_task_name(url),
+                detail,
+                endpoint: Some(url.to_string()),
+            })
+        }
         // A 422 on a config-RESOURCE path (07-05 gap 3): the gateway
         // rejected a client-composed resource BODY — validation, not
         // an internal error. Path-scoped (the EAM create path
@@ -187,6 +211,31 @@ fn is_config_resource_url(url: &str) -> bool {
     url.contains("/data/api/v1/resources/")
 }
 
+/// Is `url` on the EAM FORCE route
+/// (`…/data/eam/api/v1/eam-tasks/force/…`)? The in-flight 409 arm
+/// is scoped to this prefix — the history route and the
+/// config-resource definition paths keep the Internal fallback.
+fn is_eam_force_url(url: &str) -> bool {
+    url.contains("/data/eam/api/v1/eam-tasks/force/")
+}
+
+/// The forced task's name — the LAST path segment after the
+/// force-route prefix (the URL is `/eam-tasks/force/{owner}/{name}`;
+/// query-safe like [`designer_prune_id`]).
+fn eam_force_task_name(url: &str) -> String {
+    url.split_once("/data/eam/api/v1/eam-tasks/force/")
+        .map(|(_, tail)| {
+            tail.split('?')
+                .next()
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// Is `url` the SINGULAR designer-prune route
 /// (`…/data/api/v1/designer/{id}`)? The trailing `/designer/` segment
 /// cannot match the plural `/data/api/v1/designers` list — the `s`
@@ -242,8 +291,8 @@ fn html_error_parts(body: &str) -> Option<(u16, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        designer_prune_id, html_error_parts, is_config_resource_url, is_designer_prune_url,
-        is_eam_url,
+        designer_prune_id, eam_force_task_name, html_error_parts, is_config_resource_url,
+        is_designer_prune_url, is_eam_force_url, is_eam_url,
     };
 
     /// The 422 arm's path scoping (07-05): the EAM create path (and
@@ -360,6 +409,40 @@ mod tests {
         assert_eq!(
             designer_prune_id("http://gw:8088/data/api/v1/designer/10443A91?x=1"),
             "10443A91"
+        );
+    }
+
+    /// The force-409 arm's path scoping (07-06 gap 4): the FORCE
+    /// prefix matches; the history route and the config-resource
+    /// definition path do NOT (they keep the Internal fallback).
+    #[test]
+    fn eam_force_url_detection_scopes_the_409_arm() {
+        assert!(is_eam_force_url(
+            "http://gw:8088/data/eam/api/v1/eam-tasks/force/eam/cli-research-backup"
+        ));
+        assert!(!is_eam_force_url(
+            "http://gw:8088/data/eam/api/v1/eam-tasks/history"
+        ));
+        assert!(!is_eam_force_url(
+            "http://gw:8088/data/api/v1/resources/list/com.inductiveautomation.eam/eam-tasks"
+        ));
+    }
+
+    /// The forced task's name is the LAST force-route segment after
+    /// the owner (query-safe like `designer_prune_id`).
+    #[test]
+    fn eam_force_task_name_extracts_the_trailing_segment() {
+        assert_eq!(
+            eam_force_task_name(
+                "http://gw:8088/data/eam/api/v1/eam-tasks/force/eam/cli-research-backup"
+            ),
+            "cli-research-backup"
+        );
+        assert_eq!(
+            eam_force_task_name(
+                "http://gw:8088/data/eam/api/v1/eam-tasks/force/eam/nightly-backup?x=1"
+            ),
+            "nightly-backup"
         );
     }
 }

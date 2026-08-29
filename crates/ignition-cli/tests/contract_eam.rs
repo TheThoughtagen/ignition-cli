@@ -648,3 +648,90 @@ dispatched nightly-backup (owner eam) — run outcomes:
   [Failed] Gateway network for agent '_controller' is currently not connected"#]],
     );
 }
+
+/// The force CONFLICT golden (07-06 gap 4): a leftover '(forced)'
+/// run occupies the slot — the gateway answers the force POST with
+/// 409 + its Jetty error page (the live 8.3.3 capture, 07-UAT test
+/// 7). The refusal is exit-6 `eam_task_in_flight` carrying the
+/// page's own text verbatim — never internal_error.
+#[tokio::test]
+async fn task_force_conflict_refusal_golden() {
+    let server = wiremock::MockServer::start().await;
+    // The find (owner resolution) — the force sequence's first half.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/cli%2Dresearch%2Dbackup",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "cli-research-backup",
+                "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}},
+                "scheduledTaskState": {"currentState": "IDLE", "details": {"owner": "eam"}}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The force POST answers 409 with the CAPTURED Jetty page body
+    // (raw HTML — set_body_raw, never set_body_string's forced
+    // text/plain; apostrophes HTML-escaped as the live 8.3.3 page
+    // sends them).
+    const CAPTURED_409_HTML: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Conflict</h2>\n<table>\n<tr><th>URI:</th><td>/data/eam/api/v1/eam-tasks/force/eam/cli-research-backup</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Task &apos;cli-research-backup (forced)&apos; already exists! It must be completed or deleted before another task of this type can be force executed.</td></tr>\n</table>\n\n</body>\n</html>\n";
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/eam/api/v1/eam-tasks/force/eam/cli-research-backup",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(409).set_body_raw(
+            CAPTURED_409_HTML.as_bytes().to_vec(),
+            "text/html;charset=iso-8859-1",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "eam",
+            "task",
+            "force",
+            "cli-research-backup",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "target state, not internal");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: serde_json::Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(
+        body["profile"],
+        serde_json::Value::String("dev".into()),
+        "post-resolution refusal carries the resolved profile"
+    );
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::Value::String("eam_task_in_flight".into())
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("already exists"),
+        "the gateway's page text rides verbatim: {message}"
+    );
+    assert!(
+        message.contains("cli-research-backup"),
+        "the task name rides the refusal: {message}"
+    );
+    assert!(
+        message.contains("must be completed or deleted"),
+        "the gateway's resolution text rides verbatim: {message}"
+    );
+    let hint = body["error"]["hint"].as_str().expect("hint");
+    assert!(
+        hint.contains("EAM console"),
+        "the hint names where to resolve the leftover run: {hint}"
+    );
+}

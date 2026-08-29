@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -366,6 +366,25 @@ pub enum CoreError {
         task_type: String,
     },
 
+    /// An `eam task force` whose slot a leftover run occupies — the
+    /// force route answers 409 with the gateway's own Jetty page
+    /// ("Task 'X (forced)' already exists! It must be completed or
+    /// deleted before another task of this type can be force
+    /// executed."; live-captured 8.3.3, 07-UAT test 7). Exit 6 —
+    /// target state (the `session_not_prunable` precedent,
+    /// force-route edition): the gateway's state refused the command,
+    /// not a bug; classify()'s path-scoped 409 arm constructs this.
+    #[error("EAM task {task} has a run in flight — the gateway refused the force: {detail}")]
+    EamTaskInFlight {
+        /// The forced task's name (the force URL's last segment).
+        task: String,
+        /// The gateway's Jetty page message verbatim when sniffed;
+        /// the '(forced)' fallback text otherwise.
+        detail: String,
+        /// URL of the refused force POST, when known.
+        endpoint: Option<String>,
+    },
+
     /// The scriptExec route is not configured for this profile — no
     /// webdev secret is persisted, which can only mean `ign webdev
     /// deploy --with-script-exec` has never run (deploy persists the
@@ -426,6 +445,7 @@ impl CoreError {
             Self::Rig(_) => "rig_error",
             Self::EamNotController { .. } => "eam_not_controller",
             Self::EamTaskTypeRefused { .. } => "eam_task_type_refused",
+            Self::EamTaskInFlight { .. } => "eam_task_in_flight",
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
             Self::LintToolAbsent => "lint_tool_absent",
         }
@@ -462,6 +482,7 @@ impl CoreError {
             | Self::ImportDenied { .. }
             | Self::EamNotController { .. }
             | Self::EamTaskTypeRefused { .. }
+            | Self::EamTaskInFlight { .. }
             | Self::ScriptExecNotConfigured { .. }
             | Self::LintToolAbsent => 6,
             Self::Rig(_) => 7,
@@ -654,8 +675,14 @@ impl CoreError {
             ),
             Self::EamTaskTypeRefused { .. } => Some(
                 "restore/install/upgrade tasks dispatch fleet-wide (every \
-                  agent target); run them from the Ignition EAM console — \
-                  EXT-03 (v2) will scope them into the CLI"
+                   agent target); run them from the Ignition EAM console — \
+                   EXT-03 (v2) will scope them into the CLI"
+                    .to_string(),
+            ),
+            Self::EamTaskInFlight { .. } => Some(
+                "complete or delete the leftover '(forced)' run from the EAM \
+                   console — no ign verb deletes runs; the slot frees once the \
+                   run is resolved"
                     .to_string(),
             ),
             Self::ScriptExecNotConfigured { .. } => Some(
@@ -701,7 +728,8 @@ impl CoreError {
             | Self::AlarmJournalMissing { endpoint }
             | Self::SessionNotPrunable { endpoint, .. }
             | Self::ImportDenied { endpoint, .. }
-            | Self::EamNotController { endpoint } => endpoint.clone(),
+            | Self::EamNotController { endpoint }
+            | Self::EamTaskInFlight { endpoint, .. } => endpoint.clone(),
             _ => None,
         }
     }
@@ -987,6 +1015,18 @@ mod tests {
                 "eam_task_type_refused",
             ),
             (
+                CoreError::EamTaskInFlight {
+                    task: "cli-research-backup".into(),
+                    detail: "Task 'cli-research-backup (forced)' already exists! It must be completed or deleted before another task of this type can be force executed.".into(),
+                    endpoint: Some(
+                        "http://gw:8088/data/eam/api/v1/eam-tasks/force/eam/cli-research-backup"
+                            .into(),
+                    ),
+                },
+                6,
+                "eam_task_in_flight",
+            ),
+            (
                 CoreError::ScriptExecNotConfigured {
                     profile: "dev".into(),
                 },
@@ -1197,6 +1237,25 @@ mod tests {
         assert!(
             hint.contains("fleet-wide") || hint.contains("EXT-03"),
             "refused hint names the fleet consequence / scope: {hint}"
+        );
+
+        // The force-route 409 (07-06 gap 4): the hint names the
+        // resolution — complete or delete the leftover '(forced)'
+        // run via the EAM console (no ign verb deletes runs).
+        let in_flight = CoreError::EamTaskInFlight {
+            task: "cli-research-backup".into(),
+            detail: "the previous '(forced)' run must be completed or deleted first".into(),
+            endpoint: None,
+        };
+        assert_eq!(in_flight.exit_code(), 6, "target state");
+        let hint = in_flight.hint().expect("hint required");
+        assert!(
+            hint.contains("EAM console"),
+            "in-flight hint names where to resolve it: {hint}"
+        );
+        assert!(
+            hint.contains("complete or delete"),
+            "in-flight hint names the resolution: {hint}"
         );
 
         // The scriptExec structural gate (07-03): the hint names the

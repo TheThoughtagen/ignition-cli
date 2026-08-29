@@ -33,7 +33,7 @@ output directly, so it is never JSON-wrapped.
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `script_exec_not_configured`, `lint_tool_absent` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -616,6 +616,12 @@ so the OUTCOME is visible immediately: `level`/`detail` are data —
 a `Failed` run with "Gateway network for agent … not connected" or
 "Trial timer is expired" is the honest report of the gateway's
 execution prerequisites (GNET agent + live trial), never hidden.
+
+A leftover run occupying the task's slot refuses with exit 6
+`eam_task_in_flight` — the gateway's own 409 page text ("Task 'X
+(forced)' already exists! It must be completed or deleted …") rides
+the message verbatim; resolve the run from the EAM console (no
+`ign` verb deletes runs).
 
 **`eam_restoreBackup` vs `ign backup restore`** — different axes:
 `ign backup restore` restores THIS gateway from gwbk bytes; the EAM
