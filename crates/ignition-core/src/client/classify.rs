@@ -21,6 +21,8 @@
 //! The Jetty sniffer is a deliberate substring scan, not an HTML crate:
 //! the error pages are a fixed server template (research Don't-Hand-Roll).
 
+use serde_json::Value;
+
 use crate::error::CoreError;
 
 /// Classify `resp` (from `url`) into `Ok(response)` on 2xx or the typed
@@ -109,6 +111,41 @@ pub(crate) async fn classify(
             id: designer_prune_id(url),
             endpoint: Some(url.to_string()),
         }),
+        // A 422 on a config-RESOURCE path (07-05 gap 3): the gateway
+        // rejected a client-composed resource BODY — validation, not
+        // an internal error. Path-scoped (the EAM create path
+        // `/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks`
+        // live-answers 422 `{"messages":["Settings cannot be
+        // null"],"fieldMessages":[]}` on 8.3.3) so runtime endpoints
+        // keep the Internal fallback. The `messages` array joins into
+        // the reason; a non-JSON body rides its raw text; an empty
+        // body stays a bare 422 note (the EamNotController arm's
+        // body-reading precedent).
+        S::UNPROCESSABLE_ENTITY if is_config_resource_url(url) => {
+            let body = resp.text().await.unwrap_or_default();
+            let joined = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|parsed| {
+                    parsed["messages"].as_array().map(|messages| {
+                        messages
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                })
+                .filter(|joined| !joined.is_empty());
+            let reason = match joined {
+                Some(joined) => {
+                    format!("gateway rejected the resource body (HTTP 422 from {url}): {joined}")
+                }
+                None if !body.trim().is_empty() => {
+                    format!("gateway rejected the resource body (HTTP 422 from {url}): {body}")
+                }
+                None => format!("gateway rejected the resource body (HTTP 422 from {url})"),
+            };
+            Err(CoreError::InvalidInput { reason })
+        }
         _ => {
             // Unclassifiable: if the body is the Jetty HTML error page,
             // surface its own title/message instead of a bare status.
@@ -138,6 +175,16 @@ pub(crate) async fn classify(
 /// module-scoped seam (the designer-prune route scoping precedent).
 fn is_eam_url(url: &str) -> bool {
     url.contains("/data/eam/")
+}
+
+/// Is `url` on the config-RESOURCE surface
+/// (`/data/api/v1/resources/`)? The 422 body-rejection arm is
+/// scoped to this prefix — resource create/PUT bodies are
+/// client-composed, so a 422 is OUR payload failing the server's
+/// validation (`invalid_input`); everything else keeps the Internal
+/// fallback.
+fn is_config_resource_url(url: &str) -> bool {
+    url.contains("/data/api/v1/resources/")
 }
 
 /// Is `url` the SINGULAR designer-prune route
@@ -194,7 +241,29 @@ fn html_error_parts(body: &str) -> Option<(u16, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{designer_prune_id, html_error_parts, is_designer_prune_url, is_eam_url};
+    use super::{
+        designer_prune_id, html_error_parts, is_config_resource_url, is_designer_prune_url,
+        is_eam_url,
+    };
+
+    /// The 422 arm's path scoping (07-05): the EAM create path (and
+    /// every config-resource path) matches; the EAM runtime paths
+    /// and gateway-info do NOT (they keep the Internal fallback).
+    #[test]
+    fn config_resource_url_detection_scopes_the_422_arm() {
+        assert!(is_config_resource_url(
+            "http://gw:8088/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks"
+        ));
+        assert!(is_config_resource_url(
+            "http://gw:8088/data/api/v1/resources/list/com.inductiveautomation.eam/eam-tasks"
+        ));
+        assert!(!is_config_resource_url(
+            "http://gw:8088/data/eam/api/v1/eam-tasks/history"
+        ));
+        assert!(!is_config_resource_url(
+            "http://gw:8088/data/api/v1/gateway-info"
+        ));
+    }
 
     /// The EAM controller-403 scoping (07-02): the runtime prefix
     /// matches; the config-resource definition paths do NOT (they

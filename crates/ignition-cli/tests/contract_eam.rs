@@ -448,14 +448,116 @@ async fn task_new_backup_ondemand_fires_unguarded() {
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
         snapbox::str![[
-            r#"{"ok":true,"profile":"dev","data":{"name":"nightly-backup","task_type":"eam_backup","schedule_mode":"OnDemand","definition":{"config":{"profile":{"concurrentBackups":2,"forceBackups":true,"scheduleMode":"OnDemand","targetGateways":["gw-a"],"type":"eam_backup"}},"name":"nightly-backup"}}}"#
+            r#"{"ok":true,"profile":"dev","data":{"name":"nightly-backup","task_type":"eam_backup","schedule_mode":"OnDemand","definition":{"config":{"profile":{"scheduleMode":"OnDemand","type":"eam_backup"},"settings":{"concurrentBackups":2,"forceBackups":true,"targetGateways":["gw-a"],"targetGroups":[]}},"name":"nightly-backup"}}}"#
         ]],
     );
-    // The typed settings rode the wire (no stringly-typed leaks).
+    // The typed settings rode the wire under config.SETTINGS (the
+    // live 8.3.3 profile/settings split — never in profile).
     let requests = server.received_requests().await.unwrap_or_default();
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
-    assert_eq!(body[0]["config"]["profile"]["concurrentBackups"], 2);
-    assert_eq!(body[0]["config"]["profile"]["forceBackups"], true);
+    assert_eq!(body[0]["config"]["settings"]["concurrentBackups"], 2);
+    assert_eq!(body[0]["config"]["settings"]["forceBackups"], true);
+    assert_eq!(
+        body[0]["config"]["settings"]["targetGateways"],
+        serde_json::json!(["gw-a"])
+    );
+    assert!(
+        body[0]["config"]["profile"]
+            .get("concurrentBackups")
+            .is_none(),
+        "profile carries no settings keys"
+    );
+}
+
+/// The ZERO-TARGET default pin (07-05 gap 3): no `--target` composes
+/// `targetGateways: ["_controller"]` — the live-captured zero-config
+/// default on a controller-mode gateway.
+#[tokio::test]
+async fn task_new_backup_no_target_defaults_to_controller() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["eam", "task", "new", "t2", "eam_backup", "--compact"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
+    assert_eq!(
+        body[0]["config"]["settings"]["targetGateways"],
+        serde_json::json!(["_controller"]),
+        "zero --target defaults to the controller itself"
+    );
+    assert_eq!(
+        body[0]["config"]["settings"]["targetGroups"],
+        serde_json::json!([])
+    );
+}
+
+/// THE 422 classification contract (07-05 gap 3): a config-resource
+/// create answered 422 with the live body
+/// `{"messages":["Settings cannot be null"],"fieldMessages":[]}`
+/// surfaces as exit-2 `invalid_input` carrying the gateway's own
+/// message and naming the endpoint — NEVER `internal_error`.
+#[tokio::test]
+async fn task_new_422_classifies_invalid_input() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(422).set_body_raw(
+            br#"{"messages":["Settings cannot be null"],"fieldMessages":[]}"#.to_vec(),
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (_config_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["eam", "task", "new", "t-422", "eam_backup", "--compact"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid_input, not internal_error"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: serde_json::Value =
+        serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::Value::String("invalid_input".into())
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("Settings cannot be null"),
+        "the gateway's own message rides verbatim: {message}"
+    );
+    assert!(
+        message.contains("/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks"),
+        "the endpoint is named: {message}"
+    );
 }
 
 /// The force SUCCESS golden: --yes passes the guard, the 3-request

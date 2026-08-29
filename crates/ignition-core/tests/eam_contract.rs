@@ -19,13 +19,14 @@ fn token_credential() -> Credential {
 }
 
 /// The live-captured history page shape (trimmed to two items): the
+/// UUID-string taskIds (8.3.3 wire-faithful — 07-05 gap 1), the
 /// forced-run taskName suffix, the Failed level with GNET detail,
 /// epoch-ms numbers.
 fn history_page() -> serde_json::Value {
     serde_json::json!({
         "items": [
             {
-                "taskId": 2,
+                "taskId": "c3d5ebc2-0b91-40fc-8417-3af372071547",
                 "taskName": "nightly-backup (forced)",
                 "taskStart": 1787930000000_i64,
                 "taskEnd": 1787930009000_i64,
@@ -35,7 +36,7 @@ fn history_page() -> serde_json::Value {
                 "taskType": "eam_backup"
             },
             {
-                "taskId": 1,
+                "taskId": "d4e6fcd3-1c92-410d-8528-4ba483082658",
                 "taskName": "nightly-backup",
                 "taskStart": 1787920000000_i64,
                 "taskEnd": 1787920005000_i64,
@@ -62,13 +63,13 @@ fn definition_list_page() -> serde_json::Value {
                 "config": {
                     "profile": {
                         "type": "eam_backup",
-                        "scheduleMode": "OnDemand",
-                        "settings": {
-                            "targetGateways": ["gw-a"],
-                            "targetGroups": [],
-                            "concurrentBackups": 2,
-                            "forceBackups": true
-                        }
+                        "scheduleMode": "OnDemand"
+                    },
+                    "settings": {
+                        "targetGateways": ["gw-a"],
+                        "targetGroups": [],
+                        "concurrentBackups": 2,
+                        "forceBackups": true
                     }
                 }
             }
@@ -349,24 +350,28 @@ async fn task_create_posts_array_body_with_typed_settings() {
     assert_eq!(
         body,
         serde_json::json!([{
-            "config": {"profile": {
-                "concurrentBackups": 2,
-                "forceBackups": true,
-                "scheduleMode": "OnDemand",
-                "targetGateways": ["gw-a"],
-                "type": "eam_backup"
-            }},
+            "config": {
+                "profile": {"scheduleMode": "OnDemand", "type": "eam_backup"},
+                "settings": {
+                    "concurrentBackups": 2,
+                    "forceBackups": true,
+                    "targetGateways": ["gw-a"],
+                    "targetGroups": []
+                }
+            },
             "name": "nightly-backup"
         }]),
-        "the ARRAY body, composed definition verbatim — settings TYPED"
+        "the ARRAY body, composed definition verbatim — the live 8.3.3 \
+         profile/settings split with settings TYPED"
     );
 }
 
 /// THE create body pin (b) — the `--definition` file path: a
 /// full-JSON overlay carrying the live-captured eam_backup settings
 /// shape (`targetGateways`/`targetGroups` arrays, `concurrentBackups`
-/// int, `forceBackups` bool) deep-merged over the composed base
-/// `{name, profile: {type, scheduleMode}}`.
+/// int, `forceBackups` bool) deep-merged over the composed
+/// `config.settings` (zero `--target` defaults to
+/// `["_controller"]`; the overlay's arrays REPLACE it).
 #[tokio::test]
 async fn task_create_deep_merges_the_definition_file() {
     let mock = IgnitionMock::start().await;
@@ -401,17 +406,18 @@ async fn task_create_deep_merges_the_definition_file() {
     assert_eq!(
         body,
         serde_json::json!([{
-            "config": {"profile": {
-                "concurrentBackups": 3,
-                "forceBackups": false,
-                "scheduleMode": "OnDemand",
-                "targetGateways": ["gw-a", "gw-b"],
-                "targetGroups": [],
-                "type": "eam_backup"
-            }},
+            "config": {
+                "profile": {"scheduleMode": "OnDemand", "type": "eam_backup"},
+                "settings": {
+                    "concurrentBackups": 3,
+                    "forceBackups": false,
+                    "targetGateways": ["gw-a", "gw-b"],
+                    "targetGroups": []
+                }
+            },
             "name": "fleet-backup"
         }]),
-        "the overlay's typed/array settings deep-merged over the base"
+        "the overlay's typed/array settings deep-merged over the composed config.settings"
     );
 }
 
@@ -525,7 +531,7 @@ async fn task_force_is_the_three_request_sequence() {
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [
                     {
-                        "taskId": 9,
+                        "taskId": "e5f7ade4-2da3-421e-9639-5cb594193769",
                         "taskName": "nightly-backup (forced)",
                         "taskStart": 1787930000000_i64,
                         "taskEnd": 1787930009000_i64,

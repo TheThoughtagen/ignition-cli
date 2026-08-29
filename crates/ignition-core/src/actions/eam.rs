@@ -169,17 +169,78 @@ fn deep_merge(base: &mut Value, overlay: &Value) {
     }
 }
 
+/// Compose the `eam task new` definition body (pure — the
+/// unit-testable core of [`eam_task_create`]). The live 8.3.3
+/// controller requires the profile/settings SPLIT (captured in
+/// `.planning/debug/eam-working-definition.json`; the pre-split body
+/// 422'd with "Settings cannot be null"):
+///
+/// - `config.profile` = `{type, scheduleMode}` ONLY (`isSuspended` is
+///   server-owned — never sent on create);
+/// - `config.settings` = `{targetGateways, targetGroups}` + every
+///   `--setting K=V` (auto-typed scalars) with the `--definition`
+///   overlay deep-merged over the composed SETTINGS object (objects
+///   merge, arrays/scalars replace).
+///
+/// Zero `--target` values default to the controller itself —
+/// `targetGateways: ["_controller"]`, the live-captured zero-config
+/// default on a controller-mode gateway; explicit targets replace it
+/// wholesale. `targetGroups` is always `[]` (no `--group` flag
+/// exists).
+fn compose_task_definition(
+    name: &str,
+    task_type: &str,
+    targets: &[String],
+    settings: &[String],
+    definition: Option<&Value>,
+    schedule_mode: &str,
+) -> Result<Value, CoreError> {
+    let mut profile = Map::new();
+    profile.insert("type".to_string(), Value::String(task_type.to_string()));
+    profile.insert(
+        "scheduleMode".to_string(),
+        Value::String(schedule_mode.to_string()),
+    );
+
+    let mut composed_settings = Map::new();
+    composed_settings.insert(
+        "targetGateways".to_string(),
+        if targets.is_empty() {
+            Value::Array(vec![Value::String("_controller".to_string())])
+        } else {
+            Value::Array(targets.iter().map(|t| Value::String(t.clone())).collect())
+        },
+    );
+    composed_settings.insert("targetGroups".to_string(), Value::Array(vec![]));
+    for raw in settings {
+        let (key, value) = parse_setting(raw)?;
+        composed_settings.insert(key, value);
+    }
+    let mut settings_value = Value::Object(composed_settings);
+    if let Some(overlay) = definition {
+        deep_merge(&mut settings_value, overlay);
+    }
+
+    Ok(serde_json::json!({
+        "name": name,
+        "config": {
+            "profile": Value::Object(profile),
+            "settings": settings_value,
+        },
+    }))
+}
+
 /// `ign eam task new` — compose the definition, run the ladder's
 /// authoritative re-check, POST the array body.
 ///
-/// Composition: `{name, config: {profile: {type, scheduleMode,
-/// targetGateways: [--target...], ...--setting K=V}}}`; a
-/// `--definition` file's top-level object deep-merges over the
-/// composed `profile` (the typed/array settings path — mutually
-/// exclusive with `--setting` at clap). The refusal ladder runs
-/// AGAIN here (main.rs already guarded by verdict; the re-check
-/// keeps the pure fn authoritative in core — the double-check is
-/// cheap).
+/// Composition (the live 8.3.3 `config.settings` shape — see
+/// [`compose_task_definition`]): `{name, config: {profile: {type,
+/// scheduleMode}, settings: {targetGateways, targetGroups, ...--setting
+/// K=V}}}`; a `--definition` file's top-level object deep-merges over
+/// the composed SETTINGS (the typed/array path — mutually exclusive
+/// with `--setting` at clap). The refusal ladder runs AGAIN here
+/// (main.rs already guarded by verdict; the re-check keeps the pure fn
+/// authoritative in core — the double-check is cheap).
 pub async fn eam_task_create(
     api: &dyn GatewayApi,
     name: &str,
@@ -197,40 +258,14 @@ pub async fn eam_task_create(
         });
     }
 
-    // Compose profile: type + scheduleMode + targetGateways + the
-    // K=V settings (auto-typed), then the --definition overlay.
-    let mut profile = Map::new();
-    profile.insert("type".to_string(), Value::String(task_type.to_string()));
-    profile.insert(
-        "scheduleMode".to_string(),
-        Value::String(schedule_mode.to_string()),
-    );
-    profile.insert(
-        "targetGateways".to_string(),
-        Value::Array(targets.iter().map(|t| Value::String(t.clone())).collect()),
-    );
-    for raw in settings {
-        let (key, value) = parse_setting(raw)?;
-        profile.insert(key, value);
-    }
-    if let Some(overlay) = definition {
-        let Value::Object(profile_value) = Value::Object(profile) else {
-            unreachable!("profile is an object by construction")
-        };
-        let mut merged = Value::Object(profile_value);
-        deep_merge(&mut merged, overlay);
-        profile = match merged {
-            Value::Object(map) => map,
-            _ => unreachable!("deep merge of objects stays an object"),
-        };
-    }
-
-    // The full definition record (the wire shape the find read-back
-    // answers; config wraps the profile).
-    let composed = serde_json::json!({
-        "name": name,
-        "config": {"profile": Value::Object(profile)},
-    });
+    let composed = compose_task_definition(
+        name,
+        task_type,
+        targets,
+        settings,
+        definition,
+        schedule_mode,
+    )?;
     api.eam_task_create(&composed).await?;
     Ok(EamTaskCreateResult {
         name: name.to_string(),
@@ -391,8 +426,8 @@ fn summary_from(record: &EamTaskRecord) -> EamTaskSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        EamTaskRecord, TaskCreateVerdict, auto_type, deep_merge, parse_setting, summary_from,
-        task_create_guard,
+        EamTaskRecord, TaskCreateVerdict, auto_type, compose_task_definition, deep_merge,
+        parse_setting, summary_from, task_create_guard,
     };
 
     /// The ladder EXHAUSTIVELY over the openapi taxonomy's 11 types
@@ -543,6 +578,91 @@ mod tests {
                 "forceBackups": true,
                 "settingsNested": {"a": 1, "b": {"x": 1, "y": 2}}
             })
+        );
+    }
+
+    /// The composition pins (07-05 gap 3 — the live `config.settings`
+    /// shape): profile carries type/scheduleMode ONLY; settings owns
+    /// targetGateways/targetGroups + the K=V scalars; a bare create
+    /// (no --target) defaults to the controller itself.
+    #[test]
+    fn composition_splits_profile_and_settings_the_live_shape() {
+        // Bare create: targetGateways defaults to ["_controller"]
+        // (the live-captured zero-config default on a
+        // controller-mode gateway).
+        let bare =
+            compose_task_definition("uat-backup-demo", "eam_backup", &[], &[], None, "OnDemand")
+                .expect("bare composition");
+        assert_eq!(bare["name"], serde_json::json!("uat-backup-demo"));
+        assert_eq!(
+            bare["config"]["profile"],
+            serde_json::json!({"type": "eam_backup", "scheduleMode": "OnDemand"}),
+            "profile carries type + scheduleMode ONLY (isSuspended is server-owned)"
+        );
+        assert_eq!(
+            bare["config"]["settings"],
+            serde_json::json!({"targetGateways": ["_controller"], "targetGroups": []})
+        );
+
+        // Explicit --target values replace the default wholesale.
+        let targeted = compose_task_definition(
+            "nightly-backup",
+            "eam_backup",
+            &["gw-a".to_string()],
+            &[
+                "concurrentBackups=2".to_string(),
+                "forceBackups=true".to_string(),
+            ],
+            None,
+            "OnDemand",
+        )
+        .expect("targeted composition");
+        assert_eq!(
+            targeted["config"]["settings"]["targetGateways"],
+            serde_json::json!(["gw-a"])
+        );
+        assert_eq!(
+            targeted["config"]["settings"]["concurrentBackups"],
+            serde_json::json!(2),
+            "K=V lands in config.SETTINGS"
+        );
+        assert!(
+            targeted["config"]["profile"]
+                .get("concurrentBackups")
+                .is_none(),
+            "profile carries NO settings keys"
+        );
+        assert!(
+            targeted["config"]["profile"]
+                .get("targetGateways")
+                .is_none(),
+            "targetGateways lives in settings, not profile"
+        );
+
+        // The --definition overlay deep-merges over the composed
+        // SETTINGS object (arrays/scalars replace, objects merge).
+        let overlayed = compose_task_definition(
+            "t3",
+            "eam_backup",
+            &["gw-a".to_string()],
+            &[],
+            Some(&serde_json::json!({
+                "targetGateways": ["gw-b", "gw-c"],
+                "concurrentBackups": 5
+            })),
+            "OnDemand",
+        )
+        .expect("overlay composition");
+        assert_eq!(
+            overlayed["config"]["settings"]["targetGateways"],
+            serde_json::json!(["gw-b", "gw-c"]),
+            "the overlay's array REPLACES the composed default"
+        );
+        assert_eq!(overlayed["config"]["settings"]["concurrentBackups"], 5);
+        assert_eq!(
+            overlayed["config"]["settings"]["targetGroups"],
+            serde_json::json!([]),
+            "composed keys the overlay omits survive the merge"
         );
     }
 
