@@ -993,10 +993,23 @@ pub enum EamTaskCommand {
     /// Create a task definition (scheduleMode defaults to OnDemand —
     /// never auto-fires)
     New {
-        /// Task definition name
+        /// Task definition name (any resource name — e.g. nightly-backup)
         name: String,
-        /// Task type (the openapi taxonomy: eam_backup, eam_restart,
-        /// eam_sendProject, … — restore/install/upgrade refuse)
+        /// Task type — the openapi taxonomy, three classes with different guard consequences:
+        ///
+        /// - benign (no --yes with the default OnDemand schedule): eam_backup
+        ///
+        /// - mutating (need --yes — they act on their agent targets when dispatched):
+        ///   eam_restart, eam_sendProject, eam_sendResource, eam_sendTags,
+        ///   eam_activateLicense, eam_updateLicense, eam_unactivateLicense
+        ///
+        /// - refused (exit 6 eam_task_type_refused — fleet-destructive; run from the EAM console):
+        ///   eam_restoreBackup, eam_installModules, eam_remoteUpgrade
+        ///
+        /// Any OTHER type fails safe to the --yes rung (unknown future
+        /// types stay accepted, never silently unguarded).
+        ///
+        /// Example: ign eam task new nightly-backup eam_backup --target gw-a
         r#type: String,
         /// Target gateway name (repeatable; the GNET agent id)
         #[arg(long, value_name = "NAME")]
@@ -1007,7 +1020,7 @@ pub enum EamTaskCommand {
         #[arg(long, value_name = "K=V")]
         setting: Vec<String>,
         /// Full-JSON settings file deep-merged over the composed
-        /// profile (the typed/array settings path)
+        /// `config.settings` (the typed/array settings path)
         #[arg(long, value_name = "PATH", conflicts_with = "setting")]
         definition: Option<PathBuf>,
         /// Schedule mode (default OnDemand — never auto-fires;
