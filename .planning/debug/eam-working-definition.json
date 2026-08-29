@@ -1,0 +1,51 @@
+{
+  "type": "com.inductiveautomation.eam/eam-tasks",
+  "name": "cli-research-backup",
+  "description": "phase7 research",
+  "enabled": true,
+  "version": 1,
+  "collection": "core",
+  "collections": [
+    "core"
+  ],
+  "signature": "f8a16bd1f40ee835e7bcfb015b10d449a6d28db8db4eeccdf2f89a3b031a4d72",
+  "config": {
+    "profile": {
+      "type": "eam_backup",
+      "isSuspended": false,
+      "scheduleMode": "OnDemand"
+    },
+    "settings": {
+      "targetGateways": [
+        "_controller"
+      ],
+      "targetGroups": [],
+      "concurrentBackups": 0,
+      "forceBackups": false
+    }
+  },
+  "data": [
+    "config.json"
+  ],
+  "attributes": {
+    "uuid": "9a8637ef-6ff3-4af2-a2ba-57a9dc18fac1",
+    "enabled": true
+  },
+  "metrics": {},
+  "healthchecks": {
+    "scheduledTaskState": {
+      "name": "eam.tasks.scheduled.health.cli-research-backup",
+      "result": {
+        "healthy": false,
+        "time": 1788016112915,
+        "details": {
+          "repeats": false,
+          "nextScheduled": "N/A",
+          "currentState": "Errored",
+          "erroredServers": "_controller",
+          "owner": "eam"
+        }
+      }
+    }
+  }
+}
