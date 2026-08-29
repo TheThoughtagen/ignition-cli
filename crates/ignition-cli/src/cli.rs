@@ -499,7 +499,8 @@ pub enum TagsCommand {
 
     /// Browse tags as a tree (Property children filtered by
     /// default) — providers appear at the root; needs the deployed
-    /// routes (`ign webdev deploy`)
+    /// routes (`ign webdev deploy`) — or run fully OFFLINE against
+    /// an export via --from-export
     Browse {
         /// Tag path to browse from (default: the root — providers)
         path: Option<String>,
@@ -512,6 +513,13 @@ pub enum TagsCommand {
         /// Project holding the deployed routes (default ign-cli)
         #[arg(long, default_value = "ign-cli", value_name = "NAME")]
         project: String,
+        /// Browse an OFFLINE tag export instead of the gateway (no
+        /// profile, no credential, no routes): the CLI's own `tags
+        /// export` JSON, a legacy `<provider>.json` whole tree, or a
+        /// git-module tags/ directory — mutually exclusive with the
+        /// positional browse path
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["path"])]
+        from_export: Option<PathBuf>,
     },
     /// Read one or more tag values (quality and timestamp included)
     /// — needs the deployed routes

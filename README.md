@@ -149,6 +149,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign tags provider create <NAME>` | Create a STANDARD tag provider | MVP creates the fixed STANDARD shape only (`{profile:{type:"STANDARD"}, settings:{}}` — the live-proven array-body POST); DB-backed providers are out of scope; audit-logged server-side |
 | `ign tags provider delete <NAME>` | Delete a tag provider (find → signature → delete chain) | **destructive**: exit 2 (`confirmation_required`) without `--yes` — the guard fires before ANY resolution (zero network work); a nonexistent provider exits 6 (`provider_not_found`, hint names `ign tags provider list`); the delete embeds the record's server signature on the path; audit-logged server-side |
 | `ign tags browse [PATH] [--filter SUBSTR] [--include-properties] [--project NAME]` | Browse tags as a tree — providers at the root, folders/tags nested | needs the deployed routes (see the version-negotiation matrix above — refuses exit 6 pre-deploy); **Property children are filtered out by default** (`--include-properties` keeps them — the display default); `--filter` is a case-insensitive substring on name and full path; human mode renders the indented tree with tagType badges, JSON is the flat `{path, name, tag_type, has_children, data_type}[]` (nesting derivable from `path`) |
+| `ign tags browse --from-export PATH [--filter SUBSTR] [--include-properties]` | Browse a tag export OFFLINE — no gateway, no credential, no deployed routes (`profile: null`; the positional browse path and this flag are mutually exclusive) | THREE layouts accepted: the CLI's own `tags export` JSON (the interchange file — provider = file stem), a legacy `<provider>.json` whole tree, or a **git-module directory** (a `tags/` root, or the dir itself when it holds provider folders/`.json` files) — per provider: individual `.json`-per-leaf files (folders = directories, `_types_/*.json` = UDT definitions, names decoded from `%XX`-encoded filenames, dot-entries skipped, `System` excluded, `.tag-config.json` ignored) OR the legacy single-file tree; the output reuses the SAME tree render + flat JSON row shape as the live browse; a nonexistent path or unparseable JSON exits 2 `invalid_input` (zero network) |
 | `ign tags read <PATH>... [--project NAME]` | Read one or more tag values — `path  =  value  [quality]  timestamp` | needs the deployed routes; always batch on the wire (a single path is a one-element batch); rows pass through VERBATIM — quality strings carry their own detail (`Good`, `Bad_NotFound`, …) and are never parsed further: a missing tag is DATA (exit 0, quality `Bad_NotFound`), not an error |
 | `ign tags write <PATH> --value V [--project NAME]` | Write a value to a tag — returns the post-write quality | needs the deployed routes; **the write-scalar-is-JSON rule**: `--value` parses as a JSON scalar (`42`, `1.5`, `true`, `null`, `"quoted"`); text that does not parse is sent as the bare string (`--value hello` is the string `hello`); arrays/objects refuse exit 2 (`invalid_input`) before any network I/O — the tag value wire slot is a scalar; a nonexistent target writes back a `Bad…` quality (quality is data) |
 | `ign tags config get <PATH> [--project NAME]` | A tag's configuration as (pretty) JSON — the surgical edit loop's read half | needs the deployed routes; the gateway hands `value`/`defaultValue` back as STRINGIFIED JSON — the CLI re-parses them into real JSON objects/arrays so agents see structured data, not JSON-in-a-string (unparseable and scalar-parse strings stay strings); JSON data carries `{project, path, tag_type, config}`; a missing tag exits 6 (`not_found` — the route's own denial) |
@@ -976,6 +977,40 @@ the abort pre-check and the `imported` count therefore key on the
 EFFECTIVE top-level names, and the structural `_types_` folder
 (present on every provider; the server's own abort policy accepts
 configuring it) never counts as a collision.
+
+### Browsing tag exports offline (`--from-export`)
+
+`ign tags browse --from-export <PATH>` reads a tag export WITHOUT a
+gateway — no profile resolution, no credential, no deployed routes
+(the envelope carries `profile: null`; the positional browse path
+and the flag are mutually exclusive). Three layouts are accepted:
+
+1. **The CLI's own export** — the JSON file `ign tags export -o`
+   writes (the list-of-subtrees interchange). The provider is the
+   file stem (`default.json` → `[default]…` rows).
+2. **A legacy whole-tree file** — a `<provider>.json` carrying the
+   entire provider (the pre-individual-file git-module format).
+   Provider = file stem.
+3. **A git-module directory** — the layout
+   [ignition-git-module](https://github.com/TheThoughtagen/ignition-git-module)
+   checks in: a `tags/` root (or the directory itself when it
+   directly holds provider folders/`.json` files), one folder or
+   legacy `<provider>.json` per provider. In the individual-file
+   format, folders are DIRECTORIES, each leaf tag is one `.json`
+   (the tag's `name` field is stripped — the filename is the name,
+   `%XX`-decoded for reserved characters), and `_types_/*.json` at
+   the provider root are the UDT definitions. Dot-entries skip (the
+   module's own rule), `.tag-config.json` is config (not a provider),
+   and the `System` provider is always excluded.
+
+The rows ride the SAME renderer and flat JSON shape as the live
+browse (`{path, name, tag_type, has_children, data_type}` with
+bracketed fullPaths) — `--filter` applies client-side. Offline
+errors (missing path, unparseable JSON) exit 2 `invalid_input`
+before any network. The natural pipe: browse an export from one
+gateway's git module, then promote it with
+`ign tags import --provider <prov> --file <interchange>` (or the
+README's cross-profile pipe).
 
 ### Alarms and tag history
 

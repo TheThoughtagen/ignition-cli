@@ -348,6 +348,380 @@ pub async fn tags_read(
     })
 }
 
+// ---- offline export browsing (07-04, INTR-03) ------------------------------
+//
+// `tags browse --from-export <PATH>` parses a tag export OFFLINE —
+// no gateway, no route precondition, no credential (the docker-verb
+// precedent for non-gateway commands). THREE layouts accepted
+// (07-RESEARCH Focus 6, source-read from ignition-git-module's
+// GitTagManager.java):
+//
+// 1. a DIRECTORY in the git-module layout — a `tags/` root (or the
+//    dir itself when it directly holds provider folders/`.json`
+//    files), one provider per subfolder in EITHER on-disk format:
+//    individual files (one `.json` per leaf tag in a mirroring
+//    hierarchy, folders = directories, `_types_/*.json` = UDT
+//    definitions, the tag `name` field STRIPPED — derived from the
+//    filename) or the legacy single-file `<provider>.json` (whole
+//    tree). Dot-entries skip (the module's own rule);
+//    `.tag-config.json` is config, not a provider; the `System`
+//    provider is excluded (`.tag-config.json` semantics).
+// 2. a FILE holding the CLI's own `tags export` interchange (the
+//    normalized list-of-subtrees array).
+// 3. a FILE holding a legacy `<provider>.json` whole tree — the
+//    provider is the file stem.
+//
+// Rows emit the EXISTING [`BrowseRow`] shape (bracketed fullPath)
+// so the CLI's tree renderer and flat JSON render ride verbatim —
+// zero render changes.
+
+/// `ign tags browse --from-export` result — the offline contract:
+/// `source: "export"` + the origin path + the (filtered) rows.
+#[derive(Debug, Serialize)]
+pub struct TagBrowseFromExportResult {
+    /// Always `"export"` — the offline provenance.
+    pub source: &'static str,
+    /// The path browsed.
+    pub origin: String,
+    /// The filtered rows (flat agent shape; the tree renders from
+    /// path nesting).
+    pub entries: Vec<BrowseRow>,
+}
+
+/// The row-level twin of [`filter_entries`]: Property children drop
+/// unless included, then the case-insensitive substring on
+/// name+path. Pure — the offline rows pass through the SAME display
+/// rules the live browse applies.
+fn filter_rows(
+    rows: Vec<BrowseRow>,
+    filter: Option<&str>,
+    include_properties: bool,
+) -> Vec<BrowseRow> {
+    rows.into_iter()
+        .filter(|row| include_properties || row.tag_type != "Property")
+        .filter(|row| {
+            let Some(needle) = filter else {
+                return true;
+            };
+            let needle = needle.to_lowercase();
+            row.name.to_lowercase().contains(&needle) || row.path.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// Decode a git-module filesystem name: `%XX` hex escapes for the
+/// reserved set (`<>:"/\|?*`), control chars, and `%` itself
+/// (round-trips on every OS). Invalid escapes ride verbatim.
+fn decode_fs_name(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &raw[i + 1..i + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The per-provider ROOT row: `[provider]` (the live browse's
+/// provider shape).
+fn provider_root_row(provider: &str) -> BrowseRow {
+    BrowseRow {
+        path: format!("[{provider}]"),
+        name: provider.to_string(),
+        tag_type: "Provider".to_string(),
+        has_children: true,
+        data_type: None,
+    }
+}
+
+/// Walk one export SUBTREE into rows under `parent` (the 05-06
+/// rule: an empty-named / Provider-typed wrapper lands its CHILDREN
+/// at the current level — no row for the wrapper itself). A tag's
+/// `tagType` rides verbatim when present; a subtree without one
+/// infers Folder (has `tags`) vs AtomicTag.
+fn walk_subtree(
+    provider: &str,
+    parent: &str,
+    subtree: &serde_json::Value,
+    rows: &mut Vec<BrowseRow>,
+) {
+    let Some(object) = subtree.as_object() else {
+        return;
+    };
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let tag_type = object
+        .get("tagType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let children = object.get("tags").and_then(serde_json::Value::as_array);
+    if tag_type == "Provider" || name.is_empty() {
+        // The provider-shaped wrapper: children land at the current
+        // level (live-proven 05-06 — the effective-top-level rule).
+        if let Some(kids) = children {
+            for child in kids {
+                walk_subtree(provider, parent, child, rows);
+            }
+        }
+        return;
+    }
+    let path = if parent.is_empty() {
+        format!("[{provider}]{name}")
+    } else {
+        format!("{parent}/{name}")
+    };
+    let has_children = children.is_some_and(|kids| !kids.is_empty());
+    let tag_type = if tag_type.is_empty() {
+        if has_children { "Folder" } else { "AtomicTag" }
+    } else {
+        tag_type
+    };
+    rows.push(BrowseRow {
+        path: path.clone(),
+        name: name.to_string(),
+        tag_type: tag_type.to_string(),
+        has_children,
+        data_type: object
+            .get("dataType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    });
+    if let Some(kids) = children {
+        for child in kids {
+            walk_subtree(provider, &path, child, rows);
+        }
+    }
+}
+
+/// Walk a provider FOLDER in the git-module individual-file layout:
+/// directories are folders, `.json` files are leaf tags (name from
+/// the DECODED filename — the format strips the `name` field),
+/// `_types_/` holds UDT definitions at the provider root (a missing
+/// `tagType` defaults UdtType there, AtomicTag elsewhere).
+fn walk_provider_dir(
+    provider: &str,
+    dir: &std::path::Path,
+    parent: &str,
+    rows: &mut Vec<BrowseRow>,
+) -> Result<(), CoreError> {
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .map_err(|err| CoreError::InvalidInput {
+            reason: format!("cannot walk {}: {err}", dir.display()),
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(|err| CoreError::InvalidInput {
+            reason: format!("cannot walk {}: {err}", dir.display()),
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let is_types_folder = dir.file_name().is_some_and(|name| name == "_types_");
+    // The child path under an EMPTY parent rides directly after the
+    // provider bracket (`[prov]tag` — the bracket-join convention
+    // browse_depth renders); deeper levels join with `/`.
+    let child_path = |decoded: &str| {
+        if parent.is_empty() {
+            format!("[{provider}]{decoded}")
+        } else {
+            format!("{parent}/{decoded}")
+        }
+    };
+    for entry in entries {
+        let raw_name = entry.file_name();
+        let name = raw_name.to_string_lossy();
+        if name.starts_with('.') {
+            continue; // dot-entries skip (the module's own rule)
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let decoded = decode_fs_name(&name);
+            let child = child_path(&decoded);
+            rows.push(BrowseRow {
+                path: child.clone(),
+                name: decoded,
+                tag_type: "Folder".to_string(),
+                has_children: true,
+                data_type: None,
+            });
+            walk_provider_dir(provider, &path, &child, rows)?;
+        } else if let Some(stem) = name.strip_suffix(".json") {
+            // A leaf tag file: tagType from the JSON (the native
+            // TAG_GSON deterministic copy), name from the filename.
+            let json: serde_json::Value = std::fs::read(&path)
+                .map_err(|err| CoreError::InvalidInput {
+                    reason: format!("cannot read {}: {err}", path.display()),
+                })
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes).map_err(|err| CoreError::InvalidInput {
+                        reason: format!("{} is not valid JSON: {err}", path.display()),
+                    })
+                })?;
+            let decoded = decode_fs_name(stem);
+            let default_type = if is_types_folder {
+                "UdtType"
+            } else {
+                "AtomicTag"
+            };
+            rows.push(BrowseRow {
+                path: child_path(&decoded),
+                name: decoded,
+                tag_type: json
+                    .get("tagType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(default_type)
+                    .to_string(),
+                has_children: json
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|kids| !kids.is_empty()),
+                data_type: json
+                    .get("dataType")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+        // Non-.json files skip (binary payloads the module keeps
+        // aside); folders under a leaf-name dir recurse above.
+    }
+    Ok(())
+}
+
+/// `ign tags browse --from-export PATH` — the OFFLINE parse (no
+/// [`GatewayApi`], no route precondition, no credential): a
+/// directory (the git-module layout — a `tags/` root, or the dir
+/// itself when it directly holds provider folders/`.json` files) or
+/// a file (the CLI's own export interchange, or a legacy
+/// `<provider>.json` whole tree — provider = file stem). A
+/// nonexistent path or unparseable JSON is usage-class (exit 2).
+pub fn browse_rows_from_export(
+    path: &std::path::Path,
+    include_properties: bool,
+    filter: Option<&str>,
+) -> Result<TagBrowseFromExportResult, CoreError> {
+    let invalid = |reason: String| CoreError::InvalidInput { reason };
+    let meta = std::fs::metadata(path)
+        .map_err(|err| invalid(format!("cannot read {}: {err}", path.display())))?;
+    let mut rows: Vec<BrowseRow> = Vec::new();
+    if meta.is_dir() {
+        // The git-module root: <project>/tags/ when present, else the
+        // dir itself IF it directly holds provider dirs/.json files.
+        let tags_root = path.join("tags");
+        let has_tags_root = tags_root.is_dir();
+        let base = if has_tags_root {
+            tags_root
+        } else {
+            path.to_path_buf()
+        };
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&base)
+            .map_err(|err| invalid(format!("cannot walk {}: {err}", base.display())))?
+            .collect::<Result<_, _>>()
+            .map_err(|err| invalid(format!("cannot walk {}: {err}", base.display())))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let providers: Vec<std::fs::DirEntry> = entries
+            .into_iter()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || name == ".tag-config.json" {
+                    return false; // config + dot-entries skip
+                }
+                entry.path().is_dir() || name.ends_with(".json")
+            })
+            .collect();
+        if providers.is_empty() {
+            return Err(invalid(format!(
+                "{} is not a tag export layout (no provider folders or .json \
+                 files under it{})",
+                path.display(),
+                if has_tags_root { "/tags" } else { "" }
+            )));
+        }
+        for entry in providers {
+            let provider_name = entry.file_name().to_string_lossy().into_owned();
+            let provider_path = entry.path();
+            if provider_path.is_dir() {
+                // `System` is always excluded (`.tag-config.json`
+                // semantics — managed provider, README notes).
+                if provider_name == "System" {
+                    continue;
+                }
+                rows.push(provider_root_row(&provider_name));
+                walk_provider_dir(&provider_name, &provider_path, "", &mut rows)?;
+            } else {
+                // A legacy single-file provider tree at the root
+                // level: `<provider>.json`.
+                let stem = provider_name
+                    .strip_suffix(".json")
+                    .unwrap_or(&provider_name)
+                    .to_string();
+                let bytes = std::fs::read(&provider_path).map_err(|err| {
+                    invalid(format!("cannot read {}: {err}", provider_path.display()))
+                })?;
+                let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+                    invalid(format!(
+                        "{} is not valid JSON: {err}",
+                        provider_path.display()
+                    ))
+                })?;
+                rows.push(provider_root_row(&stem));
+                match &json {
+                    serde_json::Value::Array(subtrees) => {
+                        for subtree in subtrees {
+                            walk_subtree(&stem, "", subtree, &mut rows);
+                        }
+                    }
+                    other => walk_subtree(&stem, "", other, &mut rows),
+                }
+            }
+        }
+    } else {
+        // A FILE: the CLI's own interchange (array of subtrees) or a
+        // legacy whole tree — provider = file stem.
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tags".to_string());
+        let bytes = std::fs::read(path)
+            .map_err(|err| invalid(format!("cannot read {}: {err}", path.display())))?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| invalid(format!("{} is not valid JSON: {err}", path.display())))?;
+        match &json {
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                rows.push(provider_root_row(&stem));
+                let subtrees: Vec<&serde_json::Value> = match &json {
+                    serde_json::Value::Array(items) => items.iter().collect(),
+                    serde_json::Value::Object(_) => vec![&json],
+                    _ => unreachable!("the outer match bounded the shape"),
+                };
+                for subtree in subtrees {
+                    walk_subtree(&stem, "", subtree, &mut rows);
+                }
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "{} is not a tag export (expected an array of tag \
+                     subtrees or a provider tree object)",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(TagBrowseFromExportResult {
+        source: "export",
+        origin: path.display().to_string(),
+        entries: filter_rows(rows, filter, include_properties),
+    })
+}
+
 /// `ign tags write PATH --value V` — route action `write`; the value
 /// is a JSON scalar the CLI passes through untyped (the
 /// write-scalar-is-JSON rule, README-documented).
@@ -3251,5 +3625,188 @@ mod tests {
             assert_eq!(err.code(), "invalid_input", "{bad}: {err}");
             assert_eq!(err.exit_code(), 2);
         }
+    }
+
+    // ---- offline export browsing (07-04, INTR-03) ----
+
+    use super::{browse_rows_from_export, decode_fs_name};
+
+    /// The git-module fs-name encoding round-trips the reserved set;
+    /// invalid escapes ride verbatim.
+    #[test]
+    fn fs_name_decoding() {
+        assert_eq!(
+            decode_fs_name("Tag%2F1"),
+            "Tag/1",
+            "%2F is the encoded slash"
+        );
+        assert_eq!(decode_fs_name("a%3Ab.json"), "a:b.json", "%3A is the colon");
+        assert_eq!(
+            decode_fs_name("100%25"),
+            "100%",
+            "%25 is the escaped percent"
+        );
+        assert_eq!(decode_fs_name("plain_name"), "plain_name", "plain rides");
+        assert_eq!(
+            decode_fs_name("bad%zz"),
+            "bad%zz",
+            "invalid escapes ride verbatim"
+        );
+        assert_eq!(
+            decode_fs_name("trail%2"),
+            "trail%2",
+            "truncated escapes ride verbatim"
+        );
+    }
+
+    /// (a) THE git-module individual-file layout: provider folders,
+    /// mirroring directory hierarchy, `_types_/` definitions at the
+    /// provider root, an encoded filename, a dot-entry, and
+    /// `.tag-config.json` + `System` excluded. Detected via the
+    /// project's `tags/` root AND directly (dir itself = providers
+    /// parent).
+    #[test]
+    fn from_export_walks_the_git_module_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tags = dir.path().join("tags");
+        let prov = tags.join("default");
+        std::fs::create_dir_all(prov.join("Area1")).expect("dirs");
+        std::fs::create_dir_all(prov.join("_types_")).expect("types dir");
+        // The per-project config + a dot-entry + System provider (all
+        // skipped).
+        std::fs::write(tags.join(".tag-config.json"), b"{}").expect("config");
+        std::fs::write(prov.join(".gitkeep"), b"").expect("dot entry");
+        std::fs::create_dir_all(tags.join("System")).expect("system dir");
+        std::fs::write(tags.join("System").join("x.json"), b"{}").expect("system tag");
+        // Leaf tags: name field STRIPPED in this format — the filename
+        // is the name.
+        std::fs::write(
+            prov.join("T1.json"),
+            br#"{"tagType":"AtomicTag","value":{"value":4}}"#,
+        )
+        .expect("t1");
+        std::fs::write(prov.join("Tag%2F1.json"), br#"{"tagType":"AtomicTag"}"#)
+            .expect("encoded name");
+        std::fs::write(
+            prov.join("Area1").join("Deep.json"),
+            br#"{"tagType":"AtomicTag"}"#,
+        )
+        .expect("deep");
+        std::fs::write(prov.join("_types_").join("Motor.json"), br#"{"tags":[]}"#).expect("udt");
+
+        for base in [dir.path(), tags.as_path()] {
+            let result = browse_rows_from_export(base, true, None).expect("the layout walks");
+            assert_eq!(result.source, "export");
+            let paths: Vec<&str> = result.entries.iter().map(|r| r.path.as_str()).collect();
+            // Deterministic DFS in name-sorted order (ASCII: Area1 <
+            // T1 < Tag%2F1 < _types_ — capital letters sort before
+            // the underscore).
+            assert_eq!(
+                paths,
+                vec![
+                    "[default]",
+                    "[default]Area1",
+                    "[default]Area1/Deep",
+                    "[default]T1",
+                    "[default]Tag/1",
+                    "[default]_types_",
+                    "[default]_types_/Motor",
+                ],
+                "sorted walk; _types_/encoded/dot/System handled ({:?})",
+                result.entries
+            );
+            let types_def = &result.entries[6];
+            assert_eq!(types_def.tag_type, "UdtType", "the _types_ default");
+            assert!(!types_def.has_children, "empty tags array = no children");
+            let folder = &result.entries[1];
+            assert_eq!(folder.tag_type, "Folder");
+            assert!(folder.has_children);
+        }
+    }
+
+    /// (b) The legacy single-file layout: `<provider>.json` carrying
+    /// the whole tree (Provider-typed wrapper swallows; children at
+    /// the stem's root).
+    #[test]
+    fn from_export_walks_the_legacy_single_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tags = dir.path().join("tags");
+        std::fs::create_dir_all(&tags).expect("tags dir");
+        std::fs::write(
+            tags.join("default.json"),
+            br#"{"name":"default","tagType":"Provider","tags":[
+                {"name":"T1","tagType":"AtomicTag","dataType":"Int4"},
+                {"name":"Folder1","tagType":"Folder","tags":[
+                    {"name":"Inner","tagType":"AtomicTag"}
+                ]}
+            ]}"#,
+        )
+        .expect("legacy tree");
+
+        let result = browse_rows_from_export(dir.path(), true, None).expect("walks");
+        let paths: Vec<&str> = result.entries.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "[default]",
+                "[default]T1",
+                "[default]Folder1",
+                "[default]Folder1/Inner",
+            ]
+        );
+        assert_eq!(result.entries[1].data_type.as_deref(), Some("Int4"));
+    }
+
+    /// (c) The CLI's own interchange (a list of subtrees — what
+    /// `tags export -o FILE` writes) browsed from the FILE; (d) the
+    /// filter applies client-side; the provider-shaped wrapper lands
+    /// its children at the stem's root.
+    #[test]
+    fn from_export_walks_the_cli_interchange_file_and_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("default.json");
+        std::fs::write(
+            &file,
+            br#"[{"name":"","tagType":"Provider","tags":[
+                {"name":"T1","tagType":"AtomicTag"},
+                {"name":"Pump","tagType":"AtomicTag"}
+            ]}]"#,
+        )
+        .expect("interchange");
+
+        let result = browse_rows_from_export(&file, true, None).expect("walks");
+        let paths: Vec<&str> = result.entries.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["[default]", "[default]T1", "[default]Pump"]);
+
+        // (d) the filter: substring on name+path.
+        let filtered = browse_rows_from_export(&file, true, Some("pump"))
+            .expect("walks")
+            .entries;
+        assert_eq!(
+            filtered.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["[default]Pump"]
+        );
+    }
+
+    /// Nonexistent path / unparseable JSON / a non-export layout are
+    /// usage-class refusals (exit 2, offline errors lead).
+    #[test]
+    fn from_export_error_shapes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = browse_rows_from_export(&dir.path().join("nope"), true, None)
+            .expect_err("missing path refuses");
+        assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+        assert_eq!(err.exit_code(), 2);
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, b"<<<not json>>>").expect("write");
+        let err = browse_rows_from_export(&bad, true, None).expect_err("bad json refuses");
+        assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+
+        // A directory with NO provider content is not an export layout.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let err = browse_rows_from_export(empty.path(), true, None).expect_err("empty dir refuses");
+        assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("not a tag export layout"), "{err}");
     }
 }

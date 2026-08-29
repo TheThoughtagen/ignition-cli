@@ -1816,3 +1816,213 @@ async fn tags_time_and_username_usage_refusals() {
         "the usage error names the required flag"
     );
 }
+
+// ---- offline export browsing (07-04, INTR-03) ----
+
+/// stdout minus the single trailing newline.
+fn stdout_trimmed(out: &std::process::Output) -> &str {
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8 stdout");
+    stdout.strip_suffix('\n').unwrap_or(stdout)
+}
+
+/// A git-module export tree fixture: provider `default` with a leaf
+/// tag, an encoded filename, a nested folder, `_types_`, plus the
+/// skipped set (`.tag-config.json`, dot-entry, `System/`).
+fn git_module_export(root: &std::path::Path) {
+    let tags = root.join("tags");
+    let prov = tags.join("default");
+    std::fs::create_dir_all(prov.join("Area1")).expect("dirs");
+    std::fs::create_dir_all(prov.join("_types_")).expect("types");
+    std::fs::write(tags.join(".tag-config.json"), b"{}").expect("config");
+    std::fs::write(prov.join(".gitkeep"), b"").expect("dot entry");
+    std::fs::create_dir_all(tags.join("System")).expect("system");
+    std::fs::write(tags.join("System").join("managed.json"), b"{}").expect("managed");
+    std::fs::write(prov.join("T1.json"), br#"{"tagType":"AtomicTag"}"#).expect("t1");
+    std::fs::write(prov.join("Tag%2F1.json"), br#"{"tagType":"AtomicTag"}"#).expect("encoded");
+    std::fs::write(
+        prov.join("Area1").join("Deep.json"),
+        br#"{"tagType":"AtomicTag"}"#,
+    )
+    .expect("deep");
+    std::fs::write(prov.join("_types_").join("Motor.json"), br#"{"tags":[]}"#).expect("udt");
+}
+
+/// (a)+(f) THE offline proof: a git-module tree browses against a
+/// DEAD gateway URL — no HTTP possible, exit 0, the existing tree
+/// render (the flag short-circuits before any resolution).
+#[test]
+fn from_export_git_module_layout_browses_offline() {
+    let export = tempfile::tempdir().expect("export dir");
+    git_module_export(export.path());
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://127.0.0.1:1"); // dead URL: any HTTP exits 4
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "tags",
+            "browse",
+            "--from-export",
+            export.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "offline: no HTTP — stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_trimmed(&out),
+        snapbox::str![[r#"
+browsing export [..]
+default  Provider
+  Area1  Folder
+    Deep  AtomicTag
+  T1  AtomicTag
+    Tag/1  AtomicTag
+  _types_  Folder
+    Motor  UdtType
+"#]],
+    );
+    // NB: `Tag/1` (the DECODED %2F name) renders one depth deeper —
+    // the tree derives nesting from path slashes, and a tag named
+    // with a literal slash genuinely carries one.
+}
+
+/// (e) THE profile-null JSON golden (the offline contract) over the
+/// CLI's own interchange file — the flat agent shape.
+#[test]
+fn from_export_interchange_json_golden_profile_null() {
+    let export = tempfile::tempdir().expect("export dir");
+    let file = export.path().join("default.json");
+    std::fs::write(
+        &file,
+        br#"[{"name":"","tagType":"Provider","tags":[
+            {"name":"T1","tagType":"AtomicTag","dataType":"Int4"},
+            {"name":"Pump","tagType":"AtomicTag"}
+        ]}]"#,
+    )
+    .expect("interchange");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://127.0.0.1:1");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "tags",
+            "browse",
+            "--from-export",
+            file.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_trimmed(&out),
+        snapbox::str![[r#"{"ok":true,"profile":null,"data":{"source":"export","origin":"[..]default.json","entries":[{"path":"[default]","name":"default","tag_type":"Provider","has_children":true,"data_type":null},{"path":"[default]T1","name":"T1","tag_type":"AtomicTag","has_children":false,"data_type":"Int4"},{"path":"[default]Pump","name":"Pump","tag_type":"AtomicTag","has_children":false,"data_type":null}]}}"#]],
+    );
+}
+
+/// (b) The legacy single-file layout (a `<provider>.json` whole tree
+/// under tags/) + (d) the --filter applies client-side.
+#[test]
+fn from_export_legacy_layout_and_filter() {
+    let export = tempfile::tempdir().expect("export dir");
+    let tags = export.path().join("tags");
+    std::fs::create_dir_all(&tags).expect("tags dir");
+    std::fs::write(
+        tags.join("default.json"),
+        br#"{"name":"default","tagType":"Provider","tags":[
+            {"name":"T1","tagType":"AtomicTag"},
+            {"name":"Folder1","tagType":"Folder","tags":[
+                {"name":"Pump","tagType":"AtomicTag"}
+            ]}
+        ]}"#,
+    )
+    .expect("legacy");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://127.0.0.1:1");
+
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "tags",
+            "browse",
+            "--from-export",
+            export.path().to_str().unwrap(),
+            "--filter",
+            "pump",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Filtered rows only; the origin line prints the passed path.
+    let stdout = stdout_trimmed(&out);
+    assert!(
+        stdout.starts_with("browsing export "),
+        "origin header: {stdout}"
+    );
+    assert!(
+        stdout.ends_with("    Pump  AtomicTag"),
+        "the filtered row: {stdout}"
+    );
+    assert!(!stdout.contains("T1"), "non-matching rows drop");
+    assert_eq!(stdout.lines().count(), 2, "header + the one row: {stdout}");
+}
+
+/// The positional browse path and --from-export are mutually
+/// exclusive (clap usage error, exit 2).
+#[test]
+fn from_export_conflicts_with_the_browse_path() {
+    let export = tempfile::tempdir().expect("export dir");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://127.0.0.1:1");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "tags",
+            "browse",
+            "[default]",
+            "--from-export",
+            export.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "clap usage error");
+}
+
+/// A nonexistent path refuses usage-class with profile null (offline
+/// errors lead — zero network).
+#[test]
+fn from_export_missing_path_refuses() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://127.0.0.1:1");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "tags",
+            "browse",
+            "--from-export",
+            "/definitely/not/here",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let start = stderr.find('{').unwrap_or(0);
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr[start..].trim_end_matches('\n'),
+        snapbox::str![[r#"{"ok":false,"profile":null,"error":{"code":"invalid_input","message":"invalid input: cannot read /definitely/not/here: [..]","endpoint":null,"hint":"fix the input source — a readable file path via --file, or `-` to pipe the content on stdin"}}"#]],
+    );
+}

@@ -168,7 +168,9 @@ pub fn routes() -> &'static [CliRoute] {
         // stdout pipe form stays CLI-only, hint-named in the export
         // form). The coverage test walks leaf PATHS only, so no
         // OutOfBand row exists for it — this comment IS the
-        // documentation.
+        // documentation. Same convention, 07-04: `tags browse
+        // --from-export` is a FLAG on the `tags browse` leaf (the
+        // offline form stays CLI-only — no separate row).
         CliRoute {
             path: "tags provider list",
             mapping: Mapping::Screen(Screen::Tags),

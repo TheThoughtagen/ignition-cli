@@ -203,6 +203,9 @@ enum ActionOutput {
     /// `ign tags browse` — the filtered flat entry list (JSON mode;
     /// human renders the tree).
     TagsBrowse(actions::tags::TagsBrowseResult),
+    /// `ign tags browse --from-export` — the OFFLINE rows (the same
+    /// BrowseRow shape; profile null, no gateway).
+    TagsBrowseFromExport(actions::tags::TagBrowseFromExportResult),
     /// `ign tags read` — verbatim per-path rows.
     TagsRead(actions::tags::TagsReadResult),
     /// `ign tags write` — the post-write quality.
@@ -317,6 +320,7 @@ impl ActionOutput {
             ActionOutput::TagProviderCreate(result) => render_success(profile, result, compact),
             ActionOutput::TagProviderDelete(result) => render_success(profile, result, compact),
             ActionOutput::TagsBrowse(result) => render_success(profile, result, compact),
+            ActionOutput::TagsBrowseFromExport(result) => render_success(profile, result, compact),
             ActionOutput::TagsRead(result) => render_success(profile, result, compact),
             ActionOutput::TagsWrite(result) => render_success(profile, result, compact),
             ActionOutput::TagsConfigGet(result) => render_success(profile, result, compact),
@@ -1306,6 +1310,26 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // ack is deliberately NOT guarded (acknowledging never
         // un-acknowledges — a state-advancing read-adjacent verb).
         Commands::Tags(TagsArgs { command }) => {
+            // `--from-export` short-circuits BEFORE profile/secret/
+            // client/route resolution ENTIRELY (07-04, INTR-03) —
+            // offline: no gateway, envelope profile null (the
+            // docker-verb precedent for non-gateway commands). The
+            // render rides the existing browse paths.
+            if let TagsCommand::Browse {
+                from_export: Some(export_path),
+                filter,
+                include_properties,
+                ..
+            } = &command
+            {
+                let result = actions::tags::browse_rows_from_export(
+                    export_path,
+                    *include_properties,
+                    filter.as_deref(),
+                )
+                .map(ActionOutput::TagsBrowseFromExport);
+                return (None, result);
+            }
             let guard_operation = match &command {
                 TagsCommand::Provider(TagsProviderCommand::Delete { .. }) => {
                     Some("tags provider delete")
@@ -1398,6 +1422,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         filter,
                         include_properties,
                         project,
+                        ..
                     },
                     Ok(api),
                 ) => actions::tags::tags_browse(

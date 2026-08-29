@@ -38,9 +38,9 @@ use ignition_core::actions::rig::{
 use ignition_core::actions::script::ScriptRunResult;
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::actions::tags::{
-    TagProvidersResult, TagsAlarmsAckResult, TagsAlarmsActiveResult, TagsAlarmsHistoryResult,
-    TagsBrowseResult, TagsConfigGetResult, TagsExportResult, TagsHistoryQueryResult,
-    TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
+    BrowseRow, TagBrowseFromExportResult, TagProvidersResult, TagsAlarmsAckResult,
+    TagsAlarmsActiveResult, TagsAlarmsHistoryResult, TagsBrowseResult, TagsConfigGetResult,
+    TagsExportResult, TagsHistoryQueryResult, TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
 };
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::client::logs::LogEntry;
@@ -249,6 +249,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
             println!("deleted tag provider {}", result.deleted);
         }
         ActionOutput::TagsBrowse(result) => render_tags_browse_human(result),
+        ActionOutput::TagsBrowseFromExport(result) => render_tags_browse_from_export_human(result),
         ActionOutput::TagsRead(result) => render_tags_read_human(result),
         ActionOutput::TagsWrite(result) => {
             println!("wrote {}  quality: {}", result.path, result.quality);
@@ -1206,7 +1207,21 @@ fn render_tags_browse_human(result: &TagsBrowseResult) {
         Some(filter) => println!("browsing {root} (filter: {filter})"),
         None => println!("browsing {root}"),
     }
-    for entry in &result.entries {
+    print_browse_tree(&result.entries);
+}
+
+/// `ign tags browse --from-export` human mode: the SAME tree over
+/// the offline rows, headed by the export's origin (07-04 — zero
+/// new render surface: the tree loop is the shared helper).
+fn render_tags_browse_from_export_human(result: &TagBrowseFromExportResult) {
+    println!("browsing export {}", result.origin);
+    print_browse_tree(&result.entries);
+}
+
+/// The shared indented-tree loop (browse_depth derives nesting from
+/// the bracketed fullPath).
+fn print_browse_tree(entries: &[BrowseRow]) {
+    for entry in entries {
         let depth = browse_depth(&entry.path);
         let data_type = entry.data_type.as_deref().unwrap_or_default();
         let badge = if data_type.is_empty() {
