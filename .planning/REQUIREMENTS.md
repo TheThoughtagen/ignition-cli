@@ -75,17 +75,17 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Advanced Operations
 
-- [ ] **SYNC-01**: User can diff two gateways' projects at resource level (`ign project diff <profile-a> <profile-b>`)
-- [ ] **SYNC-02**: User can selectively sync resources between gateways (dev→test→prod promotion)
-- [ ] **SCRPT-01**: User can execute gateway scripts via `ign script run` (opt-in, disabled by default)
-- [ ] **BKUP-01**: User can download and restore gateway backups (gwbk) via native API
-- [ ] **BKUP-02**: User can list EAM task history and create EAM tasks (read-heavy; write scope guarded)
+- [x] **SYNC-01**: User can diff two gateways' projects at resource level (`ign project diff <profile-a> <profile-b>`)
+- [x] **SYNC-02**: User can selectively sync resources between gateways (dev→test→prod promotion)
+- [x] **SCRPT-01**: User can execute gateway scripts via `ign script run` (opt-in, disabled by default)
+- [x] **BKUP-01**: User can download and restore gateway backups (gwbk) via native API
+- [x] **BKUP-02**: User can list EAM task history and create EAM tasks (read-heavy; write scope guarded)
 
 ### Ecosystem Interop
 
-- [ ] **INTR-01**: User can export a project with `--decode-scripts` (emit `.py` alongside JSON) and import with `--encode-scripts` for round-trip editing in nvim/VS Code
-- [ ] **INTR-02**: User can run `ign lint` which delegates to ignition-lint on PATH, passing through exit codes and JSON reports (actionable install hint if absent)
-- [ ] **INTR-03**: User can run `ign tag browse --from-export <path>` to browse git-module tag exports offline
+- [x] **INTR-01**: User can export a project with `--decode-scripts` (emit `.py` alongside JSON) and import with `--encode-scripts` for round-trip editing in nvim/VS Code
+- [x] **INTR-02**: User can run `ign lint` which delegates to ignition-lint on PATH, passing through exit codes and JSON reports (actionable install hint if absent)
+- [x] **INTR-03**: User can run `ign tag browse --from-export <path>` to browse git-module tag exports offline
 
 ## v2 Requirements
 
@@ -171,14 +171,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TUI-04 | Phase 6 | Pending |
 | TUI-05 | Phase 6 | Pending |
 | TUI-06 | Phase 6 | Pending |
-| SYNC-01 | Phase 7 | Pending |
-| SYNC-02 | Phase 7 | Pending |
-| SCRPT-01 | Phase 7 | Pending |
-| BKUP-01 | Phase 7 | Pending |
-| BKUP-02 | Phase 7 | Pending |
-| INTR-01 | Phase 7 | Pending |
-| INTR-02 | Phase 7 | Pending |
-| INTR-03 | Phase 7 | Pending |
+| SYNC-01 | Phase 7 | Complete |
+| SYNC-02 | Phase 7 | Complete |
+| SCRPT-01 | Phase 7 | Complete |
+| BKUP-01 | Phase 7 | Complete |
+| BKUP-02 | Phase 7 | Complete |
+| INTR-01 | Phase 7 | Complete |
+| INTR-02 | Phase 7 | Complete |
+| INTR-03 | Phase 7 | Complete |
 
 **Coverage:**
 - v1 requirements: 53 total (previous footer said 46 — corrected 2026-08-21; actual REQ-ID count is 53)

@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 7 COMPLETE (4/4 plans) — 07-04 shipped the interop trio: INTR-01 `scripts_codec` (PURE Flint codec, single-pass decode, tab dedent/reindent, position-tracking scanner + SPAN-LEVEL splice — no preserve_order, no Value re-serialization; `project export --decode-scripts` writes members + `<member>.<n>.py` sidecars + scripts-manifest.json, `import --encode-scripts` splices back; unedited round-trip BYTE-IDENTICAL, contract-pinned); INTR-02 `ign lint` (PATH-discovered ignition-lint delegation, ARG-VECTOR spawn, doctor posture — findings/child_exit_code/report as data, exit 0 when the child ran; `--strict` passes the child's masked code after the envelope renders; absent tool = additive `lint_tool_absent` exit 6; TUI lint row = first clientless worker); INTR-03 `tags browse --from-export` (offline: git-module dirs + legacy single files + the CLI interchange, profile null, dead-URL-proven, existing tree/flat renders reused). 841 tests green workspace-wide, fmt/clippy clean, zero new deps. Next: /gsd-verify-work 7.
+**Current focus:** Phase 7 COMPLETE (4/4 plans) — 07-04 shipped the interop trio: INTR-01 `scripts_codec` (PURE Flint codec, single-pass decode, tab dedent/reindent, position-tracking scanner + SPAN-LEVEL splice — no preserve_order, no Value re-serialization; `project export --decode-scripts` writes members + `<member>.<n>.py` sidecars + scripts-manifest.json, `import --encode-scripts` splices back; unedited round-trip BYTE-IDENTICAL, contract-pinned); INTR-02 `ign lint` (PATH-discovered ignition-lint delegation, ARG-VECTOR spawn, doctor posture — findings/child_exit_code/report as data, exit 0 when the child ran; `--strict` passes the child's masked code after the envelope renders; absent tool = additive `lint_tool_absent` exit 6; TUI lint row = first clientless worker); INTR-03 `tags browse --from-export` (offline: git-module dirs + legacy single files + the CLI interchange, profile null, dead-URL-proven, existing tree/flat renders reused). 841 tests green workspace-wide, fmt/clippy clean, zero new deps. 07-VERIFICATION.md PASSED (8/8 requirements, 19/19 truths, 852 tests re-run during verification, live binary smoke proofs for every guard ladder). Next: /gsd-verify-work 7 (manual UAT) → /gsd-complete-milestone.
 
 ## Current Position
 
 **Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
 **Current Plan:** 4
 **Total Plans in Phase:** 4
-**Status:** Phase complete — ready for verification
+**Status:** Phase complete — verification passed (07-VERIFICATION.md)
 **Last Activity:** 2026-08-29
 
 **Progress:** [██████████] 100%
