@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 7 in progress — 07-03 shipped (`ign script run` (SCRPT-01): three input forms (--code/--file/--file -), the structural secret gate (missing webdev_secret → additive script_exec_not_configured exit 6, zero HTTP, deploy-flag hint), probe+exec sequence over scriptExec, {stdout, result, elapsedMs} all-keys envelope, traceback surfacing, redaction canaries at action+binary level, TUI row fresh in-plan (tui_coverage green), NO --yes by design — the deploy flag IS the opt-in; 808 tests green, fmt/clippy clean, zero new deps). Next: 07-04 (the final plan — delegation bridges).
+**Current focus:** Phase 7 COMPLETE (4/4 plans) — 07-04 shipped the interop trio: INTR-01 `scripts_codec` (PURE Flint codec, single-pass decode, tab dedent/reindent, position-tracking scanner + SPAN-LEVEL splice — no preserve_order, no Value re-serialization; `project export --decode-scripts` writes members + `<member>.<n>.py` sidecars + scripts-manifest.json, `import --encode-scripts` splices back; unedited round-trip BYTE-IDENTICAL, contract-pinned); INTR-02 `ign lint` (PATH-discovered ignition-lint delegation, ARG-VECTOR spawn, doctor posture — findings/child_exit_code/report as data, exit 0 when the child ran; `--strict` passes the child's masked code after the envelope renders; absent tool = additive `lint_tool_absent` exit 6; TUI lint row = first clientless worker); INTR-03 `tags browse --from-export` (offline: git-module dirs + legacy single files + the CLI interchange, profile null, dead-URL-proven, existing tree/flat renders reused). 841 tests green workspace-wide, fmt/clippy clean, zero new deps. Next: /gsd-verify-work 7.
 
 ## Current Position
 
 **Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
 **Current Plan:** 4
 **Total Plans in Phase:** 4
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-08-29
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -64,6 +64,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 07 P01 | 79min | 3 tasks | 14 files |
 | Phase 07 P02 | 133min | 3 tasks | 31 files |
 | Phase 07 P03 | 54min | 2 tasks | 14 files |
+| Phase 07 P04 | 122min | 3 tasks | 18 files |
 
 ## Accumulated Context
 
@@ -197,6 +198,9 @@ Recent decisions affecting current work:
 - [Phase 07-02]: eam task force = find (owner from scheduledTaskState.details.owner, fallback eam) -> 204 force POST -> history re-read (3-request sequence wiremock-pinned); outcomes (Failed + GNET-not-connected / trial-expired) ride as DATA in the result — never hidden, never errors — Research Pitfall 3: execution prerequisites are gateway state, honest data; one extra round trip for owner correctness (the 05-04 precondition precedent)
 - [Phase 07-03]: [Phase 07-03]: ign script run ships UNGATED by design — the opt-in is STRUCTURAL (scriptExec deploys only via ign webdev deploy --with-script-exec; a missing persisted secret = script_exec_not_configured exit 6 with zero HTTP, hint naming the deploy flag verbatim); no clap conflicts_with on --code/--file so read_script_input surfaces the invalid_input envelope (exit 2, profile null) instead of a clap usage render
 - [Phase 07-03]: [Phase 07-03]: script run's precondition is the version action WITH the secret header riding webdev_route_call's existing denial mapping (secret_mismatch → webdev_route_error family, redeploy/--rotate-secret advice already in the hint — no new slug, no version-compare magic); result maps under {stdout, result, elapsedMs} ALL keys always; TUI row is code-only (single Input, stdin refused per the crossterm rule) firing through a worker-side config load (the fire_webdev_status precedent)
+- [Phase 07-04]: [Phase 07-04]: Round-trip script editing LOCKED on span-level raw-byte splicing — scripts_codec is PURE (client/resources discipline), serde_json stays READ-ONLY (no preserve_order feature, no Value re-serialization: key-order stability of existing goldens preserved by construction); sidecar addressing = counter-named <member>.<n>.py siblings + scripts-manifest.json JSON-pointer manifest, exported JSON stays marker-free; acceptance = byte-equality of UNEDITED re-encoded members (contract-pinned incl. hand-edit re-resolution); SCRIPT_KEYS is NINE keys (the dual-ported ignition-nvim source — the plan's [&str;10] was an off-by-one)
+- [Phase 07-04]: [Phase 07-04]: ign lint posture LOCKED — doctor posture default (exit 0 whenever the child RAN; findings + child_exit_code + parsed report ride as data, all keys always) with --strict passing the child's masked (0..127) code LITERALLY, decided in main() AFTER the envelope renders (the one sanctioned success-path EXIT exception); PATH discovery (first executable, no which dep) + tokio ARG-VECTOR spawn (--report-format json --target per path, -- passthrough verbatim); absent tool = additive lint_tool_absent exit 6 with uv/pip install hint; the TUI lint worker is the first CLIENTLESS dashboard worker (local delegation)
+- [Phase 07-04]: [Phase 07-04]: tags browse --from-export is OFFLINE BY CONSTRUCTION — the flag short-circuits before profile/secret/client/route resolution entirely (profile null, dead-URL-proven); three layouts parse (git-module dirs with individual-file format + _types_ + %XX fs-name decoding + System/dot/.tag-config skips, legacy <provider>.json whole trees, the CLI interchange file); provider = file stem for file inputs (the only derivable provenance); rows emit the EXISTING BrowseRow shape so tree + flat JSON renders ride verbatim; NO new TUI leaf (the flag-exception convention, noted beside the tags export -o - comment)
 
 ### Pending Todos
 
@@ -213,6 +217,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-29T03:10:38.456Z
-**Stopped At:** Completed 07-03-PLAN.md — ign script run shipped (SCRPT-01: three input forms, structural secret gate, {stdout, result, elapsedMs}, TUI row fresh, 808 tests green, fmt/clippy clean, zero new deps); next: 07-04 (final plan)
+**Last session:** 2026-08-29T05:20:39.643Z
+**Stopped At:** Completed 07-04-PLAN.md — the interop trio shipped (INTR-01 scripts_codec byte-exact round-trip + decode/encode flags, INTR-02 ign lint doctor-posture delegation + --strict + lint_tool_absent, INTR-03 tags browse --from-export offline three-layout parsing; 841 tests green workspace-wide, fmt/clippy clean, zero new deps). Phase 7 COMPLETE (4/4 plans) — next: /gsd-verify-work 7
 **Resume file:** None

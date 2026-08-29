@@ -20,7 +20,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 4: Rig Lifecycle & Trial State** - Docker test rig up/down/status/reset with logs, trial status/reset, and snapshot/restore (2026-08-23)
 - [x] **Phase 5: WebDev Backend & Tag Operations** - Ship the CLI's own versioned WebDev routes, deploy them, and operate the full tag lifecycle: values, configs, UDTs, alarms, history — the ignition-mcp replacement bar (2026-08-25; all five live e2e gates green on a real 8.3.3 rig; UAT gaps closed & re-verified 7/7 on 2026-08-26)
 - [x] **Phase 6: TUI Cockpit** (Complete 2026-08-28 — 11/11 plans: 6 original + 5 gap-closure from 06-UAT) - Ratatui cockpit exposing every CLI action: dashboard, log tail, tag browser with live watch, alarm panel, project browser, rig screen; CLI<->TUI coverage CI-enforced (tui_coverage clap-tree walk); gap closure shipped: tags freshness refire, TTY hint, f64 gauges, root-level puts, modal geometry/vim motions/prose menus (06-10), grouped rig status render + README keymap sync (06-11); monochrome/color UX themes backlog-owned per UAT triage
-- [ ] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows
+- [x] **Phase 7: Ecosystem Interop & Advanced Ops** - Cross-gateway diff/sync, gwbk backups, EAM tasks, opt-in script exec, and delegation bridges to ignition-lint / git-module / nvim workflows (COMPLETE 2026-08-29 — 4/4 plans)
 
 ## Phase Details
 
@@ -190,4 +190,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 4. Rig Lifecycle & Trial State | 4/4 | Complete | 2026-08-23 |
 | 5. WebDev Backend & Tag Operations | 8/8 | Complete | 2026-08-26 |
 | 6. TUI Cockpit | 11/11 | Complete | 2026-08-28 |
-| 7. Ecosystem Interop & Advanced Ops | 0/4 | Not started | - |
+| 7. Ecosystem Interop & Advanced Ops | 4/4 | Complete | 07-01 79min · 07-02 133min · 07-03 54min · 07-04 122min |
