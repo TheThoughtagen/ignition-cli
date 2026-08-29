@@ -1455,3 +1455,275 @@ synced 1 resource(s) dev → other · project p (scope project)
         );
     }
 }
+
+// ---- export --decode-scripts / import --encode-scripts (07-04, INTR-01) ----
+
+/// A script-bearing export fixture (gateway-image escapes): the view
+/// member carries TWO embedded scripts + an expression that passes
+/// through; a plain script-python member never decodes.
+fn script_zip_fixture() -> Vec<u8> {
+    use std::io::Write as _;
+    let view: &[u8] = br#"{
+  "scope" : "G",
+  "children" : [ {
+    "type" : "ia.display.label",
+    "eventScripts" : {
+      "actionPerformed" : {
+        "config" : {
+          "script" : "\tprint \u0027clicked\u0027\n\tprint \u0027done\u0027"
+        }
+      }
+    }
+  }, {
+    "type" : "ia.chart",
+    "transform" : {
+      "script" : "\t\tfor i in range(3):\n\t\t\tprint i\n\t\tprint \u0027end\u0027"
+    },
+    "props" : {
+      "expression" : "toStr({view.args.x} * 2)"
+    }
+  } ]
+}"#;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let members: &[(&str, &[u8])] = &[
+        ("project.json", br#"{"title":"Fixture"}"#),
+        ("c/resources/views/Dash/view.json", view),
+        ("c/resources/views/Dash/resource.json", br#"{"scope":"G"}"#),
+        ("ignition/resources/scratch", b"print('plain')"),
+    ];
+    for (name, bytes) in members {
+        writer.start_file(*name, options).expect("starts");
+        writer.write_all(bytes).expect("writes");
+    }
+    writer.finish().expect("finalize").into_inner()
+}
+
+/// The decode-export HUMAN golden (the plan-locked artifact line +
+/// scope + the re-import pointer) over a wiremock export serving the
+/// script-bearing zip — plus the on-disk tree shape proof.
+#[tokio::test]
+async fn project_export_decode_scripts_human_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/MyProj",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(script_zip_fixture(), "application/zip")
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"MyProj-export.zip\"",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let workdir = tempfile::tempdir().expect("workdir");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign_in(
+        workdir.path(),
+        &config,
+        &server.uri(),
+        &["project", "export", "MyProj", "--decode-scripts"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+Exported 4 members, 2 scripts decoded to MyProj-export
+scope: includes views/scripts/named-queries/vision-windows/perspective-themes-styles/reporting/alarm-notification-profiles/webdev-routes/translations/sfc-charts · excludes tag-providers/tags/udts/gateway-config/database-connections/users-roles/alarm-journal/certificates
+edit the <member>.<n>.py sidecars, then re-import with `--encode-scripts --file MyProj-export`
+"#]],
+    );
+    // The tree landed in the CWD (the default <name>-export/ dir).
+    let root = workdir.path().join("MyProj-export");
+    assert!(root.join("c/resources/views/Dash/view.json.1.py").is_file());
+    assert!(root.join("c/resources/views/Dash/view.json.2.py").is_file());
+    assert!(
+        root.join(ignition_core::client::scripts_codec::MANIFEST_NAME)
+            .is_file()
+    );
+}
+
+/// The decode-export COMPACT JSON golden: all keys, declaration
+/// order, `-o DIR` honored.
+#[tokio::test]
+async fn project_export_decode_scripts_json_golden() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/MyProj",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_raw(script_zip_fixture(), "application/zip"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let workdir = tempfile::tempdir().expect("workdir");
+    let out_dir = workdir.path().join("decoded");
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign_in(
+        workdir.path(),
+        &config,
+        &server.uri(),
+        &[
+            "project",
+            "export",
+            "MyProj",
+            "--decode-scripts",
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"MyProj","dir":"[..]decoded","members":4,"scripts_decoded":2,"bytes":[..],"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]}}}"#]],
+    );
+}
+
+/// Import `--encode-scripts` success REUSES the standard import
+/// golden shape (the re-zip rides the same path verbatim) — and the
+/// UPLOADED body round-trips the fixture's members byte-exactly
+/// (unedited sidecars; the manifest and sidecars stripped).
+#[tokio::test]
+async fn project_import_encode_scripts_success_golden() {
+    let server = wiremock::MockServer::start().await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/roundtrip",
+        ))
+        .and(wiremock::matchers::query_param("overwrite", "false"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/find/roundtrip",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"message": "Project not found"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Build the decoded tree with the PURE helper (what
+    // `export --decode-scripts` writes).
+    let tree = tempfile::tempdir().expect("tree dir");
+    ignition_core::client::scripts_codec::decode_export_tree(&script_zip_fixture(), tree.path())
+        .expect("decode fixture");
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "project",
+            "import",
+            "roundtrip",
+            "--file",
+            tree.path().to_str().unwrap(),
+            "--encode-scripts",
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"name":"roundtrip","collision_policy":"abort","bytes":[..],"scope":{"includes":["views","scripts","named-queries","vision-windows","perspective-themes-styles","reporting","alarm-notification-profiles","webdev-routes","translations","sfc-charts"],"excludes":["tag-providers","tags","udts","gateway-config","database-connections","users-roles","alarm-journal","certificates"]},"outcome":{"status":"success"}}}"#]],
+    );
+
+    // THE member-level honesty: the uploaded body carries every
+    // original member byte-exactly (unedited round-trip through the
+    // BINARY), and the manifest/sidecars never ride. Read members by
+    // their EXACT zip names (read_member's user-path mapping does
+    // not apply to project.json — it is not a resource).
+    let requests = import_guard.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    let body = &requests[0].body;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(body.as_slice())).expect("walkable zip");
+    use std::io::Read as _;
+    for name in [
+        "project.json",
+        "c/resources/views/Dash/view.json",
+        "c/resources/views/Dash/resource.json",
+        "ignition/resources/scratch",
+    ] {
+        let mut member = archive.by_name(name).expect("member present");
+        let mut bytes = Vec::new();
+        member.read_to_end(&mut bytes).expect("member reads");
+        let original = script_zip_fixture();
+        let mut original_archive =
+            zip::ZipArchive::new(std::io::Cursor::new(original.as_slice())).expect("fixture zip");
+        let mut original_member = original_archive.by_name(name).expect("fixture member");
+        let mut original_bytes = Vec::new();
+        original_member
+            .read_to_end(&mut original_bytes)
+            .expect("fixture reads");
+        assert_eq!(bytes, original_bytes, "{name} byte-identical in the upload");
+    }
+    assert!(
+        archive
+            .by_name(ignition_core::client::scripts_codec::MANIFEST_NAME)
+            .is_err(),
+        "the manifest never rides an upload"
+    );
+}
+
+/// `--encode-scripts --file -` refuses usage-class pre-resolution
+/// (stdin cannot carry a directory) — dead URL, no mocks, zero HTTP.
+#[tokio::test]
+async fn project_import_encode_scripts_stdin_refuses() {
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        "http://127.0.0.1:1",
+        &[
+            "project",
+            "import",
+            "x",
+            "--file",
+            "-",
+            "--encode-scripts",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage class, zero network");
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stderr_envelope(&out),
+        snapbox::str![[r#"
+{"ok":false,"profile":null,"error":{"code":"invalid_input","message":"invalid input: --encode-scripts needs the decoded export DIRECTORY via --file (stdin cannot carry one)","endpoint":null,"hint":"fix the input source — a readable file path via --file, or `-` to pipe the content on stdin"}}
+
+"#]],
+    );
+}

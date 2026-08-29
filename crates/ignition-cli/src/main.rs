@@ -113,6 +113,10 @@ enum ActionOutput {
     /// `ign project export` — ZIP streamed to disk; data carries
     /// {project, file, bytes, scope}.
     ProjectExport(actions::projects::ExportResult),
+    /// `ign project export --decode-scripts` — the member tree +
+    /// sidecars + manifest directory; data carries {project, dir,
+    /// members, scripts_decoded, bytes, scope}.
+    ProjectExportDecoded(actions::projects::ExportDecodedResult),
     /// `ign project import` — buffered upload with collision policy;
     /// data carries {name, collision_policy, bytes, scope, outcome}.
     ProjectImport(actions::projects::ImportResult),
@@ -274,6 +278,7 @@ impl ActionOutput {
             ActionOutput::ProjectSet(result) => render_success(profile, result, compact),
             ActionOutput::ProjectDelete(result) => render_success(profile, result, compact),
             ActionOutput::ProjectExport(result) => render_success(profile, result, compact),
+            ActionOutput::ProjectExportDecoded(result) => render_success(profile, result, compact),
             ActionOutput::ProjectImport(result) => render_success(profile, result, compact),
             ActionOutput::ProjectDiff(result) => render_success(profile, result, compact),
             ActionOutput::ProjectSync(result) => render_success(profile, result, compact),
@@ -878,9 +883,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // stdout stays data-only (no stdout exception); human mode
             // gets a one-line progress note on STDERR while the ZIP
             // streams (stdout is reserved for the envelope).
+            // 07-04: `--decode-scripts` routes to the decoded-tree
+            // action (same streaming seam, then the PURE codec owns
+            // the directory write).
             ProjectCommand::Export {
                 name: project_name,
                 output,
+                decode_scripts,
             } => {
                 if mode == RenderMode::Human {
                     eprintln!("exporting {project_name} …");
@@ -888,9 +897,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
-                        actions::projects::project_export(&api, &project_name, output.as_deref())
+                        if decode_scripts {
+                            actions::projects::project_export_decoded(
+                                &api,
+                                &project_name,
+                                output.as_deref(),
+                            )
+                            .await
+                            .map(ActionOutput::ProjectExportDecoded)
+                        } else {
+                            actions::projects::project_export(
+                                &api,
+                                &project_name,
+                                output.as_deref(),
+                            )
                             .await
                             .map(ActionOutput::ProjectExport)
+                        }
                     }
                     Err(err) => Err(err),
                 };
@@ -908,6 +931,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 name: project_name,
                 file,
                 collision_policy,
+                encode_scripts,
             } => {
                 if matches!(collision_policy, cli::CollisionPolicy::Overwrite)
                     && let Err(err) =
@@ -915,7 +939,30 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 {
                     return (None, Err(err));
                 }
-                let zip = if file == "-" {
+                // 07-04: `--encode-scripts` re-zips the decoded
+                // DIRECTORY first (the byte source is a tree, not an
+                // archive) — the re-encoded zip then rides the
+                // standard import path verbatim, so validate_import's
+                // full-structure walk applies free. Stdin cannot
+                // carry a directory (usage-class, pre-resolution).
+                let zip = if encode_scripts {
+                    if file == "-" {
+                        return (
+                            None,
+                            Err(CoreError::InvalidInput {
+                                reason: "--encode-scripts needs the decoded export \
+                                         DIRECTORY via --file (stdin cannot carry one)"
+                                    .to_string(),
+                            }),
+                        );
+                    }
+                    match ignition_core::client::scripts_codec::encode_export_tree(
+                        std::path::Path::new(&file),
+                    ) {
+                        Ok(zip) => zip,
+                        Err(err) => return (None, Err(err)),
+                    }
+                } else if file == "-" {
                     use tokio::io::AsyncReadExt;
                     let mut buffer = Vec::new();
                     match tokio::io::stdin().read_to_end(&mut buffer).await {

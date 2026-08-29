@@ -309,15 +309,26 @@ pub enum ProjectCommand {
         /// Project name
         name: String,
         /// Output file (default: the gateway's Content-Disposition
-        /// name, else <name>.zip)
+        /// name, else <name>.zip); with --decode-scripts, the output
+        /// DIRECTORY (default <name>-export/)
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+        /// Also decode embedded JSON scripts (Perspective view.json
+        /// etc.) into editable `<member>.<n>.py` sidecars beside a
+        /// copied member tree + scripts-manifest.json — the output is
+        /// a DIRECTORY (script-python members are already plain .py
+        /// and never decode; expressions pass through)
+        #[arg(long)]
+        decode_scripts: bool,
     },
     /// Import a project from a ZIP archive
     Import {
         /// Project name to import as
         name: String,
-        /// ZIP file path, or - to read the archive from stdin
+        /// ZIP file path, or - to read the archive from stdin; with
+        /// --encode-scripts, a decoded export DIRECTORY (re-zipped
+        /// with the sidecars spliced back before upload; stdin is
+        /// invalid in that mode)
         #[arg(long, value_name = "PATH")]
         file: String,
         /// Collision policy: abort refuses when the name exists
@@ -326,6 +337,11 @@ pub enum ProjectCommand {
         /// value; the README documents why)
         #[arg(long, value_enum, default_value_t = CollisionPolicy::Abort)]
         collision_policy: CollisionPolicy,
+        /// --file points at a decoded export DIRECTORY (from
+        /// `export --decode-scripts`): the sidecars are spliced back
+        /// and the manifest stripped before the standard import path
+        #[arg(long)]
+        encode_scripts: bool,
     },
     /// Compare a project across two gateway profiles — statuses are
     /// B-relative-to-A (`added` = in B only, `removed` = in A only,

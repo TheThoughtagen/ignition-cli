@@ -646,6 +646,47 @@ the ENTIRE project — resources absent from the ZIP are deleted).
 `merge` is the Designer import popup's mode and is not available via
 REST; the CLI rejects it at the flag level by simply not offering it.
 
+### Script decode/encode (`--decode-scripts` / `--encode-scripts`)
+
+`ign project export NAME --decode-scripts [-o DIR]` writes the
+export's members to a DIRECTORY (default `<name>-export/`) plus, for
+every JSON member with embedded scripts, editable sidecars:
+
+```
+MyProj-export/
+├── project.json
+├── com.inductiveautomation.perspective/resources/views/Dashboard/
+│   ├── view.json                  # the member, marker-free
+│   ├── view.json.1.py             # decoded + dedented script
+│   ├── view.json.2.py
+│   └── resource.json
+└── scripts-manifest.json          # JSON-pointer addresses → sidecar
+```
+
+Edit the `.py` sidecars in nvim/VS Code, lint them with
+[ignition-lint](#linting-ign-lint), then re-import the whole tree:
+`ign project import NAME --file MyProj-export --encode-scripts`
+(the sidecars are spliced back and the manifest stripped before the
+standard import path — `--file -` is invalid in this mode). An
+edited member changes ONLY at the spliced spans; a sidecar deleted
+from the tree keeps the JSON's current value.
+
+**The unedited round-trip is byte-exact.** Decode → encode with no
+edits reproduces every member byte-identically (contract-pinned).
+This rides the exact "Ignition Flint" escape codec ignition-nvim
+uses (backslash-first multi-pass encode, single-pass decode, common
+tab-prefix dedent/reindent) with splicing done at raw byte spans —
+key order and formatting of the gateway's JSON are never touched.
+
+**Scope honesty.** Only scripts EMBEDDED in JSON resources decode
+(Perspective `view.json` component/event scripts, tag event scripts,
+…). `ignition/script-python` project resources are ALREADY plain
+`.py` members in the export — they land in the tree verbatim and
+never grow sidecars. Single-line Ignition expressions (under
+`expression` and friends) pass through untouched: a value decodes
+only when it carries script-ish escape markers AND decodes to
+multiple lines.
+
 ### Cross-gateway diff & sync
 
 `ign project diff <PROFILE_A> <PROFILE_B> --project <NAME>` compares

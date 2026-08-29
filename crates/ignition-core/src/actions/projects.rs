@@ -773,6 +773,56 @@ pub async fn project_import(
     })
 }
 
+/// `ign project export --decode-scripts` output model (07-04,
+/// INTR-01): the DIRECTORY is the artifact — the export's members
+/// plus `<member>.<n>.py` sidecars plus the pointer manifest, ready
+/// for nvim/ignition-lint editing.
+#[derive(Debug, Serialize)]
+pub struct ExportDecodedResult {
+    /// The exported project's name.
+    pub project: String,
+    /// The directory written (the `-o` value, or `<name>-export/`).
+    pub dir: String,
+    /// File members in the export zip.
+    pub members: usize,
+    /// Scripts decoded to sidecars.
+    pub scripts_decoded: usize,
+    /// Bytes of the source export zip.
+    pub bytes: u64,
+    /// What the ZIP does and does not contain (the shared consts).
+    pub scope: ExportScope,
+}
+
+/// `ign project export NAME --decode-scripts` — buffer the export
+/// (the diff/sync seam), then decode the tree via the PURE codec:
+/// members + counter-named sidecars + `scripts-manifest.json` at the
+/// directory root. The re-encode half (`import --encode-scripts`)
+/// lives at the CLI dispatch seam — it re-zips the directory BEFORE
+/// this action's import path, which then rides verbatim
+/// (`validate_import` walks the re-zipped archive — the 05-07 guard
+/// applies free).
+pub async fn project_export_decoded(
+    api: &dyn GatewayApi,
+    name: &str,
+    out_dir: Option<&Path>,
+) -> Result<ExportDecodedResult, CoreError> {
+    let zip = crate::actions::resources::export_zip_bytes(api, name).await?;
+    let dir = match out_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => PathBuf::from(format!("{}-export", safe_fallback_stem(name))),
+    };
+    let members = crate::client::scripts_codec::count_file_members(&zip)?;
+    let scripts_decoded = crate::client::scripts_codec::decode_export_tree(&zip, &dir)?;
+    Ok(ExportDecodedResult {
+        project: name.to_string(),
+        dir: dir.display().to_string(),
+        members,
+        scripts_decoded,
+        bytes: zip.len() as u64,
+        scope: ExportScope::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{NewOptions, ProjectSummary, SetOptions, project_new, projects};
@@ -802,6 +852,9 @@ mod tests {
         /// collision pre-check's two outcomes (default: the project
         /// exists, preserving the create/copy/rename/set read-backs).
         absent: bool,
+        /// An export-body override (07-04: the decode tests serve a
+        /// script-bearing zip; default None = the bare fixture).
+        export_body: Option<Vec<u8>>,
     }
 
     impl ProjectsRig {
@@ -1090,7 +1143,7 @@ mod tests {
             out: &std::path::Path,
         ) -> Result<crate::client::projects::ExportMeta, CoreError> {
             self.exports.lock().unwrap().push(name.into());
-            let fixture = Self::zip_fixture();
+            let fixture = self.export_body.clone().unwrap_or_else(Self::zip_fixture);
             std::fs::write(out, &fixture)
                 .map_err(|err| CoreError::Internal(format!("rig export write: {err}")))?;
             Ok(crate::client::projects::ExportMeta {
@@ -1541,5 +1594,118 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
         assert_eq!(err.code(), "invalid_input");
         assert!(rig.exports.lock().unwrap().is_empty());
+    }
+
+    // ---- export --decode-scripts (07-04, INTR-01) ----
+
+    /// A script-bearing export zip (the codec's contract shape,
+    /// gateway-image escapes): a view member with two embedded
+    /// scripts + an expression value, its folder descriptor, a plain
+    /// script-python member, and project.json.
+    fn script_bearing_zip() -> Vec<u8> {
+        use std::io::Write as _;
+        let view = br#"{
+  "scope": "G",
+  "children": [
+    {
+      "type": "ia.display.label",
+      "eventScripts": {
+        "actionPerformed": {
+          "config": {
+            "script": "\tprint \u0027clicked\u0027\n\tprint \u0027done\u0027"
+          }
+        }
+      }
+    },
+    {
+      "type": "ia.chart",
+      "transform": {
+        "script": "\t\tfor i in range(3):\n\t\t\tprint i\n\t\tprint \u0027end\u0027"
+      },
+      "props": {
+        "expression": "toStr({view.args.x} * 2)"
+      }
+    }
+  ]
+}"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("project.json", options).expect("starts");
+        writer.write_all(br#"{"title":"T"}"#).expect("writes");
+        writer
+            .start_file("c/resources/views/Dash/view.json", options)
+            .expect("starts");
+        writer.write_all(view).expect("writes");
+        writer
+            .start_file("c/resources/views/Dash/resource.json", options)
+            .expect("starts");
+        writer
+            .write_all(br#"{"scope":"G","version":1,"files":["view.json"]}"#)
+            .expect("writes");
+        writer
+            .start_file("ignition/resources/scratch", options)
+            .expect("starts");
+        writer.write_all(b"print('plain')").expect("writes");
+        writer.finish().expect("finalize").into_inner()
+    }
+
+    /// The decode-export action: counts honest (members + sidecars),
+    /// the directory carries the members + sidecars + manifest, and
+    /// the JSON shape rides all keys in declaration order.
+    #[tokio::test]
+    async fn project_export_decoded_writes_the_tree() {
+        let rig = ProjectsRig {
+            export_body: Some(script_bearing_zip()),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = super::project_export_decoded(&rig, "p", Some(dir.path()))
+            .await
+            .expect("decode export");
+        assert_eq!(result.members, 4);
+        assert_eq!(result.scripts_decoded, 2);
+        assert_eq!(result.dir, dir.path().display().to_string());
+        assert!(
+            dir.path()
+                .join("c/resources/views/Dash/view.json.1.py")
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join("c/resources/views/Dash/view.json.2.py")
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join(crate::client::scripts_codec::MANIFEST_NAME)
+                .is_file()
+        );
+        // The plain script-python member rides verbatim (scope
+        // honesty: already plain .py text — never decoded).
+        assert_eq!(
+            std::fs::read(dir.path().join("ignition/resources/scratch")).expect("scratch member"),
+            b"print('plain')"
+        );
+        // Agent shape: all keys present (the declaration order is the
+        // struct's — pinned by the CLI golden; a Value walk sorts).
+        let json = serde_json::to_value(&result).expect("serialize");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bytes",
+                "dir",
+                "members",
+                "project",
+                "scope",
+                "scripts_decoded"
+            ]
+        );
     }
 }

@@ -43,6 +43,7 @@ pub mod projects;
 pub mod query;
 pub mod resources;
 pub mod restart;
+pub mod scripts_codec;
 pub mod sessions;
 pub mod status;
 pub mod tags;

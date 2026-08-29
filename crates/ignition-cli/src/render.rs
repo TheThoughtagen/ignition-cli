@@ -24,8 +24,8 @@ use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
 };
 use ignition_core::actions::projects::{
-    ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult, ProjectDiffResult,
-    ProjectRenameResult, ProjectSetResult, ProjectSyncResult, ProjectsResult,
+    ExportDecodedResult, ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult,
+    ProjectDiffResult, ProjectRenameResult, ProjectSetResult, ProjectSyncResult, ProjectsResult,
 };
 use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
@@ -209,6 +209,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ProjectSet(result) => render_project_set_human(result),
         ActionOutput::ProjectDelete(result) => render_project_delete_human(result),
         ActionOutput::ProjectExport(result) => render_project_export_human(result),
+        ActionOutput::ProjectExportDecoded(result) => render_project_export_decoded_human(result),
         ActionOutput::ProjectImport(result) => render_project_import_human(result),
         ActionOutput::ProjectDiff(result) => render_project_diff_human(result),
         ActionOutput::ProjectSync(result) => render_project_sync_human(result),
@@ -670,6 +671,27 @@ fn render_project_export_human(result: &ExportResult) {
         "scope: includes {} \u{b7} excludes {}",
         result.scope.includes.join("/"),
         result.scope.excludes.join("/")
+    );
+}
+
+/// `ign project export --decode-scripts` human lines: the plan-locked
+/// artifact line (members + decoded scripts + the directory), then
+/// the scope summary (the shared export contract) — plus the editing
+/// loop pointer (sidecars + manifest, re-import via --encode-scripts).
+fn render_project_export_decoded_human(result: &ExportDecodedResult) {
+    println!(
+        "Exported {} members, {} scripts decoded to {}",
+        result.members, result.scripts_decoded, result.dir
+    );
+    println!(
+        "scope: includes {} \u{b7} excludes {}",
+        result.scope.includes.join("/"),
+        result.scope.excludes.join("/")
+    );
+    println!(
+        "edit the <member>.<n>.py sidecars, then re-import with \
+         `--encode-scripts --file {}`",
+        result.dir
     );
 }
 
