@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-08-20)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 7 COMPLETE (4/4 plans) — 07-04 shipped the interop trio: INTR-01 `scripts_codec` (PURE Flint codec, single-pass decode, tab dedent/reindent, position-tracking scanner + SPAN-LEVEL splice — no preserve_order, no Value re-serialization; `project export --decode-scripts` writes members + `<member>.<n>.py` sidecars + scripts-manifest.json, `import --encode-scripts` splices back; unedited round-trip BYTE-IDENTICAL, contract-pinned); INTR-02 `ign lint` (PATH-discovered ignition-lint delegation, ARG-VECTOR spawn, doctor posture — findings/child_exit_code/report as data, exit 0 when the child ran; `--strict` passes the child's masked code after the envelope renders; absent tool = additive `lint_tool_absent` exit 6; TUI lint row = first clientless worker); INTR-03 `tags browse --from-export` (offline: git-module dirs + legacy single files + the CLI interchange, profile null, dead-URL-proven, existing tree/flat renders reused). 841 tests green workspace-wide, fmt/clippy clean, zero new deps. 07-VERIFICATION.md PASSED (8/8 requirements, 19/19 truths, 852 tests re-run during verification, live binary smoke proofs for every guard ladder). Next: /gsd-verify-work 7 (manual UAT) → /gsd-complete-milestone.
+**Current focus:** Phase 7 gap closure (5/6 plans) — 07-05 closed all three 07-UAT EAM gaps live against gateway A (:9088): history decodes wire-faithful UUID-string taskIds (raw-capture-shaped contract added); `eam task new` composes the live `config.settings` shape (`config.profile={type,scheduleMode}` only, `--definition` merges over settings, zero `--target` defaults `["_controller"]` — live create exits 0, `uat-backup-demo` listed); path-scoped 422 on `/data/api/v1/resources/` classifies exit-2 `invalid_input` with the gateway's `messages` verbatim; TYPE help enumerates the benign/mutating/refused taxonomy + example. 857 tests green workspace-wide, fmt/clippy clean, no new deps/slugs. Gateway A untouched for 07-06 (cli-research-backup asset + uat-backup-demo). Next: 07-06-PLAN.md → re-verify → /gsd-complete-milestone.
 
 ## Current Position
 
 **Phase:** 7 of 7 (Ecosystem Interop & Advanced Ops)
-**Current Plan:** 4
-**Total Plans in Phase:** 4
-**Status:** Phase complete — verification passed (07-VERIFICATION.md)
+**Current Plan:** 5
+**Total Plans in Phase:** 6
+**Status:** In progress — gap closure (07-05 complete, 07-06 pending)
 **Last Activity:** 2026-08-29
 
-**Progress:** [██████████] 100%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -65,6 +65,7 @@ See: .planning/PROJECT.md (updated 2026-08-20)
 | Phase 07 P02 | 133min | 3 tasks | 31 files |
 | Phase 07 P03 | 54min | 2 tasks | 14 files |
 | Phase 07 P04 | 122min | 3 tasks | 18 files |
+| Phase 07 P05 | 327min (load-throttled machine) | 3 tasks tasks | 7 files files |
 
 ## Accumulated Context
 
@@ -201,6 +202,7 @@ Recent decisions affecting current work:
 - [Phase 07-04]: [Phase 07-04]: Round-trip script editing LOCKED on span-level raw-byte splicing — scripts_codec is PURE (client/resources discipline), serde_json stays READ-ONLY (no preserve_order feature, no Value re-serialization: key-order stability of existing goldens preserved by construction); sidecar addressing = counter-named <member>.<n>.py siblings + scripts-manifest.json JSON-pointer manifest, exported JSON stays marker-free; acceptance = byte-equality of UNEDITED re-encoded members (contract-pinned incl. hand-edit re-resolution); SCRIPT_KEYS is NINE keys (the dual-ported ignition-nvim source — the plan's [&str;10] was an off-by-one)
 - [Phase 07-04]: [Phase 07-04]: ign lint posture LOCKED — doctor posture default (exit 0 whenever the child RAN; findings + child_exit_code + parsed report ride as data, all keys always) with --strict passing the child's masked (0..127) code LITERALLY, decided in main() AFTER the envelope renders (the one sanctioned success-path EXIT exception); PATH discovery (first executable, no which dep) + tokio ARG-VECTOR spawn (--report-format json --target per path, -- passthrough verbatim); absent tool = additive lint_tool_absent exit 6 with uv/pip install hint; the TUI lint worker is the first CLIENTLESS dashboard worker (local delegation)
 - [Phase 07-04]: [Phase 07-04]: tags browse --from-export is OFFLINE BY CONSTRUCTION — the flag short-circuits before profile/secret/client/route resolution entirely (profile null, dead-URL-proven); three layouts parse (git-module dirs with individual-file format + _types_ + %XX fs-name decoding + System/dot/.tag-config skips, legacy <provider>.json whole trees, the CLI interchange file); provider = file stem for file inputs (the only derivable provenance); rows emit the EXISTING BrowseRow shape so tree + flat JSON renders ride verbatim; NO new TUI leaf (the flag-exception convention, noted beside the tags export -o - comment)
+- [Phase 07]: [Phase 07-05]: EAM wire truth corrected from live captures — taskId is a UUID STRING (i64 model died on every live history read); create composes the profile/settings split (profile={type,scheduleMode} ONLY, settings={targetGateways,targetGroups,+K=V}, --definition deep-merges over SETTINGS, zero --target defaults ["_controller"]); a 422 on /data/api/v1/resources/ classifies exit-2 invalid_input carrying the gateway's messages verbatim (path-scoped body-reading arm, the EamNotController precedent); TYPE help enumerates the guard-ladder taxonomy with NO possible_values (unknown future types stay accepted, fail-safe to --yes) — All three blockers made working 07-02 features fail against the real controller; the README settings shape was always right — the composition landed it in the wrong node
 
 ### Pending Todos
 
@@ -217,6 +219,6 @@ None yet.
 
 ## Session Continuity
 
-**Last session:** 2026-08-29T05:20:39.643Z
-**Stopped At:** Completed 07-04-PLAN.md — the interop trio shipped (INTR-01 scripts_codec byte-exact round-trip + decode/encode flags, INTR-02 ign lint doctor-posture delegation + --strict + lint_tool_absent, INTR-03 tags browse --from-export offline three-layout parsing; 841 tests green workspace-wide, fmt/clippy clean, zero new deps). Phase 7 COMPLETE (4/4 plans) — next: /gsd-verify-work 7
+**Last session:** 2026-08-29T21:41:13.173Z
+**Stopped At:** Completed 07-05-PLAN.md — all three EAM UAT gaps closed and live-verified on gateway A (UUID taskIds, config.settings create composition + 422 invalid_input, TYPE taxonomy help); 857 tests green, fmt/clippy clean; gateway A untouched for 07-06
 **Resume file:** None
