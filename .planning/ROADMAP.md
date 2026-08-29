@@ -173,9 +173,9 @@ Plans:
 
 Plans:
 - [x] 07-01-PLAN.md — cross-gateway `project diff` (normalized member compare, B-relative-to-A, two-client resolution shape) + guarded `project sync` (A→B, --delete opt-in) (SYNC-01/02)
-- [ ] 07-02-PLAN.md — standalone `ign backup download/restore` (--type param, 8th guarded verb) + EAM family (`eam history/tasks`, guarded `task new`/`task force`, `eam_not_controller` state-gate slug) (BKUP-01/02)
-- [ ] 07-03-PLAN.md — `ign script run` over the shipped scriptExec route (structural opt-in, three input forms, `script_exec_not_configured` slug) (SCRPT-01)
-- [ ] 07-04-PLAN.md — interop trio: Flint codec `--decode-scripts`/`--encode-scripts` round-trip, `ign lint` delegation (doctor posture + `--strict`), `tags browse --from-export` offline (INTR-01/02/03)
+- [x] 07-02-PLAN.md — standalone `ign backup download/restore` (--type param, 8th guarded verb) + EAM family (`eam history/tasks`, guarded `task new`/`task force`, `eam_not_controller` state-gate slug) (BKUP-01/02)
+- [x] 07-03-PLAN.md — `ign script run` over the shipped scriptExec route (structural opt-in, three input forms, `script_exec_not_configured` slug) (SCRPT-01)
+- [x] 07-04-PLAN.md — interop trio: Flint codec `--decode-scripts`/`--encode-scripts` round-trip, `ign lint` delegation (doctor posture + `--strict`), `tags browse --from-export` offline (INTR-01/02/03)
 
 ## Progress
 
