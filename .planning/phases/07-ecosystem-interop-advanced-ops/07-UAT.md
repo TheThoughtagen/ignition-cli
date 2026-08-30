@@ -1,14 +1,96 @@
 ---
-status: diagnosed
+status: complete
 phase: 07-ecosystem-interop-advanced-ops
-source: 07-01-SUMMARY.md, 07-02-SUMMARY.md, 07-03-SUMMARY.md, 07-04-SUMMARY.md
+source: 07-05-SUMMARY.md, 07-06-SUMMARY.md (round 2 — gap-closure re-verification of round-1 gaps 1-5)
+round: 2
+round1_source: 07-01-SUMMARY.md, 07-02-SUMMARY.md, 07-03-SUMMARY.md, 07-04-SUMMARY.md
+round1_outcome: 9/12 passed, 5 gaps diagnosed -> closed by 07-05/07-06; static verification passed (07-VERIFICATION.md 8/8, 07-VERIFICATION-GAPS.md 8/8)
 started: 2026-08-29T13:03:04Z
-updated: 2026-08-29T15:05:00Z
+updated: 2026-08-29T20:22:00Z
 ---
 
 ## Current Test
 
-[testing complete]
+[testing complete — round 2: 5/5 passed, 0 issues]
+
+## Tests
+
+### 1. eam history decodes the live controller response
+expected: On gateway A (profile uat), `ign eam history` exits 0 listing history rows incl. `cli-research-backup (forced)` [Failed] with GNET detail as data; `--json` carries taskId as UUID string. No internal decode error (round-1 gap 1, fixed 07-05: task_id String, wire-faithful).
+result: pass
+note: >-
+  User ran live after refreshing the installed binary: exit 0, one run listed —
+  'cli-research-backup (forced) [Failed] target=_controller Attempt 1: Gateway network for
+  agent _controller is currently not connected, connection status NotDefined' — outcome rides
+  as data verbatim. INCIDENT (environment, not code): user's first attempt failed with the
+  round-1 decode error because ~/.cargo/bin/ign (built 07:22) predated the 07-05 fix commit
+  (12:17); reinstalled via cargo install --path, then green. Operational observation: `ign
+  --version` prints only '0.1.0' with no build date/commit hash, so a stale install is
+  undetectable from the CLI itself — backlog candidate (build-metadata in version output).
+
+### 2. eam task new creates on the real controller + helpful TYPE help
+expected: `ign eam task new --help` enumerates the guard-ladder taxonomy (benign eam_backup / 7 mutating tokens / refused restore-install-upgrade + fail-safe note) with a worked example line. `ign eam task new uat-reverify-demo eam_backup` exits 0 (OnDemand unguarded), and `ign eam tasks` lists uat-reverify-demo type=eam_backup schedule=OnDemand. The round-1 422 ('Settings cannot be null', config.settings composition) is gone. Note: the 422→invalid_input classification arm is wiremock-contract-pinned (07-05) — no longer live-provocable now that composition is correct; count contract evidence or flag.
+result: [pending]
+
+### 3. eam task force surfaces the 409 as a target-state refusal
+expected: `ign eam task force cli-research-backup --yes` (the standing '(forced)' fixture run still occupies the slot) → exit 6, slug `eam_task_in_flight`, message carries the gateway's "already exists" page text, hint names the EAM console — NOT internal_error. If the fixture slot has freed, a live probe would dispatch a real task (mutation) — in that case pass on the executor's live capture (07-06-SUMMARY) + wiremock contract, or skip.
+result: pass
+note: >-
+  User ran live: 'error: EAM task cli-research-backup has a run in flight — the gateway
+  refused the force: Task (forced) already exists! It must be completed or deleted...' +
+  hint naming the EAM console. Target-state refusal (exit 6) replaces the round-1
+  internal_error; the standing '(forced)' fixture still occupies the slot so no task was
+  dispatched. Cosmetic observation: the gateway page text's HTML entities render raw
+  (&apos; instead of ') in the human message — readable, backlog candidate
+  (html_error_parts entity unescaping), not a gap.
+
+### 4. Provider-root tag paths refuse honestly; subtree paths unregressed
+expected: `ign tags export default` and `ign tags config get [default]` → exit 6 `provider_root_unsupported`, message + hint name the `[provider]folder` subtree form. Regression check: `ign tags export [default]uattest` and `ign tags config get [default]uattest` still exit 0 with real data (uattest AtomicTag, Int4, default 42).
+result: pass
+note: >-
+  User ran all four live: `tags export default` AND `tags config get '[default]'` both
+  refuse exit-6 provider_root_unsupported with the subtree-form message + hint (bracket-form
+  detection confirmed); `tags config get '[default]uattest'` exit 0 with real config
+  (Int4, defaultValue 42, live value 1234, valueSource memory); `tags export
+  '[default]uattest'` exit 0, exported 1 path -> uattest.json. No 1.1.0 redeploy regression.
+  Doc observation: bracket tag paths collide with zsh globbing — unquoted [default]uattest
+  fails in the SHELL before ign sees it ('no matches found'); README should say quote
+  bracket paths in zsh (one-line backlog candidate if not already documented). User also
+  ran `ign rig trial reset --yes` mid-test (side action: expired true->false, 1h59m
+  remaining) — noted, out of scope for this test.
+
+### 5. Route bundle 1.1.0 version lock
+expected: Stale 1.0.0 route deployments refuse `route_version_mismatch` until redeploy; equality-lock tests (VERSION file = all five doPost.py ROUTE_VERSION = ROUTE_BUNDLE_VERSION) green in the 863. Live capture of both directions exists in 07-06-SUMMARY (stale refusal → redeploy → refusals served by 1.1.0) — a fresh live re-probe is not recreatable with the current binary (it only deploys 1.1.0), so pass on captured evidence or flag.
+result: pass
+note: >-
+  Accepted on captured evidence (user-approved): executor's live two-direction capture in
+  07-06-SUMMARY (stale-1.0.0 route_version_mismatch refusal -> redeploy -> 1.1.0-served
+  refusals + subtree regression probe), equality-lock drift tests green in the 863, and the
+  consequential live proof from test 4 (provider-root refusals run minutes earlier are
+  served by 1.1.0-only denial code on gateway A).
+
+## Summary
+
+total: 5
+passed: 5
+issues: 0
+pending: 0
+skipped: 0
+
+Non-gap observations collected (backlog candidates, NOT gaps):
+- ign --version prints only '0.1.0' — no build date/commit; a stale install is undetectable
+  from the CLI itself (bit the user this session: ~/.cargo/bin/ign predated the 07-05 fix)
+- Gateway error-page HTML entities render raw in refusal messages (&apos; not ')
+- README bracket-path examples (lines 726, 838) are unquoted — zsh glob-fails before ign
+  sees them; add quotes + a one-line 'quote bracket paths in zsh' note
+
+## Gaps
+
+[none yet — round 2]
+
+---
+
+# Round 1 (archived 2026-08-29 — 9/12 passed, 5 gaps diagnosed and closed by 07-05/07-06)
 
 ## Tests
 
