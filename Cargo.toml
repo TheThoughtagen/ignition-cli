@@ -5,7 +5,7 @@ members = ["crates/ignition-cli", "crates/ignition-core", "crates/ignition-tui"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.88" # CORRECTED: keyring 4.1.x floor (was 1.85 in STACK.md)
-version = "0.1.0"
+version = "1.0.0"
 
 [workspace.dependencies]
 ignition-core = { path = "crates/ignition-core" }
