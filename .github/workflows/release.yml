@@ -1,11 +1,23 @@
 name: Release
 
-# Prebuilt binaries for tags (v1.0, v1.1, ...). Four targets:
-#   aarch64-apple-darwin   (native on macos-latest arm64 runner)
-#   x86_64-apple-darwin    (cross-compiled on the same mac runner)
-#   x86_64-unknown-linux-gnu   (native on ubuntu-latest)
-#   aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm — free for public repos)
-# Each job uploads its tarball + checksum to the GitHub release; assets merge.
+# The one-push release pipeline. Pushing a tag (v1.0, v1.1, ...) triggers:
+#
+#   build            — 4-target release matrix; tarballs + sha256 attached
+#                      to the GitHub release (created if missing)
+#                      aarch64-apple-darwin       (native on macos-latest)
+#                      x86_64-apple-darwin        (cross on the same mac)
+#                      x86_64-unknown-linux-gnu   (native on ubuntu-latest)
+#                      aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm)
+#   publish-crates   — cargo publish --workspace (core → tui → cli) after the
+#                      binaries prove the tag builds; idempotent: skips when
+#                      the version is already on crates.io
+#
+# Prereqs (one-time): repo secret CARGO_REGISTRY_TOKEN — a crates.io token
+# with publish-new AND publish-update scopes (new covers the first version of
+# each crate; update is required for every later version). See RELEASING.md.
+#
+# Re-run manually: workflow_dispatch (tag input names the release; publish
+# toggle controls the crates.io step).
 
 on:
   push:
@@ -16,6 +28,10 @@ on:
         description: "Release tag to attach binaries to (e.g. v1.0)"
         required: true
         default: "v1.0"
+      publish:
+        description: "Publish crates to crates.io"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -66,3 +82,52 @@ jobs:
           files: |
             ign-*.tar.gz
             ign-*.tar.gz.sha256
+
+  publish-crates:
+    needs: build # only publish crates once the tag's binaries prove it builds
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Fail fast on missing token
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set."
+            echo "::error::Create a crates.io token (publish-new + publish-update scopes) at"
+            echo "::error::https://crates.io/settings/tokens and add it as a repo secret:"
+            echo "::error::gh secret set CARGO_REGISTRY_TOKEN"
+            exit 1
+          fi
+      - name: Skip if this version is already published (idempotent re-runs)
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "//;s/"//')
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: ignition-cli-release-pipeline" \
+            "https://crates.io/api/v1/crates/ignition-cli/$VERSION")
+          if [ "$CODE" = "200" ]; then
+            echo "ignition-cli $VERSION is already on crates.io — skipping publish."
+            echo "SKIP_PUBLISH=1" >> "$GITHUB_ENV"
+          else
+            echo "ignition-cli $VERSION not yet published (HTTP $CODE) — publishing."
+          fi
+      - name: Publish workspace (core → tui → cli, cargo orders it)
+        if: env.SKIP_PUBLISH != '1'
+        run: cargo publish --workspace
+      - name: Post-publish verification
+        if: env.SKIP_PUBLISH != '1'
+        run: |
+          sleep 5 # registry index propagation
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "//;s/"//')
+          for CRATE in ignition-core ignition-tui ignition-cli; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "User-Agent: ignition-cli-release-pipeline" \
+              "https://crates.io/api/v1/crates/$CRATE/$VERSION")
+            echo "$CRATE@$VERSION → HTTP $CODE"
+            [ "$CODE" = "200" ] || exit 1
+          done
+          echo "All three crates live on crates.io at $VERSION."
