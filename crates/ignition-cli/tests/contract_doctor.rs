@@ -251,8 +251,8 @@ auth          FAIL  token recognized but under-permitted (HTTP 403 on gateway-in
 permissions   WARN  this token cannot read security-properties either (HTTP 403) — the gateway's read/write permissions likely exclude the token's security level (three-part cause 2)
 write         SKIP  not requested (--check-write)
 webdev        SKIP  not requested (--webdev-route NAME)
-rig           OK    Docker version 29.4.0, build 9d7ad9f
-8 checks: 4 ok, 1 warn, 1 fail, 2 skip
+rig           [..]
+8 checks: [..]
 "#]],
     );
 }
