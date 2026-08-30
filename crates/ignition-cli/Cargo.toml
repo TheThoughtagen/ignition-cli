@@ -4,6 +4,11 @@ description = "ign — operate Ignition 8.3+ gateways from the terminal"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["ignition", "cli", "scada", "gateway", "industrial"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "ign"

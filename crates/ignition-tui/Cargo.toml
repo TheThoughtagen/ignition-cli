@@ -4,6 +4,8 @@ description = "Ratatui TUI cockpit for ign — the interactive command surface o
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # Phase 6 fills this crate: ratatui 0.30 + crossterm 0.29 (event-stream)
 # are the only NEW runtime deps the whole phase takes — everything else

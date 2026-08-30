@@ -2,7 +2,8 @@
 //!
 //! Phase 5 ships five action-dispatch WebDev routes (tags, tagConfig,
 //! alarms, tagHistory, scriptExec) whose sources live under
-//! `webdev/routes/` in this repository. This module embeds them into the
+//! `crates/ignition-core/webdev/routes/` (inside the crate so the
+//! published package embeds them). This module embeds them into the
 //! binary at compile time so `ign webdev deploy` (05-03) can zip and
 //! upload the bundle with no source checkout — the routes travel with
 //! the binary.
@@ -38,82 +39,82 @@ pub const ROUTE_FILES: &[(&str, &str)] = &[
     // Deploy project manifest.
     (
         "project.json",
-        include_str!("../../../../webdev/routes/project.json"),
+        include_str!("../../webdev/routes/project.json"),
     ),
     // tags — live tag values (version/browse/read/write).
     (
         "com.inductiveautomation.webdev/resources/cli/tags/resource.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tags/resource.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tags/resource.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/tags/config.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tags/config.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tags/config.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/tags/doPost.py",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tags/doPost.py"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tags/doPost.py"
         ),
     ),
     // tagConfig — configuration CRUD, UDTs, bulk export.
     (
         "com.inductiveautomation.webdev/resources/cli/tagConfig/resource.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagConfig/resource.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagConfig/resource.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/tagConfig/config.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagConfig/config.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagConfig/config.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/tagConfig/doPost.py",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagConfig/doPost.py"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagConfig/doPost.py"
         ),
     ),
     // alarms — active status, journal history, acknowledge.
     (
         "com.inductiveautomation.webdev/resources/cli/alarms/resource.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/alarms/resource.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/alarms/resource.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/alarms/config.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/alarms/config.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/alarms/config.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/alarms/doPost.py",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/alarms/doPost.py"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/alarms/doPost.py"
         ),
     ),
     // tagHistory — historical tag value queries.
     (
         "com.inductiveautomation.webdev/resources/cli/tagHistory/resource.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagHistory/resource.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagHistory/resource.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/tagHistory/config.json",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagHistory/config.json"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagHistory/config.json"
         ),
     ),
     (
         "com.inductiveautomation.webdev/resources/cli/tagHistory/doPost.py",
         include_str!(
-            "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagHistory/doPost.py"
+            "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/tagHistory/doPost.py"
         ),
     ),
 ];
@@ -127,7 +128,7 @@ pub const ROUTE_FILES: &[(&str, &str)] = &[
 /// itself fail-closes on exactly that state, and this separation is the
 /// structural guarantee it never happens.
 pub const SCRIPT_EXEC_TEMPLATE: &str = include_str!(
-    "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py"
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/doPost.py"
 );
 
 #[cfg(test)]
@@ -136,7 +137,7 @@ mod tests {
 
     // The repo-level VERSION file — the third copy of the handshake
     // version, pinned here so all three must move together.
-    const VERSION_FILE: &str = include_str!("../../../../webdev/routes/VERSION");
+    const VERSION_FILE: &str = include_str!("../../webdev/routes/VERSION");
 
     /// (1) Every always-on doPost.py carries the handshake constants, and
     /// they match the Rust embed — route sources and binary must never

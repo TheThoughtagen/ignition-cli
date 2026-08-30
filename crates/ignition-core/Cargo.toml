@@ -4,6 +4,8 @@ description = "Core library for ign: config, profiles, gateway client, actions, 
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }

@@ -6,10 +6,13 @@ members = ["crates/ignition-cli", "crates/ignition-core", "crates/ignition-tui"]
 edition = "2024"
 rust-version = "1.88" # CORRECTED: keyring 4.1.x floor (was 1.85 in STACK.md)
 version = "1.0.0"
+license = "MIT"
+repository = "https://github.com/TheThoughtagen/ignition-cli"
 
 [workspace.dependencies]
-ignition-core = { path = "crates/ignition-core" }
-ignition-tui = { path = "crates/ignition-tui" }
+# version = required alongside path for crates.io publish (path wins locally)
+ignition-core = { path = "crates/ignition-core", version = "1.0.0" }
+ignition-tui = { path = "crates/ignition-tui", version = "1.0.0" }
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 serde = { version = "1.0", features = ["derive"] }

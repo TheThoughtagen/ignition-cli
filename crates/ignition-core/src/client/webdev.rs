@@ -47,10 +47,10 @@ pub const DEFAULT_PROJECT: &str = "ign-cli";
 /// that packs them).
 const SCRIPT_EXEC_ROUTE_ROOT: &str = "com.inductiveautomation.webdev/resources/cli/scriptExec";
 const SCRIPT_EXEC_RESOURCE_JSON: &str = include_str!(
-    "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/resource.json"
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/resource.json"
 );
 const SCRIPT_EXEC_CONFIG_JSON: &str = include_str!(
-    "../../../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/config.json"
+    "../../webdev/routes/com.inductiveautomation.webdev/resources/cli/scriptExec/config.json"
 );
 
 /// The always-on route folders, in manifest order — DERIVED from

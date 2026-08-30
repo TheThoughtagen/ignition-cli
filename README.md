@@ -6,6 +6,17 @@ gateway webpage or Designer. Every subcommand is non-interactive by default
 and scriptable with JSON output; `ign tui` (below) is the interactive
 cockpit over the same actions layer.
 
+## Install
+
+```
+cargo install ignition-cli
+```
+
+(or grab a prebuilt binary from the
+[releases](https://github.com/TheThoughtagen/ignition-cli/releases) —
+macOS arm64/x86_64, Linux x86_64/arm64). Requires Rust 1.88+ when building
+from source. The binary is `ign`.
+
 ## Output contract (for agents)
 
 Success prints a stable envelope on **stdout**; errors go to **stderr** in

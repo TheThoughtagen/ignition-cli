@@ -1,0 +1,66 @@
+name: Release
+
+# Prebuilt binaries for tags (v1.0, v1.1, ...). Four targets:
+#   aarch64-apple-darwin   (native on macos-latest arm64 runner)
+#   x86_64-apple-darwin    (cross-compiled on the same mac runner)
+#   x86_64-unknown-linux-gnu   (native on ubuntu-latest)
+#   aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm — free for public repos)
+# Each job uploads its tarball + checksum to the GitHub release; assets merge.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach binaries to (e.g. v1.0)"
+        required: true
+        default: "v1.0"
+
+permissions:
+  contents: write
+
+env:
+  TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release -p ignition-cli --target ${{ matrix.target }}
+      - name: Package tarball
+        run: |
+          ART="ign-${{ env.TAG_NAME }}-${{ matrix.target }}"
+          mkdir "$ART"
+          cp "target/${{ matrix.target }}/release/ign" "$ART/"
+          cp README.md LICENSE "$ART/"
+          tar -czf "$ART.tar.gz" "$ART"
+          shasum -a 256 "$ART.tar.gz" > "$ART.tar.gz.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            ign-*.tar.gz
+            ign-*.tar.gz.sha256
