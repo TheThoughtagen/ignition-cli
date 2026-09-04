@@ -2,77 +2,49 @@
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-30)
+See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 — Agent Surface & IDE Integration (started 2026-09-04)
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 8: 08-foundations-session-core-config-contract
 
 ## Current Position
 
-**Phase:** Not started (defining requirements)
-**Plan:** —
-**Status:** Defining requirements
-**Last Activity:** 2026-09-04 — Milestone v1.1 started
+**Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
+**Plan:** 0 of TBD in current phase
+**Status:** Ready to plan (`/gsd-plan-phase 8`)
+**Last Activity:** 2026-09-04 — v1.1 roadmap created (7 phases, 25 requirements mapped, 100% coverage)
 
 **Progress:** [░░░░░░░░░░] 0% (v1.1)
 
 ## Performance Metrics
 
-**Velocity (v1.0 milestone totals):**
-- Total plans completed: 41 (v1.0)
-- Total execution time: per-plan durations below (v1.0 history)
+**v1.0 baseline (for comparison):** 41 plans, 118 tasks, 9 days (2026-08-20 → 2026-08-29); avg ~38 min/plan; slowest plans were live-gate/WebDev phases (P03-P04 of Phase 5 at ~400+ min).
 
-| Plan | Duration | Tasks | Files |
-|------|----------|-------|-------|
-| Phase 01 P01 | 8min | 3 tasks | 13 files |
-| Phase 01 P02 | 53min | 3 tasks | 9 files |
-| Phase 01 P03 | 15min | 3 tasks | 15 files |
-| Phase 01 P04 | 37min | 3 tasks | 18 files |
-| Phase 02 P01 | 19min | 3 tasks | 14 files |
+**v1.1 velocity:** No plans executed yet.
 
-| Phase 02 P02 | 12min | 3 tasks | 14 files |
-| Phase Phase 02 PP03 | 14min | 3 tasks | 15 files |
-| Phase 02 P04 | 35min | 3 tasks | 18 files |
-| Phase 02 P05 | 40min | 3 tasks | 20 files |
-| Phase 03 P01 | 21min | 3 tasks | 13 files |
-| Phase 03 P02 | 29min | 3 tasks | 21 files |
-| Phase 03 P03 | 29min | 3 tasks | 12 files |
-| Phase 04 P01 | 42min | 3 tasks | 14 files |
-| Phase 04 P02 | 18min | 3 tasks | 8 files |
-| Phase 04 P03 | 406min | 3 tasks | 14 files |
-| Phase 04 PP04 | 37min | 3 tasks | 17 files |
-| Phase 05 P01 | 24min | 3 tasks | 19 files |
-| Phase 05 P02 | 38min | 3 tasks | 16 files |
-| Phase 05 P03 | ~400min (2 sessions) | 3 tasks | 35 files |
-| Phase 05 P04 | ~450min (3 sessions) | 3 tasks | 21 files |
-| Phase 05 P05 | 39min | 3 tasks | 10 files |
-| Phase 05 P06 | 114min | 3 tasks | 17 files |
-| Phase 05 P07 | 196min | 3 tasks | 10 files |
-| Phase 05 P08 | 60min | 2 tasks | 9 files |
-| Phase 06 P01 | 222min | 3 tasks | 31 files |
-| Phase 06 P02 | 60min | 3 tasks | 16 files |
-| Phase 06 P03 | 36min | 3 tasks tasks | 11 files files |
-| Phase 06 P04 | 12min | 3 tasks | 8 files |
-| Phase 06 P05 | 29min | 3 tasks tasks | 8 files files |
-| Phase 06 P06 | 28min | 3 tasks | 17 files |
-| Phase 06 P09 | ~15min (6min code + 9min continuation verify) | 3 tasks tasks | 3 files files |
-| Phase 06 P07 | 52min | 3 tasks | 10 files |
-| Phase 06 P08 | 52min | 2 tasks | 2 files |
-| Phase 06 P10 | 41min | 3 tasks | 3 files |
-| Phase 06 P11 | 20min | 2 tasks | 2 files |
-| Phase 07 P01 | 79min | 3 tasks | 14 files |
-| Phase 07 P02 | 133min | 3 tasks | 31 files |
-| Phase 07 P03 | 54min | 2 tasks | 14 files |
-| Phase 07 P04 | 122min | 3 tasks | 18 files |
-| Phase 07 P05 | 327min (load-throttled machine) | 3 tasks tasks | 7 files files |
-| Phase 07 P06 | 96min | 2 tasks | 15 files |
+| Phase | Plans | Total | Avg/Plan |
+|-------|-------|-------|----------|
+| 8 | 0/TBD | - | - |
+| 9 | 0/TBD | - | - |
+| 10 | 0/TBD | - | - |
+| 11 | 0/TBD | - | - |
+| 12 | 0/TBD | - | - |
+| 13 | 0/TBD | - | - |
+| 14 | 0/TBD | - | - |
 
+*Updated after each plan completion*
 
 ## Accumulated Context
 
 ### Decisions
 
-Cleared at v1.0 milestone close — full decision log lives in PROJECT.md Key Decisions and the phase SUMMARYs (all 7 phases' raw execution history retained under .planning/phases/).
+Decisions are logged in PROJECT.md Key Decisions table.
+Recent decisions affecting current work:
+
+- [Roadmap]: Phase numbering continues v1.0 (8-14); research layer-2 split into four phases (9-12) — 15 reqs in one phase exceeded standard-depth manageability
+- [Roadmap]: Transports (Phase 14) deliberately last — MCP catalog derives from the clap tree, so every command family must land first
+- [Roadmap]: Historian binding (Phase 13) is spike-gated — licensed-Historian rig access must be confirmed BEFORE Phase 13 planning
+- [Roadmap]: TUIX-05 fully delivered in Phase 8 (config plumbing + worker parameterization + clamp); TUIX-03/04 (rendering) in Phase 12
 
 ### Pending Todos
 
@@ -80,9 +52,10 @@ None.
 
 ### Blockers/Concerns
 
-None open — all v1.0 blockers closed (Phase 3 resource-family defect closed by 05-02 zip surgery; Phase 4 live gates closed autonomously post-verification; all spikes resolved at planning). Known limitations carried as next-milestone candidates in PROJECT.md Active list.
+- [Phase 13 prerequisite]: Confirm licensed-Historian rig access before starting Phase 13 planning — spike cannot proceed without it (documented-limitation fallback is legitimate, but access confirmation must happen first)
+- [Phase 11 prerequisite]: Real multi-level UDT export needed for the derive-vs-Event-loop decision — requires a live rig during Phase 11 planning
 
 ## Session Continuity
 
-**Last session:** 2026-09-04 — Milestone v1.1 started (scope: agent surface, tag completion, TUI polish, EAM expansion, IDE integration). Defining requirements.
+**Last session:** 2026-09-04 — Created v1.1 ROADMAP.md (phases 8-14), initialized STATE.md, populated REQUIREMENTS.md traceability (25/25 mapped).
 **Resume file:** None

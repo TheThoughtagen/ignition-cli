@@ -5,7 +5,7 @@
 
 ## v1.1 Requirements
 
-Requirements for the v1.1 release. Each maps to roadmap phases (continues v1.0 numbering; v1.0 shipped 44 requirements — see `milestones/v1.0-REQUIREMENTS.md`).
+Requirements for the v1.1 release. Each maps to roadmap phases (continues v1.0 numbering; v1.0 shipped 44 requirements — see `milestones/v1.0-REQUIREMENTS.md`). **Note: the enumeration below contains 25 requirements** (the earlier "24" count mis-tallied EAMW-01..07 as 6; it is 7).
 
 ### Foundation
 
@@ -83,13 +83,37 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (populated by `/gsd-new-milestone` roadmap step) | | Pending |
+| CORE-09 | Phase 8 | Pending |
+| CORE-10 | Phase 8 | Pending |
+| CORE-11 | Phase 8 | Pending |
+| TUIX-05 | Phase 8 | Pending |
+| EXT-01 | Phase 9 | Pending |
+| EXT-02 | Phase 9 | Pending |
+| EAMW-01 | Phase 10 | Pending |
+| EAMW-02 | Phase 10 | Pending |
+| EAMW-03 | Phase 10 | Pending |
+| EAMW-04 | Phase 10 | Pending |
+| EAMW-05 | Phase 10 | Pending |
+| EAMW-06 | Phase 10 | Pending |
+| EAMW-07 | Phase 10 | Pending |
+| TAGS-10 | Phase 11 | Pending |
+| TAGS-11 | Phase 11 | Pending |
+| TAGS-12 | Phase 11 | Pending |
+| TUIX-03 | Phase 12 | Pending |
+| TUIX-04 | Phase 12 | Pending |
+| IDE-04 | Phase 13 | Pending |
+| TAGS-13 | Phase 13 | Pending |
+| TAGS-14 | Phase 13 | Pending |
+| IDE-01 | Phase 13 | Pending |
+| EXT-04 | Phase 14 | Pending |
+| IDE-02 | Phase 14 | Pending |
+| IDE-03 | Phase 14 | Pending |
 
 **Coverage:**
-- v1.1 requirements: 24 total
-- Mapped to phases: 0
-- Unmapped: 24 ⚠️ (roadmap pending)
+- v1.1 requirements: 25 total
+- Mapped to phases: 25
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-09-04*
-*Last updated: 2026-09-04 after initial definition*
+*Last updated: 2026-09-04 — traceability populated by roadmap step; corrected requirement count 24 → 25*
