@@ -1,336 +1,182 @@
-# Technology Stack
+# Stack Research: ignition-cli v1.1 Milestone Additions
 
-**Project:** ignition-cli — Rust CLI + ratatui TUI cockpit for Ignition 8.3+ gateways
-**Researched:** 2026-08-20 (versions verified against crates.io API and official changelogs on 2026-08-20/21)
-
-## Recommendation Summary
-
-| Layer | Choice | Version | Confidence |
-|-------|--------|---------|------------|
-| Workspace layout | Cargo workspace: `ignition-cli` (bin) + `ignition-core` (lib) + `ignition-tui` (lib), `webdev/` payload crate/dir | cargo 1.85+ | HIGH |
-| Rust edition / MSRV | Edition 2024, `rust-version = "1.85"` | 1.85 | HIGH |
-| CLI framework | `clap` (derive API) + `clap_complete` | 4.6.6 / 4.6.9 | HIGH |
-| Serialization / JSON output | `serde` + `serde_json` | 1.0.229 / 1.0.151 | HIGH |
-| Async runtime | `tokio` (rt-multi-thread, macros, time, process, signal) | 1.53.1 | HIGH |
-| HTTP client | `reqwest` (default rustls TLS, `json` feature) | 0.13.4 | HIGH |
-| TUI | `ratatui` (umbrella crate → ratatui-core 0.1.2 + ratatui-crossterm 0.1.2 → crossterm 0.29) | 0.30.2 | HIGH |
-| Docker orchestration | Shell out to `docker compose` (Compose v2 CLI plugin) via `tokio::process::Command` | n/a (host tool) | HIGH |
-| Config / profiles | Hand-rolled: `toml` + `serde` + `directories` | 1.1.4 / 6.0.0 | HIGH |
-| Secrets | `keyring` (default `v1` feature: classic `Entry` API) + env-var fallback | 4.1.6 | MEDIUM |
-| Error handling | `thiserror` everywhere + `std::process::ExitCode` in `main` | 2.0.20 | HIGH |
-| Logging | `tracing` + `tracing-subscriber` (env-filter) [+ `tracing-appender` for TUI mode] | 0.1.44 / 0.3.23 / 0.2.5 | MEDIUM |
-| Time (only if CLI must format/parse timestamps) | `jiff` | 0.2.35 | MEDIUM |
-| HTTP mock tests | `wiremock` | 0.6.5 | HIGH |
-| CLI integration tests | `assert_cmd` + `predicates` + `tempfile` | 2.2.2 / 3.1.4 / 3.27.0 | HIGH |
-| Progress bars (CLI mode only, optional) | `indicatif` | 0.18.6 | LOW (defer) |
-
-**The one-sentence stack:** clap 4 + tokio 1 + reqwest 0.13 + ratatui 0.30 in a three-crate workspace, plain TOML config files with keyring-stored secrets, thiserror-driven JSON error reporting, and `docker compose` driven by subprocess — deliberately boring, all-batteries-included, no frameworks.
+**Domain:** Incremental stack additions to an existing validated Rust CLI/TUI (ignition-cli v1.0 shipped 2026-08-30, 3-crate workspace, ~73,900 lines, lean-tree philosophy)
+**Researched:** 2026-09-04
+**Confidence:** HIGH on crate versions (all verified against crates.io API 2026-09-04, rmcp manifest verified on GitHub `main`, MCP spec fetched from modelcontextprotocol.io) · MEDIUM on the MCP hand-roll-vs-SDK verdict (spec facts HIGH; recommendation is judgment)
+**Workspace floor:** `rust-version = 1.88`, `edition = 2024`, resolver 3
 
 ---
 
-## Detailed Choices
+## Executive Verdict (read this first)
 
-### 1. Project Scaffolding — Cargo Workspace, Three Crates
+The v1.1 feature list needs only **three new direct dependencies**:
 
-**Recommendation: virtual workspace with three member crates + a WebDev routes directory.**
+| Crate | Version | Feature | Serves |
+|-------|---------|---------|--------|
+| `quick-xml` | `"0.42"` | `["serialize"]` | Tag-provider bulk transfer XML (EXT bulk transfer) |
+| `csv` | `"1.4"` | — | Tag-provider bulk transfer CSV (EXT bulk transfer) |
+| `lsp-server` | `"0.10"` | — | IDE-02: LSP mode (`ign lsp`) |
+| `lsp-types` | `"0.97"` | — | IDE-02: protocol types (pairs with lsp-server) |
 
-```
-ignition-cli/
-├── Cargo.toml            # [workspace] virtual manifest, workspace.dependencies
-├── crates/
-│   ├── ignition-cli/     # binary: clap parsing, --json output formatting, exit codes
-│   ├── ignition-core/    # library: GatewayClient (reqwest), API models, config,
-│   │                     #   profiles, keyring, errors, docker compose driver
-│   └── ignition-tui/     # library: ratatui cockpit (depends on ignition-core)
-└── webdev/               # WebDev route Python sources + serde payload contracts,
-                          #   versioned/deployed with the CLI (Key Decision: own routes)
-```
+Everything else is either **already in the workspace graph** (reqwest for EXT-01/02/03, toml/serde/directories for TUIX-01, zip/tempfile for IDE-03, tempfile+std for IDE-01, ratatui 0.30.2 `Style`/`Color` for theming) or — the headline decision — **hand-rolled for EXT-04 MCP: zero new crates**.
 
-**Why:**
-- **`ignition-core` is the seam.** Both front-ends (clap dispatch and TUI) call the same `GatewayClient` + command functions. This makes "every CLI action available in TUI" structural rather than aspirational, and gives wiremock-based tests one surface to target.
-- **`ignition-tui` separate from the bin** keeps the binary's non-TUI path compile-clean and lets you feature-gate the TUI (`[features] default = ["tui"]`) for a smaller headless/agent build (`--no-default-features`). Ratatui + crossterm pull a real dependency subtree; agents never render it.
-- **`webdev/` in-repo** because tag write/alarm/script endpoints are the CLI's own WebDev backend (per Key Decision). Keep the Python route sources and their JSON request/response serde types versioned together — a shared payload crate (`webdev` types inside `ignition-core`, or a 4th tiny crate if the Python side wants to consume a JSON schema later).
-- **`workspace.dependencies`** for single-source-of-truth versions across crates.
+The big call: **MCP transport mode is a hand-rolled JSON-RPC 2.0 shim (~300–500 lines, `serde_json` + tokio only), NOT the official `rmcp` SDK.** The official SDK is excellent and active (rmcp 3.2.0, updated 2026-08-31, MSRV exactly 1.88), but its stdio-server feature set transitively drags in `chrono` (non-optional on native targets!), `schemars`, `uuid`, `pastey`, `indexmap`, `tokio-util`, and `futures` — 8–10 new crates, and `chrono` is on this project's own v1.0 What-NOT-Use list. The v1.0 precedent (docker compose shell-out over `bollard`; serde+toml over `config`/`figment`) and the milestone's own "thin shim over the stable JSON contract" language both point the same way. rmcp is documented below as the sanctioned escalation path if the MCP surface ever grows beyond tools-only.
 
-**Rejected:**
-- *Single crate* — the TUI↔CLI↔client separation is what keeps the "simple but complete" constraint enforceable; single crates rot into module soup at this scope.
-- *xtask* — not needed until there are repo maintenance tasks cargo scripts can't do; add later if wanted.
-- *Workspace member per subcommand domain* — framework creep; three crates is the maximum justified by boundaries.
+---
 
-### 2. CLI Framework — clap 4.6 (derive)
+## Recommended Stack
 
-**Recommendation: `clap = { version = "4.6", features = ["derive"] }` + `clap_complete` 4.6 for a `completions` subcommand.**
+### New Direct Dependencies (complete list — nothing else)
 
-**Why:**
-- Derive-API subcommands map 1:1 onto the domain (`gateway status`, `project list`, `tag read`, `rig up`, `tui`), generate help/completions for free, and `#[command(propagate_version = true)]` gives every subcommand `--version`.
-- Global args (`#[arg(global = true)]`) are exactly what `--json`, `--profile`, `--verbose` need — available on every subcommand without repetition.
-- clap's default exit code for usage errors is `2`, distinct from runtime failures (`1`+) — the exit-code contract (below) builds on this.
-- It is *the* Rust CLI standard (docs.rs/clap sustainably ~10M+ downloads/mo; maintained under clap-rs org with active 2026 releases — 4.6.6 released 2026-08-06).
+| Technology | Version | Purpose | Why Recommended |
+|------------|---------|---------|-----------------|
+| `quick-xml` | `"0.42"`, features `["serialize"]` | Read/write Ignition tag-provider export XML | The consensus Rust XML library (398M downloads, updated 2026-08-22, MSRV 1.86 ✓). Streaming pull-parser + Writer covers both directions of bulk transfer; serde bridge (`serialize` feature) maps tag structs. Only mandatory dep is `memchr` — the leanest real option by a wide margin |
+| `csv` | `"1.4"` | Tag-provider bulk transfer CSV | BurntSushi's canonical CSV crate (238M downloads, 1.4.0 stable since 2025-10, MSRV 1.73 ✓). Deps: `csv-core`, `itoa`, `ryu`, `serde_core` — no tokio, no serde_json pull. Serde row-mapping is exactly the bulk-transfer model |
+| `lsp-server` | `"0.10"` | IDE-02: LSP transport scaffold for `ign lsp` | rust-analyzer's own scaffold, maintained by the rust-lang team (updated 2026-07-16, 15M downloads). Sync crossbeam-channel design: `Connection::stdio()`, framing/handshake handled, dispatch loop owned by us. Total deps: `crossbeam-channel`, `log`, `serde`, `serde_derive`, `serde_json` — **no tokio, no tower** |
+| `lsp-types` | `"0.97"` | IDE-02: LSP 3.17 protocol types | The standard types crate (343M downloads). "Stale" since 2024-06 but that's fine: LSP 3.17-era types cover completion/diagnostics/hover/didChange completely; ignition-nvim needs nothing newer |
 
-**Rejected:**
-- `argh`, `argh_derive` — Google-internal conventions, thinner ecosystem, no completion generation story to match clap_complete.
-- `bpaf` — clever combinators, smaller community; nothing here needs it.
-- Builder API (vs derive) — more code for identical behavior; derive is the community default.
+### Already-in-Graph — No Action Required
 
-### 3. JSON Output Mode — serde_json on every subcommand
+| v1.1 Feature | Existing Crates That Cover It | Integration Note |
+|--------------|-------------------------------|------------------|
+| EXT-01 `ign api call` raw REST passthrough | `reqwest 0.13` (json, query, stream already enabled) | New clap verb → `ignition-core::GatewayApi` extension or a raw-request escape method; response JSON passes through the envelope untouched. Zero deps |
+| EXT-02 diagnostics commands (license, bundle, redundancy, GAN) | `reqwest 0.13`, `serde_json` | All read-path REST + existing exit taxonomy. The bundle command assembles downloaded artifacts — `zip` (already direct in core) if the bundle is an archive |
+| EXT-03 EAM write operations | `reqwest 0.13` | Same `GatewayApi` seam as v1.0's guarded EAM; extend with unguarded verbs + `--yes` guards. Zero deps |
+| TUIX-01 per-profile polling cadence | `toml 1.1`, `serde`, `directories 6.0` | Add a field to the profile struct in `ignition-core`; TUI reads it. Zero deps |
+| TUI theming | `ratatui 0.30.2` (`Style`, `Color`, `Stylize`) | Hand-rolled palette: a `Theme` struct in `ignition-tui` mapping semantic roles → ratatui styles, selected by config. All ratatui theme crates on crates.io are micro-projects (≤2.5k downloads — verified 2026-09-04); do not add one |
+| IDE-01 `ign edit` round-trip | `std::process::Command`, `tempfile 3.27` (already direct in ignition-core) | Spawn `$VISUAL` → `$EDITOR` → `vi` fallback on a `tempfile::Builder` temp file **with a suffix** (`.py` for script resources, `.xml`/`.json` per resource type) so editors apply syntax highlighting. Compare mtime + size after editor exit to detect no-op. Zero deps |
+| IDE-03 workspace checkout | `zip 8.6`, `tempfile`, `tokio::fs`, existing diff/sync actions | Pure fs orchestration of proven v1.0 machinery. **No file watching** — checkout/sync is command-driven by design; do not add `notify` |
+| Tag↔historian binding closure | `reqwest 0.13`, `serde_json`, existing Designer-diff path | Gateway API work, not stack work |
 
-**Recommendation: `serde 1.0` (derive) + `serde_json 1.0`; a global `--json` flag selecting a structured output writer; errors as JSON on stderr.**
+### MCP (EXT-04): Hand-Rolled JSON-RPC Shim — Zero New Crates
 
-**Why:**
-- The `--json` contract is a *project requirement* (agentic usage). Concretely:
-  - `--json`: `serde_json::to_writer_pretty(stdout, &result)` — stable, additive-evolving result shapes (`#[serde(rename_all = "snake_case")]`, `skip_serializing_if` for optionals).
-  - Errors under `--json`: `{"error": {"code": "<stable-slug>", "message": "...", "details": {...}}}` to **stderr**, with non-zero exit code. Agents parse stdout for data and stderr for failure; humans get the same info rendered plainly.
-  - Gateway responses that are passed through (health, module lists) should flow as typed structs where practical, `serde_json::Value` passthrough where the shape is version-dependent.
-- serde/serde_json are compile-time codegen with zero runtime reflection and are already required by reqwest's `json` feature — no extra tree cost.
+**Recommendation:** implement `ign mcp serve` as a stdio MCP server hand-rolled on `serde_json` + tokio (io-std/io-util features already enabled in the workspace tokio).
 
-**Note:** consider machine-readable `--json` output "API" — document field stability the way the ignition-mcp tool catalog did, since this CLI *replaces* ignition-mcp as the agent interface.
+**Why the official SDK is not the pick here (verified facts, not vibes):**
 
-### 4. Async Runtime — tokio 1.53
+- `rmcp` **is** the official Rust MCP SDK (modelcontextprotocol/rust-sdk) — 3.2.0, updated 2026-08-31, 24.2M downloads, Apache-2.0, MSRV 1.88 (exactly matches our floor). It is *not* being rejected on quality grounds.
+- Verified against its GitHub `main` manifest: the `server` feature (which the `default` feature set includes) **forcibly enables** `schemars` (+ its `chrono04` feature), `uuid`, `pastey`, and `transport-async-rw` (`tokio-util/codec`). Separately, `chrono` is a **non-optional** dependency on all native targets. Net new tree for a stdio server: `chrono`, `schemars`, `uuid`, `pastey`, `indexmap`, `tokio-util`, `futures`, `pin-project-lite` (± a few) — 8–10 crates, one of which (`chrono`) this project explicitly rejected in v1.0 ("prefer `jiff` if/when datetime is actually needed").
+- rmcp's ergonomics are typed-parameter-first: `#[tool]` macros want `schemars`-derivable Rust parameter structs. Our tools are *passthrough wrappers* around the frozen `ign` CLI surface — a schema-from-derive model is an awkward fit; we'd fight the framework to express "arguments are the CLI's own arg model".
+- rmcp has moved 0.x → 1.x → 2.x → 3.x within roughly 18 months; riding a fast-moving SDK inside a lean-tree project means recurring churn for capabilities (streamable HTTP, OAuth, elicitation, tasks) a tools-only stdio shim will never use.
 
-**Recommendation: `tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "signal", "io-util", "fs"] }`.**
+**Why hand-rolling is safe here (spec-grounded, modelcontextprotocol.io, spec 2025-06-18):**
 
-**Why:**
-- reqwest is async-on-tokio; ratatui integrates via the standard `tokio::select!` event loop (terminal events + IPC channels + tick). One runtime for HTTP, subprocess, and timeouts.
-- `process` feature drives `docker compose` asynchronously (`Command::output().await`, streaming `stdout`/`stderr` for `compose up --wait` / `logs -f` into the TUI without blocking the render loop).
-- `signal` supports Ctrl-C handling in long-running rig/TUI flows.
-- tokio 1.x is a 6-year-stable LTS line (1.53.1, July 2026); no alternative is credible here.
+- stdio transport = newline-delimited JSON-RPC 2.0; messages MUST be UTF-8, no embedded newlines; stderr is free for logs; client launches the server as a subprocess. The full lifecycle for a tools-only server is: `initialize` → `notifications/initialized` → `tools/list` → `tools/call` (+ `ping`, and `notifications/cancelled` / `$/…` notifications which the spec says to ignore). That's ~4 methods and 2 notifications.
+- Version negotiation is server-tolerant: respond with our pinned `protocolVersion` (e.g. `"2025-06-18"`); spec defines client-side downgrade behavior. No negotiation logic needed.
+- Testing precedent exists: the project already ships a Python WebDev harness; the official Python `mcp` SDK (FastMCP client — the stack being *replaced*) makes a perfect conformance test oracle, alongside live tests against Claude Code / ignition-mcp consumers.
 
-**Rejected:**
-- `async-std` — effectively dormant; reqwest doesn't target it; would require compat shims.
-- `smol` — lovely, wrong network effects for this stack.
-- Blocking everywhere (no runtime) — reqwest's blocking client can't drive a ratatui event loop or stream compose output; you'd fight it within the first TUI phase.
+**The two rules that make-or-break the shim (write them into the plan):**
 
-### 5. HTTP Client — reqwest 0.13 (rustls default)
+1. **stdout purity** — spec: server MUST NOT write anything to stdout that is not a valid MCP message. The child `ign` process's JSON must be *captured* (tokio `process` feature already enabled) and re-emitted inside the `tools/call` response payload, never piped through.
+2. **Unknown-method tolerance** — any `$/`-prefixed or unrecognized notification gets a silent drop, not an error response.
 
-**Recommendation: `reqwest = { version = "0.13", features = ["json"] }` (default features → rustls TLS). Add `"multipart"` when project import/export needs it. Do **not** add `"cookies"` in v1.**
+**Sanctioned escalation path:** if the MCP surface ever needs prompts, resources, elicitation, sampling, or streamable-HTTP transport, switch to `rmcp = { version = "3.2", features = ["server", "transport-io", "macros"] }` (default already carries `server` + `macros` + `base64`; add `transport-io` for stdio). Re-evaluate then; the current milestone doesn't need any of it.
 
-**Why:**
-- One client, cloned across requests, base-URL'd per gateway profile — mirrors the proven `httpx.AsyncClient` shape in ignition-mcp's `IgnitionClient` (the reference implementation this CLI replaces).
-- **0.13 is a real release line with breaking changes you must know up front** (verified from the official CHANGELOG):
-  - **rustls is now the default TLS backend** (was native-tls), crypto provider aws-lc, roots via `rustls-platform-verifier`.
-  - `query` and `form` are now **off-by-default features** — enable if needed.
-  - For dev rigs with self-signed certs: `ClientBuilder::danger_accept_invalid_certs(true)` behind a per-profile `ssl_verify = false` flag (same semantics as ignition-mcp's `ssl_verify` setting). This is a *dev-rig profile* option, never default.
-- Timeouts: set explicit `connect_timeout` + request `timeout` (ignition-mcp uses 30s; keep parity).
+### LSP (IDE-02): `lsp-server` + `lsp-types` — Ecosystem State Late-2025/2026
 
-**⚠ Correction to the project brief — auth is header-based, not cookie/session-based.**
-The research brief said "session/cookie auth." The author's own reference implementation (`ignition-mcp/src/ignition_mcp/ignition_client.py`) does exactly two things:
-1. `X-Ignition-API-Token: <token>` header when an API token is configured (8.3 first-class API tokens; the 83-api Bruno collection has an entire `api-token/` + `config-api-token/` section, e.g. `POST /data/api/v1/api-token/generate`),
-2. HTTP Basic (`Authorization: Basic …`) fallback.
+The Rust LSP-server field, verified against crates.io 2026-09-04:
 
-Neither requires a cookie jar. So: build auth as per-request headers from profile config, keep the `cookies` feature **out** of the tree until a live-gateway phase proves some endpoint needs a session cookie (flag for phase-level verification against a real 8.3.1 gateway). Confidence: MEDIUM-HIGH (reference impl + endpoint evidence; Ignition official docs not directly fetched for auth).
+| Candidate | Version | Last updated | Verdict |
+|-----------|---------|--------------|---------|
+| `tower-lsp` | 0.20.0 | **2023-08-11** | **Dead.** Three years without a release. Ruled out |
+| `tower-lsp-server` (community fork of tower-lsp) | 0.23.0 | 2025-12-07 | Alive but wrong shape: deps include `tower`, `dashmap`, `httparse`, `memchr`, `bytes` **plus its own `ls-types 0.0.6`** — a 0.0.x-versioned types crate with no semver guarantees. Heavier and riskier than the rust-lang option for zero capability gain |
+| `async-lsp` | 0.2.4 | 2026-04-24 | Actively maintained, tower-middleware architecture, but pinned to `lsp-types ^0.95` (two majors old) and drags `tower-layer`/`tower-service`. Middleware layers are overkill for a single-purpose gateway-fed server |
+| **`lsp-server`** | **0.10.0** | **2026-07-16** | **The pick.** rust-analyzer's scaffold, owned by the rust-lang/rust-analyzer team. 5 deps total, no tokio. Sync dispatch loop is a *feature* here: gateway calls via the existing reqwest-backed core run under a small in-process tokio runtime (`Runtime::block_on` — standard pattern, `rt` features already enabled), while the LSP loop stays on plain threads |
 
-**Rejected:**
-- `ureq` (blocking) — fine for pure CLIs, wrong when the TUI needs concurrent requests + streaming output.
-- `hyper` directly — you'd rebuild reqwest.
-- `surf`/`isahc` — stagnant; no reason.
-- `reqwest-middleware` — retries/backoff can be added at the `GatewayClient` level in ~20 lines; skip the extra layer for v1.
+**Integration shape:** `ign lsp` subcommand in the `ignition-cli` crate (like `ign mcp serve`). Completion sources = gateway browse/UDT definitions via `ignition-core`; diagnostics = `ign lint` delegation + existing tag validation. Capability set needed is 3.16/3.17-era: `textDocument/completion`, `didOpen`/`didChange`, `publishDiagnostics`/`textDocument/diagnostic`. `lsp-types 0.97` covers all of it.
 
-### 6. TUI — ratatui 0.30 (umbrella crate)
+**Feature-gating:** add the two crates ungated to `ignition-cli` — combined tree cost is 3 crates (`lsp-server`, `lsp-types`, `crossbeam-channel`), trivially small next to `tui`'s ratatui/crossterm weight. If the default binary size matters later, gate behind `lsp = ["dep:lsp-server", "dep:lsp-types"]` mirroring the existing `tui` feature; not required up front.
 
-**Recommendation: `ratatui = "0.30"` (default features → crossterm backend). Structure: `ignition-tui` crate with an Elm-ish model/update loop driven by `tokio::select!` over (crossterm events, core-command results, tick).**
+### Bulk Transfer Serialization Notes
 
-**Why:**
-- **0.30 (Dec 2025) is ratatui's biggest release** (verified from the repo CHANGELOG): modularized architecture (`ratatui-core`, `ratatui-crossterm` 0.1.2 wrapping **crossterm 0.29** — both verified via crates.io dependency API), `no_std` core, stabilized style system, `ratatui::run(...)` convenience entry, plus 0.30.x polish (Block shadows, scrollbar fixes; 0.30.2 current, June 2026).
-- Depending on the **umbrella `ratatui` crate** is the supported path; sub-crates (`ratatui-core`, `ratatui-crossterm`) are for special needs (custom backend version pinning) — don't reach for them directly here.
-- Async pattern is standardized (ratatui's own async template): `tokio::select!` { crossterm::event::read (via a blocking-task→channel bridge or the EventStream pattern), mpsc receiver of core results, interval tick } → update model → draw. Every CLI action is a `ignition-core` call spawned as a task; the TUI is a shell over the same commands the CLI dispatches.
-- Project constraint says ratatui explicitly; this section is about *how*, not *whether*.
+- **XML (tag provider format):** Ignition 8's tag XML is attribute-heavy and element-nested. `quick-xml` serde derive handles the regular parts (`#[serde(rename = "@attrName")]` for attributes); expect hand-rolled `Event`-loop code for the irregular tag-definition corners rather than forcing full derive coverage. Writing uses `quick_xml::Writer`. Enable exactly `features = ["serialize"]`.
+- **CSV:** `csv 1.4` + serde structs per row. Flat tag export maps cleanly; UDT parameter tables need explicit column ordering — decide the column contract in requirements, not in the crate.
 
-**Rejected:**
-- `tuirealm` 4.1 (formerly `tui-realm`) — an Elm-architecture component framework over ratatui. Active (May 2026), but it's exactly the "framework creep" the project constraints rule out; its stdlib widget set adds tree weight and its abstraction fights you on custom gateway-centric views (tag trees, log tail panes).
-- `ratatui-*` third-party widget mega-crates — pull what's needed (Table, Tabs, List, Paragraph, Gauge) from core; add `tui-widgets` (the official extra-widgets repo) later only if a specific widget is missing.
-- termion backend — Unix-only; crossterm is cross-platform and the ratatui default.
-- `crossterm` as a direct dependency — access events through `ratatui`'s re-export so the crossterm version stays pinned to what `ratatui-crossterm` expects (0.29).
+### Development Tools (no additions)
 
-### 7. Docker Orchestration — shell out to `docker compose` (Compose v2 CLI plugin)
+| Tool | Purpose | Notes |
+|------|---------|-------|
+| Existing `wiremock` / `snapbox` / `assert_cmd` / `predicates` / `tempfile` | Test stack unchanged | LSP + MCP handlers test at the message layer (feed framed JSON, assert framed responses) — no new test deps. MCP conformance oracle = Python `mcp` SDK invoked like the existing Python harness precedent |
 
-**Recommendation: drive rigs via `tokio::process::Command` invoking `docker compose ...` in the rig directory; parse state with `docker compose ps --format json` (JSON Lines). No bollard in v1.**
+---
 
-**Why:**
-- **Rigs are compose files** — the git-module `docker/` directory (compose files, gw-build, gw-init, test-rig) is the declared pattern source, and WHK-Global interop is a project constraint. Compose semantics (`depends_on`, healthchecks, `env_file`, profiles, build args, `--project-directory`) are a *large, moving surface* that the `docker compose` plugin already implements and the ecosystem (including git-module rigs) is tested against.
-- **Structured output exists**: `docker compose ps --format json` emits JSON Lines per container (verified in Docker's official command reference) — parses cleanly with serde_json for both TUI status panes and `--json` CLI output.
-- **No extra dependency**: Docker is a prerequisite for rigs anyway; the CLI shells out to a tool that must already be installed. Streaming `compose up --wait` / `logs -f` output maps naturally onto tokio `Child` stdout.
-- **bollard-compose does not exist** (verified: crates.io search returns nothing; bollard itself has no compose support — it's a Docker *daemon API* client). Using bollard for rigs would mean reimplementing compose file parsing/merge/interpolation and lifecycle ordering — weeks of work to re-create a CLI that's already installed.
+## Installation
 
-**Rejected / deferred:**
-- `bollard` 0.21.1 (active, Aug 2026) — **defer, not rejected**: the right tool if v2 needs daemon-level introspection (streaming container events, stats, image pulls with progress). Re-evaluate when a feature actually wants it; keep it out of v1's tree.
-- `compose-spec` parsing crates — only relevant if you ever generate/validate compose files programmatically; rigs already have files.
-- Shelling to legacy `docker-compose` (Python v1) — dead; require Compose v2 (`docker compose`, check with a version probe and fail with a clear error).
-
-### 8. Config / Profiles — plain TOML files
-
-**Recommendation: hand-rolled profile store: `directories` 6.0 for the config dir, `toml` 1.1 + serde for parse/serialize. File layout: `~/.config/ignition-cli/config.toml` (default) + `profiles/<name>.toml`, with `IGNITION_*` env-var overrides.**
-
-**Why:**
-- Profiles are small, typed, and few (dev/test/prod gateways + rig dirs + auth refs). A `[profile.dev]` table → `GatewayProfile` struct is ~50 lines total; no framework needed — matches the "simple but complete, lean tree" constraint.
-- `directories` gives correct XDG/BaseDir behavior on macOS/Linux without hand-rolling (project owner is on macOS; `~/Library/Application Support` handled).
-- **`toml` 1.0 finally shipped (2026-02-11), now 1.1.4** (verified from toml-rs changelog) — the parser is stable at semver 1.0 with TOML 1.1 parse support. MSRV 1.85 (hence the edition-2024 recommendation above).
-
-**Shape (starting point):**
 ```toml
-# ~/.config/ignition-cli/config.toml
-default_profile = "dev"
-
-[profiles.dev]
-url = "https://localhost:8443"
-ssl_verify = false            # self-signed dev rig
-auth = "keyring"              # keyring | token-env | basic
-# secrets NEVER in this file: resolved via keyring or IGNITION_DEV_TOKEN etc.
-
-[profiles.dev.rig]
-compose_dir = "~/code/whiskeyhouse/ignition-git-module/docker"
-project = "gw-test"
+# Root Cargo.toml [workspace.dependencies] — the complete v1.1 delta
+quick-xml = { version = "0.42", features = ["serialize"] } # tag-provider bulk transfer XML (read+write, serde bridge)
+csv = "1.4"                                                 # tag-provider bulk transfer CSV
+lsp-server = "0.10"                                         # IDE-02: LSP transport scaffold (ign lsp)
+lsp-types = "0.97"                                          # IDE-02: LSP 3.17 protocol types
+# NO MCP crate. EXT-04 is hand-rolled JSON-RPC 2.0 over stdio on serde_json + tokio (already in graph).
+# Escalation path if the MCP surface grows beyond tools-only stdio:
+# rmcp = { version = "3.2", features = ["server", "transport-io", "macros"] }
 ```
 
-**Rejected:**
-- `config` 0.15 — actively maintained but pulls a broad dependency surface (many format backends) for a problem that is one file format + env overlay; the overlay logic is ~20 lines of `std::env` matching.
-- `figment` 0.10 — last release May 2024 (verified on crates.io); stale for a new greenfield choice.
-- JSON/YAML config — TOML is the Rust-native convention, human-editable, comments supported; YAML's tree and ambiguity buy nothing here.
+Placement: `quick-xml`/`csv` → `ignition-core` (serialization lives next to the gateway client, testable with wiremock fixtures). `lsp-server`/`lsp-types` → `ignition-cli` (the `ign lsp` subcommand). MCP shim → `ignition-cli` (`ign mcp serve`).
 
-### 9. Secrets — keyring 4.1 + env fallback
-
-**Recommendation: `keyring = "4.1"` with **default features** (the `v1` feature provides the classic `Entry` API). Resolution order per profile: env var → keyring → (interactive prompt, TUI only).**
-
-**Why:**
-- API tokens for prod gateways shouldn't live in plaintext TOML. `keyring::Entry::new("ignition-cli", "profile:prod")` maps 1:1 to profiles; macOS Keychain is the owner's daily driver (Linux secret-service supported too).
-- **keyring v4 was re-architected** (repo: `open-source-cooperative/keyring-rs`, verified from GitHub releases): v4.0 (Apr 2026) moved to `keyring-core` and briefly became a "sample app"; **v4.1.0 (Jun 2026) restored the v1-style standalone `Entry` API as the default feature** and stripped the CLI example's deps out — so `keyring = "4.1"` default features is both lean and the familiar API. Active maintenance (4.1.6, Aug 2026).
-- Env fallback (`IGNITION_TOKEN_<PROFILE>` / `IGNITION_TOKEN`, `IGNITION_USER`/`IGNITION_PASSWORD`) keeps CI and agents working without a keychain, mirroring ignition-mcp's settings pattern.
-- Confidence MEDIUM: v4.1's default-`Entry` behavior verified from release notes but not compiled against; pin `4.1` and smoke-test in the config phase. (If the default store surprises on Linux CI, mark keyring tests `#[cfg(target_os)]`-gated.)
-
-**Rejected:**
-- Plaintext secrets file with `0600` — works, but prod gateway tokens in dotfiles is exactly what leaks; keyring is one small crate.
-- `secrecy` crate wrapping — useful hygiene (`SecretString`) but can be added when the config layer lands; not a v1 blocker. (Mention: consider `zeroize`-backed `secrecy` for in-memory token strings — optional polish.)
-
-### 10. Error Handling & Exit Codes — thiserror + std::process::ExitCode
-
-**Recommendation: `thiserror 2.0` typed errors in `ignition-core`; a `CliError` wrapper in the bin mapping to stable exit codes; `fn main() -> ExitCode`. Errors render human-formatted by default, JSON under `--json`.**
-
-**Exit-code contract (script/agent-facing "API"):**
-
-| Code | Meaning | Examples |
-|------|---------|----------|
-| 0 | success | — |
-| 1 | general runtime failure | unexpected internal error |
-| 2 | usage error (clap default) | bad flags, missing args |
-| 3 | connection failure | gateway unreachable, timeout |
-| 4 | auth failure | 401/403, bad token |
-| 5 | gateway state error | project not found, rig not running |
-| 6 | docker/rig failure | `docker compose` nonzero, docker missing |
-
-**Why:**
-- `thiserror` (2.0.20, Aug 2026) gives typed variants that carry structured details for the JSON error envelope (`code` slug + message + optional details), and `#[from]` conversions from reqwest/serde/io.
-- `std::process::ExitCode` (stable since Rust 1.61) makes `main` return codes cleanly; the mapping lives in one `impl From<&CliError> for ExitCode`.
-- Stable slugs/codes documented alongside `--json` output = the agentic contract. Divergence = breaking change.
-
-**Rejected:**
-- `exitcode` crate — frozen since **2017** (verified on crates.io); a const-module adds nothing over `ExitCode`.
-- `anyhow` as the primary error type — great for prototypes, but the `--json` envelope needs typed variants anyway; ad-hoc context strings fight the stable-slug requirement. (Using anyhow inside TUI-internal glue would be acceptable; simplest is to not need it.)
-- `miette` 7.6 / `color-eyre` 0.6 — rich diagnostic rendering (spans, snippets) is overkill for a gateway client whose errors are mostly HTTP statuses and compose stderr; both add tree weight and opinionated output that conflicts with the JSON envelope.
-
-### 11. Logging / Diagnostics — tracing (optional but recommended)
-
-**Recommendation: `tracing 0.1` + `tracing-subscriber 0.3` with `env-filter` (`IGNITION_LOG`/`RUST_LOG`), writing to **stderr** in CLI mode and to a rotating file (`tracing-appender 0.2`) in TUI mode.**
-
-**Why:** the TUI owns the screen — any stray println corrupts the render; file-append logging during TUI sessions is the only sane sink, and CLI debuggability (HTTP request/response at `debug` level) pays for itself the first time a WebDev route misbehaves. Never at info+ by default (agents parse stdout/stderr).
-
-### 12. Time — jiff, only if needed
-
-**Recommendation: don't add a datetime crate in v1; pass gateway timestamps through as-is (serde passthrough). If formatting/parsing becomes necessary, use `jiff 0.2` (0.2.35, active July 2026) — not `chrono`.**
-
-**Why:** tag history/alarm timestamps come from the gateway; echoing them doesn't need local parsing. When it does, jiff is the modern, tz-correct, actively-developed choice; chrono 0.4 remains maintained but is the legacy option.
-
-### 13. Testing Stack
-
-| Tool | Version | Use |
-|------|---------|-----|
-| `wiremock` | 0.6.5 | Mock the gateway `/data` + `/webdev` endpoints for `GatewayClient` tests (status JSON, auth failures, WebDev payloads) |
-| `assert_cmd` | 2.2.2 | Binary-level CLI tests incl. `--json` output shape and exit-code contract |
-| `predicates` | 3.1.4 | Assertions for assert_cmd |
-| `tempfile` | 3.27.0 | Isolated config/profile dirs in tests |
-| `mockall` | 0.15.0 | Only if trait-mocking is wanted beyond wiremock; optional |
-
-Rig commands: gate compose tests behind `#[ignore]`d integration tests that require Docker — CI runs them on demand; unit tests assert the *command construction* (argv) instead.
-
-### 14. Rust Edition & MSRV
-
-**Edition 2024, `rust-version = "1.85"`.** Driven by `toml` 1.1's MSRV (verified) and the general 2026 ecosystem floor; edition 2024's `let`-chains/`unsafe_op` semantics are nice-to-haves, the MSRV is the real constraint.
+```bash
+cargo add quick-xml --features serialize -p ignition-core
+cargo add csv -p ignition-core
+cargo add lsp-server lsp-types -p ignition-cli
+```
 
 ---
 
-## What NOT to Use (summary table)
+## Alternatives Considered
+
+| Recommended | Alternative | When to Use Alternative |
+|-------------|-------------|-------------------------|
+| Hand-rolled MCP shim | `rmcp 3.2.0` (official SDK) | If/when MCP mode needs prompts, resources, elicitation, sampling, streamable-HTTP transport, or the spec drifts in ways a shim can't track. Cost then: `chrono`, `schemars`, `uuid`, `pastey`, `indexmap`, `tokio-util`, `futures` enter the tree (chrono non-optional). Acceptable as a *deliberate later decision* |
+| Hand-rolled MCP shim | `mcp-*` third-party crates | Never found a credible one worth listing — official SDK dominates; niche alternatives are less maintained than rmcp |
+| `lsp-server 0.10` + `lsp-types 0.97` | `tower-lsp-server 0.23` | Only if tower middleware composition is genuinely wanted; the `ls-types 0.0.x` dependency makes it strictly worse for us today |
+| `lsp-server 0.10` + `lsp-types 0.97` | `async-lsp 0.2.4` | Only in an already-async tower-native codebase; its `lsp-types ^0.95` pin is behind the curve |
+| `lsp-server` | Hand-rolled LSP framing | Never. LSP's Content-Length framing + encoding edge cases are exactly what this crate exists to absorb; it costs 2 crates |
+| `quick-xml 0.42` | `roxmltree` | Read-only (no writer) — wrong for a round-trip transfer feature |
+| `quick-xml 0.42` | `hard-xml` / `xmltree` | Derive-first but heavier/pull-based-or-stale; quick-xml is the ecosystem default at 40× the downloads |
+| `csv 1.4` | Hand-rolled CSV | Never. Quoting/escaping edge cases are a solved, subtle problem |
+
+---
+
+## What NOT to Add (lean-tree compliance)
 
 | Rejected | Reason |
 |----------|--------|
-| `async-std` / `smol` | Dormant/niche; reqwest + ecosystem are tokio-native |
-| `ureq` | Blocking-only; incompatible with async TUI + streaming |
-| `tuirealm` (ex tui-realm) | Framework creep (explicit project constraint); smaller ecosystem |
-| `bollard` (v1) | No compose support — reimplementing Compose semantics is a trap; revisit for daemon introspection in a later milestone |
-| `bollard-compose` | **Does not exist** (verified crates.io, 2026-08) |
-| `config` / `figment` | Heavy / stale respectively; profiles need ~100 lines of serde+toml+env |
-| `anyhow`-as-primary | Fights the stable JSON error-slug contract |
-| `exitcode` crate | Unmaintained since 2017; `std::process::ExitCode` exists |
-| `miette` / `color-eyre` | Diagnostic theater for a non-source-language tool; conflicts with JSON envelope |
-| `chrono` | Prefer `jiff` if/when datetime is actually needed |
-| `indicatif` in TUI | TUI progress = ratatui Gauge/Paragraph; indicatif only ever for CLI-mode long ops (defer) |
-| reqwest `cookies` feature | Auth is header-based (API token / Basic) per reference impl; add only if live-gateway testing proves a session-cookie endpoint |
+| `rmcp` (for now) | Official and healthy, but stdio-server profile forces `chrono` (on this project's own reject list), `schemars`, `uuid`, `pastey`, `indexmap`, `tokio-util` into the tree for capabilities a tools-only shim never uses. Documented escalation path, not a dead end |
+| `tower-lsp 0.20` | Dead — last release 2023-08-11 (verified crates.io) |
+| `tower-lsp-server 0.23` | Community fork is alive but depends on its own `ls-types 0.0.6` (0.0.x = no semver contract) plus tower/dashmap/httparse; heavier than lsp-server for nothing we need |
+| `async-lsp 0.2.4` | Pin to `lsp-types ^0.95` and tower middleware weight; wrong fit |
+| `notify` (file watching) | IDE-03 workspace checkout is command-driven fetch/sync by design — no watcher. 9.0.0-rc exists but adds an event-loop surface we don't want |
+| ratatui theme crates (`ratatui-themes` et al.) | All are micro-projects (≤2.5k downloads, verified 2026-09-04); a ~50-line `Theme` struct over ratatui 0.30.2 `Style`/`Color` is the whole feature |
+| `chrono` | v1.0 standing decision reaffirmed; if EXT-02 diagnostics needs client-side date math, `jiff 0.2` (17.9M downloads, active) is the sanctioned option — likely still unnecessary since gateway timestamps arrive as strings |
+| `tokio-util` (direct) | Only needed by rmcp's codec; the hand-rolled MCP shim does newline framing with `tokio::io::BufReader::lines()` |
+| `schemars` | MCP tool input schemas are hand-authored descriptive JSON for passthrough tools; derive-generated schemas would misdescribe CLI-arg semantics |
+| `serde_yaml`, `toml_edit`, `config`, `figment` | v1.0 standing decisions; TUIX-01 is one TOML field, not a config-framework problem |
 
 ---
 
-## Installation (workspace skeleton)
+## Confidence Assessment
 
-```toml
-# Root Cargo.toml (virtual manifest)
-[workspace]
-resolver = "3"                        # edition-2024 resolver
-members = ["crates/ignition-cli", "crates/ignition-core", "crates/ignition-tui"]
+| Area | Level | Basis |
+|------|-------|-------|
+| Crate versions | HIGH | Every version/deps/MSRV figure pulled live from the crates.io API on 2026-09-04; rmcp feature graph read from its GitHub `main` manifest |
+| LSP ecosystem verdict | HIGH | Maintenance dates verified; `lsp-server` API surface confirmed on docs.rs (0.10.0, Connection/IoThreads/dispatch-loop model) |
+| MCP spec facts | HIGH | modelcontextprotocol.io 2025-06-18 transports page fetched directly (stdio framing, stdout purity, version negotiation) |
+| MCP hand-roll recommendation | MEDIUM | Facts HIGH, but the verdict is an engineering judgment balancing lean-tree precedent vs. spec-drift ownership. Mitigated by the documented rmcp escalation path and Python-SDK conformance testing |
+| Tag XML serde coverage | MEDIUM | quick-xml serde capability is HIGH-confidence; the *degree* to which Ignition's tag XML resists derive-mapping needs phase-specific research against real exports |
 
-[workspace.package]
-edition = "2024"
-rust-version = "1.85"
+## Open Questions for Phase Research
 
-[workspace.dependencies]
-clap = { version = "4.6", features = ["derive"] }
-clap_complete = "4.6"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "process", "signal", "io-util", "fs"] }
-reqwest = { version = "0.13", features = ["json"] }        # add "multipart" for import/export
-ratatui = "0.30"
-toml = "1.1"
-directories = "6.0"
-keyring = "4.1"
-thiserror = "2.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-url = "2.5"
-# dev
-wiremock = "0.6"
-assert_cmd = "2.2"
-predicates = "3.1"
-tempfile = "3.27"
-```
+1. **Ignition tag XML shape vs. serde derive** — pull a real multi-level UDT export and decide derive-vs-Event-loop split before writing code (phase research, wiremock fixtures can't provide this).
+2. **MCP protocolVersion pin** — confirm "2025-06-18" acceptance across target clients (Claude Code, Claude Desktop) at implementation time; a live smoke test, not research.
+3. **`ign lsp` + reqwest under a sync loop** — verify the thread-loop + in-process tokio `block_on` pattern under the existing `tracing-subscriber` (LSP servers must keep stdout clean — logs go to stderr or a file, same rule as MCP).
 
----
+## Sources
 
-## Verification Notes
-
-How and where each claim was checked (no training-data-only version claims):
-
-| Claim | Source | Date checked |
-|-------|--------|--------------|
-| All crate versions (clap 4.6.6, ratatui 0.30.2, reqwest 0.13.4, tokio 1.53.1, serde 1.0.229, serde_json 1.0.151, thiserror 2.0.20, bollard 0.21.1, toml 1.1.4, keyring 4.1.6, directories 6.0.0, tracing 0.1.44/0.3.23, jiff 0.2.35, wiremock 0.6.5, assert_cmd 2.2.2, tempfile 3.27.0, predicates 3.1.4, indicatif 0.18.6, clap_complete 4.6.9, crossterm 0.29.0, ratatui-core/-crossterm 0.1.2) | `crates.io/api/v1/crates/{name}` (`max_stable_version`) via curl+jq | 2026-08-21 (UTC) |
-| reqwest 0.13 breaking changes (rustls default, aws-lc, `query`/`form` feature-gated, cookies feature, `danger_accept_invalid_certs`) | Official CHANGELOG fetched from `github.com/seanmonstar/reqwest` (raw master) | 2026-08-21 |
-| ratatui 0.30.0 = "biggest release", modular split (ratatui-core, ratatui-crossterm, etc.), 0.30.1/0.30.2 contents, crossterm 0.29 support | Official repo CHANGELOG (raw, main) + crates.io dependency API for `ratatui-crossterm 0.1.2` (shows optional crossterm ^0.28/^0.29) | 2026-08-21 |
-| `bollard-compose` does not exist; `tuirealm` renamed from tui-realm, 4.1.0 active | crates.io search API (`?q=bollard-compose` → zero results; `?q=tui-realm` → `tuirealm` 4.1.0, 2026-05) | 2026-08-21 |
-| keyring v4.0 re-architecture + v4.1.0 restoring default `v1` `Entry` API, active maintenance | GitHub releases for `open-source-cooperative/keyring-rs` (fetched full release list) | 2026-08-21 |
-| `toml` 1.0.0 (2026-02-11) / 1.1.4 / MSRV 1.85 / TOML 1.1 parsing | Official `toml-rs/toml` crate CHANGELOG (raw, main) | 2026-08-21 |
-| `docker compose ps --format json` JSON-Lines output | Official Docker command reference (docs.docker.com/reference/cli/docker/compose/ps/) | 2026-08-21 |
-| Ignition 8.3 auth = `X-Ignition-API-Token` header preferred, Basic fallback, `ssl_verify` option, no cookie jar | Author's reference implementation `~/whiskeyhouse/ignition-mcp/src/ignition_mcp/ignition_client.py` (read directly) + `83-api` Bruno collection (`api-token/`, `config-api-token/` sections incl. `POST /data/api/v1/api-token/generate`) | 2026-08-21 |
-| clap derive/subcommand/global-arg patterns | Context7 `/websites/rs_clap` (docs.rs cookbook/derive tutorial) | 2026-08-21 |
-| `exitcode` crate unmaintained (2017) | crates.io `updated_at` | 2026-08-21 |
-
-**Known gaps / items to verify during phases:**
-1. **Exact API-token header behavior** (name, and whether 8.3.1 allows token auth on *all* `/data` + `/webdev` endpoints) — verify against a live gateway and the 83-api collection in the client phase. PROJECT.md's "session/cookie auth" phrasing conflicts with the reference implementation; this stack assumes headers (evidence-backed).
-2. Whether project import/export needs `multipart` or plain body upload — enable the reqwest feature when that phase lands.
-3. keyring v4.1 default-store behavior on Linux CI (headless secret-service absent) — smoke test; keep keyring paths out of default CI.
-4. Ignition module/`WebDev` route deployment flow (how the CLI ships its own routes to a gateway) is a design question for the WebDev phase, not a stack question.
+- crates.io API (`/api/v1/crates/...`): rmcp, tower-lsp, tower-lsp-server, ls-types, async-lsp, lsp-server, lsp-types, quick-xml, csv, jiff, notify, schemars, ratatui theme search — fetched 2026-09-04
+- rmcp 3.2.0 `Cargo.toml` — github.com/modelcontextprotocol/rust-sdk (`main`, fetched 2026-09-04): feature graph, chrono non-optionality, MSRV 1.88
+- docs.rs/lsp-server/0.10.0 — crate API and rust-lang/rust-analyzer ownership
+- Context7 `/websites/rs_rmcp_rmcp` — ServerHandler/`#[tool_router]`/stdio transport API surface
+- Context7 `/tafia/quick-xml` — serde bridge capability
+- modelcontextprotocol.io spec 2025-06-18, Basic/Transports — stdio framing, stdout purity rule, version negotiation
+- `.planning/research/STACK.md` (v1.0) — What-NOT-Use list carried forward and extended

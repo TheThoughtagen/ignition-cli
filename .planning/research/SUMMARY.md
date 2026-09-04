@@ -1,186 +1,168 @@
 # Project Research Summary
 
-**Project:** ignition-cli — Rust CLI + ratatui TUI cockpit for Ignition 8.3+ gateways
-**Domain:** Developer/ops tooling wrapping Ignition Gateway REST + WebDev APIs with Docker test-rig control (greenfield, ecosystem-completing)
-**Researched:** 2026-08-20
-**Confidence:** HIGH (stack versions verified against crates.io API + official changelogs 2026-08-21; domain pitfalls verified against official IA docs, IA forum engineer guidance, and the author's own working code)
+**Project:** ignition-cli — v1.1 "Agent Surface & IDE Integration" milestone
+**Domain:** Rust CLI/TUI cockpit for Ignition 8.3+ SCADA gateways — 11 new features layered onto a contract-frozen, live-verified v1.0 (3-crate workspace, ~73,900 lines, lean-tree discipline)
+**Researched:** 2026-09-04
+**Confidence:** HIGH overall (stack versions verified live against crates.io same-day; every architecture integration point verified by reading actual source; pitfalls verified against code/CI/tests; MEDIUM pockets flagged below)
+
+> v1.0 scope baseline lives at `.planning/research/FEATURES-v1.0.md` — reference only, not repeated here.
 
 ## Executive Summary
 
-This is a greenfield Rust CLI (`ign`) that replaces the author's own ignition-mcp (37-tool Python MCP server) as the canonical agent + human interface to Ignition 8.3+ gateways. The external Ignition-CLI landscape is thin — only `igw-cli` (Go) overlaps meaningfully, and it has no TUI, no rig control, no WebDev runtime ops — so "table stakes" is defined by the ignition-mcp catalog being replaced plus standard DevOps-CLI conventions (kubectl/gh patterns: `--json`, exit codes, profiles, `wait`, `doctor`, `--yes` mutation guards). The critical domain fact shaping everything: native 8.3 REST covers config/CRUD/health/backups but **cannot** read/write runtime tag values, query/ack alarms, query history, or execute scripts — those require WebDev routes this repo ships, versions, and deploys itself (`ign webdev deploy`). That deploy capability gates the entire tag-runtime feature block and must be built with it, not after it.
+ignition-cli v1.1 is a **subsequent-milestone feature wave on a frozen contract**, and all four research streams converge on the same shape: this is fundamentally *additive integration work inside a single proven binary*, not new-system design. Zero new crates are created; at most **4 new direct dependencies** enter the tree (`quick-xml` 0.42, `csv` 1.4, `lsp-server` 0.10, `lsp-types` 0.97), everything else rides existing machinery (reqwest, zip, tempfile, ratatui 0.30, toml/serde). The headline stack decision is **EXT-04 MCP as a hand-rolled JSON-RPC 2.0 stdio shim (~300–500 lines on serde_json + tokio), NOT the official rmcp SDK** — rmcp's server profile transitively drags in `chrono` (on this project's own v1.0 reject list), `schemars`, `uuid`, and friends for capabilities a tools-only shim never uses; rmcp is documented as the sanctioned escalation path if the MCP surface ever grows beyond tools-only stdio. LSP picks rust-analyzer's `lsp-server` scaffold (tower-lsp is dead — last release 2023-08; the community fork depends on a 0.0.x types crate; async-lsp is pinned two majors behind).
 
-The recommended approach is a deliberately boring, all-batteries-included stack — clap 4.6 + tokio 1.53 + reqwest 0.13 + ratatui 0.30 in a three-crate workspace (`ignition-cli` bin / `ignition-core` lib / `ignition-tui` lib + `webdev/` route sources), TOML profiles with keyring/env secrets, thiserror-driven JSON error envelopes, and `docker compose` driven by subprocess (bollard rejected: no compose support exists, and reimplementing Compose semantics is a verified trap). The architectural invariant that makes the "TUI = full cockpit" constraint structural rather than aspirational: **CLI handlers and TUI both call a shared actions layer; neither talks to the client directly.**
+Architecturally, the 11 features classify cleanly: two are **new runtime modes** (MCP and LSP as hidden clap subcommands running their own stdio loops, exactly the way `ign tui` already runs its loop), and nine are **additive growth** of the existing action/client/CLI trees. The single structural addition v1.1 requires is **promoting the binary-private `resolve_gateway_api` into a shared `ignition-core::Session` command-execution core** so MCP tools, LSP features, and CLI arms resolve auth/clients identically and invoke `actions::*` in-process (never shelling out to `ign`, never building a second client). Two cross-cutting invariants are non-negotiable and CI-testable: the **stdout-purity rule** (protocol modes own the entire stdout pipe — one stray `println!` corrupts the JSON-RPC stream) and the **tui_coverage parity walk** (every new invocable command needs a registry row or a sanctioned OutOfBand entry; the pinned OutOfBand assertion must be deliberately updated, never casually).
 
-Key risks, all with concrete preventions from prior art: API-token auth is a three-part setup whose failures surface as bare 403s (needs `doctor` from day one); project import/export are *synchronous* with no job IDs (needs per-operation-class timeouts, not async-job machinery); the TUI event loop must never block on gateway I/O (command-layer separation from the skeleton phase); rig resets orphan volumes and collide on ports if compose semantics aren't respected (`down --remove-orphans -v`, explicit project names, port pre-flight); and trial reset has no REST endpoint — it's an auth+CSRF web flow where the three researchers diverge on delegate-vs-reimplement (flagged spike).
+The dominant risk class is **mutation of frozen contracts under feature pressure**: ~30 snapbox goldens pin exact JSON shapes and exit codes, and the reflex to regenerate failing goldens silently breaks every downstream agent. Mitigations are process, not tooling: additive-only contract rule, golden regeneration as a review event, the Three-Place slug rule, and gate-first live verification on **both** 8.3.3 and 8.3.6 rigs (the v1.0 05-06 lesson: wiremock-green-but-dead-live is the most expensive failure mode this project knows). The build order follows directly from the dependency graph: **contract/config foundations first, independent command families in parallel, composite engine work (workspace/historian/edit) next, and the MCP/LSP transports last** — because they are pure lenses over the command surface and would force protocol churn if landed early.
 
 ## Key Findings
 
-### Recommended Stack (from STACK.md)
+### Recommended Stack
 
-One sentence: clap 4 + tokio 1 + reqwest 0.13 + ratatui 0.30 in a three-crate workspace, plain TOML config with keyring-stored secrets, thiserror-driven JSON error reporting, and `docker compose` via subprocess — no frameworks, lean tree. All versions verified live against crates.io/GitHub changelogs on 2026-08-21.
+Full detail: [STACK.md](STACK.md). The entire v1.1 delta is four crates; the MCP decision is the interesting one.
 
-- **Cargo workspace (3 crates + `webdev/` dir), Edition 2024, MSRV 1.85** — `ignition-core` is the seam both front-ends share; feature-gated TUI keeps headless/agent builds lean; WebDev route sources versioned with the CLI (Key Decision: own routes).
-- **clap 4.6 (derive) + clap_complete 4.6** — 1:1 subcommand mapping, global `--json`/`--profile` args, usage-error exit code 2 for free; the Rust CLI standard.
-- **tokio 1.53** (rt-multi-thread, process, signal) — one runtime for HTTP, `docker compose` subprocess streaming, and the TUI `select!` loop.
-- **reqwest 0.13** (rustls default, `json` feature) — ⚠ 0.13 breaking changes verified: rustls is now default TLS, `query`/`form` feature-gated; per-profile `ssl_verify = false` via `danger_accept_invalid_certs` for dev rigs only. **Auth correction: header-based (`X-Ignition-API-Token` + Basic fallback), NOT session/cookie as PROJECT.md phrased it — keep the `cookies` feature OUT until a live gateway proves otherwise.**
-- **ratatui 0.30** (umbrella crate → ratatui-crossterm 0.1.2 → crossterm 0.29) — 0.30 is the modularized "biggest release"; official event-driven-async template is the TUI pattern; access crossterm only via ratatui's re-export.
-- **Shell out to `docker compose` (v2 plugin), no bollard** — `bollard-compose` verified non-existent; rigs are compose files (git-module pattern source) and `docker compose ps --format json` gives structured status. bollard deferred to a possible v2 for daemon-level introspection.
-- **Hand-rolled profiles: `toml` 1.1 + `serde` + `directories` 6.0** — profiles are ~100 lines of typed TOML + env overlay; `config`/`figment` rejected as heavy/stale.
-- **`keyring` 4.1 (default `v1` Entry API) + env fallback** — v4.1 (Jun 2026) restored the classic API; secrets never in TOML. MEDIUM confidence — smoke-test on Linux CI in Phase 1.
-- **`thiserror` 2.0 + `std::process::ExitCode`** — typed errors feed the JSON error envelope; stable exit-code contract: 0 ok / 1 runtime / 2 usage / 3 connection / 4 auth / 5 gateway-state / 6 docker-rig.
-- **Testing: `wiremock` 0.6.5 + `assert_cmd` + `predicates` + `tempfile`** — mock gateway `/data` + `/system/webdev` endpoints incl. HTML error bodies; golden-file JSON-shape tests per subcommand; rig integration tests `#[ignore]`-gated behind Docker.
+**Core technologies:**
+- `quick-xml` 0.42 (`["serialize"]`) → `ignition-core` — tag-provider bulk-transfer XML read+write; the consensus Rust XML library (398M downloads, MSRV 1.86 ✓); expect hand-rolled Event-loop code for irregular tag-XML corners rather than forcing full serde-derive coverage
+- `csv` 1.4 → `ignition-core` — bulk-transfer CSV; BurntSushi canonical crate, serde row-mapping fits the model exactly
+- `lsp-server` 0.10 + `lsp-types` 0.97 → `ignition-cli` — rust-analyzer's stdio scaffold for `ign lsp`; sync crossbeam design means the dispatch loop is ours (gateway calls run under a small in-process tokio runtime); LSP 3.17-era types cover everything ignition-nvim needs
+- **MCP: zero new crates** — hand-rolled newline-delimited JSON-RPC 2.0 over stdio (serde_json + tokio, already in graph). Two make-or-break rules: stdout purity (spec: MUST NOT write non-MCP output to stdout) and silent-drop of unknown `$/` notifications. rmcp 3.2 escalation path documented for if/when prompts/resources/elicitation/HTTP are ever needed
+- Rejected explicitly: rmcp (for now — chrono non-optional), tower-lsp (dead), tower-lsp-server (0.0.x types dep), async-lsp (^0.95 pin), `notify` (no file watching by design), all ratatui theme crates (micro-projects ≤2.5k downloads), `chrono` (standing v1.0 rejection; `jiff` is the sanctioned option if date math ever appears)
 
-Rejected-with-reasons highlights: `tuirealm` (framework creep — explicit project constraint), `anyhow`-as-primary (fights the stable JSON error-slug contract), `exitcode` crate (dead since 2017), `miette`/`color-eyre` (conflicts with JSON envelope), `chrono` (prefer `jiff` if ever needed — don't add in v1).
+**Version requirements:** workspace floor `rust-version = 1.88`, edition 2024 — all picks verified compatible same-day against crates.io.
 
-### Expected Features (from FEATURES.md)
+### Expected Features
 
-**Table stakes — the ignition-mcp 37-tool replacement bar (must be in v1):**
-- **Gateway health/inspection (A1–A11):** status/info, modules, logs (list/fetch/tail/download), logger levels, DB + OPC connections, system metrics (exceed mcp via 8.3 system-performance/thread-diagnostics), connected sessions (designers + Perspective + Vision, incl. terminate), restart + restart-task status, `doctor` (connectivity/auth/write-permission/WebDev-presence probe — igw-cli's best idea), and `wait` primitives (gateway up, restart complete).
-- **Projects (B1–B5):** list (+inheritance), CRUD, export/import (foundation for everything downstream), resource-level get/put/delete ("edit one view without re-importing everything"), collision policies (abort/overwrite/merge — match git-module convention, default Abort).
-- **Tags (C1–C9):** providers, browse (native REST) — then read/write values, tag-config CRUD, UDT defs, alarms (active/history/ack), history queries (all **WebDev**, gated on F6 deploy); bulk tag provider export/import (native, collision-policy Abort).
-- **Profiles/config (D1–D4):** multi-gateway profiles with visible profile name in every output (prod-vs-dev misfire is THE classic accident), token+basic auth from env/keyring, `IGNITION_*` env overrides for everything.
-- **Agentic conventions (E1–E7) — day one, cross-cutting:** `--json` on EVERY subcommand with stable field names, documented exit-code taxonomy, JSON error envelope with code/message/endpoint/hint (e.g., "WebDev route missing → run ign webdev deploy"), non-interactive by default + `--yes` for destructive ops, shell completions, version check refusing <8.3.1 cleanly, human tables + `--compact`.
+Full detail: [FEATURES.md](FEATURES.md). Eleven features, all P1-vs-P2 ranked against gh/kubectl/k9s/btop conventions and local ground truth (83-api Bruno collection, ignition-mcp catalog, ignition-nvim source, ignition-git-module docs).
 
-**Differentiators (the reason this becomes the daily driver):**
-- **F1 Rig lifecycle** — `rig up/down/status/reset/logs` over git-module compose conventions (env names `GATEWAY_ADMIN_USERNAME/PASSWORD`, ports 9088/9043), replacing a terminal of compose incantations. Highest-value differentiator.
-- **F6 Shipped + versioned WebDev backend** — `ign webdev deploy/status` installs the CLI's own routes; route-version negotiation; removes ignition-mcp's #1 setup failure. Gates C3–C8, F7, F10.
-- **F4 TUI cockpit** — k9s-for-Ignition (nothing like it exists in the ecosystem): live dashboard, log tail, tag browser + live watch (F10), alarm panel, project browser, profile switcher; object-list→detail navigation, not menu-tree.
-- **F3 Snapshot/restore** — gwbk via native `gateway-backups` API + project/tag exports; repeatable e2e fixture states (WHK-Global consumer).
-- **F8 Ecosystem interop** — read/delegate/drive, never re-implement: script decode/encode on export/import (nvim loop), `ign lint` delegation wrapper, tag-export browsing, e2e driver mode for WHK-Global Playwright specs.
+**Must have (v1.1 launch set):**
+- **[1] `ign api call`** — gh-api-shaped raw REST escape hatch; cheapest and most unblocking feature in the milestone
+- **[2] Curated diagnostics** — `license status`, `redundancy status`, `gan status`, bundle generate/download/wait (the daily morning-check reads)
+- **[4] MCP transport** — initialize/tools-list/tools-call over stdio, **curated tool subset (~30–40) derived from the clap tree**, `--yes` translated to a `confirm` field for write tools, frozen envelope returned verbatim as tool-result content
+- **[6] Historian binding closure** — via the documented Designer-diff oracle (create one history tag by hand in Designer, `tags config get` it, diff shapes); e2e data-rows is the only acceptable done gate
+- **[9] `ign edit`** — kubectl-edit loop ($EDITOR, content-hash save-detect, error-reopen) over existing put machinery; `--decode-scripts` leg shares the Flint codec with workspace
+- **[10] LSP server** — gateway-data feeder to ignition-nvim: live tag-path/named-query completions, hover, diagnostics; **composition with the existing Python `ignition-lsp` (which owns all static knowledge), never replacement**; nvim detection-order slot #0 is a verified one-line sibling-repo patch
 
-**Defer to v2+:** F5 cross-gateway sync/diff (build on B3/B4 after scope semantics proven), F7 script exec ships opt-in/flag-day, F9 EAM writes (reads maybe), MCP server transport (JSON contract stays stable enough to wrap later), F2 trial reset *mechanism* decision can lag `rig trial status`.
+**Should have (P2 / v1.1.x):**
+- **[3] EAM writes** — suspend/resume/cancel/force/rename/modify/delete behind `--yes`, with blast-radius preview as the differentiator
+- **[11] Workspace checkout** — checkout/status/push over a generalized `MemberSource` diff engine; manifest + three-way compare; `--decode-scripts` checkout is the feature that makes the workspace the primary authoring surface
+- **[5] Tag xml/csv** — **server-byte-faithful passthrough only** (download what the gateway produces, never CLI-side re-serialization — the kindling-shaped rabbit hole); lossy-import warning report is the differentiator
+- **[7] Theming + [8] polling cadence** — k9s/btop-convergent: named semantic palette slots (~15–25 keys), `[ui].theme` top-level config; per-profile `poll_interval_secs` with hard min clamp (a gateway is a real server — sub-second polling is self-DoS)
 
-**Anti-features (explicit):** LSP/completions (ignition-nvim), lint engine (ignition-lint — delegate only), Designer git (ignition-git-module), 8.1.x support, MCP serving in v1, view editing, OpenAPI-discovery subsystem (thin `ign api call` escape hatch instead), daemon/background service, web UI.
+**Defer (v2+):** EAM fleet-upgrade automation (needs own pre-flight/rollback design), MCP resources/sampling (when a consumer exists), historian provider CRUD, GAN diagram visualization. Standing anti-features carried forward: no daemon, no watch-mode, no OpenAPI discovery, no built-in editor, no tag values in the workspace tree.
 
-### Architecture Approach (from ARCHITECTURE.md)
+### Architecture Approach
 
-Single `ign` binary over a three-crate workspace; strict layering: **UI/CLI → shared actions → client/rig → gateway**, results flow back as typed serde models, no component reaches around the actions layer.
+Full detail: [ARCHITECTURE.md](ARCHITECTURE.md). Every integration point was verified by reading actual source; the v1.0 locks (envelope `{ok, profile, data}`, exit codes 0–7 in a single mapping site, core-never-prints, GatewayApi one-coarse-method-per-capability in one impl block, tui_coverage bidirectional walk, WebDev bundle version-lock at 1.1.0) all stand and v1.1 must respect them.
 
-1. **`ignition-core::client` (GatewayClient)** — all HTTP: auth (token header preferred, Basic fallback), base URL per profile, per-operation-class retries/timeouts, error mapping; native REST (`/data/api/v1/*`) + WebDev (`/system/webdev/{project}/{route}` → `Global/IgnitionCLI/*`); coarse `trait GatewayApi` for mock injection (the same seam the TUI uses).
-2. **`ignition-core::actions`** — the verb layer (`health`, `export_project`, `read_tags`, `rig_up`, `webdev_deploy`, …); **invariant: CLI and TUI both call actions, never the client directly** — this is what makes "every CLI action in TUI" cheap.
-3. **`ignition-core::rig`** — compose shell-out with 5-level rig discovery (flag → env/config → cwd compose → git-module docker dir → WHK-Global); trial reset as a *delegation boundary* (subprocess, not embedded browser).
-4. **`ignition-tui`** — official ratatui event-driven-async template: one `AppEvent` enum (Tick/Key/Resize/`ActionCompleted(Result)`), mpsc channel, `tokio::select!` loop, pure `AppState` + render functions, `TestBackend`-testable.
-5. **`webdev/`** — importable Ignition project fragment (`resources/IgnitionCLI/{tags,tagConfig,alarms,scriptExec,tagHistory}/doPost.py`); every route response carries `cliVersion`/contract version for handshake; deploy via REST project-import (mechanism = spike).
-6. **Output/render layer** — presentation never inside actions; `--json` serializes action models zero-copy; exit codes as agent contract.
+**Major components:**
+1. **`ignition-core::Session` execute core** (the ONE structural addition) — promotes `resolve_gateway_api` out of `main.rs`; MCP/LSP/CLI all resolve identically and call `actions::*` in-process; protocol layers are translators, never second clients
+2. **Hidden-subcommand runtime modes** — `ign mcp` and `ign lsp` as `#[command(hide = true)]` stdio loops branching **before** envelope/render resolution (the `ign tui` / `TuiExited` precedent); OutOfBand registry grows from `["completions"]` to include `mcp`, `lsp`, `edit` with per-entry justification
+3. **`MemberSource` diff-engine generalization** — extract "gateway zip OR local fs tree → normalized member list" (~100–200 line refactor of `project_diff`/`scripts_codec` seams); workspace checkout = the diff/sync engine run gateway→fs direction for the first time
+4. **Edge format conversion** — xml/csv convert at the action edge against the existing normalized JSON interchange; the gateway route contract never changes and the v1.0 "planner lock" narrows to the wire layer only
+5. **Config surface, once** — `[ui].theme` top-level + per-profile `poll_interval_secs` land together (ONE goldens migration); TUI workers already take `period: Duration` args — only spawn sites hardcode constants
 
-Testing: 3 layers — unit (mock trait), wiremock HTTP contract (real URL shapes, HTML error bodies, auth headers), and rig-based integration that dogfoods the binary itself (`ign rig up → webdev deploy → tags read --json → rig down -v`), `#[ignore]`-gated for CI.
+**Key anti-patterns to encode in plans:** MCP/LSP building their own reqwest client (five locks re-implemented badly); shelling out to `ign` per tool call; letting protocol modes touch `render_ok`; per-profile theme / global cadence (cross-placed preferences); extending the Python WebDev bundle for anything solvable in Rust (every bundle change is a version-locked deploy event).
 
-### Critical Pitfalls (from PITFALLS.md)
+### Critical Pitfalls
 
-1. **API-token auth is a three-part setup** (write-level security level defined + assigned to Gateway Write Permissions + token carries the level; plus "Require secure connections for API Keys" rejecting plain-HTTP tokens on localhost) — failures return bare 401/403 with no explanation. **Prevention:** `doctor`/`auth check` from day one translating 401/403 into the three concrete causes; document setup in `profile add` output. *(Phase 1–2.)*
-2. **Project import/export are SYNCHRONOUS** — no job IDs exist; the trap is the inverse of the presumed one: long imports block the HTTP connection and a default timeout kills them mid-flight with unknown state. **Prevention:** per-operation-class timeouts (fast reads 10s / import-export minutes-or-disabled / client slightly longer than gateway exec timeout), stream export ZIPs to disk, treat timeout as "verify with `project list`". *(Phase: projects; timeout policy in skeleton.)*
-3. **Blocking the TUI event loop with synchronous gateway calls** freezes the UI and looks like a hang. **Prevention:** actions-on-worker-tasks + mpsc from day one; the command-layer separation enabling this must exist in the skeleton phase, not be retrofitted. *(Phase: TUI, enabled by Phase 1 architecture.)*
-4. **Orphaned volumes/containers and port collisions on rigs** — `down && up` without `-v` leaves stale trial state ("reset didn't work"); implicit directory-name compose projects collide; two rigs fight over 8088/9043 and commands silently target the wrong gateway. **Prevention:** `down --remove-orphans -v` on reset, explicit `-p` project names stored in rig profile, port pre-flight on `up` ("port 8088 in use by container X (rig Y)"), profile-URL-vs-rig-mapping cross-check. *(Phase: rig.)*
-5. **Projects ≠ gateways** — tag providers/config live outside project export ZIPs; a naive "sync projects" delivers a gateway that looks synced but has no tags. **Prevention:** name scope explicitly in command semantics and `--json` metadata (`includes`/`excludes`); separate `sync`/`snapshot` concept composing project + tag-provider config. *(Phase: projects design decision.)*
-6. **WebDev routes are a bespoke contract you own** — prior art shows stringified values, drifting shapes, errors-as-200, Jython 2.7 quirks. **Prevention:** versioned route contract (`contractVersion` handshake, CLI refuses mismatched), type normalization in serde, non-2xx for real errors, `webdev deploy` as first-class bootstrap. *(Phase: WebDev.)*
-7. **Trial reset is an auth+CSRF web flow, not an endpoint** — and browser automation broke across 8.3.3's UI rewrite. **Prevention:** banners endpoint (`GET /data/api/v1/trial` state via `/data/api/v1/overview/banners`) as free `rig trial status`; version-slew-test any reset path. *(Phase: rig — mechanism is a flagged spike.)*
+Full detail: [PITFALLS.md](PITFALLS.md) (17 pitfalls; v1.0 carry-forwards at commit `9d2cc32` remain binding). Top five by blast radius:
 
-Cross-cutting agentic discipline (pitfalls 4.1–4.5): one JSON envelope everywhere, prompts gated on TTY with `--yes`, exit-code taxonomy CI-tested, secret redaction in logs and rig JSON (allowlist, never raw `docker inspect`), progress-to-stderr with parseable stage markers + graceful SIGINT ("compose up completed, gateway still starting").
+1. **Contract mutation via golden-regeneration reflex** — ~30 goldens pin exact shapes; a failing golden regenerated under pressure ships silent breakage to every downstream agent. Avoid: additive-only rule in every PLAN, golden regen = review event (diff in PR description), Three-Place slug rule (enumerated test + README table + prose), new slugs join existing exit buckets — never renumber
+2. **Fighting tui_coverage** — every new CLI node fails CI without a registry row; casual OutOfBand erosion or `hide = true` quietly kills the parity invariant. Avoid: decide the Screen-vs-OutOfBand taxonomy in the FIRST CLI-surface phase; update the pinned `out_of_band_rows_are_exactly_…` test once, in the same PR, with justification
+3. **Stdout purity when protocol modes share the dispatch chassis** — one stray print corrupts the JSON-RPC stream and looks like a server bug. Avoid: protocol modes branch before render (structural, not convention); byte-scan integration test over the real spawned binary that fails on a single stray byte; `deny(clippy::print_stdout)` in protocol modules; **one shared pattern proven in the MCP phase and reused by LSP** — do not mix newline-delimited (MCP) and Content-Length (LSP) framings
+4. **EXT-01 mis-classification: unclassified 4xx → exit-1 "internal error" storm** — the live-proven v1.0 lesson; a passthrough whose whole job is arbitrary URLs will hit this constantly. Avoid: the catch-all classifier is the FIRST task before the happy path (4xx → exit-2 class with verbatim body, 5xx → gateway class); content-type sniffing (HTML → auth class, never serde-panic); binary responses require `-o FILE`; refuse user-supplied auth-pattern headers (redaction extends to them)
+5. **Live-gate erosion (wiremock-green-but-dead-live)** — v1.1 is write-heavy against real infrastructure including the WHK production controller. Avoid: gate-first not gate-last, at least one env-gated live gate per write feature recorded during its phase; **both rigs (8.3.3 + 8.3.6) for endpoint-sensitive features** (diagnostics, historian, EAM); EXT-01's live gate itself must be designed so passthrough can't nuke the rig (read-only method matrix)
+
+Milestone-specific entries worth flagging to the roadmapper: the **MCP tool catalog MUST derive from `Cli::command()`** with a CI parity test (a hand-written catalog is the exact drift class tui_coverage was built to kill); **lsp-server 0.10's sync dispatch loop freezes** if gateway calls run inline (cache + TTL + bounded waits, completions <50ms from cache, never a synchronous round-trip in a request handler); **historian binding is spike-first** — no CLI surface commits until the Designer diff lands a wire shape on a licensed rig, and "documented limitation, now with diff evidence" remains a legitimate outcome.
 
 ## Implications for Roadmap
 
-### Convergence across all four researchers
+Based on combined research, suggested phase structure (consensus across all four researchers; 4 layers, with layer 2 parallelizable — the roadmapper may split it):
 
-- **Skeleton/profiles/auth/contracts first** — FEATURES ("every later feature sits on them"), ARCHITECTURE (build order 1), PITFALLS (phase-mapping row 1 piles 4.1–4.4, 1.1, 1.2, 1.10, 6.1 here).
-- **Rig before WebDev** — ARCHITECTURE is explicit ("the rig is the test fixture for everything downstream, and it dogfoods `rig up`/`reset` in CI"); PITFALLS 6.2 requires rig + webdev-deploy-in-suite-setup for e2e; FEATURES agrees the tracks are independent but WebDev needs a test gateway.
-- **TUI last** — all three: it consumes the completed action surface; building early forces rework (FEATURES), full coverage lands last (ARCHITECTURE), and the Elm/TestBackend pattern must be in the phase plan (PITFALLS 2.3).
-- **WebDev deploy (F6) is fused with tag runtime ops** — F6 gates C3–C8/F7/F10; ship routes + deploy + first tag commands together (FEATURES dependency graph + PITFALLS 1.8 chicken-and-egg note).
+### Phase 1: Foundations — Execute Core + Config Schema + Contract Discipline
+**Rationale:** Everything downstream depends on the Session seam; the config surface must change exactly once (one goldens migration, not two); and the contract-discipline rituals must be codified *before* the second command needs them (Pitfalls 1–2: "the classification decision must precede the second command that needs it").
+**Delivers:** `Session::resolve` + in-process dispatch seam in `ignition-core`; config schema extension (`[ui].theme` top-level + per-profile `poll_interval_secs`, both in ONE migration); TUI worker spawn-site parameterization; codified Three-Place slug rule and Screen-vs-OutOfBand classification taxonomy written into `routes.rs` comments; stdout-purity byte-scan test harness scaffolded (proven by the first protocol mode)
+**Addresses:** infrastructure for all 11 features; TUIX-01 config plumbing; theming config plumbing
+**Avoids:** Pitfalls 1, 2, 14 (config-typo-kills-TUI — degrade-to-default validation established here)
 
-### Divergence to resolve
+### Phase 2: Independent Command Families (parallelizable wave)
+**Rationale:** These features touch disjoint surfaces and depend only on Phase 1; landing them before transports means the MCP tool catalog mirrors a stable command tree (PITFALLS ordering rationale #2: tag transfer carries the possible route-bundle bump and should land before MCP).
+**Delivers:** `ign api call` (catch-all classifier FIRST, then happy path); curated diagnostics (license/redundancy/GAN/bundle, both-rig live gates); EAM write verbs (guard-ladder extension, composition via `composed_settings` seam); tag xml/csv passthrough (quick-xml + csv, server-byte-faithful, loss-report differentiator); TUI theming rendering (**tokenize first** — style-tokens module as the only home of `Color::` literals, CI grep enforcing it — then named palettes) + cadence wiring
+**Uses:** all four new crates; `GatewayApi` coarse-method extension; existing `require_confirmation` guard precedent
+**Avoids:** Pitfalls 6–9 (EXT-01 classifier/injection, EXT-02 point-release variance, EXT-03 wire-shape recomposition), 11 (export-honest/import-guarded fidelity), 13 (tokenization-first), 4 (route-bump = one atomic commit, both-direction drift tests, if xml/csv needs routes at all)
 
-- **Project-ops placement:** FEATURES MVP puts projects 3rd (daily value, native REST, webpage replacement); ARCHITECTURE puts them 5th (after WebDev). **Opinionated call: follow FEATURES — projects at Phase 3.** They need only the matured client from Phase 2, carry no gateway-side setup risk, exercise mutations + the JSON contract before the riskier rig/WebDev work, and deliver the first webpage-replacement value. Both orderings satisfy the hard constraint (rig before WebDev).
-- **Trial-reset mechanism:** ARCHITECTURE/FEATURES lean delegate-to-existing-Playwright-script (cheapest credible, "do not embed a browser engine in Rust"); PITFALLS 1.9 leans native headless HTTP flow (login → session+CSRF from `/data/app/session` → `POST /data/api/v1/trial` → verify via banners) with Playwright as fallback. **Flag as a Phase 4 spike; ship `rig trial status` (banners, free) regardless; reset can follow.**
-- **`ignition-mcp` tool count:** PROJECT.md/FEATURES say 37 tools; ARCHITECTURE cites the `ignition_tools_summary.json` artifact at 42. Treat the JSON artifact as the authoritative parity checklist when the phase lands.
+### Phase 3: Composite / Engine Work
+**Rationale:** Workspace checkout generalizes `project_diff` into `MemberSource` — and both historian binding and `ign edit` consume that same engine and codec leg; hardening decode/encode at workspace scale de-risks edit (ARCHITECTURE: workspace before edit).
+**Delivers:** `ign workspace checkout/status/push` (injective path mapping + hostile-name property tests as plan-01 deliverables, manifest three-way compare, `--yes` push ladder); tag↔historian binding closure (**spike-first**: plan 01 is the time-boxed Designer-diff on both rigs; CLI surface only after a wire shape lands); `ign edit` round-trip (editor seam trait + archetype fixtures, content-hash no-op, fail-closed encode, staleness check before push)
+**Addresses:** features [11], [6], [9]
+**Avoids:** Pitfalls 17 (bijection/manifest), 12 (guess-shapes — the roadmap must hold historian's done-definition loose pending the spike), 15 (adversarial $EDITOR)
 
-### Suggested phases
-
-**Phase 1: Workspace skeleton, profiles, auth & agentic contracts**
-- **Rationale:** Everything depends on it; agentic discipline (envelope, exit codes, TTY rules) must exist before the third command, enforced by CI from then on (PITFALLS 4.1–4.4).
-- **Delivers:** 3-crate workspace, clap global flags (`--json`, `--profile`, `--verbose`), config.toml + profiles + keyring/env secret resolution (0600, redaction), JSON envelope + error taxonomy + exit-code contract (golden-file tested), tracing (stderr CLI / file TUI), `GatewayApi` trait seam + wiremock harness, `version` + completions.
-- **Addresses:** D1–D4, E1–E7. **Avoids:** 1.1/1.2 foundations (doctor prep), 3.6, 4.1–4.4, 1.10, 6.1.
-
-**Phase 2: Gateway client & read-only inspection**
-- **Rationale:** Immediately useful against any 8.3 gateway with zero gateway-side setup; validates auth/error mapping/JSON contract against reality; produces the `wait_until_ready` primitive everything reuses.
-- **Delivers:** GatewayClient (header auth, per-class timeouts, content-type sniffing for HTML error bodies), `status/info/modules/logs(+tail,level)/db/opc/metrics/sessions`, `restart --wait` (multi-stage RUNNING poll, `pendingRestart` in status), full `doctor` (three-part-auth diagnosis + WebDev probe + rig detection), `wait` primitives, `api call` escape hatch.
-- **Addresses:** A1–A11. **Avoids:** 1.1, 1.2, 1.7, 4.4, 4.5.
-
-**Phase 3: Project operations**
-- **Rationale:** Native REST only, no rig/WebDev dependency — the webpage-replacement milestone; first mutating commands prove `--yes`/collision-policy conventions.
-- **Delivers:** `project list/new/cp/mv/rm`, export/import (streaming ZIP, timeout override, idempotent-retry guidance, `overwrite` semantics), resource `ls/get/put/rm`, collision policies, scope metadata (`includes`/`excludes` — no tag providers), first e2e harness skeleton.
-- **Addresses:** B1–B5 (+F8 round-trip hooks later). **Avoids:** 1.3, 1.5, 5.1/5.2 boundaries, 6.2 harness rules.
-
-**Phase 4: Rig lifecycle & trial state**
-- **Rationale:** Before WebDev because the rig is the self-managed test fixture WebDev e2e needs; dogfoods `rig up/reset` in CI from here on.
-- **Delivers:** compose shell-out (v2 version check, explicit `-p` project names, `--remove-orphans`), 5-level rig discovery, `up/down/status/reset/logs` (port pre-flight, volume-teardown explicitness, scan-config/projects + `wait_until_ready` after any file-level op), snapshot/restore (F3, native gwbk API — stretch, may slip to Phase 7), `trial status` (banners) + trial-reset via the spike-chosen mechanism.
-- **Addresses:** F1, F3 (stretch), F2-partial (status now, reset after spike). **Avoids:** 3.1–3.6, 1.9, 1.6, 4.5.
-
-**Phase 5: WebDev backend, deploy & tag runtime ops — the ignition-mcp replacement bar**
-- **Rationale:** F6 gates this whole block; with rig (Phase 4) as fixture, routes can be deployed by the CLI under test, killing the "manually deployed once" dependency.
-- **Delivers:** `webdev/` routes (tags, tagConfig, alarms, scriptExec, tagHistory) with versioned contract + `cliVersion` handshake, `webdev deploy/status` (post-spike), serde normalization for stringified values, `tag read/write/browse/config/udt/history`, `alarm active/history/ack`, `script run` (opt-in, guarded), signature-aware config resource read-modify-write.
-- **Addresses:** C3–C8, F6, F7. **Avoids:** 1.8, 1.4, 6.2 (webdev-deploy-in-suite-setup).
-
-**Phase 6: TUI cockpit**
-- **Rationale:** Consumes the now-complete action surface; command-layer separation (Phase 1) makes full coverage structural — a CI test can assert every CLI subcommand has a TUI action mapping.
-- **Delivers:** event-driven-async loop (AppEvent mpsc, `ratatui::init()`/restore panic hook), health dashboard, log tail with level filter, tag browser + live watch (F10, poll-based), alarm panel, project/resource browser, profile switcher; Elm split + TestBackend snapshot tests.
-- **Addresses:** F4, F10. **Avoids:** 2.1–2.4, 6.3.
-
-**Phase 7: Ecosystem interop & polish**
-- **Rationale:** Differentiators that ride the finished core; each is delegation/convention reuse, low architectural risk.
-- **Delivers:** `lint` delegation, script decode/encode on export/import (nvim loop), tag-export browsing (`--from-export`), F3 if slipped, F5 cross-gateway diff (explicit project-vs-tag-provider scope), curated backup/EAM reads (F9-read), e2e driver conveniences for WHK-Global.
-- **Addresses:** F8, F5, F9-read. **Avoids:** 5.1–5.5 scope traps (explicit delegation boundaries).
+### Phase 4: Transports — MCP then LSP
+**Rationale:** MCP and LSP are pure lenses over the now-complete command surface (FEATURES: "MCP should land AFTER the commands it exposes are stable — it is a lens, not a source"); MCP lands first to prove the protocol-mode pattern (stdout purity, scripted-client harness, coherent version triple in handshakes) once, and LSP reuses it verbatim. LSP is deliberately last: most novel failure surface, and its diagnostics consume Phase 2's lint and diagnostics families.
+**Delivers:** `ign mcp serve` (hand-rolled JSON-RPC shim; catalog derived from `Cli::command()` + CI parity test; `--yes` → `confirm`-field guard translation with the refusal envelope AS the tool result — no bypass flags; worker-task gateway calls so `ping` never starves; exit on stdin EOF); `ign lsp` (lsp-server scaffold; honest capabilities, full-text sync default; cache + TTL + bounded waits; `-32002` pre-init; `ign lsp --check` doctor); OutOfBand rows for `mcp`/`lsp`/`edit` finalized with the pinned-test update
+**Addresses:** features [4], [10] + the nvim one-line detection patch (sibling repo)
+**Avoids:** Pitfalls 3, 10 (lifecycle/framing/catalog-drift/blocked-loop), 16 (state machine, latency)
 
 ### Phase Ordering Rationale
 
-- Dependency graph from FEATURES: profiles+JSON core → everything; WebDev deploy → all WebDev ops; tag browse → read → watch; export → resource ops → diff; rig up → trial reset; native gwbk → snapshot.
-- Architecture layering: client (2) must precede actions that use it; rig (4) must precede WebDev e2e (5); TUI (6) last to avoid rework against a moving action surface.
-- Pitfall phase-mapping table aligns almost 1:1 with this ordering (its rows: skeleton / health / projects / tag-ops+WebDev / rig+trial / TUI — only the projects↔rig swap differs, resolved above toward earlier value).
+- **Dependency-honoring:** Session core is a prerequisite for both transports; config schema is one migration shared by theming + cadence; MemberSource is shared by workspace, historian, and edit; transports wrap everything.
+- **Contract safety:** every command family lands before the tool catalog that mirrors it, so the MCP catalog is derived from a stable clap tree and structurally cannot drift.
+- **Risk sequencing:** the cheapest, most unblocking feature (`api call`) and the daily-check reads land early; the research-shaped feature (historian) gets its spike early enough in its phase to fall back honestly; the most novel failure surface (LSP) lands last, reusing proven patterns.
+- **CI discipline:** each phase's PLAN bakes in its pitfall verifications (per the PITFALLS pitfall-to-phase mapping); the exit-code enumeration test stays green throughout — research found NO new exit codes are needed; all new error surfaces map onto existing classes additively.
 
 ### Research Flags
 
-**Needs `/gsd-research-phase` or an explicit spike during planning:**
-- **Phase 4 (trial reset):** genuine researcher divergence — delegate to Node/Playwright resetter (ARCHITECTURE/FEATURES: cheapest, proven) vs native headless HTTP login+CSRF flow in Rust (PITFALLS: robust against UI rewrites, no Node dep). Verify against ≥2 gateway minor versions.
-- **Phase 5 (WebDev deploy mechanism):** per-resource import vs full project-zip import via 8.3 REST — endpoints exist in 83-api but minimal-payload form unverified (ARCHITECTURE open question 1). Also: script-exec security posture (dedicated role vs admin-only) and tag-history route availability on default rigs (historian enabled?).
-- **Phase 2 (auth verification):** live-gateway check that token-header auth works on all `/data` + `/webdev` endpoints and whether Basic fallback is viable on 8.3.1 — STACK corrected PROJECT.md's "session/cookie" phrasing based on the reference impl; needs empirical confirmation (three-part write setup per PITFALLS 1.1).
+Phases likely needing deeper research during planning:
+- **Phase 2 (tag xml/csv slice):** pull a REAL multi-level UDT export and decide quick-xml serde-derive vs hand-rolled Event-loop before writing code (STACK open question #1 — wiremock fixtures cannot provide this); validate the loss-report design against real exports
+- **Phase 2 (diagnostics slice):** per-endpoint wire-shape verification against BOTH live rigs — 8.3.x point-release variance is the documented failure mode; version-tolerant parsing (deny_unknown_fields OFF, optional fields explicit)
+- **Phase 3 (historian slice):** mandatory spike research — 05-06 Designer-diff re-read, licensed-Historian rig access confirmed BEFORE the phase starts, both-rig diff; roadmap holds the done-definition loose (closure OR documented-limitation-with-diff-evidence are both acceptable outcomes)
+- **Phase 4 (LSP slice):** verify the sync-loop + in-process tokio `block_on` pattern under the existing tracing setup (STACK open question #3); scripted-client harness design
 
-**Standard patterns, skip research-phase:**
-- **Phase 1 (workspace/clap/config):** exhaustively documented Rust-CLI territory; versions verified.
-- **Phase 6 (TUI):** ratatui official templates verified (event-driven-async + component + TestBackend); the pattern is prescribed, not open.
-- **Phase 3 (projects):** endpoint shapes verified in 83-api (675 requests); Bruno `.bru` files double as wiremock fixtures.
+Phases with standard patterns (skip research-phase):
+- **Phase 1:** pure refactor of source-verified code (Session extraction, config keys, worker parameterization) — HIGH confidence, no unknowns
+- **Phase 2 (EXT-01/EXT-03 slices):** established v1.0 patterns extended (guard ladder, classify arms, coarse-method trait); local 83-api collection provides ground truth
+- **Phase 4 (MCP slice):** transport decision settled by stack research; spec facts verified from modelcontextprotocol.io; the protocolVersion pin ("2025-06-18") is an implementation-time live smoke test, not research
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Every version verified via crates.io API + official changelogs 2026-08-21; sub-items MEDIUM: keyring 4.1 default-store (smoke-test Phase 1), indicatif (deferred), tracing-appender TUI mode. One evidence-backed correction (header auth, no cookies). |
-| Features | HIGH | Bar defined by the author's own ignition-mcp catalog + local ecosystem sources (all primary). External landscape (igw-cli HIGH — README fetched; kindling/igniscope/agent-tools MEDIUM) is low-stakes: landscape is thin, competitors don't change the bar. |
-| Architecture | HIGH | Patterns verified against ratatui official templates + local source (ignition-mcp client, WHK-Global WebDev layout, git-module docker conventions). Open questions are enumerated and spike-scoped, not unresolved design risk. |
-| Pitfalls | HIGH | Majority verified against primary sources: official 8.3 docs, IA forum engineer walkthrough, local code that already hit them (reset-trial.mjs breakage comments, gateway.mjs TLS lesson). MEDIUM only: restart timing numbers, TUI-scope judgment. |
+| Stack | HIGH | Every version/deps/MSRV figure pulled live from crates.io API on 2026-09-04; rmcp feature graph read from GitHub `main` manifest; MCP spec facts from modelcontextprotocol.io. MEDIUM on two judgment calls: hand-roll-vs-rmcp verdict (facts HIGH, verdict is engineering judgment — mitigated by documented escalation path + Python-SDK conformance oracle) and degree of Ignition tag-XML resistance to serde derive |
+| Features | HIGH | Endpoint surface verified in local 83-api collection, ignition-mcp catalog (42 tools), nvim LSP source, git-module docs; v1.0 limitations read verbatim from shipped SUMMARY/README. MEDIUM on Ignition tag XML/CSV fidelity characteristics (training-data only — validate loss-report against real exports at phase planning) |
+| Architecture | HIGH | Every integration point verified by reading actual source (dispatch chassis, classify.rs, tui_coverage walk, config known-keys, worker period args, scripts_codec encode/decode). Library-pick MEDIUMs in this file were subsequently resolved by STACK's same-day crates.io verification — where the two documents differ, STACK.md's crate-level verdicts govern (hand-rolled MCP shim; lsp-server 0.10 over tower-lsp-server/async-lsp) |
+| Pitfalls | HIGH | System-internal pitfalls verified against actual code/CI/tests/phase artifacts; protocol claims (MCP stdio framing, lsp-server sync dispatch) verified against primary sources 2026-09-04. MEDIUM on domain behaviors (editor archetypes, Excel corruption, point-release drift beyond the two live rigs) — each backed by a testable prevention, so the phase verification, not the claim, is the safety net |
 
-**Overall confidence: HIGH** — unusually strong for greenfield research because the domain's hardest lessons are already encoded in the author's own prior art, and the external Ignition CLI space is thin enough that this tool defines its own table stakes.
+**Overall confidence:** HIGH — this is the strongest research posture possible for a subsequent milestone: the system is source-verified, the prior milestone's live lessons are documented in-repo, and the open questions are few, specific, and phase-researchable.
 
 ### Gaps to Address
 
-- **WebDev deploy mechanism** — per-resource vs zip import; spike at Phase 5 planning (ARCHITECTURE OQ-1).
-- **Trial-reset path** — delegate vs native HTTP; spike at Phase 4 planning (researcher divergence).
-- **Live-gateway auth verification** — token header across all endpoints, Basic viability, three-part write setup on 8.3.1; resolve empirically Phase 2 (STACK gap 1, PITFALLS 1.1).
-- **keyring 4.1 on headless Linux CI** — smoke-test in Phase 1; keep keyring paths out of default CI (STACK gap 3).
-- **Import/export transport detail** — multipart vs plain body (enable reqwest feature when known); settle in Phase 3 (STACK gap 2).
-- **Parity checklist count** — 37 (PROJECT/FEATURES) vs 42 (`ignition_tools_summary.json`); use the JSON artifact as authoritative in Phase 5.
-- **TUI refresh cadence for prod profiles** — poll-on-tick vs on-demand; decide in Phase 6 design (ARCHITECTURE OQ-5).
+- **Ignition tag XML shape vs serde derive:** decide derive-vs-Event-loop after sampling a real multi-level UDT export (Phase 2 tag slice, first task)
+- **Historian binding wire shape:** completely unknown pending the Designer-diff spike; requires confirmed licensed-Historian rig access before Phase 3 planning; both closure and documented-limitation-fallback are legitimate done states
+- **EXT-02 endpoint wire shapes:** license/redundancy/GAN/bundle shapes vary across 8.3.x point releases — both-rig live verification is a phase success criterion, not a stretch goal
+- **MCP protocolVersion pin:** confirm "2025-06-18" acceptance across Claude Code/Claude Desktop at implementation time (live smoke, cheap)
+- **LSP under tracing:** verify gateway calls via in-process tokio `block_on` coexist with the existing tracing-subscriber in a sync dispatch loop (STACK open question #3)
+- **Contract documented-exception for EXT-01:** write the "api call `data` is gateway-verbatim by design" exception INTO the contract docs during Phase 2 so the normalization instinct never "fixes" passthrough later
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- **Local author ecosystem (read directly):** `.planning/PROJECT.md`; `ignition-mcp` (readme, `ignition_client.py`, `config.py`, `docs/webdev-setup.md`, tool-summary JSON — auth shape, WebDev URL shape, 37/42-tool catalog, env matrix); `ignition-git-module` (readme, `docker/` compose + `.env` + gw-build/gw-init/gw-secrets, test-rig — rig conventions, ports 9088/9043, commissioning, `tags_importOnStartup`); `WHK-Global` (`e2e/reset_trial.mjs`, `e2e/lib/gateway.mjs`, `com.inductiveautomation.webdev/resources/` — route file layout, scoped-TLS lesson, defensive parsing); `ignition-trial-resetter` (readme, `reset-trial.mjs`, `instances/` — no-REST-for-trial-reset, CSRF/session flow, 8.3.3 UI-rewrite breakage); `ignition-nvim` + `ignition-lint` readmes (interop boundaries); `83-api` Bruno collection (~100 endpoint families, 675 requests — native surface: gateway-backups, eam-tasks, restart-tasks, perspective-sessions terminate, running-scripts diagnostics-only).
-- **Official docs/changelogs (fetched 2026-08-20/21):** crates.io API (all crate versions); reqwest 0.13 CHANGELOG (rustls default, feature gates); ratatui repo CHANGELOG + ratatui/templates repo (0.30 modularization, event-driven-async template, TestBackend); toml-rs CHANGELOG (1.0/1.1, MSRV 1.85); keyring-rs GitHub releases (v4.1 Entry-API restoration); Docker docs (compose ps `--format json`, Compose v1-EOL/Spec history); docs.inductiveautomation.com 8.3 API page (token header, signature DELETE, audit logging); IA Forum "Ignition 8.3 API Usage Guide" (three-part auth setup, CSRF session flow, scan routes, HTML error bodies).
-- **Context7:** `/websites/rs_clap` (derive/global-args/exit codes), ratatui 0.30 docs (init/restore panic hook, blocking `event::read`, TestBackend), bollard docs (Engine-API-only — informed the avoidance decision).
+- crates.io API (2026-09-04, same-day): rmcp, tower-lsp, tower-lsp-server, ls-types, async-lsp, lsp-server, lsp-types, quick-xml, csv, jiff, notify, schemars, ratatui-theme search
+- rmcp 3.2.0 `Cargo.toml` — github.com/modelcontextprotocol/rust-sdk (`main`): feature graph, chrono non-optionality, MSRV 1.88
+- modelcontextprotocol.io spec 2025-06-18, Basic/Transports: stdio framing, stdout purity, version negotiation
+- docs.rs/lsp-server/0.10.0: Connection/IoThreads/sync dispatch-loop model; rust-lang/rust-analyzer ownership
+- Context7: `/websites/rs_rmcp_rmcp` (ServerHandler/stdio API), `/tafia/quick-xml` (serde bridge)
+- **Local system source (read directly):** workspace `Cargo.toml`; `ignition-cli/src/{main,cli}.rs`; `ignition-cli/tests/tui_coverage.rs`; `ignition-core/src/client/{mod,classify}.rs`; `ignition-core/src/{output,error,config,poll}.rs`; `ignition-core/src/actions/{mod,tags,projects,eam,resources,lint}.rs`; `ignition-core/src/{scripts_codec,webdev,rig/compose}.rs`; `ignition-tui/src/{lib,context,workers/*}.rs`
+- **Local milestone artifacts:** 05-06 PLAN/SUMMARY (historian spike outcome + Designer-diff path, live-gate discipline); 07-VERIFICATION-GAPS (guard ladder, Two-Place exit rule, route 1.1.0 lockstep, stale-binary evidence); `debug/eam-create-422.md`; v1.0 PITFALLS @ `9d2cc32`; v1.0 ROADMAP/REQUIREMENTS
+- **Local ground-truth repos:** `~/whiskeyhouse/83-api` (Bruno collection — full EAM/license/redundancy/GAN/cert endpoint families); `~/whiskeyhouse/ignition-mcp` (42-tool catalog); `~/whiskeyhouse/ignition-nvim` (LSP detection order, Python ignition-lsp feature set); `~/whiskeyhouse/ignition-git-module` (repo layout, Overwrite/Merge/Abort, `tags_importOnStartup`)
 
 ### Secondary (MEDIUM confidence)
-- `igw-cli` README (fetched raw — command set, doctor, wait, profiles, JSON/exit-code discipline, `--yes` guard; the one meaningful competitor). kindling / igniscope / ignition-agent-tools repo metadata (README fetches 404'd or description-only — landscape context only).
+- Comparable-tool conventions (long-stable, corroborated by v1.0's igw-cli citations): `gh api`, `kubectl edit/--raw`, k9s skins + `refreshRate`, btop `.theme` + `update_ms`, lazygit `gui.theme`, `watch -n`, kubectl-edit loop semantics
+- Ignition tag XML/CSV fidelity characteristics (lossy CSV, legacy XML) — training-data, consistent with kindling's reason to exist; validate against real exports
+- Editor-archetype behaviors (vscode `--wait`, emacs daemon), Excel round-trip corruption modes, nvim LSP client specifics
 
 ### Tertiary (LOW confidence)
-- Landscape negatives ("nobody combines these") rest on absence-of-evidence in a thin ecosystem — recheck igw-cli's trajectory before v1 ships. keyring 4.1 default-store behavior on Linux (release-notes-verified, not compiled against).
+- 8.3.x point-release endpoint drift beyond the two live-verified rigs — bounded by both-rig gating and honest-degradation design, not by prediction
 
 ---
-*Research completed: 2026-08-20 (external verification 2026-08-21)*
+*Research completed: 2026-09-04*
 *Ready for roadmap: yes*

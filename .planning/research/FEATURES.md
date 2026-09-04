@@ -1,229 +1,468 @@
-# Feature Landscape
+# Feature Research — v1.1 New Features
 
-**Domain:** Gateway-management / developer CLI+TUI for Ignition 8.3+ (SCADA/industrial platform)
-**Researched:** 2026-08-20
-**Mode:** Ecosystem (greenfield — what do gateway CLIs have; table stakes vs differentiating)
-
-## Landscape Summary (who else is in this space)
-
-The external Ignition CLI space is **thin** — this niche is wide open (all findings via GitHub API + fetched READMEs, 2026-08-20):
-
-| Tool | Lang | What it does | Overlap |
-|------|------|--------------|---------|
-| `igw-cli` (alex-mccollum, Feb 2026) | Go | Generic Ignition Gateway API wrapper: `call` passthrough, `doctor`, profiles, logs, diagnostics bundles, backup export/restore, tags import/export, restart, `wait` commands, `--json --select --raw --compact`, stable exit codes, `--yes` mutation guard, OpenAPI-spec discovery | **Highest overlap** — but no TUI, no rig control, no WebDev runtime ops (tag read/write, alarms, history, script exec), no ecosystem interop. HIGH confidence (README fetched) |
-| `kindling` (paul-griffith, 48★) | Kotlin | Utilities for Ignition's custom export formats — .gwbk create/extract, project-export editing | Adjacent, not a live-gateway CLI. Already integrated by ignition-nvim. MEDIUM confidence (repo metadata only; README fetch 404'd) |
-| `igniscope` (marcelo-6, Mar 2026) | Rust | Parses Ignition project exports and gateway backups (offline) | Offline parsing only, no gateway ops. MEDIUM confidence (repo description) |
-| `ignition-agent-tools` (baidixueguo, May 2026) | Java+Python | 8.3 gateway module + Python CLI for tag automation over HTTP | Tag automation only, requires their custom module. MEDIUM confidence |
-| Ignition official tooling | — | Gateway web UI, Designer, EAM web UI; Docker image entrypoint (commissioning, gwbk restore); REST API | No CLI/TUI cockpit exists from IA. HIGH confidence |
-
-**Implication:** For Ignition specifically, "table stakes" is defined less by competitors and more by (a) the ignition-mcp 37-tool catalog this CLI replaces (author's own bar), (b) general DevOps-CLI conventions (kubectl/gh/igw-cli patterns: `--json`, exit codes, profiles, `wait`, `doctor`, completion), and (c) the 8.3 native REST surface (~100 endpoint families in the author's 83-api Bruno collection) plus WebDev for runtime ops.
-
-**Key API fact confirmed from local 83-api collection:** native 8.3 REST covers config/CRUD/backups/EAM/sessions/performance — but **not** runtime tag value read/write, alarm queries/acks, tag history, or script *execution* (only running-script *diagnostics*). Those still require the WebDev backend, exactly as ignition-mcp's split assumes. HIGH confidence (675 Bruno requests inspected + ignition-mcp catalog).
+**Domain:** Gateway-management CLI/TUI for Ignition 8.3+ — v1.1 feature landscape (11 new features on a shipped v1.0 base)
+**Researched:** 2026-09-04
+**Confidence:** HIGH overall (endpoint surface verified in local 83-api collection + ignition-mcp catalog + v1.0 live-verified docs; comparable-tool patterns from kubectl/gh/k9s/btop/lazygit conventions — MEDIUM where training-data-only, noted inline)
+**Mode:** Ecosystem, scoped to the 11 v1.1 features. Stack decisions are settled by the sibling STACK researcher (MCP = hand-rolled JSON-RPC 2.0 stdio shim; LSP = lsp-server 0.10 + lsp-types 0.97; theming/polling/workspace = zero new crates) — **not re-litigated here.** v1.0 scope lives in `FEATURES-v1.0.md`; this file only covers the new surface.
 
 ---
 
-## Table Stakes
+## Per-Feature Verdict (scannable summary)
 
-Must-haves. The ignition-mcp catalog is the author's own minimum bar (it replaced the webpage for these); general CLI conventions (validated against igw-cli/kubectl/gh patterns) are the rest. Missing any of these = the user opens the gateway webpage again and the tool loses the daily-driver slot.
-
-### A. Gateway health / inspection
-
-| # | Feature | Command shape (illustrative) | Backend | Complexity | Notes |
-|---|---------|------------------------------|---------|------------|-------|
-| A1 | Gateway info + status (version, platform, revision, running state) | `ign status` / `ign info` | Native REST | Low | mcp: `get_gateway_info`. First thing every agent runs. |
-| A2 | Module health (all modules, state, versions) | `ign modules` | Native REST | Low | mcp: `get_module_health`. |
-| A3 | Gateway logs: list, fetch, tail (`-f`), download | `ign logs [tail]` | Native REST | Med | mcp: `get_gateway_logs`; igw-cli has list/download + logger-level mgmt. TUI log tail is a headline use. |
-| A4 | Logger level management (get/set per-logger) | `ign logs level set` | Native REST | Low-Med | igw-cli parity; debugging staple. |
-| A5 | Database connections status | `ign db` | Native REST | Low | mcp: `get_database_connections`. |
-| A6 | OPC connections status | `ign opc` | Native REST | Low | mcp: `get_opc_connections`. |
-| A7 | System metrics / performance (CPU, memory, historic + current, thread execution) | `ign metrics` | Native REST | Low-Med | mcp: `get_system_metrics`; 8.3 adds system-performance + thread-diagnostics endpoints — exceed the mcp catalog here. |
-| A8 | Connected clients: designers, Perspective sessions, Vision sessions | `ign sessions` | Native REST | Low | mcp: `list_designers` only; 8.3 native has designer-sessions, perspective-sessions (incl. terminate), vision-sessions. |
-| A9 | Gateway restart + restart-task status | `ign restart [--wait]` | Native REST | Med | restart-tasks endpoints; restart without wait-for-ready is a footgun — see A11. |
-| A10 | Connectivity/auth preflight ("doctor") | `ign doctor` | Native + WebDev probe | Low-Med | igw-cli's best idea: URL, TCP, auth, read/write perm checks; ours adds **WebDev-route presence probe** and rig detection. |
-| A11 | Wait/poll primitives: gateway up, restart complete, module ready | `ign wait gateway` | Native REST | Low-Med | Poll loops agents would otherwise hand-roll. igw-cli has `wait gateway/diagnostics-bundle/restart-tasks`. |
-
-### B. Project operations
-
-| # | Feature | Command shape | Backend | Complexity | Notes |
-|---|---------|--------------|---------|------------|-------|
-| B1 | List projects (+ inheritance/parent info) | `ign project ls` | Native REST | Low | mcp: `list_projects`; 8.3 adds valid-parents queries. |
-| B2 | Project CRUD: create, delete, copy, rename | `ign project new/cp/mv/rm` | Native REST | Low-Med | mcp parity. |
-| B3 | Export/import project (full, to/from file or stdout) | `ign project export/import` | Native REST | Med | mcp parity; foundation for sync/diff/lint/e2e workflows. |
-| B4 | Resource-level ops: list, get, put, delete within a project | `ign resource ls/get/put/rm` | Native REST | Med | mcp: 4 resource tools. The "edit one view without re-importing everything" loop. |
-| B5 | Import/export with collision policy (abort/overwrite/merge as API permits) | flag on B3 | Native REST | Low | igw-cli tags import defaults `--collision-policy Abort`; git-module import popup has Overwrite/Merge/Abort — match the convention. |
-
-### C. Tag operations
-
-| # | Feature | Command shape | Backend | Complexity | Notes |
-|---|---------|--------------|---------|------------|-------|
-| C1 | List tag providers; create/delete providers | `ign tag providers` | Native REST | Low-Med | mcp: 4 provider tools. |
-| C2 | Browse tags (tree/filtered) | `ign tag browse` | Native REST | Low-Med | mcp: `browse_tags`. Gate for read/watch. |
-| C3 | Read tag values (single/batch) | `ign tag read` | **WebDev** | Med | mcp: `read_tags`. Native REST cannot read runtime values. |
-| C4 | Write tag value | `ign tag write` | **WebDev** | Med | mcp: `write_tag`. Needs the shipped WebDev routes (D2). |
-| C5 | Tag config CRUD (get/create/edit/delete) | `ign tag get/create/edit/rm` | **WebDev** | Med-High | mcp: 4 tag-config tools. JSON in/out. |
-| C6 | UDT definitions: list types, get definition | `ign tag udt ls/get` | **WebDev** | Med | mcp: `list_udt_types`, `get_udt_definition`. (Native tag *export/import* covers UDTs too — consider native for bulk, WebDev for surgical.) |
-| C7 | Alarms: active, history, acknowledge | `ign alarm active/history/ack` | **WebDev** | Med | mcp: 3 alarm tools. TUI alarm panel depends on this. |
-| C8 | Tag history query | `ign tag history` | **WebDev** | Med | mcp: `get_tag_history`. |
-| C9 | Tag provider export/import (bulk, json/xml/csv) | `ign tag export/import` | Native REST | Med | 8.3 native (igw-cli has it); collision policy default Abort. Complements C5 surgical ops. |
-
-### D. Profile / config management
-
-| # | Feature | Command shape | Complexity | Notes |
-|---|---------|--------------|------------|-------|
-| D1 | Multi-gateway profiles (dev/test/prod): URL, auth, label; `--profile` flag + `IGNITION_PROFILE` env; active default | `ign profile add/use/ls` | Med | kubectl contexts / igw-cli profiles pattern. **Safety: profile name should be visible in every prompt/output** (prod vs dev misfire is THE classic multi-target CLI accident). |
-| D2 | Auth: API token (preferred) + basic auth; token from env, file, or keychain; never echo secrets in `--json` output | config + env | Low-Med | mcp uses API-key-or-basic; 83-api notes `data/config/EXTERNAL/ignition/api-token` persists better across gwbk restores. |
-| D3 | Env-var overrides for everything (URL, token, user/pass, SSL-verify, WebDev endpoints) — scriptable without config files | `IGNITION_*` env | Low | mcp's `IGNITION_MCP_*` pattern, renamed. |
-| D4 | Secrets handling: read from env/files (git-module `gw-secrets/` file pattern exists), optional OS keychain; no plaintext secrets in config by default | config | Med | Interop with rigs' `.env`/`gw-secrets` conventions. |
-
-### E. Agentic / scripting conventions (cross-cutting — do these from day one)
-
-| # | Feature | Complexity | Notes |
-|---|---------|------------|-------|
-| E1 | `--json` on **every** subcommand, stable field names within major versions | Med | Project constraint; igw-cli documents JSON-field stability policy — copy that discipline. |
-| E2 | Stable, documented exit codes (0 ok / 2 usage / config / auth / network / target-state distinctions) | Low-Med | igw-cli: 0/2/6/7 + compat policy. Agents branch on these. |
-| E3 | Machine-readable errors: JSON error envelope with code, message, endpoint, hint (e.g., "WebDev route missing → run ign webdev deploy") | Low-Med | mcp returns "clear error with setup instructions" for missing WebDev — keep that behavior. |
-| E4 | Non-interactive by default; destructive ops require `--yes` (or `IGNITION_YES` env) | Low | igw-cli mutation-safety pattern; agents and CI both need it. |
-| E5 | Shell completion (bash/zsh/fish) via clap | Low | Standard clap_complete; cheap, expected. |
-| E6 | `ign version` (+ check gateway min-version and refuse cleanly on <8.3.1) | Low | Support policy from git-module v2. |
-| E7 | Sensible default output for humans (tables), `--compact` one-line JSON for agents | Low | igw-cli `--compact` pattern. |
+| # | Feature | Table stakes core | Differentiator to chase | Worst anti-feature | Complexity | v1.0 deps |
+|---|---------|-------------------|--------------------------|--------------------|------------|-----------|
+| 1 | `ign api call` | GET-default raw passthrough, method/body flags, raw-not-contract output | method-aware safety classification | an OpenAPI discovery subsystem (already rejected in v1.0) | LOW | profiles, auth, exit codes |
+| 2 | Curated diagnostics | license status, redundancy status, GAN gateways, bundle generate+download+wait | `doctor --deep` / morning-check roll-up | license *activation* writes by default | LOW–MED | status/wait patterns, E-contract |
+| 3 | EAM writes | task suspend/resume/cancel/force + rename/modify/delete, each behind `--yes` | blast-radius preview before execution | fleet-wide Upgrade Agent automation | MED | EAM reads, `--yes`, wait |
+| 4 | MCP transport | initialize/tools-list/tools-call over stdio JSON-RPC, wrapping the command layer | curated tool subset + confirm-field guard mapping | exposing all ~100 REST families as tools | MED | frozen envelope (payload), whole command layer |
+| 5 | Tag bulk xml/csv | server-byte-faithful export + same-endpoint import, format sniffed | lossy-import warning report | CLI-side JSON↔CSV conversion as a "migration" tool | LOW–MED | TAGS-09 export/import |
+| 6 | Historian binding closure | close the gap via Designer-diff oracle, prove data flows e2e | full Designer parity for CLI-created history tags | shipping a shape guess without live data proof | MED (research-shaped) | 05-06 fixture, `tags config get` |
+| 7 | TUI theming | built-in theme set, named palette keys, persisted choice | user theme file + live switch | per-widget arbitrary color pickers | LOW | TUI cockpit, config plumbing |
+| 8 | Polling cadence | global default + per-view override + min clamp | per-panel cadence + pause-on-hidden | sub-second defaults (gateway load) | LOW | TUI poll loop, wait loops |
+| 9 | `ign edit` | $EDITOR + temp file + save-detect + error-reopen loop (kubectl-edit pattern) | `--decode-scripts` leg (edit the .py) | a built-in text editor | MED | resource put, tag config put, Flint codec |
+| 10 | LSP server | stdio LSP serving gateway-data completions/diagnostics, offline-degraded | live tag-path + named-query completions, live hover | reimplementing the Python LSP's static knowledge | MED–HIGH | browse/config/export, profiles |
+| 11 | Workspace checkout | checkout/status/push with deterministic path mapping + manifest | `--decode-scripts` checkout, server-side change detection | bidirectional live-sync daemon (rejected v1.0) | MED–HIGH | export/import, zip surgery, codec |
 
 ---
 
-## Differentiators
+## Feature Landscape
 
-Nobody in the surveyed landscape combines these with the table-stakes API layer. These are the competitive advantages — and the reasons this CLI (not igw-cli, not the webpage, not ignition-mcp) becomes the daily driver.
+### 1. `ign api call` — raw REST passthrough
 
-| # | Feature | Value proposition | Backend | Complexity | Notes |
-|---|---------|-------------------|---------|------------|-------|
-| F1 | **Docker test-rig lifecycle**: `rig up/down/status/reset` driven by compose-file discovery (git-module `docker/` conventions: docker-compose.yml, gw-init, gw-secrets, test-rig); port mapping awareness (8088→9088 etc.); `rig logs` passthrough; wait-for-commissioned | One command replaces a terminal of `docker compose -f ... --env-file ...` incantations; the author's daily workflow | Docker API / compose CLI | **High** | Pattern source: ignition-git-module/docker + test-rig (verified locally). Delegate to `docker compose` CLI first; Docker API only if needed. |
-| F2 | **Trial reset**: `rig trial reset` (+ auto mode) folding ignition-trial-resetter logic | Trial expiry breaks every dev rig; currently 3 separate scripts exist (trial-resetter, WHK-Global e2e/reset_trial.mjs, instance envs) | Headless browser | **High + risk** | Trial reset has NO REST endpoint — needs browser automation (verified: resetter + WHK-Global both use Playwright; mcp catalog lacks it). In Rust this means chromiumoxide/headless_chrome or shelling to the existing Node tool. Flag for phase-level spike. |
-| F3 | **Rig snapshot/restore**: snapshot = gwbk download (native `gateway-backups` API) + project/tag exports; restore = gwbk restore | Repeatable test states; nobody offers this | Native REST | Med-High | Native Get/Restore Gateway Backup exists (83-api verified). Great for e2e fixture reset. |
-| F4 | **TUI cockpit** (ratatui): every CLI action available; live status dashboard (modules, sessions, metrics), log tail with level filtering, tag browser + live watch, alarm panel, project/resource browser, profile switcher | k9s-for-Ignition; nothing like it exists anywhere in the Ignition ecosystem | Same command layer | **High** | Navigation paradigm: object-list → detail (k9s/lazygit style), not menu-tree. Shares the exact command core with CLI (constraint: TUI is the cockpit, not a viewer). |
-| F5 | **Cross-gateway sync/diff**: `ign project diff <profile-a> <profile-b>` (resource-level), then selective sync | Env promotion (dev→test→prod) currently done by hand via webpages | Native REST (export + compare) | Med-High | Build on B3/B4. Compare resource JSON (decoded where possible). |
-| F6 | **Shipped + versioned WebDev backend**: `ign webdev deploy/status` installs/updates the CLI's own WebDev routes on a gateway; route version negotiation; doctor probes it | Removes the #1 setup failure of ignition-mcp (unconfigured endpoints) | WebDev module deploy via REST | Med-High | PROJECT.md decision. Version-stamp routes; CLI refuses WebDev commands with actionable error if mismatched. |
-| F7 | **Script execution** (opt-in): `ign script run` via WebDev, disabled by default like mcp's `run_gateway_script` | Agents can compute/debug gateway-side | WebDev | Med | Native 8.3 has only running-script *diagnostics* (verified) — execution is WebDev-only. Guard rails mandatory (it's RCE-by-design). |
-| F8 | **Ecosystem interop** (see dedicated section): script decode/encode on export/import, tag-export browsing, `ign lint` delegation, e2e driver mode | The whole WhiskeyHouse toolkit becomes one workflow | Mixed | Med | Detailed below. |
-| F9 | **Backup/EAM surface beyond the mcp catalog**: gwbk download/upload-restore, EAM task list/history/create (fan-out to agent gateways) | Replaces EAM webpage for common reads; enables F3 | Native REST | Med | 83-api verified: gateway-backups + full eam-tasks family. Decide EAM *write* scope carefully (anti-footgun). |
-| F10 | **Tag watch** (TUI): live-updating subscribed tag values | The "designer without Designer" feel for checkout/debug | WebDev polling | Med | Poll-based first (WebDev has no push); C2+C3 dependency. |
-| F11 | **Session management**: terminate Perspective sessions/pages (native) | Kick stuck sessions without the webpage | Native REST | Low-Med | 83-api verified (Terminate Perspective Session(s)). |
+**How comparable tools do it:** `gh api <endpoint> [-X METHOD] [-f k=v] [-F typed] [--input -] [--jq]` (GET default, status-coded exit, jq filter, `--paginate`); `kubectl get --raw` / `kubectl proxy` (raw passthrough with zero negotiation). Both are "escape hatches" for endpoints the tool hasn't curated, and both keep raw output **explicitly outside** their stable-output contracts. Pattern is well-established: HIGH confidence.
 
-Complexity note on F2: this is the single riskiest differentiator. Cheapest credible path is wrapping/invoking the existing Playwright resetter (systemd timer pattern already proven) rather than embedding browser automation in the Rust binary. Decide at phase-planning.
+**Table stakes**
 
----
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| GET by default; path relative to gateway base | gh api convention; every raw user expects it | LOW | auto-prefix `/data/api/v1/`; absolute path opt-out via leading `/data` awareness |
+| `--method`, `--header`, body via `--field`, `--input -`/file | gh api shape | LOW | JSON body detection; stdin for agents |
+| Raw JSON passthrough, labeled non-contract | users must know raw ≠ frozen envelope | LOW | stable envelope fields (e.g. `--jq`-style `--select`) unavailable in raw mode — or clearly marked advisory |
+| Exit codes track HTTP status class | agents branch on them | LOW | E2 table gets two slugs: `upstream_error` (4xx/5xx mapped), `raw_not_found` |
+| Auth/profile resolution identical to curated commands | one config surface | LOW | free (D1/D2) |
 
-## Anti-Features
+**Differentiators**
 
-Deliberately NOT building. Each is either owned by a sibling tool, violates a project constraint, or is scope creep.
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Method-aware safety classification | non-GET requires `--yes` (consistent with v1.0 guard); known-destructive paths (activation, redundancy failover, task queue pause) get a named warning | LOW–MED | a small static path-classifier table; this is the single best safety lever |
+| `--select`/jq-style filter over raw responses | agents avoid jq dependency | LOW | reuse existing selector if one exists in v1.0 output path |
 
-| Anti-Feature | Why avoid | What to do instead |
-|--------------|-----------|--------------------|
-| LSP / completions / hover / go-to-def for Ignition scripts | ignition-nvim + ignition-lsp own this (14 `system.*` modules, 239+ functions, Java/Jython stubs) | Interop only: decode/encode scripts so files opened in nvim/VS Code "just work" (see interop). |
-| Lint engine (Jython syntax, naming conventions, schema checks) | ignition-lint owns this (rules, severity levels, ignore files, CI action, its own MCP server) | `ign lint` **delegation wrapper**: detect `ignition-lint` on PATH, run it against an exported project or path, pass through exit codes + JSON. Error clearly with install hint if absent. |
-| Designer-side Git integration (commit/push/pull/branch/stash UI) | ignition-git-module owns this inside the Designer | Interop only: understand git-module conventions (git.yaml, gw-init, tags/ exports, `tags_importOnStartup`), browse its tag exports, never reimplement. |
-| Ignition 8.1.x support | Project decision: API variance (Jython-era web framework, no 8.3 React/REST surface) not worth carrying; git-module v2 set the precedent | Clean version check + helpful refusal (E6). |
-| MCP server transport (v1) | Project decision: CLI + `--json` IS the agent interface; MCP serving is a later call | Keep JSON contract stable enough that a thin MCP shim could wrap it later. |
-| Perspective/Vision view editing, component trees, form designers | VS Code extension (Project Browser, Component Tree) + Designer own this | B4 resource get/put covers surgical raw-JSON edits; leave semantics to editors. |
-| OpenAPI-spec discovery subsystem (igw-cli's `api list/search/sync`) | Scope creep against "simple but complete"; the curated command surface IS the product | Thin escape hatch only: `ign api call --method --path` passthrough for endpoints not yet curated (low cost, unblocks edge cases). |
-| Daemon / background service | Constraint: single binary, no daemon | Poll-based wait/watch; user schedules if needed (trial auto-reset may shell to existing timer pattern). |
-| Web UI | TUI is the human interface; a web UI recreates the gateway webpage problem | — |
-| Vision project management (bin→XML auto-export) | git-module roadmap explicitly owns this | Revisit when git-module ships it; CLI consumes results. |
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| OpenAPI spec discovery/sync subsystem (igw-cli's `api list/search/sync`) | "discover everything" | already rejected in v1.0 as scope creep; the curated surface IS the product | `ign api call` itself is the escape hatch |
+| Full curl parity (arbitrary headers, proxies, chunked upload, retries) | "just make it curl" | infinite surface, each flag a support case; auth/proxy policy escapes the tool | auth + content-type are enough; users escalate to curl deliberately |
+| Raw output inside the frozen JSON contract | "consistency" | the contract's value is stability; raw responses change with Ignition versions | contract covers curated commands; raw is opt-in instability by definition |
+
+### 2. Curated diagnostics (license, diagnostics bundle, redundancy, GAN)
+
+**What Ignition 8.3 exposes (verified in local 83-api collection, HIGH):**
+- `license-status`: Licensing Information, Trial Information. `license-management`: hardware/leased license CRUD (writes). `license-activation`: activate/reactivate/offline flows (writes).
+- `redundancy`: Status, Config, Log Events, Force Failover, Re-Sync Configuration, Provider Metrics.
+- `gateway-network` (classic GAN): Gateways, Gateway Detail, Live Diagram, Diagnostic Ping, Remote Tag Providers, Task Queue pause/resume/cancel, Toggle Approval, Reset Incoming/Outgoing Connection.
+- `agent-management` (8.3 agents): EAM Agents Status/Overview, License Keys, Quarantined agents, Approve/Upgrade/Delete.
+- Diagnostics bundle: generate/download + wait (igw-cli already models `wait diagnostics-bundle`; v1.0 has the wait primitive).
+
+**What admins check daily (domain knowledge, HIGH — this is the author's own ops context):** license/trial days remaining, redundancy state (independent/master/backup + backup connection), GAN peers reachable + certificate state, gateway faults in logs, thread diagnostics under load, storage/disk. Cert expiry is the classic silent failure (certificate-management families exist in 83-api).
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| `ign license status` (edition, state, expiry, trial days left) | trial expiry + license expiry are day-1 admin checks; ignition-mcp already wraps activation endpoints | LOW | two GETs merged into one shape |
+| `ign redundancy status` (state, role, peer, sync state) | degraded redundancy is THE silent SCADA risk | LOW–MED | Status + Provider Metrics merged |
+| `ign gan status` / `ign gateways` (connections, state, detail) | GAN health is the daily connectivity check | MED | classic gateway-network family; agent-based status belongs with EAM (below) |
+| `ign diagnostics bundle generate/download [--wait]` | support ticket staple; igw-cli parity | MED | async generate + poll + multipart download |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| `ign doctor --deep` (or `ign diagnostics` roll-up) | one command = morning check: license, redundancy, GAN, modules, disk, cert expiry — each PASS/WARN with machine-readable per-check JSON | MED | composes existing v1.0 checks + new reads; agents love one-shot status |
+| Cert expiry surfaced in diagnostics | silent-failure class nobody curated | LOW–MED | certificate-management GET; expiry-window thresholds |
+| Guarded redundancy re-sync/failover verbs | replaces a webpage trip in an incident | LOW–MED | `--yes` guard; failover also gets a `--confirm-failover` style explicit flag in prompt text |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| License activation/unactivation as first-class writes | "activate from CLI" | wrong activation state can lock a gateway or burn a seat; zero recovery margin via automation | leave behind `ign api call` with the path classifier's warning; revisit only with a real activation runbook |
+| GAN task-queue pause/resume/cancel as commands | fleet debugging | pausing the GAN queue wedges cross-gateway ops subtly; rare need | api-call escape hatch |
+| Rendering the GAN live diagram in TUI | "the webpage has it" | graph layout in ratatui is a project of its own; data already covered by `gan status` | tabular connections list |
+
+### 3. EAM writes beyond guarded basics
+
+**What write ops exist in Ignition EAM (verified, 83-api `eam-tasks` + `agent-management`, HIGH):**
+- Task CRUD: Create, Modify, Rename, Delete (+ Delete multiple), Get config/names, List resources.
+- Task lifecycle: **Cancel, Suspend, Resume, Force execution**, Clear retry data, Get retry tasks.
+- Task status: Running or Scheduled Tasks, Task History.
+- Agent management writes: Approve agent, Delete quarantined agent, Upgrade Agent (+ pre-flight: Retrieve agent info for upgrade, agent modules, projects).
+- v1.0 already shipped the guarded basics (task list/history/create per milestone context) — this is the write half.
+
+**How comparable tools do it:** kubectl drain/cordon (guarded, explicit, reversible verbs); `gh workflow run` (explicit execution of a thing defined elsewhere); Terraform's plan→apply split (preview before mutate). The convention: lifecycle verbs are cheap; *execution* verbs and deletes are where guards and previews earn their keep. MEDIUM–HIGH confidence (well-established patterns).
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| `ign eam tasks suspend/resume/cancel <task>` | lifecycle verbs are the everyday writes | LOW–MED | 1:1 REST mapping; each behind `--yes`; show affected agent scope in output |
+| `ign eam tasks run <task>` (force execution) | "run it now" is the whole point of tasks | MED | returns task id → poll Running/Scheduled + Task History (reuse wait primitives); `--yes` mandatory |
+| `ign eam tasks rename/modify/delete` | CRUD parity | LOW–MED | delete behind `--yes`; skip "delete multiple" sugar (see anti-features) |
+| Task history/status output shapes | agents poll these | LOW | frozen envelope per E1 |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Blast-radius preview | `run --dry-run` (or default pre-exec summary) prints exactly which agents/resources the task touches before `--yes` | MED | task config GET already has the data; formatting + consistency is the work — Terraform plan feel |
+| Agent-group fan-out summary | create/list across agent groups with one clear "N agents affected" line | MED | rides agent-management reads |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| `ign eam agents upgrade` (fleet module push) | "one command upgrades everything" | brickable fleet operation needing pre-flight (version compat, rollback, staging order) — its own milestone's worth of design | ship the pre-flight *reads* (upgrade info, agent modules) and leave the upgrade itself behind api-call; revisit v1.2+ |
+| Bulk delete flags for tasks ("delete multiple" endpoint) | convenience | one fat-finger deletes a fleet's schedule; zero legitimate daily use | per-task delete; agents can loop |
+| Auto-retry loops around force-execution | "make it reliable" | tasks may be long-running; retry storms on a SCADA fleet | return task id + wait verb; agents decide |
+
+### 4. MCP transport over the existing JSON contract
+
+**How comparable tools do it:** the canonical pattern (HIGH confidence in mechanics — JSON-RPC 2.0 over stdio, newline-delimited messages) is a thin server whose `tools/list` emits one entry per logical operation with a JSON-schema, and whose `tools/call` maps directly onto the existing command layer — returning the CLI's frozen envelope as the tool result content. Wrapping an existing CLI core this way is exactly what ecosystem MCP servers do; the interesting decisions are *which* tools to expose and *how guards translate*, not the transport. (STACK researcher settled: hand-rolled shim, no rmcp — respected here.)
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| `initialize` handshake with protocolVersion negotiation + capability listing | protocol requirement; clients refuse without it | LOW | stdio, newline-delimited JSON-RPC |
+| `tools/list` with per-tool JSON schema | discovery is the point of MCP | MED | schema generation from the existing clap command definitions keeps one source of truth |
+| `tools/call` → command layer (in-process, not subprocess) | agents get the frozen envelope back as result content | MED | reuse the same GatewayApi/action core the CLI calls — architectural invariant from v1.0 TUI work |
+| Exit-code → MCP error mapping | CLI exit 2/6/7 etc. must surface as `isError` content with the JSON error envelope | LOW | E3 machine-readable errors become tool-call errors verbatim |
+| `ign mcp` as an explicit subcommand | servers are spawned (`command: ign mcp`) by clients like Claude/Cursor | LOW | never a default/daemon behavior (v1.0 anti-feature stance carried forward) |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Curated tool subset (~30–40 tools: reads + guarded writes) | the 37-tool ignition-mcp catalog proved curation is the value; agent context is a budget | LOW–MED | map: v1.0 command tree → tools; write-tools take a `confirm: true` argument replacing `--yes` (the non-interactive guard translation — decide at spec time, document loudly) |
+| Server name/version derived from CLI version | one version story for humans and agents | LOW | free |
+| Resources (MCP file-like resources) for status snapshots | clients can pin a status read without tool-call ceremony | MED | v1.x stretch; tools suffice day one |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| Exposing all ~100 REST families as generic MCP tools | "completeness" | catalog bloat burns agent context; unsafe paths get automated without judgment — the exact failure ignition-mcp's curation avoided | curated subset + `ign api call` mapped as ONE raw escape-hatch tool (clearly guarded) |
+| prompts/sampling/completions MCP capabilities on day one | "full server" | no consumer for them in the primary nvim/Claude flows yet | tools-only capabilities block; add capabilities when a consumer exists |
+| Guard-free write tools because "MCP clients are trusted" | agent convenience | an agent auto-approving tool calls is exactly the destructive-ops threat the `--yes` guard exists for | confirm-argument or config-level allowlist per write tool |
+
+### 5. Tag bulk transfer xml/csv
+
+**Ignition's tag export format shapes (domain knowledge, MEDIUM–HIGH — consistent with v1.0 live findings):** JSON is the 8.x-native interchange (v1.0 proved round-trip live); XML is the legacy 7.x format the platform still imports/exports; CSV is a flattened, lossy convenience export. The kindling project exists largely because these custom formats are painful to parse — which is the strongest available evidence that CLI-side re-serialization is the wrong lane. v1.0 deliberately deferred xml/csv to backlog after proving JSON-native; the Designer-diff-adjacent risk is fidelity, not plumbing.
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| `ign tags export --format xml|csv` | designers/export pipelines in the wild still ship XML; teams expect format parity with the Designer's export dialog | LOW | **server-byte-faithful passthrough** — download what the gateway produces, never re-serialize |
+| `ign tags import --format xml|csv` | importing legacy/CSV sets is a real migration lane | LOW–MED | same native endpoints, correct content-type/multipart form; collision-policy default Abort (v1.0 convention) |
+| Format auto-detection on import | files arrive unflagged | LOW | content sniffing (`<?xml`, CSV header) |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Lossy-import report | `ign tags export --format csv --warn-lossy` (or import-time check): parse the payload, diff against the JSON export of the same subtree, print what a round-trip would drop (UDT params, docs, arrays, event scripts…) | MED | the CSV/XML fidelity warning is exactly the trap teams hit; nobody offers it |
+| Per-format capability matrix in docs | sets expectations before an ops surprise | LOW | static docs table |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| CLI-side JSON→CSV/XML conversion ("export as anything") | "uniform interface" | re-serializing Ignition's formats is the kindling-shaped rabbit hole and guarantees silent data loss | passthrough only; if conversion is ever needed, delegate to kindling |
+| Declaring CSV columns a stable contract | "agents will parse it" | CSV shape is Ignition's, varies across versions; ours-to-break promises invite breakage | agents use JSON (native contract); CSV is for humans/spreadsheets |
+| Blessing spreadsheet round-trips as a first-class workflow | "edit in Excel" | cell-embedded JSON blobs + type coercion = classic corruption | allowed but warned loudly (differentiator's lossy report); JSON remains the blessed editing format |
+
+### 6. Tag↔historian binding closure via Designer-diff
+
+**The 05-06 limitation (verified verbatim from v1.0 SUMMARY + README, HIGH):** the bounded spike tried execution scan-class keys, aggregation variations, and `browseHistoricalTags` cross-checks — **no candidate produced data** within budget. Structural query proven; data flow documented as a limitation. The README names the resolution path: **create one history tag by hand in the Designer, `tags config get` it via the CLI, diff the shapes** — find the field(s) the WebDev path isn't setting, set them, prove data flows.
+
+This is a **research-and-fix feature, not a UI surface**: the deliverable is a working `configure a history tag via CLI → data appears in `tags history`` loop, plus whatever route/config changes make it true.
+
+**Table stakes (once resolved)**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| CLI-configured history tags actually record data | parity with Designer is the bar; v1.0's fixture (InternalHistorian provisioned headlessly) already exists to prove it | MED | the diff oracle makes this deterministic instead of budget-boxed guessing |
+| Documented root cause in README + route docs | v1.0 established the honest-limitation pattern; closure must update the doc, not just the code | LOW | one paragraph: missing field(s), why, fix |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| `ign tags history enable <path>` convenience verb (if the fix is a simple field) | one command instead of a config JSON edit | LOW | only if the root cause is a single missing config field — don't build ceremony around a one-line put |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Requested→Problematic | Alternative |
+|---------|---------------|---------------------------|-------------|
+| Shipping a guessed wire shape without live-data proof | "the diff looks right" | v1.0 already proved guesses burn spike budget; only live rows count | assert-then-prove: shape applied → write → query returns rows → THEN claim parity |
+| Expanding scope to historian provider management (historian-config CRUD family) | "while we're in there" | separate surface, zero dependency for the fix | keep in backlog; api-call covers reads |
+| Claiming parity until e2e shows rows | milestone pressure | the limitation exists precisely because structural success ≠ data | the e2e gate from 05-06 IS the definition of done |
+
+### 7. TUI theming
+
+**How comparable tools do it:** k9s skins — YAML files of **named UI keys** (`body.fgColor`, `charts.*`, `table.*`…), selected via config/env, community skin packs; lazygit — a small `gui.theme` block of named colors in its config; btop — `.theme` files with ~30 named keys, theme directory, live switching. Convergent pattern: **named semantic palette slots, not per-widget pickers**; a file-based override; ideally hot-swappable. HIGH confidence (very stable, long-lived conventions).
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| Built-in theme set (default/dark/light + one or two accents) | light-terminals users bounce off an unreadable TUI instantly | LOW | ratatui palette struct; zero new crates (settled) |
+| Theme persisted in config | choice survives restarts | LOW | rides existing config plumbing |
+| ~15–25 named palette keys (bg, fg, border, selection, table header, status ok/warn/err, bar charts) | matches k9s/btop granularity; enough to restyle, small enough to document | LOW | semantic status colors (alarm=red) must remain **semantic, not themeable away** |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| User theme file (same named keys, TOML) + `ign tui theme ls/use` | k9s-skin-level customization without a code change | LOW | unknown keys warn, don't fail |
+| Live theme switch in TUI | btop-style polish | LOW | re-read palette on keybind/command |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|----------------|-------------|
+| Arbitrary per-widget color config | "total control" | unmaintainable matrix; every new panel multiplies keys | named semantic slots only |
+| Terminal ANSI-16 "compatibility mode" as a separate theme engine | old terminals | ratatui already degrades; a second engine doubles testing | single truecolor-first engine |
+| Theme marketplace / pack ecosystem | community enthusiasm | distribution/maintenance burden with no user | document the file format; let users share files informally |
+
+### 8. Configurable polling cadence
+
+**How comparable tools do it:** k9s `refreshRate` (single global, seconds, in config.yaml, default ~2s); btop `update_ms` (global with a hard min clamp); `watch -n <interval>`; htop `delay`. Convergent pattern: **one global default, a per-invocation override, and a sane minimum clamp** — nobody offers per-resource-type cadence matrices. HIGH confidence.
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| Global default (config) + per-view/command override | k9s/btop/watch convention | LOW | applies to TUI pollers AND `wait`/watch loops (one cadence plumbing, two consumers) |
+| Min clamp with warn (e.g. ≥1s) | a gateway is a real server; sub-second polling is self-DoS | LOW | clamp, don't refuse — log/warn once |
+| Sensible default (2–5s) | v1.0 shipped some cadence; make it configurable, don't change the feel | LOW | current value becomes the default |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Per-panel cadence in TUI (dashboard fast, tag browser slower) | refresh what you're looking at | LOW–MED | natural extension; keep defaults conservative |
+| Backoff on error + pause-on-hidden | don't hammer a gateway that's already struggling; don't poll invisible panels | MED | error backoff is cheap; hidden-panel pause depends on TUI focus model |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|----------------|-------------|
+| Sub-second default | "live feel" | SCADA gateways feel latency in polling bursts; WebDev routes are server-side scripts | defaults 2s+, clamp 1s |
+| Per-resource-type cadence config matrix | "fine control" | config explosion, zero comparable tool does it, every panel becomes a config surface | global + per-panel |
+| Server push / websocket subscriptions | "real-time" | no such endpoint exists on these surfaces; inventing a push layer is a platform, not a flag | polling with cadence control |
+
+### 9. `ign edit` round-trip
+
+**How comparable tools do it:** the gold standard is **kubectl edit** — temp file with explanatory header comments, open `$EDITOR`/`$VISUAL`, on close: content-hash save-detection ("no changes → Edit cancelled"), attempt the update, on validation error **reopen the file with the error injected**, loop until success or explicit abort; conflict detection on concurrent modification. `git commit` contributes: empty content = abort. `gh`/`crontab -e` confirm the temp-file convention is universal. HIGH confidence (canonical, stable patterns).
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| `$VISUAL`/`$EDITOR` resolution with fallback | universal convention | LOW | no in-binary editor ever (see anti-features) |
+| Temp file + save-detection (content hash) | kubectl semantics; avoids surprise pushes on `:q` | LOW–MED | no-change → clean abort, exit 0 with message |
+| Push via existing machinery on save | resource put (zip surgery) / tag config put already exist | MED | this feature is a *loop*, not a new API path |
+| Validation/conflict errors reopened in-editor | kubectl's killer UX: fix-and-retry without retyping the command | MED | server 4xx/409 → error text injected as comment at top; loop; explicit abort keyword |
+| Guarded push | edit IS a write: `--yes` semantics or an explicit confirm prompt unless non-interactive | LOW | E4 conventions |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| `--decode-scripts` leg | edit the actual `.py` (Flint codec) instead of JSON-embedded script strings — the nvim workflow, on demand, for one resource | MED | ties the codec into the everyday edit path; re-encode on save |
+| Diff preview before push | terraform-plan trust: show gateway→edited delta | LOW–MED | reuse diff from cross-gateway compare |
+| Works for both project resources and tag configs | one verb, two surfaces users already manipulate | LOW | second call-site of the same loop |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| Built-in TUI text editor | "self-contained" | editors are solved; ratatui text editing is a project; syntax highlighting is table stakes for real work | shell out; $EDITOR is universal |
+| Save-on-interval auto-push watcher | "live editing" | accidental pushes + conflict storms; kubectl's loop is user-timed for a reason | push per editor-close with change detection |
+| Multi-resource single buffer | "batch editing" | partial-failure semantics on push become incoherent | loop the verb; agents batch fine |
+
+### 10. LSP server feeding ignition-nvim
+
+**Local ground truth (HIGH, read from source):** ignition-nvim already ships and auto-launches a **Python LSP** (`ignition-lsp`, pygls 2.0, stdio): completion for `system.*`/`project.*`/`shared.*` (239+ functions, 14 modules), hover, go-to-def, diagnostics, workspace symbols, project scanning. Its server selection is an **explicit ordered list**: (1) plugin venv `ignition-lsp`, (2) PATH `ignition-lsp`, (3) dev-venv source. The v1.1 Rust LSP (lsp-server 0.10 + lsp-types 0.97 — settled) is therefore **the gateway-data feeder**: the piece the static Python LSP cannot have because it never talks to a gateway.
+
+**What completions/diagnostics make sense from gateway data** (behavior design for this feature):
+- *Completions:* live tag paths (from `tags browse`, cached with TTL) in tag-path string contexts; provider names; `project.*`/`shared.*` script function names harvested from the live project's exported script resources; named queries in `system.db.runNamedQuery` call sites; UDT type names; history providers in tag history config; WebDev route names.
+- *Diagnostics:* unknown tag path (staleness-caveated), unknown named query, references to deleted/renamed providers — each diagnosable only because the gateway is the source of truth.
+- *Hover:* live tag metadata (type, doc, UDT ancestry) and script function signatures from live exports.
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| stdio LSP: initialize, textDocument/completion, publishDiagnostics, hover | the nvim client registers a standard client; anything less doesn't attach | MED | lsp-server crate handles framing; scope = gateway data only |
+| Offline/graceful degradation | no gateway profile → serve nothing gateway-related, never crash, log once | MED | static-only fallback keeps nvim usable everywhere |
+| Never block typing on the network | sync gateway calls inside completion = frozen editor | MED | async prefetch + cached responses; TTL-stamped cache |
+| Cache invalidation knobs | stale completions erode trust faster than missing ones | MED | TTL + explicit refresh (command/workspace-config trigger) |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Live tag-path + named-query completions | the single highest-value gateway-only capability — nothing else in the ecosystem does it | MED–HIGH | rides existing browse/export machinery; context detection (which string position is a tag path) is the fiddly part |
+| Live hover for tags | "Designer tooltip in the editor" | MED | shares cache with completions |
+| `ign lsp` slots as nvim detection candidate #0 | one-line nvim patch (sibling repo); CLI ships the binary | LOW | verified: nvim's ordered list makes this trivial — insert venv-agnostic `ign lsp` first when present |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|----------------|-------------|
+| Reimplementing the Python LSP's static knowledge (system.* functions, Jython stubs) | "one server" | v1.0 explicitly deferred to the Python LSP; 239+ function stubs are maintained there; duplication guarantees drift | **composition**: nvim can attach both clients; Rust = gateway truth, Python = statics; document the split |
+| Blocking/synchronous gateway reads in completion handlers | simpler code | editor freezes; kills adoption on real projects | prefetch + cache, always |
+| Gateway credentials cached to disk by the LSP | latency | secrets at rest in editor cache dirs violates the v1.0 secrets posture (D4) | use profile/env auth in-memory; cache only data, never credentials |
+| Diagnostics beyond gateway-truth (Jython lint, style) | "useful linter" | ignition-lint owns this (v1.0 anti-feature, unchanged) | stay in the gateway-data lane |
+
+### 11. Workspace checkout
+
+**Model (local ground truth, HIGH):** ignition-git-module's export model is the reference: project resources land as a file tree in the repo (resources + `tags/` per project), `git.yaml` carries repo/branch/user config, pull-side imports offer **Overwrite/Merge/Abort** collision policies, and `tags_importOnStartup` governs tag restore. The native project export is a zip with per-resource members — v1.0 already does **zip-member surgery** on it (verified live: "no per-resource REST exists on real 8.3 gateways — resource editing rides zip-member surgery"). Workspace checkout = materialize that same zip layout as a directory + a manifest, and reverse the trip. Comparable tools: git worktree/checkout (the naming metaphor users expect), kubectl apply (declarative files → server state), terraform (state drift = manifest diff).
+
+**Table stakes**
+
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| `ign workspace checkout <project> [dir]` → deterministic file tree | the checkout metaphor demands stable, predictable paths; manifest = terraform-state analog | MED–HIGH | reproduce the native export/zip layout exactly (v1.0-proven), so push = re-assemble changed members; **bijective path mapping** with safe encoding of odd resource names is the core correctness risk |
+| `ign workspace status` | which files differ from the gateway — the loop only works with a drift check | MED | manifest hashes vs gateway re-export (server-side truth, not memory) |
+| `ign workspace push [path…]` | selective write-back of edited files | MED | rides zip-surgery put; collision policy default Abort (module convention) |
+| Manifest at tree root | enables status/diff/push without re-deriving everything | LOW | document it as internal-but-readable |
+
+**Differentiators**
+
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| `--decode-scripts` checkout | `.py` files alongside JSON — the git-module/nvim editing experience, fully offline-editable, re-encoded on push | MED | shares the Flint codec leg with `ign edit`; this is the feature that makes the workspace the *primary* authoring surface |
+| Server-side change detection on push | gateway moved since checkout → refuse/warn (kubectl 409 semantics) | MED | status re-export comparison; prevents silent clobber in multi-editor teams |
+| Per-file pull (`ign workspace pull <path>`) | grab one changed resource without full checkout | LOW–MED | subcase of status+push machinery |
+
+**Anti-features**
+
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| Bidirectional live-sync daemon | "always in sync" | explicitly rejected in v1.0 (no daemon, single binary); sync daemons on SCADA state are conflict farms | explicit checkout/status/push loop |
+| Tag values / runtime data in the workspace | "one tree for everything" | tags ride the git-module tag-export lane (`tags/`, `tags_importOnStartup`) — v1.0 established lane separation; mixing values into resources corrupts both | workspace = project **resources** only; tags via existing tag export/import |
+| Merge-conflict resolution UI | parity with git-module's Designer conflicts | the module owns Designer-side conflict UX; a TUI merge resolver is a project of its own | detect conflict state, surface it, abort cleanly; humans resolve in git or Designer |
+| Live two-way auto-push on save | "like hot reload" | partial-failure + conflict semantics make unattended pushes hazardous on gateways | the `ign edit` loop (explicit, user-timed) |
 
 ---
 
 ## Feature Dependencies
 
 ```
-D1 profiles + D2/D3 auth/env  ──►  everything (every command resolves a target)
-E1/E2 JSON + exit codes       ──►  everything scripted (build into command core, not after)
-A10 doctor                    ──►  depends on D1/D2; probes WebDev (F6) + rig (F1)
-F6 webdev deploy              ──►  C3 C4 C5 C6 C7 C8 F7 F10  (all WebDev ops)
-A2 modules ── F6: WebDev requires WebDev module installed (doctor should check)
-C2 tag browse ──► C3 read ──► F10 watch (TUI)
-C1 providers ──► C2/C5 (tag addressing), C9 (bulk)
-B3 project export/import ──► B4 resource ops ──► F5 sync/diff ──► (multi-profile D1)
-B3 export ──► F8 decode/encode interop ──► nvim/agent edit ──► B3 import (round trip)
-A9 restart ──► A11 wait  (restart without wait is incomplete)
-F1 rig up ──► F2 trial reset ──► long-running rig
-F1 rig ──► F3 snapshot/restore ──► e2e fixture reset (WHK-Global)
-Native gwbk (F9) ──► F3
-A3 logs ──► TUI log tail (F4)
-A5/A6/A7/A8 ──► TUI dashboard (F4)
-F4 TUI ──► reuses command layer of A/B/C (no separate API path — architectural invariant)
-B3 export ──► ign lint delegation ──► CI loop
+v1.0 base (profiles/auth, JSON+exit codes, --yes guard, export/import,
+zip surgery, tag browse/config, Flint codec, TUI command layer, wait primitives)
+    └── underpins ALL v1.1 features
+
+[1 api call]     ──requires──> profiles/auth only          (standalone, cheap)
+[2 diagnostics]  ──requires──> status/wait patterns; ──enhances──> doctor
+[3 EAM writes]   ──requires──> EAM reads (v1.0) + --yes + wait; ──related──> [2] agents status
+[4 MCP shim]     ──requires──> entire command layer; ──consumes──> frozen envelope; ──translates──> --yes (confirm field)
+[5 xml/csv]      ──requires──> TAGS-09 native export/import (v1.0)
+[6 historian]    ──requires──> 05-06 fixture + tags config get + e2e harness (all v1.0)
+[7 theming]      ──requires──> TUI v1.0 + config plumbing
+[8 polling]      ──requires──> TUI poll loop; ──shared plumbing──> wait loops
+[9 ign edit]     ──requires──> resource put + tag config put + Flint codec; ──enhances──> [11]
+[10 LSP]         ──requires──> browse/config/export + profiles; ──pairs──> nvim detection order (sibling repo patch)
+[11 workspace]   ──requires──> export/import + zip surgery + codec; ──shares codec leg──> [9]
+
+[9 edit] and [11 workspace] share the decode/encode path  (build codec leg once)
+[2 diagnostics] and [3 EAM] share agent-management reads   (build agents-status read once)
+[4 MCP] should land AFTER the commands it exposes are stable — it is a lens, not a source
 ```
 
-Key ordering consequences for the roadmap:
-1. **Profiles + JSON/exit-code core first** — every later feature sits on them.
-2. **WebDev deploy (F6) gates the entire tag-runtime/alarm/history block** — schedule it before or with C3–C8.
-3. **Rig lifecycle (F1) unlocks F2/F3 and e2e workflows** — but is independent of the WebDev track; can parallelize.
-4. **TUI (F4) comes last-ish**: it consumes every command; building it early forces rework.
+**Key ordering consequences:**
+1. **[1] api call is the cheapest and most unblocking** — land early.
+2. **[9]+[11] share the codec leg** — same phase or workspace second.
+3. **[10] LSP's hard part is gateway-data cache/context detection** — its nvim integration is a trivial sibling-repo patch (verified), so sequencing risk is internal only.
+4. **[4] MCP is a pure lens on the command layer** — schedule after (or with) the v1.1 commands it should expose, never before.
+5. **[6] historian is research-shaped and bounded** — small enough to slot early or parallel; e2e gate is the definition of done.
+6. **[7]+[8] are pure TUI polish** — zero API surface, safe to parallelize with anything.
 
----
+## MVP Definition (v1.1 launch set)
 
-## Notes from ignition-mcp catalog mapping
+### Launch With (v1.1 core)
 
-The 37-tool catalog maps 1:1 onto table-stakes commands (this is the replacement bar):
+- [ ] **[1] `ign api call`** — escape hatch for everything uncurated; trivially cheap, disproportionately unblocking (agents + edge endpoints)
+- [ ] **[2] diagnostics core**: `license status`, `redundancy status`, `gan status`, bundle generate/download/wait — the daily-check reads
+- [ ] **[4] MCP shim** — the agent-facing surface is the project's core value; tools = curated command map, confirm-field guard translation
+- [ ] **[10] LSP server** (completion + hover + diagnostics, offline-degraded, cached) + the one-line nvim detection patch
+- [ ] **[9] `ign edit`** (resource + tag config, error-reopen loop; `--decode-scripts` if codec leg shared with workspace)
+- [ ] **[6] historian closure** — bounded, research-shaped; e2e rows-or-it-didn't-happen
 
-| mcp category (tools) | CLI coverage | Notes |
-|----------------------|--------------|-------|
-| Gateway (6) | A1 A2 A3 A5 A6 A7 | Direct parity. |
-| Projects (8) | B1 B2 B3 | Direct parity (+ parents query beyond mcp). |
-| Project Resources (4) | B4 | Direct parity. |
-| Designers (1) | A8 | **Exceed**: add perspective-sessions + vision-sessions + terminate (native 8.3). |
-| Tag Providers (4) | C1 | Direct parity (native). |
-| Tag Browse (1) | C2 | Direct parity (native). |
-| Tag Values (2) | C3 C4 | WebDev, via shipped backend F6. |
-| Tag Config (6) | C5 C6 | WebDev; consider native C9 bulk export/import as complement. |
-| Alarms (3) | C7 | WebDev. |
-| Historian (1) | C8 | WebDev. |
-| Script Execution (1) | F7 | WebDev, opt-in — keep mcp's default-off stance. |
+### Add After Validation (v1.1.x)
 
-**Coverage stance: parity is table stakes; the CLI should also exceed the catalog** using native 8.3 endpoints the mcp never wrapped (verified in 83-api): gateway backups get/restore (F3/F9), EAM tasks (F9), restart-tasks (A9), system-performance + thread-diagnostics (A7), license-status, diagnostics bundle generation/download, redundancy status, gateway-network/agent status. Which of these graduate from "escape hatch via `ign api call`" to curated commands should be demand-driven — start with the ones in this table (A7/A9/F9).
+- [ ] **[3] EAM write verbs** (suspend/resume/cancel/run/rename/modify/delete) — trigger: the read+create base is in daily use; blast-radius preview with it
+- [ ] **[11] workspace checkout** (checkout/status/push + manifest) — trigger: `ign edit` loop validated; shares its codec leg
+- [ ] **[5] xml/csv transfer** — trigger: a real migration/import need appears (passthrough keeps it cheap whenever it lands)
+- [ ] **[7] theming + [8] polling cadence** — trigger: TUI daily-driver adoption; pure polish, any slot
 
-**Config translation:** mcp's env matrix (gateway URL, API key, user/pass, SSL-verify, five WebDev endpoint vars, script-exec toggle) collapses in the CLI to: profiles (D1) + per-profile WebDev auto-discovery via F6 (endpoint vars should not be user-facing anymore — the CLI knows its own routes) + `IGNITION_ENABLE_SCRIPT_EXECUTION` equivalent for F7.
+### Future Consideration (v2+)
 
----
+- [ ] EAM agent fleet upgrade automation — needs its own pre-flight/rollback design (pre-flight *reads* can ship in v1.1.x)
+- [ ] MCP resources/sampling capabilities — when a consumer exists
+- [ ] Historian provider management (historian-config CRUD) — api-call covers reads meanwhile
+- [ ] GAN diagram visualization — webpage owns it
 
-## Ecosystem Interop
+## Feature Prioritization Matrix
 
-### ignition-nvim (LSP/editor — editing belongs there, pairing belongs here)
-- **Script decode/encode interop (differentiator F8):** nvim's decoder extracts embedded Python from resource JSON into editable buffers. CLI counterpart for file/agent workflows: `ign project export --decode-scripts` (emit `.py` alongside JSON) and `ign project import --encode-scripts` (round-trip). Same convention = a resource exported by CLI, decoded, edited in nvim/VS Code, re-encoded, imported — one coherent loop. Complexity: Med. Dependency: B3.
-- **.gwbk handling:** nvim opens .gwbk via kindling. CLI stays out of gwbk *authoring*; for F3 snapshots the gwbk is opaque bytes via native API (correct division). If offline gwbk extraction is ever needed, delegate to kindling rather than reimplement (note: kindling is Kotlin/GUI-oriented — treat as optional integration, MEDIUM confidence).
-- **Explicitly not built:** completions, hover, workspace symbols — nvim/lsp own them.
+| Feature | User Value | Implementation Cost | Priority |
+|---------|------------|---------------------|----------|
+| [1] api call | HIGH (agents + edge cases) | LOW | **P1** |
+| [2] curated diagnostics | HIGH (daily ops) | LOW–MED | **P1** |
+| [4] MCP transport | HIGH (core agentic value) | MED | **P1** |
+| [6] historian closure | HIGH (closes a shipped limitation) | MED (research) | **P1** |
+| [9] ign edit | HIGH (editing loop, nvim pairing) | MED | **P1** |
+| [10] LSP server | HIGH (nvim flagship pairing) | MED–HIGH | **P1** |
+| [3] EAM writes | MED–HIGH (ops completeness) | MED | P2 |
+| [11] workspace checkout | HIGH (authoring surface) | MED–HIGH | P2 |
+| [5] xml/csv | MED (migration lane) | LOW–MED | P2 |
+| [7] theming | MED (TUI adoption) | LOW | P2 |
+| [8] polling cadence | MED (TUI comfort + gateway safety) | LOW | P2 |
 
-### ignition-lint (linting engine — theirs)
-- **`ign lint` delegation (F8):** wrapper, not engine. Detect binary on PATH → run against path or freshly exported project (B3) → pass through exit codes and `--report-format json`. Absent binary → actionable error with `pip install ignition-lint-toolkit` hint. This slots the CLI into the existing CI story (their GitHub Action exists; our wrapper serves the interactive/e2e path).
-- **Explicitly not built:** rules, severities, suppression files.
+## Competitor Feature Analysis
 
-### ignition-git-module (Designer git + rig conventions — the rig pattern source)
-- **Rig conventions (F1):** `rig` commands discover and drive the module repo's docker layout — compose files, `gw-init/git.yaml`, `gw-secrets/` (verified locally: docker/, test-rig/ with git-server + gateway, gw-build). Same env var names (`GATEWAY_ADMIN_USERNAME/PASSWORD`, `GATEWAY_GIT_USER_SECRET`, `IGNITION_VERSION`) so a rig started by hand works with the CLI and vice versa.
-- **Tag export browsing:** module exports `tags/` per project (tags.json/udts.json seen in WHK-Global). `ign tag browse --from-export <path>` reads git-module exports offline — complements live browse (C2) and matches the nvim VS Code Tag Browser's data source. Complexity: Low-Med.
-- **`tags_importOnStartup` awareness:** rigs relying on it restore tags on restart; CLI tag ops should respect "provider authority" guidance (one authoritative project per provider — from module docs, verified).
-- **Explicitly not built:** any git operations, Designer UI, commissioning logic itself (CLI *drives* the compose files that do it).
-
-### WHK-Global (parent project + e2e — the CLI's flagship consumer)
-- **E2e driver mode:** WHK-Global's Playwright specs need: healthy gateway (A10/A11), fresh project state (B3 import / F3 restore), fixture tag writes (C4), trial reset (F2), port/env conventions (D1/D3 — resetter instances/*.env pattern; observed ports 8088/9088/9043). The e2e `reset_trial.mjs` already exists as a reusable node script — F2 should wrap or replicate it, not reinvent (spike: Rust browser automation vs shell-out).
-- **WebDev independence:** WHK-Global deploys its own WebDev routes (perspective-screenshot etc. seen); the CLI ships its own versioned routes (F6) per PROJECT.md decision — doctor should tolerate both existing side-by-side (different route names).
-- **Named queries / scripts on the gateway:** `ignition/` dir (named-query, script-python, event-scripts...) is repo-level content — git-module + editors own it; CLI touches it only via project export/import.
-
-### Cross-cutting interop principle
-Interop features are **read/delegate/drive**, never re-implement. The CLI is the operational hub (health, projects, tags, rigs) that makes the sibling specialists (edit, lint, git) reachable from one place — including for AI agents via `--json`.
-
----
-
-## MVP Recommendation
-
-Prioritize:
-1. **Core plumbing**: D1 profiles, D2/D3 auth/env, E1–E7 JSON/exit-codes/non-interactive (everything depends on it)
-2. **Read-side inspection**: A1–A8, A10 doctor, A11 wait (immediate daily value, native-only, no WebDev needed)
-3. **Projects**: B1–B5 (webpage replacement for project admin)
-4. **WebDev deploy (F6) + tag runtime C1–C8** (the ignition-mcp replacement bar; F6 first)
-5. **Rig lifecycle F1 (+F3 snapshot)** — differentiator, unblocks e2e; F2 trial reset as a spike/wrap decision
-
-Defer: F4 TUI cockpit (consume the finished command layer), F5 cross-gateway diff, F7 script exec (opt-in flag day), F9 EAM writes, F8 interop niceties (decode/encode, lint wrapper, export browsing) — all post-MVP, all phased by dependency graph above.
+| Feature | Comparable tool pattern | Our approach |
+|---------|------------------------|--------------|
+| Raw API passthrough | `gh api` (GET default, jq, status exits), `kubectl --raw` | same shape; method-aware `--yes` classification is the SCADA-specific addition |
+| Diagnostics | k9s status surfacing, igw-cli diagnostics bundle + wait | merge per-subsystem status into one shape; `doctor --deep` roll-up is our differentiator |
+| EAM guarded writes | kubectl drain/cordon, `gh workflow run`, terraform plan→apply | lifecycle verbs 1:1; blast-radius preview before force-run |
+| MCP wrapping | canonical thin stdio JSON-RPC servers over existing CLI cores | in-process tools/call into the command layer; frozen envelope as result content; curated subset only |
+| Tag formats | kindling exists because Ignition's custom formats are hard to parse | server-byte-faithful passthrough, never re-serialize; lossy-report differentiator |
+| Historian binding | — (our own v1.0 spike; no competitor has tag-history CLI at all) | Designer-diff oracle; e2e rows as the done gate |
+| Theming | k9s skins (named keys), lazygit theme block, btop .theme live switch | same named-slot model; semantic status colors stay non-themeable |
+| Polling | k9s refreshRate, btop update_ms clamp, `watch -n` | global default + per-view override + min clamp |
+| Edit loop | kubectl edit (hash save-detect, error-reopen), git commit (empty=abort) | kubectl semantics over existing puts; `--decode-scripts` leg |
+| LSP | Python `ignition-lsp` owns statics (verified in nvim source) | Rust LSP = gateway data only; composition, not reimplementation; detection-order slot #0 |
+| Workspace checkout | git worktree metaphor + git-module repo layout (Overwrite/Merge/Abort imports, tags_importOnStartup) | native-zip-layout directory + manifest + status/push; resources-only lane |
 
 ## Sources
 
-- Local (HIGH confidence, author's own): `.planning/PROJECT.md`; ignition-mcp readme (37-tool catalog + env matrix + WebDev prerequisites); ignition-git-module readme + docker/ + test-rig/ (rig conventions, git.yaml, tags_importOnStartup, tag export ownership); ignition-nvim readme (decode/encode commands, kindling, VS Code extras incl. Tag Browser); ignition-lint readme (CLI, JSON reports, CI/MCP integrations); ignition-trial-resetter readme + instances/ (trial reset mechanism, env pattern); WHK-Global e2e/reset_trial.mjs + com.inductiveautomation.webdev/ (WebDev routes, IdP stepped login); 83-api Bruno collection (~100 endpoint families, 675 requests — native surface incl. gateway-backups, eam-tasks, perspective-sessions terminate, system-performance, restart-tasks, running-scripts diagnostics-only).
-- External: igw-cli README (HIGH — fetched raw): command set, doctor, wait, profiles, JSON/select/raw/compact, exit codes 0/2/6/7, `--yes` mutation guard, OpenAPI discovery. kindling repo metadata (MEDIUM — README fetch 404). igniscope, ignition-agent-tools repo descriptions (MEDIUM, unverified).
-- General CLI conventions (kubectl/gh/docker): HIGH confidence standard knowledge; corroborated by igw-cli design.
+- **Local, HIGH confidence (read directly):**
+  - `~/whiskeyhouse/83-api` Bruno collection — endpoint families verified: `eam-tasks` (full lifecycle write set incl. Cancel/Suspend/Resume/Force/Clear-retry), `agent-management` (Approve/Delete-quarantined/Upgrade + pre-flight reads), `license-status`, `license-management`, `license-activation`, `redundancy` (Status/Force-Failover/Re-Sync/Log Events/Provider Metrics), `gateway-network` (Gateways/Diagnostic Ping/Task Queue/Toggle Approval/Reset connections), `certificate-management`, `historian-config`, `call-script`
+  - `~/whiskeyhouse/ignition-mcp/ignition_tools_summary.json` — catalog now 42 tools; activation/license endpoints confirmed wrapped
+  - `~/whiskeyhouse/ignition-nvim/lua/ignition/lsp.lua` — LSP server detection order (venv → PATH → dev source) read from source; `lsp/README.md` — Python LSP feature set (239+ functions, pygls 2.0)
+  - `~/whiskeyhouse/ignition-git-module/readme.md` + `docs/production-mode.md` — git.yaml conventions, Overwrite/Merge/Abort import policies, `tags_importOnStartup`, repo layout
+  - `.planning/research/FEATURES-v1.0.md` — v1.0 scope baseline, competitor survey (igw-cli, kindling, igniscope), rejected anti-features carried forward
+  - `.planning/PROJECT.md`, `.planning/milestones/v1.0-ROADMAP.md`, `.planning/phases/05-webdev-backend-tag-operations/05-06-{PLAN,SUMMARY}.md`, `README.md` — the 05-06 binding limitation verbatim ("no candidate produced data… Designer-diff follow-up is the resolution path"), JSON-native-only bulk decision, zip-surgery finding
+- **Comparable-tool patterns, HIGH–MEDIUM confidence (long-stable ecosystem conventions; kubectl/gh patterns corroborated by v1.0's igw-cli citations):** `gh api` flag surface; `kubectl edit/--raw`; k9s skins + `refreshRate`; btop `.theme` + `update_ms`; lazygit `gui.theme`; `watch -n`; JSON-RPC 2.0 stdio MCP mechanics
+- **MEDIUM confidence (training-data domain knowledge, not re-fetched this session):** Ignition tag export CSV/XML fidelity characteristics (lossy CSV, legacy XML) — consistent with kindling's reason to exist; recommend the lossy-report differentiator be validated against real exports at phase planning
+
+---
+*Feature research for: ignition-cli v1.1 — gateway CLI/TUI new-feature landscape*
+*Researched: 2026-09-04*
