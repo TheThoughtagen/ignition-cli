@@ -8,6 +8,23 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 
 One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
 
+## Current Milestone: v1.1 Agent Surface & IDE Integration
+
+**Goal:** Deepen the agent-facing surface (raw API passthrough, curated diagnostics, MCP transport), close the remaining tag gaps (xml/csv transfer, historian binding), expand EAM writes, polish the TUI (theming, polling cadence), and make `ign` a first-class editing frontend for ignition-nvim (live LSP, edit round-trip, workspace checkout).
+
+**Target features:**
+- EXT-01: `ign api call` raw REST passthrough escape hatch
+- EXT-02: Curated diagnostics commands (license status, diagnostics bundle, redundancy, GAN status)
+- EXT-03: EAM write operations beyond guarded basics
+- EXT-04: MCP-server transport mode (thin shim over the stable JSON contract)
+- Tag-provider bulk transfer in xml/csv
+- Tag↔historian data-flow binding closure (Designer-diff path from 05-06)
+- TUI theming (monochrome/color UX themes)
+- TUIX-01: Configurable polling cadence per profile
+- IDE integration: `ign edit` fetch→decode→$EDITOR→encode→push round-trip
+- IDE integration: LSP mode feeding ignition-nvim live completions/diagnostics from gateway data
+- IDE integration: workspace checkout (project resources ↔ local dir tree via existing diff/sync)
+
 ## Requirements
 
 ### Validated
@@ -26,7 +43,7 @@ All shipped and live-verified in v1.0 (2026-08-30) — 44 atomic requirements, 7
 
 ### Active
 
-Candidates for the next milestone — actual scope defined by `/gsd-new-milestone`:
+Current v1.1 scope (milestone started 2026-09-04):
 
 - [ ] Tag-provider bulk transfer in xml/csv (deferred from TAGS-09; JSON shipped as the native interchange)
 - [ ] Tag↔historian data-flow binding (05-06 documented limitation; Designer-diff follow-up is the resolution path)
@@ -36,6 +53,9 @@ Candidates for the next milestone — actual scope defined by `/gsd-new-mileston
 - [ ] EXT-03: EAM write operations beyond guarded basics
 - [ ] EXT-04: MCP-server transport mode (thin shim over the stable JSON contract)
 - [ ] TUIX-01: configurable polling cadence per profile
+- [ ] IDE-01: `ign edit` resource round-trip (fetch→decode→$EDITOR→encode→push)
+- [ ] IDE-02: LSP mode — gateway-fed completions/diagnostics for ignition-nvim
+- [ ] IDE-03: workspace checkout — project resources ↔ local dir tree via diff/sync
 
 ### Out of Scope
 
@@ -43,7 +63,8 @@ Candidates for the next milestone — actual scope defined by `/gsd-new-mileston
 - Designer-side integration — that's ignition-git-module's job (the CLI bridges to its exports, doesn't replace it)
 - LSP/editing features — ignition-nvim / ignition-lsp already cover this (the CLI's decode/encode-scripts codec bridges to them)
 - Linting engine — ignition-lint owns it; the CLI delegates only (`ign lint` shipped in v1.0)
-- MCP transport — CLI + JSON output is the agent interface for now; MCP-style serving stays a later decision (EXT-04 candidate above)
+- Full MCP-style serving beyond the thin shim — v1.1 ships EXT-04 as a minimal MCP transport over the frozen JSON contract only; no separate MCP tool surface to maintain
+- Live file-watcher auto-push editing — v1.1 IDE integration stays daemon-free: explicit `ign edit` round-trip and workspace diff/sync only (watch-mode deferred; "no daemon required" constraint holds)
 
 ## Context
 
@@ -101,4 +122,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-30 after v1.0 milestone*
+*Last updated: 2026-09-04 — milestone v1.1 started*

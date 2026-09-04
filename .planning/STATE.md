@@ -5,15 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** v1.0 MVP shipped & archived (2026-08-30) — 7 phases, 41 plans, 44 requirements live-verified. Planning the next milestone: run `/gsd-new-milestone`.
+**Current focus:** Milestone v1.1 — Agent Surface & IDE Integration (started 2026-09-04)
 
 ## Current Position
 
-**Phase:** None (v1.0 complete — phases 1-7 archived)
-**Status:** Milestone v1.0 complete; awaiting next milestone definition
-**Last Activity:** 2026-08-30
+**Phase:** Not started (defining requirements)
+**Plan:** —
+**Status:** Defining requirements
+**Last Activity:** 2026-09-04 — Milestone v1.1 started
 
-**Progress:** [██████████] 100% (v1.0)
+**Progress:** [░░░░░░░░░░] 0% (v1.1)
 
 ## Performance Metrics
 
@@ -83,5 +84,5 @@ None open — all v1.0 blockers closed (Phase 3 resource-family defect closed by
 
 ## Session Continuity
 
-**Last session:** 2026-08-30 — v1.0 milestone archived (roadmap + requirements to .planning/milestones/), PROJECT.md evolved, tag v1.0 created.
+**Last session:** 2026-09-04 — Milestone v1.1 started (scope: agent surface, tag completion, TUI polish, EAM expansion, IDE integration). Defining requirements.
 **Resume file:** None
