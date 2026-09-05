@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
-**Current Plan:** 4
+**Current Plan:** 5
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-05
 
-**Progress:** [█████████░] 94%
+**Progress:** [██████████] 96%
 
 ## Performance Metrics
 
@@ -37,6 +37,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 08 P02 | 200 min | 2 tasks | 3 files |
 | Phase 08 P01 | 4h 58min | 3 tasks | 9 files |
 | Phase 08 P03 | 1h 40min | 2 tasks | 2 files |
+| Phase 08 P04 | 128 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -55,6 +56,8 @@ Recent decisions affecting current work:
 - [Phase 08]: New config keys follow the lenient-degradation pattern: deserialize_with warn+default on wrong types, warn-list entry, skip_serializing_if at defaults — legacy configs round-trip byte-identically — a typo in a NEW key must never fail the load; legacy on-disk shape and contract goldens stay frozen
 - [Phase 08]: Plan 08-03: Session gained profile_url/credential_present accessors + resolve_side constructor — doctor's raw-URL/presence contract and the diff/sync no-re-overlay golden contract cannot hold through resolve/resolve_degraded alone — Byte-identical mandate; goldens pinned sides as overlay-immune
 - [Phase 08]: Plan 08-03: resolve_profile_context survives reduced to selection-only (profile list view + two-client envelope echo) — envelope must not demand the active profile's secret and list must tolerate fresh installs — Plan's 'otherwise' clause; non-construction consumers keep main.rs selection-only
+- [Phase 08]: TUI load pattern: config::load_for_tui then Session::resolve_loaded — caller owns the load policy, seam owns overlay/selection/LOCKED chain; Session::resolve_loaded added to core (returns session + selected POST-OVERLAY profile) — Session::resolve loads strict config internally, physically incompatible with the TUI degradation contract; constructor extension beats keeping a duplicated selection choreography in the TUI
+- [Phase 08]: TUI rig helpers return Option<Arc<ReqwestGatewayApi>> via Session::for_url — Session hands out Arc handles (client not Clone); call sites deref with &*api / as_deref — Zero second-source construction in the TUI requires going through the seam; Arc is also the shape 08-05's ResolvedContext wants
 
 ### Pending Todos
 
@@ -67,5 +70,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-05T19:20:26.212Z
+**Last session:** 2026-09-05T19:56:07.456Z
 **Resume file:** None
