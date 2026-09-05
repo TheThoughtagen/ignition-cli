@@ -26,8 +26,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use ignition_core::actions;
-use ignition_core::client::ReqwestGatewayApi;
-use ignition_core::config::{self, AuthRef, Config, Credential, SecretStore};
+use ignition_core::session::Session;
+use ignition_core::config::{self, Config, Credential};
 use ignition_core::error::CoreError;
 
 // The command tree lives in the crate's lib target (shared with the
@@ -410,33 +410,19 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
     };
 
     match cli.command {
-        Commands::Version => match resolve_profile_context(&mut config, cli.profile.as_deref()) {
-            Ok(None) => {
+        Commands::Version => match Session::resolve_degraded(cli.profile.as_deref()) {
+            Ok(session) => {
+                let name = session.profile_name().to_string();
+                let result =
+                    actions::version::version(Some(session.api()), env!("CARGO_PKG_VERSION")).await;
+                (Some(name), result.map(ActionOutput::Version))
+            }
+            Err(CoreError::NoActiveProfile) => {
                 // Fresh install / nothing resolved: CLI version only.
                 let result = actions::version::version(None, env!("CARGO_PKG_VERSION")).await;
                 (None, result.map(ActionOutput::Version))
             }
-            Ok(Some((name, profile))) => {
-                // Credential for the CHECK only: exhaustion degrades to
-                // header-less (version must not demand a secret; gateway-info
-                // is `auth: none`); every other credential error propagates.
-                let credential = match resolve_secret_opt(&name, &profile.auth) {
-                    Ok(credential) => credential,
-                    Err(err) => return (Some(name), Err(err)),
-                };
-                // The client is built from the POST-OVERLAY profile — the
-                // research-locked precedence (flag > IGNITION_URL env >
-                // profile value) must hold at the construction site, not
-                // just in the config unit tests.
-                let result = match ReqwestGatewayApi::new(&profile, credential) {
-                    Ok(api) => {
-                        actions::version::version(Some(&api), env!("CARGO_PKG_VERSION")).await
-                    }
-                    Err(err) => Err(err),
-                };
-                (Some(name), result.map(ActionOutput::Version))
-            }
-            Err(err) => (None, Err(err)),
+            Err(err) => (error_profile(&err), Err(err)),
         },
         // The inspection commands (02-02): authed reads of a healthy
         // gateway. Credential REQUIRED — resolve_secret, not the
@@ -444,11 +430,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // work unauthenticated, so a missing secret is SecretUnavailable
         // (exit 3), the correct taxonomy, not a doomed 401.
         Commands::Status => {
-            run_inspection(&mut config, cli.profile.as_deref(), Inspection::Status).await
+            run_inspection(cli.profile.as_deref(), Inspection::Status).await
         }
         Commands::Modules { quarantined } => {
             run_inspection(
-                &mut config,
                 cli.profile.as_deref(),
                 Inspection::Modules(quarantined),
             )
@@ -456,7 +441,6 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         }
         Commands::Metrics { history } => {
             run_inspection(
-                &mut config,
                 cli.profile.as_deref(),
                 Inspection::Metrics(history),
             )
@@ -469,9 +453,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // config/profile state (usage-class errors lead, like clap's).
         Commands::Sessions(SessionsArgs { r#type, command }) => match command {
             None => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::sessions::sessions(&api, r#type.map(Into::into))
+                    Ok(api) => actions::sessions::sessions(&*api, r#type.map(Into::into))
                         .await
                         .map(ActionOutput::Sessions),
                     Err(err) => Err(err),
@@ -486,10 +470,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if let Err(err) = require_confirmation(cli.yes, "sessions terminate") {
                     return (None, Err(err));
                 }
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => actions::sessions::terminate_session(
-                        &api,
+                        &*api,
                         r#type.into(),
                         &id,
                         message.as_deref(),
@@ -503,9 +487,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         },
         // Connections (02-03): authed read of the resource lists.
         Commands::Connections { r#type } => {
-            let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+            let (name, api) = resolve_gateway_api(cli.profile.as_deref());
             let result = match api {
-                Ok(api) => actions::connections::connections(&api, r#type.map(Into::into))
+                Ok(api) => actions::connections::connections(&*api, r#type.map(Into::into))
                     .await
                     .map(ActionOutput::Connections),
                 Err(err) => Err(err),
@@ -530,7 +514,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             command,
         }) => match command {
             None => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) if follow => {
                         let min_level = min_level.map(LogLevel::wire);
@@ -559,7 +543,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 }
                             };
                         actions::logs::tail(
-                            &api,
+                            &*api,
                             logger.as_deref(),
                             min_level,
                             since,
@@ -572,7 +556,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     }
                     Ok(api) => {
                         let min_level = min_level.map(LogLevel::wire);
-                        actions::logs::list_logs(&api, logger.as_deref(), min_level, since, limit)
+                        actions::logs::list_logs(&*api, logger.as_deref(), min_level, since, limit)
                             .await
                             .map(ActionOutput::LogsList)
                     }
@@ -581,11 +565,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (name, result)
             }
             Some(LogsCmd::Download { output }) => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
                         let stem = name.as_deref().unwrap_or("gateway");
-                        actions::logs::download(&api, output.as_deref(), stem)
+                        actions::logs::download(&*api, output.as_deref(), stem)
                             .await
                             .map(ActionOutput::LogsDownload)
                     }
@@ -595,9 +579,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             }
             Some(LogsCmd::Loggers(loggers_args)) => match loggers_args.command {
                 None => {
-                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                     let result = match api {
-                        Ok(api) => actions::logs::loggers(&api, loggers_args.search.as_deref())
+                        Ok(api) => actions::logs::loggers(&*api, loggers_args.search.as_deref())
                             .await
                             .map(ActionOutput::LoggersList),
                         Err(err) => Err(err),
@@ -611,9 +595,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     if let Err(err) = require_confirmation(cli.yes, "logs loggers set") {
                         return (None, Err(err));
                     }
-                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                     let result = match api {
-                        Ok(api) => actions::logs::set_logger_level(&api, &logger, level.wire())
+                        Ok(api) => actions::logs::set_logger_level(&*api, &logger, level.wire())
                             .await
                             .map(ActionOutput::LoggerSet),
                         Err(err) => Err(err),
@@ -624,9 +608,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     if let Err(err) = require_confirmation(cli.yes, "logs loggers reset") {
                         return (None, Err(err));
                     }
-                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                     let result = match api {
-                        Ok(api) => actions::logs::reset_logger_levels(&api)
+                        Ok(api) => actions::logs::reset_logger_levels(&*api)
                             .await
                             .map(ActionOutput::LoggerReset),
                         Err(err) => Err(err),
@@ -648,7 +632,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             if let Err(err) = require_confirmation(cli.yes, "restart") {
                 return (None, Err(err));
             }
-            let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+            let (name, api) = resolve_gateway_api(cli.profile.as_deref());
             let result = match api {
                 Ok(api) => {
                     let interval = interval.map_or(
@@ -661,7 +645,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     );
                     if wait {
                         actions::restart::restart_and_wait(
-                            &api,
+                            &*api,
                             interval,
                             timeout,
                             actions::restart::RESTART_FLOOR,
@@ -669,7 +653,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         .await
                         .map(ActionOutput::RestartWait)
                     } else {
-                        actions::restart::restart(&api)
+                        actions::restart::restart(&*api)
                             .await
                             .map(ActionOutput::Restart)
                     }
@@ -685,10 +669,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // `wait module` is an authed read (modules needs a token).
         Commands::Wait(WaitArgs { command }) => match command {
             WaitCmd::Gateway { interval, timeout } => {
-                let (name, api) = resolve_headerless_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_headerless_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => actions::restart::wait_gateway(
-                        &api,
+                        &*api,
                         std::time::Duration::from_secs(interval),
                         std::time::Duration::from_secs(timeout),
                     )
@@ -705,10 +689,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // only past the SAME 5 s floor as `restart --wait` —
                 // running right after `ign restart` cannot
                 // false-positive on the ~5 s grace window.
-                let (name, api) = resolve_headerless_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_headerless_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => actions::restart::wait_restart(
-                        &api,
+                        &*api,
                         std::time::Duration::from_secs(interval),
                         std::time::Duration::from_secs(timeout),
                         actions::restart::RESTART_FLOOR,
@@ -724,10 +708,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 interval,
                 timeout,
             } => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => actions::restart::wait_module(
-                        &api,
+                        &*api,
                         &id,
                         std::time::Duration::from_secs(interval),
                         std::time::Duration::from_secs(timeout),
@@ -750,35 +734,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         Commands::Doctor {
             check_write,
             webdev_route,
-        } => match resolve_profile_context(&mut config, cli.profile.as_deref()) {
-            Ok(None) => (None, Err(CoreError::NoActiveProfile)),
-            Ok(Some((name, profile))) => {
-                let credential = resolve_secret_opt(&name, &profile.auth);
-                match credential {
-                    Ok(credential) => {
-                        let credential_present = credential.is_some();
-                        match ReqwestGatewayApi::new(&profile, credential) {
-                            Ok(api) => {
-                                let opts = actions::doctor::DoctorOptions {
-                                    check_write,
-                                    webdev_route,
-                                };
-                                let result = actions::doctor::doctor(
-                                    &api,
-                                    profile.url.as_str(),
-                                    credential_present,
-                                    &opts,
-                                )
-                                .await;
-                                (Some(name), Ok(ActionOutput::Doctor(result)))
-                            }
-                            Err(err) => (Some(name), Err(err)),
-                        }
-                    }
-                    Err(err) => (Some(name), Err(err)),
-                }
+        } => match Session::resolve_degraded(cli.profile.as_deref()) {
+            Ok(session) => {
+                let name = session.profile_name().to_string();
+                let opts = actions::doctor::DoctorOptions {
+                    check_write,
+                    webdev_route,
+                };
+                let result = actions::doctor::doctor(
+                    &*session,
+                    session.profile_url().as_str(),
+                    session.credential_present(),
+                    &opts,
+                )
+                .await;
+                (Some(name), Ok(ActionOutput::Doctor(result)))
             }
-            Err(err) => (None, Err(err)),
+            Err(err) => (error_profile(&err), Err(err)),
         },
         // Projects (03-01, PROJ-01/02): the first project-family
         // commands. All arms are authed (inspection-command rule: exit
@@ -790,9 +762,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // relabel, never destroy — NO --yes (planner decision).
         Commands::Project(ProjectArgs { command }) => match command {
             ProjectCommand::List => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::projects::projects(&api)
+                    Ok(api) => actions::projects::projects(&*api)
                         .await
                         .map(ActionOutput::ProjectsList),
                     Err(err) => Err(err),
@@ -807,7 +779,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 inheritable,
                 disabled,
             } => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
                         let opts = actions::projects::NewOptions {
@@ -817,7 +789,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             parent,
                             inheritable: inheritable.then_some(true),
                         };
-                        actions::projects::project_new(&api, &project_name, &opts)
+                        actions::projects::project_new(&*api, &project_name, &opts)
                             .await
                             .map(ActionOutput::ProjectNew)
                     }
@@ -826,9 +798,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
             ProjectCommand::Copy { src, dst } => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::projects::project_copy(&api, &src, &dst)
+                    Ok(api) => actions::projects::project_copy(&*api, &src, &dst)
                         .await
                         .map(ActionOutput::ProjectCopy),
                     Err(err) => Err(err),
@@ -836,9 +808,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
             ProjectCommand::Rename { old_name, new_name } => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::projects::project_rename(&api, &old_name, &new_name)
+                    Ok(api) => actions::projects::project_rename(&*api, &old_name, &new_name)
                         .await
                         .map(ActionOutput::ProjectRename),
                     Err(err) => Err(err),
@@ -854,7 +826,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 disabled,
                 inheritable,
             } => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
                         // --set-enabled → Some(true), --disabled →
@@ -873,7 +845,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             enabled,
                             inheritable,
                         };
-                        actions::projects::project_set(&api, &project_name, &opts)
+                        actions::projects::project_set(&*api, &project_name, &opts)
                             .await
                             .map(ActionOutput::ProjectSet)
                     }
@@ -889,9 +861,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if let Err(err) = require_confirmation(cli.yes, "project delete") {
                     return (None, Err(err));
                 }
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::projects::project_delete(&api, &project_name)
+                    Ok(api) => actions::projects::project_delete(&*api, &project_name)
                         .await
                         .map(ActionOutput::ProjectDelete),
                     Err(err) => Err(err),
@@ -914,12 +886,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if mode == RenderMode::Human {
                     eprintln!("exporting {project_name} …");
                 }
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
                         if decode_scripts {
                             actions::projects::project_export_decoded(
-                                &api,
+                                &*api,
                                 &project_name,
                                 output.as_deref(),
                             )
@@ -927,7 +899,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             .map(ActionOutput::ProjectExportDecoded)
                         } else {
                             actions::projects::project_export(
-                                &api,
+                                &*api,
                                 &project_name,
                                 output.as_deref(),
                             )
@@ -1009,10 +981,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         }
                     }
                 };
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => actions::projects::project_import(
-                        &api,
+                        &*api,
                         &project_name,
                         zip,
                         collision_policy.into(),
@@ -1042,8 +1014,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 );
                 let result = match sides {
                     Ok((api_a, api_b)) => actions::projects::project_diff(
-                        &api_a,
-                        &api_b,
+                        &*api_a,
+                        &*api_b,
                         &project_name,
                         &profile_a,
                         &profile_b,
@@ -1103,8 +1075,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             all_changed,
                         };
                         actions::projects::project_sync(
-                            &api_a,
-                            &api_b,
+                            &*api_a,
+                            &*api_b,
                             &project_name,
                             &selection,
                             delete,
@@ -1132,10 +1104,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // InvalidInput path), the action owns the sniff + surgery.
         Commands::Resource(ResourceArgs { command }) => match command {
             ResourceCommand::List { project, prefix } => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
-                        actions::resources::resources_list(&api, &project, prefix.as_deref())
+                        actions::resources::resources_list(&*api, &project, prefix.as_deref())
                             .await
                             .map(ActionOutput::ResourcesList)
                     }
@@ -1144,9 +1116,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (profile, result)
             }
             ResourceCommand::Get { project, path } => {
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::resources::resource_get(&api, &project, &path)
+                    Ok(api) => actions::resources::resource_get(&*api, &project, &path)
                         .await
                         .map(ActionOutput::ResourceGet),
                     Err(err) => Err(err),
@@ -1197,9 +1169,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 ) {
                     return (None, Err(err));
                 }
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::resources::resource_put(&api, &project, &path, input)
+                    Ok(api) => actions::resources::resource_put(&*api, &project, &path, input)
                         .await
                         .map(ActionOutput::ResourcePut),
                     Err(err) => Err(err),
@@ -1219,9 +1191,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 ) {
                     return (None, Err(err));
                 }
-                let (profile, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (profile, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::resources::resource_delete(&api, &project, &path)
+                    Ok(api) => actions::resources::resource_delete(&*api, &project, &path)
                         .await
                         .map(ActionOutput::ResourceDelete),
                     Err(err) => Err(err),
@@ -1241,53 +1213,51 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // (required credential, exit 3 without — the
         // inspection-command rule).
         Commands::Webdev(WebdevArgs { command }) => {
-            match resolve_profile_context(&mut config, cli.profile.as_deref()) {
-                Ok(None) => (None, Err(CoreError::NoActiveProfile)),
-                Ok(Some((name, profile))) => {
-                    let client = config::resolve_secret(&name, &profile.auth, &secret_chain())
-                        .and_then(|credential| ReqwestGatewayApi::new(&profile, Some(credential)));
-                    match command {
+            match Session::resolve(cli.profile.as_deref()) {
+                Ok(session) => {
+                    let name = session.profile_name().to_string();
+                    // `webdev status` reads the profile's STORED scriptExec
+                    // secret — a config fact the URL overlay never touches,
+                    // answered by the already-loaded dispatch config now
+                    // that the profile struct is core-owned (the seam
+                    // resolves clients; the stored secret is not one).
+                    let stored_secret = config
+                        .profiles
+                        .get(&name)
+                        .and_then(|profile| profile.webdev_secret.clone());
+                    let result = match command {
                         WebdevCommand::Deploy {
                             project,
                             with_script_exec,
                             rotate_secret,
                         } => {
-                            let result = match client {
-                                Ok(api) => {
-                                    if mode == RenderMode::Human {
-                                        eprintln!("deploying webdev routes to {project} …");
-                                    }
-                                    actions::webdev::webdev_deploy(
-                                        &api,
-                                        &project,
-                                        with_script_exec,
-                                        rotate_secret,
-                                        &path,
-                                        &name,
-                                    )
-                                    .await
-                                    .map(ActionOutput::WebdevDeploy)
-                                }
-                                Err(err) => Err(err),
-                            };
-                            (Some(name), result)
+                            if mode == RenderMode::Human {
+                                eprintln!("deploying webdev routes to {project} …");
+                            }
+                            actions::webdev::webdev_deploy(
+                                &*session,
+                                &project,
+                                with_script_exec,
+                                rotate_secret,
+                                &path,
+                                &name,
+                            )
+                            .await
+                            .map(ActionOutput::WebdevDeploy)
                         }
                         WebdevCommand::Status { project } => {
-                            let result = match client {
-                                Ok(api) => actions::webdev::webdev_status(
-                                    &api,
-                                    &project,
-                                    profile.webdev_secret.as_deref(),
-                                )
-                                .await
-                                .map(ActionOutput::WebdevStatus),
-                                Err(err) => Err(err),
-                            };
-                            (Some(name), result)
+                            actions::webdev::webdev_status(
+                                &*session,
+                                &project,
+                                stored_secret.as_deref(),
+                            )
+                            .await
+                            .map(ActionOutput::WebdevStatus)
                         }
-                    }
+                    };
+                    (Some(name), result)
                 }
-                Err(err) => (None, Err(err)),
+                Err(err) => (error_profile(&err), Err(err)),
             }
         }
         // `rig reset`, `rig trial reset`, and `rig restore` are the
@@ -1397,23 +1367,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
                 _ => None,
             };
-            let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+            let (name, api) = resolve_gateway_api(cli.profile.as_deref());
             let result = match (&command, api) {
                 (TagsCommand::Provider(TagsProviderCommand::List), Ok(api)) => {
-                    actions::tags::tag_provider_list(&api)
+                    actions::tags::tag_provider_list(&*api)
                         .await
                         .map(ActionOutput::TagProviders)
                 }
                 (
                     TagsCommand::Provider(TagsProviderCommand::Create { name: provider }),
                     Ok(api),
-                ) => actions::tags::tag_provider_create(&api, provider)
+                ) => actions::tags::tag_provider_create(&*api, provider)
                     .await
                     .map(ActionOutput::TagProviderCreate),
                 (
                     TagsCommand::Provider(TagsProviderCommand::Delete { name: provider }),
                     Ok(api),
-                ) => actions::tags::tag_provider_delete(&api, provider)
+                ) => actions::tags::tag_provider_delete(&*api, provider)
                     .await
                     .map(ActionOutput::TagProviderDelete),
                 (
@@ -1426,7 +1396,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     },
                     Ok(api),
                 ) => actions::tags::tags_browse(
-                    &api,
+                    &*api,
                     project,
                     path.as_deref().unwrap_or(""),
                     filter.as_deref(),
@@ -1435,23 +1405,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 .await
                 .map(ActionOutput::TagsBrowse),
                 (TagsCommand::Read { paths, project }, Ok(api)) => {
-                    actions::tags::tags_read(&api, project, paths)
+                    actions::tags::tags_read(&*api, project, paths)
                         .await
                         .map(ActionOutput::TagsRead)
                 }
                 (TagsCommand::Write { path, project, .. }, Ok(api)) => {
-                    actions::tags::tags_write(&api, project, path, write_value.expect("parsed"))
+                    actions::tags::tags_write(&*api, project, path, write_value.expect("parsed"))
                         .await
                         .map(ActionOutput::TagsWrite)
                 }
                 (TagsCommand::Config(TagsConfigCommand::Get { path, project }), Ok(api)) => {
-                    actions::tags::tags_config_get(&api, project, path)
+                    actions::tags::tags_config_get(&*api, project, path)
                         .await
                         .map(ActionOutput::TagsConfigGet)
                 }
                 (TagsCommand::Config(TagsConfigCommand::Create { path, project, .. }), Ok(api)) => {
                     actions::tags::tags_config_create(
-                        &api,
+                        &*api,
                         project,
                         path,
                         json_input.as_ref().expect("parsed pre-resolution"),
@@ -1461,7 +1431,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
                 (TagsCommand::Config(TagsConfigCommand::Edit { path, project, .. }), Ok(api)) => {
                     actions::tags::tags_config_edit(
-                        &api,
+                        &*api,
                         project,
                         path,
                         json_input.as_ref().expect("parsed pre-resolution"),
@@ -1470,12 +1440,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     .map(ActionOutput::TagsConfigEdit)
                 }
                 (TagsCommand::Config(TagsConfigCommand::Delete { paths, project }), Ok(api)) => {
-                    actions::tags::tags_config_delete(&api, project, paths)
+                    actions::tags::tags_config_delete(&*api, project, paths)
                         .await
                         .map(ActionOutput::TagsConfigDelete)
                 }
                 (TagsCommand::Udt(TagsUdtCommand::Types { provider, project }), Ok(api)) => {
-                    actions::tags::tags_udt_types(&api, project, provider)
+                    actions::tags::tags_udt_types(&*api, project, provider)
                         .await
                         .map(ActionOutput::TagsUdtTypes)
                 }
@@ -1486,12 +1456,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         project,
                     }),
                     Ok(api),
-                ) => actions::tags::tags_udt_def(&api, project, provider, udt_name)
+                ) => actions::tags::tags_udt_def(&*api, project, provider, udt_name)
                     .await
                     .map(ActionOutput::TagsUdtDef),
                 (TagsCommand::Export { paths, project, .. }, Ok(api)) => {
                     actions::tags::tags_export(
-                        &api,
+                        &*api,
                         project,
                         paths,
                         export_out
@@ -1511,7 +1481,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     },
                     Ok(api),
                 ) => actions::tags::tags_import(
-                    &api,
+                    &*api,
                     project,
                     provider,
                     json_input.expect("parsed pre-resolution"),
@@ -1528,7 +1498,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     }),
                     Ok(api),
                 ) => actions::tags::tags_alarms_active(
-                    &api,
+                    &*api,
                     project,
                     source.as_deref(),
                     priority.as_deref(),
@@ -1538,7 +1508,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 .map(ActionOutput::TagsAlarmsActive),
                 (TagsCommand::Alarms(TagsAlarmsCommand::History { project, .. }), Ok(api)) => {
                     let (start_ms, end_ms) = time_args.expect("parsed pre-resolution");
-                    actions::tags::tags_alarms_history(&api, project, start_ms, end_ms)
+                    actions::tags::tags_alarms_history(&*api, project, start_ms, end_ms)
                         .await
                         .map(ActionOutput::TagsAlarmsHistory)
                 }
@@ -1551,7 +1521,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     }),
                     Ok(api),
                 ) => actions::tags::tags_alarms_ack(
-                    &api,
+                    &*api,
                     project,
                     ids,
                     note.as_deref().unwrap_or(""),
@@ -1571,7 +1541,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 ) => {
                     let (start_ms, end_ms) = time_args.expect("parsed pre-resolution");
                     actions::tags::tags_history_query(
-                        &api,
+                        &*api,
                         project,
                         paths,
                         start_ms,
@@ -1634,7 +1604,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let probe = commissioned_probe(&plan);
                         let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> = probe
                             .as_ref()
-                            .map(|api| api as &dyn ignition_core::client::GatewayApi);
+                            .map(|session| {
+                                session.api() as &dyn ignition_core::client::GatewayApi
+                            });
                         match command {
                             RigCommand::Up { timeout } => {
                                 actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
@@ -1689,7 +1661,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     // (--user / IGNITION_USER + IGNITION_PASSWORD).
                     RigCommand::Trial(ref trial_args) => match trial_args.command.clone() {
                         cli::TrialCommand::Status => match rig_gateway_client(&plan, None) {
-                            Some(api) => actions::rig::trial_status(&api)
+                            Some(api) => actions::rig::trial_status(&*api)
                                 .await
                                 .map(ActionOutput::RigTrialStatus),
                             None => Err(trial_no_gateway(&plan)),
@@ -1729,7 +1701,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                         .as_ref()
                                         .map(|(user, password)| (user.as_str(), password));
                                     actions::rig::trial_reset(
-                                        &api,
+                                        &*api,
                                         &rig_url,
                                         token_available,
                                         basic_ref,
@@ -1757,7 +1729,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let credential = Some(Credential::Token(config::Secret::new(token)));
                         match rig_gateway_client(&plan, credential) {
                             Some(api) => {
-                                actions::rig::rig_snapshot(&api, &plan.name, output.as_deref())
+                                actions::rig::rig_snapshot(&*api, &plan.name, output.as_deref())
                                     .await
                                     .map(ActionOutput::RigSnapshot)
                             }
@@ -1782,7 +1754,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             Some(api) => {
                                 let rig_url = actions::rig::gateway_url_from(&plan)
                                     .expect("rig_gateway_client derived it or returned None");
-                                actions::rig::rig_restore(&api, &rig_url, &file, timeout)
+                                actions::rig::rig_restore(&*api, &rig_url, &file, timeout)
                                     .await
                                     .map(ActionOutput::RigRestore)
                             }
@@ -1810,12 +1782,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // naming the whole-gateway consequence + restart block.
         Commands::Backup(BackupArgs { command }) => match command {
             BackupCommand::Download { output, r#type } => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => {
                         let stem = name.as_deref().unwrap_or("gateway");
                         actions::backup::backup_download(
-                            &api,
+                            &*api,
                             output.as_deref(),
                             stem,
                             r#type.into(),
@@ -1835,9 +1807,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 ) {
                     return (None, Err(err));
                 }
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::backup::backup_restore(&api, &file)
+                    Ok(api) => actions::backup::backup_restore(&*api, &file)
                         .await
                         .map(ActionOutput::BackupRestore),
                     Err(err) => Err(err),
@@ -1852,9 +1824,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // gateways). Both are reads, unguarded.
         Commands::Eam(EamArgs { command }) => match command {
             EamCommand::History { limit, search } => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
-                    Ok(api) => actions::eam::eam_history(&api, limit, search.as_deref())
+                    Ok(api) => actions::eam::eam_history(&*api, limit, search.as_deref())
                         .await
                         .map(ActionOutput::EamHistory),
                     Err(err) => Err(err),
@@ -1862,13 +1834,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (name, result)
             }
             EamCommand::Tasks { name: task_name } => {
-                let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                 let result = match api {
                     Ok(api) => match task_name {
-                        Some(task_name) => actions::eam::eam_task_detail(&api, &task_name)
+                        Some(task_name) => actions::eam::eam_task_detail(&*api, &task_name)
                             .await
                             .map(ActionOutput::EamTaskDetail),
-                        None => actions::eam::eam_tasks(&api)
+                        None => actions::eam::eam_tasks(&*api)
                             .await
                             .map(ActionOutput::EamTasks),
                     },
@@ -1937,10 +1909,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         },
                         None => None,
                     };
-                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                     let result = match api {
                         Ok(api) => actions::eam::eam_task_create(
-                            &api,
+                            &*api,
                             &task_name,
                             &r#type,
                             &target,
@@ -1961,9 +1933,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     ) {
                         return (None, Err(err));
                     }
-                    let (name, api) = resolve_gateway_api(&mut config, cli.profile.as_deref());
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                     let result = match api {
-                        Ok(api) => actions::eam::eam_task_force(&api, &task_name)
+                        Ok(api) => actions::eam::eam_task_force(&*api, &task_name)
                             .await
                             .map(ActionOutput::EamTaskForce),
                         Err(err) => Err(err),
@@ -1992,24 +1964,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         Ok(script) => script,
                         Err(err) => return (None, Err(err)),
                     };
-                match resolve_profile_context(&mut config, cli.profile.as_deref()) {
-                    Ok(None) => (None, Err(CoreError::NoActiveProfile)),
-                    Ok(Some((name, profile))) => {
-                        let client = config::resolve_secret(&name, &profile.auth, &secret_chain())
-                            .and_then(|credential| {
-                                ReqwestGatewayApi::new(&profile, Some(credential))
-                            });
-                        let result = match client {
-                            Ok(api) => {
-                                actions::script::script_run(&api, &config, &name, &project, &script)
-                                    .await
-                                    .map(ActionOutput::ScriptRun)
-                            }
-                            Err(err) => Err(err),
-                        };
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result =
+                            actions::script::script_run(&*session, &config, &name, &project, &script)
+                                .await
+                                .map(ActionOutput::ScriptRun);
                         (Some(name), result)
                     }
-                    Err(err) => (None, Err(err)),
+                    Err(err) => (error_profile(&err), Err(err)),
                 }
             }
         },
@@ -2105,9 +2069,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
     }
 }
 
-/// Resolve the profile context once: mirror the selection precedence
+/// Selection-only profile resolution for the TWO consumers that need the
+/// resolved NAME/config VIEW rather than a gateway client (`profile list`
+/// and the two-client envelope echo): mirror the selection precedence
 /// (flag > config.active) to scope the `IGNITION_URL` env overlay, then
-/// resolve and validate the selection.
+/// resolve and validate the selection. NO secret is walked and NO client
+/// is built here — all client construction is core-owned
+/// ([`Session::resolve`] family); this survives because those consumers
+/// must not demand the active profile's credential (a secret-less active
+/// profile can still diff/sync two named sides, and `profile list` runs
+/// on a fresh install).
 fn resolve_profile_context(
     config: &mut Config,
     flag: Option<&str>,
@@ -2129,20 +2100,19 @@ enum Inspection {
 /// construction site), then run the action. The profile name travels
 /// out even on failure so the error envelope echoes it (CORE-01).
 async fn run_inspection(
-    config: &mut Config,
     flag: Option<&str>,
     inspection: Inspection,
 ) -> (Option<String>, Result<ActionOutput, CoreError>) {
-    let (name, api) = resolve_gateway_api(config, flag);
+    let (name, api) = resolve_gateway_api(flag);
     let result = match api {
         Ok(api) => match inspection {
-            Inspection::Status => actions::inspect::status(&api)
+            Inspection::Status => actions::inspect::status(&*api)
                 .await
                 .map(ActionOutput::Status),
-            Inspection::Modules(quarantined) => actions::inspect::modules(&api, quarantined)
+            Inspection::Modules(quarantined) => actions::inspect::modules(&*api, quarantined)
                 .await
                 .map(ActionOutput::Modules),
-            Inspection::Metrics(history) => actions::inspect::metrics(&api, history)
+            Inspection::Metrics(history) => actions::inspect::metrics(&*api, history)
                 .await
                 .map(ActionOutput::Metrics),
         },
@@ -2151,88 +2121,67 @@ async fn run_inspection(
     (name, result)
 }
 
-/// Profile + REQUIRED credential + client for gateway commands. `None`
-/// profile → `NoActiveProfile` (these commands cannot run without a
-/// target); the LOCKED secret chain with NO degradation — a missing
-/// secret is `SecretUnavailable` (exit 3), correct for authed reads.
-fn resolve_gateway_api(
-    config: &mut Config,
-    flag: Option<&str>,
-) -> (Option<String>, Result<ReqwestGatewayApi, CoreError>) {
-    match resolve_profile_context(config, flag) {
-        Ok(None) => (None, Err(CoreError::NoActiveProfile)),
-        Ok(Some((name, profile))) => {
-            let credential = config::resolve_secret(&name, &profile.auth, &secret_chain());
-            let result = credential
-                .and_then(|credential| ReqwestGatewayApi::new(&profile, Some(credential)));
-            (Some(name), result)
-        }
-        Err(err) => (None, Err(err)),
+/// Profile + REQUIRED credential + client for gateway commands — a thin
+/// delegate onto [`Session::resolve`] (the seam owns load → overlay →
+/// selection → LOCKED chain → construction; CORE-09 dissolved this file's
+/// duplicated choreography). `None` profile → `NoActiveProfile`; a missing
+/// secret is `SecretUnavailable` (exit 3), correct for authed reads. The
+/// profile name travels out even on failure so the error envelope echoes
+/// it (CORE-01).
+fn resolve_gateway_api(flag: Option<&str>) -> (Option<String>, Result<Session, CoreError>) {
+    match Session::resolve(flag) {
+        Ok(session) => (Some(session.profile_name().to_string()), Ok(session)),
+        Err(err) => (error_profile(&err), Err(err)),
     }
 }
 
-/// Resolve ONE named profile side to a built client — the per-profile
-/// construction path shared with [`resolve_gateway_api`]: REQUIRED
-/// credential through the ONE locked secret chain (no degradation, no
-/// fork), then `ReqwestGatewayApi::new` from the resolved profile.
-fn named_profile_client(config: &mut Config, name: &str) -> Result<ReqwestGatewayApi, CoreError> {
-    let Some((_resolved, profile)) = config::resolve_selection(config, Some(name))? else {
-        return Err(CoreError::Internal(
-            "a named profile selection resolved to nothing".to_string(),
-        ));
-    };
-    let credential = config::resolve_secret(name, &profile.auth, &secret_chain())?;
-    ReqwestGatewayApi::new(&profile, Some(credential))
+/// Resolve ONE named profile side to a session — a thin delegate onto
+/// [`Session::resolve_side`] (per-side resolution, the seam's locked
+/// shape: each side walks the one chain independently, and the env
+/// overlay does NOT re-target the sides — only the envelope's active
+/// selection is overlaid, which the caller's already-loaded config
+/// carries).
+fn named_profile_client(config: &mut Config, name: &str) -> Result<Session, CoreError> {
+    Session::resolve_side(config, name)
 }
 
 /// THE two-client resolution shape (07-01, 07-RESEARCH Pattern): the
-/// ENVELOPE's active profile resolves exactly as every other command
-/// (flag > active, `IGNITION_URL` env overlay scoped to that
-/// selection — resolution UNCHANGED), then each positional side
-/// resolves through the same `resolve_selection` machinery and builds
-/// its own client. Each side's secret chain resolves INDEPENDENTLY
-/// through the one locked chain: `IGNITION_TOKEN` (and the basic env
-/// pair) applies to BOTH sides unless per-profile keyring entries
-/// exist — the README's two-sided-secret caveat.
+/// ENVELOPE's active profile resolves for its NAME exactly as every
+/// other command (flag > active, env overlay scoped to that selection —
+/// no secret demanded: a credential-less active profile can still drive
+/// diff/sync between two named sides), then each positional side builds
+/// its own session through the seam. Each side's secret chain resolves
+/// INDEPENDENTLY: `IGNITION_TOKEN` (and the basic env pair) applies to
+/// BOTH sides unless per-profile keyring entries exist — the README's
+/// two-sided-secret caveat.
 fn resolve_two_clients(
     config: &mut Config,
     flag: Option<&str>,
     name_a: &str,
     name_b: &str,
-) -> (
-    Option<String>,
-    Result<(ReqwestGatewayApi, ReqwestGatewayApi), CoreError>,
-) {
+) -> (Option<String>, Result<(Session, Session), CoreError>) {
     match resolve_profile_context(config, flag) {
         Ok(None) => (None, Err(CoreError::NoActiveProfile)),
         Ok(Some((active, _))) => {
-            let sides = named_profile_client(config, name_a)
-                .and_then(|api_a| named_profile_client(config, name_b).map(|api_b| (api_a, api_b)));
+            let sides = named_profile_client(config, name_a).and_then(|api_a| {
+                named_profile_client(config, name_b).map(|api_b| (api_a, api_b))
+            });
             (Some(active), sides)
         }
         Err(err) => (None, Err(err)),
     }
 }
 
-/// Profile + HEADER-LESS-tolerant client for the unauthenticated wait
-/// commands (`wait gateway`, `wait restart`): credential resolution
-/// DEGRADES to None — StatusPing answers with no credential, so a
-/// missing/broken secret must never block readiness polling (the whole
-/// point: these waits work when auth is broken). Other credential
-/// errors still propagate.
-fn resolve_headerless_api(
-    config: &mut Config,
-    flag: Option<&str>,
-) -> (Option<String>, Result<ReqwestGatewayApi, CoreError>) {
-    match resolve_profile_context(config, flag) {
-        Ok(None) => (None, Err(CoreError::NoActiveProfile)),
-        Ok(Some((name, profile))) => {
-            let credential = resolve_secret_opt(&name, &profile.auth);
-            let result =
-                credential.and_then(|credential| ReqwestGatewayApi::new(&profile, credential));
-            (Some(name), result)
-        }
-        Err(err) => (None, Err(err)),
+/// Profile + HEADER-LESS-tolerant session for the unauthenticated wait
+/// commands (`wait gateway`, `wait restart`) — a thin delegate onto
+/// [`Session::resolve_degraded`]: credential resolution DEGRADES to None
+/// — StatusPing answers with no credential, so a missing/broken secret
+/// must never block readiness polling (the whole point: these waits work
+/// when auth is broken). Other credential errors still propagate.
+fn resolve_headerless_api(flag: Option<&str>) -> (Option<String>, Result<Session, CoreError>) {
+    match Session::resolve_degraded(flag) {
+        Ok(session) => (Some(session.profile_name().to_string()), Ok(session)),
+        Err(err) => (error_profile(&err), Err(err)),
     }
 }
 
@@ -2242,7 +2191,7 @@ fn resolve_headerless_api(
 /// waits work even with no credential at all. `ssl_verify=false`:
 /// localhost probes against self-signed rig https are the norm.
 /// Shared by `rig up` and `rig reset` (both end in the wait).
-fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<ReqwestGatewayApi> {
+fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<Session> {
     rig_gateway_client(plan, None)
 }
 
@@ -2250,21 +2199,15 @@ fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<ReqwestGatew
 /// `commissioned_probe` generalized for the trial verbs: an optional
 /// credential rides along — tier 0's token when `IGNITION_TOKEN` is
 /// set; the trial endpoints tolerate headers either way,
-/// live-verified). `None` when no gateway port is derivable.
+/// live-verified). `None` when no gateway port is derivable. The URL
+/// DERIVATION stays here; the construction is [`Session::for_url`] —
+/// headerless-by-construction, no config read.
 fn rig_gateway_client(
     plan: &ignition_core::rig::RigPlan,
     credential: Option<Credential>,
-) -> Option<ReqwestGatewayApi> {
+) -> Option<Session> {
     actions::rig::gateway_url_from(plan).and_then(|url| {
-        let profile = config::Profile {
-            url: url.parse().ok()?,
-            label: None,
-            ssl_verify: false,
-            auth: AuthRef::default(),
-            webdev_secret: None,
-            poll_interval_secs: None,
-        };
-        ReqwestGatewayApi::new(&profile, credential).ok()
+        Session::for_url(url.parse().ok()?, credential, false).ok()
     })
 }
 
@@ -2278,33 +2221,22 @@ fn trial_no_gateway(plan: &ignition_core::rig::RigPlan) -> CoreError {
     ))
 }
 
+/// The profile NAME an error carries, when it does — `SecretUnavailable`
+/// names the profile whose chain exhausted, so the error envelope still
+/// echoes `[profile: NAME]` (CORE-01 threading) even though the seam no
+/// longer hands the resolved name across its error path. Selection-class
+/// errors (`profile_not_found`, `no_active_profile`) carry no name — the
+/// envelope stays `null`, as today.
+fn error_profile(err: &CoreError) -> Option<String> {
+    match err {
+        CoreError::SecretUnavailable { profile } => Some(profile.clone()),
+        _ => None,
+    }
+}
+
 /// A non-empty env var, when set.
 fn env_non_empty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-/// The LOCKED secret chain (env tokens → keyring → basic pair), built in
-/// exactly one place.
-fn secret_chain() -> Vec<Box<dyn SecretStore>> {
-    vec![
-        Box::new(config::EnvStore),
-        Box::new(config::KeyringStore),
-        Box::new(config::BasicEnvStore),
-    ]
-}
-
-/// Credential resolution degraded for non-authenticating commands: the
-/// LOCKED chain (env tokens → keyring → basic pair) with
-/// `SecretUnavailable` mapped to `Ok(None)` — version proceeds header-less
-/// (gateway-info is `auth: none`) instead of demanding a secret. Every
-/// OTHER credential error propagates.
-fn resolve_secret_opt(profile: &str, auth: &AuthRef) -> Result<Option<Credential>, CoreError> {
-    config::resolve_secret(profile, auth, &secret_chain())
-        .map(Some)
-        .or_else(|err| match err {
-            CoreError::SecretUnavailable { .. } => Ok(None),
-            other => Err(other),
-        })
 }
 
 /// Deterministic auth-ref construction from `profile add` flags:

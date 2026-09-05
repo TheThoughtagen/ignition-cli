@@ -129,6 +129,32 @@ impl Session {
         ))
     }
 
+    /// Resolve ONE NAMED side of a multi-profile command through a
+    /// config the CALLER already loaded — the project diff/sync shape.
+    /// Verbatim port of main.rs's `named_profile_client`: the selection
+    /// runs against the caller's config with NO env overlay applied
+    /// (side B carries its own URL even while `IGNITION_URL` overlays
+    /// the envelope's active profile — the contract the diff/sync
+    /// goldens pin), then the LOCKED chain (required) and the client
+    /// construction. The caller's `name` rides the secret resolution
+    /// verbatim, and the impossible empty-selection arm stays
+    /// `CoreError::Internal` exactly as the original wrote it.
+    pub fn resolve_side(config: &mut Config, name: &str) -> Result<Self, CoreError> {
+        let Some((_resolved, profile)) = config::resolve_selection(config, Some(name))? else {
+            return Err(CoreError::Internal(
+                "a named profile selection resolved to nothing".to_string(),
+            ));
+        };
+        let credential = config::resolve_secret(name, &profile.auth, &secret_chain())?;
+        let api = ReqwestGatewayApi::new(&profile, Some(credential))?;
+        Ok(Self {
+            profile: name.to_string(),
+            url: profile.url.clone(),
+            credential_present: true,
+            api: Arc::new(api),
+        })
+    }
+
     /// Resolve through config with the credential DEGRADED to `None`
     /// when the secret chain exhausts: `version` must not demand a
     /// secret (gateway-info answers), the wait commands must keep
