@@ -193,6 +193,7 @@ mod tests {
     use ignition_core::error::CoreError;
 
     use std::path::PathBuf;
+    use std::time::Duration;
 
     /// The crate-wide env lock (lib.rs) — serializes EVERY env-mutating
     /// ignition-tui test against the others (per-module locks do not).
@@ -281,6 +282,11 @@ mod tests {
             ctx.profile_url, "http://localhost:9443/",
             "profile url rides along"
         );
+        assert_eq!(
+            ctx.poll_interval,
+            Duration::from_secs(5),
+            "an absent poll_interval_secs resolves to the REFRESH_PERIOD default"
+        );
 
         let ctx = resolve(None).expect("active profile resolves");
         assert_eq!(
@@ -308,6 +314,48 @@ mod tests {
         assert!(matches!(err, CoreError::ProfileNotFound { .. }));
 
         teardown(&vars);
+    }
+
+    /// THE SWITCH TRAP'S unit proof (TUIX-05): each profile's configured
+    /// `poll_interval_secs` rides the resolved context PER PROFILE —
+    /// `resolve` carries the selected profile's cadence and `rebuild`
+    /// (the switcher's entry point) carries the NAMED one, so a switch
+    /// can adopt a different interval without a restart.
+    #[test]
+    fn resolve_and_rebuild_carry_each_profiles_configured_interval() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+poll_interval_secs = 2
+
+[profiles.prod]
+url = "http://localhost:9443/"
+poll_interval_secs = 5
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let ctx = resolve(None).expect("active profile resolves");
+        assert_eq!(
+            ctx.poll_interval,
+            Duration::from_secs(2),
+            "the active profile's configured cadence flows through resolve"
+        );
+
+        let ctx = rebuild("prod").expect("named profile resolves");
+        assert_eq!(
+            ctx.poll_interval,
+            Duration::from_secs(5),
+            "rebuild returns the NAMED profile's interval — not the active one's"
+        );
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
     }
 
     /// No flag, no active profile → clean NoActiveProfile (exit 3) error,
@@ -371,6 +419,11 @@ poll_interval_secs = "banana"
             ctx.profile_url, "http://localhost:9088/",
             "the degraded profile still resolves to its url"
         );
+        assert_eq!(
+            ctx.poll_interval,
+            Duration::from_secs(5),
+            "the degraded load falls back to the 5 s default cadence"
+        );
         teardown(&["IGNITION_TOKEN".to_string()]);
     }
 
@@ -399,6 +452,11 @@ poll_interval_secs = 0
         assert_eq!(
             ctx.profile_name, "dev",
             "the cockpit starts on the default cadence"
+        );
+        assert_eq!(
+            ctx.poll_interval,
+            Duration::from_secs(5),
+            "the clamp-degraded profile polls at the 5 s default"
         );
 
         let path = dir.path().join("config.toml");

@@ -263,7 +263,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::mount_gateway;
-    use super::{REFRESH_PERIOD, refresh_worker, snapshot, spawn_refresh_once};
+    use super::{REFRESH_PERIOD, refresh_worker, snapshot, spawn_refresh, spawn_refresh_once};
     use crate::event::AppEvent;
     use crate::state::AppState;
 
@@ -381,5 +381,38 @@ mod tests {
         // Busy → refused (no stack, no second transition).
         spawn_refresh_once(&mut state);
         assert!(state.dashboard.busy);
+    }
+
+    /// The spawn guard with TUIX-05's new argument source: outside a
+    /// tokio runtime the rails + era transition stand alone and NOTHING
+    /// spawns — no panic, and the state's cadence (here the
+    /// REFRESH_PERIOD default, the value a runtime spawn would have
+    /// received) is the 5 s default, never zero.
+    #[test]
+    fn spawn_refresh_rails_stand_alone_without_a_runtime() {
+        let mut state = AppState::new();
+        assert_eq!(
+            state.poll_interval, REFRESH_PERIOD,
+            "default cadence seeded by the state's Default"
+        );
+        assert!(state.refresh_shutdown.is_none());
+
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        let era_before = state.era;
+
+        spawn_refresh(&mut state); // no runtime → no spawn, no panic
+
+        assert!(
+            state.refresh_shutdown.is_some(),
+            "the fresh shutdown rail armed (nothing spawned outside a runtime)"
+        );
+        assert_eq!(
+            state.era,
+            era_before + 1,
+            "era transitioned for the new world"
+        );
     }
 }

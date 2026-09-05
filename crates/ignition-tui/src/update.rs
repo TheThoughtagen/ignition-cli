@@ -3536,6 +3536,8 @@ fn rig_cli_form(form: &RigForm) -> String {
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
+    use std::time::Duration;
+
     use super::update;
     use crate::event::AppEvent;
     use crate::state::{AppState, Modal, PendingAction, PendingInput, Screen};
@@ -4179,7 +4181,7 @@ mod tests {
             active: Some("dev".into()),
             ..Default::default()
         };
-        for (name, port) in [("dev", 9088), ("prod", 9443)] {
+        for (name, port, interval) in [("dev", 9088, 2), ("prod", 9443, 1)] {
             config.profiles.insert(
                 name.into(),
                 ignition_core::config::Profile {
@@ -4188,7 +4190,9 @@ mod tests {
                     ssl_verify: true,
                     auth: ignition_core::config::AuthRef::default(),
                     webdev_secret: None,
-                    poll_interval_secs: None,
+                    // Distinct per profile so the switch test can prove
+                    // the NEW profile's cadence is adopted (TUIX-05).
+                    poll_interval_secs: Some(interval),
                 },
             );
         }
@@ -4276,6 +4280,11 @@ mod tests {
         // Adopted: profile + era + FRESH shutdown rail + reset dashboard.
         assert_eq!(state.profile.as_deref(), Some("prod"), "profile adopted");
         assert_eq!(state.era, era_before + 1, "era bumped exactly once");
+        assert_eq!(
+            state.poll_interval,
+            Duration::from_secs(1),
+            "the NEW profile's cadence adopted (TUIX-05 switch trap)"
+        );
         assert!(
             state.dashboard.snapshot.is_none(),
             "dashboard reset to Loading"
@@ -4313,6 +4322,46 @@ mod tests {
             },
         );
         assert_eq!(state.banner.as_deref(), Some("profile: prod"));
+
+        teardown_profiles(&vars);
+    }
+
+    /// THE SWITCH TRAP pinned at the state-machine level (TUIX-05):
+    /// switching to a profile carrying `poll_interval_secs = 1` adopts
+    /// that cadence into the state BEFORE `switch_profile` re-spawns
+    /// the refresh worker — the dashboard's next world ticks at 1 s
+    /// with no restart.
+    #[test]
+    fn profile_switch_adopts_the_new_poll_interval() {
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_dir, vars) = isolated_profiles();
+
+        let mut state = AppState::new();
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        state.profile = Some("dev".into());
+        state.events_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        assert_eq!(
+            state.poll_interval,
+            Duration::from_secs(5),
+            "precondition: a fresh state runs the REFRESH_PERIOD default (world adoption is run_loop's job)"
+        );
+
+        // p opens the switcher, Down lands on prod (interval 1), Enter
+        // switches.
+        update(&mut state, key(KeyCode::Char('p'), KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(state.profile.as_deref(), Some("prod"), "switch landed");
+        assert_eq!(
+            state.poll_interval,
+            Duration::from_secs(1),
+            "the NEW profile's cadence adopted — not dev's"
+        );
 
         teardown_profiles(&vars);
     }
