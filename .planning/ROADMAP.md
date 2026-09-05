@@ -54,7 +54,14 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
   3. Contract discipline is executable, not prose: Three-Place slug rule is test-enforced (exit-code enum test + README table + prose agree), OutOfBand registry is extended for `mcp`/`lsp`/`edit` with the pinned test deliberately updated with justification, and a stdout-purity byte-scan harness over the real spawned binary fails on a single stray byte
   4. All command dispatch — CLI arms and in-process callers — resolves auth/gateway clients through `ignition-core::Session` with no second client construction anywhere in the tree
 **Research/Planning flags**: None — pure refactor of source-verified code (Session extraction, config keys, worker spawn-site parameterization); HIGH confidence, no unknowns. Standard patterns; skip research-phase.
-**Plans**: TBD
+**Plans**: 6 plans
+Plans:
+- [ ] 08-01-PLAN.md — Config schema migration: [ui].theme + per-profile poll_interval_secs, lenient degradation, poll_interval_too_small clamp slug, load_for_tui
+- [ ] 08-02-PLAN.md — ignition-core::Session type (resolve / resolve_degraded / for_url) with behavior-parity tests
+- [ ] 08-03-PLAN.md — CLI sweep: all 8 main.rs construction sites onto Session, duplicated choreography deleted, grep-clean proof
+- [ ] 08-04-PLAN.md — TUI onto Session + config-degradation wiring (load_for_tui), TUI duplicate chain deleted
+- [ ] 08-05-PLAN.md — Per-profile polling cadence (context→AppState→spawn_refresh, switch adoption) + human-verify checkpoint
+- [ ] 08-06-PLAN.md — Executable contract rituals: README-table agreement test, OutOfBand reserved slugs, stdout-purity harness
 
 ### Phase 9: 09-agent-surface-api-diagnostics
 **Goal**: The daily gateway check needs no hand-crafted curl: users get `ign api call` as the escape hatch for anything uncurated, plus curated one-command reads (`license status`, `redundancy status`, `gan status`, diagnostics bundle) for the morning check — live-verified on both rigs.
