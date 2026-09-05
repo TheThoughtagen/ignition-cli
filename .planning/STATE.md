@@ -10,11 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
-**Plan:** 0 of TBD in current phase
-**Status:** Ready to plan (`/gsd-plan-phase 8`)
-**Last Activity:** 2026-09-04 — v1.1 roadmap created (7 phases, 25 requirements mapped, 100% coverage)
+**Current Plan:** 3
+**Total Plans in Phase:** 6
+**Status:** Ready to execute
+**Last Activity:** 2026-09-05
 
-**Progress:** [░░░░░░░░░░] 0% (v1.1)
+**Progress:** [█░░░░░░░░░] 8% (v1.1 — phase 8 is first of 7 v1.1 phases; 1 of 6 phase-8 plans SUMMARIED, 08-01 in flight)
 
 ## Performance Metrics
 
@@ -24,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 8 | 0/TBD | - | - |
+| 8 | 1/6 | 200 min | 200 min |
 | 9 | 0/TBD | - | - |
 | 10 | 0/TBD | - | - |
 | 11 | 0/TBD | - | - |
@@ -33,6 +34,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 14 | 0/TBD | - | - |
 
 *Updated after each plan completion*
+| Phase 08 P02 | 200 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -45,6 +47,8 @@ Recent decisions affecting current work:
 - [Roadmap]: Transports (Phase 14) deliberately last — MCP catalog derives from the clap tree, so every command family must land first
 - [Roadmap]: Historian binding (Phase 13) is spike-gated — licensed-Historian rig access must be confirmed BEFORE Phase 13 planning
 - [Roadmap]: TUIX-05 fully delivered in Phase 8 (config plumbing + worker parameterization + clamp); TUIX-03/04 (rendering) in Phase 12
+- [Phase 08]: Session seam is concrete-with-deref (Arc<ReqwestGatewayApi>, not Arc<dyn>) — dyn-widening deferred to Phase 14 where MCP needs dyn — TUI workers/ClientHandle are concretely typed; Phase 8 goal is construction-site unification, not handle-type churn
+- [Phase 08]: Session::resolve takes the EFFECTIVE profile flag — IGNITION_PROFILE folding stays in the bin's apply_env_defaults (one env-to-flag home) — Seam must mirror main.rs resolve_profile_context verbatim; re-reading env in core would fork the precedence rule
 
 ### Pending Todos
 
@@ -57,5 +61,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-04 — Created v1.1 ROADMAP.md (phases 8-14), initialized STATE.md, populated REQUIREMENTS.md traceability (25/25 mapped).
+**Last session:** 2026-09-05 — Completed 08-02-PLAN.md (Session execution seam; 08-01 still in flight concurrently). Plans 03-06 remain.
 **Resume file:** None
