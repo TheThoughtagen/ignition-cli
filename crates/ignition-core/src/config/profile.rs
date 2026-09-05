@@ -29,6 +29,68 @@ pub struct Config {
     /// on-disk shape (the save goldens).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rigs: BTreeMap<String, RigEntry>,
+    /// UI preferences (`[ui]` table — TUIX-05 plumbing). PLUMBING ONLY:
+    /// `theme` is carried on the config, never rendered (rendering is
+    /// Phase 12, TUIX-03/04). Omitted from serialization at defaults so
+    /// legacy configs round-trip byte-identically; a wrong-shaped `[ui]`
+    /// degrades to the default with a warning (see [`lenient_ui`]).
+    #[serde(
+        default,
+        skip_serializing_if = "UiConfig::is_default",
+        deserialize_with = "lenient_ui"
+    )]
+    pub ui: UiConfig,
+}
+
+/// The `[ui]` table: TUI preference keys (TUIX-05 plumbing).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Preferred UI theme name (e.g. `"dark"`). `None` = the built-in
+    /// default. Carried only — nothing consumes it until Phase 12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+
+impl UiConfig {
+    /// True when nothing is set — keeps `[ui]` out of configs that never
+    /// carried one (the `rig_config_is_empty` precedent).
+    pub fn is_default(ui: &UiConfig) -> bool {
+        *ui == UiConfig::default()
+    }
+}
+
+/// Lenient `poll_interval_secs` extraction (TUIX-05): an integer loads
+/// verbatim — INCLUDING 0, which the load-time clamp (see
+/// [`super::load`]) refuses; anything else (string, float, negative,
+/// table) warns and degrades to `None` (default cadence). A typo in the
+/// NEW key never fails the load.
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    match value {
+        toml::Value::Integer(v) if v >= 0 => Ok(Some(v as u64)),
+        other => {
+            tracing::warn!(
+                value = %other,
+                "poll_interval_secs must be a non-negative integer — ignoring (default cadence in use)"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Lenient `[ui]` extraction (TUIX-05): a well-shaped `[ui]` table loads;
+/// anything else (a bare scalar, a mistyped member) warns and degrades to
+/// the default. Unknown keys INSIDE a valid table are simply ignored (no
+/// `deny_unknown_fields`, ever — Pitfall 7 forward compat).
+fn lenient_ui<'de, D: serde::Deserializer<'de>>(d: D) -> Result<UiConfig, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    match UiConfig::deserialize(value) {
+        Ok(ui) => Ok(ui),
+        Err(_) => {
+            tracing::warn!("[ui] is not a valid table — using defaults");
+            Ok(UiConfig::default())
+        }
+    }
 }
 
 /// True when the `[rig]` block carries nothing worth serializing —
@@ -85,6 +147,19 @@ pub struct Profile {
     /// result, log, or JSON envelope (the redaction discipline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdev_secret: Option<String>,
+    /// TUI background-refresh poll interval in seconds (TUIX-05
+    /// plumbing). `None` = the default cadence. Sub-second values
+    /// (`Some(0)`) are REFUSED by load-time validation on the normal CLI
+    /// path (exit 3, `poll_interval_too_small`) and degraded to `None`
+    /// on the TUI path ([`super::load_for_tui`]); a wrong-TYPED value
+    /// degrades to `None` with a warning (see [`lenient_u64`]) — a typo
+    /// in the new key never bricks the load.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_u64"
+    )]
+    pub poll_interval_secs: Option<u64>,
 }
 
 fn default_ssl_verify() -> bool {
@@ -220,5 +295,94 @@ auth = { user_env = "IGNITION_USER", password_env = "IGNITION_PASSWORD" }
                 token_env: "IGNITION_TOKEN".into()
             }
         );
+    }
+
+    /// New-schema round trip (TUIX-05): `[ui]` + `poll_interval_secs`
+    /// survive load → serialize → load losslessly.
+    #[test]
+    fn ui_and_poll_interval_round_trip() {
+        let toml = r#"
+active = "dev"
+
+[ui]
+theme = "dark"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+poll_interval_secs = 10
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(config.ui.theme.as_deref(), Some("dark"));
+        assert_eq!(config.profiles["dev"].poll_interval_secs, Some(10));
+
+        let reserialized = toml::to_string(&config).expect("serialize");
+        let back: Config = toml::from_str(&reserialized).expect("re-parse");
+        assert_eq!(back, config, "round trip must be lossless");
+    }
+
+    /// Legacy-shape pin: a config without the new keys serializes WITHOUT
+    /// them — existing configs keep their exact on-disk shape (goldens).
+    #[test]
+    fn legacy_config_serializes_without_new_keys() {
+        let toml = "[profiles.dev]\nurl = \"http://localhost:9088/\"\n";
+        let config: Config = toml::from_str(toml).expect("parse");
+        let out = toml::to_string(&config).expect("serialize");
+        assert!(
+            !out.contains("ui") && !out.contains("poll_interval_secs"),
+            "new keys must stay off legacy-shaped configs: {out}"
+        );
+    }
+
+    /// Lenient degrade (TUIX-05): a wrong-TYPED value in the NEW surface
+    /// never fails the load — it warns and falls back to defaults.
+    #[test]
+    fn lenient_degrade_on_bad_typed_new_keys() {
+        let toml = r#"
+[ui]
+theme = "dark"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+poll_interval_secs = "banana"
+"#;
+        let config: Config = toml::from_str(toml).expect("typo'd new key must not fail the load");
+        assert_eq!(
+            config.profiles["dev"].poll_interval_secs, None,
+            "bad poll_interval_secs degrades to None"
+        );
+
+        let toml = "ui = 42\n[profiles.dev]\nurl = \"http://localhost:9088/\"\n";
+        let config: Config = toml::from_str(toml).expect("bad [ui] shape must not fail the load");
+        assert_eq!(
+            config.ui,
+            super::UiConfig::default(),
+            "non-table [ui] degrades to the default"
+        );
+    }
+
+    /// A well-shaped `[ui]` table with FUTURE keys inside still loads —
+    /// unknown keys inside are ignored, never denied (Pitfall 7).
+    #[test]
+    fn ui_table_with_unknown_keys_still_loads() {
+        let toml = r#"
+[ui]
+theme = "dark"
+future_key = "whatever"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(config.ui.theme.as_deref(), Some("dark"));
+    }
+
+    /// The clamp's floor belongs to validation, not serde: 0 parses fine
+    /// here (permissive deserializer) and is refused by `load` (tested in
+    /// `config::tests`).
+    #[test]
+    fn poll_interval_zero_parses_leniently() {
+        let toml = "[profiles.dev]\nurl = \"http://localhost:9088/\"\npoll_interval_secs = 0\n";
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(config.profiles["dev"].poll_interval_secs, Some(0));
     }
 }

@@ -15,7 +15,7 @@
 pub mod profile;
 pub mod secret;
 
-pub use profile::{AuthRef, Config, Profile, RigConfig, RigEntry};
+pub use profile::{AuthRef, Config, Profile, RigConfig, RigEntry, UiConfig};
 pub use secret::{
     BasicEnvStore, Credential, EnvStore, KeyringStore, Secret, SecretStore, resolve_secret,
 };
@@ -68,8 +68,15 @@ pub fn load(path: &Path) -> Result<Config, CoreError> {
     })
 }
 
-const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles", "rig", "rigs"];
-const KNOWN_PROFILE_KEYS: &[&str] = &["url", "label", "ssl_verify", "auth", "webdev_secret"];
+const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles", "rig", "rigs", "ui"];
+const KNOWN_PROFILE_KEYS: &[&str] = &[
+    "url",
+    "label",
+    "ssl_verify",
+    "auth",
+    "webdev_secret",
+    "poll_interval_secs",
+];
 const KNOWN_AUTH_KEYS: &[&str] = &["token_env", "keyring", "user_env", "password_env"];
 
 /// Warn (never fail) about config keys a future CLI version might
@@ -221,6 +228,7 @@ mod tests {
                     token_env: "IGNITION_TOKEN".into(),
                 },
                 webdev_secret: None,
+                poll_interval_secs: None,
             },
         );
         config.profiles.insert(
@@ -233,6 +241,7 @@ mod tests {
                     keyring: "profile:prod".into(),
                 },
                 webdev_secret: None,
+                poll_interval_secs: None,
             },
         );
         config
@@ -312,6 +321,40 @@ future_auth_key = "x"
         let config = load(&path).expect("unknown keys must not fail the load");
         assert_eq!(config.active.as_deref(), Some("dev"));
         assert!(config.profiles.contains_key("dev"));
+    }
+
+    /// Warn-silent pin (TUIX-05): the NEW schema keys (`ui`, `poll_interval_secs`)
+    /// must be on the warn-lists so loading a config that carries them emits
+    /// NO unknown-key warning. Membership asserted against the private lists —
+    /// the lists ARE the warning behavior.
+    #[test]
+    fn new_schema_keys_are_warn_silent() {
+        assert!(
+            super::KNOWN_TOP_LEVEL.contains(&"ui"),
+            "KNOWN_TOP_LEVEL must carry \"ui\""
+        );
+        assert!(
+            super::KNOWN_PROFILE_KEYS.contains(&"poll_interval_secs"),
+            "KNOWN_PROFILE_KEYS must carry \"poll_interval_secs\""
+        );
+
+        // And a config carrying both loads cleanly (behavioral half).
+        let (_dir, path) = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[ui]
+theme = "dark"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+poll_interval_secs = 10
+"#,
+        )
+        .expect("write");
+        let config = load(&path).expect("new keys must not fail the load");
+        assert_eq!(config.ui.theme.as_deref(), Some("dark"));
+        assert_eq!(config.profiles["dev"].poll_interval_secs, Some(10));
     }
 
     /// Missing file is a fresh install, not an error; with no flag and no

@@ -4185,6 +4185,7 @@ mod tests {
                     ssl_verify: true,
                     auth: ignition_core::config::AuthRef::default(),
                     webdev_secret: None,
+                    poll_interval_secs: None,
                 },
             );
         }

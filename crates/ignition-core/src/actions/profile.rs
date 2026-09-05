@@ -82,6 +82,7 @@ pub fn add(
                 ssl_verify: true,
                 auth: auth.clone(),
                 webdev_secret: None,
+                poll_interval_secs: None,
             },
         )
         .is_some()

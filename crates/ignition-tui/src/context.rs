@@ -123,6 +123,7 @@ fn rig_client_with(url: &str, credential: Option<config::Credential>) -> Option<
         ssl_verify: false,
         auth: config::AuthRef::default(),
         webdev_secret: None,
+        poll_interval_secs: None,
     };
     ReqwestGatewayApi::new(&profile, credential).ok()
 }
@@ -199,6 +200,7 @@ mod tests {
                     ssl_verify: true,
                     auth: AuthRef::default(),
                     webdev_secret: None,
+                    poll_interval_secs: None,
                 },
             );
         }
