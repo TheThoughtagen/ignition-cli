@@ -224,9 +224,11 @@ mod tests {
             // Generous on purpose: the Network/Restarting steps build
             // REAL transport errors (a TCP connect to a refused port),
             // which can take tens of ms each under parallel test load —
-            // 500 ms flaked there. The fast path this config drives is
-            // the sleep/backoff, not the deadline.
-            deadline: Duration::from_millis(5_000),
+            // 500 ms flaked there, and 5 s flaked again on a heavily
+            // loaded box (concurrent cargo builds + agents, 08-01). The
+            // fast path this config drives is the sleep/backoff, not the
+            // deadline: the ceiling only bounds pathological load.
+            deadline: Duration::from_millis(60_000),
             ..PollConfig::default()
         }
     }
