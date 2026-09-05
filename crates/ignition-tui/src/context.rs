@@ -1,37 +1,33 @@
-//! Profile → client resolution for the TUI (Phase 6 research, Pattern 3).
+//! Profile → client resolution for the TUI (Phase 8, CORE-09/CORE-10).
 //!
-//! The CLI's `resolve_profile_context` / `resolve_gateway_api` are PRIVATE
-//! fns in ignition-cli's main.rs — not importable here, and the choke files
-//! stay untouched. This module composes the same PUBLIC
-//! `ignition_core::config` building blocks in the same LOCKED order, so the
-//! TUI resolves a gateway exactly like the CLI does:
+//! EVERY gateway client the cockpit builds routes through
+//! `ignition_core::session::Session` — the one core-owned seam for the
+//! resolution choreography (env overlay scoped to the would-be
+//! selection, then the selection, then the LOCKED secret chain) and
+//! construction (`Session::resolve_loaded` / `Session::for_url`). The
+//! TUI no longer duplicates any of it: the v1.0 copies of the secret
+//! chain and the overlay→selection sequence were deleted when Session
+//! absorbed them (research gotcha 9 — the "choke files stay untouched"
+//! decision is superseded).
 //!
-//! `config_path()` → `load` → `apply_env_overlay` (scoped to the
-//! selection) → `resolve_selection` (flag > active) → `resolve_secret`
-//! (the LOCKED chain, no degradation — the cockpit is an authed surface)
-//! → `ReqwestGatewayApi::new`.
+//! The LOAD is the one TUI-owned step: `config::load_for_tui` degrades
+//! NEW-surface schema failures (`[ui]` contents, `poll_interval_secs`
+//! type/clamp) to defaults with a stderr tracing warning, so a config
+//! typo can never kill cockpit startup (CORE-10). Resolution failures —
+//! raw TOML, profile deserialize, selection, auth — still hard-error:
+//! the caller (`lib.rs::run`) returns BEFORE `ratatui::init` with the
+//! normal exit-3 envelope.
 //!
-//! Secrets stay confined: the [`Credential`] flows into
-//! `ReqwestGatewayApi::new` and is never formatted or stored —
-//! `Secret::expose` remains locked inside the client's single
-//! header-construction site.
+//! Secrets stay confined: the [`Credential`] flows into the client and
+//! is never formatted or stored — `Secret::expose` remains locked
+//! inside the client's single header-construction site.
 
 use std::sync::Arc;
 
 use ignition_core::client::ReqwestGatewayApi;
-use ignition_core::config::{self, Config, Profile, SecretStore};
+use ignition_core::config;
 use ignition_core::error::CoreError;
-
-/// The LOCKED secret chain (env tokens → keyring → basic pair), built in
-/// exactly this order — identical to ignition-cli's private `secret_chain`.
-/// The chain, not the structs, encodes the order.
-fn secret_chain() -> Vec<Box<dyn SecretStore>> {
-    vec![
-        Box::new(config::EnvStore),
-        Box::new(config::KeyringStore),
-        Box::new(config::BasicEnvStore),
-    ]
-}
+use ignition_core::session::Session;
 
 /// Resolve the profile flag → `(name, url, Arc<ReqwestGatewayApi>)` for
 /// the cockpit's opening context (`url` is the profile's URL string —
@@ -42,56 +38,50 @@ fn secret_chain() -> Vec<Box<dyn SecretStore>> {
 pub fn resolve(
     profile_flag: Option<&str>,
 ) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
-    let mut config = config::load(&config::config_path())?;
-    let (name, profile) = resolve_from(&mut config, profile_flag)?;
-    build_client(name, profile)
+    build_client(profile_flag)
 }
 
 /// Rebuild a client for a NAMED profile (06-02's profile switcher):
 /// reload config from disk, overlay, resolve the named profile's secret.
 pub fn rebuild(profile_name: &str) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
-    let mut config = config::load(&config::config_path())?;
-    let (name, profile) = resolve_from(&mut config, Some(profile_name))?;
-    build_client(name, profile)
+    build_client(Some(profile_name))
 }
 
-/// Overlay + selection, mirroring main.rs's private
-/// `resolve_profile_context` semantics exactly: the `IGNITION_URL` env
-/// overlay is scoped to the would-be selection (flag > active) FIRST,
-/// then the selection resolves against the overlaid config.
-fn resolve_from(config: &mut Config, flag: Option<&str>) -> Result<(String, Profile), CoreError> {
-    let overlay_target = flag.map(str::to_string).or_else(|| config.active.clone());
-    config::apply_env_overlay(config, overlay_target.as_deref());
-    match config::resolve_selection(config, flag)? {
-        Some((name, profile)) => Ok((name, profile)),
-        None => Err(CoreError::NoActiveProfile),
-    }
-}
-
-/// REQUIRED credential (authed-read chain — a missing secret is
-/// `SecretUnavailable` exit 3, never degraded) + client construction.
-/// Returns the profile's URL string alongside the client (doctor's
-/// `profile_url` — the cockpit runs no doctor-less world).
+/// Degraded load + Session resolution + REQUIRED-credential client.
+/// The load is the TUI's degradation point (`config::load_for_tui` —
+/// new-surface schema failures warn and default; the clamp verdict is
+/// the only strict/degrading fork). Everything downstream is
+/// Session's: `Session::resolve_loaded` owns overlay → selection →
+/// LOCKED chain in the required mode (a missing secret is
+/// `SecretUnavailable` exit 3, never degraded — the cockpit is an
+/// authed surface). Returns the profile's URL string alongside the
+/// client (doctor's `profile_url` — the cockpit runs no doctor-less
+/// world). The triple stays until 08-05 grows it into the resolved
+/// context struct.
 fn build_client(
-    name: String,
-    profile: Profile,
+    profile_flag: Option<&str>,
 ) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
+    let mut config = config::load(&config::config_path())?;
+    let (session, profile) = Session::resolve_loaded(&mut config, profile_flag)?;
     let url = profile.url.to_string();
-    let credential = config::resolve_secret(&name, &profile.auth, &secret_chain())?;
-    let api = ReqwestGatewayApi::new(&profile, Some(credential))?;
-    Ok((name, url, Arc::new(api)))
+    Ok((
+        session.profile_name().to_string(),
+        url,
+        session.api_handle(),
+    ))
 }
 
 // ---- The rig family's client construction (06-06) ----
 //
 // The rig verbs address the RIG'S OWN derived gateway URL (never the
-// profile's gateway — 04-03's lock): these helpers are the TUI
-// edition of main.rs's private `rig_gateway_client` + trial cred
-// sourcing, composed from the same public building blocks. They are
-// ALSO the confinement home for every `Credential`/`Secret`
-// construction outside the client itself — the rig workers pass raw
-// env-sourced strings in and typed pairs out, so the phase's
-// secrets-confinement grep keeps its single-file answer.
+// profile's gateway — 04-03's lock): the URL DERIVATION stays at the
+// call sites, and construction routes through `Session::for_url` —
+// the core-owned headerless-BY-CONSTRUCTION constructor (the TUI twin
+// of main.rs's rig clients). These helpers are ALSO the confinement
+// home for every `Credential`/`Secret` construction outside the client
+// itself — the rig workers pass raw env-sourced strings in and typed
+// pairs out, so the phase's secrets-confinement grep keeps its
+// single-file answer.
 
 /// A HEADER-LESS client pointed at the rig's own gateway URL — the
 /// commissioned-wait probe (`rig up`/`reset`) and `trial status`
@@ -99,14 +89,14 @@ fn build_client(
 /// friendly). `ssl_verify=false`: localhost probes against
 /// self-signed rig https are the norm. `None` is impossible for a
 /// parseable URL — the caller already derived it.
-pub fn rig_client(url: &str) -> Option<ReqwestGatewayApi> {
+pub fn rig_client(url: &str) -> Option<Arc<ReqwestGatewayApi>> {
     rig_client_with(url, None)
 }
 
 /// The token-bearing twin: the tier-0 `IGNITION_TOKEN` credential
 /// rides the header (`snapshot`/`restore`'s only rung; `trial
 /// reset`'s first).
-pub fn rig_client_token(url: &str, token: &str) -> Option<ReqwestGatewayApi> {
+pub fn rig_client_token(url: &str, token: &str) -> Option<Arc<ReqwestGatewayApi>> {
     rig_client_with(
         url,
         Some(config::Credential::Token(config::Secret::new(
@@ -115,17 +105,17 @@ pub fn rig_client_token(url: &str, token: &str) -> Option<ReqwestGatewayApi> {
     )
 }
 
-/// The shared constructor behind both rig clients.
-fn rig_client_with(url: &str, credential: Option<config::Credential>) -> Option<ReqwestGatewayApi> {
-    let profile = config::Profile {
-        url: url.parse().ok()?,
-        label: None,
-        ssl_verify: false,
-        auth: config::AuthRef::default(),
-        webdev_secret: None,
-        poll_interval_secs: None,
-    };
-    ReqwestGatewayApi::new(&profile, credential).ok()
+/// The shared constructor behind both rig clients: `Session::for_url`
+/// with the rig's `ssl_verify=false` probe posture. `None` when the
+/// URL doesn't parse or the client can't build (the callers' `?`
+/// hatch).
+fn rig_client_with(
+    url: &str,
+    credential: Option<config::Credential>,
+) -> Option<Arc<ReqwestGatewayApi>> {
+    let rig_url = url.parse().ok()?;
+    let session = Session::for_url(rig_url, credential, false).ok()?;
+    Some(session.api_handle())
 }
 
 /// A non-empty env var, when set (main.rs's private twin — the rig
@@ -223,6 +213,17 @@ mod tests {
         }
         unsafe { std::env::set_var("IGNITION_CLI_CONFIG", &path) };
         (dir, set_vars)
+    }
+
+    /// RAW-text fixture variant: the load-boundary tests exercise the
+    /// parser/validator, not the serializer, so the TOML is written
+    /// verbatim (the `save()` round-trip would launder the very typos
+    /// under test).
+    fn isolate_raw_config(dir: &tempfile::TempDir, toml: &str) {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).expect("write config fixture");
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::set_var("IGNITION_CLI_CONFIG", &path) };
     }
 
     /// Scope-bound cleanup BEFORE the guard drops: tests that follow must

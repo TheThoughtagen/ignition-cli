@@ -184,7 +184,7 @@ pub fn fire_rig_up(state: &mut AppState) {
         let plan = resolve_auto_plan().await?;
         let probe = actions::rig::gateway_url_from(&plan).and_then(|url| context::rig_client(&url));
         let probe_dyn = probe
-            .as_ref()
+            .as_deref()
             .map(|api| api as &dyn ignition_core::client::GatewayApi);
         actions::rig::rig_up(&DockerCompose, &plan, WAIT_TIMEOUT_S, probe_dyn).await
     });
@@ -206,7 +206,7 @@ pub fn fire_rig_reset(state: &mut AppState) {
         let plan = resolve_auto_plan().await?;
         let probe = actions::rig::gateway_url_from(&plan).and_then(|url| context::rig_client(&url));
         let probe_dyn = probe
-            .as_ref()
+            .as_deref()
             .map(|api| api as &dyn ignition_core::client::GatewayApi);
         actions::rig::rig_reset(&DockerCompose, &plan, WAIT_TIMEOUT_S, probe_dyn).await
     });
@@ -229,7 +229,7 @@ pub fn fire_rig_trial_status(state: &mut AppState) {
         let url = rig_url(&plan)?;
         let api = context::rig_client(&url)
             .ok_or_else(|| CoreError::Rig(format!("cannot build client for {url}")))?;
-        actions::rig::trial_status(&api).await
+        actions::rig::trial_status(&*api).await
     });
 }
 
@@ -250,7 +250,7 @@ pub fn fire_rig_trial_reset(state: &mut AppState) {
         let basic_ref = basic
             .as_ref()
             .map(|(user, password)| (user.as_str(), password));
-        actions::rig::trial_reset(&api, &url, token.is_some(), basic_ref).await
+        actions::rig::trial_reset(&*api, &url, token.is_some(), basic_ref).await
     });
 }
 
@@ -263,7 +263,7 @@ pub fn fire_rig_snapshot(state: &mut AppState) {
         let token = context::rig_token_only()?;
         let api = context::rig_client_token(&url, &token)
             .ok_or_else(|| CoreError::Rig(format!("cannot build client for {url}")))?;
-        actions::rig::rig_snapshot(&api, &plan.name, None).await
+        actions::rig::rig_snapshot(&*api, &plan.name, None).await
     });
 }
 
@@ -277,7 +277,7 @@ pub fn fire_rig_restore(state: &mut AppState, file: String) {
         let token = context::rig_token_only()?;
         let api = context::rig_client_token(&url, &token)
             .ok_or_else(|| CoreError::Rig(format!("cannot build client for {url}")))?;
-        actions::rig::rig_restore(&api, &url, std::path::Path::new(&file), WAIT_TIMEOUT_S).await
+        actions::rig::rig_restore(&*api, &url, std::path::Path::new(&file), WAIT_TIMEOUT_S).await
     });
 }
 
