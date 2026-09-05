@@ -59,7 +59,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::client::ReqwestGatewayApi;
-use crate::config::{self, AuthRef, Credential, Profile, SecretStore};
+use crate::config::{self, AuthRef, Config, Credential, Profile, SecretStore};
 use crate::error::CoreError;
 
 /// One resolved execution context: a named profile and the gateway
@@ -72,6 +72,8 @@ use crate::error::CoreError;
 /// field (the redaction discipline, CORE-02).
 pub struct Session {
     profile: String,
+    url: url::Url,
+    credential_present: bool,
     api: Arc<ReqwestGatewayApi>,
 }
 
@@ -95,13 +97,36 @@ impl Session {
     /// resolution is just `resolve(Some(name))`).
     pub fn resolve(profile_flag: Option<&str>) -> Result<Self, CoreError> {
         let mut config = config::load(&config::config_path())?;
-        let (name, profile) = resolve_selected(&mut config, profile_flag)?;
+        Self::resolve_loaded(&mut config, profile_flag).map(|(session, _)| session)
+    }
+
+    /// Resolve through a config the CALLER already loaded — the caller
+    /// owns the load policy, the seam keeps everything downstream
+    /// (overlay scoped to the selection → selection → LOCKED secret
+    /// chain → REQUIRED-credential construction). This is the cockpit's
+    /// entry point: the TUI loads with `config::load_for_tui`, whose
+    /// NEW-surface degradation contract (a schema typo warns and
+    /// defaults instead of killing startup) must apply BEFORE the seam
+    /// runs, while selection/auth failures stay fatal. Returns the
+    /// session AND the selected POST-OVERLAY profile — the url string
+    /// and cadence fields consumers like the cockpit display, which a
+    /// `Session` deliberately doesn't re-expose.
+    pub fn resolve_loaded(
+        config: &mut Config,
+        profile_flag: Option<&str>,
+    ) -> Result<(Self, Profile), CoreError> {
+        let (name, profile) = resolve_selected(config, profile_flag)?;
         let credential = config::resolve_secret(&name, &profile.auth, &secret_chain())?;
         let api = ReqwestGatewayApi::new(&profile, Some(credential))?;
-        Ok(Self {
-            profile: name,
-            api: Arc::new(api),
-        })
+        Ok((
+            Self {
+                profile: name,
+                url: profile.url.clone(),
+                credential_present: true,
+                api: Arc::new(api),
+            },
+            profile,
+        ))
     }
 
     /// Resolve through config with the credential DEGRADED to `None`
@@ -116,9 +141,12 @@ impl Session {
         let mut config = config::load(&config::config_path())?;
         let (name, profile) = resolve_selected(&mut config, profile_flag)?;
         let credential = resolve_secret_opt(&name, &profile.auth)?;
+        let credential_present = credential.is_some();
         let api = ReqwestGatewayApi::new(&profile, credential)?;
         Ok(Self {
             profile: name,
+            url: profile.url.clone(),
+            credential_present,
             api: Arc::new(api),
         })
     }
@@ -149,9 +177,12 @@ impl Session {
             webdev_secret: None,
             poll_interval_secs: None,
         };
+        let credential_present = credential.is_some();
         let api = ReqwestGatewayApi::new(&profile, credential)?;
         Ok(Self {
             profile: String::new(),
+            url: profile.url.clone(),
+            credential_present,
             api: Arc::new(api),
         })
     }
@@ -160,6 +191,26 @@ impl Session {
     /// sessions (no profile exists).
     pub fn profile_name(&self) -> &str {
         &self.profile
+    }
+
+    /// The resolved profile's configured gateway URL — the POST-OVERLAY
+    /// value (flag > `IGNITION_URL` env > profile), i.e. exactly what the
+    /// session's client targets. Doctor's url check re-parses this raw
+    /// value: the honest diagnosis must describe the URL the client
+    /// ACTUALLY connects to, overlay included. For [`Self::for_url`] rig
+    /// sessions this is the caller-derived rig URL.
+    pub fn profile_url(&self) -> &url::Url {
+        &self.url
+    }
+
+    /// Whether a credential resolved into this session's client — the
+    /// doctor's `credential_present` flag (a MISSING credential is a
+    /// different diagnosis than an UNRECOGNIZED one; the degraded chain
+    /// decides, this accessor reports, and the secret itself never
+    /// crosses the seam). Always `true` for [`Self::resolve`]; the
+    /// caller's `Some`-ness for [`Self::for_url`].
+    pub fn credential_present(&self) -> bool {
+        self.credential_present
     }
 
     /// The gateway client, borrowed.
