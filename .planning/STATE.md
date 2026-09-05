@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
-**Current Plan:** 3 (08-01 + 08-02 complete — executed in parallel; counter corrected after double-advance)
+**Current Plan:** 4
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-05
 
-**Progress:** [█████████░] 91%
+**Progress:** [█████████░] 94%
 
 ## Performance Metrics
 
@@ -36,6 +36,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 *Updated after each plan completion*
 | Phase 08 P02 | 200 min | 2 tasks | 3 files |
 | Phase 08 P01 | 4h 58min | 3 tasks | 9 files |
+| Phase 08 P03 | 1h 40min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -52,6 +53,8 @@ Recent decisions affecting current work:
 - [Phase 08]: Session::resolve takes the EFFECTIVE profile flag — IGNITION_PROFILE folding stays in the bin's apply_env_defaults (one env-to-flag home) — Seam must mirror main.rs resolve_profile_context verbatim; re-reading env in core would fork the precedence rule
 - [Phase 08]: poll_interval_too_small is its own enum variant riding the config exit class (exit 3) — Phase-7 additive-slug mechanism; serde accepts 0, load-time validation refuses, load_for_tui degrades — keeps code() total, slug first-class in the envelope for agents, and the strict/degrading split is exactly what 08-04's TUI wiring needs
 - [Phase 08]: New config keys follow the lenient-degradation pattern: deserialize_with warn+default on wrong types, warn-list entry, skip_serializing_if at defaults — legacy configs round-trip byte-identically — a typo in a NEW key must never fail the load; legacy on-disk shape and contract goldens stay frozen
+- [Phase 08]: Plan 08-03: Session gained profile_url/credential_present accessors + resolve_side constructor — doctor's raw-URL/presence contract and the diff/sync no-re-overlay golden contract cannot hold through resolve/resolve_degraded alone — Byte-identical mandate; goldens pinned sides as overlay-immune
+- [Phase 08]: Plan 08-03: resolve_profile_context survives reduced to selection-only (profile list view + two-client envelope echo) — envelope must not demand the active profile's secret and list must tolerate fresh installs — Plan's 'otherwise' clause; non-construction consumers keep main.rs selection-only
 
 ### Pending Todos
 
@@ -64,5 +67,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-05T17:36:18.568Z
+**Last session:** 2026-09-05T19:20:26.212Z
 **Resume file:** None
