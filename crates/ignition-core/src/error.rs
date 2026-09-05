@@ -1157,10 +1157,7 @@ mod tests {
     /// backticked non-slugs like `--yes`), and keep the backtick-delimited
     /// tokens that start with an ASCII letter and contain no spaces.
     fn parse_readme_exit_table(readme: &str) -> Vec<(u8, Vec<String>)> {
-        let section = readme
-            .split("## Exit codes")
-            .nth(1)
-            .unwrap_or_default();
+        let section = readme.split("## Exit codes").nth(1).unwrap_or_default();
         let mut rows = Vec::new();
         let table_lines = section
             .lines()
@@ -1188,8 +1185,7 @@ mod tests {
                 .filter(|(idx, _)| idx % 2 == 1)
                 .map(|(_, token)| token.trim().to_string())
                 .filter(|token| {
-                    token.starts_with(|c: char| c.is_ascii_alphabetic())
-                        && !token.contains(' ')
+                    token.starts_with(|c: char| c.is_ascii_alphabetic()) && !token.contains(' ')
                 })
                 .collect();
             rows.push((exit, slugs));
