@@ -49,19 +49,21 @@ pub fn rebuild(profile_name: &str) -> Result<(String, String, Arc<ReqwestGateway
 
 /// Degraded load + Session resolution + REQUIRED-credential client.
 /// The load is the TUI's degradation point (`config::load_for_tui` —
-/// new-surface schema failures warn and default; the clamp verdict is
-/// the only strict/degrading fork). Everything downstream is
-/// Session's: `Session::resolve_loaded` owns overlay → selection →
-/// LOCKED chain in the required mode (a missing secret is
-/// `SecretUnavailable` exit 3, never degraded — the cockpit is an
-/// authed surface). Returns the profile's URL string alongside the
+/// new-surface schema failures warn and default: a `[ui]` typo or a
+/// wrong-typed/clamped-violating `poll_interval_secs` can never kill
+/// cockpit startup, CORE-10). Everything downstream is Session's:
+/// `Session::resolve_loaded` owns overlay → selection → LOCKED chain
+/// in the required mode (a missing secret is `SecretUnavailable` exit
+/// 3, never degraded — the cockpit is an authed surface), and raw TOML
+/// / profile-deserialize / selection failures still hard-error
+/// through it. Returns the profile's URL string alongside the
 /// client (doctor's `profile_url` — the cockpit runs no doctor-less
 /// world). The triple stays until 08-05 grows it into the resolved
 /// context struct.
 fn build_client(
     profile_flag: Option<&str>,
 ) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
-    let mut config = config::load(&config::config_path())?;
+    let mut config = config::load_for_tui(&config::config_path())?;
     let (session, profile) = Session::resolve_loaded(&mut config, profile_flag)?;
     let url = profile.url.to_string();
     Ok((
@@ -291,5 +293,130 @@ mod tests {
 
         drop(dir);
         teardown(&[]);
+    }
+
+    // ---- The degradation boundary (CORE-10, TUI half) ----
+    //
+    // The TUI loads with `config::load_for_tui`: NEW-surface schema
+    // failures degrade with a stderr warning and the cockpit STARTS;
+    // resolution failures stay fatal pre-init (exit 3). These four pin
+    // both sides of that line at the `resolve` level — the seam the
+    // cockpit's startup actually goes through. Raw-text fixtures (the
+    // `save()` round-trip would launder the typos under test); the
+    // generic `IGNITION_TOKEN` head satisfies the required-credential
+    // chain so the LOAD verdict is the only variable.
+
+    /// A wrong-TYPED new-surface value (`poll_interval_secs = "banana"`)
+    /// degrades to the default and the cockpit STARTS — `resolve`
+    /// succeeds where a strict schema surface would have been a
+    /// type-error refusal. (The interval consumer lands in 08-05; the
+    /// load-level outcome is what this pins today.)
+    #[test]
+    fn resolve_degrades_wrong_typed_poll_interval() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+poll_interval_secs = "banana"
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let (name, url, _api) =
+            resolve(None).expect("a new-surface typo must degrade, not kill startup");
+        assert_eq!(name, "dev");
+        assert_eq!(
+            url, "http://localhost:9088/",
+            "the degraded profile still resolves to its url"
+        );
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
+    }
+
+    /// `poll_interval_secs = 0` (the clamp violation) degrades to the
+    /// default cadence on the TUI path — `resolve` succeeds — while the
+    /// SAME file is refused by the strict CLI load (`PollIntervalTooSmall`,
+    /// exit 3). This is the strict/degrading discriminator: one file,
+    /// two load policies, both correct.
+    #[test]
+    fn resolve_degrades_clamp_violation_the_strict_load_refuses() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+poll_interval_secs = 0
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let (name, _url, _api) =
+            resolve(None).expect("the TUI degrades the clamp instead of refusing");
+        assert_eq!(name, "dev", "the cockpit starts on the default cadence");
+
+        let path = dir.path().join("config.toml");
+        let strict = ignition_core::config::load(&path)
+            .expect_err("the strict CLI load refuses the same file");
+        assert_eq!(strict.exit_code(), 3);
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
+    }
+
+    /// A broken profile URL is a RESOLUTION failure, not a schema
+    /// failure — still fatal (exit 3) even on the degrading load path.
+    /// A config that cannot name a reachable profile cannot start the
+    /// authed cockpit (the LOCKED NoActiveProfile family of refusals).
+    #[test]
+    fn resolve_still_refuses_broken_profile_url() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[profiles.dev]
+url = "not a url at all"
+poll_interval_secs = 5
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let err = match resolve(None) {
+            Ok(_) => panic!("a broken profile url must stay fatal"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CoreError::ConfigInvalid { .. }));
+        assert_eq!(err.exit_code(), 3);
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
+    }
+
+    /// Garbage TOML (raw parse failure) is fatal pre-init — the cockpit
+    /// never opens over an unreadable config, degradation notwithstanding.
+    #[test]
+    fn resolve_still_refuses_unparseable_toml() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(&dir, ":::: this is not toml ::::");
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let err = match resolve(None) {
+            Ok(_) => panic!("garbage toml must stay fatal"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CoreError::ConfigInvalid { .. }));
+        assert_eq!(err.exit_code(), 3);
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
     }
 }

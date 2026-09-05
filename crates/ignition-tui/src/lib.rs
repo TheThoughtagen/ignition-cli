@@ -45,11 +45,17 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// Open the cockpit over the resolved profile context.
 ///
-/// Resolution failures (no profile, missing secret) return BEFORE the
-/// terminal is touched — the user sees the normal stderr envelope and
-/// exit taxonomy, not a flash of alternate screen. Every path after
-/// `ratatui::init()` runs through `ratatui::restore()` (Ok, Err, and
-/// the init-installed panic hook).
+/// The degradation contract (CORE-10, the `load_for_tui` entry point):
+/// NEW-surface schema failures — `[ui]` contents, a wrong-typed or
+/// clamp-violating `poll_interval_secs` — degrade to defaults with a
+/// stderr tracing warning and the TUI STARTS. Resolution failures —
+/// raw TOML parse, profile deserialize (e.g. a broken profile URL),
+/// selection, auth (missing secret) — still return BEFORE the terminal
+/// is touched with the normal stderr envelope and exit-3 taxonomy, not
+/// a flash of alternate screen (the `NoActiveProfile` refusal for the
+/// authed cockpit is LOCKED — a gateway surface cannot open without a
+/// target). Every path after `ratatui::init()` runs through
+/// `ratatui::restore()` (Ok, Err, and the init-installed panic hook).
 pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
     // The cockpit owns a live client from the first frame: the
     // dashboard's refresh worker spawns against it (06-02). The URL
