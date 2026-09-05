@@ -1103,6 +1103,151 @@ mod tests {
         }
     }
 
+    /// The (exit_code, slug) literal table the Three-Place rule syncs.
+    /// DUPLICATED from [`exit_code_mapping_enumerated`]'s triple list by
+    /// design: that test is the literal source of truth (enum ↔ literals);
+    /// this flat table is what the README cross-check runs against, so a
+    /// drift inside error.rs surfaces as a disagreement instead of silently
+    /// re-shuffling both sides. Keep the two lists in lockstep — the
+    /// enumerated test fails if the enum respells/renumbers, and a stale
+    /// copy here fails the README check below until updated.
+    const EXIT_SLUG_LITERALS: &[(u8, &str)] = &[
+        (1, "internal"),
+        (2, "confirmation_required"),
+        (2, "invalid_import_file"),
+        (2, "invalid_input"),
+        (3, "profile_not_found"),
+        (3, "no_active_profile"),
+        (3, "secret_unavailable"),
+        (3, "config_invalid"),
+        (3, "poll_interval_too_small"),
+        (4, "network_error"),
+        (5, "auth_rejected"),
+        (6, "gateway_too_old"),
+        (6, "gateway_not_commissioned"),
+        (6, "gateway_restarting"),
+        (6, "not_found"),
+        (6, "project_exists"),
+        (6, "resource_binary"),
+        (6, "trial_not_expired"),
+        (6, "provider_not_found"),
+        (6, "routes_not_deployed"),
+        (6, "webdev_unlicensed"),
+        (6, "route_version_mismatch"),
+        (6, "webdev_route_error"),
+        (6, "tag_collision"),
+        (6, "alarm_journal_missing"),
+        (6, "import_denied"),
+        (6, "session_not_prunable"),
+        (6, "eam_not_controller"),
+        (6, "eam_task_type_refused"),
+        (6, "eam_task_in_flight"),
+        (6, "script_exec_not_configured"),
+        (6, "lint_tool_absent"),
+        (6, "provider_root_unsupported"),
+        (7, "rig_error"),
+    ];
+
+    /// Parse the README's exit-code table: rows `| <exit> | class | meaning |
+    /// \`slug\`, ... |` where `<exit>` is 1–7 (row 0 is the success row, no
+    /// slugs). Parsing is SCOPED to the `## Exit codes` section — the README
+    /// contains unrelated tables whose rows coincidentally begin `| 5 |`,
+    /// `| 3 |`, etc. Std-only string ops: split on `|`, trim, take the LAST
+    /// non-empty cell as the slug column (the meaning column can carry
+    /// backticked non-slugs like `--yes`), and keep the backtick-delimited
+    /// tokens that start with an ASCII letter and contain no spaces.
+    fn parse_readme_exit_table(readme: &str) -> Vec<(u8, Vec<String>)> {
+        let section = readme
+            .split("## Exit codes")
+            .nth(1)
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        let table_lines = section
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with('|'));
+        for line in table_lines {
+            if !line.trim_start().starts_with('|') {
+                break; // table ended
+            }
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let Some(exit) = cells.get(1).and_then(|cell| cell.parse::<u8>().ok()) else {
+                continue;
+            };
+            if !(1..=7).contains(&exit) {
+                continue;
+            }
+            let slug_cell = cells
+                .iter()
+                .rev()
+                .find(|cell| !cell.is_empty())
+                .copied()
+                .unwrap_or_default();
+            let slugs: Vec<String> = slug_cell
+                .split('`')
+                .enumerate()
+                .filter(|(idx, _)| idx % 2 == 1)
+                .map(|(_, token)| token.trim().to_string())
+                .filter(|token| {
+                    token.starts_with(|c: char| c.is_ascii_alphabetic())
+                        && !token.contains(' ')
+                })
+                .collect();
+            rows.push((exit, slugs));
+        }
+        rows
+    }
+
+    /// CORE-11, the Three-Place slug rule made executable: the exit-code
+    /// table exists in the enum ([`CoreError::exit_code`]), this file's
+    /// literal triples, and the README — and the README side is now
+    /// machine-checked. The README is parsed verbatim via `include_str!`
+    /// and cross-checked against the literal table in BOTH directions:
+    /// (a) every literal slug appears under its exit code (a README row
+    /// that lost or misspelled a slug fails), (b) every README slug token
+    /// exists in the literal table (a stale/deleted row fails). Exit 6
+    /// carries 22 slugs, so the full cross-check is the value — not the
+    /// happy-path smoke.
+    #[test]
+    fn readme_exit_table_agreement() {
+        let readme = include_str!("../../../README.md");
+        let rows = parse_readme_exit_table(readme);
+        assert!(
+            rows.len() >= 7,
+            "README exit-code table not found — the parser must see all 7 \
+             failure-class rows (found {})",
+            rows.len()
+        );
+
+        // Direction (a): every literal (exit, slug) is present in the
+        // README row matching its exit code.
+        for (exit, slug) in EXIT_SLUG_LITERALS {
+            let row = rows
+                .iter()
+                .find(|(readme_exit, _)| readme_exit == exit)
+                .unwrap_or_else(|| panic!("README table has no row for exit {exit}"));
+            assert!(
+                row.1.iter().any(|s| s == slug),
+                "README exit-{exit} row is missing slug {slug:?} (row: {:?})",
+                row.1
+            );
+        }
+
+        // Direction (b): every README slug token exists in the literal
+        // table under the same exit code — catches stale/deleted rows.
+        for (exit, slugs) in &rows {
+            for slug in slugs {
+                assert!(
+                    EXIT_SLUG_LITERALS
+                        .iter()
+                        .any(|(lit_exit, lit_slug)| lit_exit == exit && lit_slug == slug),
+                    "README exit-{exit} row carries slug {slug:?} that no \
+                     CoreError variant emits — stale table row or slug/exit \
+                     drift between README and error.rs"
+                );
+            }
+        }
+    }
+
     /// CORE-05: config, auth, and target-state classes carry actionable
     /// hints (and every other class does too).
     #[test]

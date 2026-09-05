@@ -49,7 +49,12 @@ output directly, so it is never JSON-wrapped.
 
 The exit-code table lives in exactly two places — this README and
 `CoreError::exit_code()` in `crates/ignition-core/src/error.rs` — kept in
-sync by the enumerated mapping unit test and the golden-file contract tests.
+sync by two tests: `exit_code_mapping_enumerated` pins the enum to its
+exit-code/slug literals, and `readme_exit_table_agreement` parses THIS
+table via `include_str!` and cross-checks every slug ↔ exit-code row
+against those literals in both directions, so a missing, stale, or
+misplaced table row fails the test suite (the Three-Place rule: enum +
+literals + this table, all machine-checked).
 
 ## Gateway authentication (8.3)
 
