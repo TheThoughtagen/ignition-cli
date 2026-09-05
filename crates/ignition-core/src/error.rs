@@ -9,7 +9,7 @@
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
 //! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input` (clap renders its own usage errors — never hook clap)
-//! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`
+//! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01)
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
 //! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06)
@@ -91,6 +91,18 @@ pub enum CoreError {
     /// Config file unreadable or wrong shape. Exit 3.
     #[error("invalid configuration: {reason}")]
     ConfigInvalid { reason: String },
+
+    /// A profile's `poll_interval_secs` is below the 1-second floor
+    /// (08-01, TUIX-05 clamp): sub-second gateway polling is refused at
+    /// load time — the TUI's background refresh cadence may not hammer
+    /// the gateway. Exit 3 — the CONFIG class (the Phase-7 additive-slug
+    /// precedent, e.g. `eam_not_controller`: same exit class, own slug,
+    /// never a new exit code — the 1–7 taxonomy is frozen).
+    #[error("profile {profile:?}: poll_interval_secs must be >= 1 (sub-second polling refused)")]
+    PollIntervalTooSmall {
+        /// The profile carrying the refused value.
+        profile: String,
+    },
 
     /// Gateway unreachable / timeout / TLS failure. Exit 4.
     ///
@@ -444,6 +456,7 @@ impl CoreError {
             Self::NoActiveProfile => "no_active_profile",
             Self::SecretUnavailable { .. } => "secret_unavailable",
             Self::ConfigInvalid { .. } => "config_invalid",
+            Self::PollIntervalTooSmall { .. } => "poll_interval_too_small",
             Self::Network { .. } => "network_error",
             Self::Auth { .. } => "auth_rejected",
             Self::GatewayTooOld { .. } => "gateway_too_old",
@@ -481,7 +494,8 @@ impl CoreError {
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
-            | Self::ConfigInvalid { .. } => 3,
+            | Self::ConfigInvalid { .. }
+            | Self::PollIntervalTooSmall { .. } => 3,
             Self::Network { .. } => 4,
             Self::Auth { .. } => 5,
             Self::GatewayTooOld { .. }
@@ -571,6 +585,10 @@ impl CoreError {
                  tables; `ign profile add` writes a known-good one"
                     .to_string(),
             ),
+            Self::PollIntervalTooSmall { profile } => Some(format!(
+                "set poll_interval_secs to 1 or higher in [profiles.{profile}], \
+                 or remove the key to use the default cadence"
+            )),
             Self::Network { url, .. } => Some(format!(
                 "check the gateway is reachable at {url} (host, port, VPN, TLS)"
             )),
@@ -889,6 +907,13 @@ mod tests {
                 },
                 3,
                 "config_invalid",
+            ),
+            (
+                CoreError::PollIntervalTooSmall {
+                    profile: "dev".into(),
+                },
+                3,
+                "poll_interval_too_small",
             ),
             (network_error(), 4, "network_error"),
             (

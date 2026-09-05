@@ -63,9 +63,27 @@ pub fn load(path: &Path) -> Result<Config, CoreError> {
         return Ok(Config::default());
     }
     warn_unknown_keys(&raw);
-    toml::from_str(&raw).map_err(|err| CoreError::ConfigInvalid {
+    let config: Config = toml::from_str(&raw).map_err(|err| CoreError::ConfigInvalid {
         reason: format!("{}: {err}", path.display()),
-    })
+    })?;
+    validate(&config)?;
+    Ok(config)
+}
+
+/// Post-deserialize validation — the sub-second clamp (08-01, TUIX-05):
+/// `poll_interval_secs = 0` is REFUSED (exit 3, `poll_interval_too_small`)
+/// rather than silently honoring a cadence that hammers the gateway. The
+/// FIRST offending profile in BTreeMap order is named (deterministic).
+/// Everything else — including the lenient-degraded defaults — passes.
+fn validate(config: &Config) -> Result<(), CoreError> {
+    for (name, profile) in &config.profiles {
+        if profile.poll_interval_secs == Some(0) {
+            return Err(CoreError::PollIntervalTooSmall {
+                profile: name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles", "rig", "rigs", "ui"];
@@ -355,6 +373,47 @@ poll_interval_secs = 10
         let config = load(&path).expect("new keys must not fail the load");
         assert_eq!(config.ui.theme.as_deref(), Some("dark"));
         assert_eq!(config.profiles["dev"].poll_interval_secs, Some(10));
+    }
+
+    /// The sub-second clamp (08-01): `poll_interval_secs = 0` is refused
+    /// with the additive slug on the config class — exit 3, never a new
+    /// exit code.
+    #[test]
+    fn poll_interval_zero_is_refused() {
+        let (_dir, path) = temp_config_path();
+        std::fs::write(
+            &path,
+            "[profiles.dev]\nurl = \"http://localhost:9088/\"\npoll_interval_secs = 0\n",
+        )
+        .expect("write");
+
+        let err = load(&path).expect_err("0 must be refused");
+        assert_eq!(err.code(), "poll_interval_too_small");
+        assert_eq!(err.exit_code(), 3, "config class — no new exit code");
+        let message = err.to_string();
+        assert!(
+            message.contains("dev") && message.contains("sub-second"),
+            "refusal must name the profile + the rule: {message}"
+        );
+        let hint = err.hint().expect("hint required");
+        assert!(
+            hint.contains("[profiles.dev]") && hint.contains("poll_interval_secs"),
+            "hint must point at the profile key: {hint}"
+        );
+    }
+
+    /// The floor is 1: `Some(1)` passes the clamp.
+    #[test]
+    fn poll_interval_one_is_the_floor() {
+        let (_dir, path) = temp_config_path();
+        std::fs::write(
+            &path,
+            "[profiles.dev]\nurl = \"http://localhost:9088/\"\npoll_interval_secs = 1\n",
+        )
+        .expect("write");
+
+        let config = load(&path).expect("1 is the floor — must load");
+        assert_eq!(config.profiles["dev"].poll_interval_secs, Some(1));
     }
 
     /// Missing file is a fresh install, not an error; with no flag and no
