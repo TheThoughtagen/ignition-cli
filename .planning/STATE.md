@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
-**Current Plan:** 5
+**Current Plan:** 6
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-05
 
-**Progress:** [██████████] 96%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -38,6 +38,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 08 P01 | 4h 58min | 3 tasks | 9 files |
 | Phase 08 P03 | 1h 40min | 2 tasks | 2 files |
 | Phase 08 P04 | 128 min | 2 tasks | 3 files |
+| Phase 08 P06 | 189 min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -58,6 +59,9 @@ Recent decisions affecting current work:
 - [Phase 08]: Plan 08-03: resolve_profile_context survives reduced to selection-only (profile list view + two-client envelope echo) — envelope must not demand the active profile's secret and list must tolerate fresh installs — Plan's 'otherwise' clause; non-construction consumers keep main.rs selection-only
 - [Phase 08]: TUI load pattern: config::load_for_tui then Session::resolve_loaded — caller owns the load policy, seam owns overlay/selection/LOCKED chain; Session::resolve_loaded added to core (returns session + selected POST-OVERLAY profile) — Session::resolve loads strict config internally, physically incompatible with the TUI degradation contract; constructor extension beats keeping a duplicated selection choreography in the TUI
 - [Phase 08]: TUI rig helpers return Option<Arc<ReqwestGatewayApi>> via Session::for_url — Session hands out Arc handles (client not Clone); call sites deref with &*api / as_deref — Zero second-source construction in the TUI requires going through the seam; Arc is also the shape 08-05's ResolvedContext wants
+- [Phase 08]: Three-Place slug rule now executable: readme_exit_table_agreement parses README exit table via include_str! (section-scoped) and cross-checks against literal (exit,slug) table both directions — nothing later mutates the frozen contract by accident
+- [Phase 08]: mcp/lsp/edit pre-declared as reserved OutOfBand slugs (taxonomy + justification only, zero rows); rows land TOGETHER with their clap commands in P13/14 — orphan registry rows fail the clap walk by design; pinned test is the pre-declaration
+- [Phase 08]: stdout purity harness is assert-based byte-exact over the real binary (NOT snapbox goldens) so SNAPSHOTS=overwrite cannot sanitize a leaked byte; ambient IGNITION_* env knobs stripped for determinism — single stray stdout byte under max diagnostics must fail CI, never be rewritten
 
 ### Pending Todos
 
@@ -70,5 +74,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-05T19:56:07.456Z
+**Last session:** 2026-09-05T20:48:47.618Z
 **Resume file:** None
