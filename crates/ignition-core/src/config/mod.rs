@@ -46,8 +46,31 @@ pub fn config_path() -> PathBuf {
 /// (`version` must work day one). Unreadable or invalid TOML is
 /// [`CoreError::ConfigInvalid`] (exit 3) naming the path. Unknown keys WARN
 /// (tracing) and are otherwise tolerated — no `deny_unknown_fields`, ever
-/// (Pitfall 7).
+/// (Pitfall 7). Sub-second `poll_interval_secs` is REFUSED (exit 3,
+/// `poll_interval_too_small`) — the strict path.
 pub fn load(path: &Path) -> Result<Config, CoreError> {
+    load_inner(path, true)
+}
+
+/// The TUI's load entry point (08-01, TUIX-05): identical parse and
+/// lenient extraction to [`load`], but a clamp violation confined to the
+/// NEW schema surface does NOT error — it warns carrying the same
+/// `poll_interval_too_small` slug/message, substitutes the default
+/// cadence, and returns Ok.
+///
+/// Contract: schema-surface failures degrade with a warning; resolution
+/// failures are fatal — the TUI is an authed cockpit. Raw TOML parse
+/// failures, profile deserialize failures (e.g. a broken profile URL),
+/// and selection failures still hard-error through the frozen
+/// `config_invalid` exit-3 taxonomy: a config that cannot name a
+/// reachable profile cannot start the cockpit.
+pub fn load_for_tui(path: &Path) -> Result<Config, CoreError> {
+    load_inner(path, false)
+}
+
+/// Shared body of [`load`] / [`load_for_tui`]: everything is common
+/// except the clamp's strictness.
+fn load_inner(path: &Path, strict_clamp: bool) -> Result<Config, CoreError> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -63,10 +86,14 @@ pub fn load(path: &Path) -> Result<Config, CoreError> {
         return Ok(Config::default());
     }
     warn_unknown_keys(&raw);
-    let config: Config = toml::from_str(&raw).map_err(|err| CoreError::ConfigInvalid {
+    let mut config: Config = toml::from_str(&raw).map_err(|err| CoreError::ConfigInvalid {
         reason: format!("{}: {err}", path.display()),
     })?;
-    validate(&config)?;
+    if strict_clamp {
+        validate(&config)?;
+    } else {
+        degrade_clamp_violations(&mut config);
+    }
     Ok(config)
 }
 
@@ -84,6 +111,23 @@ fn validate(config: &Config) -> Result<(), CoreError> {
         }
     }
     Ok(())
+}
+
+/// The [`load_for_tui`] half of the clamp: substitute the default cadence
+/// for every sub-second value, warning with the SAME
+/// `poll_interval_too_small` slug/message the strict path refuses with.
+/// Only the NEW schema surface degrades; nothing else is touched.
+fn degrade_clamp_violations(config: &mut Config) {
+    for (name, profile) in &mut config.profiles {
+        if profile.poll_interval_secs == Some(0) {
+            profile.poll_interval_secs = None;
+            tracing::warn!(
+                slug = "poll_interval_too_small",
+                profile = %name,
+                "poll_interval_secs must be >= 1 (sub-second polling refused) — using the default cadence"
+            );
+        }
+    }
 }
 
 const KNOWN_TOP_LEVEL: &[&str] = &["active", "profiles", "rig", "rigs", "ui"];
@@ -218,7 +262,10 @@ pub fn resolve_selection(
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Profile, apply_env_overlay, config_path, load, resolve_selection, save};
+    use super::{
+        Config, Profile, apply_env_overlay, config_path, load, load_for_tui, resolve_selection,
+        save,
+    };
     use crate::config::AuthRef;
     use crate::config::ENV_LOCK;
     use crate::error::CoreError;
@@ -414,6 +461,53 @@ poll_interval_secs = 10
 
         let config = load(&path).expect("1 is the floor — must load");
         assert_eq!(config.profiles["dev"].poll_interval_secs, Some(1));
+    }
+
+    /// `load_for_tui` (08-01): a clamp violation on the NEW schema surface
+    /// degrades to the default cadence with a warning — Ok, field None.
+    #[test]
+    fn load_for_tui_degrades_clamp_violation() {
+        let (_dir, path) = temp_config_path();
+        std::fs::write(
+            &path,
+            "[profiles.dev]\nurl = \"http://localhost:9088/\"\npoll_interval_secs = 0\n",
+        )
+        .expect("write");
+
+        let config = load_for_tui(&path).expect("the TUI degrades the clamp instead of refusing");
+        assert_eq!(
+            config.profiles["dev"].poll_interval_secs, None,
+            "sub-second value substituted with the default cadence"
+        );
+    }
+
+    /// `load_for_tui` degrades ONLY the new-surface clamp: a broken
+    /// profile URL is a RESOLUTION failure and stays fatal (the TUI is
+    /// an authed cockpit — a config that cannot name a reachable profile
+    /// cannot start it).
+    #[test]
+    fn load_for_tui_still_refuses_broken_profile_url() {
+        let (_dir, path) = temp_config_path();
+        std::fs::write(
+            &path,
+            "[profiles.dev]\nurl = \"not a url at all\"\npoll_interval_secs = 5\n",
+        )
+        .expect("write");
+
+        let err = load_for_tui(&path).expect_err("broken profile url is fatal");
+        assert_eq!(err.exit_code(), 3, "config_invalid class");
+        assert_eq!(err.code(), "config_invalid");
+    }
+
+    /// `load_for_tui` on garbage TOML: raw parse failure stays fatal.
+    #[test]
+    fn load_for_tui_still_refuses_garbage_toml() {
+        let (_dir, path) = temp_config_path();
+        std::fs::write(&path, "this is ][ not toml\n").expect("write");
+
+        let err = load_for_tui(&path).expect_err("garbage toml is fatal");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(err.code(), "config_invalid");
     }
 
     /// Missing file is a fresh install, not an error; with no flag and no
