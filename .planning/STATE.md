@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
-**Current Plan:** 3
+**Current Plan:** 3 (08-01 + 08-02 complete — executed in parallel; counter corrected after double-advance)
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-05
 
-**Progress:** [█░░░░░░░░░] 8% (v1.1 — phase 8 is first of 7 v1.1 phases; 1 of 6 phase-8 plans SUMMARIED, 08-01 in flight)
+**Progress:** [█████████░] 91%
 
 ## Performance Metrics
 
@@ -35,6 +35,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 
 *Updated after each plan completion*
 | Phase 08 P02 | 200 min | 2 tasks | 3 files |
+| Phase 08 P01 | 4h 58min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -49,6 +50,8 @@ Recent decisions affecting current work:
 - [Roadmap]: TUIX-05 fully delivered in Phase 8 (config plumbing + worker parameterization + clamp); TUIX-03/04 (rendering) in Phase 12
 - [Phase 08]: Session seam is concrete-with-deref (Arc<ReqwestGatewayApi>, not Arc<dyn>) — dyn-widening deferred to Phase 14 where MCP needs dyn — TUI workers/ClientHandle are concretely typed; Phase 8 goal is construction-site unification, not handle-type churn
 - [Phase 08]: Session::resolve takes the EFFECTIVE profile flag — IGNITION_PROFILE folding stays in the bin's apply_env_defaults (one env-to-flag home) — Seam must mirror main.rs resolve_profile_context verbatim; re-reading env in core would fork the precedence rule
+- [Phase 08]: poll_interval_too_small is its own enum variant riding the config exit class (exit 3) — Phase-7 additive-slug mechanism; serde accepts 0, load-time validation refuses, load_for_tui degrades — keeps code() total, slug first-class in the envelope for agents, and the strict/degrading split is exactly what 08-04's TUI wiring needs
+- [Phase 08]: New config keys follow the lenient-degradation pattern: deserialize_with warn+default on wrong types, warn-list entry, skip_serializing_if at defaults — legacy configs round-trip byte-identically — a typo in a NEW key must never fail the load; legacy on-disk shape and contract goldens stay frozen
 
 ### Pending Todos
 
@@ -61,5 +64,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-05 — Completed 08-02-PLAN.md (Session execution seam; 08-01 still in flight concurrently). Plans 03-06 remain.
+**Last session:** 2026-09-05T17:36:18.568Z
 **Resume file:** None
