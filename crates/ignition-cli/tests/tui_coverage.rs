@@ -40,6 +40,11 @@
 //! `tags export` leaf; `rig logs` raw passthrough maps as Streamed.
 //! The four-exception STATE list stays traceable through the
 //! routes.rs comments.
+//!
+//! Reserved OutOfBand slugs (`mcp`, `lsp`, `edit` — 08-06): sanctioned
+//! out-of-band FUTURES, pre-declared with justification at the pinned
+//! OutOfBand test and in routes.rs; rows land with their clap commands
+//! in Phases 13/14, not before (orphan rows fail the walk by design).
 
 #![cfg(feature = "tui")]
 
@@ -116,6 +121,19 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 /// `completions` leaf — the only leaf-representable sanctioned
 /// stdout exception (the flag-value/stream-form exceptions are
 /// documented in routes.rs comments, not rows).
+///
+/// RESERVED OutOfBand slugs (08-06 pre-declaration): `mcp`, `lsp`, and
+/// `edit` are sanctioned out-of-band FUTURES, not rows today. MCP stdio
+/// and LSP speak their own protocols on stdout — a cockpit would fight
+/// them for the terminal; `edit` is an editor round-trip, not a cockpit
+/// verb. Their registry rows land TOGETHER with their clap commands in
+/// Phases 13/14 (sibling `every_row_requiring_cli_node_is_mapped_and_no_orphans`
+/// asserts bidirectional equality with the live clap tree, so rows for
+/// not-yet-existing commands fail as orphans BY DESIGN). This pinned
+/// expectation — the set stays exactly `["completions"]` — is the
+/// written justification and the pre-declaration: when the `mcp`/`lsp`/
+/// `edit` clap commands land, their OutOfBand rows extend THIS vec
+/// alongside this test's expected set, and both sides move together.
 #[test]
 fn out_of_band_rows_are_exactly_the_completions_leaf() {
     let out_of_band: Vec<&str> = routes()

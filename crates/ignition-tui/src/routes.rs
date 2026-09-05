@@ -20,6 +20,13 @@ pub enum Mapping {
     Streamed,
     /// No TUI surface BY DESIGN (completions, raw-stdout pipelines like
     /// `tags export -o -`, the version warning path): out-of-band.
+    ///
+    /// RESERVED OutOfBand slugs (08-06 pre-declaration): `mcp`, `lsp`, and
+    /// `edit` will join this set in Phases 13/14 — MCP stdio and LSP speak
+    /// their own protocols on stdout; `edit` is an editor round-trip, not a
+    /// cockpit verb. Their rows land TOGETHER with their clap commands
+    /// (adding them earlier would be orphan rows and fail the clap walk by
+    /// design). Until then the OutOfBand set is exactly `["completions"]`.
     OutOfBand,
 }
 
@@ -327,6 +334,15 @@ pub fn routes() -> &'static [CliRoute] {
         // `tags export` leaf) — are NOT distinct leaves and carry no
         // rows; the leaf-representable exception is `completions`
         // ONLY (the coverage test's OutOfBand sanity pin).
+        //
+        // Reserved OutOfBand slugs (08-06): `mcp`, `lsp`, and `edit` are
+        // PRE-DECLARED for Phases 13/14 — MCP stdio and LSP speak their
+        // own protocols on stdout (a cockpit would fight them for the
+        // terminal), and `edit` is an editor round-trip, not a cockpit
+        // verb. Their registry rows land TOGETHER with their clap
+        // commands; rows added before the commands exist are orphans and
+        // the clap walk refuses them by design — this comment plus the
+        // pinned OutOfBand test ARE the pre-declaration.
         CliRoute {
             path: "rig up",
             mapping: Mapping::Screen(Screen::Rig),
