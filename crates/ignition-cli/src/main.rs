@@ -26,9 +26,9 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use ignition_core::actions;
-use ignition_core::session::Session;
 use ignition_core::config::{self, Config, Credential};
 use ignition_core::error::CoreError;
+use ignition_core::session::Session;
 
 // The command tree lives in the crate's lib target (shared with the
 // integration tests — the TUI-coverage walk needs `Cli::command()`).
@@ -429,22 +429,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // header-less degradation `version` uses: these commands cannot
         // work unauthenticated, so a missing secret is SecretUnavailable
         // (exit 3), the correct taxonomy, not a doomed 401.
-        Commands::Status => {
-            run_inspection(cli.profile.as_deref(), Inspection::Status).await
-        }
+        Commands::Status => run_inspection(cli.profile.as_deref(), Inspection::Status).await,
         Commands::Modules { quarantined } => {
-            run_inspection(
-                cli.profile.as_deref(),
-                Inspection::Modules(quarantined),
-            )
-            .await
+            run_inspection(cli.profile.as_deref(), Inspection::Modules(quarantined)).await
         }
         Commands::Metrics { history } => {
-            run_inspection(
-                cli.profile.as_deref(),
-                Inspection::Metrics(history),
-            )
-            .await
+            run_inspection(cli.profile.as_deref(), Inspection::Metrics(history)).await
         }
         // Sessions (02-03): the merged list is a plain authed read; the
         // terminate half is the CLI's FIRST DESTRUCTIVE COMMAND — the
@@ -1245,15 +1235,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             .await
                             .map(ActionOutput::WebdevDeploy)
                         }
-                        WebdevCommand::Status { project } => {
-                            actions::webdev::webdev_status(
-                                &*session,
-                                &project,
-                                stored_secret.as_deref(),
-                            )
-                            .await
-                            .map(ActionOutput::WebdevStatus)
-                        }
+                        WebdevCommand::Status { project } => actions::webdev::webdev_status(
+                            &*session,
+                            &project,
+                            stored_secret.as_deref(),
+                        )
+                        .await
+                        .map(ActionOutput::WebdevStatus),
                     };
                     (Some(name), result)
                 }
@@ -1604,9 +1592,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let probe = commissioned_probe(&plan);
                         let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> = probe
                             .as_ref()
-                            .map(|session| {
-                                session.api() as &dyn ignition_core::client::GatewayApi
-                            });
+                            .map(|session| session.api() as &dyn ignition_core::client::GatewayApi);
                         match command {
                             RigCommand::Up { timeout } => {
                                 actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
@@ -1967,10 +1953,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 match Session::resolve(cli.profile.as_deref()) {
                     Ok(session) => {
                         let name = session.profile_name().to_string();
-                        let result =
-                            actions::script::script_run(&*session, &config, &name, &project, &script)
-                                .await
-                                .map(ActionOutput::ScriptRun);
+                        let result = actions::script::script_run(
+                            &*session, &config, &name, &project, &script,
+                        )
+                        .await
+                        .map(ActionOutput::ScriptRun);
                         (Some(name), result)
                     }
                     Err(err) => (error_profile(&err), Err(err)),
@@ -2163,9 +2150,8 @@ fn resolve_two_clients(
     match resolve_profile_context(config, flag) {
         Ok(None) => (None, Err(CoreError::NoActiveProfile)),
         Ok(Some((active, _))) => {
-            let sides = named_profile_client(config, name_a).and_then(|api_a| {
-                named_profile_client(config, name_b).map(|api_b| (api_a, api_b))
-            });
+            let sides = named_profile_client(config, name_a)
+                .and_then(|api_a| named_profile_client(config, name_b).map(|api_b| (api_a, api_b)));
             (Some(active), sides)
         }
         Err(err) => (None, Err(err)),
@@ -2206,9 +2192,8 @@ fn rig_gateway_client(
     plan: &ignition_core::rig::RigPlan,
     credential: Option<Credential>,
 ) -> Option<Session> {
-    actions::rig::gateway_url_from(plan).and_then(|url| {
-        Session::for_url(url.parse().ok()?, credential, false).ok()
-    })
+    actions::rig::gateway_url_from(plan)
+        .and_then(|url| Session::for_url(url.parse().ok()?, credential, false).ok())
 }
 
 /// The trial verbs' no-gateway refusal: a rig with no 8088/443 port
