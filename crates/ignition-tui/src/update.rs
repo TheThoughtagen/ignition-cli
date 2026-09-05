@@ -543,8 +543,8 @@ fn open_error_modal(state: &mut AppState, title: &str, message: &str) {
 ///    the dashboard to Loading, re-spawn under a bumped era, and post
 ///    the era-stamped `ProfileChanged` banner.
 fn switch_profile(state: &mut AppState, name: &str) {
-    let rebuilt = match crate::context::rebuild(name) {
-        Ok((resolved_name, url, api)) => (resolved_name, url, api),
+    let ctx = match crate::context::rebuild(name) {
+        Ok(ctx) => ctx,
         Err(err) => {
             open_error_modal(state, "profile switch failed", &err.to_string());
             return;
@@ -557,7 +557,6 @@ fn switch_profile(state: &mut AppState, name: &str) {
         return;
     }
 
-    let (resolved_name, url, api) = rebuilt;
     // Stop the old world's refresh worker BEFORE adopting (its results
     // are already stale — the era bump below formally retires them).
     // The screen-scoped workers stop too, and their data clears: the
@@ -569,9 +568,13 @@ fn switch_profile(state: &mut AppState, name: &str) {
     workers::watch::stop_alarms(state);
     workers::watch::stop_tag_watch(state);
     workers::rig_stream::stop_rig_logs(state);
-    state.client = Some(crate::state::ClientHandle(api));
-    state.profile_url = Some(url);
-    state.profile = Some(resolved_name.clone());
+    state.client = Some(crate::state::ClientHandle(ctx.api));
+    state.profile_url = Some(ctx.profile_url);
+    // THE SWITCH TRAP (08-05): adopt the NEW profile's cadence BEFORE
+    // spawn_refresh reads it — miss this assignment and the dashboard
+    // silently keeps the OLD profile's interval after every switch.
+    state.poll_interval = ctx.poll_interval;
+    state.profile = Some(ctx.profile_name.clone());
     state.dashboard = crate::state::DashboardData::default();
     state.logs = crate::state::LogsData::default();
     state.alarms = crate::state::AlarmsData::default();
@@ -598,7 +601,7 @@ fn switch_profile(state: &mut AppState, name: &str) {
     if let Some(tx) = &state.events_tx {
         let _ = tx.send(AppEvent::ProfileChanged {
             era: state.era,
-            name: resolved_name,
+            name: ctx.profile_name,
         });
     }
 }

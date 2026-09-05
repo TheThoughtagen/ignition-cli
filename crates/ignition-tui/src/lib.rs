@@ -58,12 +58,13 @@ const TICK: Duration = Duration::from_millis(250);
 /// `ratatui::restore()` (Ok, Err, and the init-installed panic hook).
 pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
     // The cockpit owns a live client from the first frame: the
-    // dashboard's refresh worker spawns against it (06-02). The URL
-    // rides along for doctor's `profile_url`.
-    let (profile_name, profile_url, client) = context::resolve(profile_flag.as_deref())?;
+    // dashboard's refresh worker spawns against it (06-02). The context
+    // carries the URL (doctor's `profile_url`) AND the profile's poll
+    // cadence (TUIX-05) — both adopted by run_loop in one block.
+    let ctx = context::resolve(profile_flag.as_deref())?;
 
     let mut terminal = ratatui::init();
-    let app_result = run_loop(&mut terminal, profile_name, profile_url, client).await;
+    let app_result = run_loop(&mut terminal, ctx).await;
     ratatui::restore();
     app_result
 }
@@ -71,9 +72,7 @@ pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
 /// State wiring + worker spawn + the select loop, then worker teardown.
 async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    profile_name: String,
-    profile_url: String,
-    client: std::sync::Arc<ignition_core::client::ReqwestGatewayApi>,
+    ctx: context::ResolvedContext,
 ) -> Result<(), CoreError> {
     let mut state = AppState::new();
     let mut crossterm_events = crossterm::event::EventStream::new();
@@ -83,9 +82,10 @@ async fn run_loop(
     // The dashboard's interval refresh worker (06-02): one spawn per
     // world — the profile switcher re-spawns through the same helper
     // with the new client under a new era.
-    state.client = Some(ClientHandle(client));
-    state.profile = Some(profile_name);
-    state.profile_url = Some(profile_url);
+    state.client = Some(ClientHandle(ctx.api));
+    state.profile = Some(ctx.profile_name);
+    state.profile_url = Some(ctx.profile_url);
+    state.poll_interval = ctx.poll_interval;
     state.events_tx = Some(events_tx.clone());
     workers::refresh::spawn_refresh(&mut state);
 

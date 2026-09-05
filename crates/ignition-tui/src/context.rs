@@ -23,31 +23,56 @@
 //! inside the client's single header-construction site.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::config;
 use ignition_core::error::CoreError;
 use ignition_core::session::Session;
 
-/// Resolve the profile flag → `(name, url, Arc<ReqwestGatewayApi>)` for
-/// the cockpit's opening context (`url` is the profile's URL string —
-/// doctor's `profile_url`). `None` selection (no flag, no active
-/// profile) is [`CoreError::NoActiveProfile`] — the hint names how to
-/// add one; the cockpit is a gateway surface and cannot open without
-/// a target.
-pub fn resolve(
-    profile_flag: Option<&str>,
-) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
-    build_client(profile_flag)
+use crate::workers::refresh::REFRESH_PERIOD;
+
+/// The cockpit's opening context: everything resolution knows about the
+/// selected world, carried as ONE value so callers adopt the pieces in
+/// a single assignment block (the profile-switch trap's antidote —
+/// `update.rs::switch_profile` must set ALL of these before re-spawning
+/// the refresh worker, or the dashboard silently keeps the old
+/// cadence).
+pub struct ResolvedContext {
+    /// The resolved profile's name (flag > active — workers' target).
+    pub profile_name: String,
+    /// The profile's URL string (doctor's `profile_url`).
+    pub profile_url: String,
+    /// The profile's configured dashboard refresh cadence —
+    /// `poll_interval_secs` when set, the 5 s [`REFRESH_PERIOD`]
+    /// default when absent or degraded. THE single source the refresh
+    /// worker reads via `AppState.poll_interval`.
+    pub poll_interval: Duration,
+    /// The authed client handle (Session-constructed — the ONLY
+    /// construction site the cockpit's world uses).
+    pub api: Arc<ReqwestGatewayApi>,
 }
 
-/// Rebuild a client for a NAMED profile (06-02's profile switcher):
-/// reload config from disk, overlay, resolve the named profile's secret.
-pub fn rebuild(profile_name: &str) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
-    build_client(Some(profile_name))
+/// Resolve the profile flag → the cockpit's opening [`ResolvedContext`]
+/// the cockpit's opening context (`profile_url` is the profile's URL
+/// string — doctor's `profile_url`). `None` selection (no flag, no
+/// active profile) is [`CoreError::NoActiveProfile`] — the hint names
+/// how to add one; the cockpit is a gateway surface and cannot open
+/// without a target.
+pub fn resolve(profile_flag: Option<&str>) -> Result<ResolvedContext, CoreError> {
+    build_context(profile_flag)
 }
 
-/// Degraded load + Session resolution + REQUIRED-credential client.
+/// Rebuild a context for a NAMED profile (06-02's profile switcher):
+/// reload config from disk, overlay, resolve the named profile's
+/// secret. The returned `poll_interval` is the NAMED profile's — the
+/// switcher adopts it verbatim so the cadence changes without a
+/// restart.
+pub fn rebuild(profile_name: &str) -> Result<ResolvedContext, CoreError> {
+    build_context(Some(profile_name))
+}
+
+/// Degraded load + Session resolution + REQUIRED-credential context.
 /// The load is the TUI's degradation point (`config::load_for_tui` —
 /// new-surface schema failures warn and default: a `[ui]` typo or a
 /// wrong-typed/clamped-violating `poll_interval_secs` can never kill
@@ -56,21 +81,25 @@ pub fn rebuild(profile_name: &str) -> Result<(String, String, Arc<ReqwestGateway
 /// in the required mode (a missing secret is `SecretUnavailable` exit
 /// 3, never degraded — the cockpit is an authed surface), and raw TOML
 /// / profile-deserialize / selection failures still hard-error
-/// through it. Returns the profile's URL string alongside the
-/// client (doctor's `profile_url` — the cockpit runs no doctor-less
-/// world). The triple stays until 08-05 grows it into the resolved
-/// context struct.
-fn build_client(
-    profile_flag: Option<&str>,
-) -> Result<(String, String, Arc<ReqwestGatewayApi>), CoreError> {
+/// through it. The context carries the profile's URL string (doctor's
+/// `profile_url` — the cockpit runs no doctor-less world) and its poll
+/// cadence: the configured `poll_interval_secs`, or the 5 s
+/// [`REFRESH_PERIOD`] default when absent/degraded — ONE source for
+/// the default (this import; never a second constant).
+fn build_context(profile_flag: Option<&str>) -> Result<ResolvedContext, CoreError> {
     let mut config = config::load_for_tui(&config::config_path())?;
     let (session, profile) = Session::resolve_loaded(&mut config, profile_flag)?;
-    let url = profile.url.to_string();
-    Ok((
-        session.profile_name().to_string(),
-        url,
-        session.api_handle(),
-    ))
+    let poll_interval = Duration::from_secs(
+        profile
+            .poll_interval_secs
+            .unwrap_or(REFRESH_PERIOD.as_secs()),
+    );
+    Ok(ResolvedContext {
+        profile_name: session.profile_name().to_string(),
+        profile_url: profile.url.to_string(),
+        poll_interval,
+        api: session.api_handle(),
+    })
 }
 
 // ---- The rig family's client construction (06-06) ----
@@ -243,12 +272,21 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let (_dir, vars) = isolated_env();
 
-        let (name, url, _api) = resolve(Some("prod")).expect("flag profile resolves");
-        assert_eq!(name, "prod", "flag must beat the active profile");
-        assert_eq!(url, "http://localhost:9443/", "profile url rides along");
+        let ctx = resolve(Some("prod")).expect("flag profile resolves");
+        assert_eq!(
+            ctx.profile_name, "prod",
+            "flag must beat the active profile"
+        );
+        assert_eq!(
+            ctx.profile_url, "http://localhost:9443/",
+            "profile url rides along"
+        );
 
-        let (name, _url, _api) = resolve(None).expect("active profile resolves");
-        assert_eq!(name, "dev", "no flag falls back to config.active");
+        let ctx = resolve(None).expect("active profile resolves");
+        assert_eq!(
+            ctx.profile_name, "dev",
+            "no flag falls back to config.active"
+        );
 
         teardown(&vars);
     }
@@ -259,8 +297,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let (_dir, vars) = isolated_env();
 
-        let (name, _url, _api) = rebuild("prod").expect("named profile resolves");
-        assert_eq!(name, "prod");
+        let ctx = rebuild("prod").expect("named profile resolves");
+        assert_eq!(ctx.profile_name, "prod");
 
         // An unknown name is the standard ProfileNotFound refusal.
         let err = match rebuild("nope") {
@@ -327,14 +365,12 @@ poll_interval_secs = "banana"
         );
         unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
 
-        let (name, url, _api) =
-            resolve(None).expect("a new-surface typo must degrade, not kill startup");
-        assert_eq!(name, "dev");
+        let ctx = resolve(None).expect("a new-surface typo must degrade, not kill startup");
+        assert_eq!(ctx.profile_name, "dev");
         assert_eq!(
-            url, "http://localhost:9088/",
+            ctx.profile_url, "http://localhost:9088/",
             "the degraded profile still resolves to its url"
         );
-
         teardown(&["IGNITION_TOKEN".to_string()]);
     }
 
@@ -359,9 +395,11 @@ poll_interval_secs = 0
         );
         unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
 
-        let (name, _url, _api) =
-            resolve(None).expect("the TUI degrades the clamp instead of refusing");
-        assert_eq!(name, "dev", "the cockpit starts on the default cadence");
+        let ctx = resolve(None).expect("the TUI degrades the clamp instead of refusing");
+        assert_eq!(
+            ctx.profile_name, "dev",
+            "the cockpit starts on the default cadence"
+        );
 
         let path = dir.path().join("config.toml");
         let strict = ignition_core::config::load(&path)

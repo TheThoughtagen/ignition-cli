@@ -343,8 +343,8 @@ pub fn fire_project_diff(
     project: String,
 ) {
     super::spawn_action(state, "project diff", async move {
-        let (_name_a, _url_a, api_a) = crate::context::rebuild(&profile_a)?;
-        let (_name_b, _url_b, api_b) = crate::context::rebuild(&profile_b)?;
+        let api_a = crate::context::rebuild(&profile_a)?.api;
+        let api_b = crate::context::rebuild(&profile_b)?.api;
         actions::projects::project_diff(&*api_a, &*api_b, &project, &profile_a, &profile_b).await
     });
 }
@@ -362,8 +362,8 @@ pub fn fire_project_sync(
     resources: Vec<String>,
 ) {
     super::spawn_action(state, "project sync", async move {
-        let (_name_a, _url_a, api_a) = crate::context::rebuild(&profile_a)?;
-        let (_name_b, _url_b, api_b) = crate::context::rebuild(&profile_b)?;
+        let api_a = crate::context::rebuild(&profile_a)?.api;
+        let api_b = crate::context::rebuild(&profile_b)?.api;
         let selection = actions::projects::SyncSelection {
             resources,
             all_changed: false,

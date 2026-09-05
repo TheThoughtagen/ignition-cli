@@ -16,8 +16,13 @@ use tokio::sync::{mpsc, watch};
 use crate::event::AppEvent;
 use crate::state::AppState;
 
-/// The LOCKED refresh period — panels update every 5 s with zero
-/// keystrokes (must-have truth #1).
+/// The LOCKED refresh period — the DEFAULT dashboard cadence: panels
+/// update every 5 s with zero keystrokes when a profile carries no
+/// `poll_interval_secs` (must-have truth #1). THE single source of
+/// that default — `context::build_context` imports it (never a second
+/// constant), and `AppState`'s manual Default seeds it for workers
+/// spawned before a profile resolves. It parameterizes the DEFAULT
+/// only: a configured `poll_interval_secs` overrides it per profile.
 pub const REFRESH_PERIOD: Duration = Duration::from_secs(5);
 
 /// One dashboard refresh: per-panel `Option<T>` result + per-panel
@@ -110,10 +115,14 @@ pub async fn refresh_worker(
 }
 
 /// Spawn the interval refresh worker for the CURRENT world: a fresh
-/// shutdown channel, a fresh era, the state's client + rail. Callers
-/// own the teardown ordering — the profile switch signals the OLD
-/// shutdown before adopting the new client, then re-spawns through
-/// here (run_loop's startup spawn is the other caller).
+/// shutdown channel, a fresh era, the state's client + rail. The
+/// cadence is `state.poll_interval` (TUIX-05) — the resolved profile's
+/// configured `poll_interval_secs` or the 5 s default; the profile
+/// switcher sets that field BEFORE calling here so the newly-selected
+/// profile's cadence takes effect immediately. Callers own the
+/// teardown ordering — the profile switch signals the OLD shutdown
+/// before adopting the new client, then re-spawns through here
+/// (run_loop's startup spawn is the other caller).
 ///
 /// Outside a tokio runtime (unit tests) the rails + era transition
 /// stands alone and nothing spawns.
@@ -128,7 +137,13 @@ pub fn spawn_refresh(state: &mut crate::state::AppState) {
     state.refresh_shutdown = Some(shutdown_tx);
     let era = crate::workers::new_era(state);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(refresh_worker(client, tx, shutdown_rx, era, REFRESH_PERIOD));
+        handle.spawn(refresh_worker(
+            client,
+            tx,
+            shutdown_rx,
+            era,
+            state.poll_interval,
+        ));
     }
 }
 

@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use ignition_core::actions::projects::ProjectSummary;
@@ -1227,7 +1228,7 @@ impl RigData {
 /// The whole cockpit, in plain data. The era counter is the stale-worker
 /// guard (research Pitfall 9): workers stamp their spawn-era onto
 /// results; update drops events whose era no longer matches.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AppState {
     /// Set by update; the select loop breaks out when it flips.
     pub should_quit: bool,
@@ -1244,6 +1245,11 @@ pub struct AppState {
     pub client: Option<ClientHandle>,
     /// The active profile's URL string (doctor's `profile_url`).
     pub profile_url: Option<String>,
+    /// The active profile's dashboard refresh cadence (TUIX-05):
+    /// configured `poll_interval_secs`, or the 5 s REFRESH_PERIOD
+    /// default. Read by `spawn_refresh` at every (re)spawn — the
+    /// profile switch adopts the NEW profile's value before re-spawning.
+    pub poll_interval: Duration,
     /// The AppEvent rail — a clone of the loop's sender, so update can
     /// arm workers (spawn helpers take their copy from here).
     pub events_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -1270,6 +1276,35 @@ pub struct AppState {
     /// (`profile: NAME`), cleared by the first refresh of the new
     /// world (the confirmation fulfilled its purpose).
     pub banner: Option<String>,
+}
+
+impl Default for AppState {
+    /// MANUAL Default (not derive): `poll_interval` must default to the
+    /// 5 s REFRESH_PERIOD, never `Duration::ZERO` — derive would give
+    /// zero, and `tokio::time::interval(0)` panics inside the spawned
+    /// worker. Every other field keeps its derived default.
+    fn default() -> Self {
+        Self {
+            should_quit: false,
+            screen: Screen::default(),
+            focus: Focus::default(),
+            modal: None,
+            era: 0,
+            client: None,
+            profile_url: None,
+            poll_interval: crate::workers::refresh::REFRESH_PERIOD,
+            events_tx: None,
+            refresh_shutdown: None,
+            dashboard: DashboardData::default(),
+            logs: LogsData::default(),
+            alarms: AlarmsData::default(),
+            tags: TagsData::default(),
+            projects: ProjectsData::default(),
+            rig: RigData::default(),
+            profile: None,
+            banner: None,
+        }
+    }
 }
 
 impl AppState {
