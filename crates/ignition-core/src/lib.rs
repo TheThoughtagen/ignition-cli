@@ -13,7 +13,9 @@
 //! Module map: `error` (the LOCKED exit-code taxonomy + failure envelope),
 //! `output` (the LOCKED success envelope), `config` (discovery, profiles,
 //! secrets, rigs), `client` (the [`client::GatewayApi`] seam + GatewayInfo),
-//! `poll` (the shared wait/retry engine), `rig` (the compose shell-out
+//! `session` (the [`session::Session`] execution seam — the ONE resolution
+//! choreography every auth/gateway client flows through), `poll` (the
+//! shared wait/retry engine), `rig` (the compose shell-out
 //! engine — runner seam, discovery, pre-flight), `actions` (the shared
 //! verb layer), and `webdev` (the embedded route bundle `ign webdev deploy`
 //! zips — pure data, no I/O).
@@ -25,4 +27,5 @@ pub mod error;
 pub mod output;
 pub mod poll;
 pub mod rig;
+pub mod session;
 pub mod webdev;
