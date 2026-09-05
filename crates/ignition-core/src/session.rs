@@ -116,7 +116,7 @@ impl Session {
         profile_flag: Option<&str>,
     ) -> Result<(Self, Profile), CoreError> {
         let (name, profile) = resolve_selected(config, profile_flag)?;
-        let credential = config::resolve_secret(&name, &profile.auth, &secret_chain())?;
+        let credential = config::resolve_secret(&name, &profile.auth, &locked_secret_chain())?;
         let api = ReqwestGatewayApi::new(&profile, Some(credential))?;
         Ok((
             Self {
@@ -145,7 +145,7 @@ impl Session {
                 "a named profile selection resolved to nothing".to_string(),
             ));
         };
-        let credential = config::resolve_secret(name, &profile.auth, &secret_chain())?;
+        let credential = config::resolve_secret(name, &profile.auth, &locked_secret_chain())?;
         let api = ReqwestGatewayApi::new(&profile, Some(credential))?;
         Ok(Self {
             profile: name.to_string(),
@@ -265,7 +265,7 @@ impl Deref for Session {
 /// THE LOCKED secret chain (env tokens → keyring → basic pair), built
 /// in exactly one place — the chain, not the structs, encodes the
 /// order (main.rs's private `secret_chain`, now shared).
-fn secret_chain() -> Vec<Box<dyn SecretStore>> {
+fn locked_secret_chain() -> Vec<Box<dyn SecretStore>> {
     vec![
         Box::new(config::EnvStore),
         Box::new(config::KeyringStore),
@@ -297,7 +297,7 @@ fn resolve_selected(
 /// other credential error propagates (the main.rs `resolve_secret_opt`
 /// port, verbatim).
 fn resolve_secret_opt(profile: &str, auth: &AuthRef) -> Result<Option<Credential>, CoreError> {
-    config::resolve_secret(profile, auth, &secret_chain())
+    config::resolve_secret(profile, auth, &locked_secret_chain())
         .map(Some)
         .or_else(|err| match err {
             CoreError::SecretUnavailable { .. } => Ok(None),
@@ -519,7 +519,7 @@ url = "{url_b}"
     /// requests run with the guard dropped (the client already
     /// snapshotted its credential).
     #[tokio::test]
-    async fn secret_chain_env_first_required_errors_degraded_headerless() {
+    async fn locked_chain_env_first_required_errors_degraded_headerless() {
         let mock = wiremock::MockServer::start().await;
         let guard = mount_info(&mock, 2).await;
         let dir = tempfile::tempdir().expect("tempdir");
