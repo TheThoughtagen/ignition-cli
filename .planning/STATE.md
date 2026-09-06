@@ -12,10 +12,10 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 **Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
 **Current Plan:** 6
 **Total Plans in Phase:** 6
-**Status:** Ready to execute
-**Last Activity:** 2026-09-05
+**Status:** Phase complete — ready for verification
+**Last Activity:** 2026-09-06
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -39,6 +39,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 08 P03 | 1h 40min | 2 tasks | 2 files |
 | Phase 08 P04 | 128 min | 2 tasks | 3 files |
 | Phase 08 P06 | 189 min | 3 tasks | 5 files |
+| Phase 08 P05 | 194 min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -62,6 +63,8 @@ Recent decisions affecting current work:
 - [Phase 08]: Three-Place slug rule now executable: readme_exit_table_agreement parses README exit table via include_str! (section-scoped) and cross-checks against literal (exit,slug) table both directions — nothing later mutates the frozen contract by accident
 - [Phase 08]: mcp/lsp/edit pre-declared as reserved OutOfBand slugs (taxonomy + justification only, zero rows); rows land TOGETHER with their clap commands in P13/14 — orphan registry rows fail the clap walk by design; pinned test is the pre-declaration
 - [Phase 08]: stdout purity harness is assert-based byte-exact over the real binary (NOT snapbox goldens) so SNAPSHOTS=overwrite cannot sanitize a leaked byte; ambient IGNITION_* env knobs stripped for determinism — single stray stdout byte under max diagnostics must fail CI, never be rewritten
+- [Phase 08]: Plan 08-05: ResolvedContext struct replaces the positional (String, String, Arc) triple from resolve/rebuild — poll_interval rides a typed field so the profile-switch chain cannot silently drop it (the update.rs:545-587 trap)
+- [Phase 08]: Plan 08-05: 5s poll default has ONE source (workers::refresh::REFRESH_PERIOD, imported by context.rs); only the dashboard refresh worker is parameterized — WATCH/ALARMS/TAIL periods + TICK parked for Phase 12; CI pins plumbing assertions (Duration values per hop), wall-clock cadence is checkpoint-only
 
 ### Pending Todos
 
@@ -74,5 +77,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-05T20:48:47.618Z
+**Last session:** 2026-09-06T22:41:07.453Z
 **Resume file:** None

@@ -34,7 +34,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 **Structure rationale** (from research consensus): contract/config foundations first (one config migration, contract rituals codified before the second command needs them); independent command families next (disjoint surfaces, parallelizable among themselves); composite engine work after (workspace/historian/edit share the MemberSource seam); protocol transports last (pure lenses over a stable command surface — MCP proves the pattern, LSP reuses it). Phases 9-12 are order-independent of each other; all depend only on Phase 8.
 
-- [ ] **Phase 8: 08-foundations-session-core-config-contract** — Shared execution core, one-shot config schema migration, codified contract discipline
+- [x] **Phase 8: 08-foundations-session-core-config-contract** — Shared execution core, one-shot config schema migration, codified contract discipline *(complete 2026-09-06)*
 - [ ] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics
 - [ ] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview
 - [ ] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings
