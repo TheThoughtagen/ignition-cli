@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 9 of 14 (09-agent-surface-api-diagnostics)
-**Current Plan:** 4
+**Current Plan:** 5
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-07
 
-**Progress:** [█████████░] 94%
+**Progress:** [██████████] 96%
 
 ## Performance Metrics
 
@@ -43,6 +43,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P02 | 62 min | 2 tasks | 2 files |
 | Phase 09 P01 | 210min | 2 tasks | 5 files |
 | Phase 09 P03 | 175min | 3 tasks | 20 files |
+| Phase 09 P04 | 168min | 3 tasks | 22 files |
 
 ## Accumulated Context
 
@@ -78,6 +79,9 @@ Recent decisions affecting current work:
 - [Phase 09]: api-call guards run PRE-resolve (auth-pattern header refusal + path validation: exit 2, envelope profile null, ZERO requests — binary-pinned against a bare mock) and the action re-checks for in-process callers
 - [Phase 09]: api call maps OutOfBand in routes.rs (raw passthrough is not a cockpit verb — the envelope IS the product, completions genre); pinned OutOfBand set extended to [completions, api call] in the same task as the clap command
 - [Phase 09]: User-supplied --header strings validated via HeaderName/HeaderValue::from_bytes before reqwest (whose .header() panics) — bad headers refuse exit 2, never crash; host-shaped --path check precedes the slash check (protocol-relative // refused explicitly)
+- [Phase 09]: license action merges the trial companion — /licenses carries NO mode/edition keys on the captures (capture wins over the plan's field sketch); mode + countdown ride TrialWire — Live-capture ground truth over plan field sketch
+- [Phase 09]: redundancy lastSyncTimestamp: -1 sentinel (never synced) normalized to None via last_sync_epoch_ms(); ms unit flagged INFERENCE in model docs — never presented as capture-proven — No sync ever happened on the fresh rigs; sibling epoch-ms pattern is the only evidence
+- [Phase 09]: 09-04 wire models: partial-curated + flatten passthrough; role stays String (unknown future roles ride); GAN byte rates f64 (parse int+float wire forms); non-hardware license arrays stay Vec<Value> element passthrough — Version-tolerance directive; element shapes not capture-proven on fresh rigs
 
 ### Pending Todos
 
@@ -90,5 +94,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-07T08:17:28.368Z
+**Last session:** 2026-09-07T11:10:57.989Z
 **Resume file:** None
