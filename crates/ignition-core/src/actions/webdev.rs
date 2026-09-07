@@ -362,6 +362,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for WebdevRig {
+        async fn bundle_generate(
+            &self,
+        ) -> Result<crate::client::diagnostics::BundleStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn bundle_status(
+            &self,
+        ) -> Result<crate::client::diagnostics::BundleStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn bundle_download(
+            &self,
+            _out: &std::path::Path,
+        ) -> Result<crate::client::projects::ExportMeta, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn tag_provider_list(
             &self,
             _query: &crate::client::query::ListQuery,

@@ -36,6 +36,7 @@ pub mod apicall;
 pub mod backup;
 mod classify;
 pub mod connections;
+pub mod diagnostics;
 pub mod eam;
 pub mod gan;
 pub mod idp;
@@ -56,6 +57,7 @@ pub mod version;
 pub mod webdev;
 
 use crate::client::connections::GatewayConnection;
+use crate::client::diagnostics::BundleStatusWire;
 use crate::client::eam::{EamHistoryItem, EamTaskRecord};
 use crate::client::gan::GanStatusWire;
 use crate::client::license::LicenseStatusWire;
@@ -419,6 +421,23 @@ pub trait GatewayApi: Send + Sync {
     /// summary (09-04); a non-GAN gateway's zero-connection body IS
     /// the canonical capture.
     async fn gan_status(&self) -> Result<GanStatusWire, CoreError>;
+    /// POST `/data/api/v1/diagnostics/bundle/generate` (authed, no
+    /// body) — start bundle generation (09-05). The 200 body IS the
+    /// fresh [`BundleStatusWire`] (live capture:
+    /// `{"state":"Generating"}`). Audit-logged server-side.
+    async fn bundle_generate(&self) -> Result<BundleStatusWire, CoreError>;
+    /// GET `/data/api/v1/diagnostics/bundle/status` (authed) — the
+    /// status poll: captured state vocabulary + `fileSize` (bytes,
+    /// absent while generating — 09-LIVE-CAPTURES §5).
+    async fn bundle_status(&self) -> Result<BundleStatusWire, CoreError>;
+    /// GET `/data/api/v1/diagnostics/bundle/download` (authed,
+    /// per-request [`diagnostics::BUNDLE_DOWNLOAD_TIMEOUT`] = 300 s —
+    /// Pitfall 8: the 30 s client default would truncate MB-sized
+    /// bundles) — the ZIP STREAMED to `out` chunk-by-chunk through the
+    /// `download_to_file` pipeline (classify-first; NO `Vec<u8>`
+    /// anywhere). The `Content-Disposition` filename + `Content-Type`
+    /// ride the pipeline's [`ExportMeta`].
+    async fn bundle_download(&self, out: &Path) -> Result<ExportMeta, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -1458,6 +1477,45 @@ impl GatewayApi for ReqwestGatewayApi {
 
     async fn gan_status(&self) -> Result<GanStatusWire, CoreError> {
         self.get_json(gan::GAN_OVERVIEW_PATH, None, true).await
+    }
+
+    async fn bundle_generate(&self) -> Result<BundleStatusWire, CoreError> {
+        // Empty body, authed POST (the restart/set-logger precedent;
+        // token mutations need no CSRF). The 200 body IS the status
+        // wire per capture ({"state":"Generating"}) — classify-first
+        // through the shared pipeline, then parse.
+        let url = self.url_for(diagnostics::DIAGNOSTICS_GENERATE_PATH);
+        let response = self
+            .send_and_classify(self.apply_auth(self.client.post(url.clone())), &url)
+            .await?;
+        response.json::<BundleStatusWire>().await.map_err(|err| {
+            CoreError::Internal(format!(
+                "response from {url} did not match the expected shape: {err}"
+            ))
+        })
+    }
+
+    async fn bundle_status(&self) -> Result<BundleStatusWire, CoreError> {
+        // auth = true — a /data route under 8.3 default security; the
+        // capture session rode a token header.
+        self.get_json(diagnostics::DIAGNOSTICS_STATUS_PATH, None, true)
+            .await
+    }
+
+    async fn bundle_download(&self, out: &Path) -> Result<ExportMeta, CoreError> {
+        // The 300 s per-request override rides the RequestBuilder
+        // inside download_to_file (Pitfall 8: the 30 s client default
+        // would truncate MB-sized bundles); the chunk loop stays THE
+        // one streaming body-consumption site. No Accept header — the
+        // capture named none (Content-Type: application/zip is the
+        // answer). Disposition filename + content type ride ExportMeta.
+        self.download_to_file(
+            diagnostics::DIAGNOSTICS_DOWNLOAD_PATH,
+            out,
+            diagnostics::BUNDLE_DOWNLOAD_TIMEOUT,
+            None,
+        )
+        .await
     }
 }
 
