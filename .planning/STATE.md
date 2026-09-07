@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9: 09-agent-surface-api-diagnostics
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9 complete (6/6), ready for `/gsd-verify-work` then Phase 10 planning
 
 ## Current Position
 
-**Phase:** 9 of 14 (09-agent-surface-api-diagnostics)
+**Phase:** 9 of 14 (09-agent-surface-api-diagnostics) — COMPLETE
 **Current Plan:** 6
 **Total Plans in Phase:** 6
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-09-07
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
 **v1.0 baseline (for comparison):** 41 plans, 118 tasks, 9 days (2026-08-20 → 2026-08-29); avg ~38 min/plan; slowest plans were live-gate/WebDev phases (P03-P04 of Phase 5 at ~400+ min).
 
-**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 P02 done (62 min) — P01 pending, then P03-P06.
+**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 complete (6/6 plans, closed 2026-09-07 with the both-rig live-gate matrix) — next: verify-work, then Phase 10 planning.
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
@@ -45,6 +45,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P03 | 175min | 3 tasks | 20 files |
 | Phase 09 P04 | 168min | 3 tasks | 22 files |
 | Phase 09 P05 | 314 min | 3 tasks | 10 files |
+| Phase 09 P06 | 131 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,8 @@ Recent decisions affecting current work:
 - [Phase 09]: 09-05: bundle state vocabulary stays String consts (BUNDLE_GENERATING_STATES=[Generating], BUNDLE_CAPTURED_STATES=[Generating,Valid]) with per-element rig provenance — never an enum (Pitfall 2); fileSize=Option<u64> bytes (capture Decision 2 over plan's i64 sketch) — Capture-locked vocabulary; unobserved states must ride passthrough and wait honestly
 - [Phase 09]: 09-05: bundle download rides download_to_file (the ONE streaming site) with BUNDLE_DOWNLOAD_TIMEOUT=300s pinned by unit test at birth — no second hand-built request site, no sleep-based wiremock — Pitfall 8: the 30s client default would truncate MB-sized bundles; the parameter ride preserves the one-streaming-site invariant
 - [Phase 09]: 09-05: bundle wait = captured non-generating terminal / Generating pending / UNKNOWN pending-until-deadline, exit 4 network_error (no new slug); envelope data IS the wire (data.state) for generate/status/wait — Honest unknowns keep polling with the final status on the deadline observation; data.state matches the contract-test spec
+- [Phase 09]: 09-06 live gates: DELETE probe asserts the captured 404-empty answer (exit 6 not_found) — the 405/exit-2 hypothesis stays falsified; classify.rs maps every 404 before the api-call catch-all — Capture wins over plan hypothesis; gate encodes live truth
+- [Phase 09]: 09-06 first-time capture: gateway-info body rides ignitionVersion (not version) — identical key shape on 8.3.3/8.3.6; wiremock mocks serve only the alias name — Wire truth recorded; gate spot-key corrected mid-run
 
 ### Pending Todos
 
@@ -98,5 +101,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-07T16:29:08.851Z
+**Last session:** 2026-09-07T18:44:09.555Z
 **Resume file:** None

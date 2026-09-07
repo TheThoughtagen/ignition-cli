@@ -35,7 +35,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 **Structure rationale** (from research consensus): contract/config foundations first (one config migration, contract rituals codified before the second command needs them); independent command families next (disjoint surfaces, parallelizable among themselves); composite engine work after (workspace/historian/edit share the MemberSource seam); protocol transports last (pure lenses over a stable command surface — MCP proves the pattern, LSP reuses it). Phases 9-12 are order-independent of each other; all depend only on Phase 8.
 
 - [x] **Phase 8: 08-foundations-session-core-config-contract** — Shared execution core, one-shot config schema migration, codified contract discipline *(complete 2026-09-06)*
-- [ ] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics
+- [x] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics *(complete 2026-09-07)*
 - [ ] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview
 - [ ] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings
 - [ ] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation
@@ -80,7 +80,7 @@ Plans:
 - [x] 09-03-PLAN.md — `ign api call`: raw passthrough core (RawValue verbatim data, auth-header refusal, path/query contract) + CLI + OutOfBand TUI row + binary contract tests + README contract exception
 - [x] 09-04-PLAN.md — Curated reads: license/redundancy/gan status — capture-backed version-tolerant models + actions + CLI + Dashboard TUI rows + contract tests
 - [x] 09-05-PLAN.md — Diagnostics bundle generate/status/wait/download: capture-encoded state vocabulary, poll-based wait, streaming download with 300s timeout override + CLI + TUI rows + contract tests
-- [ ] 09-06-PLAN.md — Live gates (e2e_api_diagnostics.rs): env-gated read-only matrix + mutations-gated bundle round-trip, run on BOTH rigs with recorded evidence
+- [x] 09-06-PLAN.md — Live gates (e2e_api_diagnostics.rs): env-gated read-only matrix + mutations-gated bundle round-trip, run on BOTH rigs with recorded evidence
 
 ### Phase 10: 10-eam-write-operations
 **Goal**: Users manage the full EAM agent/task lifecycle from the CLI without the gateway webpage — every write behind a confirmation guard, with blast-radius visibility protecting the production controller.
