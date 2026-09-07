@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 9 of 14 (09-agent-surface-api-diagnostics)
-**Current Plan:** 2
+**Current Plan:** 3
 **Total Plans in Phase:** 6
-**Status:** In progress — 09-01 next (09-02 captured the wire truth it depends on)
+**Status:** Ready to execute
 **Last Activity:** 2026-09-07
 
-**Progress:** [█████████░] 91%
+**Progress:** [█████████░] 92%
 
 ## Performance Metrics
 
@@ -41,6 +41,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 08 P06 | 189 min | 3 tasks | 5 files |
 | Phase 08 P05 | 194 min | 3 tasks | 6 files |
 | Phase 09 P02 | 62 min | 2 tasks | 2 files |
+| Phase 09 P01 | 210min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -70,6 +71,8 @@ Recent decisions affecting current work:
 - [Phase 09]: Units locked from captures: uptime=ms-since-gateway-start (wall-clock proven twice); lastSyncTimestamp=-1 never-synced sentinel (unit not capture-proven, model Option, ms flagged inference); fileSize=bytes, key absent until Valid — Magnitude cross-checks against wall clock; -1 sentinel rules out epoch units on fresh rigs
 - [Phase 09]: Live 4xx partition: 404+HTML=unknown path, 404+EMPTY=wrong method on real path (NOT 405), 401+HTML=bad auth — DELETE /gateway-info answered 404-empty on both rigs - the plan's 405 hypothesis falsified by capture; evidence for 09-06 gates
 - [Phase 09]: 8.3 headless commissioning rides the commissioner wire API (bootstrap -> eula-accept -> start-gateway); 8.3 image entrypoint ignores ACCEPT_EULA/GATEWAY_ADMIN_PASSWORD — Env vars are 8.1-era; wire recipe extracted from commissioner.js and replayed with curl on both rigs
+- [Phase 09]: GatewayClientError rides exit 2 with slug gateway_client_error carrying the verbatim 4 KiB-capped gateway body — additive-slug on the frozen taxonomy, Three-Place rule landed atomically (README row + both CI agreement tests)
+- [Phase 09]: The api-call catch-all is parameter-scoped (api_call: bool on classify, set only by pub send_and_classify_for_api) — curated pipeline 4xx/exit-1 semantics provably unchanged via pinned non-leak regression
 
 ### Pending Todos
 
@@ -82,5 +85,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-07T02:52:19.037Z
+**Last session:** 2026-09-07T05:17:30.281Z
 **Resume file:** None
