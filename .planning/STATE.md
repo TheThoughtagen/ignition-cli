@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 9 of 14 (09-agent-surface-api-diagnostics)
-**Current Plan:** 5
+**Current Plan:** 6
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-07
 
-**Progress:** [██████████] 96%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -44,6 +44,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P01 | 210min | 2 tasks | 5 files |
 | Phase 09 P03 | 175min | 3 tasks | 20 files |
 | Phase 09 P04 | 168min | 3 tasks | 22 files |
+| Phase 09 P05 | 314 min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -82,6 +83,9 @@ Recent decisions affecting current work:
 - [Phase 09]: license action merges the trial companion — /licenses carries NO mode/edition keys on the captures (capture wins over the plan's field sketch); mode + countdown ride TrialWire — Live-capture ground truth over plan field sketch
 - [Phase 09]: redundancy lastSyncTimestamp: -1 sentinel (never synced) normalized to None via last_sync_epoch_ms(); ms unit flagged INFERENCE in model docs — never presented as capture-proven — No sync ever happened on the fresh rigs; sibling epoch-ms pattern is the only evidence
 - [Phase 09]: 09-04 wire models: partial-curated + flatten passthrough; role stays String (unknown future roles ride); GAN byte rates f64 (parse int+float wire forms); non-hardware license arrays stay Vec<Value> element passthrough — Version-tolerance directive; element shapes not capture-proven on fresh rigs
+- [Phase 09]: 09-05: bundle state vocabulary stays String consts (BUNDLE_GENERATING_STATES=[Generating], BUNDLE_CAPTURED_STATES=[Generating,Valid]) with per-element rig provenance — never an enum (Pitfall 2); fileSize=Option<u64> bytes (capture Decision 2 over plan's i64 sketch) — Capture-locked vocabulary; unobserved states must ride passthrough and wait honestly
+- [Phase 09]: 09-05: bundle download rides download_to_file (the ONE streaming site) with BUNDLE_DOWNLOAD_TIMEOUT=300s pinned by unit test at birth — no second hand-built request site, no sleep-based wiremock — Pitfall 8: the 30s client default would truncate MB-sized bundles; the parameter ride preserves the one-streaming-site invariant
+- [Phase 09]: 09-05: bundle wait = captured non-generating terminal / Generating pending / UNKNOWN pending-until-deadline, exit 4 network_error (no new slug); envelope data IS the wire (data.state) for generate/status/wait — Honest unknowns keep polling with the final status on the deadline observation; data.state matches the contract-test spec
 
 ### Pending Todos
 
@@ -94,5 +98,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-07T11:10:57.989Z
+**Last session:** 2026-09-07T16:29:08.851Z
 **Resume file:** None

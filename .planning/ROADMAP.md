@@ -78,8 +78,8 @@ Plans:
 - [x] 09-01-PLAN.md — GatewayClientError exit-2 slug (Three-Place rule in one task) + api-call-scoped classify arm + exit-partition contract tests
 - [x] 09-02-PLAN.md — Live captures on BOTH rigs (8.3.3 + 8.3.6): bundle state vocabulary, license nesting, redundancy/gan units → 09-LIVE-CAPTURES.md (before any model task)
 - [x] 09-03-PLAN.md — `ign api call`: raw passthrough core (RawValue verbatim data, auth-header refusal, path/query contract) + CLI + OutOfBand TUI row + binary contract tests + README contract exception
-- [ ] 09-04-PLAN.md — Curated reads: license/redundancy/gan status — capture-backed version-tolerant models + actions + CLI + Dashboard TUI rows + contract tests
-- [ ] 09-05-PLAN.md — Diagnostics bundle generate/status/wait/download: capture-encoded state vocabulary, poll-based wait, streaming download with 300s timeout override + CLI + TUI rows + contract tests
+- [x] 09-04-PLAN.md — Curated reads: license/redundancy/gan status — capture-backed version-tolerant models + actions + CLI + Dashboard TUI rows + contract tests
+- [x] 09-05-PLAN.md — Diagnostics bundle generate/status/wait/download: capture-encoded state vocabulary, poll-based wait, streaming download with 300s timeout override + CLI + TUI rows + contract tests
 - [ ] 09-06-PLAN.md — Live gates (e2e_api_diagnostics.rs): env-gated read-only matrix + mutations-gated bundle round-trip, run on BOTH rigs with recorded evidence
 
 ### Phase 10: 10-eam-write-operations
@@ -159,7 +159,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 6. TUI Cockpit | v1.0 | 11/11 | Complete | 2026-08-28 |
 | 7. Ecosystem Interop & Advanced Ops | v1.0 | 6/6 | Complete | 2026-08-29 |
 | 8. 08-foundations-session-core-config-contract | v1.1 | 0/TBD | Not started | - |
-| 9. 09-agent-surface-api-diagnostics | v1.1 | 4/6 | In progress | - |
+| 9. 09-agent-surface-api-diagnostics | v1.1 | 5/6 | In progress | - |
 | 10. 10-eam-write-operations | v1.1 | 0/TBD | Not started | - |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 0/TBD | Not started | - |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
