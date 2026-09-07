@@ -34,6 +34,20 @@ One success-path exception: `ign completions <SHELL>` writes the raw
 completion script to stdout regardless of `--json` — shells source its
 output directly, so it is never JSON-wrapped.
 
+### The `ign api call` contract exception
+
+`ign api call` is the one documented exception on the SUCCESS side:
+its `data.result.data` is the gateway's OWN JSON — **gateway-verbatim**
+(no field dropped, no value coerced, key order preserved), not a
+curated model. A 2xx answer with a **non-JSON** body refuses exit 1
+`internal` with an explanatory message — binary endpoints belong to
+the logs/backup download pipelines, never this command. Gateway error
+bodies on the api-call path ride the error envelope's message
+verbatim, truncated at **4 KiB** with an explicit `... [truncated]`
+marker. Auth-pattern headers (`Authorization`, `X-Ignition-API-Token`,
+`Cookie` — case-insensitive) are refused exit 2 BEFORE any request:
+credentials come from the profile, full stop.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs
@@ -55,6 +69,16 @@ table via `include_str!` and cross-checks every slug ↔ exit-code row
 against those literals in both directions, so a missing, stale, or
 misplaced table row fails the test suite (the Three-Place rule: enum +
 literals + this table, all machine-checked).
+
+`ign api call` partitions gateway answers through the same classifier:
+401/403 → 5 `auth_rejected`, 404 → 6 `not_found`, 503 → 6
+`gateway_restarting`, 500 → 1 `internal`, and every OTHER 4xx → 2
+`gateway_client_error` with the response body carried verbatim in the
+message (4 KiB cap, `... [truncated]` marker). Usage-class input
+problems (auth-pattern headers, bad `--path`, malformed
+`--header`/`--query`) refuse exit 2 `invalid_input` BEFORE any
+resolution — the envelope's `profile` is null and zero requests hit
+the gateway.
 
 ## Gateway authentication (8.3)
 
@@ -197,6 +221,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign eam task force <NAME> --yes` | Force-dispatch a task NOW (find → owner → POST → history read-back) | **destructive — always `--yes`-guarded** (dispatches to the agent targets immediately; exit 2 pre-resolution without); the owner resolves from the healthcheck's `scheduledTaskState.details.owner` (fallback `eam`); a 2xx is DISPATCH acceptance — the run's OUTCOME lands in history as data (`Failed` + GNET-not-connected detail is the honest shape of an unconfigured agent; trial expiry blocks runs); JSON data `{task, owner, dispatched, history}` |
 | `ign script run --code PY\|--file PATH\|- [--project NAME]` | Execute gateway-side Python (Jython) through the secret-gated `scriptExec` route — non-interactive, the route's entire purpose | **the opt-in is STRUCTURAL, not a flag**: `scriptExec` deploys only via `ign webdev deploy --with-script-exec` (which generates + persists the secret); without it the verb exits 6 `script_exec_not_configured` with ZERO HTTP, hint naming the deploy flag; **no `--yes` by design** — the deploy flag IS the opt-in and agents need it non-interactive; `--code`/`--file` are mutually exclusive (both or neither → exit 2 `invalid_input` before any resolution; `--file -` reads stdin — the agent pipe path); each run probes the route's version handshake then execs (two round trips); JSON data `{stdout, result, elapsedMs}` — ALL keys always; a route-side Python exception surfaces its traceback verbatim (exit 6 `webdev_route_error`); NO server-side execution timeout exists — a long-running script holds the HTTP connection (the client's per-request timeout class applies); the secret NEVER appears in any output mode (see the scriptExec posture below) |
 | `ign lint PATH... [--strict] [-- ARGS...]` | Lint local project files by delegating to `ignition-lint` (PATH-discovered; no gateway, `profile: null`) | **doctor posture**: exit 0 whenever the tool RAN — findings, `child_exit_code`, and the parsed JSON report ride as data (ALL keys always; `report` null + `stdout` verbatim when unparseable; `stderr_preview` capped at 4000 chars); `--strict` exits with the tool's own code for CI (envelope prints first — the one sanctioned success-path exit exception; 1 = findings at the `--fail-on` threshold); PATHS map to `--target <path>` pairs + `--report-format json` on an ARG VECTOR (never a shell string); anything after `--` passes through verbatim; no tool on PATH → exit 6 `lint_tool_absent` with the install hint (`uv tool install ignition-lint-toolkit`); pair with `project export --decode-scripts` to lint the decoded sidecars |
+| `ign api call --method M --path /P [--data TEXT] [--header "Name: Value"]... [--query k=v]...` | Raw passthrough to any gateway REST endpoint — the escape hatch for the uncurated endpoint families (any HTTP verb accepted) | the envelope's `data.result.data` IS the gateway's JSON **verbatim** (no field dropped, no value coerced, key order preserved — the documented contract exception above); a non-JSON 2xx body exits 1 `internal` with the explanation (binary endpoints: use logs/backup downloads); auth-pattern headers (`Authorization`, `X-Ignition-API-Token`, `Cookie` — case-insensitive) refuse exit 2 pre-resolve with ZERO gateway requests (credentials come from the profile); `--path` must start with `/`, refuses host-shaped URLs and embedded `?` (use repeatable `--query k=v` — the ONE query mechanism); `--header` splits on the FIRST `:` (repeatable), `--data` is raw text on ANY method (GET/DELETE bodies allowed — curl parity); exit partition: 401/403→5, 404→6, 503→6, 500→1, every other 4xx→2 `gateway_client_error` with the body verbatim (4 KiB cap + `... [truncated]` marker) |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
