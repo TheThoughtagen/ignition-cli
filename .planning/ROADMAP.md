@@ -73,7 +73,14 @@ Plans:
   3. `license status`, `redundancy status`, and `gan status` each return live gateway truth with one command
   4. Diagnostics bundle generate/download/wait works as curated commands, live-verified on BOTH rigs (8.3.3 + 8.3.6)
 **Research/Planning flags**: Diagnostics slice needs per-endpoint wire-shape verification against both live rigs — 8.3.x point-release variance is the documented failure mode; use version-tolerant parsing (deny_unknown_fields OFF, optional fields explicit). EXT-01: catch-all classifier is the FIRST task before the happy path; live gate designed read-only so passthrough can't nuke the rig. No research-phase for EXT-01 itself (83-api collection is ground truth).
-**Plans**: TBD
+**Plans**: 6 plans
+Plans:
+- [ ] 09-01-PLAN.md — GatewayClientError exit-2 slug (Three-Place rule in one task) + api-call-scoped classify arm + exit-partition contract tests
+- [ ] 09-02-PLAN.md — Live captures on BOTH rigs (8.3.3 + 8.3.6): bundle state vocabulary, license nesting, redundancy/gan units → 09-LIVE-CAPTURES.md (before any model task)
+- [ ] 09-03-PLAN.md — `ign api call`: raw passthrough core (RawValue verbatim data, auth-header refusal, path/query contract) + CLI + OutOfBand TUI row + binary contract tests + README contract exception
+- [ ] 09-04-PLAN.md — Curated reads: license/redundancy/gan status — capture-backed version-tolerant models + actions + CLI + Dashboard TUI rows + contract tests
+- [ ] 09-05-PLAN.md — Diagnostics bundle generate/status/wait/download: capture-encoded state vocabulary, poll-based wait, streaming download with 300s timeout override + CLI + TUI rows + contract tests
+- [ ] 09-06-PLAN.md — Live gates (e2e_api_diagnostics.rs): env-gated read-only matrix + mutations-gated bundle round-trip, run on BOTH rigs with recorded evidence
 
 ### Phase 10: 10-eam-write-operations
 **Goal**: Users manage the full EAM agent/task lifecycle from the CLI without the gateway webpage — every write behind a confirmation guard, with blast-radius visibility protecting the production controller.
