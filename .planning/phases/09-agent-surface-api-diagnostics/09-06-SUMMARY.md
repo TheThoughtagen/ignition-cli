@@ -69,7 +69,7 @@ completed: 2026-09-07
 Each task was committed atomically:
 
 1. **Task 1: write the env-gated live gates (quiet no-op without envs)** - `d5a1226` (feat)
-2. **Task 2: run the full gate matrix on BOTH rigs, record, teardown** - `d832068` (docs)
+2. **Task 2: run the full gate matrix on BOTH rigs, record, teardown** - `d832068` (docs) + `2b1a4ce` (fix: gate spot-key corrected to captured truth)
 
 **Plan metadata:** the `docs(09-06): complete live-gate matrix plan` commit (see `git log --grep "docs(09-06)"`)
 
@@ -95,7 +95,7 @@ Each task was committed atomically:
 - **Fix:** gate spot-key changed to `ignitionVersion`, comment cites the run's own capture; delta recorded in 09-RIG-NOTES.md per the plan's Task-2-step-3 protocol
 - **Files modified:** crates/ignition-cli/tests/e2e_api_diagnostics.rs
 - **Verification:** both rigs 6/6 PASS after the fix; this is the documented point-release-variance failure mode the phase exists to close
-- **Committed in:** d832068 (Task 2 commit; the gate file fix rode the Task-2 edit pass, file first committed in d5a1226)
+- **Committed in:** 2b1a4ce (fix: api-call gate spot-key corrected to live-captured ignitionVersion)
 
 ---
 
