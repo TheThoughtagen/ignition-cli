@@ -158,8 +158,8 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 5. WebDev Backend & Tag Operations | v1.0 | 8/8 | Complete | 2026-08-26 |
 | 6. TUI Cockpit | v1.0 | 11/11 | Complete | 2026-08-28 |
 | 7. Ecosystem Interop & Advanced Ops | v1.0 | 6/6 | Complete | 2026-08-29 |
-| 8. 08-foundations-session-core-config-contract | v1.1 | 0/TBD | Not started | - |
-| 9. 09-agent-surface-api-diagnostics | v1.1 | 5/6 | In progress | - |
+| 8. 08-foundations-session-core-config-contract | v1.1 | 6/6 | Complete | 2026-09-06 |
+| 9. 09-agent-surface-api-diagnostics | v1.1 | 6/6 | Complete | 2026-09-07 |
 | 10. 10-eam-write-operations | v1.1 | 0/TBD | Not started | - |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 0/TBD | Not started | - |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
