@@ -673,7 +673,8 @@ impl ReqwestGatewayApi {
     /// Send + transport-error mapping + [`classify`] — the shared tail of
     /// every pipeline helper. Transport failures (connect/timeout/TLS) →
     /// `Network` (exit 4); everything the gateway ANSWERED goes through
-    /// the classifier.
+    /// the classifier. Curated traffic: `api_call = false` — the
+    /// catch-all cannot fire without the parameter (09-01 Pitfall 1).
     async fn send_and_classify(
         &self,
         request: reqwest::RequestBuilder,
@@ -683,7 +684,27 @@ impl ReqwestGatewayApi {
             url: url.to_string(),
             source: Some(err),
         })?;
-        classify::classify(response, url.as_ref()).await
+        classify::classify(response, url.as_ref(), false).await
+    }
+
+    /// The api-call-scoped pipeline entry (09-01): identical
+    /// transport-error → `Network` mapping, then [`classify`] with
+    /// `api_call = true` so an unclassified gateway 4xx maps to
+    /// `GatewayClientError` (exit 2, verbatim capped body) instead of
+    /// `Internal`. Public because `ign api call`'s action layer (09-03)
+    /// is the production consumer and the contract tests
+    /// (tests/api_classify_contract.rs) pin the full exit partition
+    /// through it — nothing in the curated pipeline switches to it.
+    pub async fn send_and_classify_for_api(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &url::Url,
+    ) -> Result<reqwest::Response, CoreError> {
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+        })?;
+        classify::classify(response, url.as_ref(), true).await
     }
 }
 
@@ -939,7 +960,7 @@ impl GatewayApi for ReqwestGatewayApi {
         let (url, response) = self
             .webdev_post_raw(project, route, body, extra_headers)
             .await?;
-        let response = classify::classify(response, &url).await?;
+        let response = classify::classify(response, &url, false).await?;
         let text = response.text().await.unwrap_or_default();
         match webdev::parse_route_body(&text)? {
             RouteBody::Ok(data) => Ok(data),
@@ -1010,7 +1031,7 @@ impl GatewayApi for ReqwestGatewayApi {
             // status mappings verbatim; every non-success response
             // classifies to Err, and the Ok arm is unreachable by
             // construction (all 2xx took the body branch above).
-            _ => match classify::classify(response, &url).await {
+            _ => match classify::classify(response, &url, false).await {
                 Err(err) => Err(err),
                 Ok(_) => Err(CoreError::Internal(format!(
                     "unexpected HTTP {status} from webdev route probe at {url}"

@@ -18,6 +18,16 @@
 //! 6. Anything else → `Internal`, enriched with the Jetty HTML page's
 //!    own title/message when the body is HTML (see [`html_error_parts`]).
 //!
+//! **6b.** api-call path + unclassified 4xx → `GatewayClientError` (exit
+//! 2, verbatim body): the `api_call` parameter scopes this arm to the raw
+//! api-call pipeline (the `send_and_classify_for_api` entry, 09-01) — a
+//! 4xx the CLI does not curate is the CALLER's usage problem, and the
+//! body is theirs to read. The curated pipeline passes `api_call = false`,
+//! so v1.0-era commands' exit-1 semantics are untouched (Pitfall 1: a
+//! global catch-all would reclassify them). The earlier match arms
+//! (401/403, 503, 404, the route-scoped 409/422 arms) run BEFORE this
+//! fallback and keep their meanings on both paths.
+//!
 //! The Jetty sniffer is a deliberate substring scan, not an HTML crate:
 //! the error pages are a fixed server template (research Don't-Hand-Roll).
 
@@ -29,9 +39,16 @@ use crate::error::CoreError;
 /// [`CoreError`] every other observed gateway shape maps to. Consumes the
 /// body ONLY on the unclassifiable fallback (to sniff the HTML detail);
 /// classified variants keep their fixed Display strings.
+///
+/// `api_call` scopes the catch-all (09-01): only the raw api-call
+/// pipeline sets it, so an UNCLASSIFIED 4xx there maps to
+/// [`CoreError::GatewayClientError`] (exit 2, verbatim truncated body)
+/// instead of `Internal`. Every curated call site passes `false` — the
+/// arm is parameter-scoped, not global (Pitfall 1).
 pub(crate) async fn classify(
     resp: reqwest::Response,
     url: &str,
+    api_call: bool,
 ) -> Result<reqwest::Response, CoreError> {
     use reqwest::StatusCode as S;
 
@@ -171,6 +188,22 @@ pub(crate) async fn classify(
             Err(CoreError::InvalidInput { reason })
         }
         _ => {
+            // The api-call catch-all (09-01): an UNCLASSIFIED 4xx on the
+            // api-call path is the caller's request failing, not a CLI
+            // bug — the gateway's verbatim body is theirs to read
+            // (capped + marked at construction via truncate_api_body).
+            // Parameter-scoped so the curated pipeline's Internal/exit-1
+            // semantics are byte-for-byte unchanged (Pitfall 1); the
+            // earlier arms (401/403/404/503 + the route-scoped 409/422
+            // arms) already ran and keep their meanings on the api path.
+            if api_call && status.is_client_error() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(CoreError::GatewayClientError {
+                    status: status.as_u16(),
+                    endpoint: url.to_string(),
+                    body: crate::error::truncate_api_body(&body),
+                });
+            }
             // Unclassifiable: if the body is the Jetty HTML error page,
             // surface its own title/message instead of a bare status.
             let is_html = resp
