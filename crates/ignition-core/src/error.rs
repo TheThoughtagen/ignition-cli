@@ -8,7 +8,7 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input` (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01)
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
@@ -28,6 +28,38 @@ use serde::Serialize;
 /// raise site keeps the resource-put default. Construct via
 /// [`CoreError::tui_tty_refusal`] so the reason/hint pair cannot drift.
 pub const TUI_TTY_REFUSAL_REASON: &str = "ign tui requires a terminal (stdout is not a TTY)";
+
+/// The api-call catch-all's body cap (09-01): a gateway 4xx body rides
+/// [`CoreError::GatewayClientError`] VERBATIM up to this many bytes; a
+/// larger body is truncated at [`truncate_api_body`] with the explicit
+/// [`GATEWAY_CLIENT_BODY_TRUNCATION_MARKER`]. 4 KiB is the plan-locked
+/// cap — an unbounded passthrough would let a pathological gateway
+/// page flood the agent's envelope.
+pub const GATEWAY_CLIENT_BODY_CAP_BYTES: usize = 4096;
+
+/// The truncation marker [`truncate_api_body`] appends when the api-call
+/// body exceeds [`GATEWAY_CLIENT_BODY_CAP_BYTES`]. ASCII-pinned (no
+/// multi-byte characters) so golden-file consumers never see an encoding
+/// surprise at the cut.
+pub const GATEWAY_CLIENT_BODY_TRUNCATION_MARKER: &str = "... [truncated]";
+
+/// The ONE construction site for a capped api-call body: returns `body`
+/// verbatim when it fits [`GATEWAY_CLIENT_BODY_CAP_BYTES`], otherwise its
+/// first cap bytes (on a UTF-8 char boundary) plus
+/// [`GATEWAY_CLIENT_BODY_TRUNCATION_MARKER`]. The variant always carries
+/// its final form — construction cannot forget the cap.
+pub fn truncate_api_body(body: &str) -> String {
+    if body.len() <= GATEWAY_CLIENT_BODY_CAP_BYTES {
+        return body.to_string();
+    }
+    let mut end = GATEWAY_CLIENT_BODY_CAP_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = body[..end].to_string();
+    truncated.push_str(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER);
+    truncated
+}
 
 /// Every failure `ign` can report. One variant per contract class; `code()`,
 /// `exit_code()`, `hint()` are total functions over it.
@@ -441,6 +473,28 @@ pub enum CoreError {
     /// command is fine).
     #[error("ignition-lint is not installed (no executable found on PATH)")]
     LintToolAbsent,
+
+    /// The gateway answered the api call with a 4xx this CLI does not
+    /// curate — the caller's request is the problem, and the body is
+    /// theirs to read. Exit 2 (usage class; additive slug — the
+    /// poll_interval_too_small precedent: same class, own slug, no new
+    /// exit code). Constructed ONLY by the api-call-scoped classify arm
+    /// (09-01: the `api_call` parameter) — a curated command's 4xx keeps
+    /// its existing classification (the catch-all cannot fire without
+    /// the parameter). The body is the gateway's answer VERBATIM,
+    /// truncated at [`GATEWAY_CLIENT_BODY_CAP_BYTES`] with the explicit
+    /// [`GATEWAY_CLIENT_BODY_TRUNCATION_MARKER`] via [`truncate_api_body`]
+    /// at construction.
+    #[error("gateway rejected the api call (HTTP {status} from {endpoint}): {body}")]
+    GatewayClientError {
+        /// HTTP status the gateway answered with.
+        status: u16,
+        /// Full URL of the rejected request.
+        endpoint: String,
+        /// The response body VERBATIM, truncated at
+        /// [`GATEWAY_CLIENT_BODY_CAP_BYTES`] with an explicit marker.
+        body: String,
+    },
 }
 
 impl CoreError {
@@ -481,6 +535,7 @@ impl CoreError {
             Self::EamTaskInFlight { .. } => "eam_task_in_flight",
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
             Self::LintToolAbsent => "lint_tool_absent",
+            Self::GatewayClientError { .. } => "gateway_client_error",
         }
     }
 
@@ -490,7 +545,8 @@ impl CoreError {
             Self::Internal(_) => 1,
             Self::ConfirmationRequired { .. }
             | Self::InvalidImportFile { .. }
-            | Self::InvalidInput { .. } => 2,
+            | Self::InvalidInput { .. }
+            | Self::GatewayClientError { .. } => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -744,6 +800,12 @@ impl CoreError {
                  ignition-lint on PATH"
                     .to_string(),
             ),
+            Self::GatewayClientError { .. } => Some(
+                "the gateway rejected this request — the body above is the \
+                 gateway's own answer; fix the path/method/body, or use a \
+                 curated `ign` command when one exists"
+                    .to_string(),
+            ),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -837,7 +899,10 @@ pub struct ErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreError, ErrorBody, ErrorEnvelope};
+    use super::{
+        CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
+        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, truncate_api_body,
+    };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
     /// an unroutable loopback port fails at connect time (instant refusal —
@@ -1095,6 +1160,15 @@ mod tests {
                 "script_exec_not_configured",
             ),
             (CoreError::LintToolAbsent, 6, "lint_tool_absent"),
+            (
+                CoreError::GatewayClientError {
+                    status: 400,
+                    endpoint: "http://gw:8088/data/api/v1/nonexistent".into(),
+                    body: r#"{"error":{"code":"NOT_FOUND"}}"#.into(),
+                },
+                2,
+                "gateway_client_error",
+            ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
         ];
         for (err, code, slug) in cases {
@@ -1116,6 +1190,7 @@ mod tests {
         (2, "confirmation_required"),
         (2, "invalid_import_file"),
         (2, "invalid_input"),
+        (2, "gateway_client_error"),
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
@@ -1505,5 +1580,48 @@ mod tests {
         let no_request = CoreError::NoActiveProfile;
         let body: &ErrorBody = &no_request.envelope(None).error;
         assert_eq!(body.endpoint, None);
+    }
+
+    /// The api-call body cap (09-01): a body at or under
+    /// [`GATEWAY_CLIENT_BODY_CAP_BYTES`] rides verbatim (no marker); a
+    /// larger body is truncated to the cap on a UTF-8 char boundary with
+    /// the exact ASCII marker appended — and the cap is enforced at
+    /// CONSTRUCTION, so the variant always carries its final form.
+    #[test]
+    fn truncates_at_cap_with_marker() {
+        // Under the cap: byte-identical passthrough.
+        let short = r#"{"error":{"code":"NOT_FOUND"}}"#;
+        assert_eq!(truncate_api_body(short), short);
+        assert!(!short.contains(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER));
+
+        // Exactly at the cap: still verbatim (the marker only joins an
+        // OVER-cap body — the boundary is <=, not <).
+        let exact = "x".repeat(GATEWAY_CLIENT_BODY_CAP_BYTES);
+        assert_eq!(truncate_api_body(&exact), exact);
+
+        // One byte over: truncated, marker appended, total size bounded.
+        let over = "x".repeat(GATEWAY_CLIENT_BODY_CAP_BYTES + 1);
+        let truncated = truncate_api_body(&over);
+        assert!(
+            truncated.ends_with(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER),
+            "truncated body must end with the explicit marker"
+        );
+        assert!(
+            truncated.len()
+                <= GATEWAY_CLIENT_BODY_CAP_BYTES + GATEWAY_CLIENT_BODY_TRUNCATION_MARKER.len(),
+            "truncated body must stay within cap + marker: {}",
+            truncated.len()
+        );
+
+        // A multi-byte character straddling the cap boundary does not
+        // panic (the cut backs up to a char boundary) and still carries
+        // the marker.
+        let multibyte = "é".repeat(GATEWAY_CLIENT_BODY_CAP_BYTES); // 2 bytes each
+        let truncated = truncate_api_body(&multibyte);
+        assert!(truncated.ends_with(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER));
+        assert!(
+            truncated
+                .is_char_boundary(truncated.len() - GATEWAY_CLIENT_BODY_TRUNCATION_MARKER.len())
+        );
     }
 }

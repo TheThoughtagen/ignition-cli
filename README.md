@@ -40,7 +40,7 @@ output directly, so it is never JSON-wrapped.
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, an invalid import file, or an unreadable command input | `confirmation_required`, `invalid_import_file`, `invalid_input`
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, an invalid import file, an unreadable command input, or a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim) | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9)
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
