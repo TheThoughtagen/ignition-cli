@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 9 of 14 (09-agent-surface-api-diagnostics)
-**Current Plan:** 3
+**Current Plan:** 4
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-07
 
-**Progress:** [█████████░] 92%
+**Progress:** [█████████░] 94%
 
 ## Performance Metrics
 
@@ -42,6 +42,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 08 P05 | 194 min | 3 tasks | 6 files |
 | Phase 09 P02 | 62 min | 2 tasks | 2 files |
 | Phase 09 P01 | 210min | 2 tasks | 5 files |
+| Phase 09 P03 | 175min | 3 tasks | 20 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,10 @@ Recent decisions affecting current work:
 - [Phase 09]: 8.3 headless commissioning rides the commissioner wire API (bootstrap -> eula-accept -> start-gateway); 8.3 image entrypoint ignores ACCEPT_EULA/GATEWAY_ADMIN_PASSWORD — Env vars are 8.1-era; wire recipe extracted from commissioner.js and replayed with curl on both rigs
 - [Phase 09]: GatewayClientError rides exit 2 with slug gateway_client_error carrying the verbatim 4 KiB-capped gateway body — additive-slug on the frozen taxonomy, Three-Place rule landed atomically (README row + both CI agreement tests)
 - [Phase 09]: The api-call catch-all is parameter-scoped (api_call: bool on classify, set only by pub send_and_classify_for_api) — curated pipeline 4xx/exit-1 semantics provably unchanged via pinned non-leak regression
+- [Phase 09]: Gateway-verbatim = RawValue passthrough: capture text, from_string validates + embeds in ONE call (no parse-re-serialize); non-JSON 2xx is the honest exit-1 refusal naming the download pipelines
+- [Phase 09]: api-call guards run PRE-resolve (auth-pattern header refusal + path validation: exit 2, envelope profile null, ZERO requests — binary-pinned against a bare mock) and the action re-checks for in-process callers
+- [Phase 09]: api call maps OutOfBand in routes.rs (raw passthrough is not a cockpit verb — the envelope IS the product, completions genre); pinned OutOfBand set extended to [completions, api call] in the same task as the clap command
+- [Phase 09]: User-supplied --header strings validated via HeaderName/HeaderValue::from_bytes before reqwest (whose .header() panics) — bad headers refuse exit 2, never crash; host-shaped --path check precedes the slash check (protocol-relative // refused explicitly)
 
 ### Pending Todos
 
@@ -85,5 +90,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-07T05:17:30.281Z
+**Last session:** 2026-09-07T08:17:28.368Z
 **Resume file:** None
