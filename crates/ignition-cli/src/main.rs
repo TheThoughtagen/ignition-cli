@@ -35,13 +35,13 @@ use ignition_core::session::Session;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    ApiArgs, ApiCommand, BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand,
-    EamTaskCommand, GanArgs, GanCommand, LicenseArgs, LicenseCommand, LintArgs, LogLevel,
-    LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
-    RedundancyArgs, RedundancyCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand,
-    ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand,
-    TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand,
-    TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    ApiArgs, ApiCommand, BackupArgs, BackupCommand, BundleCommand, Cli, Commands, DiagnosticsArgs,
+    DiagnosticsCommand, EamArgs, EamCommand, EamTaskCommand, GanArgs, GanCommand, LicenseArgs,
+    LicenseCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd,
+    ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs, ResourceCommand,
+    RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd,
+    TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
+    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -193,6 +193,18 @@ enum ActionOutput {
     RedundancyStatus(actions::redundancy::RedundancyStatusResult),
     /// `ign gan status` — the 5-field GAN overview (09-04).
     GanStatus(actions::gan::GanStatusResult),
+    /// `ign diagnostics bundle generate` — the fresh status wire
+    /// (09-05, EXT-02; the 200 body IS the status).
+    BundleGenerate(actions::diagnostics::BundleStatusWire),
+    /// `ign diagnostics bundle status` — the captured-vocabulary
+    /// status read.
+    BundleStatus(actions::diagnostics::BundleStatusWire),
+    /// `ign diagnostics bundle wait` — the terminal status wire
+    /// (poll engine semantics).
+    BundleWait(actions::diagnostics::BundleStatusWire),
+    /// `ign diagnostics bundle download` — file + bytes + content
+    /// type.
+    BundleDownload(actions::diagnostics::BundleDownloadResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -328,6 +340,10 @@ impl ActionOutput {
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
             ActionOutput::GanStatus(result) => render_success(profile, result, compact),
+            ActionOutput::BundleGenerate(result) => render_success(profile, result, compact),
+            ActionOutput::BundleStatus(result) => render_success(profile, result, compact),
+            ActionOutput::BundleWait(result) => render_success(profile, result, compact),
+            ActionOutput::BundleDownload(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -2070,6 +2086,64 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (Some(name), result)
             }
             Err(err) => (error_profile(&err), Err(err)),
+        },
+        // The diagnostics-bundle family (09-05, EXT-02): the same
+        // Session::resolve shape as the morning-check reads (all
+        // authed /data routes — exit 3 without a credential).
+        // generate/status/download are one-shot; wait rides the poll
+        // engine (deadline → exit 4 network_error, no new slug).
+        // Nothing here is destructive — no --yes guard (the
+        // backup-download posture).
+        Commands::Diagnostics(DiagnosticsArgs {
+            command: DiagnosticsCommand::Bundle(command),
+        }) => match command {
+            BundleCommand::Generate => match Session::resolve(cli.profile.as_deref()) {
+                Ok(session) => {
+                    let name = session.profile_name().to_string();
+                    let result = actions::diagnostics::bundle_generate(&*session)
+                        .await
+                        .map(ActionOutput::BundleGenerate);
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            },
+            BundleCommand::Status => match Session::resolve(cli.profile.as_deref()) {
+                Ok(session) => {
+                    let name = session.profile_name().to_string();
+                    let result = actions::diagnostics::bundle_status(&*session)
+                        .await
+                        .map(ActionOutput::BundleStatus);
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            },
+            BundleCommand::Download { output } => match Session::resolve(cli.profile.as_deref()) {
+                Ok(session) => {
+                    let name = session.profile_name().to_string();
+                    let result =
+                        actions::diagnostics::bundle_download(&*session, output.as_deref())
+                            .await
+                            .map(ActionOutput::BundleDownload);
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            },
+            BundleCommand::Wait { interval, timeout } => {
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::diagnostics::bundle_wait(
+                            &*session,
+                            std::time::Duration::from_secs(interval),
+                            std::time::Duration::from_secs(timeout),
+                        )
+                        .await
+                        .map(ActionOutput::BundleWait);
+                        (Some(name), result)
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
         },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {

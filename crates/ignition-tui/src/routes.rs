@@ -84,6 +84,27 @@ pub fn routes() -> &'static [CliRoute] {
             path: "gan status",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 09-05: the diagnostics-bundle family (EXT-02) — four
+        // Dashboard rows (decision 3: no new screen this phase; the
+        // verbs are gateway-support actions hosted beside
+        // backup/restart). Rows land in the SAME task as their clap
+        // commands (Pitfall 5: a command family is atomic).
+        CliRoute {
+            path: "diagnostics bundle generate",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "diagnostics bundle status",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "diagnostics bundle download",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "diagnostics bundle wait",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // 06-02: the dashboard's read panels + its actions-menu verbs.
         // `sessions` is the BARE form (SessionsArgs.command is Option —
         // bare `ign sessions` IS the list action; there is no
@@ -684,6 +705,40 @@ mod tests {
             assert_eq!(
                 count, expected_count,
                 "exactly the {prefix} leaves that exist"
+            );
+        }
+    }
+
+    /// The 09-05 diagnostics-bundle rows cover the FULL
+    /// BundleCommand tree exactly as clap spells it (there is no bare
+    /// `diagnostics`/`diagnostics bundle` row — both levels require
+    /// their subcommand, the `rig trial` shape), all on the Dashboard
+    /// (decision 3: no new screen this phase).
+    #[test]
+    fn diagnostics_rows_cover_the_bundle_family() {
+        let rows: Vec<&super::CliRoute> = routes()
+            .iter()
+            .filter(|route| route.path.starts_with("diagnostics"))
+            .collect();
+        let expected = [
+            "diagnostics bundle generate",
+            "diagnostics bundle status",
+            "diagnostics bundle download",
+            "diagnostics bundle wait",
+        ];
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "exactly the bundle leaves that exist: {rows:?}"
+        );
+        for path in expected {
+            let row = rows
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("diagnostics route row {path:?} missing"));
+            assert!(
+                matches!(row.mapping, super::Mapping::Screen(s) if s == Screen::Dashboard),
+                "{path} maps to the Dashboard screen"
             );
         }
     }

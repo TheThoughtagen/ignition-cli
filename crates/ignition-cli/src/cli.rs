@@ -191,6 +191,11 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Gan(GanArgs),
 
+    /// Diagnostics support-bundle operations: generate, check
+    /// status, download (streamed), wait — the support-bundle slice
+    #[command(arg_required_else_help = true)]
+    Diagnostics(DiagnosticsArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -1234,6 +1239,64 @@ pub enum GanCommand {
     /// rates, remote gateways — all zeros are healthy data on a
     /// non-GAN gateway (the capture IS the canonical shape)
     Status,
+}
+
+/// `ign diagnostics` args (09-05, EXT-02) — the support-bundle
+/// family: `bundle` nests one level (the `tags provider` grouped-
+/// subfamily pattern).
+#[derive(Debug, clap::Args)]
+pub struct DiagnosticsArgs {
+    #[command(subcommand)]
+    pub command: DiagnosticsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnosticsCommand {
+    /// Support-bundle operations (generate / status / download /
+    /// wait) — the state machine is ENCODED FROM LIVE CAPTURES:
+    /// observed states are exactly `Generating` (mid-generation) and
+    /// `Valid` (terminal/ready), PascalCase, both rigs
+    #[command(subcommand)]
+    Bundle(BundleCommand),
+}
+
+/// The four bundle verbs (09-05). Nothing here is destructive:
+/// generate creates a support bundle, download writes a local file,
+/// wait polls — none carry `--yes` (the backup-download posture).
+#[derive(Debug, Subcommand)]
+pub enum BundleCommand {
+    /// Start bundle generation (POST, no body) — the 200 answer IS
+    /// the fresh status (live capture: `{"state":"Generating"}`);
+    /// generation takes ~2–6 s on a fresh rig, so pair with `wait`
+    Generate,
+    /// The bundle status: `state` rides the CAPTURED vocabulary
+    /// (`Generating` / `Valid` — unknown future states pass through
+    /// verbatim, never refused); `fileSize` (bytes) appears only
+    /// when `Valid`
+    Status,
+    /// Download the bundle ZIP (streamed to disk; the request rides
+    /// a 300 s per-request timeout — the 30 s client default would
+    /// truncate MB-sized bundles)
+    Download {
+        /// Output file (default: the gateway's Content-Disposition
+        /// name, else ignition-diagnostics-bundle-<unix_ts>.zip)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Poll the status until a terminal captured state (`Valid`)
+    /// — an UNKNOWN state (outside the captured vocabulary) keeps
+    /// polling honestly until the deadline; deadline expiry is
+    /// exit 4 `network_error` (the restart-wait convention, no new
+    /// slug) with the last observed state in the message
+    Wait {
+        /// Poll interval in seconds
+        #[arg(long, default_value_t = 2, value_name = "SECS")]
+        interval: u64,
+        /// Give up after this many seconds (default 300 — mirrors
+        /// restart --wait)
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

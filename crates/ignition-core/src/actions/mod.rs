@@ -7,6 +7,7 @@
 pub mod apicall;
 pub mod backup;
 pub mod connections;
+pub mod diagnostics;
 pub mod doctor;
 pub mod eam;
 pub mod gan;

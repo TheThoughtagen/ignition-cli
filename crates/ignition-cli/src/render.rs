@@ -17,6 +17,7 @@
 use ignition_core::actions::apicall::ApiCallOutcome;
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
+use ignition_core::actions::diagnostics::{BundleDownloadResult, BundleStatusWire};
 use ignition_core::actions::eam::{
     EamHistoryResult, EamTaskCreateResult, EamTaskDetailResult, EamTaskForceResult, EamTasksResult,
 };
@@ -245,6 +246,12 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
         ActionOutput::GanStatus(result) => render_gan_status_human(result),
+        ActionOutput::BundleGenerate(result) => {
+            render_bundle_status_line("generation started", result)
+        }
+        ActionOutput::BundleStatus(result) => render_bundle_status_line("status", result),
+        ActionOutput::BundleWait(result) => render_bundle_status_line("wait complete", result),
+        ActionOutput::BundleDownload(result) => render_bundle_download_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -1159,6 +1166,23 @@ fn render_gan_status_human(result: &GanStatusResult) {
         "byte rate in {:.0} B/s  out {:.0} B/s",
         gan.incoming_byte_rate, gan.outgoing_byte_rate
     );
+}
+
+/// `ign diagnostics bundle generate|status|wait` human shape (09-05):
+/// ONE status line carrying the CAPTURED vocabulary verbatim plus the
+/// byte size when `Valid` (absent while generating — the key is
+/// missing on the wire, not zero).
+fn render_bundle_status_line(verb: &str, wire: &BundleStatusWire) {
+    match wire.file_size {
+        Some(bytes) => println!("bundle {verb}: {} ({bytes} bytes)", wire.state),
+        None => println!("bundle {verb}: {}", wire.state),
+    }
+}
+
+/// `ign diagnostics bundle download` human shape (09-05) — the
+/// logs-download line: file + bytes.
+fn render_bundle_download_human(result: &BundleDownloadResult) {
+    println!("wrote {} ({} bytes)", result.file, result.bytes);
 }
 
 /// `ign eam tasks <NAME>` human shape — the definition pretty-printed
