@@ -36,11 +36,12 @@ use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
     ApiArgs, ApiCommand, BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand,
-    EamTaskCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd,
-    ProjectArgs, ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode,
-    ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand,
-    TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd,
-    WebdevArgs, WebdevCommand,
+    EamTaskCommand, GanArgs, GanCommand, LicenseArgs, LicenseCommand, LintArgs, LogLevel,
+    LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
+    RedundancyArgs, RedundancyCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand,
+    ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand,
+    TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand,
+    TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -185,6 +186,13 @@ enum ActionOutput {
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
     ApiCall(actions::apicall::ApiCallOutcome),
+    /// `ign license status` — the inventory + trial-companion merge
+    /// (09-04, EXT-02; the morning-check read).
+    LicenseStatus(actions::license::LicenseStatusResult),
+    /// `ign redundancy status` — the flat capture-shaped read (09-04).
+    RedundancyStatus(actions::redundancy::RedundancyStatusResult),
+    /// `ign gan status` — the 5-field GAN overview (09-04).
+    GanStatus(actions::gan::GanStatusResult),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -317,6 +325,9 @@ impl ActionOutput {
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
+            ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
+            ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
+            ActionOutput::GanStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -2019,6 +2030,47 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 Err(err) => (error_profile(&err), Err(err)),
             }
         }
+        // The three curated morning-check reads (09-04, EXT-02):
+        // `Session::resolve` (the Phase-8 seam — NO second
+        // construction path) → the action, one command per read. All
+        // authed (/data routes under 8.3 default security — exit 3
+        // without a credential, the inspection-command rule).
+        Commands::License(LicenseArgs {
+            command: LicenseCommand::Status,
+        }) => match Session::resolve(cli.profile.as_deref()) {
+            Ok(session) => {
+                let name = session.profile_name().to_string();
+                let result = actions::license::license_status(&*session)
+                    .await
+                    .map(ActionOutput::LicenseStatus);
+                (Some(name), result)
+            }
+            Err(err) => (error_profile(&err), Err(err)),
+        },
+        Commands::Redundancy(RedundancyArgs {
+            command: RedundancyCommand::Status,
+        }) => match Session::resolve(cli.profile.as_deref()) {
+            Ok(session) => {
+                let name = session.profile_name().to_string();
+                let result = actions::redundancy::redundancy_status(&*session)
+                    .await
+                    .map(ActionOutput::RedundancyStatus);
+                (Some(name), result)
+            }
+            Err(err) => (error_profile(&err), Err(err)),
+        },
+        Commands::Gan(GanArgs {
+            command: GanCommand::Status,
+        }) => match Session::resolve(cli.profile.as_deref()) {
+            Ok(session) => {
+                let name = session.profile_name().to_string();
+                let result = actions::gan::gan_status(&*session)
+                    .await
+                    .map(ActionOutput::GanStatus);
+                (Some(name), result)
+            }
+            Err(err) => (error_profile(&err), Err(err)),
+        },
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {

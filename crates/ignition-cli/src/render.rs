@@ -20,7 +20,9 @@ use ignition_core::actions::connections::ConnectionsResult;
 use ignition_core::actions::eam::{
     EamHistoryResult, EamTaskCreateResult, EamTaskDetailResult, EamTaskForceResult, EamTasksResult,
 };
+use ignition_core::actions::gan::GanStatusResult;
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
+use ignition_core::actions::license::LicenseStatusResult;
 use ignition_core::actions::lint::LintResult;
 use ignition_core::actions::logs::{
     DownloadResult, LogPage, ResetResult, SetLevelResult, TailResult,
@@ -29,6 +31,7 @@ use ignition_core::actions::projects::{
     ExportDecodedResult, ExportResult, ImportResult, ProjectCopyResult, ProjectDeleteResult,
     ProjectDiffResult, ProjectRenameResult, ProjectSetResult, ProjectSyncResult, ProjectsResult,
 };
+use ignition_core::actions::redundancy::RedundancyStatusResult;
 use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
 };
@@ -239,6 +242,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
+        ActionOutput::LicenseStatus(result) => render_license_status_human(result),
+        ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
+        ActionOutput::GanStatus(result) => render_gan_status_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -1055,6 +1061,104 @@ fn render_api_call_human(result: &ApiCallOutcome) {
         // raw text rather than hiding the answer.
         Err(_) => println!("{raw}"),
     }
+}
+
+/// `ign license status` human shape (09-04): the trial
+/// mode/countdown line (the mode lives on the trial companion —
+/// capture fact), then per-hardware-key item rows
+/// (`name  title  version`).
+fn render_license_status_human(result: &LicenseStatusResult) {
+    let trial = &result.trial;
+    let countdown = if trial.expired {
+        "expired".to_string()
+    } else {
+        format!(
+            "{} remaining",
+            humanize_duration_ms(trial.trial_seconds_left * 1000)
+        )
+    };
+    println!("license: {}, {}", trial.license_mode, countdown);
+
+    let license = &result.license;
+    if license.hardware.is_empty() {
+        println!("hardware: (no entries)");
+    }
+    for entry in &license.hardware {
+        let key = entry.key.as_deref().unwrap_or("-");
+        println!("{key}: {} item(s)", entry.items.len());
+        for item in &entry.items {
+            println!(
+                "  {}  {}  {}",
+                item.name.as_deref().unwrap_or("-"),
+                item.title.as_deref().unwrap_or("-"),
+                item.version.as_deref().unwrap_or("-"),
+            );
+        }
+    }
+}
+
+/// `ign redundancy status` human shape (09-04): role/peer/
+/// project-state/sync rows, then uptime + last-sync with the units
+/// AS CAPTURED (uptime = ms since gateway start, wall-clock-proven;
+/// lastSyncTimestamp = the -1 never-synced sentinel on fresh rigs —
+/// a non-negative value reads epoch-ms flagged as inference, never
+/// presented as proven).
+fn render_redundancy_status_human(result: &RedundancyStatusResult) {
+    let status = &result.status;
+    println!("role: {}", status.role);
+    if let Some(state) = &status.project_state {
+        println!("project state: {state}");
+    }
+    if let Some(level) = &status.activity_level {
+        println!("activity: {level}");
+    }
+    match &status.peer_id {
+        Some(peer) => println!(
+            "peer: {} ({})",
+            peer,
+            if status.peer_connected {
+                "connected"
+            } else {
+                "disconnected"
+            }
+        ),
+        None => println!("peer: none"),
+    }
+    println!(
+        "config access: {}  sync pending: {}  failover pending: {}",
+        if status.has_config_access {
+            "yes"
+        } else {
+            "no"
+        },
+        status.sync_pending,
+        status.failover_pending
+    );
+    if let Some(uptime) = status.uptime {
+        println!(
+            "uptime: {} (ms since gateway start)",
+            humanize_duration_ms(uptime)
+        );
+    }
+    match status.last_sync_epoch_ms() {
+        Some(ms) => println!("last sync: {ms} epoch-ms (unit inferred, not capture-proven)"),
+        None => println!("last sync: never (-1 sentinel)"),
+    }
+}
+
+/// `ign gan status` human shape (09-04): connections + remote
+/// gateways, then the in/out byte rates (the fresh-rig capture is the
+/// zero-connection canonical shape — zeros are healthy data).
+fn render_gan_status_human(result: &GanStatusResult) {
+    let gan = &result.status;
+    println!(
+        "connections: {}/{} running  remote gateways: {}",
+        gan.running_connections, gan.total_connections, gan.remote_gateways
+    );
+    println!(
+        "byte rate in {:.0} B/s  out {:.0} B/s",
+        gan.incoming_byte_rate, gan.outgoing_byte_rate
+    );
 }
 
 /// `ign eam tasks <NAME>` human shape — the definition pretty-printed

@@ -66,6 +66,24 @@ pub fn routes() -> &'static [CliRoute] {
             path: "api call",
             mapping: Mapping::OutOfBand,
         },
+        // 09-04: the three curated morning-check reads (EXT-02) —
+        // Dashboard rows because they ARE morning-check verbs
+        // (dashboard-shaped, like `status`/`doctor`; decision 3 kept
+        // the TUI scope small — no new Diagnostics screen this
+        // phase). Rows land in the SAME task as their clap commands
+        // (Pitfall 5: a command family is atomic).
+        CliRoute {
+            path: "license status",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "redundancy status",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "gan status",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // 06-02: the dashboard's read panels + its actions-menu verbs.
         // `sessions` is the BARE form (SessionsArgs.command is Option —
         // bare `ign sessions` IS the list action; there is no

@@ -178,6 +178,19 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Api(ApiArgs),
 
+    /// License inventory + trial state — the morning-check read
+    /// (trial companion merged into one command)
+    #[command(arg_required_else_help = true)]
+    License(LicenseArgs),
+
+    /// Gateway redundancy status — the morning-check read
+    #[command(arg_required_else_help = true)]
+    Redundancy(RedundancyArgs),
+
+    /// Gateway Area Network (GAN) overview — the morning-check read
+    #[command(arg_required_else_help = true)]
+    Gan(GanArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -1170,6 +1183,57 @@ pub struct ApiCallArgs {
     /// ONE query mechanism)
     #[arg(long, value_name = "K=V")]
     pub query: Vec<String>,
+}
+
+/// `ign license` args (09-04, EXT-02) — the license morning-check
+/// family. One verb today; room to grow (the uniform-leaf shape).
+#[derive(Debug, clap::Args)]
+pub struct LicenseArgs {
+    #[command(subcommand)]
+    pub command: LicenseCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LicenseCommand {
+    /// License inventory + trial state in ONE command: the
+    /// hardware-key item rows and effective stamp ride the
+    /// `/licenses` read, the license mode + countdown ride the trial
+    /// companion (the mode is NOT on the licenses payload — capture
+    /// fact)
+    Status,
+}
+
+/// `ign redundancy` args (09-04, EXT-02) — the redundancy
+/// morning-check family.
+#[derive(Debug, clap::Args)]
+pub struct RedundancyArgs {
+    #[command(subcommand)]
+    pub command: RedundancyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RedundancyCommand {
+    /// The flat redundancy status: role, project state, peer
+    /// connection, config access, sync/failover pending, uptime
+    /// (ms since gateway start — capture-proven) and last-sync (the
+    /// `-1` never-synced sentinel on fresh rigs)
+    Status,
+}
+
+/// `ign gan` args (09-04, EXT-02) — the Gateway Area Network
+/// morning-check family.
+#[derive(Debug, clap::Args)]
+pub struct GanArgs {
+    #[command(subcommand)]
+    pub command: GanCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GanCommand {
+    /// The GAN overview: total/running connections, in/out byte
+    /// rates, remote gateways — all zeros are healthy data on a
+    /// non-GAN gateway (the capture IS the canonical shape)
+    Status,
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand
