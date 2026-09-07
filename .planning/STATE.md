@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 8: 08-foundations-session-core-config-contract
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9: 09-agent-surface-api-diagnostics
 
 ## Current Position
 
-**Phase:** 8 of 14 (08-foundations-session-core-config-contract) — first of 7 v1.1 phases
-**Current Plan:** 6
+**Phase:** 9 of 14 (09-agent-surface-api-diagnostics)
+**Current Plan:** 2
 **Total Plans in Phase:** 6
-**Status:** Phase complete — ready for verification
-**Last Activity:** 2026-09-06
+**Status:** In progress — 09-01 next (09-02 captured the wire truth it depends on)
+**Last Activity:** 2026-09-07
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 91%
 
 ## Performance Metrics
 
 **v1.0 baseline (for comparison):** 41 plans, 118 tasks, 9 days (2026-08-20 → 2026-08-29); avg ~38 min/plan; slowest plans were live-gate/WebDev phases (P03-P04 of Phase 5 at ~400+ min).
 
-**v1.1 velocity:** No plans executed yet.
+**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 P02 done (62 min) — P01 pending, then P03-P06.
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
@@ -40,6 +40,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 08 P04 | 128 min | 2 tasks | 3 files |
 | Phase 08 P06 | 189 min | 3 tasks | 5 files |
 | Phase 08 P05 | 194 min | 3 tasks | 6 files |
+| Phase 09 P02 | 62 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -65,6 +66,10 @@ Recent decisions affecting current work:
 - [Phase 08]: stdout purity harness is assert-based byte-exact over the real binary (NOT snapbox goldens) so SNAPSHOTS=overwrite cannot sanitize a leaked byte; ambient IGNITION_* env knobs stripped for determinism — single stray stdout byte under max diagnostics must fail CI, never be rewritten
 - [Phase 08]: Plan 08-05: ResolvedContext struct replaces the positional (String, String, Arc) triple from resolve/rebuild — poll_interval rides a typed field so the profile-switch chain cannot silently drop it (the update.rs:545-587 trap)
 - [Phase 08]: Plan 08-05: 5s poll default has ONE source (workers::refresh::REFRESH_PERIOD, imported by context.rs); only the dashboard refresh worker is parameterized — WATCH/ALARMS/TAIL periods + TICK parked for Phase 12; CI pins plumbing assertions (Duration values per hop), wall-clock cadence is checkpoint-only
+- [Phase 09]: Bundle states captured PascalCase: Generating->Valid; BUNDLE_GENERATING_STATES=["Generating"]; unobserved states must passthrough — Live capture on both rigs; lowercase guesses would have shipped wrong (Pitfall 2)
+- [Phase 09]: Units locked from captures: uptime=ms-since-gateway-start (wall-clock proven twice); lastSyncTimestamp=-1 never-synced sentinel (unit not capture-proven, model Option, ms flagged inference); fileSize=bytes, key absent until Valid — Magnitude cross-checks against wall clock; -1 sentinel rules out epoch units on fresh rigs
+- [Phase 09]: Live 4xx partition: 404+HTML=unknown path, 404+EMPTY=wrong method on real path (NOT 405), 401+HTML=bad auth — DELETE /gateway-info answered 404-empty on both rigs - the plan's 405 hypothesis falsified by capture; evidence for 09-06 gates
+- [Phase 09]: 8.3 headless commissioning rides the commissioner wire API (bootstrap -> eula-accept -> start-gateway); 8.3 image entrypoint ignores ACCEPT_EULA/GATEWAY_ADMIN_PASSWORD — Env vars are 8.1-era; wire recipe extracted from commissioner.js and replayed with curl on both rigs
 
 ### Pending Todos
 
@@ -77,5 +82,5 @@ None.
 
 ## Session Continuity
 
-**Last session:** 2026-09-06T22:41:07.453Z
+**Last session:** 2026-09-07T02:52:19.037Z
 **Resume file:** None
