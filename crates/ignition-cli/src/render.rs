@@ -14,6 +14,7 @@
 //! modes are untouched — the envelope's top-level `profile` field is their
 //! mechanism.
 
+use ignition_core::actions::apicall::ApiCallOutcome;
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
 use ignition_core::actions::eam::{
@@ -237,6 +238,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskForce(result) => render_eam_task_force_human(result),
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
+        ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::RigTrialStatus(result) => render_trial_status_human(result),
         ActionOutput::RigTrialReset(result) => render_trial_reset_human(result),
         ActionOutput::WebdevDeploy(result) => render_webdev_deploy_human(result),
@@ -1029,6 +1031,30 @@ fn render_script_run_human(result: &ScriptRunResult) {
     }
     println!("result: {}", result.result);
     println!("elapsed: {} ms", result.elapsed_ms);
+}
+
+/// `ign api call` human shape: one verdict line, then the body — the
+/// body IS the answer (a table is meaningless for arbitrary gateway
+/// shapes), so it prints pretty-printed. Display-only prettifying:
+/// the JSON envelope's `data.result.data` stays gateway-verbatim
+/// (RawValue passthrough — the README's documented contract
+/// exception); a body that somehow fails to re-parse prints verbatim.
+fn render_api_call_human(result: &ApiCallOutcome) {
+    println!(
+        "api call → {} {} (HTTP {})",
+        result.method, result.path, result.result.status
+    );
+    let raw = result.result.data.get();
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => match serde_json::to_string_pretty(&value) {
+            Ok(pretty) => println!("{pretty}"),
+            Err(_) => println!("{raw}"),
+        },
+        // Unreachable by construction (RawValue::from_string already
+        // validated the JSON at the client boundary) — degrade to the
+        // raw text rather than hiding the answer.
+        Err(_) => println!("{raw}"),
+    }
 }
 
 /// `ign eam tasks <NAME>` human shape — the definition pretty-printed

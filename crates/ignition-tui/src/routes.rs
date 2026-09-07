@@ -26,7 +26,8 @@ pub enum Mapping {
     /// their own protocols on stdout; `edit` is an editor round-trip, not a
     /// cockpit verb. Their rows land TOGETHER with their clap commands
     /// (adding them earlier would be orphan rows and fail the clap walk by
-    /// design). Until then the OutOfBand set is exactly `["completions"]`.
+    /// design). 09-03 added `api call`: raw passthrough is not a cockpit
+    /// verb — the envelope IS the product (completions genre).
     OutOfBand,
 }
 
@@ -49,6 +50,20 @@ pub fn routes() -> &'static [CliRoute] {
         },
         CliRoute {
             path: "completions",
+            mapping: Mapping::OutOfBand,
+        },
+        // 09-03: `ign api call` (EXT-01) — OutOfBand with written
+        // justification: raw passthrough to arbitrary gateway REST
+        // endpoints is NOT a cockpit verb — there is no screenable
+        // surface for an arbitrary method/path/body, and the envelope
+        // (gateway-verbatim data in, gateway-verbatim error bodies
+        // out) IS the product. Same genre as `completions`: the CLI
+        // talks to a consumer, not to a human at a dashboard. The
+        // pinned OutOfBand test in ignition-cli's tui_coverage.rs was
+        // extended to exactly [completions, api call] in the same
+        // task (row + clap command land together — Pitfall 5).
+        CliRoute {
+            path: "api call",
             mapping: Mapping::OutOfBand,
         },
         // 06-02: the dashboard's read panels + its actions-menu verbs.
@@ -332,8 +347,9 @@ pub fn routes() -> &'static [CliRoute] {
         // `logs -f` NDJSON (a FLAG on the Screen-mapped `logs` leaf)
         // and `tags export -o -` (a FLAG VALUE on the Screen-mapped
         // `tags export` leaf) — are NOT distinct leaves and carry no
-        // rows; the leaf-representable exception is `completions`
-        // ONLY (the coverage test's OutOfBand sanity pin).
+        // rows; the leaf-representable exceptions are `completions`
+        // and, since 09-03, `api call` (the pinned OutOfBand test
+        // carries both).
         //
         // Reserved OutOfBand slugs (08-06): `mcp`, `lsp`, and `edit` are
         // PRE-DECLARED for Phases 13/14 — MCP stdio and LSP speak their

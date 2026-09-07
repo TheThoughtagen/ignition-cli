@@ -35,12 +35,12 @@ use ignition_core::session::Session;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand, EamTaskCommand, LintArgs,
-    LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand,
-    ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand,
-    SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
-    TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
-    WebdevCommand,
+    ApiArgs, ApiCommand, BackupArgs, BackupCommand, Cli, Commands, EamArgs, EamCommand,
+    EamTaskCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd,
+    ProjectArgs, ProjectCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode,
+    ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand,
+    TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd,
+    WebdevArgs, WebdevCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -181,6 +181,10 @@ enum ActionOutput {
     /// parsed report as data (`--strict`'s passthrough is decided
     /// in `main` AFTER the envelope renders).
     Lint(actions::lint::LintResult),
+    /// `ign api call` — the raw passthrough's outcome: method/path
+    /// echo plus the gateway's verbatim answer (status + RawValue
+    /// body; the README's documented contract exception).
+    ApiCall(actions::apicall::ApiCallOutcome),
     /// `ign rig trial status` — the credential-free trial truth +
     /// banners cross-check (04-03).
     RigTrialStatus(actions::rig::TrialStatusResult),
@@ -312,6 +316,7 @@ impl ActionOutput {
             ActionOutput::EamTaskForce(result) => render_success(profile, result, compact),
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
+            ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialStatus(result) => render_success(profile, result, compact),
             ActionOutput::RigTrialReset(result) => render_success(profile, result, compact),
             ActionOutput::WebdevDeploy(result) => render_success(profile, result, compact),
@@ -1980,6 +1985,40 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 .map(ActionOutput::Lint);
             (None, result)
         }
+        // `ign api call` (09-03, EXT-01): the raw passthrough escape
+        // hatch. Usage-class guards LEAD — header/query string parsing,
+        // the auth-pattern refusal, and path validation all run
+        // PRE-resolve (exit 2, envelope profile null, ZERO client
+        // construction or gateway requests — the sync-guard
+        // convention), then `Session::resolve` (the Phase-8 seam — NO
+        // second construction path), then the action (whose own
+        // re-check keeps in-process callers honest). NEVER hook clap
+        // for the refusal — it renders as a contract error envelope
+        // (the frozen rule).
+        Commands::Api(ApiArgs {
+            command: ApiCommand::Call(args),
+        }) => {
+            let call = match build_api_call_request(&args) {
+                Ok(call) => call,
+                Err(err) => return (None, Err(err)),
+            };
+            if let Err(err) = ignition_core::client::apicall::refuse_auth_headers(&call.headers) {
+                return (None, Err(err));
+            }
+            if let Err(err) = ignition_core::client::apicall::validate_path(&call.path) {
+                return (None, Err(err));
+            }
+            match Session::resolve(cli.profile.as_deref()) {
+                Ok(session) => {
+                    let name = session.profile_name().to_string();
+                    let result = actions::apicall::api_call(&*session, call)
+                        .await
+                        .map(ActionOutput::ApiCall);
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            }
+        }
         Commands::Profile(ProfileArgs { command }) => match command {
             ProfileCmd::List => {
                 match resolve_profile_context(&mut config, cli.profile.as_deref()) {
@@ -2342,6 +2381,54 @@ async fn read_json_input(file: &std::path::Path) -> Result<serde_json::Value, Co
     };
     serde_json::from_slice(&bytes).map_err(|err| CoreError::InvalidInput {
         reason: format!("{label} is not valid JSON: {err}"),
+    })
+}
+
+/// `ign api call --header`/`--query` string parsing (09-03): headers
+/// split on the FIRST `:` (values may contain colons — URLs, tokens),
+/// query pairs on the FIRST `=`; both trimmed; a malformed entry is a
+/// usage-class refusal (exit 2, pre-resolution — zero work). The
+/// method is normalized to uppercase so the wire, the outcome echo,
+/// and human rendering agree.
+fn build_api_call_request(
+    args: &ignition_cli::cli::ApiCallArgs,
+) -> Result<ignition_core::client::apicall::ApiCallRequest, CoreError> {
+    let mut headers = Vec::with_capacity(args.header.len());
+    for raw in &args.header {
+        let Some((name, value)) = raw.split_once(':') else {
+            return Err(CoreError::InvalidInput {
+                reason: format!(
+                    "--header expects \"Name: Value\" (split on the first colon): {raw:?}"
+                ),
+            });
+        };
+        if name.trim().is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: format!("--header needs a non-empty header name: {raw:?}"),
+            });
+        }
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    let mut query = Vec::with_capacity(args.query.len());
+    for raw in &args.query {
+        let Some((key, value)) = raw.split_once('=') else {
+            return Err(CoreError::InvalidInput {
+                reason: format!("--query expects \"k=v\" (split on the first '='): {raw:?}"),
+            });
+        };
+        if key.trim().is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: format!("--query needs a non-empty key: {raw:?}"),
+            });
+        }
+        query.push((key.trim().to_string(), value.trim().to_string()));
+    }
+    Ok(ignition_core::client::apicall::ApiCallRequest {
+        method: args.method.trim().to_uppercase(),
+        path: args.path.clone(),
+        body: args.data.clone(),
+        headers,
+        query,
     })
 }
 

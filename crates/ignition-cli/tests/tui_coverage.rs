@@ -32,14 +32,14 @@
 //!
 //! ## The sanctioned stdout exceptions
 //!
-//! The OutOfBand row set is exactly `["completions"]` — the only
-//! LEAF-REPRESENTABLE sanctioned stdout exception. The flag-value /
-//! stream-form exceptions are NOT distinct leaves and carry no rows:
-//! `logs -f` NDJSON is a FLAG on the Screen-mapped `logs` leaf;
-//! `tags export -o -` is a FLAG VALUE on the Screen-mapped
-//! `tags export` leaf; `rig logs` raw passthrough maps as Streamed.
-//! The four-exception STATE list stays traceable through the
-//! routes.rs comments.
+//! The OutOfBand row set is exactly `["completions", "api call"]` —
+//! the LEAF-REPRESENTABLE sanctioned stdout exceptions. The
+//! flag-value / stream-form exceptions are NOT distinct leaves and
+//! carry no rows: `logs -f` NDJSON is a FLAG on the Screen-mapped
+//! `logs` leaf; `tags export -o -` is a FLAG VALUE on the Screen-
+//! mapped `tags export` leaf; `rig logs` raw passthrough maps as
+//! Streamed. The exceptions stay traceable through the routes.rs
+//! comments.
 //!
 //! Reserved OutOfBand slugs (`mcp`, `lsp`, `edit` — 08-06): sanctioned
 //! out-of-band FUTURES, pre-declared with justification at the pinned
@@ -117,34 +117,41 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
     );
 }
 
-/// Mapping-kind sanity: the OutOfBand row set is EXACTLY the
-/// `completions` leaf — the only leaf-representable sanctioned
-/// stdout exception (the flag-value/stream-form exceptions are
-/// documented in routes.rs comments, not rows).
+/// Mapping-kind sanity: the OutOfBand row set is pinned to the
+/// leaf-representable sanctioned stdout exceptions — exactly
+/// `["completions", "api call"]` (compared as a SET: order-free by
+/// design, so a routes() re-ordering cannot churn the pin).
 ///
-/// RESERVED OutOfBand slugs (08-06 pre-declaration): `mcp`, `lsp`, and
-/// `edit` are sanctioned out-of-band FUTURES, not rows today. MCP stdio
-/// and LSP speak their own protocols on stdout — a cockpit would fight
-/// them for the terminal; `edit` is an editor round-trip, not a cockpit
-/// verb. Their registry rows land TOGETHER with their clap commands in
-/// Phases 13/14 (sibling `every_row_requiring_cli_node_is_mapped_and_no_orphans`
+/// Why `api call` belongs here (09-03 justification): raw passthrough
+/// to ARBITRARY gateway REST endpoints is not a cockpit verb — there
+/// is no screenable surface for an arbitrary method/path/body
+/// combination, and the envelope (gateway-verbatim `data` in;
+/// gateway-verbatim error bodies out on the exit-2 catch-all) IS the
+/// product. Same genre as `completions`: the CLI speaks directly to a
+/// consumer (a shell, an agent), not to a human at a dashboard.
+///
+/// RESERVED OutOfBand slugs (`mcp`, `lsp`, `edit` — 08-06): sanctioned
+/// out-of-band FUTURES, pre-declared with justification here and in
+/// routes.rs; rows land with their clap commands in Phases 13/14
+/// (sibling `every_row_requiring_cli_node_is_mapped_and_no_orphans`
 /// asserts bidirectional equality with the live clap tree, so rows for
-/// not-yet-existing commands fail as orphans BY DESIGN). This pinned
-/// expectation — the set stays exactly `["completions"]` — is the
-/// written justification and the pre-declaration: when the `mcp`/`lsp`/
-/// `edit` clap commands land, their OutOfBand rows extend THIS vec
-/// alongside this test's expected set, and both sides move together.
+/// not-yet-existing commands fail as orphans BY DESIGN). When the
+/// `mcp`/`lsp`/`edit` clap commands land, their OutOfBand rows extend
+/// THIS vec alongside this test's expected set, and both sides move
+/// together.
 #[test]
-fn out_of_band_rows_are_exactly_the_completions_leaf() {
-    let out_of_band: Vec<&str> = routes()
+fn out_of_band_rows_are_pinned() {
+    let mut out_of_band: Vec<&str> = routes()
         .iter()
         .filter(|route| matches!(route.mapping, Mapping::OutOfBand))
         .map(|route| route.path)
         .collect();
+    out_of_band.sort_unstable();
     assert_eq!(
         out_of_band,
-        vec!["completions"],
-        "the OutOfBand set must stay exactly the completions leaf"
+        vec!["api call", "completions"],
+        "the OutOfBand set must stay exactly [completions, api call] — a new \
+         member needs a written justification here AND in routes.rs"
     );
 }
 

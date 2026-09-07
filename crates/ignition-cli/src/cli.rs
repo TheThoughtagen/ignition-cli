@@ -172,6 +172,12 @@ pub enum Commands {
     /// through for CI
     Lint(LintArgs),
 
+    /// Raw passthrough to any gateway REST endpoint — the escape
+    /// hatch for the uncurated routes (the envelope's `data` is left
+    /// gateway-verbatim; see README's documented contract exception)
+    #[command(arg_required_else_help = true)]
+    Api(ApiArgs),
+
     /// Manage gateway profiles
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
@@ -1117,6 +1123,53 @@ pub enum ScriptCommand {
         #[arg(long, default_value = "ign-cli", value_name = "NAME")]
         project: String,
     },
+}
+
+/// `ign api` args (09-03, EXT-01) — the raw-passthrough family. One
+/// verb today (`call`); the escape hatch for the 80+ gateway endpoint
+/// families no curated command covers.
+#[derive(Debug, clap::Args)]
+pub struct ApiArgs {
+    #[command(subcommand)]
+    pub command: ApiCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApiCommand {
+    /// Call any gateway REST endpoint raw: `--method`/`--path` are the
+    /// request, `--data`/`--header`/`--query` shape it, and the
+    /// envelope's `data.result.data` is the gateway's JSON VERBATIM
+    /// (no field dropped, no value coerced, key order preserved — the
+    /// README's documented contract exception). Auth-pattern headers
+    /// (`Authorization`, `X-Ignition-API-Token`, `Cookie`) are
+    /// refused pre-I/O — credentials come from the profile.
+    Call(ApiCallArgs),
+}
+
+/// `ign api call` args (09-03, EXT-01). Arbitrary verbs accepted —
+/// reqwest's `Method` parser validates (usage-class refusal for
+/// garbage); `--data` is RAW TEXT on ANY method (GET/DELETE bodies
+/// allowed — curl parity; the gateway's answer classifies); ONE query
+/// mechanism (repeatable `--query k=v`, never `?` in `--path`).
+#[derive(Debug, clap::Args)]
+pub struct ApiCallArgs {
+    /// HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, …)
+    #[arg(long, value_name = "METHOD")]
+    pub method: String,
+    /// Absolute path on the gateway (must start with `/`; no `?`, no host)
+    #[arg(long, value_name = "PATH")]
+    pub path: String,
+    /// Raw body text passthrough (rides ANY method — curl parity)
+    #[arg(long, value_name = "TEXT")]
+    pub data: Option<String>,
+    /// Extra request header `Name: Value` (repeatable; split on the
+    /// FIRST `:`; auth-pattern names are refused pre-I/O)
+    #[arg(long, value_name = "NAME: VALUE")]
+    pub header: Vec<String>,
+    /// Query pair `k=v` (repeatable; split on the FIRST `=` — the
+    /// ONE query mechanism)
+    #[arg(long, value_name = "K=V")]
+    pub query: Vec<String>,
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand
