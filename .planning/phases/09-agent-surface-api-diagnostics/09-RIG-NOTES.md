@@ -1,13 +1,13 @@
 # Phase 09 — Live Rig Ops Log (09-02)
 
-**Purpose:** Ops record for the two disposable rigs spun to capture live wire truth (09-LIVE-CAPTURES.md). No product code touched. **No secret material in this file** — token KEYS live only in the session shell env (`$T_A` / `$T_B`); only token NAMES appear below.
+**Purpose:** Ops record for the two disposable rigs spun to capture live wire truth (09-LIVE-CAPTURES.md). No product code touched. **No secret material in this file** — token KEYS never entered the repo; they rode the session shell env plus a chmod-600 scratch file (`/tmp/ign-p9-rigs/tokens.env`, outside the repo, removed at teardown). Only token NAMES appear below.
 
 ## Rigs
 
 | Rig | Image | Host port | Container | Created (UTC) | Commissioned (UTC) | Provisioned token (NAME only) |
 | --- | ----- | --------- | --------- | ------------- | ------------------ | ----------------------------- |
-| A | `inductiveautomation/ignition:8.3.6` | 18188 → 8088 | `ign-p9-836` (id `b63402cfb9d7`) | 2026-09-07T01:48:37Z | 2026-09-07T02:29:30Z | `p9tok836` |
-| B | `inductiveautomation/ignition:8.3.3` | 19188 → 8088 | `ign-p9-833` (compose project `ign-p9-833`, dir `/tmp/ign-p9-rigs/ign-p9-833/`) | 2026-09-07T01:48:38Z | 2026-09-07T02:29:30Z | `p9tok833` |
+| A | `inductiveautomation/ignition:8.3.6` | 18188 → 8088 | `ign-p9-836` (id `b63402cfb9d7`) | 2026-09-07T01:48:37Z | 2026-09-07T02:29:30Z | `p9tok836b` |
+| B | `inductiveautomation/ignition:8.3.3` | 19188 → 8088 | `ign-p9-833` (compose project `ign-p9-833`, dir `/tmp/ign-p9-rigs/ign-p9-833/`) | 2026-09-07T01:48:38Z | 2026-09-07T02:29:30Z | `p9tok833b` |
 
 Pre-flight: ports 18188/19188 confirmed free (`lsof` empty) before start; both images already cached locally (pulled during Phase 4). Untouched throughout: flux-scratch (55432), cask-postgres (5433), and all other stacks.
 
@@ -59,9 +59,9 @@ Timeline: first-boot 01:48:37Z → first StatusPing 200 (still COMMISSIONING) 01
 2. `POST /data/api/v1/api-token/generate` `{}` (session + `X-CSRF-Token`) → `{"key","hash"}`.
 3. `POST /data/api/v1/resources/ignition/api-token` (session + CSRF) with ARRAY body `[{"name":N,"collection":"core","enabled":true,"description":"","config":{"profile":{"type":"basic-token","secureChannelRequired":false,"securityLevels":[{"name":"Authenticated","children":[]}],"timestamp":<epoch_ms>},"settings":{"tokenHash":<hash>}}}]` → `.success==true`.
 4. **The 403 fix:** `GET /data/api/v1/resources/singleton/ignition/security-properties?collection=core`, then PUT (array body carrying the current `signature`) with `readPermissions`/`writePermissions` both `{"type":"AnyOf","securityLevels":[{"name":"Authenticated","children":[]}]}`.
-5. Token is `NAME:key` (key recorded NOWHERE — `$T_A` = `p9tok836:<key>`, `$T_B` = `p9tok833:<key>`, session shell env only).
+5. Token is `NAME:key` (key recorded NOWHERE). First provisioning pass created `p9tok836` / `p9tok833`; the executor's shell env did not persist keys between tool calls (keys were never printed — only names), so a second pass created `p9tok836b` / `p9tok833b`, staged in `/tmp/ign-p9-rigs/tokens.env` (chmod 600, outside the repo) and sourced per command batch. The orphaned first-pass token entries died with the rigs at teardown. Operational lesson: source keys from a scratch file immediately after provisioning when the driver may not preserve env between calls.
 
-Sanity per rig: `curl -H "X-Ignition-API-Token: $T_x" http://localhost:<port>/data/api/v1/gateway-info` → **200 on both** (18188 with `p9tok836`, 19188 with `p9tok833`).
+Sanity per rig: `curl -H "X-Ignition-API-Token: $T_x" http://localhost:<port>/data/api/v1/gateway-info` → **200 on both** (18188 with `p9tok836b`, 19188 with `p9tok833b`).
 
 ## Teardown
 
@@ -72,7 +72,7 @@ docker rm -f -v ign-p9-836                                   # Rig A (container 
 docker compose -p ign-p9-833 --project-directory /tmp/ign-p9-rigs/ign-p9-833 down -v --remove-orphans  # Rig B (volume ign-p9-833_gateway_data deleted)
 ```
 
-Result: zero `ign-p9*` containers/volumes remain; ports 18188/19188 freed.
+Result: zero `ign-p9*` containers/volumes remain; ports 18188/19188 freed; capture scratch dirs, `tokens.env` (the only file that ever held key material), and the commissioner.js probe download all removed.
 
 ---
 *Executed: 2026-09-07, autonomous live-capture run for phase 09 plan 02 (GSD executor).*
