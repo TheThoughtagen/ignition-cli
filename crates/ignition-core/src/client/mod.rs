@@ -32,6 +32,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+pub mod apicall;
 pub mod backup;
 mod classify;
 pub mod connections;
@@ -377,6 +378,25 @@ pub trait GatewayApi: Send + Sync {
     /// OUTCOMES surface later in history as data, never on this
     /// response). Runtime seam: the controller gate classifies.
     async fn eam_task_force(&self, owner: &str, name: &str) -> Result<(), CoreError>;
+    /// The raw passthrough (09-03, EXT-01): send `call` with its
+    /// arbitrary method, caller headers, query pairs, and optional raw
+    /// body (ANY method — GET/DELETE bodies allowed, curl parity).
+    /// Auth rides [`ReqwestGatewayApi::apply_auth`] (the ONE
+    /// `Secret::expose` site — user auth-pattern headers are refused
+    /// by [`apicall::refuse_auth_headers`] at the CLI/action layer,
+    /// never stripped); classification rides the api-call pipeline
+    /// ([`ReqwestGatewayApi::send_and_classify_for_api`]), so an
+    /// unclassified gateway 4xx is `GatewayClientError` (exit 2,
+    /// verbatim capped body). The 2xx body returns VERBATIM
+    /// ([`apicall::ApiCallData`] — `RawValue` passthrough: no field
+    /// dropped, no value coerced, key order preserved); a non-JSON
+    /// 2xx body is the honest internal-class refusal. The usage
+    /// guards live in [`apicall`] and the action layer — BOTH run
+    /// them, so in-process callers cannot skip the checks.
+    async fn api_call(
+        &self,
+        call: &apicall::ApiCallRequest,
+    ) -> Result<apicall::ApiCallData, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -1328,6 +1348,80 @@ impl GatewayApi for ReqwestGatewayApi {
         self.post_empty(&eam::eam_force_path(owner, name), &[], true)
             .await
             .map(|_| ())
+    }
+
+    async fn api_call(
+        &self,
+        call: &apicall::ApiCallRequest,
+    ) -> Result<apicall::ApiCallData, CoreError> {
+        let url = self.url_for(&call.path);
+        // Any RFC verb (lowercase input normalized); an unparseable
+        // method is a usage-class refusal BEFORE the wire — reqwest's
+        // own `Method` parse is the validator (no hand-rolled list).
+        let method =
+            reqwest::Method::from_bytes(call.method.to_uppercase().as_bytes()).map_err(|_| {
+                CoreError::InvalidInput {
+                    reason: format!(
+                        "{:?} is not a valid HTTP method — use an RFC verb \
+                     (GET/POST/PUT/DELETE/PATCH/HEAD, …)",
+                        call.method
+                    ),
+                }
+            })?;
+        let mut request = self.client.request(method, url.clone());
+        for (name, value) in &call.headers {
+            // reqwest's `.header()` PANICS on an invalid name/value —
+            // these strings are user-supplied, so they are validated
+            // HERE: a bad header is an exit-2 refusal, never a crash
+            // (the webdev extra_headers loop never carried raw user
+            // input; this one does).
+            let name =
+                reqwest::header::HeaderName::from_bytes(name.trim().as_bytes()).map_err(|_| {
+                    CoreError::InvalidInput {
+                        reason: format!("{name:?} is not a valid HTTP header name"),
+                    }
+                })?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                CoreError::InvalidInput {
+                    reason: format!("{value:?} is not a valid HTTP header value"),
+                }
+            })?;
+            request = request.header(name, value);
+        }
+        // The ONE query mechanism: reqwest's own serializer (the same
+        // `.query(&pairs)` shape every other capability uses) — never
+        // a `?` smuggled through the path (validate_path refuses it).
+        if !call.query.is_empty() {
+            request = request.query(&call.query);
+        }
+        if let Some(body) = &call.body {
+            // Raw TEXT on ANY method — GET/DELETE body passthrough is
+            // allowed (curl parity; the gateway's answer classifies).
+            request = request.body(body.clone());
+        }
+        // THE auth site: profile credentials only (the redaction
+        // boundary); the pipeline tail is the api-call-scoped
+        // classifier so unclassified gateway 4xx ride
+        // GatewayClientError instead of Internal.
+        let request = self.apply_auth(request);
+        let response = self.send_and_classify_for_api(request, &url).await?;
+        let status = response.status().as_u16();
+        let text = response.text().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+        })?;
+        // THE verbatim decision (research OQ1): `from_string` both
+        // preserves the gateway's bytes (key order, unknown fields)
+        // AND validates JSON in one call — no parse-re-serialize. A
+        // non-JSON 2xx body is the documented internal-class honesty
+        // refusal (binary endpoints ride the download pipelines).
+        let data = serde_json::value::RawValue::from_string(text).map_err(|err| {
+            CoreError::Internal(format!(
+                "the gateway answered 2xx with a non-JSON body — api call returns \
+                 JSON; use logs/backup downloads for binary endpoints ({err})"
+            ))
+        })?;
+        Ok(apicall::ApiCallData { status, data })
     }
 }
 
