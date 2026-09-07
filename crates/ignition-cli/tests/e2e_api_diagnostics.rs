@@ -348,11 +348,16 @@ fn api_call_envelope_live() {
         result.is_object(),
         "the gateway's own JSON parses as an object: {body}"
     );
-    // Spot-check a capture-named key: gateway-info carries
-    // `version` (the version-gateway contract's parse target).
+    // Spot-check a capture-named key: the LIVE gateway-info body
+    // (recorded 09-06 run, both rigs) carries the version under the
+    // gateway-native key `ignitionVersion` ("8.3.6 (b2026042713)"
+    // shape) — the same key `GatewayInfo` renames in (its `version`
+    // name is a legacy alias only). The 09-02 captures recorded the
+    // 200 status but not this body; the spot-key choice is therefore
+    // grounded in the run's own capture, noted in 09-RIG-NOTES.
     assert!(
-        result["version"].is_string(),
-        "gateway-info.version rides verbatim: {body}"
+        result["ignitionVersion"].is_string(),
+        "gateway-info.ignitionVersion rides verbatim: {body}"
     );
 }
 
