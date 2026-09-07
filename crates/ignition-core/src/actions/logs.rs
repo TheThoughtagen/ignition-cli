@@ -463,6 +463,19 @@ mod tests {
         ) -> Result<crate::client::apicall::ApiCallData, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn license_status(
+            &self,
+        ) -> Result<crate::client::license::LicenseStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn redundancy_status(
+            &self,
+        ) -> Result<crate::client::redundancy::RedundancyStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn gan_status(&self) -> Result<crate::client::gan::GanStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
             self.queries.lock().unwrap().push(filter.clone());
             let items = self.pages.lock().unwrap().pop_front().unwrap_or_default();
@@ -816,6 +829,19 @@ mod tests {
                 &self,
                 _call: &crate::client::apicall::ApiCallRequest,
             ) -> Result<crate::client::apicall::ApiCallData, CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn license_status(
+                &self,
+            ) -> Result<crate::client::license::LicenseStatusWire, CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn redundancy_status(
+                &self,
+            ) -> Result<crate::client::redundancy::RedundancyStatusWire, CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn gan_status(&self) -> Result<crate::client::gan::GanStatusWire, CoreError> {
                 unreachable!("not part of this action")
             }
             async fn logs(&self, _filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {

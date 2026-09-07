@@ -62,6 +62,19 @@ mod tests {
                 data: serde_json::value::RawValue::from_string("{}".to_string()).expect("fixture"),
             })
         }
+        async fn license_status(
+            &self,
+        ) -> Result<crate::client::license::LicenseStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn redundancy_status(
+            &self,
+        ) -> Result<crate::client::redundancy::RedundancyStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn gan_status(&self) -> Result<crate::client::gan::GanStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<crate::client::version::GatewayInfo, CoreError> {
             unreachable!("not part of this action")
         }

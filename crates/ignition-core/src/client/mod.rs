@@ -37,11 +37,14 @@ pub mod backup;
 mod classify;
 pub mod connections;
 pub mod eam;
+pub mod gan;
 pub mod idp;
+pub mod license;
 pub mod logs;
 pub mod metrics;
 pub mod projects;
 pub mod query;
+pub mod redundancy;
 pub mod resources;
 pub mod restart;
 pub mod scripts_codec;
@@ -54,6 +57,8 @@ pub mod webdev;
 
 use crate::client::connections::GatewayConnection;
 use crate::client::eam::{EamHistoryItem, EamTaskRecord};
+use crate::client::gan::GanStatusWire;
+use crate::client::license::LicenseStatusWire;
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
 use crate::client::metrics::{CurrentGauges, PerformanceCharts, ThreadCounts};
 use crate::client::projects::{
@@ -61,6 +66,7 @@ use crate::client::projects::{
     ProjectRenameBody,
 };
 use crate::client::query::ListEnvelope;
+use crate::client::redundancy::RedundancyStatusWire;
 use crate::client::restart::SecurityProperties;
 use crate::client::sessions::{DesignerInfo, PerspectiveSession, VisionClient};
 use crate::client::status::{ModuleInfo, Overview, StatusPing};
@@ -397,6 +403,22 @@ pub trait GatewayApi: Send + Sync {
         &self,
         call: &apicall::ApiCallRequest,
     ) -> Result<apicall::ApiCallData, CoreError>;
+    /// GET `/data/api/v1/licenses` (authed) — the license inventory
+    /// (09-04). The wire model is PARTIAL-CURATED: the morning-check
+    /// skeleton typed, array elements + `details` passthrough (the
+    /// fresh-rig captures answered empty arrays — element shapes are
+    /// not capture-proven).
+    async fn license_status(&self) -> Result<LicenseStatusWire, CoreError>;
+    /// GET `/data/api/v1/redundancy` (authed) — the flat 11-field
+    /// redundancy status (09-04). Units are capture-locked at the
+    /// model (`uptime` ms-since-start wall-clock-proven; the
+    /// `lastSyncTimestamp` `-1` sentinel normalized via
+    /// [`redundancy::RedundancyStatusWire::last_sync_epoch_ms`]).
+    async fn redundancy_status(&self) -> Result<RedundancyStatusWire, CoreError>;
+    /// GET `/data/api/v1/overview/gan` (authed) — the 5-field GAN
+    /// summary (09-04); a non-GAN gateway's zero-connection body IS
+    /// the canonical capture.
+    async fn gan_status(&self) -> Result<GanStatusWire, CoreError>;
 }
 
 /// Production [`GatewayApi`] over reqwest.
@@ -1422,6 +1444,20 @@ impl GatewayApi for ReqwestGatewayApi {
             ))
         })?;
         Ok(apicall::ApiCallData { status, data })
+    }
+
+    async fn license_status(&self) -> Result<LicenseStatusWire, CoreError> {
+        // auth = true — a /data route under 8.3 default security (the
+        // gateway-info rule); the capture session rode a token header.
+        self.get_json(license::LICENSES_PATH, None, true).await
+    }
+
+    async fn redundancy_status(&self) -> Result<RedundancyStatusWire, CoreError> {
+        self.get_json(redundancy::REDUNDANCY_PATH, None, true).await
+    }
+
+    async fn gan_status(&self) -> Result<GanStatusWire, CoreError> {
+        self.get_json(gan::GAN_OVERVIEW_PATH, None, true).await
     }
 }
 

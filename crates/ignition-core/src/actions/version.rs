@@ -176,6 +176,19 @@ mod tests {
         ) -> Result<crate::client::apicall::ApiCallData, CoreError> {
             unreachable!("not part of this action")
         }
+        async fn license_status(
+            &self,
+        ) -> Result<crate::client::license::LicenseStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn redundancy_status(
+            &self,
+        ) -> Result<crate::client::redundancy::RedundancyStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn gan_status(&self) -> Result<crate::client::gan::GanStatusWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn gateway_info(&self) -> Result<GatewayInfo, CoreError> {
             match &self.0 {
                 FakeOutcome::Ok(info) => Ok(info.clone()),
