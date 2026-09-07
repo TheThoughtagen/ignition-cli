@@ -54,7 +54,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
   3. Contract discipline is executable, not prose: Three-Place slug rule is test-enforced (exit-code enum test + README table + prose agree), OutOfBand registry is extended for `mcp`/`lsp`/`edit` with the pinned test deliberately updated with justification, and a stdout-purity byte-scan harness over the real spawned binary fails on a single stray byte
   4. All command dispatch — CLI arms and in-process callers — resolves auth/gateway clients through `ignition-core::Session` with no second client construction anywhere in the tree
 **Research/Planning flags**: None — pure refactor of source-verified code (Session extraction, config keys, worker spawn-site parameterization); HIGH confidence, no unknowns. Standard patterns; skip research-phase.
-**Plans**: 6 plans
+**Plans**: 8 plans (6 executed + 2 gap-closure from UAT)
 Plans:
 - [ ] 08-01-PLAN.md — Config schema migration: [ui].theme + per-profile poll_interval_secs, lenient degradation, poll_interval_too_small clamp slug, load_for_tui
 - [ ] 08-02-PLAN.md — ignition-core::Session type (resolve / resolve_degraded / for_url) with behavior-parity tests
@@ -81,6 +81,8 @@ Plans:
 - [x] 09-04-PLAN.md — Curated reads: license/redundancy/gan status — capture-backed version-tolerant models + actions + CLI + Dashboard TUI rows + contract tests
 - [x] 09-05-PLAN.md — Diagnostics bundle generate/status/wait/download: capture-encoded state vocabulary, poll-based wait, streaming download with 300s timeout override + CLI + TUI rows + contract tests
 - [x] 09-06-PLAN.md — Live gates (e2e_api_diagnostics.rs): env-gated read-only matrix + mutations-gated bundle round-trip, run on BOTH rigs with recorded evidence
+- [ ] 09-07-PLAN.md — Gap closure (UAT test 8): bundle wait Invalid = terminal steady state, immediate exit-6 bundle_not_available, honest deadline message
+- [ ] 09-08-PLAN.md — Gap closure (UAT test 10): Dashboard actions menu for the seven Phase 9 verbs + routes↔menu parity CI contract
 
 ### Phase 10: 10-eam-write-operations
 **Goal**: Users manage the full EAM agent/task lifecycle from the CLI without the gateway webpage — every write behind a confirmation guard, with blast-radius visibility protecting the production controller.

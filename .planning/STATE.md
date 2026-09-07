@@ -92,7 +92,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-None.
+- [Phase 12 prerequisite — from 09 UAT test 10, minor]: TUI tab indicator is visually ambiguous — `render_tab_bar` (crates/ignition-tui/src/ui/mod.rs) signals the active tab with BOLD ONLY and the terminal cursor block parks on the tab bar reading as a stuck highlight. Logic is correct; the fix is visual/theming: `Tabs::select(idx)` + a visible `highlight_style` from the token palette + hide the terminal cursor in frame setup. Assigned to Phase 12 (TUIX-03/04) per the 09 UAT diagnosis — NOT a Phase 9 regression. Details: 09-UAT.md Gap 2.
 
 ### Blockers/Concerns
 
