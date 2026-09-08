@@ -1,9 +1,9 @@
 ---
-status: diagnosed
+status: complete
 phase: 09-agent-surface-api-diagnostics
-source: 09-01-SUMMARY.md, 09-03-SUMMARY.md, 09-04-SUMMARY.md, 09-05-SUMMARY.md, 09-06-SUMMARY.md
+source: 09-01-SUMMARY.md, 09-03-SUMMARY.md, 09-04-SUMMARY.md, 09-05-SUMMARY.md, 09-06-SUMMARY.md, 09-07-SUMMARY.md, 09-08-SUMMARY.md
 started: 2026-09-07T19:10:00Z
-updated: 2026-09-07T23:30:00Z
+updated: 2026-09-08T11:30:07Z
 ---
 
 ## Current Test
@@ -59,6 +59,29 @@ reported: "actions menu shows only the 15 v1.0 verbs (version, connections, wait
 severity: major
 note: "routes.rs rows EXIST (license/redundancy/gan/bundle mapped Screen::Dashboard, clap-walk green) but the menu is a hardcoded const ACTIONS [&str; 15] in state.rs that 09-04/09-05 never extended; update.rs executor arms also absent. Tab-indicator issue found during this test recorded as its own gap below"
 
+---
+
+## Re-verification Round (2026-09-08)
+<!-- Gap closures 09-07 and 09-08 executed; this round live re-tests the failed/pending items only -->
+
+### 11. [RE-TEST of #6] gan status
+expected: Run `ign gan status` — one command returns the 5-field gateway-area-network overview (including connection counts/rates); on a standalone gateway the zero-connection shape renders cleanly; exit 0
+result: pass
+
+note: "setup interlude: uat profile had been repointed at the whk-services container (9088) — repointed uat→18188 (8.3.6 rig) / uat-b→19188 (8.3.3 rig) with token_env IGNITION_TOKEN_836/833 sourced from ~/.config/ignition-cli/rig-tokens.env; old 9088 setup preserved as whk-local profile. Aside observed (not a gap): missing token env var surfaces as gateway 401 rather than a local env-var-missing error — pre-existing v1.0 auth behavior, out of Phase 9 scope"
+
+### 12. [RE-TEST of #8] diagnostics bundle wait — Invalid terminal state (09-07 fix)
+expected: The old bundle from 2026-09-07 has long decayed to Invalid (steady state). Run `ign diagnostics bundle status` first (expect Invalid), then `ign diagnostics bundle wait` — wait must exit **6 bundle_not_available IMMEDIATELY** (seconds, not 300s), reporting the observed state Invalid and that a fresh generate is required. Old broken behavior: polls the full 300s deadline and calls a gateway that answered "gateway unreachable"
+result: pass
+
+note: "wait exited in 0.548s with 'no diagnostics bundle available (gateway reports state \"Invalid\") — run ign diagnostics bundle generate first; polling cannot change this state' + generate hint; status independently confirmed Invalid; exit code 6 pinned by Claude re-run (recorded evidence). No 'gateway unreachable' wording anywhere — the round-1 mislabel is gone"
+
+### 13. [RE-TEST of #10] TUI Dashboard actions menu — Phase 9 verbs (09-08 fix)
+expected: Run `ign tui`, press `a` on the Dashboard — the actions menu now includes the seven Phase 9 verbs alongside the 15 v1.0 ones: license status, redundancy status, gan status, diagnostics bundle generate, diagnostics bundle status, diagnostics bundle download, diagnostics bundle wait. Each new verb dispatches through the menu like the old ones do
+result: pass
+
+note: "screenshot evidence: actions menu shows all 22 verbs (15 v1.0 + the 7 Phase 9 verbs in clap-exact labels); gan status dispatched from the menu rendered the live JSON payload (totalConnections 0, runningConnections 0, byte rates 0.0, remoteGateways 0) in the scrollable viewer — dispatch chain works, not just menu presence"
+
 ## Summary
 
 total: 10
@@ -67,12 +90,29 @@ issues: 2
 pending: 1
 skipped: 0
 
+### Re-verification Round (2026-09-08)
+
+total: 3
+passed: 3
+issues: 0
+pending: 0
+skipped: 0
+
+**Round verdict:** both gap closures verified live — 09-07 (bundle wait Invalid terminal state) and 09-08 (Dashboard menu + dispatch) confirmed working on the 8.3.6 rig. No open gaps remain from this UAT except the tab-indicator item deliberately deferred to Phase 12 (below).
+
+**Out-of-scope observations (2026-09-08, post-round):**
+1. Tab indicator confirmed still bold-only in the user's TUI session — consistent with the OPEN-by-design deferral to Phase 12, not a regression.
+2. `trial reset` (v1.0 rig verb, not a Phase 9 test) stopped at the designed ladder tail: tier-0 token POST refused 401 (endpoint expects the login rung) and no IGNITION_USER/IGNITION_PASSWORD in shell. Root-caused while triaging: the defensive tail (rig.rs:589) puts the rig URL in the error's `profile` slot — message-honesty wart recorded in STATE.md pending todos (minor, v1.0 code).
+
 (note: 1 pending = test 10's OutOfBand completions sub-check folded into the pass/issue call above; tab-indicator finding recorded as its own gap, not a test slot)
 
 ## Gaps
 
+<!-- Round-1 gaps: two FIXED + re-verified 2026-09-08; one OPEN (deferred Phase 12 by design) -->
+
 - truth: "The new Phase 9 morning-check verbs are runnable from the TUI Dashboard"
   status: failed
+  resolution: "FIXED by 09-08 (ACTIONS const + executor arms + routes↔menu parity CI) — re-verified pass 2026-09-08, re-test 13 (screenshot evidence)"
   reason: "User reported: actions menu shows only the 15 v1.0 verbs — none of the Phase 9 verbs appear"
   severity: major
   test: 10
@@ -90,6 +130,7 @@ skipped: 0
 
 - truth: "The active tab is visually unambiguous when switching screens"
   status: failed
+  resolution: "OPEN by design — deferred to Phase 12 theming (TUIX-03/04); tracked in STATE.md pending todos. Not a Phase 9 regression; visual fix (Tabs::select + highlight_style + cursor hide) belongs to the token-palette work"
   reason: "User reported: the tab indicator doesn't change — the tab (content) changes but not the indicator"
   severity: minor
   test: 10
@@ -104,6 +145,7 @@ skipped: 0
 
 - truth: "bundle wait reaches a terminal state and reports it honestly — does not hang forever on a failed generation"
   status: failed
+  resolution: "FIXED by 09-07 (Invalid terminal steady state + immediate exit-6 bundle_not_available + honest deadline message) — re-verified pass 2026-09-08, re-test 12 (0.548s exit, exit code 6 pinned, no 'unreachable' mislabel)"
   reason: "User reported: wait timed out after 300s with 'gateway unreachable... unknown state Invalid — still waiting', exit 4 — the gateway had answered (bundle generation FAILED, state Invalid) but wait kept polling and the final message implied a network problem"
   severity: major
   test: 8

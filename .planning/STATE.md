@@ -5,7 +5,7 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9 complete (8/8 incl. gap-closure), ready for `/gsd-verify-work` then Phase 10 planning
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9 complete AND verified (UAT re-verification round 3/3 passed 2026-09-08: bundle-wait Invalid terminal state + TUI menu parity confirmed live), ready for Phase 10 planning
 
 ## Current Position
 
@@ -101,6 +101,7 @@ Recent decisions affecting current work:
 ### Pending Todos
 
 - [Phase 12 prerequisite — from 09 UAT test 10, minor]: TUI tab indicator is visually ambiguous — `render_tab_bar` (crates/ignition-tui/src/ui/mod.rs) signals the active tab with BOLD ONLY and the terminal cursor block parks on the tab bar reading as a stuck highlight. Logic is correct; the fix is visual/theming: `Tabs::select(idx)` + a visible `highlight_style` from the token palette + hide the terminal cursor in frame setup. Assigned to Phase 12 (TUIX-03/04) per the 09 UAT diagnosis — NOT a Phase 9 regression. Details: 09-UAT.md Gap 2.
+- [Polish, v1.0 code — from 09 UAT re-verification round, minor]: `trial_reset`'s defensive tail (crates/ignition-core/src/actions/rig.rs:589) stuffs the rig URL into `CoreError::SecretUnavailable`'s `profile` slot, so the TUI modal renders `secret unavailable for profile "http://localhost:…"` — the profile NAME and the missing-credential path (IGNITION_USER/IGNITION_PASSWORD) should be named instead. Candidate to ride along with any later error-message/UX pass.
 
 ### Blockers/Concerns
 
