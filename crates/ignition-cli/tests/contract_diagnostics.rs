@@ -13,12 +13,19 @@
 //!    on the third probe (≥3 status hits on the mock).
 //! 7. `bundle_wait_deadline_is_network` — an always-generating
 //!    gateway expires the deadline → exit 4 `network_error` (the
-//!    poll convention — NO new slug) naming the subject.
-//! 8. `bundle_download_bytes_and_default_name` — bytes land
+//!    poll convention — NO new slug) naming the subject; the last
+//!    observation rides the message and "unreachable" is ABSENT (the
+//!    gateway ANSWERED — 09-07).
+//! 8. `bundle_wait_invalid_exits_immediately` (09-07) — the gateway
+//!    answering `Invalid` (the captured TERMINAL steady state, UAT
+//!    Gap 3) ends the wait IMMEDIATELY: exit 6, slug
+//!    `bundle_not_available`, the observed state + the generate
+//!    command named, ONE status hit.
+//! 9. `bundle_download_bytes_and_default_name` — bytes land
 //!    verbatim (ZIP magic asserted), the default timestamped name
 //!    applies when no `Content-Disposition` rides, and a disposition
 //!    name wins when present.
-//! 9. `bundle_download_timeout_override_present` — the 300 s
+//! 10. `bundle_download_timeout_override_present` — the 300 s
 //!    per-request override is pinned DETERMINISTICALLY: the
 //!    constant is asserted cross-crate where it is born
 //!    (`client::diagnostics::BUNDLE_DOWNLOAD_TIMEOUT`), and the
@@ -484,10 +491,13 @@ async fn bundle_wait_flips_to_terminal() {
     );
 }
 
-/// The deadline convention: an always-generating gateway expires the
-/// wait → exit 4 with the `network_error` slug (the poll engine's
-/// Network{source:None} — NOT a new slug) and the envelope message
-/// naming the subject.
+/// The deadline convention (09-07 edition): an always-generating
+/// gateway expires the wait → exit 4 with the `network_error` slug
+/// (the poll engine's Network{source:None} — NOT a new slug) and the
+/// envelope message naming the subject; the last observation (the
+/// gateway's own "Generating" answer) rides the message, and
+/// "unreachable" is ABSENT — the gateway ANSWERED, the deadline
+/// message must not mislabel it as a network failure.
 #[tokio::test]
 async fn bundle_wait_deadline_is_network() {
     let server = wiremock::MockServer::start().await;
@@ -527,6 +537,75 @@ async fn bundle_wait_deadline_is_network() {
     assert!(
         message.contains("diagnostics bundle generation"),
         "the subject names the wait: {message}"
+    );
+    assert!(
+        message.contains("Generating"),
+        "the last observation rides the message verbatim: {message}"
+    );
+    assert!(
+        !message.contains("unreachable"),
+        "the gateway answered — never claim unreachability (09-07): {message}"
+    );
+}
+
+/// UAT Gap 3 (09-07): the gateway answering `Invalid` — the captured
+/// TERMINAL steady state meaning "no current bundle" — ends the wait
+/// IMMEDIATELY: exit 6, envelope slug `bundle_not_available`, the
+/// observed state and the generate command named, exactly ONE status
+/// hit (no further polls, no deadline wait — polling cannot change
+/// this state).
+#[tokio::test]
+async fn bundle_wait_invalid_exits_immediately() {
+    let server = wiremock::MockServer::start().await;
+    let script = BundleStatusScript::new(&["Invalid"]);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/diagnostics/bundle/status",
+        ))
+        .respond_with(script.clone())
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+    let out = ign_cmd(
+        &config,
+        &[
+            "diagnostics",
+            "bundle",
+            "wait",
+            "--interval",
+            "1",
+            "--timeout",
+            "30",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "Invalid = exit 6 target state; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(
+        envelope["error"]["code"],
+        Value::String("bundle_not_available".into()),
+        "the Three-Place slug rides the envelope"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Invalid"),
+        "the observed state is named: {message}"
+    );
+    assert!(
+        message.contains("generate"),
+        "the fresh-generate fix is named: {message}"
+    );
+    assert_eq!(
+        script.hits(),
+        1,
+        "EXACTLY one status hit — immediate exit, no further polls"
     );
 }
 
