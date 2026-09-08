@@ -12,10 +12,10 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 **Phase:** 9 of 14 (09-agent-surface-api-diagnostics) — COMPLETE + 2 gap-closure plans (09-07, 09-08 from the 09 UAT diagnosis)
 **Current Plan:** 8 of 8 (gap-closure: 07 diagnostics-bundle edge cases, 08 TUI menu surface + parity contract)
 **Total Plans in Phase:** 8 (6 original + 2 gap-closure)
-**Status:** Phase complete — 09-08 done; 09-07 code committed, its SUMMARY pending (parallel execution)
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-09-08
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -47,6 +47,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P05 | 314 min | 3 tasks | 10 files |
 | Phase 09 P06 | 131 min | 2 tasks | 2 files |
 | Phase 09 P08 | 138 min | 2 tasks | 5 files |
+| Phase 09 P07 | 167 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -93,6 +94,9 @@ Recent decisions affecting current work:
 - [Phase 09]: 09-08: the seven Phase 9 menu labels are clap-exact (menu_label seam stays minimal to the 06-10 wait trio); parity CI resolves labels through the seam in both directions
 - [Phase 09]: 09-08: Dashboard routes↔menu parity is CI-enforced via a pinned 31-row count + bidirectional menu_label resolution — route-without-menu and menu-without-route both fail in the same change
 - [Phase 09]: 09-08: bundle wait deadline is the 300s clap Wait default, deliberately NOT BUNDLE_DOWNLOAD_TIMEOUT (per-request download override ≠ poll deadline)
+- [Phase 09]: 09-07: Invalid is a captured TERMINAL steady state (UAT TTL-probe truth — Valid decays to Invalid within ~2 min unprompted and stays); BUNDLE_UNAVAILABLE_STATES + is_bundle_unavailable; wait exits IMMEDIATELY exit 6 bundle_not_available (2-probe pin) — only a fresh generate changes the state — Capture-locked vocabulary extended with live 2026-09-07 provenance; polling a steady state is structurally futile
+- [Phase 09]: 09-07: CoreError::Network gained observation: Option<String> — poll deadline() populates it; Display leads 'no terminal state' when the gateway answered (never 'unreachable' for an observed answer) and preserves 'gateway unreachable' byte-for-byte when None; exit 4/network_error unchanged — UAT Gap 3: the deadline message mislabeled an answered gateway as a network failure; dedicated field keeps transport-error wording untouched
+- [Phase 09]: 09-07: bundle_not_available landed Three-Place ATOMIC in one commit (exit enum + literal (exit,slug) table + README exit-6 row) — readme_exit_table_agreement include_str!'s the README so the third place cannot lag a commit — Phase 08 pin makes the Three-Place rule executable; splitting the README row across tasks would commit a red suite
 
 ### Pending Todos
 
@@ -105,5 +109,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-08T05:03:55.204Z
+**Last session:** 2026-09-08T05:33:51.262Z
 **Resume file:** None
