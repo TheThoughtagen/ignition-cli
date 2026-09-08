@@ -222,6 +222,7 @@ mod tests {
                             .await
                             .expect_err("dead port refuses"),
                     ),
+                    observation: None,
                 }),
             }
         }

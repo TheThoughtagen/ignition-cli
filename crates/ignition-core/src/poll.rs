@@ -13,7 +13,11 @@
 //! - any other error aborts;
 //! - deadline expiry → `CoreError::Network`-class timeout (exit 4,
 //!   `network_error` slug — NO new variant; the source is `None` and
-//!   `url` carries the subject + last observation).
+//!   `url` carries the poll's subject). The last observation rides
+//!   the dedicated `observation` field (09-07): `Some` ⇒ the gateway
+//!   ANSWERED (Display leads "no terminal state", never claims
+//!   unreachability for an observed answer); `None` ⇒ today's plain
+//!   "gateway unreachable" wording preserved.
 //!
 //! `deadline = Duration::MAX` runs until the process is killed — the
 //! documented Ctrl-C contract for `logs -f` (default kill, no envelope).
@@ -121,16 +125,18 @@ where
 }
 
 /// Deadline expiry: the `network_error` slug (exit 4) carrying the
-/// subject and the last observation — reusing the Network variant with
-/// `source: None` (a poll timeout has no transport error to show).
+/// subject and — when one exists — the last observation. The
+/// observation rides its DEDICATED field (09-07): `Some` means the
+/// gateway ANSWERED with a concrete state and the Display leads "no
+/// terminal state" (never "unreachable" for an observed answer);
+/// `None` keeps today's plain unreachability wording. Reusing the
+/// Network variant with `source: None` (a poll timeout has no
+/// transport error to show).
 fn deadline_error(cfg: &PollConfig, waited: Duration, last: &Option<String>) -> CoreError {
-    let observation = last
-        .as_deref()
-        .map(|last| format!("; last observation: {last}"))
-        .unwrap_or_default();
     CoreError::Network {
-        url: format!("{} — timed out after {waited:?}{observation}", cfg.subject),
+        url: format!("{} — timed out after {waited:?}", cfg.subject),
         source: None,
+        observation: last.clone(),
     }
 }
 
@@ -182,6 +188,7 @@ mod tests {
                 Some(Step::Network) => Err(CoreError::Network {
                     url: "http://127.0.0.1:1".into(),
                     source: Some(transport_error().await),
+                    observation: None,
                 }),
                 Some(Step::Restarting) => Err(CoreError::GatewayRestarting {
                     endpoint: Some("http://127.0.0.1:1/data/api/v1/overview".into()),
@@ -321,7 +328,44 @@ mod tests {
             "last observation carried: {message}"
         );
         assert!(message.contains("timed out"), "timeout named: {message}");
+        assert!(
+            !message.contains("unreachable"),
+            "an OBSERVED answer is never called unreachable (09-07): {message}"
+        );
+        assert!(
+            message.contains("no terminal state"),
+            "the observation-bearing lead: {message}"
+        );
         assert!(*calls.lock().unwrap() > 1, "multiple polls before expiry");
+    }
+
+    /// The `observation: None` deadline branch (09-07): with NO last
+    /// observation the plain unreachability wording is preserved —
+    /// "gateway unreachable at {subject} — timed out after …".
+    #[tokio::test]
+    async fn deadline_without_observation_still_says_unreachable() {
+        let err = poll(
+            PollConfig {
+                subject: "silent wait".into(),
+                interval: Duration::from_millis(1),
+                deadline: Duration::from_millis(20),
+                ..PollConfig::default()
+            },
+            &mut (),
+            |()| Box::pin(async { Ok(PollState::<()>::Pending(None)) }),
+        )
+        .await
+        .expect_err("deadline must expire");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("gateway unreachable at silent wait"),
+            "the no-observation wording preserved: {message}"
+        );
+        assert!(message.contains("timed out"), "timeout named: {message}");
+        assert!(
+            !message.contains("last observation"),
+            "no observation to carry: {message}"
+        );
     }
 
     /// The backoff sequence: 2 s → 3 s → 4.5 s → … clamped at 30 s,

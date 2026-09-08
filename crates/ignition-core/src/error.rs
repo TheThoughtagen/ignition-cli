@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01)
 //! | 4    | network        | `network_error`
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -140,14 +140,35 @@ pub enum CoreError {
     ///
     /// `source: None` marks a POLL deadline expiry (02-04 `poll.rs`):
     /// same class, same slug (`network_error`), no new variant — the
-    /// transport-error `source` a real failure carries is simply absent,
-    /// and `url` describes what was being waited on instead (the poll's
-    /// subject + the last observation).
-    #[error("gateway unreachable at {url}{source_note}", source_note = source.as_ref().map(|source| format!(": {source}")).unwrap_or_default())]
+    /// transport-error `source` a real failure carries is simply
+    /// absent, and `url` describes what was being waited on instead
+    /// (the poll's subject). The deadline's last observation rides
+    /// `observation` (09-07): when it is `Some` the gateway ANSWERED
+    /// with a concrete state, and the message leads with "no terminal
+    /// state" — it NEVER claims unreachability for an observed
+    /// answer; `None` keeps the plain unreachability wording.
+    #[error(
+        "{lead} at {url}{source_note}{observation_note}",
+        lead = if observation.is_some() {
+            "no terminal state"
+        } else {
+            "gateway unreachable"
+        },
+        source_note = source.as_ref().map(|source| format!(": {source}")).unwrap_or_default(),
+        observation_note = observation
+            .as_deref()
+            .map(|obs| format!("; last observation: {obs}"))
+            .unwrap_or_default()
+    )]
     Network {
         url: String,
         #[source]
         source: Option<reqwest::Error>,
+        /// The poll deadline's last concrete observation (e.g. the
+        /// gateway's reported state) — `None` for transport failures
+        /// and observation-less deadlines. `Some` ⇒ the gateway
+        /// answered; the Display never says "unreachable" then.
+        observation: Option<String>,
     },
 
     /// Gateway reachable but rejected credentials (401/403). Exit 5.
@@ -495,6 +516,25 @@ pub enum CoreError {
         /// [`GATEWAY_CLIENT_BODY_CAP_BYTES`] with an explicit marker.
         body: String,
     },
+
+    /// No diagnostics bundle is available — the status poll ANSWERED
+    /// with a captured TERMINAL steady state meaning "no current
+    /// bundle" (`Invalid`: live-proven on 8.3.6 rig ign-p9-836,
+    /// 2026-09-07 UAT / 09-UAT.md Gap 3 — a `Valid` bundle decays to
+    /// `Invalid` within ~2 minutes UNPROMPTED and stays `Invalid`;
+    /// only a fresh generate changes it, polling cannot). Exit 6 —
+    /// target state (the `ImportDenied` precedent: a gateway-answered
+    /// refusal riding its own class, action-constructed by `bundle
+    /// wait`'s probe, not classify).
+    #[error(
+        "no diagnostics bundle available (gateway reports state {state:?}) — run \
+         `ign diagnostics bundle generate` first; polling cannot change this state"
+    )]
+    BundleNotAvailable {
+        /// The observed steady state (the captured unavailable
+        /// vocabulary, e.g. `Invalid`).
+        state: String,
+    },
 }
 
 impl CoreError {
@@ -536,6 +576,7 @@ impl CoreError {
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
             Self::LintToolAbsent => "lint_tool_absent",
             Self::GatewayClientError { .. } => "gateway_client_error",
+            Self::BundleNotAvailable { .. } => "bundle_not_available",
         }
     }
 
@@ -575,7 +616,8 @@ impl CoreError {
             | Self::EamTaskTypeRefused { .. }
             | Self::EamTaskInFlight { .. }
             | Self::ScriptExecNotConfigured { .. }
-            | Self::LintToolAbsent => 6,
+            | Self::LintToolAbsent
+            | Self::BundleNotAvailable { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -645,9 +687,18 @@ impl CoreError {
                 "set poll_interval_secs to 1 or higher in [profiles.{profile}], \
                  or remove the key to use the default cadence"
             )),
-            Self::Network { url, .. } => Some(format!(
-                "check the gateway is reachable at {url} (host, port, VPN, TLS)"
-            )),
+            Self::Network {
+                url,
+                observation,
+                ..
+            } => Some(match observation {
+                Some(observation) => format!(
+                    "the gateway answered but no terminal state arrived before the deadline — \
+                     the last observation was: {observation}; address that state, not the \
+                     connection ({url})"
+                ),
+                None => format!("check the gateway is reachable at {url} (host, port, VPN, TLS)"),
+            }),
             Self::Auth { status, .. } => Some(match status {
                 401 => {
                     // 401 = token not recognized — the #1 setup failure is
@@ -806,6 +857,12 @@ impl CoreError {
                  curated `ign` command when one exists"
                     .to_string(),
             ),
+            Self::BundleNotAvailable { .. } => Some(
+                "generate a fresh bundle with `ign diagnostics bundle generate`, \
+                 then wait again — the gateway reports no current bundle and \
+                 polling cannot produce one"
+                    .to_string(),
+            ),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -919,6 +976,7 @@ mod tests {
         CoreError::Network {
             url: url.to_string(),
             source: Some(source),
+            observation: None,
         }
     }
 
@@ -1161,6 +1219,13 @@ mod tests {
             ),
             (CoreError::LintToolAbsent, 6, "lint_tool_absent"),
             (
+                CoreError::BundleNotAvailable {
+                    state: "Invalid".into(),
+                },
+                6,
+                "bundle_not_available",
+            ),
+            (
                 CoreError::GatewayClientError {
                     status: 400,
                     endpoint: "http://gw:8088/data/api/v1/nonexistent".into(),
@@ -1220,6 +1285,7 @@ mod tests {
         (6, "script_exec_not_configured"),
         (6, "lint_tool_absent"),
         (6, "provider_root_unsupported"),
+        (6, "bundle_not_available"),
         (7, "rig_error"),
     ];
 
@@ -1276,7 +1342,7 @@ mod tests {
     /// (a) every literal slug appears under its exit code (a README row
     /// that lost or misspelled a slug fails), (b) every README slug token
     /// exists in the literal table (a stale/deleted row fails). Exit 6
-    /// carries 22 slugs, so the full cross-check is the value — not the
+    /// carries 23 slugs, so the full cross-check is the value — not the
     /// happy-path smoke.
     #[test]
     fn readme_exit_table_agreement() {

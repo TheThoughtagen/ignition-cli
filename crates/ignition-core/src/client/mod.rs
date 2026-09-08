@@ -556,6 +556,7 @@ impl ReqwestGatewayApi {
         let bytes = response.bytes().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         Ok(LogDownload {
             bytes: bytes.to_vec(),
@@ -619,6 +620,7 @@ impl ReqwestGatewayApi {
             let chunk = chunk.map_err(|err| CoreError::Network {
                 url: url.to_string(),
                 source: Some(err),
+                observation: None,
             })?;
             file.write_all(&chunk).await.map_err(|err| {
                 CoreError::Internal(format!("cannot write {}: {err}", out.display()))
@@ -713,6 +715,7 @@ impl ReqwestGatewayApi {
         let response = request.send().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         Ok((url.to_string(), response))
     }
@@ -744,6 +747,7 @@ impl ReqwestGatewayApi {
         let response = request.send().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         classify::classify(response, url.as_ref(), false).await
     }
@@ -764,6 +768,7 @@ impl ReqwestGatewayApi {
         let response = request.send().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         classify::classify(response, url.as_ref(), true).await
     }
@@ -1003,6 +1008,7 @@ impl GatewayApi for ReqwestGatewayApi {
         let response = request.send().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         Ok(response.status().as_u16())
     }
@@ -1450,6 +1456,7 @@ impl GatewayApi for ReqwestGatewayApi {
         let text = response.text().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         // THE verbatim decision (research OQ1): `from_string` both
         // preserves the gateway's bytes (key order, unknown fields)

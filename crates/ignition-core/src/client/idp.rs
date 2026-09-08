@@ -223,6 +223,7 @@ impl IdpLoginFlow {
         let response = request.send().await.map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
         self.capture_cookies(&response);
         match response.status().as_u16() {
@@ -273,6 +274,7 @@ impl IdpLoginFlow {
             .map_err(|err| CoreError::Network {
                 url: url.to_string(),
                 source: Some(err),
+                observation: None,
             })?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
@@ -453,6 +455,7 @@ pub async fn login(
     let response = request.send().await.map_err(|err| CoreError::Network {
         url: session_url.to_string(),
         source: Some(err),
+        observation: None,
     })?;
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
@@ -508,6 +511,7 @@ pub async fn trial_reset_via_session(
         .map_err(|err| CoreError::Network {
             url: url.to_string(),
             source: Some(err),
+            observation: None,
         })?;
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();

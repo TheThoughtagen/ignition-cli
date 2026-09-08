@@ -1,24 +1,32 @@
-//! Diagnostics-bundle actions (09-05, EXT-02) — generate / status /
-//! wait / download over the wire landed in this phase.
+//! Diagnostics-bundle actions (09-05, EXT-02; 09-07 Invalid semantics)
+//! — generate / status / wait / download over the wire landed in this
+//! phase.
 //!
 //! **The wait rides the ONE poll engine** ([`crate::poll`], the
 //! restart_and_wait shape): the probe polls
-//! `GET /data/api/v1/diagnostics/bundle/status` and reports
+//! `GET /data/api/v1/diagnostics/bundle/status` and reports, in THIS
+//! order —
 //!
-//! - `PollState::Done(wire)` when the state is a CAPTURED
-//!   non-generating state (`Valid` today — any captured
-//!   non-generating state is terminal);
 //! - `PollState::Pending("state … — still generating")` while
-//!   `Generating`;
+//!   `Generating` (`is_generating`);
+//! - `Err(CoreError::BundleNotAvailable { state })` IMMEDIATELY when
+//!   `is_bundle_unavailable` (`Invalid` — the captured TERMINAL
+//!   steady state, 09-UAT.md Gap 3): zero further polls — only a
+//!   fresh generate changes this state, so waiting is structurally
+//!   futile (exit 6, `bundle_not_available`);
+//! - `PollState::Done(wire)` when the state is a captured
+//!   non-generating, non-unavailable state (`Valid` — terminal
+//!   success);
 //! - `PollState::Pending("unknown state … — still waiting")` for a
 //!   state OUTSIDE the captured vocabulary (Pitfall 2's honest-
-//!   unknowns rule — a failure state the captures never saw must not
-//!   be declared terminal; it keeps polling, and the final status
-//!   rides the deadline observation).
+//!   unknowns rule — a state the captures never saw must not be
+//!   declared terminal; it keeps polling).
 //!
 //! Deadline expiry is the poll engine's `CoreError::Network {
 //! source: None }` convention (exit 4, `network_error` slug — NO new
-//! slug) naming the subject and the last observation.
+//! slug) naming the subject; the last observation rides the dedicated
+//! `observation` field, so a deadline the gateway ANSWERED leads with
+//! "no terminal state" and never claims unreachability (09-07).
 //!
 //! The download applies the default naming when the caller passes no
 //! `--output`: the backup/logs `.part` rename pattern — stream to
@@ -41,8 +49,8 @@ use crate::poll::{self, PollConfig, PollState};
 // The wire re-exports for the CLI/TUI render seams (the actions
 // module is the import home for envelope payloads).
 pub use crate::client::diagnostics::{
-    BUNDLE_CAPTURED_STATES, BUNDLE_DOWNLOAD_TIMEOUT, BUNDLE_GENERATING_STATES, BundleStatusWire,
-    is_generating,
+    BUNDLE_CAPTURED_STATES, BUNDLE_DOWNLOAD_TIMEOUT, BUNDLE_GENERATING_STATES,
+    BUNDLE_UNAVAILABLE_STATES, BundleStatusWire, is_bundle_unavailable, is_generating,
 };
 
 /// `ign diagnostics bundle generate` / `status` / `wait` — the three
@@ -75,10 +83,14 @@ pub async fn bundle_status(api: &dyn GatewayApi) -> Result<BundleStatusWire, Cor
     api.bundle_status().await
 }
 
-/// Poll the status until a CAPTURED non-generating state (`Valid`
-/// today). Unknown states keep polling (honest unknowns); deadline →
-/// the poll engine's Network-class timeout (exit 4, `network_error`)
-/// with the last observation riding the message.
+/// Poll the status until the bundle is ready. The captured
+/// TERMINAL-unavailable states (`Invalid`) refuse IMMEDIATELY (exit
+/// 6, `bundle_not_available` — no further polls, only a fresh
+/// generate changes them); `Valid` is terminal success; unknown
+/// states keep polling (honest unknowns); deadline → the poll
+/// engine's Network-class timeout (exit 4, `network_error`) with the
+/// last observation riding the dedicated field — a deadline the
+/// gateway ANSWERED never claims unreachability (09-07).
 pub async fn bundle_wait(
     api: &dyn GatewayApi,
     interval: Duration,
@@ -102,6 +114,14 @@ pub async fn bundle_wait(
                 Ok(PollState::<()>::Pending(Some(format!(
                     "state {state:?} — still generating"
                 ))))
+            } else if diagnostics::is_bundle_unavailable(state) {
+                // The unavailable arm MUST precede the captured-Done
+                // arm (Invalid is in BUNDLE_CAPTURED_STATES too):
+                // abort immediately — zero further polls, the poll
+                // engine never retries a non-transient error class.
+                Err(CoreError::BundleNotAvailable {
+                    state: state.to_string(),
+                })
             } else if diagnostics::BUNDLE_CAPTURED_STATES.contains(&state) {
                 *final_wire.get_mut().expect("terminal wire") = Some(wire);
                 Ok(PollState::<()>::Done(()))
@@ -580,9 +600,48 @@ mod tests {
             "the final status rides the deadline observation: {message}"
         );
         assert!(
+            !message.contains("unreachable"),
+            "the gateway ANSWERED — the deadline message never claims unreachability (09-07): {message}"
+        );
+        assert!(
             rig.calls() > 2,
             "unknown states keep polling: {}",
             rig.calls()
+        );
+    }
+
+    /// THE 09-07 Gap-3 semantics: `Invalid` is the captured TERMINAL
+    /// steady state ("no current bundle") — the wait refuses
+    /// IMMEDIATELY (exit 6, `bundle_not_available`) after EXACTLY the
+    /// two probes, with NO deadline wait: polling cannot change this
+    /// state, only a fresh generate can. The message names the
+    /// observed state and the generate command.
+    #[tokio::test]
+    async fn invalid_state_exits_immediately_bundle_not_available() {
+        let rig = WaitRig::with(&["Generating", "Invalid"], "Invalid");
+        let err = bundle_wait(&rig, Duration::from_millis(1), Duration::from_secs(10))
+            .await
+            .expect_err("Invalid is terminal-unavailable");
+        assert_eq!(err.exit_code(), 6, "target state");
+        assert_eq!(err.code(), "bundle_not_available");
+        assert_eq!(
+            rig.calls(),
+            2,
+            "EXACTLY two probes — immediate exit, no further polls, no deadline wait"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Invalid"),
+            "the observed state is named: {message}"
+        );
+        assert!(
+            message.contains("generate"),
+            "the fresh-generate fix is named: {message}"
+        );
+        let hint = err.hint().expect("hint required");
+        assert!(
+            hint.contains("ign diagnostics bundle generate"),
+            "the hint names the generate command verbatim: {hint}"
         );
     }
 
