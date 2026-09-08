@@ -95,7 +95,13 @@ Plans:
   4. Before any guarded EAM write executes, user sees a blast-radius preview naming the target agent/task and the controller impact
   5. At least one guarded write is live-verified end-to-end against the real WHK controller rig (env-gated live gate recorded during the phase, not bolted on after)
 **Research/Planning flags**: Established v1.0 guard-ladder patterns extended; no research-phase needed. EAM is endpoint-sensitive — both-rig guidance applies where endpoint shapes are involved (v1.0 `debug/eam-create-422.md` is required reading for wire-shape honesty). Gate-first, not gate-last.
-**Plans**: TBD
+**Plans:** 5 plans
+Plans:
+- [ ] 10-01-PLAN.md — Live wire captures on both rigs (controller-mode provisioning + 12-probe list) → 10-LIVE-CAPTURES.md
+- [ ] 10-02-PLAN.md — Client surface: runtime verb paths + trait methods + wiremock REQUEST pins (capture-locked)
+- [ ] 10-03-PLAN.md — Action layer: suspend/resume/cancel/modify/delete + blast-radius preview composer + authoritative re-checks
+- [ ] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation
+- [ ] 10-05-PLAN.md — Env-gated WHK controller live gate: scratch-task lifecycle, recorded in-phase (SC-5)
 
 ### Phase 11: 11-tag-bulk-transfer-xml-csv
 **Goal**: Tags move in the formats the ecosystem already speaks — byte-faithful passthrough of what the gateway produces (never CLI-side re-serialization) — with honest warnings about what lossy formats would drop before import commits.
