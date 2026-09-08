@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9 complete (6/6), ready for `/gsd-verify-work` then Phase 10 planning
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9 complete (8/8 incl. gap-closure), ready for `/gsd-verify-work` then Phase 10 planning
 
 ## Current Position
 
-**Phase:** 9 of 14 (09-agent-surface-api-diagnostics) — COMPLETE
-**Current Plan:** 6
-**Total Plans in Phase:** 6
-**Status:** Phase complete — ready for verification
-**Last Activity:** 2026-09-07
+**Phase:** 9 of 14 (09-agent-surface-api-diagnostics) — COMPLETE + 2 gap-closure plans (09-07, 09-08 from the 09 UAT diagnosis)
+**Current Plan:** 8 of 8 (gap-closure: 07 diagnostics-bundle edge cases, 08 TUI menu surface + parity contract)
+**Total Plans in Phase:** 8 (6 original + 2 gap-closure)
+**Status:** Phase complete — 09-08 done; 09-07 code committed, its SUMMARY pending (parallel execution)
+**Last Activity:** 2026-09-08
 
-**Progress:** [██████████] 100%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -46,6 +46,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P04 | 168min | 3 tasks | 22 files |
 | Phase 09 P05 | 314 min | 3 tasks | 10 files |
 | Phase 09 P06 | 131 min | 2 tasks | 2 files |
+| Phase 09 P08 | 138 min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -89,6 +90,9 @@ Recent decisions affecting current work:
 - [Phase 09]: 09-05: bundle wait = captured non-generating terminal / Generating pending / UNKNOWN pending-until-deadline, exit 4 network_error (no new slug); envelope data IS the wire (data.state) for generate/status/wait — Honest unknowns keep polling with the final status on the deadline observation; data.state matches the contract-test spec
 - [Phase 09]: 09-06 live gates: DELETE probe asserts the captured 404-empty answer (exit 6 not_found) — the 405/exit-2 hypothesis stays falsified; classify.rs maps every 404 before the api-call catch-all — Capture wins over plan hypothesis; gate encodes live truth
 - [Phase 09]: 09-06 first-time capture: gateway-info body rides ignitionVersion (not version) — identical key shape on 8.3.3/8.3.6; wiremock mocks serve only the alias name — Wire truth recorded; gate spot-key corrected mid-run
+- [Phase 09]: 09-08: the seven Phase 9 menu labels are clap-exact (menu_label seam stays minimal to the 06-10 wait trio); parity CI resolves labels through the seam in both directions
+- [Phase 09]: 09-08: Dashboard routes↔menu parity is CI-enforced via a pinned 31-row count + bidirectional menu_label resolution — route-without-menu and menu-without-route both fail in the same change
+- [Phase 09]: 09-08: bundle wait deadline is the 300s clap Wait default, deliberately NOT BUNDLE_DOWNLOAD_TIMEOUT (per-request download override ≠ poll deadline)
 
 ### Pending Todos
 
@@ -101,5 +105,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-07T18:44:09.555Z
+**Last session:** 2026-09-08T05:03:55.204Z
 **Resume file:** None
