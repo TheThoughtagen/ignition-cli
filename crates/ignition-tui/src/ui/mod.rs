@@ -546,20 +546,26 @@ mod tests {
     /// Modal geometry is content-driven and frame-clamped (06-10): at
     /// a large terminal every menu modal shows its FULL footer hint —
     /// the UAT's clipped "Enter to run · Esc to cancel" rows on the
-    /// Actions (7 entries) and LogsActions (3 entries) menus — and at
-    /// a tiny 12-row frame the same modal still renders with visible
-    /// borders and no panic (height clamped to the frame).
+    /// LogsActions (3 entries) menu — and at a tiny 12-row frame the
+    /// same modal still renders with visible borders and no panic
+    /// (height clamped to the frame). 09-08: the Actions menu grew to
+    /// 22 entries (22 + 4 chrome rows = 26), so its fit assertion
+    /// renders at 80x30 — 80x24 was sized for the v1.0 15-entry menu
+    /// and the modal now CLAMPS there by design (the footer hint is
+    /// the first casualty of the clamp, the mechanism this same test
+    /// verifies on small frames below).
     #[test]
     fn menu_modals_fit_content_and_clamp_to_small_frames() {
         // Large frame: the FULL footer hint row renders verbatim on
-        // both menus the UAT caught clipping.
+        // the Actions menu (sized for the 22-entry menu; the 06-10
+        // assertion at its new minimum comfortable frame).
         let mut state = AppState::new();
         state.open_modal(Modal::Actions { selected: 0 });
-        let rows = rendered_rows(&state);
+        let rows = rendered_rows_sized(&state, 80, 30);
         assert!(
             rows.iter()
                 .any(|row| row.contains("Enter to run · Esc to cancel")),
-            "Actions footer fully visible at 80x24: {rows:?}"
+            "Actions footer fully visible at 80x30: {rows:?}"
         );
 
         let mut logs = AppState::new();

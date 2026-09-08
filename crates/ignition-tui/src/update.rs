@@ -2516,6 +2516,100 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 buffer: String::new(),
             });
         }
+        // 07-04: the lint paths — an Input modal for the target
+        // paths (fires UNGATED at accept through PendingInput::
+        // LintPaths; empty input falls through to clear_pending,
+        // mirroring clap's required PATH). DEAD-VERB FIX (09-08):
+        // this arm never existed — Enter on the menu's lint entry
+        // fell through to `_ => {}` and did nothing since 07-04;
+        // the LintPaths consumer arm in the input router was
+        // reachable from nowhere.
+        Some("lint") => {
+            state.dashboard.pending_input = Some(PendingInput::LintPaths);
+            state.open_modal(Modal::Input {
+                title: "lint — paths".to_string(),
+                hint: Some(
+                    "space-separated paths to lint (one --target each)\n\
+                     local ignition-lint delegation — NO gateway involved\n\
+                     CLI: ign lint <PATH>... [-- extra args]"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
+        // 09-08: the Phase 9 morning-check reads + the
+        // diagnostics-bundle family — DIRECT-spawn, ungated (the
+        // backup/eam-read pattern: no PendingAction variants, no
+        // Confirm/Input modals), every label clap-exact. Results
+        // render through the generic pretty-JSON ActionDone path
+        // (the output types all derive Serialize — no per-type
+        // render arms). The routes↔menu parity test in
+        // ignition-cli's tui_coverage.rs pins each of these labels
+        // to its routes.rs row.
+        Some("license status") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "license status", async move {
+                    ignition_core::actions::license::license_status(&*client).await
+                });
+            }
+        }
+        Some("redundancy status") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "redundancy status", async move {
+                    ignition_core::actions::redundancy::redundancy_status(&*client).await
+                });
+            }
+        }
+        Some("gan status") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "gan status", async move {
+                    ignition_core::actions::gan::gan_status(&*client).await
+                });
+            }
+        }
+        Some("diagnostics bundle generate") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "diagnostics bundle generate", async move {
+                    ignition_core::actions::diagnostics::bundle_generate(&*client).await
+                });
+            }
+        }
+        Some("diagnostics bundle status") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "diagnostics bundle status", async move {
+                    ignition_core::actions::diagnostics::bundle_status(&*client).await
+                });
+            }
+        }
+        // The wait arm mirrors the clap defaults (2 s / 300 s — the
+        // cli.rs Wait leaves): DEFAULT_INTERVAL is the single 2 s
+        // poll-interval source; the 300 s literal is the wait
+        // DEADLINE, deliberately NOT BUNDLE_DOWNLOAD_TIMEOUT (that
+        // const is the per-request download override — a different
+        // semantic that must not silently retune polling).
+        Some("diagnostics bundle wait") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "diagnostics bundle wait", async move {
+                    ignition_core::actions::diagnostics::bundle_wait(
+                        &*client,
+                        ignition_core::actions::restart::DEFAULT_INTERVAL,
+                        std::time::Duration::from_secs(300),
+                    )
+                    .await
+                });
+            }
+        }
+        // Download rides the default naming (None = the
+        // .part-rename pattern with the timestamped fallback —
+        // NOTE this differs from backup download, which passes the
+        // profile stem as the naming seed).
+        Some("diagnostics bundle download") => {
+            if let Some(client) = client_arc(state) {
+                workers::spawn_action(state, "diagnostics bundle download", async move {
+                    ignition_core::actions::diagnostics::bundle_download(&*client, None).await
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -4064,12 +4158,14 @@ mod tests {
             "k steps back up like Up"
         );
 
-        // G bottoms out at the last entry (lint, index 14 — the
-        // 07-02 backup + EAM families appended after restart,
-        // 07-03's script verb after those, 07-04's lint after that).
+        // G bottoms out at the last entry (diagnostics bundle wait,
+        // index 21 — the 07-02 backup + EAM families appended after
+        // restart, 07-03's script verb after those, 07-04's lint
+        // after that, and 09-08's Phase 9 morning-check reads +
+        // diagnostics-bundle family after lint).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 14 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 21 })),
             "G jumps to the last entry"
         );
 

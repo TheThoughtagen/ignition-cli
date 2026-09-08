@@ -408,7 +408,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 15] = [
+pub const ACTIONS: [&str; 22] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -429,6 +429,17 @@ pub const ACTIONS: [&str; 15] = [
     // 07-04: the local ignition-lint delegation (ungated; the
     // doctor posture — findings are data).
     "lint",
+    // 09-04: the curated morning-check reads (EXT-02) — labels
+    // clap-exact, matching the routes.rs rows.
+    "license status",
+    "redundancy status",
+    "gan status",
+    // 09-05: the diagnostics-bundle family (EXT-02) — gateway-support
+    // actions beside backup/restart.
+    "diagnostics bundle generate",
+    "diagnostics bundle status",
+    "diagnostics bundle download",
+    "diagnostics bundle wait",
 ];
 
 /// The Logs screen's actions menu entries (06-03) — the loggers
@@ -1334,7 +1345,10 @@ mod tests {
     /// the executor arms in update.rs match these exact strings, and
     /// routes.rs carries the clap-exact spellings (never these).
     /// 07-02 appends the backup pair (clap-exact — no prose needed);
-    /// 07-03 appends script run (same).
+    /// 07-03 appends script run (same); 09-08 appends the Phase 9
+    /// morning-check reads + the diagnostics-bundle family (all
+    /// clap-exact — the routes↔menu parity test in ignition-cli's
+    /// tui_coverage.rs keys off this list against routes()).
     #[test]
     fn dashboard_actions_use_display_prose_wait_labels() {
         assert_eq!(
@@ -1355,6 +1369,15 @@ mod tests {
                 "eam task force",
                 "script run",
                 "lint",
+                // 09-04: the curated morning-check reads (clap-exact).
+                "license status",
+                "redundancy status",
+                "gan status",
+                // 09-05: the diagnostics-bundle family (clap-exact).
+                "diagnostics bundle generate",
+                "diagnostics bundle status",
+                "diagnostics bundle download",
+                "diagnostics bundle wait",
             ]
         );
     }
