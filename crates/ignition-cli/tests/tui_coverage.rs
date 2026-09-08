@@ -52,7 +52,8 @@ use std::collections::BTreeSet;
 
 use clap::CommandFactory;
 use ignition_cli::cli::Cli;
-use ignition_tui::routes::{Mapping, routes};
+use ignition_tui::routes::{Mapping, menu_label, routes};
+use ignition_tui::state::{ACTIONS, Screen};
 
 /// Recurse the clap tree, collecting every ROW-REQUIRING node's
 /// space-joined path. Skips clap's auto-generated `help` subcommand
@@ -187,4 +188,147 @@ fn bare_option_forms_are_row_requiring_nodes() {
             "the required-subcommand group {group:?} must not be a row of its own"
         );
     }
+}
+
+/// THE routes↔menu parity contract for the Dashboard actions menu
+/// (09-08 — the systemic blind-spot closer for UAT test 10).
+///
+/// 09-04/09-05 added `Mapping::Screen(Screen::Dashboard)` rows for the
+/// seven Phase 9 verbs but never extended the hardcoded `ACTIONS`
+/// const (nor added executor arms) — clap-walk parity held while the
+/// verbs stayed unreachable from the menu. THIS test closes that
+/// failure mode structurally: adding a Dashboard-mapped route without
+/// a menu entry, or a menu entry without a Dashboard-mapped route,
+/// fails CI in the SAME change.
+///
+/// Scope: the DASHBOARD screen only — where the gap actually bit.
+/// Per-screen extension to Logs/Tags/Projects/Rig menus is
+/// deliberately out of scope.
+#[test]
+fn dashboard_actions_menu_matches_registry() {
+    /// Every Dashboard action-menu verb as its clap-exact route path
+    /// (menu labels resolve through `menu_label`). Traced 1:1 against
+    /// the current ACTIONS entries: the 15 v1.1.0-era labels minus the
+    /// three display-prose wait labels (which key off the seam), plus
+    /// the seven 09-04/09-05 verbs (clap-exact on both sides).
+    const MENU_HOSTED: &[&str] = &[
+        // 06-02: the core global verbs (the wait trio via the seam).
+        "version",
+        "connections",
+        "wait gateway",
+        "wait restart",
+        "wait module",
+        "doctor",
+        "restart",
+        // 07-02: the standalone backup pair + the EAM family.
+        "backup download",
+        "backup restore",
+        "eam history",
+        "eam tasks",
+        "eam task new",
+        "eam task force",
+        // 07-03: the scriptExec verb.
+        "script run",
+        // 07-04: the local ignition-lint delegation.
+        "lint",
+        // 09-04: the curated morning-check reads.
+        "license status",
+        "redundancy status",
+        "gan status",
+        // 09-05: the diagnostics-bundle family.
+        "diagnostics bundle generate",
+        "diagnostics bundle status",
+        "diagnostics bundle download",
+        "diagnostics bundle wait",
+    ];
+
+    // (a) THE PINNED COUNT of Screen(Dashboard) route rows. A new
+    // Dashboard-mapped row changes this number and fails CI — forcing
+    // a conscious decision: either the new route hosts a menu verb
+    // (extend MENU_HOSTED + ACTIONS + the executor arms in the same
+    // change) or it belongs to one of the JUSTIFIED exclusions below
+    // (extend the exclusion comments). The pinned test IS the
+    // pre-declaration (the 08-06 OutOfBand pattern).
+    //
+    // Current exclusions (31 Dashboard rows − 22 menu verbs = 9):
+    //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
+    //     the TUI's menu can host).
+    //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
+    //     dashboard PANELS: in-screen polling data, not menu actions.
+    //   - `sessions terminate` — modal-driven from the sessions
+    //     panel's row action (PendingAction::TerminateSession,
+    //     Confirm-gated), not a menu-listed verb.
+    //   - `profile use`, `profile list`, `profile add` — the profile
+    //     switcher modal (the global `p` key, 06-02 Task 3), not the
+    //     actions menu.
+    let dashboard_rows: Vec<&str> = routes()
+        .iter()
+        .filter(|route| matches!(route.mapping, Mapping::Screen(Screen::Dashboard)))
+        .map(|route| route.path)
+        .collect();
+    assert_eq!(
+        dashboard_rows.len(),
+        31,
+        "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
+         + the update.rs executor arms in the same change, or justify the \
+         exclusion in this test's comment block: {dashboard_rows:#?}"
+    );
+
+    // (b) Every MENU_HOSTED path exists in routes() as a Dashboard row
+    // (a menu verb with no registry row is the orphan direction).
+    for path in MENU_HOSTED {
+        let row = routes()
+            .iter()
+            .find(|route| route.path == *path)
+            .unwrap_or_else(|| panic!("menu verb {path:?} has no routes() row"));
+        assert!(
+            matches!(row.mapping, Mapping::Screen(Screen::Dashboard)),
+            "menu verb {path:?} must map Screen(Dashboard)"
+        );
+    }
+
+    // (c) + (d) — resolve every MENU_HOSTED path through the SINGLE
+    // menu_label seam once, then walk both directions over the same
+    // (path, label) table.
+    let menu_labels: Vec<(&str, &str)> = MENU_HOSTED
+        .iter()
+        .map(|&path| (path, menu_label(path).unwrap_or(path)))
+        .collect();
+
+    // (c) route↔menu direction: every MENU_HOSTED path resolves to a
+    // label that IS an ACTIONS entry.
+    for (_, label) in &menu_labels {
+        assert!(
+            ACTIONS.contains(label),
+            "menu label {label:?} is not an ACTIONS entry (extend ACTIONS \
+             + the update.rs executor arms in the same change)"
+        );
+    }
+
+    // (d) menu↔route direction: every ACTIONS entry traces to
+    // EXACTLY ONE MENU_HOSTED path through the same seam — no orphan
+    // verbs, no label collisions. An ACTIONS entry with no route
+    // behind it is exactly the 09-04/09-05 blind spot this test
+    // exists for.
+    for action in ACTIONS {
+        let sources: Vec<&str> = menu_labels
+            .iter()
+            .filter(|(_, label)| *label == action)
+            .map(|(path, _)| *path)
+            .collect();
+        assert_eq!(
+            sources.len(),
+            1,
+            "ACTIONS entry {action:?} must trace to exactly one MENU_HOSTED \
+             path via menu_label (found {sources:?})"
+        );
+    }
+
+    // (e) Cardinality equality — the two lists cannot drift apart in
+    // size without (a)-(d) or this assert failing.
+    assert_eq!(
+        ACTIONS.len(),
+        MENU_HOSTED.len(),
+        "ACTIONS and MENU_HOSTED must have equal cardinality"
+    );
 }

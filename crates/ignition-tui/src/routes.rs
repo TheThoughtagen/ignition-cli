@@ -494,6 +494,24 @@ pub fn routes() -> &'static [CliRoute] {
     ]
 }
 
+/// The single registry-path → menu-prose alias seam — 06-10's
+/// display-prose rule made structural. The wait trio reads like a
+/// restart variant in menu prose ("wait for restart complete"), so
+/// those three paths carry display labels here; EVERY other path
+/// returns `None`, meaning the Actions-menu label IS the clap-exact
+/// path (the 09-08 Phase 9 entries included). The routes↔menu
+/// parity test in ignition-cli's tui_coverage.rs keys off this
+/// function in BOTH directions — a new display-prose label must be
+/// declared here in the same change as its menu entry, or CI fails.
+pub fn menu_label(path: &str) -> Option<&'static str> {
+    match path {
+        "wait gateway" => Some("wait for gateway up"),
+        "wait restart" => Some("wait for restart complete"),
+        "wait module" => Some("wait for module ready"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Mapping, routes};
