@@ -21,7 +21,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 
 **v1.0 baseline (for comparison):** 41 plans, 118 tasks, 9 days (2026-08-20 → 2026-08-29); avg ~38 min/plan; slowest plans were live-gate/WebDev phases (P03-P04 of Phase 5 at ~400+ min).
 
-**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 complete (6/6 plans, closed 2026-09-07 with the both-rig live-gate matrix) — next: verify-work, then Phase 10 planning.
+**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 complete (8/8 plans incl. 2 gap closures from the UAT, re-verified passed 2026-09-08) — next: `/gsd-verify-work` live re-test of UAT test 8, then Phase 10 planning.
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|

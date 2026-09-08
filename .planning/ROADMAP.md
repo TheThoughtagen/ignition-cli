@@ -73,7 +73,7 @@ Plans:
   3. `license status`, `redundancy status`, and `gan status` each return live gateway truth with one command
   4. Diagnostics bundle generate/download/wait works as curated commands, live-verified on BOTH rigs (8.3.3 + 8.3.6)
 **Research/Planning flags**: Diagnostics slice needs per-endpoint wire-shape verification against both live rigs — 8.3.x point-release variance is the documented failure mode; use version-tolerant parsing (deny_unknown_fields OFF, optional fields explicit). EXT-01: catch-all classifier is the FIRST task before the happy path; live gate designed read-only so passthrough can't nuke the rig. No research-phase for EXT-01 itself (83-api collection is ground truth).
-**Plans**: 6 plans
+**Plans**: 8 plans (6 executed + 2 gap-closure from UAT)
 Plans:
 - [x] 09-01-PLAN.md — GatewayClientError exit-2 slug (Three-Place rule in one task) + api-call-scoped classify arm + exit-partition contract tests
 - [x] 09-02-PLAN.md — Live captures on BOTH rigs (8.3.3 + 8.3.6): bundle state vocabulary, license nesting, redundancy/gan units → 09-LIVE-CAPTURES.md (before any model task)
@@ -81,8 +81,8 @@ Plans:
 - [x] 09-04-PLAN.md — Curated reads: license/redundancy/gan status — capture-backed version-tolerant models + actions + CLI + Dashboard TUI rows + contract tests
 - [x] 09-05-PLAN.md — Diagnostics bundle generate/status/wait/download: capture-encoded state vocabulary, poll-based wait, streaming download with 300s timeout override + CLI + TUI rows + contract tests
 - [x] 09-06-PLAN.md — Live gates (e2e_api_diagnostics.rs): env-gated read-only matrix + mutations-gated bundle round-trip, run on BOTH rigs with recorded evidence
-- [ ] 09-07-PLAN.md — Gap closure (UAT test 8): bundle wait Invalid = terminal steady state, immediate exit-6 bundle_not_available, honest deadline message
-- [ ] 09-08-PLAN.md — Gap closure (UAT test 10): Dashboard actions menu for the seven Phase 9 verbs + routes↔menu parity CI contract
+- [x] 09-07-PLAN.md — Gap closure (UAT test 8): bundle wait Invalid = terminal steady state, immediate exit-6 bundle_not_available, honest deadline message
+- [x] 09-08-PLAN.md — Gap closure (UAT test 10): Dashboard actions menu for the seven Phase 9 verbs + routes↔menu parity CI contract
 
 ### Phase 10: 10-eam-write-operations
 **Goal**: Users manage the full EAM agent/task lifecycle from the CLI without the gateway webpage — every write behind a confirmation guard, with blast-radius visibility protecting the production controller.
@@ -161,7 +161,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 6. TUI Cockpit | v1.0 | 11/11 | Complete | 2026-08-28 |
 | 7. Ecosystem Interop & Advanced Ops | v1.0 | 6/6 | Complete | 2026-08-29 |
 | 8. 08-foundations-session-core-config-contract | v1.1 | 6/6 | Complete | 2026-09-06 |
-| 9. 09-agent-surface-api-diagnostics | v1.1 | 6/6 | Complete | 2026-09-07 |
+| 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
 | 10. 10-eam-write-operations | v1.1 | 0/TBD | Not started | - |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 0/TBD | Not started | - |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
