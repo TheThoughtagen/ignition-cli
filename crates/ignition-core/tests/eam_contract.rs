@@ -501,12 +501,14 @@ async fn task_create_malformed_setting_refuses_pre_network() {
     );
 }
 
-/// THE force sequence pin: find GET → force POST (owner from the
+/// THE force sequence pin (10-03: the preview IS the pre-flight —
+/// EAMW-04): find GET → BOTH scheduled segments (the preview's
+/// pending read, quiet here) → force POST (owner from the
 /// healthcheck's `scheduledTaskState.details.owner`) → history GET —
-/// exactly 3 requests, the 204 accepted, and the honest history
+/// exactly 5 requests, the 204 accepted, and the honest history
 /// read-back surfaces the Forced/Failed outcome as data.
 #[tokio::test]
-async fn task_force_is_the_three_request_sequence() {
+async fn task_force_is_the_five_request_sequence() {
     let mock = IgnitionMock::start().await;
     // 1. find — carries the owner under the healthcheck details.
     mock.list_json(
@@ -522,7 +524,12 @@ async fn task_force_is_the_three_request_sequence() {
         }),
     )
     .await;
-    // 2. force — the live-proven 204.
+    // 2+3. the preview's pending read — both literal segments.
+    mock.list_json("GET", SCHEDULED_FALSE_PATH, scheduled_true_page())
+        .await;
+    mock.list_json("GET", SCHEDULED_TRUE_PATH, scheduled_true_page())
+        .await;
+    // 4. force — the live-proven 204.
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(
             "/data/eam/api/v1/eam-tasks/force/eam/nightly-backup",
@@ -531,7 +538,7 @@ async fn task_force_is_the_three_request_sequence() {
         .expect(1)
         .mount(&mock.server)
         .await;
-    // 3. history re-read — the forced run's entry.
+    // 5. history re-read — the forced run's entry.
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(HISTORY_PATH))
         .respond_with(
@@ -570,7 +577,11 @@ async fn task_force_is_the_three_request_sequence() {
     );
 
     let requests = mock.server.received_requests().await.unwrap_or_default();
-    assert_eq!(requests.len(), 3, "find → force → history, exactly");
+    assert_eq!(
+        requests.len(),
+        5,
+        "find → scheduled/false → scheduled/true → force → history, exactly"
+    );
     let sequence: Vec<(&str, String)> = requests
         .iter()
         .map(|request| (request.method.as_str(), request.url.path().to_string()))
@@ -583,6 +594,8 @@ async fn task_force_is_the_three_request_sequence() {
                 "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/nightly%2Dbackup"
                     .to_string()
             ),
+            ("GET", SCHEDULED_FALSE_PATH.to_string()),
+            ("GET", SCHEDULED_TRUE_PATH.to_string()),
             (
                 "POST",
                 "/data/eam/api/v1/eam-tasks/force/eam/nightly-backup".to_string()
@@ -604,6 +617,11 @@ async fn task_force_owner_falls_back_to_eam() {
         serde_json::json!({"name": "bare", "config": {}}),
     )
     .await;
+    // The preview's pending read tolerates the quiet bodies (§8).
+    mock.list_json("GET", SCHEDULED_FALSE_PATH, scheduled_true_page())
+        .await;
+    mock.list_json("GET", SCHEDULED_TRUE_PATH, scheduled_true_page())
+        .await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(
             "/data/eam/api/v1/eam-tasks/force/eam/bare",
@@ -1411,14 +1429,14 @@ async fn cancel_action_fires_against_a_cancellable_row() {
         .expect(2)
         .mount(&mock.server)
         .await;
-    // Only the POST-write read reaches scheduled/true — the pre-write
-    // read finds the row in the false segment and short-circuits.
+    // BOTH segments read pre- AND post-write (10-03: a Running row
+    // lives only in the true segment — never short-circuited).
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(SCHEDULED_TRUE_PATH))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()),
         )
-        .expect(1)
+        .expect(2)
         .mount(&mock.server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1767,5 +1785,83 @@ async fn delete_action_maps_a_proven_stale_signature_to_exit_2() {
     assert!(
         message.contains("changed concurrently") && message.contains("signature mismatch"),
         "the diagnostic names the conflict + the re-run path: {message}"
+    );
+}
+
+/// THE force preview pin (EAMW-04): the force result carries the
+/// composed blast-radius preview — targets from the find's
+/// `config.settings.targetGateways`, the pending row from the
+/// scheduled read, and the factual impact naming task + agents.
+#[tokio::test]
+async fn force_action_composes_the_blast_radius_preview() {
+    let mock = IgnitionMock::start().await;
+    mock.list_json(
+        "GET",
+        "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/nightly%2Dbackup",
+        serde_json::json!({
+            "name": "nightly-backup",
+            "config": {
+                "profile": {"type": "eam_backup", "scheduleMode": "Scheduled"},
+                "settings": {"targetGateways": ["gw-a", "gw-b"], "targetGroups": []}
+            },
+            "scheduledTaskState": {
+                "currentState": "Scheduled",
+                "details": {"owner": "eam"}
+            }
+        }),
+    )
+    .await;
+    // The captured scheduled row (§2), adjusted to the task name.
+    let row_page = {
+        let mut page = scheduled_false_page();
+        page["items"][0]["name"] = serde_json::json!("nightly-backup");
+        page
+    };
+    mock.list_json("GET", SCHEDULED_FALSE_PATH, row_page).await;
+    mock.list_json("GET", SCHEDULED_TRUE_PATH, scheduled_true_page())
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/eam/api/v1/eam-tasks/force/eam/nightly-backup",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    mock.list_json(
+        "GET",
+        HISTORY_PATH,
+        serde_json::json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": 20, "offset": 0}
+        }),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_force(&api, "nightly-backup")
+        .await
+        .expect("the force sequence completes");
+    let preview = &result.preview;
+    assert_eq!(preview.verb, "force");
+    assert_eq!(preview.task, "nightly-backup");
+    assert_eq!(
+        preview.target_gateways,
+        vec!["gw-a".to_string(), "gw-b".to_string()],
+        "the AGENTS the force touches"
+    );
+    assert_eq!(preview.pending_executions.len(), 1);
+    assert_eq!(preview.pending_executions[0].can_cancel, true);
+    assert_eq!(preview.owner.as_deref(), Some("eam"));
+    let impact = &preview.controller_impact;
+    assert!(
+        impact.contains("dispatches task nightly-backup") && impact.contains("2 agents"),
+        "the force impact names task + agents: {impact}"
+    );
+    // The single-line render embeds the composed facts.
+    let line = ignition_core::actions::eam::render_preview_line(preview);
+    assert!(
+        line.starts_with("force nightly-backup:") && line.contains("targets: [gw-a, gw-b] pending: 1"),
+        "the confirmation-line format: {line}"
     );
 }

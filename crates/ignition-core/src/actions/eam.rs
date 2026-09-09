@@ -116,6 +116,12 @@ pub struct EamTaskForceResult {
     /// none is visible yet) — its `level`/`detail` honestly surface
     /// GNET-not-connected / trial-expired outcomes.
     pub history: Option<EamHistoryItem>,
+    /// The composed blast-radius preview (10-03, EAMW-04: force
+    /// composes with the preview surface) — the same pre-flight the
+    /// CLI's confirmation prompt renders: targets, pending
+    /// executions, the factual controller impact. Additive field;
+    /// the serde shape stays agent-stable (all keys always).
+    pub preview: BlastRadiusPreview,
 }
 
 /// One `--setting K=V` parsed with scalar auto-typing (the 05-04
@@ -284,25 +290,20 @@ pub async fn eam_task_create(
     })
 }
 
-/// `ign eam task force` — find (owner resolution via the
+/// `ign eam task force` — the preview IS the pre-flight (EAMW-04):
+/// [`build_blast_radius`] runs the find (owner resolution via the
 /// healthcheck's `scheduledTaskState.details.owner`, live-captured
-/// fallback `"eam"`) → force POST (2xx = dispatched) → history
-/// re-read (the newest matching entry, `level`/`detail` as data).
-/// One extra round trip for the owner, correctness over latency
-/// (the 05-04 precondition precedent).
+/// fallback `"eam"`) AND the pending reads the confirmation prompt
+/// renders → force POST (2xx = dispatched) → history re-read (the
+/// newest matching entry, `level`/`detail` as data). Correctness
+/// over latency (the 05-04 precondition precedent): the extra
+/// scheduled reads are the confirmation surface's data source.
 pub async fn eam_task_force(
     api: &dyn GatewayApi,
     name: &str,
 ) -> Result<EamTaskForceResult, CoreError> {
-    let record = api.eam_task_find(name).await?;
-    let owner = record
-        .scheduled_task_state
-        .as_ref()
-        .and_then(|state| state.get("details"))
-        .and_then(|details| details.get("owner"))
-        .and_then(Value::as_str)
-        .unwrap_or("eam")
-        .to_string();
+    let preview = build_blast_radius(api, "force", name).await?;
+    let owner = preview.owner.clone().unwrap_or_else(|| "eam".to_string());
 
     api.eam_task_force(&owner, name).await?;
 
@@ -322,6 +323,7 @@ pub async fn eam_task_force(
         owner,
         dispatched: true,
         history,
+        preview,
     })
 }
 
@@ -464,22 +466,14 @@ fn is_suspended_of(record: &EamTaskRecord) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
-/// The task's pending row from BOTH literal scheduled segments
-/// (`false` then `true` — 10-LIVE-CAPTURES §2; both answered 200,
-/// the quiet body is an honest empty list §8), filtered to the task
-/// name. Tolerates rows for other tasks (they're other tasks' state).
+/// The task's FIRST pending row (both literal segments — see
+/// [`pending_rows_for`] for the both-segments discipline). The
+/// cancel action's decision input.
 async fn pending_row_for(
     api: &dyn GatewayApi,
     name: &str,
 ) -> Result<Option<EamScheduledTask>, CoreError> {
-    for running in [false, true] {
-        for row in api.eam_tasks_scheduled(running).await? {
-            if row.name == name {
-                return Ok(Some(row));
-            }
-        }
-    }
-    Ok(None)
+    Ok(pending_rows_for(api, name).await?.into_iter().next())
 }
 
 /// `ign eam task suspend` — find (the unknown-name 500 is
@@ -936,6 +930,225 @@ pub async fn eam_task_delete(
     })
 }
 
+// ---- 10-03 Task 3: the blast-radius preview ----
+//
+// The read-only pre-flight that feeds every guard prompt: ONE
+// composer (find + both scheduled segments) behind the pure
+// projection all three caller tiers (CLI refusal message, TUI
+// Confirm body, action re-checks) render identically. History is
+// deliberately EXCLUDED: 10-RESEARCH lists it as optional, the
+// radius answers who/what/targets/pending — the guards consult
+// nothing history carries, and the read would double the pre-flight
+// traffic for data nobody renders pre-write.
+
+/// The blast-radius preview — the composed pre-write facts (all keys
+/// always). Unknown-task names refuse `not_found` at the composer:
+/// the preview IS the pre-flight, so a bad name never reaches any
+/// confirm prompt.
+#[derive(Debug, Serialize)]
+pub struct BlastRadiusPreview {
+    /// The target task's name.
+    pub task: String,
+    /// `config.profile.type` (the token, e.g. `eam_backup`) — the
+    /// CONFIG seam's vocabulary (the scheduled rows' `type` is a
+    /// DIFFERENT, human-label vocabulary — never conflated).
+    pub task_type: Option<String>,
+    /// `config.profile.scheduleMode`.
+    pub schedule_mode: Option<String>,
+    /// The find healthcheck's `currentState`.
+    pub state: Option<String>,
+    /// The healthcheck's `details.owner` (the force verb's owner
+    /// segment source; `"eam"` fallback lives at the caller).
+    pub owner: Option<String>,
+    /// `config.profile.isSuspended` — the definition flag the
+    /// lifecycle verbs persist (Decision 1).
+    pub config_suspended: Option<bool>,
+    /// `config.settings.targetGateways` — the AGENTS the write
+    /// touches; empty when the record names none (the controller
+    /// itself is then the effective target, per the create
+    /// composer's zero-config default — reported as empty here
+    /// because the found record, not the composer, owns the list).
+    pub target_gateways: Vec<String>,
+    /// The task's pending executions (from BOTH literal scheduled
+    /// segments, filtered to the name; each row carries the
+    /// gateway-owned canPause/canResume/canCancel + taskState).
+    pub pending_executions: Vec<EamScheduledTask>,
+    /// One factual sentence: what the verb does to the task and how
+    /// many agents it touches. No dramatization — the CLI's
+    /// require_confirmation string and any future TUI body render
+    /// THIS text ([`render_preview_line`]).
+    pub controller_impact: String,
+    /// The verb the preview was composed for (`suspend`/`resume`/
+    /// `cancel`/`force`/`modify`/`delete`).
+    pub verb: String,
+}
+
+/// The agent-count fragment (`1 agent` / `2 agents` / `0 agents`).
+fn agents_fragment(count: usize) -> String {
+    format!("{count} agent{}", if count == 1 { "" } else { "s" })
+}
+
+/// The per-verb factual impact sentence (pure). Names the task, the
+/// profile type when known, and the agent count; the pending count
+/// only where the verb targets executions. Capture-honest: nothing
+/// here predicts outcomes (execution results are history DATA).
+fn controller_impact(
+    verb: &str,
+    task: &str,
+    task_type: Option<&str>,
+    agents: usize,
+    pending: usize,
+) -> String {
+    let type_note = task_type.map(|t| format!(" ({t})")).unwrap_or_default();
+    let agents = agents_fragment(agents);
+    match verb {
+        "suspend" => format!(
+            "suspends task {task}{type_note} — future scheduled dispatches to {agents} stop until resumed"
+        ),
+        "resume" => format!(
+            "resumes task {task}{type_note} — scheduled dispatches to {agents} can fire again"
+        ),
+        "cancel" if pending > 0 => format!(
+            "cancels the pending execution of task {task}{type_note} — {pending} queued dispatch{} to {agents}",
+            if pending == 1 { "" } else { "es" }
+        ),
+        "cancel" => format!("task {task}{type_note} has no pending execution to cancel"),
+        "force" => format!("dispatches task {task}{type_note} now to {agents}"),
+        "modify" => format!(
+            "rewrites the definition of task {task}{type_note} — dispatch behavior to {agents} follows the new body"
+        ),
+        "delete" => format!(
+            "deletes task {task}{type_note} permanently — dispatches to {agents} stop"
+        ),
+        other => format!("examines task {task}{type_note} for {other} — targets {agents}"),
+    }
+}
+
+/// The pure projection: find record + filtered pending rows + verb
+/// → the preview (the async composer's testable core).
+fn compose_blast_radius(
+    record: &EamTaskRecord,
+    pending_executions: Vec<EamScheduledTask>,
+    verb: &str,
+) -> BlastRadiusPreview {
+    // Filter to THIS task here (the pure fn owns the rule, so every
+    // caller — and every test — provably drops other tasks' rows).
+    let pending_executions: Vec<EamScheduledTask> = pending_executions
+        .into_iter()
+        .filter(|row| row.name == record.name)
+        .collect();
+    let profile = record.config.get("profile");
+    let task_type = profile
+        .and_then(|p| p.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let schedule_mode = profile
+        .and_then(|p| p.get("scheduleMode"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let config_suspended = profile
+        .and_then(|p| p.get("isSuspended"))
+        .and_then(Value::as_bool);
+    let state = current_state_of(record);
+    let owner = record
+        .scheduled_task_state
+        .as_ref()
+        .and_then(|s| s.get("details"))
+        .and_then(|d| d.get("owner"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let target_gateways: Vec<String> = record
+        .config
+        .get("settings")
+        .and_then(|settings| settings.get("targetGateways"))
+        .and_then(Value::as_array)
+        .map(|gateways| {
+            gateways
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let controller_impact = controller_impact(
+        verb,
+        &record.name,
+        task_type.as_deref(),
+        target_gateways.len(),
+        pending_executions.len(),
+    );
+    BlastRadiusPreview {
+        task: record.name.clone(),
+        task_type,
+        schedule_mode,
+        state,
+        owner,
+        config_suspended,
+        target_gateways,
+        pending_executions,
+        controller_impact,
+        verb: verb.to_string(),
+    }
+}
+
+/// The task's pending rows from BOTH literal scheduled segments
+/// (`false` then `true` — 10-LIVE-CAPTURES §2), filtered to the
+/// task name, tolerating the quiet empty-list body (§8). BOTH
+/// segments always read: a Running row lives only in the `true`
+/// segment (uncapturable on the 10-01 rigs — Decision 2) and a
+/// short-circuit would report "nothing pending" while an execution
+/// is in flight — the one lie this composer must never tell.
+async fn pending_rows_for(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<Vec<EamScheduledTask>, CoreError> {
+    let mut rows = Vec::new();
+    for running in [false, true] {
+        rows.extend(
+            api.eam_tasks_scheduled(running)
+                .await?
+                .into_iter()
+                .filter(|row| row.name == name),
+        );
+    }
+    Ok(rows)
+}
+
+/// Compose the blast-radius preview (the read-only pre-flight):
+/// find first — an unknown name refuses `not_found` HERE, before
+/// any confirm prompt or write (capture Decision 7: find-before-
+/// write is the only honest name validation on the lifecycle seam)
+/// — then both scheduled segments. History deliberately excluded
+/// (module doc). One composer, every guarded verb.
+pub async fn build_blast_radius(
+    api: &dyn GatewayApi,
+    verb: &str,
+    task_name: &str,
+) -> Result<BlastRadiusPreview, CoreError> {
+    let record = api.eam_task_find(task_name).await?;
+    let pending_executions = pending_rows_for(api, task_name).await?;
+    Ok(compose_blast_radius(
+        &record,
+        pending_executions,
+        verb,
+    ))
+}
+
+/// The single-line render the CLI's `require_confirmation` operation
+/// string embeds (ONE fn so the CLI refusal and any future TUI body
+/// agree): `"{verb} {task}: {controller_impact} targets: [a, b]
+/// pending: {n}"`.
+pub fn render_preview_line(preview: &BlastRadiusPreview) -> String {
+    format!(
+        "{verb} {task}: {impact} targets: [{targets}] pending: {pending}",
+        verb = preview.verb,
+        task = preview.task,
+        impact = preview.controller_impact,
+        targets = preview.target_gateways.join(", "),
+        pending = preview.pending_executions.len(),
+    )
+}
+
 /// `ign eam history` output model — all keys always.
 #[derive(Debug, Serialize)]
 pub struct EamHistoryResult {
@@ -1047,9 +1260,9 @@ fn summary_from(record: &EamTaskRecord) -> EamTaskSummary {
 mod tests {
     use super::{
         CancelDecision, EamLifecycleResult, EamTaskRecord, TaskChange, TaskCreateVerdict,
-        affected_resources, apply_task_change, auto_type, cancel_decision,
-        compose_task_definition, deep_merge, lifecycle_precheck, parse_setting, summary_from,
-        suspend_recheck, task_create_guard,
+        affected_resources, apply_task_change, auto_type, cancel_decision, compose_blast_radius,
+        compose_task_definition, deep_merge, lifecycle_precheck, parse_setting,
+        render_preview_line, summary_from, suspend_recheck, task_create_guard,
     };
     use crate::client::eam::{DeleteOutcome, EamScheduledTask};
 
@@ -1623,6 +1836,208 @@ mod tests {
             affected_resources(&demanded),
             vec!["task-a".to_string(), "agent-b".to_string(), "task-c".to_string()],
             "strings + name-keyed objects ride; shapeless elements skipped; dedup holds"
+        );
+    }
+
+    // ---- 10-03 Task 3: the blast-radius preview ----
+
+    /// The captured scheduled row, name-adjustable (the §2 verbatim
+    /// shape) — the preview's pending-input fixture.
+    fn scheduled_row(name: &str) -> EamScheduledTask {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "owner": "eam",
+            "type": "Collect Backup",
+            "execStart": null,
+            "message": "",
+            "repeats": true,
+            "canPause": true,
+            "canResume": false,
+            "canCancel": true,
+            "taskState": "Scheduled",
+            "isForced": false,
+            "isRunning": false,
+            "progress": 0.0
+        }))
+        .expect("the captured row shape parses")
+    }
+
+    /// The composer over fixture find + scheduled bodies: the task
+    /// targets 2 agents with 1 pending execution; rows for OTHER
+    /// tasks are filtered; the agent-stable keys ride.
+    #[test]
+    fn preview_composes_over_fixture_find_and_scheduled() {
+        let record: EamTaskRecord = serde_json::from_value(serde_json::json!({
+            "name": "ign-p10-scratch-sched",
+            "config": {
+                "profile": {"type": "eam_backup", "isSuspended": false, "scheduleMode": "Scheduled"},
+                "settings": {"targetGateways": ["gw-a", "gw-b"], "targetGroups": []}
+            },
+            "signature": "sig",
+            "scheduledTaskState": {"currentState": "Scheduled", "details": {"owner": "eam"}}
+        }))
+        .expect("fixture record parses");
+        let pending = vec![
+            scheduled_row("ign-p10-scratch-sched"),
+            scheduled_row("some-other-task"),
+        ];
+
+        let preview = compose_blast_radius(&record, pending, "suspend");
+        assert_eq!(preview.task, "ign-p10-scratch-sched");
+        assert_eq!(preview.task_type.as_deref(), Some("eam_backup"));
+        assert_eq!(preview.schedule_mode.as_deref(), Some("Scheduled"));
+        assert_eq!(preview.state.as_deref(), Some("Scheduled"));
+        assert_eq!(preview.owner.as_deref(), Some("eam"));
+        assert_eq!(preview.config_suspended, Some(false));
+        assert_eq!(
+            preview.target_gateways,
+            vec!["gw-a".to_string(), "gw-b".to_string()],
+            "the AGENTS the write touches"
+        );
+        assert_eq!(
+            preview.pending_executions.len(),
+            1,
+            "rows for other tasks are filtered out"
+        );
+        assert_eq!(preview.pending_executions[0].can_cancel, true);
+        assert_eq!(preview.verb, "suspend");
+        let impact = &preview.controller_impact;
+        assert!(
+            impact.contains("ign-p10-scratch-sched")
+                && impact.contains("eam_backup")
+                && impact.contains("2 agents")
+                && impact.contains("stop until resumed"),
+            "the impact names task + type + agent count + consequence: {impact}"
+        );
+
+        // All keys always — serialization never drops a key.
+        let json = serde_json::to_value(&preview).expect("serializes");
+        for key in [
+            "task",
+            "task_type",
+            "schedule_mode",
+            "state",
+            "owner",
+            "config_suspended",
+            "target_gateways",
+            "pending_executions",
+            "controller_impact",
+            "verb",
+        ] {
+            assert!(json.as_object().unwrap().contains_key(key), "{key} always rides");
+        }
+    }
+
+    /// The empty case: a bare record (no settings, no healthcheck)
+    /// and zero pending rows compose an honest preview — empty
+    /// lists, nulls, and an impact that still names the task.
+    #[test]
+    fn preview_tolerates_empty_targets_and_pending() {
+        let record: EamTaskRecord = serde_json::from_value(serde_json::json!({
+            "name": "bare",
+            "config": {}
+        }))
+        .expect("bare record parses");
+        let preview = compose_blast_radius(&record, Vec::new(), "cancel");
+        assert_eq!(preview.target_gateways, Vec::<String>::new());
+        assert_eq!(preview.pending_executions, Vec::<EamScheduledTask>::new());
+        assert_eq!(preview.task_type, None);
+        assert_eq!(preview.owner, None);
+        assert!(
+            preview.controller_impact.contains("bare")
+                && preview.controller_impact.contains("no pending execution"),
+            "the cancel impact names the empty case factually: {}",
+            preview.controller_impact
+        );
+    }
+
+    /// Per-verb impact sentences DIFFER where the verbs differ —
+    /// one composer, six honest sentences (plus the fallback).
+    #[test]
+    fn preview_impacts_differ_per_verb() {
+        let record: EamTaskRecord = serde_json::from_value(serde_json::json!({
+            "name": "nightly-backup",
+            "config": {
+                "profile": {"type": "eam_backup", "scheduleMode": "Scheduled"},
+                "settings": {"targetGateways": ["gw-a"]}
+            },
+            "scheduledTaskState": {"currentState": "Scheduled", "details": {"owner": "eam"}}
+        }))
+        .expect("fixture record parses");
+        let pending = vec![scheduled_row("nightly-backup")];
+
+        let mut impacts = Vec::new();
+        for verb in ["suspend", "resume", "cancel", "force", "modify", "delete"] {
+            let preview = compose_blast_radius(&record, pending.clone(), verb);
+            let impact = preview.controller_impact.clone();
+            assert!(
+                impact.contains("nightly-backup") && impact.contains("1 agent"),
+                "{verb}'s impact names the task + agent count: {impact}"
+            );
+            impacts.push(impact);
+        }
+        let distinct: std::collections::BTreeSet<&String> = impacts.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            impacts.len(),
+            "each verb's factual sentence is distinct: {impacts:?}"
+        );
+        // The pending-aware cancel names the execution count; the
+        // empty-pending cancel says so.
+        let cancel_with = compose_blast_radius(&record, pending.clone(), "cancel");
+        assert!(cancel_with.controller_impact.contains("1 queued dispatch"));
+        let cancel_without = compose_blast_radius(&record, Vec::new(), "cancel");
+        assert!(cancel_without.controller_impact.contains("no pending execution"));
+        // Unknown verbs get the factual fallback (never a panic).
+        let odd = compose_blast_radius(&record, Vec::new(), "teleport");
+        assert!(odd.controller_impact.contains("teleport"));
+    }
+
+    /// THE render pin: `"{verb} {task}: {impact} targets: [a, b]
+    /// pending: {n}"` — the ONE line both the CLI refusal and the
+    /// future TUI body embed.
+    #[test]
+    fn render_preview_line_contains_task_agents_verb_and_pending() {
+        let record: EamTaskRecord = serde_json::from_value(serde_json::json!({
+            "name": "ign-p10-scratch",
+            "config": {
+                "profile": {"type": "eam_backup", "scheduleMode": "OnDemand"},
+                "settings": {"targetGateways": ["_controller"]}
+            }
+        }))
+        .expect("fixture record parses");
+        let preview = compose_blast_radius(
+            &record,
+            vec![scheduled_row("ign-p10-scratch"), scheduled_row("ign-p10-scratch")],
+            "delete",
+        );
+        assert_eq!(
+            preview.pending_executions.len(),
+            2,
+            "same-name rows from both segments both count"
+        );
+        let line = render_preview_line(&preview);
+        assert_eq!(
+            line,
+            "delete ign-p10-scratch: deletes task ign-p10-scratch (eam_backup) permanently \
+             — dispatches to 1 agent stop targets: [_controller] pending: 2"
+        );
+        assert!(line.contains("ign-p10-scratch"));
+        assert!(line.contains("1 agent"));
+
+        // Empty targets render as empty brackets (never "[ ]" or a
+        // dropped key — the format is agent-stable).
+        let bare = compose_blast_radius(
+            &serde_json::from_value::<EamTaskRecord>(serde_json::json!({
+                "name": "bare", "config": {}
+            }))
+            .expect("bare parses"),
+            Vec::new(),
+            "resume",
+        );
+        assert_eq!(
+            render_preview_line(&bare),
+            "resume bare: resumes task bare — scheduled dispatches to 0 agents can fire again targets: [] pending: 0"
         );
     }
 }
