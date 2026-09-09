@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 10 of 14 (10-eam-write-operations)
-**Current Plan:** 2 of 5 COMPLETE (10-02 client surface — 8 EAM write trait methods + 29 REQUEST-pinning contract tests, capture-locked)
+**Current Plan:** 3 of 5 COMPLETE (10-03 action layer — lifecycle re-checks, full-record RMW modify/delete, blast-radius preview + force composer)
 **Total Plans in Phase:** 5
-**Status:** In progress — ready for 10-03 (action layer builds on trait methods + outcome models + signature-mismatch FINDING)
+**Status:** In progress — ready for 10-04 (CLI verbs consume lifecycle_precheck + build_blast_radius/render_preview_line + the five actions)
 **Last Activity:** 2026-09-09
 
-**Progress:** [██████████] 94%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -50,6 +50,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P07 | 167 min | 3 tasks | 9 files |
 | Phase 10 P01 | 24 min | 2 tasks | 2 files |
 | Phase 10 P02 | ~175 min (incl. infra outage) | 2 tasks | 16 files |
+| Phase 10 P03 | 3h 23m | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -107,6 +108,9 @@ Recent decisions affecting current work:
 - [Phase 10 / 10-02]: Signature-mismatch 500 (captured) is a module-doc FINDING for the action layer — 10-03/10-04 classify on the stable 'signature mismatch' substring; the client stays classification-free
 - [Phase 10 / 10-02]: eam_task_delete always sends collection=core; ?confirm= rides only on opt-in (capture Decision 3); modify PUT body is the full single-element array INCLUDING config.settings + original signature — 422-trap pinned at REQUEST level
 - [Phase 10 / 10-02]: Contract tests are REQUEST-pinning (recorded request: method+path+query+body), not response-only — expect(1) + .mount() guard discipline; fixtures verbatim from 10-LIVE-CAPTURES.md
+- [Phase 10]: 10-03: lifecycle re-checks are pure fns shared three ways (lifecycle_precheck / suspend_recheck / cancel_decision) — suspend refuses already-suspended exit 2 pre-write; resume fires unconditionally (§1b silent 204); cancel mirrors the gateway (no-pending no-op fired:false, canCancel=false reported)
+- [Phase 10]: 10-03: modify is full-record RMW with rename+suspend_flag OMITTED from TaskChange per capture honesty (§5 rename-PUT=404; PUT-driven isSuspended unproven) — the create-new+delete-old composite is 10-04's documented workflow; delete derives signature from find, no-confirm by default with ONE confirm=true retry on the demand shape (Decision 3)
+- [Phase 10]: 10-03: signature-mismatch 500s classify on EVIDENCE (post-failure find shows a changed signature ⇒ exit 2 re-run guidance) — the substring never reaches the action layer (classify's Internal fallback drops non-HTML bodies); zero new slugs/variants; BlastRadiusPreview composes find + BOTH scheduled segments (never short-circuited — Running rows live only in true) and force rides it (EAMW-04)
 
 ### Pending Todos
 
@@ -120,5 +124,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-09T10:12:16.692Z
+**Last session:** 2026-09-09T17:27:58.543Z
 **Resume file:** None
