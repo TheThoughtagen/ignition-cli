@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 9 complete AND verified (UAT re-verification round 3/3 passed 2026-09-08: bundle-wait Invalid terminal state + TUI menu parity confirmed live), ready for Phase 10 planning
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 in progress (capture-first plan 01 executed; client/action/CLI/gate plans 02–05 remain)
 
 ## Current Position
 
-**Phase:** 9 of 14 (09-agent-surface-api-diagnostics) — COMPLETE + 2 gap-closure plans (09-07, 09-08 from the 09 UAT diagnosis)
-**Current Plan:** 8 of 8 (gap-closure: 07 diagnostics-bundle edge cases, 08 TUI menu surface + parity contract)
-**Total Plans in Phase:** 8 (6 original + 2 gap-closure)
-**Status:** Phase complete — ready for verification
-**Last Activity:** 2026-09-08
+**Phase:** 10 of 14 (10-eam-write-operations)
+**Current Plan:** 1 of 5 COMPLETE (10-01 live captures — dual-rig EAM wire truth + Decisions-locked section)
+**Total Plans in Phase:** 5
+**Status:** In progress — ready for 10-02 (client models cite 10-LIVE-CAPTURES.md Decisions-locked-by-captures)
+**Last Activity:** 2026-09-09
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 93%
 
 ## Performance Metrics
 
@@ -48,6 +48,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P06 | 131 min | 2 tasks | 2 files |
 | Phase 09 P08 | 138 min | 2 tasks | 5 files |
 | Phase 09 P07 | 167 min | 3 tasks | 9 files |
+| Phase 10 P01 | 24 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -97,6 +98,9 @@ Recent decisions affecting current work:
 - [Phase 09]: 09-07: Invalid is a captured TERMINAL steady state (UAT TTL-probe truth — Valid decays to Invalid within ~2 min unprompted and stays); BUNDLE_UNAVAILABLE_STATES + is_bundle_unavailable; wait exits IMMEDIATELY exit 6 bundle_not_available (2-probe pin) — only a fresh generate changes the state — Capture-locked vocabulary extended with live 2026-09-07 provenance; polling a steady state is structurally futile
 - [Phase 09]: 09-07: CoreError::Network gained observation: Option<String> — poll deadline() populates it; Display leads 'no terminal state' when the gateway answered (never 'unreachable' for an observed answer) and preserves 'gateway unreachable' byte-for-byte when None; exit 4/network_error unchanged — UAT Gap 3: the deadline message mislabeled an answered gateway as a network failure; dedicated field keeps transport-error wording untouched
 - [Phase 09]: 09-07: bundle_not_available landed Three-Place ATOMIC in one commit (exit enum + literal (exit,slug) table + README exit-6 row) — readme_exit_table_agreement include_str!'s the README so the third place cannot lag a commit — Phase 08 pin makes the Three-Place rule executable; splitting the README row across tasks would commit a red suite
+- [Phase 10]: Phase 10 capture decisions live in 10-LIVE-CAPTURES.md Decisions-locked-by-captures (12 items); headline: suspend/resume runtime verbs SYNC config.profile.isSuspended (bidirectional, both rigs) — Capture-first plan 10-01: later plans must cite, not re-derive, wire truth
+- [Phase 10]: Signature mismatch (PUT+DELETE) = HTTP 500 + JSON problem{message,stacktrace}; classify on stable substring 'signature mismatch' — message prose + stack frames drift between 8.3.3/8.3.6 — Live capture falsified the 400/409 hypotheses; 8.3.3 message leaks the live signature
+- [Phase 10]: Rename via PUT is NOT supported (404 empty, no create); delete succeeds WITHOUT ?confirm= for lone resources and ?collection= takes the COLLECTION name (core), not the type; runtime-verb unknown-task = 500-HTML (suspend/resume) or silent 204 (cancel), never 404 — All three plan hypotheses corrected by capture; locked for 10-02/10-03/10-04
 
 ### Pending Todos
 
@@ -110,5 +114,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-08T05:33:51.262Z
+**Last session:** 2026-09-09T10:12:16.692Z
 **Resume file:** None

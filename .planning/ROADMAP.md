@@ -97,7 +97,7 @@ Plans:
 **Research/Planning flags**: Established v1.0 guard-ladder patterns extended; no research-phase needed. EAM is endpoint-sensitive — both-rig guidance applies where endpoint shapes are involved (v1.0 `debug/eam-create-422.md` is required reading for wire-shape honesty). Gate-first, not gate-last.
 **Plans:** 5 plans
 Plans:
-- [ ] 10-01-PLAN.md — Live wire captures on both rigs (controller-mode provisioning + 12-probe list) → 10-LIVE-CAPTURES.md
+- [x] 10-01-PLAN.md — Live wire captures on both rigs (controller-mode provisioning + 12-probe list) → 10-LIVE-CAPTURES.md *(complete 2026-09-09)*
 - [ ] 10-02-PLAN.md — Client surface: runtime verb paths + trait methods + wiremock REQUEST pins (capture-locked)
 - [ ] 10-03-PLAN.md — Action layer: suspend/resume/cancel/modify/delete + blast-radius preview composer + authoritative re-checks
 - [ ] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation
