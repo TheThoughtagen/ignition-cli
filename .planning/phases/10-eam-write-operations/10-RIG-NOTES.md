@@ -61,4 +61,24 @@ Both rigs: **200** `{"success":true,"changes":[{…,"newSignature":<…>}],"prob
 
 **Rung (a) achieved on both rigs** — headless controller provisioning worked; no stock-gateway 403 captures needed for the ladder (the 403 shape evidence remains available in 07-RESEARCH/09 captures and, if encountered in Task 2's probes, will be captured verbatim then). WHK controller-rig route not needed for provisioning.
 
-Teardown: performed ONLY after Task 2's captures complete — see the Teardown section appended below.
+## Capture run (Task 2, 2026-09-09 09:56–10:04 UTC)
+
+All 12 probes executed per rig (probe list + verbatim evidence: 10-LIVE-CAPTURES.md). Wire-level notes that live in the ops domain rather than the captures doc:
+
+- **Token staging held** for the whole run: keys sourced from the chmod-600 scratch env per batch, never printed, never written to the repo. One early 401 was the FULL `name:key` lesson (header takes the complete string), fixed within one batch.
+- **Gateway non-strict JSON gotcha:** `find` responses whose healthcheck carries the stats NPE embed RAW TAB bytes inside `error.stacktrace` strings — python `json.load` and `jq` both reject them (`strict=False` works). Probe scripts switched to lenient parsing mid-run; the CLI's own parser must tolerate this (locked in captures Decision 10).
+- **Probe-spec correction recorded:** the plan's delete probe suggested `?confirm=true&collection=eam-tasks`; live wire proves `collection=` takes the COLLECTION name (`core`) — the `eam-tasks` value 404s. Captured both ways (captures §3c).
+- Mutations were confined to the two `ign-p10-*` scratch tasks + the module-settings flip; `names` lists ended empty on both rigs before teardown.
+
+## Teardown (2026-09-09 10:05Z)
+
+```bash
+docker rm -f -v ign-p10-836
+docker compose -p ign-p10-833 --project-directory /tmp/ign-p10-rigs/ign-p10-833 down -v --remove-orphans
+```
+
+Verified: zero `ign-p10*` containers/volumes (`docker ps -a` / `docker volume ls` greps empty); ports 18188/19188 freed (`lsof` empty); `/tmp/ign-p10-rigs/tokens.env` — the only file that ever held this run's key material — destroyed with `shred -u`; the stale Phase-9 `/tmp/ign-p9-rigs/tokens.env` (dead key material from 09 teardown leftovers) also shredded as hygiene. Nothing left running.
+
+---
+
+*Executed: 2026-09-09, autonomous capture-first run for phase 10 plan 01 (GSD executor). Rigs/recipe sections above are the Task-1 provisioning log (committed before captures began).*
