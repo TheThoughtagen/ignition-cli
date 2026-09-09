@@ -1212,3 +1212,231 @@ async fn runtime_verb_404_is_the_defensive_not_found_classification() {
     assert_eq!(err.exit_code(), 6);
     assert_eq!(err.code(), "not_found");
 }
+
+// ---- 10-03: the ACTION layer (find-first lifecycle with
+// authoritative re-checks — the composition the pure fns + the
+// client pins above only PARTIALLY prove) ----
+
+/// A find responder answering the FIRST call with `first` and every
+/// later call with `then` — the find→write→read-back flows need the
+/// two answers to differ (e.g. `isSuspended` false → true). A
+/// stateful responder (not two same-matcher mocks) so the answer
+/// order can NEVER depend on wiremock's multi-mock match ordering.
+fn find_responder(
+    first: serde_json::Value,
+    then: serde_json::Value,
+) -> impl Fn(&wiremock::Request) -> wiremock::ResponseTemplate {
+    use std::sync::Mutex;
+    let calls = Mutex::new(0usize);
+    move |_request| {
+        let mut calls = calls.lock().expect("counter locks");
+        *calls += 1;
+        let body = if *calls == 1 { first.clone() } else { then.clone() };
+        wiremock::ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+/// THE suspend action sequence: find (isSuspended false) → suspend
+/// POST (204) → find read-back (isSuspended true — Decision 1's
+/// persistence proof). The result reports the pre-write state, the
+/// persisted flag, and `fired: true` — exactly 2 finds + 1 POST.
+#[tokio::test]
+async fn suspend_action_finds_then_posts_then_readbacks_the_flag() {
+    let mock = IgnitionMock::start().await;
+    let find = |suspended: bool| {
+        serde_json::json!({
+            "name": "nightly-backup",
+            "config": {"profile": {"type": "eam_backup", "isSuspended": suspended, "scheduleMode": "Scheduled"}},
+            "signature": "sig-abc123",
+            "scheduledTaskState": {"currentState": "Scheduled", "details": {"owner": "eam"}}
+        })
+    };
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(find_responder(find(false), find(true)))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    let post = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(SUSPEND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_suspend(&api, "nightly-backup")
+        .await
+        .expect("the lifecycle sequence completes");
+    assert_eq!(result.task, "nightly-backup");
+    assert_eq!(result.action, "suspended");
+    assert_eq!(
+        result.previous_state.as_deref(),
+        Some("Scheduled"),
+        "the find healthcheck's currentState, pre-write"
+    );
+    assert_eq!(
+        result.config_suspended,
+        Some(true),
+        "the read-back proves the flag PERSISTED (capture Decision 1)"
+    );
+    assert_eq!(result.pending, None);
+    assert!(result.fired);
+    assert_eq!(result.reason, None);
+    assert_eq!(post.received_requests().await.len(), 1, "one POST rode");
+}
+
+/// The suspend re-check at the ACTION layer: an already-suspended
+/// task (find proves isSuspended true) refuses exit 2 naming the
+/// task BEFORE the wire — the gateway's own answer would be the
+/// indistinguishable 500 "Task could not be suspended" (§1a/§7).
+#[tokio::test]
+async fn suspend_action_refuses_already_suspended_pre_write() {
+    let mock = IgnitionMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "name": "nightly-backup",
+                "config": {"profile": {"type": "eam_backup", "isSuspended": true, "scheduleMode": "Scheduled"}},
+                "scheduledTaskState": {"currentState": "Suspended", "details": {"owner": "eam"}}
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // expect(0): if the action wrongly fires, the server-drop
+    // verification fails the test.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(SUSPEND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let err = ignition_core::actions::eam::eam_task_suspend(&api, "nightly-backup")
+        .await
+        .expect_err("already-suspended refuses pre-write");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.code(), "invalid_input");
+    let message = err.to_string();
+    assert!(
+        message.contains("nightly-backup") && message.contains("already suspended"),
+        "the refusal names the task + state: {message}"
+    );
+}
+
+/// The cancel no-op: nothing pending (both scheduled reads quiet)
+/// returns the honest no-op result (`fired: false`, the reason
+/// names it) WITHOUT firing the POST — mirroring the gateway's own
+/// silent-204 semantics for cancel-with-nothing-pending (§7) minus
+/// the pointless round trip.
+#[tokio::test]
+async fn cancel_action_without_pending_is_an_honest_noop() {
+    let mock = IgnitionMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "name": "nightly-backup",
+                "config": {"profile": {"type": "eam_backup", "isSuspended": false, "scheduleMode": "OnDemand"}},
+                "scheduledTaskState": {"currentState": "Stopped", "details": {"owner": "eam"}}
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    for running in ["false", "true"] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/data/eam/api/v1/eam-tasks/scheduled/{running}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()),
+            )
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(CANCEL_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_cancel(&api, "nightly-backup")
+        .await
+        .expect("the no-op is a success-shaped result");
+    assert_eq!(result.action, "cancelled");
+    assert!(!result.fired, "nothing pending — the POST did not ride");
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("no pending execution"),
+        "the honest reason rides the always-keys model"
+    );
+    assert_eq!(result.previous_state.as_deref(), Some("Stopped"));
+}
+
+/// The cancel fire path: a pending row with the captured can* truth
+/// cell (canCancel true) → POST → the post-write scheduled read
+/// shows the row GONE — `fired: true`, `pending: null`.
+#[tokio::test]
+async fn cancel_action_fires_against_a_cancellable_row() {
+    let mock = IgnitionMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "name": "nightly-backup",
+                "config": {"profile": {"type": "eam_backup", "isSuspended": false, "scheduleMode": "Scheduled"}},
+                "scheduledTaskState": {"currentState": "Scheduled", "details": {"owner": "eam"}}
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // scheduled/false is read pre-write (the captured row present —
+    // name adjusted to the test task) and post-write (row gone).
+    let row_page = |name: &str| {
+        let mut page = scheduled_false_page();
+        page["items"][0]["name"] = serde_json::json!(name);
+        page
+    };
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(SCHEDULED_FALSE_PATH))
+        .respond_with(find_responder(row_page("nightly-backup"), scheduled_true_page()))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    // Only the POST-write read reaches scheduled/true — the pre-write
+    // read finds the row in the false segment and short-circuits.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(SCHEDULED_TRUE_PATH))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(CANCEL_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_cancel(&api, "nightly-backup")
+        .await
+        .expect("the cancel sequence completes");
+    assert!(result.fired);
+    assert_eq!(result.reason, None);
+    assert_eq!(
+        result.pending, None,
+        "the post-write read proves the execution is gone"
+    );
+    assert_eq!(result.previous_state.as_deref(), Some("Scheduled"));
+}

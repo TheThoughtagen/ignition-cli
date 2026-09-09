@@ -1,7 +1,12 @@
 //! EAM task actions (07-02, BKUP-02) — the read-heavy surface with
-//! guarded writes. Reads: run history (the runtime seam — the
-//! controller state gate classifies honestly) and task definitions
-//! (the config-resource seam — available on stock gateways).
+//! guarded writes, now carrying the full write LIFECYCLE (10-03).
+//! Reads: run history (the runtime seam — the controller state gate
+//! classifies honestly) and task definitions (the config-resource
+//! seam — available on stock gateways). Writes: create (the guard
+//! ladder), suspend/resume/cancel (find-first lifecycle verbs),
+//! modify (full-record RMW) and delete (signature-keyed) — every
+//! verb preceded by the blast-radius preview composer
+//! ([`build_blast_radius`]) when the caller needs the pre-flight.
 //!
 //! Two-layer naming (LOCKED): the CLIENT models are wire-faithful;
 //! HERE the agent-stable summary re-exposes under unit-explicit keys
@@ -15,7 +20,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::client::GatewayApi;
-use crate::client::eam::{EamHistoryItem, EamTaskRecord};
+use crate::client::eam::{EamHistoryItem, EamScheduledTask, EamTaskRecord};
 use crate::error::CoreError;
 
 /// The planner-locked create ladder's verdict (07-02 Task 3) — a
@@ -316,6 +321,269 @@ pub async fn eam_task_force(
     })
 }
 
+// ---- 10-03 Task 1: the runtime lifecycle (suspend/resume/cancel) ----
+//
+// Capture-locked per 10-LIVE-CAPTURES.md (both rigs, 8.3.3 + 8.3.6):
+// the verbs 204 on success and PERSIST `config.profile.isSuspended`
+// (Decision 1); failures are 500s with indistinguishable Jetty HTML
+// (§7) — so find-before-write is the ONLY honest name validation,
+// and each action carries an authoritative re-check of verb
+// applicability BEFORE the write fires (the task_create double-check
+// pattern: main.rs/TUI pre-resolve on the same pure fns).
+
+/// `ign eam task suspend|resume|cancel` output model — all keys
+/// always (the agent-stable shape; nulls are honest absence).
+#[derive(Debug, Serialize)]
+pub struct EamLifecycleResult {
+    /// The lifecycle target's name.
+    pub task: String,
+    /// What ran: `"suspended"`, `"resumed"`, or `"cancelled"`.
+    pub action: String,
+    /// The find healthcheck's `currentState` BEFORE the write (the
+    /// captured vocabulary rides [`crate::client::eam::EAM_CURRENT_STATES`]).
+    pub previous_state: Option<String>,
+    /// The post-write find read-back of `config.profile.isSuspended`
+    /// — the capture-locked persistence proof (suspend ⇒ `true`,
+    /// resume ⇒ `false`, 10-LIVE-CAPTURES Decision 1). `null` for
+    /// cancel (no definition flag rides that verb).
+    pub config_suspended: Option<bool>,
+    /// cancel only: the POST-write pending read filtered to the task
+    /// — `null` when nothing was pending (the honest no-op) or the
+    /// pending row is gone (the cancel landed). Suspend/resume leave
+    /// it `null` (they target the scheduler trigger, not a row).
+    pub pending: Option<EamScheduledTask>,
+    /// Whether the lifecycle POST actually rode the wire. Carries the
+    /// cancel no-op honesty (`fired: false` ⇔ the no-op result's
+    /// "`cancelled: false`") — a write we declined to fire is
+    /// reported, never disguised as a success.
+    pub fired: bool,
+    /// Why nothing fired: `"no pending execution"` on the cancel
+    /// no-op, or the gateway's own `canCancel=false` report on an
+    /// uncancellable row. Always `null` on a fired write.
+    pub reason: Option<String>,
+}
+
+/// The lifecycle name precheck (pure, ZERO network — the
+/// guard-ladder three-place rule: main.rs pre-resolution, the TUI's
+/// Confirm gating, and the action's authoritative re-check all call
+/// THIS fn). Name-empty/whitespace refusals ONLY — every other
+/// applicability question needs the find (the action's Tier-3 job),
+/// and inventing state rules the captures don't support is exactly
+/// the wire-dishonesty pitfall.
+pub fn lifecycle_precheck(action: &str, task_name: &str) -> Result<(), CoreError> {
+    if task_name.trim().is_empty() {
+        return Err(CoreError::InvalidInput {
+            reason: format!("eam task {action}: the task name must not be empty/whitespace"),
+        });
+    }
+    Ok(())
+}
+
+/// The suspend re-check (pure): the capture-locked refusal branch.
+/// A suspended task's trigger is parked (`nextScheduled: "N/A"`,
+/// `currentState: "Suspended"` — 10-LIVE-CAPTURES §1c), so the
+/// gateway's own answer to the POST is the INDISTINGUISHABLE 500
+/// "Task could not be suspended" (§1a/§7 — same answer an
+/// unknown-name or OnDemand suspend gets). When find PROVES
+/// `isSuspended: true`, refuse pre-write exit 2 naming the task —
+/// a distinct, actionable message instead of the ambiguous page.
+/// Anything else (`false`, absent, unparseable) fires — no invented
+/// state machine.
+pub fn suspend_recheck(record: &EamTaskRecord) -> Result<(), CoreError> {
+    let suspended = record
+        .config
+        .get("profile")
+        .and_then(|profile| profile.get("isSuspended"))
+        .and_then(Value::as_bool);
+    if suspended == Some(true) {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "task {:?} is already suspended (config.profile.isSuspended=true) — \
+                 nothing to suspend; `eam task resume` it first",
+                record.name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The cancel decision (pure) over the task's pending row (from the
+/// scheduled reads, filtered to the name). Every branch mirrors a
+/// captured fact — nothing here is an invented state machine:
+///
+/// - [`CancelDecision::Fire`] — a pending row with `canCancel: true`
+///   (the captured `Scheduled` cell, §2): the gateway says the
+///   cancel CAN fire.
+/// - [`CancelDecision::NoPending`] — no row: the gateway's own
+///   answer to cancel-with-nothing-pending is a SILENT 204 (§7) —
+///   mirrored as an honest no-op result WITHOUT the wire round trip
+///   (`fired: false`, reason `"no pending execution"`).
+/// - [`CancelDecision::NotPermitted`] — a row whose `canCancel` is
+///   `false` (an unobserved cell — Running rows never materialized
+///   on the capture rigs): the gateway's own capability flag says
+///   no; the flag is reported verbatim, the POST is not fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelDecision {
+    /// Fire the cancel POST (a pending, cancellable execution exists).
+    Fire,
+    /// Honest no-op — nothing pending (`fired: false`).
+    NoPending,
+    /// Honest no-op — the row's `canCancel` is `false` (`fired: false`).
+    NotPermitted,
+}
+
+/// The pure decision read (see [`CancelDecision`]).
+pub fn cancel_decision(pending: Option<&EamScheduledTask>) -> CancelDecision {
+    match pending {
+        None => CancelDecision::NoPending,
+        Some(row) if row.can_cancel => CancelDecision::Fire,
+        Some(_) => CancelDecision::NotPermitted,
+    }
+}
+
+/// The find healthcheck's `currentState` (pure projection).
+fn current_state_of(record: &EamTaskRecord) -> Option<String> {
+    record
+        .scheduled_task_state
+        .as_ref()
+        .and_then(|state| state.get("currentState"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The definition flag `config.profile.isSuspended` (pure projection).
+fn is_suspended_of(record: &EamTaskRecord) -> Option<bool> {
+    record
+        .config
+        .get("profile")
+        .and_then(|profile| profile.get("isSuspended"))
+        .and_then(Value::as_bool)
+}
+
+/// The task's pending row from BOTH literal scheduled segments
+/// (`false` then `true` — 10-LIVE-CAPTURES §2; both answered 200,
+/// the quiet body is an honest empty list §8), filtered to the task
+/// name. Tolerates rows for other tasks (they're other tasks' state).
+async fn pending_row_for(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<Option<EamScheduledTask>, CoreError> {
+    for running in [false, true] {
+        for row in api.eam_tasks_scheduled(running).await? {
+            if row.name == name {
+                return Ok(Some(row));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `ign eam task suspend` — find (the unknown-name 500 is
+/// indistinguishable on this seam, §7 — the config-resource find's
+/// `not_found` is the honest refusal) → the authoritative
+/// already-suspended re-check → the POST → the find read-back that
+/// reports the capture-locked `isSuspended` persistence (Decision 1).
+/// A suspended task refuses exit 2 BEFORE the wire; an OnDemand or
+/// untriggered task FIRES and reports the gateway's verbatim 500
+/// (wire honesty over cleverness — no invented rules).
+pub async fn eam_task_suspend(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<EamLifecycleResult, CoreError> {
+    lifecycle_precheck("suspend", name)?;
+    let record = api.eam_task_find(name).await?;
+    let previous_state = current_state_of(&record);
+    suspend_recheck(&record)?;
+    api.eam_task_suspend(name).await?;
+    // Decision 1: the runtime verbs PERSIST the flag into the
+    // definition — the read-back is the proof the result reports.
+    let readback = api.eam_task_find(name).await?;
+    Ok(EamLifecycleResult {
+        task: name.to_string(),
+        action: "suspended".to_string(),
+        previous_state,
+        config_suspended: is_suspended_of(&readback),
+        pending: None,
+        fired: true,
+        reason: None,
+    })
+}
+
+/// `ign eam task resume` — the suspend inverse with NO refusal
+/// re-check: the capture answers resume of a never-suspended task
+/// with a silent 204 (§1b) — the gateway accepts the verb regardless,
+/// so we fire and report (wire honesty over cleverness). The
+/// read-back reports the persisted flag honestly whatever it is.
+pub async fn eam_task_resume(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<EamLifecycleResult, CoreError> {
+    lifecycle_precheck("resume", name)?;
+    let record = api.eam_task_find(name).await?;
+    let previous_state = current_state_of(&record);
+    api.eam_task_resume(name).await?;
+    let readback = api.eam_task_find(name).await?;
+    Ok(EamLifecycleResult {
+        task: name.to_string(),
+        action: "resumed".to_string(),
+        previous_state,
+        config_suspended: is_suspended_of(&readback),
+        pending: None,
+        fired: true,
+        reason: None,
+    })
+}
+
+/// `ign eam task cancel` — find (unknown names answer a SILENT 204
+/// on this seam, §7 — cancel can never be a name-validation tool;
+/// the config-resource find's `not_found` is) → the pending reads →
+/// the pure [`cancel_decision`] → fire or honest no-op → the
+/// post-write pending read (`pending` reports what REMAINS).
+pub async fn eam_task_cancel(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<EamLifecycleResult, CoreError> {
+    lifecycle_precheck("cancel", name)?;
+    let record = api.eam_task_find(name).await?;
+    let previous_state = current_state_of(&record);
+    let pending = pending_row_for(api, name).await?;
+    match cancel_decision(pending.as_ref()) {
+        CancelDecision::Fire => {
+            api.eam_task_cancel(name).await?;
+            let after = pending_row_for(api, name).await?;
+            Ok(EamLifecycleResult {
+                task: name.to_string(),
+                action: "cancelled".to_string(),
+                previous_state,
+                config_suspended: None,
+                pending: after,
+                fired: true,
+                reason: None,
+            })
+        }
+        CancelDecision::NoPending => Ok(EamLifecycleResult {
+            task: name.to_string(),
+            action: "cancelled".to_string(),
+            previous_state,
+            config_suspended: None,
+            pending: None,
+            fired: false,
+            reason: Some("no pending execution".to_string()),
+        }),
+        CancelDecision::NotPermitted => Ok(EamLifecycleResult {
+            task: name.to_string(),
+            action: "cancelled".to_string(),
+            previous_state,
+            config_suspended: None,
+            pending,
+            fired: false,
+            reason: Some(
+                "the gateway reports canCancel=false for the pending execution".to_string(),
+            ),
+        }),
+    }
+}
+
 /// `ign eam history` output model — all keys always.
 #[derive(Debug, Serialize)]
 pub struct EamHistoryResult {
@@ -426,9 +694,11 @@ fn summary_from(record: &EamTaskRecord) -> EamTaskSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        EamTaskRecord, TaskCreateVerdict, auto_type, compose_task_definition, deep_merge,
-        parse_setting, summary_from, task_create_guard,
+        CancelDecision, EamLifecycleResult, EamTaskRecord, TaskCreateVerdict, auto_type,
+        cancel_decision, compose_task_definition, deep_merge, lifecycle_precheck, parse_setting,
+        summary_from, suspend_recheck, task_create_guard,
     };
+    use crate::client::eam::EamScheduledTask;
 
     /// The ladder EXHAUSTIVELY over the openapi taxonomy's 11 types
     /// × the schedule modes — the planner-locked breadth pinned as a
@@ -691,5 +961,151 @@ mod tests {
         assert_eq!(summary.task_type, None);
         assert_eq!(summary.schedule_mode, None);
         assert_eq!(summary.current_state, None);
+    }
+
+    // ---- 10-03 Task 1: the runtime lifecycle ----
+
+    /// The lifecycle result model serializes ALL keys always (the
+    /// agent-stable shape — nulls are honest absence, never omitted
+    /// keys), for both a fired write and the cancel no-op.
+    #[test]
+    fn lifecycle_result_serializes_all_keys_always() {
+        let fired = EamLifecycleResult {
+            task: "nightly-backup".to_string(),
+            action: "suspended".to_string(),
+            previous_state: Some("Scheduled".to_string()),
+            config_suspended: Some(true),
+            pending: None,
+            fired: true,
+            reason: None,
+        };
+        let json = serde_json::to_value(&fired).expect("serializes");
+        let map = json.as_object().expect("object shape");
+        for key in [
+            "task",
+            "action",
+            "previous_state",
+            "config_suspended",
+            "pending",
+            "fired",
+            "reason",
+        ] {
+            assert!(map.contains_key(key), "key {key} always rides");
+        }
+        assert_eq!(json["pending"], serde_json::Value::Null);
+        assert_eq!(json["reason"], serde_json::Value::Null);
+        assert_eq!(json["config_suspended"], serde_json::json!(true));
+
+        let noop = EamLifecycleResult {
+            task: "t".to_string(),
+            action: "cancelled".to_string(),
+            previous_state: None,
+            config_suspended: None,
+            pending: None,
+            fired: false,
+            reason: Some("no pending execution".to_string()),
+        };
+        let json = serde_json::to_value(&noop).expect("serializes");
+        assert_eq!(json["fired"], serde_json::json!(false));
+        assert_eq!(json["reason"], serde_json::json!("no pending execution"));
+        assert_eq!(
+            json["previous_state"],
+            serde_json::Value::Null,
+            "no state on a find that carried none — null, not omitted"
+        );
+    }
+
+    /// The pure name precheck refuses empty/whitespace names exit 2
+    /// (and ONLY those — every other question needs the find).
+    #[test]
+    fn lifecycle_precheck_refuses_empty_and_whitespace_names() {
+        for name in ["", "   ", "\t\n"] {
+            for action in ["suspend", "resume", "cancel"] {
+                let err = lifecycle_precheck(action, name)
+                    .expect_err("empty/whitespace names refuse");
+                assert_eq!(err.exit_code(), 2, "usage class");
+                assert_eq!(err.code(), "invalid_input");
+                let message = err.to_string();
+                assert!(
+                    message.contains(action),
+                    "the refusal names the verb: {message}"
+                );
+            }
+        }
+        lifecycle_precheck("suspend", "nightly-backup").expect("real names pass");
+        lifecycle_precheck("cancel", " x ").expect("trimmed-nonempty passes (the gateway owns identifier rules)");
+    }
+
+    /// The suspend re-check (pure) refuses ONLY the capture-proven
+    /// already-suspended case (exit 2 naming the task); false,
+    /// absent, and unparseable flags all fire.
+    #[test]
+    fn suspend_recheck_refuses_only_already_suspended() {
+        let record_of = |is_suspended: serde_json::Value| -> EamTaskRecord {
+            serde_json::from_value(serde_json::json!({
+                "name": "nightly-backup",
+                "config": {"profile": {"isSuspended": is_suspended}}
+            }))
+            .expect("record parses")
+        };
+
+        let err = suspend_recheck(&record_of(serde_json::json!(true)))
+            .expect_err("already-suspended refuses pre-write");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_input");
+        let message = err.to_string();
+        assert!(
+            message.contains("nightly-backup") && message.contains("already suspended"),
+            "the refusal names the task + state: {message}"
+        );
+
+        suspend_recheck(&record_of(serde_json::json!(false)))
+            .expect("false fires (the normal case)");
+        suspend_recheck(&record_of(serde_json::Value::Null))
+            .expect("absent flag fires (no invented rules)");
+        suspend_recheck(&record_of(serde_json::json!("weird")))
+            .expect("unparseable flag fires (the gateway's 500 is the honest answer)");
+    }
+
+    /// The cancel decision (pure) over the pending row — every
+    /// branch mirrors a captured fact (the §2 can* truth cell, §7's
+    /// silent-204 nothing-pending answer).
+    #[test]
+    fn cancel_decision_branches_mirror_the_captures() {
+        assert_eq!(
+            cancel_decision(None),
+            CancelDecision::NoPending,
+            "nothing pending → the honest no-op, no doomed POST"
+        );
+
+        let row_of = |can_cancel: bool| -> EamScheduledTask {
+            serde_json::from_value(serde_json::json!({
+                "name": "nightly-backup",
+                "owner": "eam",
+                "type": "Collect Backup",
+                "execStart": null,
+                "message": "",
+                "repeats": true,
+                "canPause": true,
+                "canResume": false,
+                "canCancel": can_cancel,
+                "taskState": "Scheduled",
+                "isForced": false,
+                "isRunning": false,
+                "progress": 0.0
+            }))
+            .expect("the captured row shape parses")
+        };
+
+        assert_eq!(
+            cancel_decision(Some(&row_of(true))),
+            CancelDecision::Fire,
+            "the captured Scheduled cell (canCancel: true) fires"
+        );
+        assert_eq!(
+            cancel_decision(Some(&row_of(false))),
+            CancelDecision::NotPermitted,
+            "the gateway's own canCancel=false is reported, not overridden"
+        );
     }
 }
