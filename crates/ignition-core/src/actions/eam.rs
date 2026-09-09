@@ -16,11 +16,15 @@
 //! not-connected detail is an exit-0 read, never hidden, research
 //! Pitfall 3).
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::client::GatewayApi;
-use crate::client::eam::{EamHistoryItem, EamScheduledTask, EamTaskRecord};
+use crate::client::eam::{
+    DeleteOutcome, EamHistoryItem, EamScheduledTask, EamTaskRecord, ModifyOutcome, ResourceChange,
+};
 use crate::error::CoreError;
 
 /// The planner-locked create ladder's verdict (07-02 Task 3) — a
@@ -584,6 +588,354 @@ pub async fn eam_task_cancel(
     }
 }
 
+// ---- 10-03 Task 2: config mutations (modify + delete) ----
+//
+// Both are capture-locked: the PUT is a FULL-RECORD echo-modify
+// carrying the ORIGINAL signature (§6a — omitting config.settings is
+// the 422 trap, §6b/Decision 6), and the DELETE is signature-keyed
+// with the gateway-side confirm policy (§3 + Decision 3: NO confirm
+// by default; the unobserved confirm-demand shape retries ONCE with
+// confirm=true — never hard-coded).
+
+/// A targeted modify request (the keys the caller wants changed —
+/// everything else rides the found record untouched). Builder-ish:
+/// start from [`TaskChange::default`], set what applies.
+///
+/// **Deliberately ABSENT, per wire honesty:**
+///
+/// - **rename** — capture §5/Decision 5: a PUT with a changed `name`
+///   + the original signature answers **404 empty** (the modify
+///   route resolves the resource BY the body's name and finds
+///   nothing — no rename, no create, no error body). A rename verb
+///   must compose create-new + delete-old; that composite is the
+///   CLI tier's (10-04) documented workflow, NEVER this PUT.
+/// - **suspend flag** — capture §6a proved only a full-record echo
+///   (whose `isSuspended` happened to be `false`) landing; a
+///   PUT-DRIVEN `isSuspended` mutation is unproven. The
+///   capture-locked path for the flag is the suspend/resume VERBS
+///   (Decision 1) — so `TaskChange` carries no flag field at all
+///   rather than faking one.
+#[derive(Debug, Clone, Default)]
+pub struct TaskChange {
+    /// Flip the record's top-level `enabled` key.
+    pub enabled: Option<bool>,
+    /// Rewrite the record's top-level `description` key.
+    pub description: Option<String>,
+    /// Rewrite `config.profile.scheduleMode`. NOTE: scheduleDetails
+    /// rides ONLY via the found record's clone — schedule-mode
+    /// changes that also need a new cron/delay string are out of
+    /// this change's scope (the capture vocabulary: §12 — the wire
+    /// accepts the mode change; an unsupported pairing lands as
+    /// gateway-side state, visible in the read-back as data).
+    pub schedule_mode: Option<String>,
+    /// Deep-merge over the found `config.settings` (objects merge
+    /// recursively, arrays/scalars replace — the documented settings
+    /// semantics). The settings OBJECT always rides (the 422 trap).
+    pub settings_overlay: Option<Value>,
+}
+
+/// The `ign eam task modify` output model — all keys always.
+#[derive(Debug, Serialize)]
+pub struct EamModifyResult {
+    /// The post-write name (rename is NOT supported — always the
+    /// name as found).
+    pub task: String,
+    /// The dotted key paths the change touched: `"enabled"`,
+    /// `"description"`, `"config.profile.scheduleMode"`,
+    /// `"config.settings"`.
+    pub changed: Vec<String>,
+    /// The verbatim PUT body (the single record — the client wraps
+    /// it in the one-element array envelope): the agent's read-back
+    /// of exactly what was sent, signature + collection included.
+    pub definition: Value,
+    /// The captured 200 outcome
+    /// ([`ModifyOutcome`] — `changes[].newSignature` is
+    /// authoritative for the NEXT mutation, §6a; its `problem` rides
+    /// verbatim on the refusal shapes). `null` when a 2xx carried no
+    /// body (the lenient client Option).
+    pub put_outcome: Option<ModifyOutcome>,
+    /// The post-PUT find, serialized — the echo semantics make the
+    /// read-back meaningful (§6a: `newSignature` == read-back
+    /// signature, mutated keys landed, unknown round-trip keys
+    /// preserved). `null` when the read-back itself failed (the PUT
+    /// already succeeded — a read blip must not mask a landed write).
+    pub readback: Value,
+}
+
+/// The `ign eam task delete` output model — all keys always.
+#[derive(Debug, Serialize)]
+pub struct EamDeleteResult {
+    /// The deleted (or refused) task's name.
+    pub task: String,
+    /// Whether the gateway answered the captured success shape
+    /// (`success: true`, §3b).
+    pub deleted: bool,
+    /// The captured `changes[]` verbatim (the deleted resource's
+    /// final signature rides `changes[].newSignature`, §9).
+    pub changes: Vec<ResourceChange>,
+    /// Agent/resource names the delete touched: the `changes[]`
+    /// names plus any string-shaped `references` entries (the
+    /// affected-resources element shape is UNOBSERVED — §3d — so
+    /// the extraction is lenient: JSON strings ride; objects
+    /// contribute a `name` key when present).
+    pub affected: Vec<String>,
+}
+
+/// Apply the targeted mutations to the FULL-record clone (pure —
+/// the unit-testable core of [`eam_task_modify`]). Returns the
+/// dotted key paths touched. ONLY the targeted keys change:
+/// `config.settings`, `signature`, `collection`, and every
+/// unknown round-trip key ride the clone byte-for-byte (the
+/// never-compose-from-scratch invariant — compose_task_definition
+/// composes CREATE bodies and must never feed a modify).
+fn apply_task_change(body: &mut Value, change: &TaskChange) -> Vec<String> {
+    let mut changed = Vec::new();
+    let TaskChange {
+        enabled,
+        description,
+        schedule_mode,
+        settings_overlay,
+    } = change;
+    if let Some(enabled) = enabled {
+        *slot(body, "enabled") = Value::Bool(*enabled);
+        changed.push("enabled".to_string());
+    }
+    if let Some(description) = description {
+        *slot(body, "description") = Value::String(description.clone());
+        changed.push("description".to_string());
+    }
+    if let Some(schedule_mode) = schedule_mode {
+        let profile = slot(slot(body, "config"), "profile");
+        if !profile.is_object() {
+            *profile = Value::Object(Map::new());
+        }
+        *slot(profile, "scheduleMode") = Value::String(schedule_mode.clone());
+        changed.push("config.profile.scheduleMode".to_string());
+    }
+    if let Some(overlay) = settings_overlay {
+        let settings = slot(slot(body, "config"), "settings");
+        deep_merge(settings, overlay);
+        changed.push("config.settings".to_string());
+    }
+    changed
+}
+
+/// A mutable slot helper: ensures `parent` is an object and hands
+/// back the (created-if-absent) entry for `key`.
+fn slot<'a>(parent: &'a mut Value, key: &str) -> &'a mut Value {
+    if !parent.is_object() {
+        *parent = Value::Object(Map::new());
+    }
+    parent
+        .as_object_mut()
+        .expect("just ensured an object")
+        .entry(key.to_string())
+        .or_insert(Value::Null)
+}
+
+/// Serialize a record round-trip (the full-record clone — every key
+/// the find answered, unknown ones included, rides the Value).
+/// The model hoists the runtime healthcheck under a top-level
+/// `scheduledTaskState` key; when the find answer carried the state
+/// under `healthchecks` (the captured §0 envelope shape) that field
+/// is `None` and would serialize a null PLACEHOLDER — dropped here,
+/// so the clone is the find body + nothing (the PUT must never
+/// carry a key the wire never answered).
+fn record_to_value(record: &EamTaskRecord) -> Result<Value, CoreError> {
+    let mut value = serde_json::to_value(record).map_err(|err| {
+        CoreError::Internal(format!("task record failed to serialize for the clone: {err}"))
+    })?;
+    if value.get("scheduledTaskState") == Some(&Value::Null) {
+        if let Some(map) = value.as_object_mut() {
+            map.remove("scheduledTaskState");
+        }
+    }
+    Ok(value)
+}
+
+/// The stale-signature diagnostic (the client/eam.rs FINDING +
+/// capture Decision 4, classified HERE — the client stays
+/// classification-free): a signature mismatch answers HTTP 500 with
+/// a JSON `problem` whose stable `signature mismatch` substring
+/// never reaches this layer (the classifier's Internal fallback
+/// drops non-HTML bodies). Classify on EVIDENCE instead: a
+/// post-failure find whose signature differs from the one we sent
+/// PROVES a concurrent write (the capture also proves mismatches
+/// leave the resource untouched — §3a/§4 read-backs) — the
+/// client-fixable conflict rides exit 2 (re-run to apply against
+/// the current signature). No evidence → the original error
+/// propagates verbatim (no invented claims). No new slugs — the
+/// existing taxonomy exclusively.
+async fn reclassify_stale_signature(
+    api: &dyn GatewayApi,
+    name: &str,
+    sent_signature: &str,
+    err: CoreError,
+) -> CoreError {
+    let stale = matches!(
+        api.eam_task_find(name).await,
+        Ok(fresh) if fresh.signature.as_deref().is_some_and(|sig| sig != sent_signature)
+    );
+    if stale {
+        return CoreError::InvalidInput {
+            reason: format!(
+                "definition {name:?} changed concurrently (signature mismatch on write) — \
+                 the gateway answers mismatches with a 500 and leaves the resource untouched; \
+                 re-run to apply against the current signature"
+            ),
+        };
+    }
+    err
+}
+
+/// `ign eam task modify` — the FULL-RECORD read-modify-write
+/// (never compose-from-scratch: `config.settings: null` is the 422
+/// trap, §6b/Decision 6 — the create-composer composes CREATE
+/// bodies, not this): find (not_found honesty + the signature
+/// source) → clone EVERY key find answered → apply ONLY the
+/// targeted [`TaskChange`] keys → PUT the single-element array
+/// carrying the ORIGINAL signature + collection → the post-PUT find
+/// read-back (the echo semantics make it meaningful, §6a). An
+/// all-`None` change refuses exit 2 pre-network (a no-op PUT would
+/// still rotate the server-side signature).
+pub async fn eam_task_modify(
+    api: &dyn GatewayApi,
+    name: &str,
+    change: TaskChange,
+) -> Result<EamModifyResult, CoreError> {
+    lifecycle_precheck("modify", name)?;
+    let TaskChange {
+        enabled,
+        description,
+        schedule_mode,
+        settings_overlay,
+    } = &change;
+    if enabled.is_none()
+        && description.is_none()
+        && schedule_mode.is_none()
+        && settings_overlay.is_none()
+    {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "eam task modify {name:?}: no targeted keys — a modify must change \
+                 something (enabled / description / schedule-mode / settings overlay)"
+            ),
+        });
+    }
+
+    let record = api.eam_task_find(name).await?;
+    let signature = record.signature.clone().ok_or_else(|| CoreError::InvalidInput {
+        reason: format!(
+            "the found record for {name:?} carries no mutation signature — modify \
+             requires it (list-shape records don't carry one; re-find)"
+        ),
+    })?;
+    let mut body = record_to_value(&record)?;
+    let changed = apply_task_change(&mut body, &change);
+    let definition = body.clone();
+
+    let put_outcome = match api.eam_task_modify(&body).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return Err(reclassify_stale_signature(api, name, &signature, err).await);
+        }
+    };
+
+    let readback = match api.eam_task_find(name).await {
+        Ok(fresh) => record_to_value(&fresh)?,
+        Err(_) => Value::Null,
+    };
+
+    Ok(EamModifyResult {
+        task: name.to_string(),
+        changed,
+        definition,
+        put_outcome,
+        readback,
+    })
+}
+
+/// The lenient affected-names extraction (pure): `changes[]` names
+/// are capture-proven; `references` element shape is UNOBSERVED
+/// (§3d) — JSON strings ride, objects contribute a `name` key when
+/// present, everything else is skipped honestly. Deduped, wire
+/// order preserved.
+fn affected_resources(outcome: &DeleteOutcome) -> Vec<String> {
+    let mut names: Vec<String> = outcome
+        .changes
+        .iter()
+        .map(|change| change.name.clone())
+        .collect();
+    if let Some(references) = &outcome.references {
+        for reference in references {
+            match reference {
+                Value::String(name) => names.push(name.clone()),
+                Value::Object(map) => {
+                    if let Some(Value::String(name)) = map.get("name") {
+                        names.push(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+/// `ign eam task delete` — find first (the `not_found` honesty AND
+/// the signature source — never ask the caller for it) → DELETE
+/// with `?collection=core` and NO confirm (capture §3b/Decision 3:
+/// a lone-resource delete succeeds without it; hard-coding
+/// `confirm=true` would bypass a genuine multi-resource warning we
+/// cannot yet see) → on the body-level `success: false` (the
+/// UNOBSERVED confirm-demand shape, §3d) retry ONCE with
+/// `confirm=true` — the CLI's `--yes` gate already ran before this
+/// correctness-path action. Signature-mismatch 500s classify on
+/// evidence ([`reclassify_stale_signature`]).
+pub async fn eam_task_delete(
+    api: &dyn GatewayApi,
+    name: &str,
+) -> Result<EamDeleteResult, CoreError> {
+    lifecycle_precheck("delete", name)?;
+    let record = api.eam_task_find(name).await?;
+    let signature = record.signature.clone().ok_or_else(|| CoreError::InvalidInput {
+        reason: format!(
+            "the found record for {name:?} carries no mutation signature — delete \
+             is signature-keyed (list-shape records don't carry one; re-find)"
+        ),
+    })?;
+
+    let outcome = match api.eam_task_delete(name, &signature, false).await {
+        Ok(outcome) if outcome.success => outcome,
+        Ok(demand) => {
+            // The confirm-demand shape (success:false + the
+            // affected-resources evidence in references/changes) —
+            // the one sanctioned retry, Decision 3 as written.
+            let _ = demand;
+            match api.eam_task_delete(name, &signature, true).await {
+                Ok(retry) => retry,
+                Err(err) => {
+                    return Err(reclassify_stale_signature(api, name, &signature, err).await);
+                }
+            }
+        }
+        Err(err) => {
+            return Err(reclassify_stale_signature(api, name, &signature, err).await);
+        }
+    };
+
+    Ok(EamDeleteResult {
+        task: name.to_string(),
+        deleted: outcome.success,
+        changes: outcome.changes.clone(),
+        affected: affected_resources(&outcome),
+    })
+}
+
 /// `ign eam history` output model — all keys always.
 #[derive(Debug, Serialize)]
 pub struct EamHistoryResult {
@@ -694,11 +1046,12 @@ fn summary_from(record: &EamTaskRecord) -> EamTaskSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelDecision, EamLifecycleResult, EamTaskRecord, TaskCreateVerdict, auto_type,
-        cancel_decision, compose_task_definition, deep_merge, lifecycle_precheck, parse_setting,
-        summary_from, suspend_recheck, task_create_guard,
+        CancelDecision, EamLifecycleResult, EamTaskRecord, TaskChange, TaskCreateVerdict,
+        affected_resources, apply_task_change, auto_type, cancel_decision,
+        compose_task_definition, deep_merge, lifecycle_precheck, parse_setting, summary_from,
+        suspend_recheck, task_create_guard,
     };
-    use crate::client::eam::EamScheduledTask;
+    use crate::client::eam::{DeleteOutcome, EamScheduledTask};
 
     /// The ladder EXHAUSTIVELY over the openapi taxonomy's 11 types
     /// × the schedule modes — the planner-locked breadth pinned as a
@@ -1106,6 +1459,170 @@ mod tests {
             cancel_decision(Some(&row_of(false))),
             CancelDecision::NotPermitted,
             "the gateway's own canCancel=false is reported, not overridden"
+        );
+    }
+
+    // ---- 10-03 Task 2: modify + delete ----
+
+    /// The FULL-record fixture — the captured find shape (§0's key
+    /// inventory: type/name/description/enabled/version/collection/
+    /// collections/signature/config{profile,settings}/data/
+    /// attributes/metrics/healthchecks) with the §6a baseline values.
+    fn full_record_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "type": "com.inductiveautomation.eam/eam-tasks",
+            "name": "ign-p10-scratch-sched",
+            "description": "scratch",
+            "enabled": true,
+            "version": 1,
+            "collection": "core",
+            "collections": ["core"],
+            "signature": "e5ac8bee3a6ba85e40923c0e02d29507600c57519eb8e4d78bd8c258197fe9c6",
+            "config": {
+                "profile": {
+                    "type": "eam_backup",
+                    "isSuspended": false,
+                    "scheduleMode": "Scheduled",
+                    "scheduleDetails": "0/30 * * * * ?"
+                },
+                "settings": {
+                    "targetGateways": ["_controller"],
+                    "targetGroups": [],
+                    "concurrentBackups": 0,
+                    "forceBackups": false
+                }
+            },
+            "data": ["config.json"],
+            "attributes": {"uuid": "c1aa2b52-46ad-46ea-962b-9d2498f35db1", "enabled": true},
+            "metrics": {},
+            "healthchecks": {"scheduledTaskState": {"currentState": "Scheduled"}}
+        })
+    }
+
+    /// THE never-compose-from-scratch invariant: the modify PUT body
+    /// preserves the fixture's config.settings byte-equal on a
+    /// settings-free change; ONLY targeted keys move; signature/
+    /// collection/unknown round-trip keys ride the clone untouched.
+    #[test]
+    fn modify_put_body_preserves_the_fixture_record_except_targeted_keys() {
+        // A description-only change: EVERYTHING else byte-equal.
+        let mut body = full_record_fixture();
+        let changed = apply_task_change(
+            &mut body,
+            &TaskChange {
+                description: Some("rewritten note".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(changed, vec!["description"]);
+        let fixture = full_record_fixture();
+        assert_eq!(
+            body["config"]["settings"], fixture["config"]["settings"],
+            "config.settings rides VERBATIM — omitting/reshaping it is the 422 trap"
+        );
+        assert_eq!(body["signature"], fixture["signature"], "the ORIGINAL signature");
+        assert_eq!(body["collection"], fixture["collection"]);
+        assert_eq!(body["config"]["profile"], fixture["config"]["profile"]);
+        assert_eq!(body["data"], fixture["data"], "unknown round-trip keys survive");
+        assert_eq!(body["attributes"], fixture["attributes"]);
+        assert_eq!(body["description"], serde_json::json!("rewritten note"));
+
+        // Targeted enabled + settings overlay: ONLY those keys move
+        // (the overlay deep-merges; the rest of settings stays).
+        let mut body = full_record_fixture();
+        let changed = apply_task_change(
+            &mut body,
+            &TaskChange {
+                enabled: Some(false),
+                settings_overlay: Some(serde_json::json!({"concurrentBackups": 4})),
+                ..Default::default()
+            },
+        );
+        assert_eq!(changed, vec!["enabled", "config.settings"]);
+        assert_eq!(body["enabled"], serde_json::json!(false));
+        let mut expected_settings = fixture["config"]["settings"].clone();
+        expected_settings["concurrentBackups"] = serde_json::json!(4);
+        assert_eq!(body["config"]["settings"], expected_settings);
+        assert_eq!(body["signature"], fixture["signature"]);
+
+        // A schedule-mode change touches ONLY the profile's mode key.
+        let mut body = full_record_fixture();
+        let changed = apply_task_change(
+            &mut body,
+            &TaskChange {
+                schedule_mode: Some("OnDemand".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(changed, vec!["config.profile.scheduleMode"]);
+        assert_eq!(body["config"]["profile"]["scheduleMode"], serde_json::json!("OnDemand"));
+        assert_eq!(
+            body["config"]["profile"]["scheduleDetails"],
+            fixture["config"]["profile"]["scheduleDetails"],
+            "scheduleDetails rides the clone (this change's scope is the mode key)"
+        );
+        assert_eq!(body["config"]["settings"], fixture["config"]["settings"]);
+    }
+
+    /// The modify result model serializes ALL keys always.
+    #[test]
+    fn modify_result_serializes_all_keys_always() {
+        let result = super::EamModifyResult {
+            task: "t".to_string(),
+            changed: vec!["enabled".to_string()],
+            definition: serde_json::json!({"name": "t"}),
+            put_outcome: None,
+            readback: serde_json::Value::Null,
+        };
+        let json = serde_json::to_value(&result).expect("serializes");
+        for key in ["task", "changed", "definition", "put_outcome", "readback"] {
+            assert!(json.as_object().unwrap().contains_key(key), "{key} always rides");
+        }
+        assert_eq!(json["put_outcome"], serde_json::Value::Null);
+    }
+
+    /// The delete result's affected-names extraction: `changes[]`
+    /// names are capture-proven; the `references` element shape is
+    /// UNOBSERVED (§3d) — strings ride, name-keyed objects
+    /// contribute, the rest is skipped honestly; dedup, wire order.
+    #[test]
+    fn delete_result_extracts_affected_names_from_changes_and_references() {
+        let success: DeleteOutcome = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "changes": [
+                {
+                    "name": "ign-p10-scratch-sched",
+                    "type": "com.inductiveautomation.eam/eam-tasks",
+                    "collection": "core",
+                    "newSignature": "ec961ee921c63b18013094870ed2664331e965c4770fdf84bfe136e0b4164244"
+                }
+            ],
+            "problem": null,
+            "references": []
+        }))
+        .expect("the captured success body parses");
+        assert_eq!(
+            affected_resources(&success),
+            vec!["ign-p10-scratch-sched".to_string()],
+            "a lone-resource delete touches exactly the deleted resource"
+        );
+
+        // The confirm-demand shape is UNOBSERVED — the extraction is
+        // lenient over spec-shaped reference elements (marked as
+        // such; nothing here is capture-proven beyond `[]`/null).
+        let demanded: DeleteOutcome = serde_json::from_value(serde_json::json!({
+            "success": false,
+            "changes": [
+                {"name": "task-a", "type": "com.inductiveautomation.eam/eam-tasks", "collection": "core", "newSignature": "x"}
+            ],
+            "problem": null,
+            "references": ["agent-b", {"name": "task-c"}, {"shapeless": true}, 42, "task-a"]
+        }))
+        .expect("the lenient shape parses");
+        assert_eq!(
+            affected_resources(&demanded),
+            vec!["task-a".to_string(), "agent-b".to_string(), "task-c".to_string()],
+            "strings + name-keyed objects ride; shapeless elements skipped; dedup holds"
         );
     }
 }

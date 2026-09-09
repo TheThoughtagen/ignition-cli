@@ -1440,3 +1440,332 @@ async fn cancel_action_fires_against_a_cancellable_row() {
     );
     assert_eq!(result.previous_state.as_deref(), Some("Scheduled"));
 }
+
+// ---- 10-03 Task 2: the modify/delete ACTION layer ----
+
+/// The full find fixture for the modify action (the §6a baseline +
+/// the §0 key inventory — everything find answers rides the clone).
+fn modify_find_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "type": "com.inductiveautomation.eam/eam-tasks",
+        "name": "ign-p10-scratch-sched",
+        "description": "scratch",
+        "enabled": true,
+        "version": 1,
+        "collection": "core",
+        "collections": ["core"],
+        "signature": "e5ac8bee3a6ba85e40923c0e02d29507600c57519eb8e4d78bd8c258197fe9c6",
+        "config": {
+            "profile": {
+                "type": "eam_backup",
+                "isSuspended": false,
+                "scheduleMode": "Scheduled",
+                "scheduleDetails": "0/30 * * * * ?"
+            },
+            "settings": {
+                "targetGateways": ["_controller"],
+                "targetGroups": [],
+                "concurrentBackups": 0,
+                "forceBackups": false
+            }
+        },
+        "data": ["config.json"],
+        "attributes": {"uuid": "c1aa2b52-46ad-46ea-962b-9d2498f35db1", "enabled": true},
+        "metrics": {},
+        "healthchecks": {
+            "scheduledTaskState": {
+                "currentState": "Scheduled",
+                "details": {"owner": "eam", "nextScheduled": "1788947835694"}
+            }
+        }
+    })
+}
+
+const MODIFY_FIND_PATH: &str =
+    "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/ign%2Dp10%2Dscratch%2Dsched";
+
+/// THE modify action pin: find → clone EVERY key → enabled-only
+/// mutation → the PUT body is the FULL single record (settings,
+/// signature, collection, unknown round-trip keys ALL present —
+/// the never-compose-from-scratch invariant ON THE WIRE) → the
+/// post-PUT find read-back rides the result.
+#[tokio::test]
+async fn modify_action_preserves_the_full_record_on_the_wire() {
+    let mock = IgnitionMock::start().await;
+    let fixture = modify_find_fixture();
+    let mut post_write = fixture.clone();
+    post_write["enabled"] = serde_json::json!(false);
+    post_write["signature"] =
+        serde_json::json!("0d0dfea2919abb1f02fc86baea73d99696626524169a9ac36526044f89ac16e0");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(MODIFY_FIND_PATH))
+        .respond_with(find_responder(fixture.clone(), post_write.clone()))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let mut expected_body = fixture.clone();
+    expected_body["enabled"] = serde_json::json!(false);
+    let put = wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path(TASKS_CREATE_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "success": true,
+                "changes": [
+                    {
+                        "name": "ign-p10-scratch-sched",
+                        "type": "com.inductiveautomation.eam/eam-tasks",
+                        "collection": "core",
+                        "newSignature": "0d0dfea2919abb1f02fc86baea73d99696626524169a9ac36526044f89ac16e0"
+                    }
+                ],
+                "problem": null
+            }),
+        ))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_modify(
+        &api,
+        "ign-p10-scratch-sched",
+        ignition_core::actions::eam::TaskChange {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the full-record RMW completes");
+    assert_eq!(result.task, "ign-p10-scratch-sched");
+    assert_eq!(result.changed, vec!["enabled".to_string()]);
+    assert_eq!(
+        result.put_outcome.as_ref().expect("the 200 body rode").success,
+        true
+    );
+    assert_eq!(
+        result.put_outcome.as_ref().unwrap().changes[0].new_signature.as_deref(),
+        Some("0d0dfea2919abb1f02fc86baea73d99696626524169a9ac36526044f89ac16e0"),
+        "newSignature is authoritative for the NEXT mutation (§6a)"
+    );
+    assert_eq!(
+        result.readback["signature"],
+        post_write["signature"],
+        "the read-back proves the landing"
+    );
+    assert_eq!(
+        result.definition["config"]["settings"],
+        fixture["config"]["settings"],
+        "the verbatim PUT body preserved config.settings"
+    );
+
+    // THE wire pin: the PUT body is the FULL single-element array —
+    // the expected body is the fixture with ONLY `enabled` moved.
+    let requests = put.received_requests().await;
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("body parses");
+    assert_eq!(
+        body,
+        serde_json::json!([expected_body]),
+        "never-compose-from-scratch ON THE WIRE: every find key rides, only the targeted key moved"
+    );
+}
+
+/// The delete action derives the signature FROM find (no signature
+/// parameter on the public fn) and the default delete carries NO
+/// confirm param (Decision 3 — never hard-coded): the captured §3b
+/// success body lands `deleted: true` + the affected names.
+#[tokio::test]
+async fn delete_action_derives_the_signature_and_sends_no_confirm() {
+    let mock = IgnitionMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "name": "nightly-backup",
+                "collection": "core",
+                "signature": "sig-abc123",
+                "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}},
+                "scheduledTaskState": {"currentState": "Stopped", "details": {"owner": "eam"}}
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path(TASKS_DELETE_PATH))
+        .and(wiremock::matchers::query_param("collection", "core"))
+        .and(wiremock::matchers::query_param_is_missing("confirm"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "success": true,
+                "changes": [
+                    {
+                        "name": "nightly-backup",
+                        "type": "com.inductiveautomation.eam/eam-tasks",
+                        "collection": "core",
+                        "newSignature": "ec961ee921c63b18013094870ed2664331e965c4770fdf84bfe136e0b4164244"
+                    }
+                ],
+                "problem": null,
+                "references": []
+            }),
+        ))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_delete(&api, "nightly-backup")
+        .await
+        .expect("the delete completes");
+    assert_eq!(result.task, "nightly-backup");
+    assert!(result.deleted);
+    assert_eq!(
+        result.changes[0].new_signature.as_deref(),
+        Some("ec961ee921c63b18013094870ed2664331e965c4770fdf84bfe136e0b4164244"),
+        "the DELETED resource's final signature rides changes[] (§9)"
+    );
+    assert_eq!(
+        result.affected,
+        vec!["nightly-backup".to_string()],
+        "a lone-resource delete touches exactly the deleted resource"
+    );
+    let requests = guard.received_requests().await;
+    assert_eq!(
+        requests[0].url.query(),
+        Some("collection=core"),
+        "NO confirm on the default delete (Decision 3)"
+    );
+}
+
+/// The confirm-demand retry (Decision 3 as written): a body-level
+/// `success: false` (the UNOBSERVED §3d shape — spec-shaped fixture)
+/// re-runs ONCE with confirm=true; the confirmed answer is the
+/// result. Hard-coding confirm on the FIRST attempt is forbidden —
+/// it would bypass a genuine multi-resource warning.
+#[tokio::test]
+async fn delete_action_retries_with_confirm_on_the_demand_shape() {
+    let mock = IgnitionMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "name": "nightly-backup",
+                "collection": "core",
+                "signature": "sig-abc123",
+                "config": {"profile": {"type": "eam_backup", "scheduleMode": "Scheduled"}}
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // First attempt (no confirm): the confirm-demand answer.
+    wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path(TASKS_DELETE_PATH))
+        .and(wiremock::matchers::query_param("collection", "core"))
+        .and(wiremock::matchers::query_param_is_missing("confirm"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "success": false,
+                "changes": [],
+                "problem": null,
+                "references": [
+                    {"name": "dependent-thing", "type": "some/dependent-type"}
+                ]
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // The one sanctioned retry: confirm=true + collection=core.
+    wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path(TASKS_DELETE_PATH))
+        .and(wiremock::matchers::query_param("collection", "core"))
+        .and(wiremock::matchers::query_param("confirm", "true"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "success": true,
+                "changes": [
+                    {
+                        "name": "nightly-backup",
+                        "type": "com.inductiveautomation.eam/eam-tasks",
+                        "collection": "core",
+                        "newSignature": "e3610cfe01c7df086da6596ccfbb7735abd5b8f2ceafd5916944919975902acf"
+                    }
+                ],
+                "problem": null,
+                "references": []
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let result = ignition_core::actions::eam::eam_task_delete(&api, "nightly-backup")
+        .await
+        .expect("the confirm retry lands the delete");
+    assert!(result.deleted);
+    assert_eq!(
+        result.affected,
+        vec!["nightly-backup".to_string()],
+        "the confirmed delete's references are honestly empty"
+    );
+}
+
+/// The stale-signature diagnostic at the ACTION layer (the
+/// client/eam.rs FINDING, classified on EVIDENCE — the `signature
+/// mismatch` substring never reaches this layer): the 500 mismatch
+/// + a post-failure find showing a DIFFERENT signature (a concurrent
+/// write — captures prove mismatches leave the resource untouched)
+/// maps to exit 2 invalid_input with re-run guidance. No new slugs.
+#[tokio::test]
+async fn delete_action_maps_a_proven_stale_signature_to_exit_2() {
+    let mock = IgnitionMock::start().await;
+    let fresh = |sig: &str| {
+        serde_json::json!({
+            "name": "nightly-backup",
+            "collection": "core",
+            "signature": sig,
+            "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}}
+        })
+    };
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(TASKS_FIND_PATH))
+        .respond_with(find_responder(fresh("sig-abc123"), fresh("sig-concurrent")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    // The captured §3a mismatch body (8.3.6 verbatim message).
+    wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path(TASKS_DELETE_PATH))
+        .and(wiremock::matchers::query_param("collection", "core"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_json(
+            serde_json::json!({
+                "success": false,
+                "changes": [],
+                "problem": {
+                    "message": "DELETE illegal: signature mismatch for 'ResourceId{resourcePath=com.inductiveautomation.eam/eam-tasks/nightly-backup, collectionName=core}'",
+                    "stacktrace": ["com.inductiveautomation.ignition.common.resourcecollection.PushException: DELETE illegal: signature mismatch for …"]
+                },
+                "references": null
+            }),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let err = ignition_core::actions::eam::eam_task_delete(&api, "nightly-backup")
+        .await
+        .expect_err("the stale-signature write refuses");
+    assert_eq!(err.exit_code(), 2, "client-fixable — the usage class");
+    assert_eq!(err.code(), "invalid_input");
+    let message = err.to_string();
+    assert!(
+        message.contains("changed concurrently") && message.contains("signature mismatch"),
+        "the diagnostic names the conflict + the re-run path: {message}"
+    );
+}
