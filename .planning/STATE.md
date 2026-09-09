@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 in progress (capture-first plan 01 executed; client/action/CLI/gate plans 02–05 remain)
+**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 in progress (plans 01 captures + 02 client surface executed; action/CLI/gate plans 03–05 remain)
 
 ## Current Position
 
 **Phase:** 10 of 14 (10-eam-write-operations)
-**Current Plan:** 1 of 5 COMPLETE (10-01 live captures — dual-rig EAM wire truth + Decisions-locked section)
+**Current Plan:** 2 of 5 COMPLETE (10-02 client surface — 8 EAM write trait methods + 29 REQUEST-pinning contract tests, capture-locked)
 **Total Plans in Phase:** 5
-**Status:** In progress — ready for 10-02 (client models cite 10-LIVE-CAPTURES.md Decisions-locked-by-captures)
+**Status:** In progress — ready for 10-03 (action layer builds on trait methods + outcome models + signature-mismatch FINDING)
 **Last Activity:** 2026-09-09
 
-**Progress:** [█████████░] 93%
+**Progress:** [██████████] 94%
 
 ## Performance Metrics
 
@@ -49,6 +49,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 09 P08 | 138 min | 2 tasks | 5 files |
 | Phase 09 P07 | 167 min | 3 tasks | 9 files |
 | Phase 10 P01 | 24 min | 2 tasks | 2 files |
+| Phase 10 P02 | ~175 min (incl. infra outage) | 2 tasks | 16 files |
 
 ## Accumulated Context
 
@@ -101,6 +102,11 @@ Recent decisions affecting current work:
 - [Phase 10]: Phase 10 capture decisions live in 10-LIVE-CAPTURES.md Decisions-locked-by-captures (12 items); headline: suspend/resume runtime verbs SYNC config.profile.isSuspended (bidirectional, both rigs) — Capture-first plan 10-01: later plans must cite, not re-derive, wire truth
 - [Phase 10]: Signature mismatch (PUT+DELETE) = HTTP 500 + JSON problem{message,stacktrace}; classify on stable substring 'signature mismatch' — message prose + stack frames drift between 8.3.3/8.3.6 — Live capture falsified the 400/409 hypotheses; 8.3.3 message leaks the live signature
 - [Phase 10]: Rename via PUT is NOT supported (404 empty, no create); delete succeeds WITHOUT ?confirm= for lone resources and ?collection= takes the COLLECTION name (core), not the type; runtime-verb unknown-task = 500-HTML (suspend/resume) or silent 204 (cancel), never 404 — All three plan hypotheses corrected by capture; locked for 10-02/10-03/10-04
+
+- [Phase 10 / 10-02]: Zero new classify arms for the write verbs — runtime verbs ride the existing path-scoped controller-403/not_found arms, PROVEN per-verb by contract test (not assumed); 403-without-message stays Auth on the new paths
+- [Phase 10 / 10-02]: Signature-mismatch 500 (captured) is a module-doc FINDING for the action layer — 10-03/10-04 classify on the stable 'signature mismatch' substring; the client stays classification-free
+- [Phase 10 / 10-02]: eam_task_delete always sends collection=core; ?confirm= rides only on opt-in (capture Decision 3); modify PUT body is the full single-element array INCLUDING config.settings + original signature — 422-trap pinned at REQUEST level
+- [Phase 10 / 10-02]: Contract tests are REQUEST-pinning (recorded request: method+path+query+body), not response-only — expect(1) + .mount() guard discipline; fixtures verbatim from 10-LIVE-CAPTURES.md
 
 ### Pending Todos
 
