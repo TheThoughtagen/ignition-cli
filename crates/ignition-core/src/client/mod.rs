@@ -58,7 +58,9 @@ pub mod webdev;
 
 use crate::client::connections::GatewayConnection;
 use crate::client::diagnostics::BundleStatusWire;
-use crate::client::eam::{EamHistoryItem, EamTaskRecord};
+use crate::client::eam::{
+    DeleteOutcome, EamHistoryItem, EamScheduledTask, EamTaskRecord, ModifyOutcome,
+};
 use crate::client::gan::GanStatusWire;
 use crate::client::license::LicenseStatusWire;
 use crate::client::logs::{LogDownload, LogEntry, LogQuery, LoggerInfo};
@@ -386,6 +388,65 @@ pub trait GatewayApi: Send + Sync {
     /// OUTCOMES surface later in history as data, never on this
     /// response). Runtime seam: the controller gate classifies.
     async fn eam_task_force(&self, owner: &str, name: &str) -> Result<(), CoreError>;
+    /// POST `/data/eam/api/v1/eam-tasks/suspend/{name}` (authed,
+    /// empty body) — suspend the task's scheduler trigger.
+    /// Live-proven success shape: **204**; the flag PERSISTS into
+    /// `config.profile.isSuspended` (10-LIVE-CAPTURES §1c/Decision 1).
+    /// Requires a live scheduler trigger — an OnDemand/untriggered
+    /// (or unknown-named, §7) task answers 500 Jetty HTML, which
+    /// classifies as `Internal` with the page's own message (no
+    /// honest 404 exists on this seam).
+    async fn eam_task_suspend(&self, name: &str) -> Result<(), CoreError>;
+    /// POST `/data/eam/api/v1/eam-tasks/resume/{name}` (authed,
+    /// empty body) — the inverse of [`Self::eam_task_suspend`]:
+    /// **204** success, `isSuspended` back to `false` (§1d). Unknown
+    /// names answer 500 HTML naming the task (§7).
+    async fn eam_task_resume(&self, name: &str) -> Result<(), CoreError>;
+    /// POST `/data/eam/api/v1/eam-tasks/cancel/{name}` (authed,
+    /// empty body) — cancel a PENDING execution. Always **204** on
+    /// the captured shapes: nothing-pending AND unknown-name are
+    /// silent successes (§7) — cancel is never a name-validation
+    /// tool (the actions layer owns find-before-write).
+    async fn eam_task_cancel(&self, name: &str) -> Result<(), CoreError>;
+    /// GET `/data/eam/api/v1/eam-tasks/scheduled/{running}` (authed)
+    /// — the pending-execution read; `{running}` is the LITERAL word
+    /// `true`/`false` (§2). Answers the standard
+    /// `{items, metadata}` envelope; this method unwraps it to the
+    /// items ([`EamScheduledTask`] — 13 capture-locked keys,
+    /// `taskState` String vocabulary). A stock gateway 403s →
+    /// [`CoreError::EamNotController`] via the same path-scoped arm
+    /// as every runtime seam call.
+    async fn eam_tasks_scheduled(&self, running: bool) -> Result<Vec<EamScheduledTask>, CoreError>;
+    /// PUT `/data/api/v1/resources/com.inductiveautomation.eam/
+    /// eam-tasks` (authed) with a single-element JSON **ARRAY**
+    /// carrying the FULL find record (settings included — omitting
+    /// `config.settings` ⇒ 422, the create trap) and the ORIGINAL
+    /// `signature`. The 200 body is the captured
+    /// [`ModifyOutcome`] `{success, changes[], problem}`
+    /// (§6a); `None` = a 2xx with an empty body (lenient). Rename via
+    /// PUT is NOT supported (§5: changed name + original signature ⇒
+    /// 404 — the actions layer must compose create-new + delete-old).
+    async fn eam_task_modify(
+        &self,
+        definition: &serde_json::Value,
+    ) -> Result<Option<ModifyOutcome>, CoreError>;
+    /// DELETE `/data/api/v1/resources/com.inductiveautomation.eam/
+    /// eam-tasks/{name}/{signature}` (authed, both segments
+    /// percent-encoded) with `?collection=core` ALWAYS (the
+    /// collection VALUE — `collection=eam-tasks` 404s, §3c) and
+    /// `confirm=true` only when the caller opts in: a lone-resource
+    /// delete SUCCEEDS without it (§3b) and the confirm-demand shape
+    /// is UNOBSERVED (§3d) — never hard-coded. The 200 body is the
+    /// captured [`DeleteOutcome`] (adds `references`). A signature
+    /// mismatch answers HTTP 500 + `problem` — see the
+    /// [`eam`] module docs for the recorded FINDING (not classified
+    /// here; slug decision belongs to 10-03/10-04).
+    async fn eam_task_delete(
+        &self,
+        name: &str,
+        signature: &str,
+        confirm: bool,
+    ) -> Result<DeleteOutcome, CoreError>;
     /// The raw passthrough (09-03, EXT-01): send `call` with its
     /// arbitrary method, caller headers, query pairs, and optional raw
     /// body (ANY method — GET/DELETE bodies allowed, curl parity).
@@ -1395,6 +1456,94 @@ impl GatewayApi for ReqwestGatewayApi {
         self.post_empty(&eam::eam_force_path(owner, name), &[], true)
             .await
             .map(|_| ())
+    }
+
+    async fn eam_task_suspend(&self, name: &str) -> Result<(), CoreError> {
+        // Empty body, authed POST — 204 is the captured success shape
+        // (10-LIVE-CAPTURES §1b/§1c); the suspend/resume failure
+        // modes are 500 HTML (classify → Internal with the page's
+        // message — the module-doc finding; no 404 exists here).
+        self.post_empty(&eam::eam_task_suspend_path(name), &[], true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn eam_task_resume(&self, name: &str) -> Result<(), CoreError> {
+        // Same shape as suspend: 204 success (§1b/§1d — resume of a
+        // never-suspended task is ALSO a 204; idempotent wire).
+        self.post_empty(&eam::eam_task_resume_path(name), &[], true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn eam_task_cancel(&self, name: &str) -> Result<(), CoreError> {
+        // 204 whether a pending execution existed, the task has
+        // nothing pending, or the name is unknown (§7) — cancel is
+        // wire-idempotent; name validation is the actions layer's
+        // find-before-write job.
+        self.post_empty(&eam::eam_task_cancel_path(name), &[], true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn eam_tasks_scheduled(&self, running: bool) -> Result<Vec<EamScheduledTask>, CoreError> {
+        // The standard {items, metadata} envelope (§2 — byte-identical
+        // shape across both rigs, incl. the empty-list quiet body);
+        // this method unwraps the envelope to the items.
+        let envelope: query::ListEnvelope<EamScheduledTask> = self
+            .get_json(&eam::eam_tasks_scheduled_path(running), None, true)
+            .await?;
+        Ok(envelope.items)
+    }
+
+    async fn eam_task_modify(
+        &self,
+        definition: &serde_json::Value,
+    ) -> Result<Option<ModifyOutcome>, CoreError> {
+        // The ARRAY body is the wire contract (single element — the
+        // §6a capture; a bare object is not the shape the resource
+        // PUT family speaks). The classify-first rule holds, then the
+        // captured 200 body parses into ModifyOutcome (None = a 2xx
+        // that carried no body — the lenient `Option` per the plan).
+        let url = self.url_for(&eam::eam_tasks_modify_path());
+        let request = self.apply_auth(self.client.put(url.clone()).json(&[definition]));
+        let response = self.send_and_classify(request, &url).await?;
+        let text = response.text().await.unwrap_or_default();
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&text).map(Some).map_err(|err| {
+            CoreError::Internal(format!(
+                "response from {url} did not match the expected shape: {err}"
+            ))
+        })
+    }
+
+    async fn eam_task_delete(
+        &self,
+        name: &str,
+        signature: &str,
+        confirm: bool,
+    ) -> Result<DeleteOutcome, CoreError> {
+        // `collection=core` ALWAYS (the captured success value — the
+        // type token 404s, §3c); `confirm=true` rides ONLY on
+        // explicit opt-in (a lone-resource delete succeeds without
+        // it, §3b; the confirm-demand shape is unobserved, §3d —
+        // never hard-coded). The 200 body is the captured
+        // DeleteOutcome; classify-first as everywhere.
+        let url = self.url_for(&eam::eam_task_delete_path(name, signature));
+        let mut pairs: Vec<(&str, String)> = vec![("collection", "core".to_string())];
+        if confirm {
+            pairs.push(("confirm", "true".to_string()));
+        }
+        let request = self.apply_auth(self.client.delete(url.clone()).query(&pairs));
+        let response = self.send_and_classify(request, &url).await?;
+        let text = response.text().await.unwrap_or_default();
+        serde_json::from_str(&text).map_err(|err| {
+            CoreError::Internal(format!(
+                "response from {url} did not match the expected shape: {err}"
+            ))
+        })
     }
 
     async fn api_call(
