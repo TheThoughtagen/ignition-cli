@@ -36,7 +36,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 - [x] **Phase 8: 08-foundations-session-core-config-contract** — Shared execution core, one-shot config schema migration, codified contract discipline *(complete 2026-09-06)*
 - [x] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics *(complete 2026-09-07)*
-- [ ] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview
+- [x] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview *(complete 2026-09-10; SC-5 live gate recorded `blocked-on-env` — user-provisioned WHK controller env pending, gate + record + contract in place)*
 - [ ] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings
 - [ ] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation
 - [ ] **Phase 13: 13-composite-engine-workspace-historian-edit** — Workspace checkout, historian binding closure (spike-first), `ign edit` round-trip
@@ -101,7 +101,7 @@ Plans:
 - [x] 10-02-PLAN.md — Client surface: runtime verb paths + trait methods + wiremock REQUEST pins (capture-locked) *(complete 2026-09-09)*
 - [x] 10-03-PLAN.md — Action layer: suspend/resume/cancel/modify/delete + blast-radius preview composer + authoritative re-checks *(complete 2026-09-09)*
 - [x] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation *(complete 2026-09-10, recovered from executor outage)*
-- [ ] 10-05-PLAN.md — Env-gated WHK controller live gate: scratch-task lifecycle, recorded in-phase (SC-5)
+- [x] 10-05-PLAN.md — Env-gated WHK controller live gate: scratch-task lifecycle, recorded in-phase (SC-5) *(complete 2026-09-10 — gate shipped + recorded `blocked-on-env`: WHK controller env access is user-provisioned; see 10-LIVE-GATE.md + 10-USER-SETUP.md)*
 
 ### Phase 11: 11-tag-bulk-transfer-xml-csv
 **Goal**: Tags move in the formats the ecosystem already speaks — byte-faithful passthrough of what the gateway produces (never CLI-side re-serialization) — with honest warnings about what lossy formats would drop before import commits.

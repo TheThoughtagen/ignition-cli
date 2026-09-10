@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 in progress (plans 01–04 executed: captures, client surface, action layer, CLI/TUI/README surface; 10-05 live gates remains)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 plans all executed (captures, client surface, action layer, CLI/TUI/README surface, live gate); SC-5 live run blocked on user-provisioned WHK controller env (10-USER-SETUP.md)
 
 ## Current Position
 
 **Phase:** 10 of 14 (10-eam-write-operations)
-**Current Plan:** 4 of 5 COMPLETE (10-04 CLI/TUI/README surface — five guarded eam task verbs, two-tier blast-radius guard, TUI preview-gated Confirm modals, parity 36/27/23; recovered from executor outage)
+**Current Plan:** 5 of 5 COMPLETE (10-05 SC-5 live gate — gate shipped with pre-write name-assertion safety + Drop cleanup; recorded `blocked-on-env`: WHK controller env is user-provisioned — see 10-LIVE-GATE.md / 10-USER-SETUP.md)
 **Total Plans in Phase:** 5
-**Status:** In progress — ready for 10-05 (live gates assert against the golden-pinned mock expectations)
+**Status:** Plans complete — SC-5 awaits the provisioned live run (single command, then append to 10-LIVE-GATE.md §5); then `/gsd-verify-work` 10
 **Last Activity:** 2026-09-10
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -52,6 +52,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 10 P02 | ~175 min (incl. infra outage) | 2 tasks | 16 files |
 | Phase 10 P03 | 3h 23m | 3 tasks | 2 files |
 | Phase 10 P04 | 3h 43m | 3 tasks | 15 files |
+| Phase 10 P05 | 2h 30m | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -115,6 +116,8 @@ Recent decisions affecting current work:
 - [Phase 10]: 10-04: preview_then_confirm folds the two-tier gate — build_blast_radius → render_preview_line → require_confirmation — so all six guarded EAM verbs (incl. force) compose the identical refusal whose message IS the blast radius (golden-pinned: refusal traffic = exactly 3 GETs, zero mutations) — One gate function means the refusal shape cannot drift per verb; agents read the blast radius from stderr alone
 - [Phase 10]: 10-04: TUI preview-gate — Confirm modals for the five EAM verbs arm ONLY after the read-only spawn_eam_preview fetch lands (EamPreview event carries the staged PendingAction); failed fetch opens the error modal and arms nothing; modify = ONE targeted change per cockpit fire (raw K=V rides to fire time, PendingAction stays Eq) — The TUI Confirm body IS the preview — same blast radius as the CLI refusal; gate-after-fetch means a bad name never reaches a gate
 - [Phase 10]: 10-04: README reconciliation — no agent-level suspend/resume exists on the EAM wire (tasks are the unit; affected agents ride targetGateways in the preview); agent-level delete/approve/upgrade exist but are deliberately unexposed in v1.1; modify has NO --rename (PUT-rename=404 — create-new + delete-old composite is the documented workflow) — Wire honesty: the README is the agent contract and must state what the wire does NOT offer
+- [Phase 10]: 10-05: SC-5 recorded as blocked-on-env — the live gate exists (compiles, clippy-clean, green-skip) but WHK controller access (IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN full name:key) is user-provisioned; 10-USER-SETUP.md + 10-LIVE-GATE.md §6 carry the unblock contract; no disposable-rig substitution permitted — roadmap names the WHK controller rig specifically; 10-01 ladder precedent: creds absent from environment => stop and record
+- [Phase 10]: 10-05: the live gate flips its own scratch task to Scheduled+cron before suspend — capture §1a proves OnDemand suspend = 500 and §1c proves ~80s trigger-registration latency — retried 7x/30s on the Jetty message; pre-write name assertion (find + assert scratch name) runs before EVERY write, enforced in test code — captures are the locked wire truth; plan verify text defers to 10-LIVE-CAPTURES Decision 1
 
 ### Pending Todos
 
@@ -125,8 +128,9 @@ Recent decisions affecting current work:
 
 - [Phase 13 prerequisite]: Confirm licensed-Historian rig access before starting Phase 13 planning — spike cannot proceed without it (documented-limitation fallback is legitimate, but access confirmation must happen first)
 - [Phase 11 prerequisite]: Real multi-level UDT export needed for the derive-vs-Event-loop decision — requires a live rig during Phase 11 planning
+- SC-5 (Phase 10) awaiting user-provisioned WHK controller env: IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN (EAM-rights token, full name:key) — then: cargo test -p ignition-core --test live_gateway live_eam_write_lifecycle -- --ignored --nocapture; append outcomes to 10-LIVE-GATE.md §5 (see 10-USER-SETUP.md)
 
 ## Session Continuity
 
-**Last session:** 2026-09-10T06:37:38.401Z
+**Last session:** 2026-09-10T09:12:44.657Z
 **Resume file:** None
