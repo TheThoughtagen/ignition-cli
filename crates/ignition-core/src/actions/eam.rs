@@ -598,7 +598,7 @@ pub async fn eam_task_cancel(
 /// **Deliberately ABSENT, per wire honesty:**
 ///
 /// - **rename** — capture §5/Decision 5: a PUT with a changed `name`
-///   + the original signature answers **404 empty** (the modify
+///   and the original signature answers **404 empty** (the modify
 ///   route resolves the resource BY the body's name and finds
 ///   nothing — no rename, no create, no error body). A rename verb
 ///   must compose create-new + delete-old; that composite is the
@@ -737,12 +737,14 @@ fn slot<'a>(parent: &'a mut Value, key: &str) -> &'a mut Value {
 /// carry a key the wire never answered).
 fn record_to_value(record: &EamTaskRecord) -> Result<Value, CoreError> {
     let mut value = serde_json::to_value(record).map_err(|err| {
-        CoreError::Internal(format!("task record failed to serialize for the clone: {err}"))
+        CoreError::Internal(format!(
+            "task record failed to serialize for the clone: {err}"
+        ))
     })?;
-    if value.get("scheduledTaskState") == Some(&Value::Null) {
-        if let Some(map) = value.as_object_mut() {
-            map.remove("scheduledTaskState");
-        }
+    if value.get("scheduledTaskState") == Some(&Value::Null)
+        && let Some(map) = value.as_object_mut()
+    {
+        map.remove("scheduledTaskState");
     }
     Ok(value)
 }
@@ -818,12 +820,15 @@ pub async fn eam_task_modify(
     }
 
     let record = api.eam_task_find(name).await?;
-    let signature = record.signature.clone().ok_or_else(|| CoreError::InvalidInput {
-        reason: format!(
-            "the found record for {name:?} carries no mutation signature — modify \
+    let signature = record
+        .signature
+        .clone()
+        .ok_or_else(|| CoreError::InvalidInput {
+            reason: format!(
+                "the found record for {name:?} carries no mutation signature — modify \
              requires it (list-shape records don't carry one; re-find)"
-        ),
-    })?;
+            ),
+        })?;
     let mut body = record_to_value(&record)?;
     let changed = apply_task_change(&mut body, &change);
     let definition = body.clone();
@@ -896,12 +901,15 @@ pub async fn eam_task_delete(
 ) -> Result<EamDeleteResult, CoreError> {
     lifecycle_precheck("delete", name)?;
     let record = api.eam_task_find(name).await?;
-    let signature = record.signature.clone().ok_or_else(|| CoreError::InvalidInput {
-        reason: format!(
-            "the found record for {name:?} carries no mutation signature — delete \
+    let signature = record
+        .signature
+        .clone()
+        .ok_or_else(|| CoreError::InvalidInput {
+            reason: format!(
+                "the found record for {name:?} carries no mutation signature — delete \
              is signature-keyed (list-shape records don't carry one; re-find)"
-        ),
-    })?;
+            ),
+        })?;
 
     let outcome = match api.eam_task_delete(name, &signature, false).await {
         Ok(outcome) if outcome.success => outcome,
@@ -1017,9 +1025,9 @@ fn controller_impact(
         "modify" => format!(
             "rewrites the definition of task {task}{type_note} — dispatch behavior to {agents} follows the new body"
         ),
-        "delete" => format!(
-            "deletes task {task}{type_note} permanently — dispatches to {agents} stop"
-        ),
+        "delete" => {
+            format!("deletes task {task}{type_note} permanently — dispatches to {agents} stop")
+        }
         other => format!("examines task {task}{type_note} for {other} — targets {agents}"),
     }
 }
@@ -1127,11 +1135,7 @@ pub async fn build_blast_radius(
 ) -> Result<BlastRadiusPreview, CoreError> {
     let record = api.eam_task_find(task_name).await?;
     let pending_executions = pending_rows_for(api, task_name).await?;
-    Ok(compose_blast_radius(
-        &record,
-        pending_executions,
-        verb,
-    ))
+    Ok(compose_blast_radius(&record, pending_executions, verb))
 }
 
 /// The single-line render the CLI's `require_confirmation` operation
@@ -1587,8 +1591,8 @@ mod tests {
     fn lifecycle_precheck_refuses_empty_and_whitespace_names() {
         for name in ["", "   ", "\t\n"] {
             for action in ["suspend", "resume", "cancel"] {
-                let err = lifecycle_precheck(action, name)
-                    .expect_err("empty/whitespace names refuse");
+                let err =
+                    lifecycle_precheck(action, name).expect_err("empty/whitespace names refuse");
                 assert_eq!(err.exit_code(), 2, "usage class");
                 assert_eq!(err.code(), "invalid_input");
                 let message = err.to_string();
@@ -1599,7 +1603,8 @@ mod tests {
             }
         }
         lifecycle_precheck("suspend", "nightly-backup").expect("real names pass");
-        lifecycle_precheck("cancel", " x ").expect("trimmed-nonempty passes (the gateway owns identifier rules)");
+        lifecycle_precheck("cancel", " x ")
+            .expect("trimmed-nonempty passes (the gateway owns identifier rules)");
     }
 
     /// The suspend re-check (pure) refuses ONLY the capture-proven
@@ -1733,10 +1738,16 @@ mod tests {
             body["config"]["settings"], fixture["config"]["settings"],
             "config.settings rides VERBATIM — omitting/reshaping it is the 422 trap"
         );
-        assert_eq!(body["signature"], fixture["signature"], "the ORIGINAL signature");
+        assert_eq!(
+            body["signature"], fixture["signature"],
+            "the ORIGINAL signature"
+        );
         assert_eq!(body["collection"], fixture["collection"]);
         assert_eq!(body["config"]["profile"], fixture["config"]["profile"]);
-        assert_eq!(body["data"], fixture["data"], "unknown round-trip keys survive");
+        assert_eq!(
+            body["data"], fixture["data"],
+            "unknown round-trip keys survive"
+        );
         assert_eq!(body["attributes"], fixture["attributes"]);
         assert_eq!(body["description"], serde_json::json!("rewritten note"));
 
@@ -1768,7 +1779,10 @@ mod tests {
             },
         );
         assert_eq!(changed, vec!["config.profile.scheduleMode"]);
-        assert_eq!(body["config"]["profile"]["scheduleMode"], serde_json::json!("OnDemand"));
+        assert_eq!(
+            body["config"]["profile"]["scheduleMode"],
+            serde_json::json!("OnDemand")
+        );
         assert_eq!(
             body["config"]["profile"]["scheduleDetails"],
             fixture["config"]["profile"]["scheduleDetails"],
@@ -1789,7 +1803,10 @@ mod tests {
         };
         let json = serde_json::to_value(&result).expect("serializes");
         for key in ["task", "changed", "definition", "put_outcome", "readback"] {
-            assert!(json.as_object().unwrap().contains_key(key), "{key} always rides");
+            assert!(
+                json.as_object().unwrap().contains_key(key),
+                "{key} always rides"
+            );
         }
         assert_eq!(json["put_outcome"], serde_json::Value::Null);
     }
@@ -1834,7 +1851,11 @@ mod tests {
         .expect("the lenient shape parses");
         assert_eq!(
             affected_resources(&demanded),
-            vec!["task-a".to_string(), "agent-b".to_string(), "task-c".to_string()],
+            vec![
+                "task-a".to_string(),
+                "agent-b".to_string(),
+                "task-c".to_string()
+            ],
             "strings + name-keyed objects ride; shapeless elements skipped; dedup holds"
         );
     }
@@ -1899,7 +1920,7 @@ mod tests {
             1,
             "rows for other tasks are filtered out"
         );
-        assert_eq!(preview.pending_executions[0].can_cancel, true);
+        assert!(preview.pending_executions[0].can_cancel);
         assert_eq!(preview.verb, "suspend");
         let impact = &preview.controller_impact;
         assert!(
@@ -1924,7 +1945,10 @@ mod tests {
             "controller_impact",
             "verb",
         ] {
-            assert!(json.as_object().unwrap().contains_key(key), "{key} always rides");
+            assert!(
+                json.as_object().unwrap().contains_key(key),
+                "{key} always rides"
+            );
         }
     }
 
@@ -1987,7 +2011,11 @@ mod tests {
         let cancel_with = compose_blast_radius(&record, pending.clone(), "cancel");
         assert!(cancel_with.controller_impact.contains("1 queued dispatch"));
         let cancel_without = compose_blast_radius(&record, Vec::new(), "cancel");
-        assert!(cancel_without.controller_impact.contains("no pending execution"));
+        assert!(
+            cancel_without
+                .controller_impact
+                .contains("no pending execution")
+        );
         // Unknown verbs get the factual fallback (never a panic).
         let odd = compose_blast_radius(&record, Vec::new(), "teleport");
         assert!(odd.controller_impact.contains("teleport"));
@@ -2008,7 +2036,10 @@ mod tests {
         .expect("fixture record parses");
         let preview = compose_blast_radius(
             &record,
-            vec![scheduled_row("ign-p10-scratch"), scheduled_row("ign-p10-scratch")],
+            vec![
+                scheduled_row("ign-p10-scratch"),
+                scheduled_row("ign-p10-scratch"),
+            ],
             "delete",
         );
         assert_eq!(

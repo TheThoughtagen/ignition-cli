@@ -787,10 +787,8 @@ async fn suspend_controller_403_classifies_eam_not_controller() {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(SUSPEND_PATH))
         .respond_with(
-            wiremock::ResponseTemplate::new(403).set_body_raw(
-                controller_403_body(),
-                "text/html;charset=iso-8859-1",
-            ),
+            wiremock::ResponseTemplate::new(403)
+                .set_body_raw(controller_403_body(), "text/html;charset=iso-8859-1"),
         )
         .expect(1)
         .mount(&mock.server)
@@ -812,10 +810,8 @@ async fn resume_controller_403_classifies_eam_not_controller() {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(RESUME_PATH))
         .respond_with(
-            wiremock::ResponseTemplate::new(403).set_body_raw(
-                controller_403_body(),
-                "text/html;charset=iso-8859-1",
-            ),
+            wiremock::ResponseTemplate::new(403)
+                .set_body_raw(controller_403_body(), "text/html;charset=iso-8859-1"),
         )
         .expect(1)
         .mount(&mock.server)
@@ -837,10 +833,8 @@ async fn cancel_controller_403_classifies_eam_not_controller() {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(CANCEL_PATH))
         .respond_with(
-            wiremock::ResponseTemplate::new(403).set_body_raw(
-                controller_403_body(),
-                "text/html;charset=iso-8859-1",
-            ),
+            wiremock::ResponseTemplate::new(403)
+                .set_body_raw(controller_403_body(), "text/html;charset=iso-8859-1"),
         )
         .expect(1)
         .mount(&mock.server)
@@ -891,9 +885,7 @@ async fn scheduled_false_read_parses_the_captured_row() {
     let mock = IgnitionMock::start().await;
     let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(SCHEDULED_FALSE_PATH))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(scheduled_false_page()),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(scheduled_false_page()))
         .expect(1)
         .mount_as_scoped(&mock.server)
         .await;
@@ -930,9 +922,7 @@ async fn scheduled_true_read_parses_the_empty_body() {
     let mock = IgnitionMock::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(SCHEDULED_TRUE_PATH))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()))
         .expect(1)
         .mount(&mock.server)
         .await;
@@ -1013,20 +1003,23 @@ async fn task_modify_puts_full_array_body_and_parses_the_outcome() {
 
     let requests = guard.received_requests().await;
     assert_eq!(requests.len(), 1);
-    let body: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("body parses");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
     let array = body.as_array().expect("the body is a JSON ARRAY");
     assert_eq!(array.len(), 1, "single-element array — the §6a shape");
     let sent = &array[0];
     assert!(
-        sent["config"]["settings"].is_object() && !sent["config"]["settings"].as_object().unwrap().is_empty(),
+        sent["config"]["settings"].is_object()
+            && !sent["config"]["settings"].as_object().unwrap().is_empty(),
         "config.settings RIDES — omitting it is the 422 trap (§6b)"
     );
     assert!(
         sent["signature"].is_string(),
         "the ORIGINAL signature key is present — the modify contract"
     );
-    assert_eq!(sent, &full_record, "echo-modify: the full record lands verbatim");
+    assert_eq!(
+        sent, &full_record,
+        "echo-modify: the full record lands verbatim"
+    );
 }
 
 /// THE delete pin (capture: §3b — correct signature, no confirm, 200
@@ -1167,8 +1160,16 @@ async fn task_delete_signature_mismatch_500_is_the_recorded_finding() {
         .eam_task_delete("nightly-backup", "sig-abc123", false)
         .await
         .expect_err("the 500 refusal is not a success");
-    assert_eq!(err.exit_code(), 1, "the FINDING: exit-1 for a client-fixable mismatch");
-    assert_eq!(err.code(), "internal", "no honest slug yet — 10-03/10-04 decides");
+    assert_eq!(
+        err.exit_code(),
+        1,
+        "the FINDING: exit-1 for a client-fixable mismatch"
+    );
+    assert_eq!(
+        err.code(),
+        "internal",
+        "no honest slug yet — 10-03/10-04 decides"
+    );
 }
 
 /// The captured lifecycle FAILURE shape (§1a verbatim): suspend of
@@ -1249,7 +1250,11 @@ fn find_responder(
     move |_request| {
         let mut calls = calls.lock().expect("counter locks");
         *calls += 1;
-        let body = if *calls == 1 { first.clone() } else { then.clone() };
+        let body = if *calls == 1 {
+            first.clone()
+        } else {
+            then.clone()
+        };
         wiremock::ResponseTemplate::new(200).set_body_json(body)
     }
 }
@@ -1370,9 +1375,7 @@ async fn cancel_action_without_pending_is_an_honest_noop() {
             .and(wiremock::matchers::path(format!(
                 "/data/eam/api/v1/eam-tasks/scheduled/{running}"
             )))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()))
             .expect(1)
             .mount(&mock.server)
             .await;
@@ -1425,7 +1428,10 @@ async fn cancel_action_fires_against_a_cancellable_row() {
     };
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(SCHEDULED_FALSE_PATH))
-        .respond_with(find_responder(row_page("nightly-backup"), scheduled_true_page()))
+        .respond_with(find_responder(
+            row_page("nightly-backup"),
+            scheduled_true_page(),
+        ))
         .expect(2)
         .mount(&mock.server)
         .await;
@@ -1433,9 +1439,7 @@ async fn cancel_action_fires_against_a_cancellable_row() {
     // lives only in the true segment — never short-circuited).
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(SCHEDULED_TRUE_PATH))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(scheduled_true_page()))
         .expect(2)
         .mount(&mock.server)
         .await;
@@ -1557,23 +1561,26 @@ async fn modify_action_preserves_the_full_record_on_the_wire() {
     .expect("the full-record RMW completes");
     assert_eq!(result.task, "ign-p10-scratch-sched");
     assert_eq!(result.changed, vec!["enabled".to_string()]);
-    assert_eq!(
-        result.put_outcome.as_ref().expect("the 200 body rode").success,
-        true
+    assert!(
+        result
+            .put_outcome
+            .as_ref()
+            .expect("the 200 body rode")
+            .success
     );
     assert_eq!(
-        result.put_outcome.as_ref().unwrap().changes[0].new_signature.as_deref(),
+        result.put_outcome.as_ref().unwrap().changes[0]
+            .new_signature
+            .as_deref(),
         Some("0d0dfea2919abb1f02fc86baea73d99696626524169a9ac36526044f89ac16e0"),
         "newSignature is authoritative for the NEXT mutation (§6a)"
     );
     assert_eq!(
-        result.readback["signature"],
-        post_write["signature"],
+        result.readback["signature"], post_write["signature"],
         "the read-back proves the landing"
     );
     assert_eq!(
-        result.definition["config"]["settings"],
-        fixture["config"]["settings"],
+        result.definition["config"]["settings"], fixture["config"]["settings"],
         "the verbatim PUT body preserved config.settings"
     );
 
@@ -1581,8 +1588,7 @@ async fn modify_action_preserves_the_full_record_on_the_wire() {
     // the expected body is the fixture with ONLY `enabled` moved.
     let requests = put.received_requests().await;
     assert_eq!(requests.len(), 1);
-    let body: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("body parses");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body parses");
     assert_eq!(
         body,
         serde_json::json!([expected_body]),
@@ -1599,15 +1605,15 @@ async fn delete_action_derives_the_signature_and_sends_no_confirm() {
     let mock = IgnitionMock::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(TASKS_FIND_PATH))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "name": "nightly-backup",
                 "collection": "core",
                 "signature": "sig-abc123",
                 "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}},
                 "scheduledTaskState": {"currentState": "Stopped", "details": {"owner": "eam"}}
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount(&mock.server)
         .await;
@@ -1668,14 +1674,14 @@ async fn delete_action_retries_with_confirm_on_the_demand_shape() {
     let mock = IgnitionMock::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(TASKS_FIND_PATH))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "name": "nightly-backup",
                 "collection": "core",
                 "signature": "sig-abc123",
                 "config": {"profile": {"type": "eam_backup", "scheduleMode": "Scheduled"}}
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount(&mock.server)
         .await;
@@ -1684,16 +1690,16 @@ async fn delete_action_retries_with_confirm_on_the_demand_shape() {
         .and(wiremock::matchers::path(TASKS_DELETE_PATH))
         .and(wiremock::matchers::query_param("collection", "core"))
         .and(wiremock::matchers::query_param_is_missing("confirm"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": false,
                 "changes": [],
                 "problem": null,
                 "references": [
                     {"name": "dependent-thing", "type": "some/dependent-type"}
                 ]
-            }),
-        ))
+            })),
+        )
         .expect(1)
         .mount(&mock.server)
         .await;
@@ -1851,7 +1857,7 @@ async fn force_action_composes_the_blast_radius_preview() {
         "the AGENTS the force touches"
     );
     assert_eq!(preview.pending_executions.len(), 1);
-    assert_eq!(preview.pending_executions[0].can_cancel, true);
+    assert!(preview.pending_executions[0].can_cancel);
     assert_eq!(preview.owner.as_deref(), Some("eam"));
     let impact = &preview.controller_impact;
     assert!(
@@ -1861,7 +1867,8 @@ async fn force_action_composes_the_blast_radius_preview() {
     // The single-line render embeds the composed facts.
     let line = ignition_core::actions::eam::render_preview_line(preview);
     assert!(
-        line.starts_with("force nightly-backup:") && line.contains("targets: [gw-a, gw-b] pending: 1"),
+        line.starts_with("force nightly-backup:")
+            && line.contains("targets: [gw-a, gw-b] pending: 1"),
         "the confirmation-line format: {line}"
     );
 }

@@ -173,6 +173,16 @@ enum ActionOutput {
     /// `ign eam task force` — the guarded dispatch + the honest
     /// history read-back.
     EamTaskForce(actions::eam::EamTaskForceResult),
+    /// `ign eam task suspend|resume|cancel` — ONE variant keyed by
+    /// the result's own `action` string ("suspended"/"resumed"/
+    /// "cancelled"; 10-04): the lifecycle verbs share the all-keys
+    /// EamLifecycleResult shape.
+    EamTaskLifecycle(actions::eam::EamLifecycleResult),
+    /// `ign eam task modify` — the full-record RMW read-back (10-04).
+    EamTaskModify(actions::eam::EamModifyResult),
+    /// `ign eam task delete` — the signature-keyed delete outcome
+    /// (10-04).
+    EamTaskDelete(actions::eam::EamDeleteResult),
     /// `ign script run` — the scriptExec answer under unit-explicit
     /// keys {stdout, result, elapsedMs} (ALL keys always; the
     /// secret never rides any output path).
@@ -334,6 +344,9 @@ impl ActionOutput {
             ActionOutput::EamTaskDetail(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskCreate(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskForce(result) => render_success(profile, result, compact),
+            ActionOutput::EamTaskLifecycle(result) => render_success(profile, result, compact),
+            ActionOutput::EamTaskModify(result) => render_success(profile, result, compact),
+            ActionOutput::EamTaskDelete(result) => render_success(profile, result, compact),
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
@@ -1944,18 +1957,178 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     };
                     (name, result)
                 }
+                // The guarded lifecycle/mutation verbs (10-04): the
+                // TWO-TIER flow — (a) the PURE precheck first (exit
+                // 2, zero network); (b) resolution; (c) the
+                // blast-radius preview fetch (a bad name refuses
+                // `not_found` BEFORE any prompt — the preview IS the
+                // pre-flight); (d) `require_confirmation` whose
+                // operation string IS the preview line (the refusal
+                // message names task + agents + impact); (e) the
+                // action (the authoritative re-checks inside core).
+                // The guard stays PRE-WRITE: the preview fetch may
+                // read, but zero writes fire without --yes.
                 EamTaskCommand::Force { name: task_name } => {
-                    if let Err(err) = require_confirmation(
-                        cli.yes,
-                        "eam task force (dispatches the task to agent targets NOW)",
-                    ) {
+                    if let Err(err) = actions::eam::lifecycle_precheck("force", &task_name) {
                         return (None, Err(err));
                     }
                     let (name, api) = resolve_gateway_api(cli.profile.as_deref());
                     let result = match api {
-                        Ok(api) => actions::eam::eam_task_force(&*api, &task_name)
-                            .await
-                            .map(ActionOutput::EamTaskForce),
+                        Ok(api) => {
+                            match preview_then_confirm(&*api, "force", &task_name, cli.yes).await {
+                                Ok(()) => actions::eam::eam_task_force(&*api, &task_name)
+                                    .await
+                                    .map(ActionOutput::EamTaskForce),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                EamTaskCommand::Suspend { name: task_name } => {
+                    if let Err(err) = actions::eam::lifecycle_precheck("suspend", &task_name) {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => {
+                            match preview_then_confirm(&*api, "suspend", &task_name, cli.yes).await
+                            {
+                                Ok(()) => actions::eam::eam_task_suspend(&*api, &task_name)
+                                    .await
+                                    .map(ActionOutput::EamTaskLifecycle),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                EamTaskCommand::Resume { name: task_name } => {
+                    if let Err(err) = actions::eam::lifecycle_precheck("resume", &task_name) {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => {
+                            match preview_then_confirm(&*api, "resume", &task_name, cli.yes).await {
+                                Ok(()) => actions::eam::eam_task_resume(&*api, &task_name)
+                                    .await
+                                    .map(ActionOutput::EamTaskLifecycle),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                EamTaskCommand::Cancel { name: task_name } => {
+                    if let Err(err) = actions::eam::lifecycle_precheck("cancel", &task_name) {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => {
+                            match preview_then_confirm(&*api, "cancel", &task_name, cli.yes).await {
+                                Ok(()) => actions::eam::eam_task_cancel(&*api, &task_name)
+                                    .await
+                                    .map(ActionOutput::EamTaskLifecycle),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                // Modify's Tier-0 pure stage validates flag sanity
+                // BEFORE resolution: --setting K=Vs parse via
+                // parse_setting (malformed K=V is exit 2 with zero
+                // network — the tags-write byte-source precedent) and
+                // an all-nothing change refuses pre-network (a no-op
+                // PUT would still rotate the server-side signature).
+                // enable+disable conflicts are clap's job.
+                EamTaskCommand::Modify {
+                    name: task_name,
+                    enable,
+                    disable,
+                    schedule_mode,
+                    setting,
+                    description,
+                } => {
+                    let mut overlay = serde_json::Map::new();
+                    for raw in &setting {
+                        match actions::eam::parse_setting(raw) {
+                            Ok((key, value)) => {
+                                overlay.insert(key, value);
+                            }
+                            Err(err) => return (None, Err(err)),
+                        }
+                    }
+                    let settings_overlay = if overlay.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Object(overlay))
+                    };
+                    let change = actions::eam::TaskChange {
+                        enabled: if enable {
+                            Some(true)
+                        } else if disable {
+                            Some(false)
+                        } else {
+                            None
+                        },
+                        description,
+                        schedule_mode,
+                        settings_overlay,
+                    };
+                    if change.enabled.is_none()
+                        && change.description.is_none()
+                        && change.schedule_mode.is_none()
+                        && change.settings_overlay.is_none()
+                    {
+                        return (
+                            None,
+                            Err(CoreError::InvalidInput {
+                                reason: format!(
+                                    "eam task modify {task_name:?}: no targeted keys — a modify \
+                                     must change something (enabled / description / schedule-mode \
+                                     / settings overlay)"
+                                ),
+                            }),
+                        );
+                    }
+                    if let Err(err) = actions::eam::lifecycle_precheck("modify", &task_name) {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => {
+                            match preview_then_confirm(&*api, "modify", &task_name, cli.yes).await {
+                                Ok(()) => actions::eam::eam_task_modify(&*api, &task_name, change)
+                                    .await
+                                    .map(ActionOutput::EamTaskModify),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (name, result)
+                }
+                EamTaskCommand::Delete { name: task_name } => {
+                    if let Err(err) = actions::eam::lifecycle_precheck("delete", &task_name) {
+                        return (None, Err(err));
+                    }
+                    let (name, api) = resolve_gateway_api(cli.profile.as_deref());
+                    let result = match api {
+                        Ok(api) => {
+                            match preview_then_confirm(&*api, "delete", &task_name, cli.yes).await {
+                                Ok(()) => actions::eam::eam_task_delete(&*api, &task_name)
+                                    .await
+                                    .map(ActionOutput::EamTaskDelete),
+                                Err(err) => Err(err),
+                            }
+                        }
                         Err(err) => Err(err),
                     };
                     (name, result)
@@ -2457,6 +2630,24 @@ fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
             operation: operation.to_string(),
         })
     }
+}
+
+/// The guarded lifecycle verbs' Tier-2 gate (10-04): the blast-radius
+/// preview fetch (read-only — a bad task name refuses `not_found`
+/// HERE, before any prompt) followed by `require_confirmation` whose
+/// operation string IS the rendered preview line — so the refusal
+/// message itself names the task, its agent targets, and the factual
+/// impact. Post-resolution refusals carry the resolved profile; the
+/// guard stays PRE-WRITE (zero mutations without --yes).
+async fn preview_then_confirm(
+    api: &dyn ignition_core::client::GatewayApi,
+    verb: &str,
+    task_name: &str,
+    yes: bool,
+) -> Result<(), CoreError> {
+    let preview = actions::eam::build_blast_radius(api, verb, task_name).await?;
+    let operation = actions::eam::render_preview_line(&preview);
+    require_confirmation(yes, &operation)
 }
 
 /// `tags write --value`'s JSON-scalar rule (05-04, README-documented):

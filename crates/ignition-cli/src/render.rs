@@ -19,7 +19,8 @@ use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
 use ignition_core::actions::diagnostics::{BundleDownloadResult, BundleStatusWire};
 use ignition_core::actions::eam::{
-    EamHistoryResult, EamTaskCreateResult, EamTaskDetailResult, EamTaskForceResult, EamTasksResult,
+    EamDeleteResult, EamHistoryResult, EamLifecycleResult, EamModifyResult, EamTaskCreateResult,
+    EamTaskDetailResult, EamTaskForceResult, EamTasksResult,
 };
 use ignition_core::actions::gan::GanStatusResult;
 use ignition_core::actions::inspect::{MetricsResult, ModulesResult, StatusResult};
@@ -240,6 +241,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskDetail(result) => render_eam_task_detail_human(result),
         ActionOutput::EamTaskCreate(result) => render_eam_task_create_human(result),
         ActionOutput::EamTaskForce(result) => render_eam_task_force_human(result),
+        ActionOutput::EamTaskLifecycle(result) => render_eam_task_lifecycle_human(result),
+        ActionOutput::EamTaskModify(result) => render_eam_task_modify_human(result),
+        ActionOutput::EamTaskDelete(result) => render_eam_task_delete_human(result),
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
@@ -1002,6 +1006,75 @@ fn render_eam_task_force_human(result: &EamTaskForceResult) {
             );
         }
         None => println!("  (no history entry visible yet)"),
+    }
+}
+
+/// `ign eam task suspend|resume|cancel` human shape (10-04) — the
+/// action word + the read-back proofs: the previous runtime state,
+/// the persisted `config.profile.isSuspended` flag (lifecycle
+/// persistence, Decision 1), and the cancel no-op honesty
+/// (`fired: false` + the reason — a write we declined is reported,
+/// never disguised).
+fn render_eam_task_lifecycle_human(result: &EamLifecycleResult) {
+    println!(
+        "{} {}  previous-state: {}",
+        result.action,
+        result.task,
+        result.previous_state.as_deref().unwrap_or("-")
+    );
+    if let Some(suspended) = result.config_suspended {
+        println!("config.profile.isSuspended: {suspended}");
+    }
+    if let Some(pending) = &result.pending {
+        println!(
+            "pending remains: {}  canCancel: {}",
+            if pending.task_state.is_empty() {
+                "-"
+            } else {
+                &pending.task_state
+            },
+            pending.can_cancel
+        );
+    }
+    if !result.fired {
+        println!(
+            "not fired: {}",
+            result.reason.as_deref().unwrap_or("(no reason given)")
+        );
+    }
+}
+
+/// `ign eam task modify` human shape (10-04) — the targeted keys that
+/// changed + the authoritative post-PUT signature (the NEXT mutation
+/// must quote it; capture §6a). The full PUT body + read-back stay
+/// JSON-mode data.
+fn render_eam_task_modify_human(result: &EamModifyResult) {
+    let changed = if result.changed.is_empty() {
+        "(none)".to_string()
+    } else {
+        result.changed.join(", ")
+    };
+    println!("modified {}  changed: {changed}", result.task);
+    let signature = result
+        .put_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.changes.first())
+        .map(|change| change.new_signature.as_deref().unwrap_or("-"));
+    println!("new signature: {}", signature.unwrap_or("-"));
+}
+
+/// `ign eam task delete` human shape (10-04) — landed (or honestly
+/// not) + the affected-resource names the gateway reported.
+fn render_eam_task_delete_human(result: &EamDeleteResult) {
+    if result.deleted {
+        let affected = if result.affected.is_empty() {
+            "(none reported)".to_string()
+        } else {
+            result.affected.join(", ")
+        };
+        println!("deleted {}  affected: {affected}", result.task);
+    } else {
+        println!("delete did NOT land for {}", result.task);
     }
 }
 

@@ -1007,11 +1007,15 @@ pub enum EamCommand {
     Task(EamTaskCommand),
 }
 
-/// `eam task …` — the guarded writes (07-02 Task 3). `new` carries
-/// the typed guard ladder (backup+OnDemand unguarded; mutating
-/// types and any non-OnDemand schedule need --yes;
-/// restore/install/upgrade types refuse outright — see README);
-/// `force` dispatches NOW, always guarded.
+/// `eam task …` — the guarded writes (07-02 Task 3; the five
+/// lifecycle/mutation verbs arrive 10-04). `new` carries the typed
+/// guard ladder (backup+OnDemand unguarded; mutating types and any
+/// non-OnDemand schedule need --yes; restore/install/upgrade types
+/// refuse outright — see README); `force` dispatches NOW, always
+/// guarded; `suspend`/`resume`/`cancel`/`modify`/`delete` are the
+/// two-tier guarded verbs (pure precheck → blast-radius preview
+/// fetch → confirm-with-preview → action — the refusal message IS
+/// the blast radius).
 #[derive(Debug, Subcommand)]
 pub enum EamTaskCommand {
     /// Create a task definition (scheduleMode defaults to OnDemand —
@@ -1053,9 +1057,77 @@ pub enum EamTaskCommand {
         schedule_mode: ScheduleMode,
     },
     /// Force-dispatch a task NOW — destructive, refused without
-    /// --yes (it dispatches to the agent targets immediately)
+    /// --yes (it dispatches to the agent targets immediately). The
+    /// confirmation prompt (and every refusal) carries the
+    /// blast-radius preview line.
     Force {
         /// Task definition name to dispatch
+        name: String,
+    },
+    /// Suspend a task definition's scheduled dispatches — TASK-scoped
+    /// runtime verb (there is NO agent-level suspend on the wire; an
+    /// "agent" is suspended by suspending its tasks). Refused exit 2
+    /// without --yes, the blast-radius preview in the refusal
+    /// message; on a stock gateway the runtime seam honestly refuses
+    /// `eam_not_controller` (exit 6).
+    Suspend {
+        /// Task definition name to suspend
+        name: String,
+    },
+    /// Resume a suspended task definition — the suspend inverse
+    /// (TASK-scoped, like suspend). Refused exit 2 without --yes
+    /// with the blast-radius preview in the message.
+    Resume {
+        /// Task definition name to resume
+        name: String,
+    },
+    /// Cancel a task's PENDING execution (TASK-scoped). Refused exit
+    /// 2 without --yes with the blast-radius preview in the message;
+    /// nothing pending is an honest no-op (`fired: false`), a
+    /// `canCancel: false` row reports the gateway's own refusal.
+    Cancel {
+        /// Task definition whose pending execution to cancel
+        name: String,
+    },
+    /// Rewrite targeted keys of a task definition — the full-record
+    /// read-modify-write (every key the gateway answered rides back;
+    /// only the targeted keys change). Rename is deliberately
+    /// ABSENT (the wire answers PUT-rename with 404 — see README's
+    /// create-new + delete-old composite). Refused exit 2 without
+    /// --yes with the blast-radius preview in the message.
+    ///
+    /// Example: ign eam task modify nightly-backup --enable
+    Modify {
+        /// Task definition to modify
+        name: String,
+        /// Flip the definition's `enabled` key to true
+        #[arg(long)]
+        enable: bool,
+        /// Flip the definition's `enabled` key to false
+        /// (conflicts with --enable)
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        /// Rewrite `config.profile.scheduleMode` (e.g. OnDemand,
+        /// Scheduled — the scheduleDetails string itself is out of
+        /// scope; the read-back shows the landed pairing)
+        #[arg(long, value_name = "MODE")]
+        schedule_mode: Option<String>,
+        /// Deep-merge a settings entry over the found
+        /// `config.settings` (K=V with scalar auto-typing;
+        /// repeatable — objects merge recursively, arrays/scalars
+        /// replace)
+        #[arg(long, value_name = "K=V")]
+        setting: Vec<String>,
+        /// Rewrite the definition's `description`
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+    },
+    /// Delete a task definition — signature-keyed (the gateway
+    /// refuses a stale signature), behind the same --yes guard.
+    /// Refused exit 2 without --yes with the blast-radius preview
+    /// in the message.
+    Delete {
+        /// Task definition to delete
         name: String,
     },
 }
