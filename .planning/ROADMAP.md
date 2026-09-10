@@ -98,9 +98,9 @@ Plans:
 **Plans:** 5 plans
 Plans:
 - [x] 10-01-PLAN.md — Live wire captures on both rigs (controller-mode provisioning + 12-probe list) → 10-LIVE-CAPTURES.md *(complete 2026-09-09)*
-- [ ] 10-02-PLAN.md — Client surface: runtime verb paths + trait methods + wiremock REQUEST pins (capture-locked)
-- [ ] 10-03-PLAN.md — Action layer: suspend/resume/cancel/modify/delete + blast-radius preview composer + authoritative re-checks
-- [ ] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation
+- [x] 10-02-PLAN.md — Client surface: runtime verb paths + trait methods + wiremock REQUEST pins (capture-locked) *(complete 2026-09-09)*
+- [x] 10-03-PLAN.md — Action layer: suspend/resume/cancel/modify/delete + blast-radius preview composer + authoritative re-checks *(complete 2026-09-09)*
+- [x] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation *(complete 2026-09-10, recovered from executor outage)*
 - [ ] 10-05-PLAN.md — Env-gated WHK controller live gate: scratch-task lifecycle, recorded in-phase (SC-5)
 
 ### Phase 11: 11-tag-bulk-transfer-xml-csv
@@ -168,7 +168,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 7. Ecosystem Interop & Advanced Ops | v1.0 | 6/6 | Complete | 2026-08-29 |
 | 8. 08-foundations-session-core-config-contract | v1.1 | 6/6 | Complete | 2026-09-06 |
 | 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
-| 10. 10-eam-write-operations | v1.1 | 0/TBD | Not started | - |
+| 10. 10-eam-write-operations | v1.1 | 4/5 | In progress | 2026-09-09 |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 0/TBD | Not started | - |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |

@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 in progress (plans 01 captures + 02 client surface executed; action/CLI/gate plans 03–05 remain)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 in progress (plans 01–04 executed: captures, client surface, action layer, CLI/TUI/README surface; 10-05 live gates remains)
 
 ## Current Position
 
 **Phase:** 10 of 14 (10-eam-write-operations)
-**Current Plan:** 3 of 5 COMPLETE (10-03 action layer — lifecycle re-checks, full-record RMW modify/delete, blast-radius preview + force composer)
+**Current Plan:** 4 of 5 COMPLETE (10-04 CLI/TUI/README surface — five guarded eam task verbs, two-tier blast-radius guard, TUI preview-gated Confirm modals, parity 36/27/23; recovered from executor outage)
 **Total Plans in Phase:** 5
-**Status:** In progress — ready for 10-04 (CLI verbs consume lifecycle_precheck + build_blast_radius/render_preview_line + the five actions)
-**Last Activity:** 2026-09-09
+**Status:** In progress — ready for 10-05 (live gates assert against the golden-pinned mock expectations)
+**Last Activity:** 2026-09-10
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -51,6 +51,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 10 P01 | 24 min | 2 tasks | 2 files |
 | Phase 10 P02 | ~175 min (incl. infra outage) | 2 tasks | 16 files |
 | Phase 10 P03 | 3h 23m | 3 tasks | 2 files |
+| Phase 10 P04 | 3h 43m | 3 tasks | 15 files |
 
 ## Accumulated Context
 
@@ -111,6 +112,9 @@ Recent decisions affecting current work:
 - [Phase 10]: 10-03: lifecycle re-checks are pure fns shared three ways (lifecycle_precheck / suspend_recheck / cancel_decision) — suspend refuses already-suspended exit 2 pre-write; resume fires unconditionally (§1b silent 204); cancel mirrors the gateway (no-pending no-op fired:false, canCancel=false reported)
 - [Phase 10]: 10-03: modify is full-record RMW with rename+suspend_flag OMITTED from TaskChange per capture honesty (§5 rename-PUT=404; PUT-driven isSuspended unproven) — the create-new+delete-old composite is 10-04's documented workflow; delete derives signature from find, no-confirm by default with ONE confirm=true retry on the demand shape (Decision 3)
 - [Phase 10]: 10-03: signature-mismatch 500s classify on EVIDENCE (post-failure find shows a changed signature ⇒ exit 2 re-run guidance) — the substring never reaches the action layer (classify's Internal fallback drops non-HTML bodies); zero new slugs/variants; BlastRadiusPreview composes find + BOTH scheduled segments (never short-circuited — Running rows live only in true) and force rides it (EAMW-04)
+- [Phase 10]: 10-04: preview_then_confirm folds the two-tier gate — build_blast_radius → render_preview_line → require_confirmation — so all six guarded EAM verbs (incl. force) compose the identical refusal whose message IS the blast radius (golden-pinned: refusal traffic = exactly 3 GETs, zero mutations) — One gate function means the refusal shape cannot drift per verb; agents read the blast radius from stderr alone
+- [Phase 10]: 10-04: TUI preview-gate — Confirm modals for the five EAM verbs arm ONLY after the read-only spawn_eam_preview fetch lands (EamPreview event carries the staged PendingAction); failed fetch opens the error modal and arms nothing; modify = ONE targeted change per cockpit fire (raw K=V rides to fire time, PendingAction stays Eq) — The TUI Confirm body IS the preview — same blast radius as the CLI refusal; gate-after-fetch means a bad name never reaches a gate
+- [Phase 10]: 10-04: README reconciliation — no agent-level suspend/resume exists on the EAM wire (tasks are the unit; affected agents ride targetGateways in the preview); agent-level delete/approve/upgrade exist but are deliberately unexposed in v1.1; modify has NO --rename (PUT-rename=404 — create-new + delete-old composite is the documented workflow) — Wire honesty: the README is the agent contract and must state what the wire does NOT offer
 
 ### Pending Todos
 
@@ -124,5 +128,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-09T17:27:58.543Z
+**Last session:** 2026-09-10T06:37:38.401Z
 **Resume file:** None
