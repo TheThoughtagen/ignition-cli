@@ -470,6 +470,31 @@ pub fn routes() -> &'static [CliRoute] {
             path: "eam task force",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // 10-04: the guarded lifecycle/mutation verbs — Dashboard
+        // rows beside the rest of the eam family. Each walks an
+        // input modal; the Confirm gate arms AFTER the blast-radius
+        // preview fetch lands (the Confirm BODY is the preview) —
+        // Confirm-gated per the CLI's --yes set, exactly like force.
+        CliRoute {
+            path: "eam task suspend",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "eam task resume",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "eam task cancel",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "eam task modify",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        CliRoute {
+            path: "eam task delete",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // 07-03: `ign script run` (SCRPT-01) — the row lands FRESH
         // in this plan (grep-verified: no pre-existing row). There
         // is no bare `script` row (ScriptCommand is required, the

@@ -273,6 +273,46 @@ pub enum PendingAction {
     /// `ign eam task force <NAME>` (Confirm ≡ `--yes` — always
     /// guarded: it dispatches to the agent targets NOW).
     EamTaskForce { name: String },
+    /// `ign eam task suspend <NAME>` (Confirm ≡ `--yes` — 10-04: the
+    /// Confirm BODY is the blast-radius preview fetched at gate-arm
+    /// time; a TASK-scoped verb — the wire has no agent-level
+    /// suspend).
+    EamTaskSuspend { name: String },
+    /// `ign eam task resume <NAME>` (Confirm ≡ `--yes`; preview body).
+    EamTaskResume { name: String },
+    /// `ign eam task cancel <NAME>` (Confirm ≡ `--yes`; preview body —
+    /// nothing pending is the honest no-op at the action).
+    EamTaskCancel { name: String },
+    /// `ign eam task modify <NAME> <CHANGE>` (Confirm ≡ `--yes`;
+    /// preview body). ONE targeted change per cockpit fire — the
+    /// CLI owns the multi-flag forms (the modal-depth decision).
+    EamTaskModify {
+        /// Task definition to modify.
+        name: String,
+        /// The pre-parsed targeted change (parsed BEFORE the gate
+        /// arms — the LoggersSetLine precedent).
+        change: EamTaskModifyChange,
+    },
+    /// `ign eam task delete <NAME>` (Confirm ≡ `--yes`; preview body —
+    /// the definition is signature-keyed and permanent).
+    EamTaskDelete { name: String },
+}
+
+/// ONE targeted `eam task modify` change as parsed from the cockpit's
+/// input line (10-04). `Setting` keeps the RAW `K=V` string — the
+/// scalar auto-typing ([`ignition_core::actions::eam::parse_setting`])
+/// runs at fire time, keeping this enum `Eq` (the `PendingAction`
+/// contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EamTaskModifyChange {
+    /// `enable` / `disable` — flip the definition's `enabled` key.
+    Enabled(bool),
+    /// `schedule-mode=MODE` — rewrite `config.profile.scheduleMode`.
+    ScheduleMode(String),
+    /// `description=TEXT` — rewrite the definition's `description`.
+    Description(String),
+    /// `K=V` — a settings deep-merge entry (typed at fire time).
+    Setting { raw: String },
 }
 
 /// The dashboard's multi-step form router (07-02: the `eam task new`
@@ -314,6 +354,20 @@ pub enum PendingInput {
     /// The task name for `eam task force` (a Confirm gate arms at
     /// accept — 07-02 Task 3).
     EamTaskForceName,
+    /// The task name for each lifecycle/mutation EAM verb (10-04):
+    /// the gate arms at accept AFTER the blast-radius preview fetch
+    /// (the Confirm BODY is the preview — EamPreview event).
+    EamTaskSuspendName,
+    /// The task name for `eam task resume`.
+    EamTaskResumeName,
+    /// The task name for `eam task cancel`.
+    EamTaskCancelName,
+    /// The task name for `eam task delete`.
+    EamTaskDeleteName,
+    /// The `NAME CHANGE` line for `eam task modify` (10-04) — parsed
+    /// BEFORE the gate arms; a bad line opens the error modal and
+    /// arms nothing.
+    EamTaskModifyLine,
     /// The Python source for `script run` (fires UNGATED at accept
     /// — 07-03: no --yes exists on the CLI verb; the deploy flag IS
     /// the opt-in. Code-only — the TUI refuses the --file/stdin
@@ -408,7 +462,7 @@ pub fn session_rows(result: &SessionsResult) -> Vec<SessionRow> {
 /// route rows in [`crate::routes`] and the worker labels carry the
 /// clap-exact spellings ("wait for gateway up" runs the `wait gateway`
 /// worker).
-pub const ACTIONS: [&str; 22] = [
+pub const ACTIONS: [&str; 27] = [
     "version",
     "connections",
     "wait for gateway up",
@@ -424,6 +478,13 @@ pub const ACTIONS: [&str; 22] = [
     "eam tasks",
     "eam task new",
     "eam task force",
+    // 10-04: the guarded lifecycle/mutation verbs (each walks an
+    // input modal; the Confirm body is the blast-radius preview).
+    "eam task suspend",
+    "eam task resume",
+    "eam task cancel",
+    "eam task modify",
+    "eam task delete",
     // 07-03: the scriptExec verb (ungated — CLI parity).
     "script run",
     // 07-04: the local ignition-lint delegation (ungated; the
@@ -1367,6 +1428,13 @@ mod tests {
                 "eam tasks",
                 "eam task new",
                 "eam task force",
+                // 10-04: the guarded lifecycle/mutation verbs
+                // (clap-exact).
+                "eam task suspend",
+                "eam task resume",
+                "eam task cancel",
+                "eam task modify",
+                "eam task delete",
                 "script run",
                 "lint",
                 // 09-04: the curated morning-check reads (clap-exact).

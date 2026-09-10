@@ -550,22 +550,22 @@ mod tests {
     /// same modal still renders with visible borders and no panic
     /// (height clamped to the frame). 09-08: the Actions menu grew to
     /// 22 entries (22 + 4 chrome rows = 26), so its fit assertion
-    /// renders at 80x30 — 80x24 was sized for the v1.0 15-entry menu
-    /// and the modal now CLAMPS there by design (the footer hint is
-    /// the first casualty of the clamp, the mechanism this same test
-    /// verifies on small frames below).
+    /// renders at 80x30. 10-04: 27 entries (27 + 4 = 31), so the fit
+    /// frame moves to 80x35 — the clamp mechanism below is unchanged
+    /// by design (the footer hint is the first casualty of the
+    /// clamp, the mechanism this same test verifies on small frames).
     #[test]
     fn menu_modals_fit_content_and_clamp_to_small_frames() {
         // Large frame: the FULL footer hint row renders verbatim on
-        // the Actions menu (sized for the 22-entry menu; the 06-10
+        // the Actions menu (sized for the 27-entry menu; the 06-10
         // assertion at its new minimum comfortable frame).
         let mut state = AppState::new();
         state.open_modal(Modal::Actions { selected: 0 });
-        let rows = rendered_rows_sized(&state, 80, 30);
+        let rows = rendered_rows_sized(&state, 80, 35);
         assert!(
             rows.iter()
                 .any(|row| row.contains("Enter to run · Esc to cancel")),
-            "Actions footer fully visible at 80x30: {rows:?}"
+            "Actions footer fully visible at 80x35: {rows:?}"
         );
 
         let mut logs = AppState::new();

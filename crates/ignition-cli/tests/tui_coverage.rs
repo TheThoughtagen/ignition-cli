@@ -227,6 +227,12 @@ fn dashboard_actions_menu_matches_registry() {
         "eam tasks",
         "eam task new",
         "eam task force",
+        // 10-04: the guarded lifecycle/mutation verbs.
+        "eam task suspend",
+        "eam task resume",
+        "eam task cancel",
+        "eam task modify",
+        "eam task delete",
         // 07-03: the scriptExec verb.
         "script run",
         // 07-04: the local ignition-lint delegation.
@@ -250,7 +256,7 @@ fn dashboard_actions_menu_matches_registry() {
     // (extend the exclusion comments). The pinned test IS the
     // pre-declaration (the 08-06 OutOfBand pattern).
     //
-    // Current exclusions (31 Dashboard rows − 22 menu verbs = 9):
+    // Current exclusions (36 Dashboard rows − 27 menu verbs = 9):
     //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
     //     the TUI's menu can host).
     //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
@@ -268,7 +274,7 @@ fn dashboard_actions_menu_matches_registry() {
         .collect();
     assert_eq!(
         dashboard_rows.len(),
-        31,
+        36,
         "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
          + the update.rs executor arms in the same change, or justify the \
          exclusion in this test's comment block: {dashboard_rows:#?}"

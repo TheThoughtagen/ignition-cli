@@ -183,6 +183,20 @@ pub enum AppEvent {
     /// stopped by its shutdown watch on screen exit / pane toggle (a
     /// last-gasp line merely joins the ring).
     RigLogLine(String),
+    /// The blast-radius preview landed (10-04) — the gate for the
+    /// five guarded EAM task verbs: the STAGED [`crate::state::
+    /// PendingAction`] rides so update can arm it and open the
+    /// Confirm modal whose BODY is the preview text (Ok), or show
+    /// the fetch's error honestly (Err). Stale eras drop whole
+    /// (Pitfall 9).
+    EamPreview {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The staged action the preview arms on confirm.
+        pending: crate::state::PendingAction,
+        /// The composed preview body, or the fetch's error.
+        result: Result<String, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

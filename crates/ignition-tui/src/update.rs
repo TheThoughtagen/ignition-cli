@@ -282,6 +282,28 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 }
             }
         }
+        // The blast-radius preview landed (10-04): arm the staged
+        // action and open the Confirm modal whose BODY is the
+        // preview (the CLI refusal's message, rendered in the
+        // cockpit); the fetch's error opens the error modal honestly
+        // (a bad name refuses `not_found` BEFORE any gate). Stale
+        // eras drop whole (Pitfall 9).
+        AppEvent::EamPreview {
+            era,
+            pending,
+            result,
+        } => {
+            if workers::is_current(state.era, era) {
+                match result {
+                    Ok(body) => {
+                        let title = gated_cli_verb(&pending).to_string();
+                        state.dashboard.pending = Some(pending);
+                        state.open_modal(Modal::Confirm { title, body });
+                    }
+                    Err(message) => open_error_modal(state, "eam task — preview", &message),
+                }
+            }
+        }
         // A profile switch landed: the era-gated banner confirmation
         // ("profile: NAME" in the status line until the new world's
         // first refresh retires it). Stale banners drop (Pitfall 9).
@@ -715,6 +737,65 @@ fn parse_logger_level_line(line: &str) -> Result<(String, String), String> {
             }
         }
         _ => Err("expected `LOGGER LEVEL` (e.g. `GatewayManager WARN`)".to_string()),
+    }
+}
+
+/// The `eam task modify` cockpit line grammar (10-04): `NAME CHANGE`
+/// — exactly one targeted change per fire (the multi-flag forms are
+/// CLI-only, the modal-depth decision):
+///
+/// - `NAME enable` / `NAME disable` — the enabled flag pair
+/// - `NAME schedule-mode=MODE` — the schedule-mode rewrite
+/// - `NAME description=TEXT` — the description rewrite (TEXT rides
+///   to the end of the line, `=` allowed)
+/// - `NAME K=V` — a settings deep-merge entry (validated via
+///   `parse_setting` HERE; the raw string rides to fire time so the
+///   scalar auto-typing stays the single parse's job)
+///
+/// Returns the parsed [`EamTaskModifyChange`] — a bad line is an Err
+/// (the error modal opens, nothing arms).
+fn parse_eam_modify_line(
+    line: &str,
+) -> Result<(String, crate::state::EamTaskModifyChange), String> {
+    use crate::state::EamTaskModifyChange;
+    let line = line.trim();
+    let Some((name, change)) = line.split_once(char::is_whitespace) else {
+        return Err("expected `NAME CHANGE` (e.g. `nightly-backup disable`)".to_string());
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("the task name must not be empty".to_string());
+    }
+    let change = change.trim();
+    match change {
+        "enable" => Ok((name, EamTaskModifyChange::Enabled(true))),
+        "disable" => Ok((name, EamTaskModifyChange::Enabled(false))),
+        _ => {
+            if let Some(mode) = change.strip_prefix("schedule-mode=") {
+                if mode.trim().is_empty() {
+                    return Err("schedule-mode= needs a mode (e.g. OnDemand)".to_string());
+                }
+                return Ok((
+                    name,
+                    EamTaskModifyChange::ScheduleMode(mode.trim().to_string()),
+                ));
+            }
+            if let Some(text) = change.strip_prefix("description=") {
+                if text.is_empty() {
+                    return Err("description= needs text".to_string());
+                }
+                return Ok((name, EamTaskModifyChange::Description(text.to_string())));
+            }
+            match ignition_core::actions::eam::parse_setting(change) {
+                Ok(_) => Ok((
+                    name,
+                    EamTaskModifyChange::Setting {
+                        raw: change.to_string(),
+                    },
+                )),
+                Err(err) => Err(err.to_string()),
+            }
+        }
     }
 }
 
@@ -2484,6 +2565,45 @@ fn execute_menu_action(state: &mut AppState, index: usize) {
                 buffer: String::new(),
             });
         }
+        // 10-04: the guarded lifecycle/mutation verbs — each walks an
+        // input modal; the Confirm gate arms only AFTER the
+        // blast-radius preview fetch lands (the Confirm BODY is the
+        // preview — the CLI refusal's message, rendered in the
+        // cockpit).
+        Some(
+            verb @ ("eam task suspend" | "eam task resume" | "eam task cancel" | "eam task delete"),
+        ) => {
+            let pending_input = match verb {
+                "eam task suspend" => PendingInput::EamTaskSuspendName,
+                "eam task resume" => PendingInput::EamTaskResumeName,
+                "eam task cancel" => PendingInput::EamTaskCancelName,
+                _ => PendingInput::EamTaskDeleteName,
+            };
+            state.dashboard.pending_input = Some(pending_input);
+            state.open_modal(Modal::Input {
+                title: format!("{verb} — name"),
+                hint: Some(format!(
+                    "the task definition's name\n\
+                     the blast-radius preview fetches before the confirm gate arms\n\
+                     CLI: ign {verb} <NAME> --yes"
+                )),
+                buffer: String::new(),
+            });
+        }
+        Some("eam task modify") => {
+            state.dashboard.pending_input = Some(PendingInput::EamTaskModifyLine);
+            state.open_modal(Modal::Input {
+                title: "eam task modify — name + change".to_string(),
+                hint: Some(
+                    "one targeted change per fire: NAME enable | disable | \
+                     schedule-mode=MODE | description=TEXT | K=V\nmulti-flag \
+                     modifies are CLI forms (the modal-depth decision)\n\
+                     CLI: ign eam task modify <NAME> --enable|--disable|... --yes"
+                        .to_string(),
+                ),
+                buffer: String::new(),
+            });
+        }
         Some("backup restore") => {
             state.dashboard.pending_input = Some(PendingInput::BackupRestoreFile);
             state.open_modal(Modal::Input {
@@ -2799,6 +2919,24 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
                     ignition_core::actions::eam::eam_task_force(&*client, &name).await
                 });
             }
+        }
+        // The confirmed lifecycle/mutation verbs fire unguarded
+        // (10-04 — the TUI owned the `--yes`; the preview fetch and
+        // the Confirm modal were the gate).
+        PendingAction::EamTaskSuspend { name } => {
+            workers::ops::fire_eam_task_lifecycle(state, "suspend", name.clone());
+        }
+        PendingAction::EamTaskResume { name } => {
+            workers::ops::fire_eam_task_lifecycle(state, "resume", name.clone());
+        }
+        PendingAction::EamTaskCancel { name } => {
+            workers::ops::fire_eam_task_lifecycle(state, "cancel", name.clone());
+        }
+        PendingAction::EamTaskDelete { name } => {
+            workers::ops::fire_eam_task_lifecycle(state, "delete", name.clone());
+        }
+        PendingAction::EamTaskModify { name, change } => {
+            workers::ops::fire_eam_task_modify(state, name.clone(), change.clone());
         }
     }
 }
@@ -3287,6 +3425,53 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                     ),
                 });
             }
+            // The lifecycle/delete targets (10-04): the gate arms
+            // only after the blast-radius PREVIEW fetch lands — the
+            // staged action rides the fetch; EamPreview arms it.
+            (Some(PendingInput::EamTaskSuspendName), false) => {
+                workers::spawn_eam_preview(
+                    state,
+                    PendingAction::EamTaskSuspend {
+                        name: value.trim().to_string(),
+                    },
+                );
+            }
+            (Some(PendingInput::EamTaskResumeName), false) => {
+                workers::spawn_eam_preview(
+                    state,
+                    PendingAction::EamTaskResume {
+                        name: value.trim().to_string(),
+                    },
+                );
+            }
+            (Some(PendingInput::EamTaskCancelName), false) => {
+                workers::spawn_eam_preview(
+                    state,
+                    PendingAction::EamTaskCancel {
+                        name: value.trim().to_string(),
+                    },
+                );
+            }
+            (Some(PendingInput::EamTaskDeleteName), false) => {
+                workers::spawn_eam_preview(
+                    state,
+                    PendingAction::EamTaskDelete {
+                        name: value.trim().to_string(),
+                    },
+                );
+            }
+            // The modify line: parsed BEFORE the preview fetch arms
+            // (the LoggersSetLine precedent — a bad line opens the
+            // error modal and arms nothing).
+            (Some(PendingInput::EamTaskModifyLine), false) => match parse_eam_modify_line(&value) {
+                Ok((name, change)) => {
+                    workers::spawn_eam_preview(
+                        state,
+                        PendingAction::EamTaskModify { name, change },
+                    );
+                }
+                Err(reason) => open_error_modal(state, "eam task modify", &reason),
+            },
             // The gwbk path: the Confirm gate arms at accept (07-02 —
             // the restore REPLACES this gateway's state).
             (Some(PendingInput::BackupRestoreFile), false) => {
@@ -3502,17 +3687,16 @@ fn clear_pending(state: &mut AppState) {
 }
 
 /// The confirm-parity classifier (06-05 Task 3, extended 06-06 with
-/// the rig family's three) — EXHAUSTIVE over [`PendingAction`] (every
-/// variant is Confirm-gated by construction: the enum IS the
-/// confirm-executed set), mapping each to the CLI operation string
-/// main.rs's `require_confirmation` guards. Adding a variant breaks
-/// this match until it is classified — the compile-time tripwire
-/// INSIDE the confirm-executed set; the structural clap-walk test in
-/// ignition-cli (06-06 Task 2) guards the other direction (a
-/// CLI-guarded verb with no TUI gate cannot hide).
-// Test-only (the parity tripwire's data source — same shape as the
-// 06-05 staging, now over the complete 14-verb set).
-#[cfg_attr(not(test), expect(dead_code))]
+/// the rig family's three, 10-04 with the five EAM task verbs) —
+/// EXHAUSTIVE over [`PendingAction`] (every variant is Confirm-gated
+/// by construction: the enum IS the confirm-executed set), mapping
+/// each to the CLI operation string main.rs's `require_confirmation`
+/// guards. Adding a variant breaks this match until it is classified
+/// — the compile-time tripwire INSIDE the confirm-executed set; the
+/// structural clap-walk test in ignition-cli (06-06 Task 2) guards
+/// the other direction (a CLI-guarded verb with no TUI gate cannot
+/// hide). LIVE since 10-04: the EamPreview handler uses it as the
+/// Confirm modal's title (the clap-exact verb chain).
 fn gated_cli_verb(pending: &PendingAction) -> &'static str {
     match pending {
         PendingAction::Restart => "restart",
@@ -3535,6 +3719,11 @@ fn gated_cli_verb(pending: &PendingAction) -> &'static str {
         PendingAction::BackupRestore { .. } => "backup restore",
         PendingAction::EamTaskNew { .. } => "eam task new",
         PendingAction::EamTaskForce { .. } => "eam task force",
+        PendingAction::EamTaskSuspend { .. } => "eam task suspend",
+        PendingAction::EamTaskResume { .. } => "eam task resume",
+        PendingAction::EamTaskCancel { .. } => "eam task cancel",
+        PendingAction::EamTaskModify { .. } => "eam task modify",
+        PendingAction::EamTaskDelete { .. } => "eam task delete",
     }
 }
 
@@ -4159,13 +4348,14 @@ mod tests {
         );
 
         // G bottoms out at the last entry (diagnostics bundle wait,
-        // index 21 — the 07-02 backup + EAM families appended after
-        // restart, 07-03's script verb after those, 07-04's lint
-        // after that, and 09-08's Phase 9 morning-check reads +
-        // diagnostics-bundle family after lint).
+        // index 26 — the 07-02 backup + EAM families appended after
+        // restart, 10-04's five guarded EAM task verbs after force,
+        // 07-03's script verb after those, 07-04's lint after that,
+        // and 09-08's Phase 9 morning-check reads + diagnostics-bundle
+        // family after lint).
         update(&mut state, key(KeyCode::Char('G'), KeyModifiers::NONE));
         assert!(
-            matches!(state.modal, Some(Modal::Actions { selected: 21 })),
+            matches!(state.modal, Some(Modal::Actions { selected: 26 })),
             "G jumps to the last entry"
         );
 
@@ -7498,14 +7688,30 @@ mod tests {
             PendingAction::EamTaskForce {
                 name: "nightly-backup".into(),
             },
+            PendingAction::EamTaskSuspend {
+                name: "nightly-backup".into(),
+            },
+            PendingAction::EamTaskResume {
+                name: "nightly-backup".into(),
+            },
+            PendingAction::EamTaskCancel {
+                name: "nightly-backup".into(),
+            },
+            PendingAction::EamTaskModify {
+                name: "nightly-backup".into(),
+                change: crate::state::EamTaskModifyChange::Enabled(false),
+            },
+            PendingAction::EamTaskDelete {
+                name: "nightly-backup".into(),
+            },
         ]
     }
 
     /// THE parity tripwire: the confirm-gated TUI set is exactly the
     /// CLI's `--yes`-guarded verbs (main.rs `require_confirmation`
     /// sites, the 06-06 set + 07-01's sync + 07-02's backup
-    /// restore) — 16 verbs, each with its family route-mapped onto
-    /// the right screen.
+    /// restore + 10-04's five EAM task verbs) — 23 verbs, each with
+    /// its family route-mapped onto the right screen.
     #[test]
     fn confirm_parity_matches_the_cli_guard_set() {
         let pendings = every_gated_pending();
@@ -7513,8 +7719,13 @@ mod tests {
         verbs.sort_unstable();
         let expected = [
             "backup restore",
+            "eam task cancel",
+            "eam task delete",
             "eam task force",
+            "eam task modify",
             "eam task new",
+            "eam task resume",
+            "eam task suspend",
             "logs loggers reset",
             "logs loggers set",
             "project delete",
@@ -7576,5 +7787,139 @@ mod tests {
         // rig_down_fires_without_confirm): the CLI guards nothing
         // there either (05-03's webdev decision; 04-01's compose-down
         // volumes-kept decision).
+    }
+
+    /// The `eam task modify` cockpit-line grammar (10-04): the four
+    /// targeted-change forms parse; a bad line refuses with the
+    /// usage named.
+    #[test]
+    fn eam_modify_line_grammar_parses_one_targeted_change() {
+        use crate::state::EamTaskModifyChange;
+
+        let (name, change) =
+            super::parse_eam_modify_line("nightly-backup disable").expect("flag form");
+        assert_eq!(name, "nightly-backup");
+        assert_eq!(change, EamTaskModifyChange::Enabled(false));
+
+        let (name, change) =
+            super::parse_eam_modify_line("t1 schedule-mode=Scheduled").expect("mode form");
+        assert_eq!(name, "t1");
+        assert_eq!(
+            change,
+            EamTaskModifyChange::ScheduleMode("Scheduled".into())
+        );
+
+        let (name, change) =
+            super::parse_eam_modify_line("t1 description=nightly backup run").expect("text form");
+        assert_eq!(name, "t1");
+        assert_eq!(
+            change,
+            EamTaskModifyChange::Description("nightly backup run".into()),
+            "the description rides to end-of-line, spaces included"
+        );
+
+        let (name, change) = super::parse_eam_modify_line("t1 concurrentBackups=2")
+            .expect("K=V auto-typing validated via parse_setting");
+        assert_eq!(name, "t1");
+        assert_eq!(
+            change,
+            EamTaskModifyChange::Setting {
+                raw: "concurrentBackups=2".into()
+            }
+        );
+
+        // `enable=true` is NOT the flag — under the documented
+        // grammar it is a K=V SETTINGS entry (the flag is bare
+        // `enable`); it parses as the settings write it names.
+        let (_, change) =
+            super::parse_eam_modify_line("t1 enable=true").expect("a K=V settings entry");
+        assert_eq!(
+            change,
+            EamTaskModifyChange::Setting {
+                raw: "enable=true".into()
+            }
+        );
+
+        for bad in ["", "onlyname", "t1 setting=", "t1 =v"] {
+            assert!(
+                super::parse_eam_modify_line(bad).is_err(),
+                "{bad:?} refuses"
+            );
+        }
+    }
+
+    /// The preview-gate flow (10-04): an EamPreview landing arms the
+    /// staged action and opens the Confirm modal whose title is the
+    /// clap-exact verb chain and whose BODY is the blast-radius
+    /// preview text; a failed fetch opens the error modal and arms
+    /// NOTHING (a bad name can never reach a gate); a stale era drops
+    /// whole.
+    #[test]
+    fn eam_preview_arms_the_confirm_gate_with_the_preview_body() {
+        let mut state = AppState::new();
+        let era = state.era;
+
+        update(
+            &mut state,
+            AppEvent::EamPreview {
+                era,
+                pending: PendingAction::EamTaskSuspend {
+                    name: "nightly-backup".into(),
+                },
+                result: Ok("suspend nightly-backup: suspends task…\nagents: gw-a".into()),
+            },
+        );
+        assert!(
+            matches!(
+                state.dashboard.pending,
+                Some(PendingAction::EamTaskSuspend { ref name }) if name == "nightly-backup"
+            ),
+            "the staged action armed"
+        );
+        match &state.modal {
+            Some(Modal::Confirm { title, body }) => {
+                assert_eq!(title, "eam task suspend", "clap-exact title");
+                assert!(body.contains("agents: gw-a"), "the preview IS the body");
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+
+        // Esc cancels: the armed action clears with the modal.
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.dashboard.pending.is_none(), "cancel clears");
+
+        // A failed fetch arms nothing.
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::EamPreview {
+                era,
+                pending: PendingAction::EamTaskDelete {
+                    name: "ghost".into(),
+                },
+                result: Err("resource not found on the gateway".into()),
+            },
+        );
+        assert!(state.dashboard.pending.is_none(), "no gate on failure");
+        assert!(
+            matches!(state.modal, Some(Modal::Result_ { .. })),
+            "the error modal shows the fetch's refusal"
+        );
+
+        // A stale era drops whole.
+        state.close_modal();
+        let stale_era = state.era.wrapping_sub(1);
+        update(
+            &mut state,
+            AppEvent::EamPreview {
+                era: stale_era,
+                pending: PendingAction::EamTaskResume {
+                    name: "stale".into(),
+                },
+                result: Ok("stale preview".into()),
+            },
+        );
+        assert!(state.dashboard.pending.is_none(), "stale drops");
+        assert!(state.modal.is_none(), "no modal from a stale preview");
     }
 }

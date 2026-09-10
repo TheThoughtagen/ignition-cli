@@ -67,6 +67,88 @@ where
     }
 }
 
+/// The blast-radius Confirm BODY for the five guarded EAM task verbs
+/// (10-04): the rendered preview line (the ONE format the CLI's
+/// refusal message embeds — `render_preview_line`) plus the
+/// agent/pending fact lines, so every tier renders the same radius.
+fn eam_preview_body(preview: &ignition_core::actions::eam::BlastRadiusPreview) -> String {
+    use ignition_core::actions::eam::render_preview_line;
+    let mut lines = vec![render_preview_line(preview)];
+    lines.push(if preview.target_gateways.is_empty() {
+        "agents: (none — the controller itself is the effective target)".to_string()
+    } else {
+        format!("agents: {}", preview.target_gateways.join(", "))
+    });
+    if preview.pending_executions.is_empty() {
+        lines.push("pending executions: 0".to_string());
+    } else {
+        let rows: Vec<String> = preview
+            .pending_executions
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} (canCancel={})",
+                    if row.task_state.is_empty() {
+                        "-"
+                    } else {
+                        &row.task_state
+                    },
+                    row.can_cancel
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "pending executions: {} — {}",
+            rows.len(),
+            rows.join("; ")
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Spawn the blast-radius PREVIEW fetch for a staged guarded EAM task
+/// verb (10-04): reads only (find + both scheduled segments — the
+/// same composer the CLI's guard runs), then reports
+/// [`AppEvent::EamPreview`] carrying the STAGED [`PendingAction`] +
+/// the composed Confirm body. Nothing is armed here — update arms the
+/// pending action and opens the Confirm modal when the preview lands
+/// (or opens the error modal on a bad name — `not_found` refuses
+/// BEFORE any gate, the preview-IS-the-preflight rule). Era-stamped;
+/// no busy guard (a read, and the modal flow owns one-at-a-time).
+pub fn spawn_eam_preview(state: &mut crate::state::AppState, pending: crate::state::PendingAction) {
+    let Some(client) = state.client.as_ref().map(|handle| handle.0.clone()) else {
+        return;
+    };
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    // The verb + name ride OUT of the staged action (the preview
+    // composer's inputs); the action itself rides back staged.
+    let (verb, name) = match &pending {
+        crate::state::PendingAction::EamTaskSuspend { name } => ("suspend", name),
+        crate::state::PendingAction::EamTaskResume { name } => ("resume", name),
+        crate::state::PendingAction::EamTaskCancel { name } => ("cancel", name),
+        crate::state::PendingAction::EamTaskModify { name, .. } => ("modify", name),
+        crate::state::PendingAction::EamTaskDelete { name } => ("delete", name),
+        _ => return,
+    };
+    let (verb, name) = (verb.to_string(), name.clone());
+    let era = state.era;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let result = ignition_core::actions::eam::build_blast_radius(&*client, &verb, &name)
+                .await
+                .map(|preview| eam_preview_body(&preview))
+                .map_err(|err| err.to_string());
+            let _ = tx.send(crate::event::AppEvent::EamPreview {
+                era,
+                pending,
+                result,
+            });
+        });
+    }
+}
+
 pub mod ops;
 pub mod refresh;
 pub mod rig_stream;

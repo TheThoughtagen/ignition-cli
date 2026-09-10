@@ -375,6 +375,92 @@ pub fn fire_project_sync(
     });
 }
 
+/// Serialize a finished action result into the shared JSON value the
+/// result-modal pipeline renders — the lifecycle verbs and delete
+/// carry DIFFERENT result models, and [`super::spawn_action`] needs
+/// one future output type (serialization cannot fail for the
+/// all-keys action models; a failure maps to `internal_error`
+/// honestly).
+async fn action_result_to_json<T: serde::Serialize>(
+    result: Result<T, CoreError>,
+) -> Result<serde_json::Value, CoreError> {
+    let value = result?;
+    serde_json::to_value(value)
+        .map_err(|err| CoreError::Internal(format!("result serialization failed: {err}")))
+}
+
+/// `ign eam task suspend|resume|cancel|delete <NAME>` (10-04) — the
+/// CONFIRMED arms (the TUI owned the `--yes`; the action runs
+/// unguarded). One helper: the verbs share the name-only shape; the
+/// label is the clap-exact verb chain.
+pub fn fire_eam_task_lifecycle(state: &mut AppState, verb: &'static str, name: String) {
+    let Some(client) = client_arc(state) else {
+        return;
+    };
+    let label: &'static str = match verb {
+        "suspend" => "eam task suspend",
+        "resume" => "eam task resume",
+        "cancel" => "eam task cancel",
+        "delete" => "eam task delete",
+        _ => return,
+    };
+    super::spawn_action(state, label, async move {
+        match verb {
+            "suspend" => {
+                action_result_to_json(actions::eam::eam_task_suspend(&*client, &name).await).await
+            }
+            "resume" => {
+                action_result_to_json(actions::eam::eam_task_resume(&*client, &name).await).await
+            }
+            "cancel" => {
+                action_result_to_json(actions::eam::eam_task_cancel(&*client, &name).await).await
+            }
+            _ => action_result_to_json(actions::eam::eam_task_delete(&*client, &name).await).await,
+        }
+    });
+}
+
+/// `ign eam task modify <NAME> <CHANGE>` (10-04) — the CONFIRMED arm.
+/// The `Setting` variant's raw `K=V` is parsed HERE (fire time — the
+/// scalar auto-typing rides `parse_setting`); a malformed K=V
+/// surfaces the parse refusal in the result modal (the gate already
+/// validated shape at arm time).
+pub fn fire_eam_task_modify(
+    state: &mut AppState,
+    name: String,
+    change: crate::state::EamTaskModifyChange,
+) {
+    use crate::state::EamTaskModifyChange;
+    use ignition_core::actions::eam::TaskChange;
+    let Some(client) = client_arc(state) else {
+        return;
+    };
+    super::spawn_action(state, "eam task modify", async move {
+        let change = match change {
+            EamTaskModifyChange::Enabled(enabled) => TaskChange {
+                enabled: Some(enabled),
+                ..Default::default()
+            },
+            EamTaskModifyChange::ScheduleMode(mode) => TaskChange {
+                schedule_mode: Some(mode),
+                ..Default::default()
+            },
+            EamTaskModifyChange::Description(text) => TaskChange {
+                description: Some(text),
+                ..Default::default()
+            },
+            EamTaskModifyChange::Setting { raw } => {
+                let (key, value) = actions::eam::parse_setting(&raw)?;
+                TaskChange {
+                    settings_overlay: Some(serde_json::json!({ key: value })),
+                    ..Default::default()
+                }
+            }
+        };
+        actions::eam::eam_task_modify(&*client, &name, change).await
+    });
+}
+
 /// The state's client Arc, cloned out of the handle (the watch.rs
 /// helper's shape).
 fn client_arc(state: &AppState) -> Option<Arc<ReqwestGatewayApi>> {
