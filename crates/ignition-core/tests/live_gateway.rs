@@ -552,3 +552,348 @@ async fn live_project_export_import_round_trip() {
     let _ = api.project_delete(&name).await;
     let _ = std::fs::remove_file(&out);
 }
+
+// ---------------------------------------------------------------------------
+// 10-05 addition: the SC-5 live gate — ONE guarded EAM write lifecycle
+// (scratch create → suspend → verify → resume → delete) end-to-end against
+// the REAL WHK controller rig through the REAL action layer
+// (actions::eam — the product's correctness path, not raw client calls).
+//
+// Wire truth cited from 10-LIVE-CAPTURES.md (both 8.3.3 + 8.3.6 rigs):
+// - suspend/resume 204 on a Scheduled task with a registered trigger and
+//   PERSIST `config.profile.isSuspended` (Decision 1); suspend of an
+//   OnDemand task answers the indistinguishable 500 "Task could not be
+//   suspended" (§1a) — so the gate flips its own scratch task to
+//   Scheduled+cron (capture §6a full-record modify) and retries suspend
+//   until the gateway registers the trigger (~80 s captured, §1c).
+// - A suspended task vanishes from `scheduled/false`; resume brings it
+//   back (§2's same-second observation).
+// - A lone-resource delete succeeds WITHOUT `?confirm=` (§3b) and
+//   post-delete find answers the config-resource 404 (`not_found`).
+// - NO force call anywhere: lifecycle writes only, so an expired trial
+//   cannot false-fail the gate (phase pitfall 8).
+//
+// SAFETY INVARIANT (enforced in code, not convention): the test derives
+// its task name from the fixed `ign-live-scratch` prefix + an epoch
+// suffix, CREATES the task itself, and asserts the found record's name
+// equals the scratch name IMMEDIATELY BEFORE every write (flip, suspend,
+// resume, delete). A misconfigured IGNITION_LIVE_URL pointing at a
+// production gateway can never touch a real task — the pre-write name
+// assertion fails first. No environment-supplied task name is ever used
+// for a write.
+// ---------------------------------------------------------------------------
+
+/// PRE-WRITE SAFETY GATE: find the record at the scratch name and assert
+/// it IS our scratch task before any write may fire. Returns the record
+/// (the flip's clone source).
+async fn assert_scratch_task(
+    api: &dyn GatewayApi,
+    scratch: &str,
+) -> ignition_core::client::eam::EamTaskRecord {
+    let record = api
+        .eam_task_find(scratch)
+        .await
+        .unwrap_or_else(|err| panic!("pre-write find for scratch task failed: {err}"));
+    assert_eq!(
+        record.name, scratch,
+        "PRE-WRITE NAME ASSERTION FAILED: the gateway's record at the scratch name \
+         is not our scratch task — refusing every write (misconfigured live URL?)"
+    );
+    record
+}
+
+/// The Jetty-page message the gateway answers while the scheduler trigger
+/// has not registered yet (capture §1c — up to ~80 s after the cron lands).
+fn is_suspend_trigger_pending(err: &CoreError) -> bool {
+    matches!(err, CoreError::Internal(msg) if msg.contains("Task could not be suspended"))
+}
+
+/// The scratch task's Drop guard — the wiremock mock-guard pattern for a
+/// REMOTE resource: best-effort delete on EVERY path, so a mid-test panic
+/// cannot leave scratch tasks behind. Drop is sync, so it builds its own
+/// single-thread runtime and a FRESH client (never drives the test
+/// runtime's client from a different event loop).
+struct ScratchTaskGuard {
+    url: String,
+    token: String,
+    name: String,
+    /// Set when the test body itself completed the delete — the Drop
+    /// path then only logs (no double delete, honest cleanup log).
+    disarmed: bool,
+}
+
+impl ScratchTaskGuard {
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ScratchTaskGuard {
+    fn drop(&mut self) {
+        let name = self.name.clone();
+        if self.disarmed {
+            eprintln!("cleanup: scratch task {name:?} deleted by the test body (Drop disarmed)");
+            return;
+        }
+        let url = self.url.clone();
+        let token = self.token.clone();
+        let name_for_block = name.clone();
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("cleanup runtime builds")
+                .block_on(async move {
+                    let api = ReqwestGatewayApi::for_tests(
+                        &url,
+                        Some(Credential::Token(Secret::new(token))),
+                    );
+                    match api.eam_task_find(&name_for_block).await {
+                        Ok(record) => {
+                            if let Some(signature) = record.signature.clone() {
+                                match api
+                                    .eam_task_delete(&name_for_block, &signature, false)
+                                    .await
+                                {
+                                    Ok(_) => eprintln!(
+                                        "cleanup: scratch task {name_for_block:?} best-effort deleted (Drop path)"
+                                    ),
+                                    Err(err) => eprintln!(
+                                        "cleanup: scratch task {name_for_block:?} Drop-time delete FAILED — remove it manually: {err}"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(_) => eprintln!(
+                            "cleanup: scratch task {name_for_block:?} not found at Drop (already gone)"
+                        ),
+                    }
+                });
+        }));
+        if cleanup.is_err() {
+            eprintln!(
+                "cleanup: scratch task {:?} Drop cleanup itself panicked — remove it manually",
+                name
+            );
+        }
+    }
+}
+
+/// THE SC-5 GATE: one guarded EAM write lifecycle end-to-end.
+#[tokio::test]
+#[ignore = "opt-in: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN (a WHK controller rig with EAM installMode=Controller)"]
+async fn live_eam_write_lifecycle() {
+    let (Some(url), Some(token)) = (live_url(), live_token()) else {
+        skip("IGNITION_LIVE_URL / IGNITION_LIVE_TOKEN not both set");
+        return;
+    };
+    let api =
+        ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token.clone()))));
+
+    // Scratch isolation: fixed prefix + epoch suffix — unique per run,
+    // created by this test, written only after the name assertion.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let scratch = format!("ign-live-scratch-{ts}");
+    let mut guard = ScratchTaskGuard {
+        url: url.clone(),
+        token: token.clone(),
+        name: scratch.clone(),
+        disarmed: false,
+    };
+
+    // Controller-gate diagnostic FIRST (one cheap read): a 403
+    // "configured as a controller" here is RIG CONFIG, not code —
+    // fail with the operator-facing message instead of a confusing
+    // write-path error later.
+    if let Err(CoreError::EamNotController { .. }) = api.eam_tasks_scheduled(false).await {
+        panic!(
+            "the live URL is NOT an EAM controller — every /data/eam/api/v1/* operation \
+             refuses until the EAM module's installMode is flipped to Controller \
+             (headless recipe: 10-RIG-NOTES.md). This is a rig-config error, not a code bug."
+        );
+    }
+
+    // 1. CREATE — the action layer (eam_backup + OnDemand is the unguarded
+    //    ladder cell; the composer ALWAYS sends config.settings — the
+    //    422 trap). Zero --target values default to ["_controller"].
+    let created = ignition_core::actions::eam::eam_task_create(
+        &api,
+        &scratch,
+        "eam_backup",
+        &[],
+        &[],
+        None,
+        "OnDemand",
+    )
+    .await
+    .expect("scratch task create through the action layer must succeed");
+    assert_eq!(created.name, scratch);
+    assert_eq!(
+        created.task_type, "eam_backup",
+        "created type echoes the request"
+    );
+    eprintln!(
+        "gate step create: scratch task {scratch:?} created (eam_backup/OnDemand, action layer)"
+    );
+
+    // 2. CREATE READ-BACK + first NAME ASSERTION: the found record IS the
+    //    scratch task, carries the profile type, and config.settings rode
+    //    the create body (the 422 trap did not fire).
+    let record = assert_scratch_task(&api, &scratch).await;
+    assert_eq!(
+        record.config.get("profile").and_then(|p| p.get("type")),
+        Some(&serde_json::Value::String("eam_backup".to_string())),
+        "created record's profile.type"
+    );
+    assert!(
+        record.config.get("settings").is_some(),
+        "config.settings present on the created record (create 422 trap avoided)"
+    );
+
+    // 3. FLIP the scratch task to Scheduled + cron — capture §6a verbatim:
+    //    the FULL-RECORD clone (every key find answered, null healthcheck
+    //    placeholder dropped) mutated at profile.scheduleMode/profile.
+    //    scheduleDetails, PUT carrying the ORIGINAL signature. Suspend of
+    //    an OnDemand task is the captured 500 (§1a) — the trigger must
+    //    exist, and this flip is the capture-proven path to a suspendable
+    //    task. (actions::eam::TaskChange deliberately cannot set
+    //    scheduleDetails — capture-honest scope — so the flip rides the
+    //    client's §6a-pinned full-record modify.)
+    let mut body = serde_json::to_value(&record).expect("find record serializes for the clone");
+    if body.get("scheduledTaskState") == Some(&serde_json::Value::Null)
+        && let Some(map) = body.as_object_mut()
+    {
+        map.remove("scheduledTaskState");
+    }
+    {
+        let profile = body
+            .get_mut("config")
+            .and_then(|config| config.get_mut("profile"))
+            .expect("the created record carries config.profile");
+        profile["scheduleMode"] = serde_json::Value::String("Scheduled".to_string());
+        // The capture-proven cron (§6a/§12 — every 30 s).
+        profile["scheduleDetails"] = serde_json::Value::String("0/30 * * * * ?".to_string());
+    }
+    assert_scratch_task(&api, &scratch).await; // pre-write name assertion
+    api.eam_task_modify(&body)
+        .await
+        .expect("schedule flip PUT (capture §6a full-record echo-modify shape) must land");
+    eprintln!(
+        "gate step flip: {scratch:?} is Scheduled with cron \"0/30 * * * * ?\" — waiting for \
+         the gateway to register the trigger (captured ~80 s, §1c)"
+    );
+
+    // 4. SUSPEND — the action layer, retried while the trigger is still
+    //    registering (the captured late-500, §1c). Every attempt re-runs
+    //    the pre-write name assertion FIRST.
+    let suspend = {
+        let mut result = None;
+        for attempt in 1..=7 {
+            assert_scratch_task(&api, &scratch).await; // pre-write name assertion
+            match ignition_core::actions::eam::eam_task_suspend(&api, &scratch).await {
+                Ok(res) => {
+                    result = Some(res);
+                    break;
+                }
+                Err(err) if attempt < 7 && is_suspend_trigger_pending(&err) => {
+                    eprintln!(
+                        "gate step suspend: attempt {attempt} — trigger not registered yet \
+                         (captured 500 \"Task could not be suspended\", §1c); retrying in 30 s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+                Err(err) => panic!("suspend failed (attempt {attempt}): {err}"),
+            }
+        }
+        result.expect("suspend must succeed once the trigger registers (≤ ~3 min)")
+    };
+    assert_eq!(suspend.task, scratch);
+    assert!(suspend.fired, "suspend actually rode the wire");
+    assert_eq!(
+        suspend.config_suspended,
+        Some(true),
+        "capture Decision 1: suspend PERSISTS isSuspended=true into the definition"
+    );
+    eprintln!(
+        "gate step suspend: 204 + read-back isSuspended=true (previous state {:?})",
+        suspend.previous_state
+    );
+
+    // 5. SCHEDULED VOCABULARY: a suspended task is NOT listed as scheduled
+    //    (capture §2). Only the scratch task's own row is asserted on —
+    //    every other row belongs to the rig and is never touched.
+    let scheduled = api
+        .eam_tasks_scheduled(false)
+        .await
+        .expect("scheduled/false read must answer on a controller");
+    assert!(
+        !scheduled.iter().any(|row| row.name == scratch),
+        "suspended scratch task must vanish from scheduled/false (capture §2)"
+    );
+    eprintln!("gate step verify: suspended task absent from scheduled/false (capture §2)");
+
+    // 6. RESUME — the action layer (fires unconditionally per §1b honesty;
+    //    here the task IS suspended so it is the real inverse, §1d).
+    assert_scratch_task(&api, &scratch).await; // pre-write name assertion
+    let resume = ignition_core::actions::eam::eam_task_resume(&api, &scratch)
+        .await
+        .expect("resume of the suspended scratch task must succeed (capture §1d 204)");
+    assert_eq!(resume.task, scratch);
+    assert!(resume.fired, "resume actually rode the wire");
+    assert_eq!(
+        resume.config_suspended,
+        Some(false),
+        "capture Decision 1: resume syncs isSuspended back to false"
+    );
+    // … and the task is schedulable again (the row reappears — §2 observed
+    // it same-second; retry tolerance for load).
+    let mut back = false;
+    for attempt in 1..=4 {
+        let scheduled = api
+            .eam_tasks_scheduled(false)
+            .await
+            .expect("scheduled/false read must answer");
+        if scheduled.iter().any(|row| row.name == scratch) {
+            back = true;
+            break;
+        }
+        eprintln!("gate step resume: task not back in scheduled/false yet (attempt {attempt})");
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+    assert!(
+        back,
+        "resumed scratch task must reappear in scheduled/false (capture §2)"
+    );
+    eprintln!("gate step resume: 204 + read-back isSuspended=false; task back in scheduled/false");
+
+    // 7. DELETE — the action layer (find-derived signature, ?collection=core,
+    //    NO confirm by default per Decision 3 — the lone-resource shape §3b).
+    assert_scratch_task(&api, &scratch).await; // pre-write name assertion
+    let deleted = ignition_core::actions::eam::eam_task_delete(&api, &scratch)
+        .await
+        .expect("delete of the lone scratch task must succeed (capture §3b)");
+    assert_eq!(deleted.task, scratch);
+    assert!(deleted.deleted, "delete outcome success:true (capture §3b)");
+    assert!(
+        !deleted.changes.is_empty(),
+        "changes[] carries the deleted resource's final signature (capture §9)"
+    );
+
+    // 8. POST-DELETE PROOF: find must answer the config-resource 404
+    //    (not_found, exit 6) — the scratch task is GONE, cleanup proven.
+    let err = api
+        .eam_task_find(&scratch)
+        .await
+        .expect_err("post-delete find must answer not_found");
+    assert!(
+        matches!(err, CoreError::NotFound { .. }),
+        "expected not_found after delete, got: {err}"
+    );
+    eprintln!("gate step delete: deleted=true; post-delete find = not_found — cleanup proven");
+
+    // The test body completed the delete itself — disarm the Drop guard.
+    guard.disarm();
+}
