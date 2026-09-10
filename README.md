@@ -218,7 +218,12 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign eam history [--limit N] [--search TEXT]` | EAM task run history — `ISO  taskName  [level]  target  detail` rows (newest first) | rides the RUNTIME seam: a stock (non-controller) gateway refuses exit 6 `eam_not_controller` with the manual-flip hint (definitions still list — see below); `--limit` defaults to 200 and is ALWAYS sent explicitly (the server default is unlimited); outcomes are DATA (`Failed` + GNET-not-connected detail read exit 0); JSON data `{items, count}` — items passthrough under the gateway's own camelCase keys (`taskName`, `taskStart` epoch-ms, `taskType`) |
 | `ign eam tasks [NAME]` | Task definitions: bare form lists (`name  type  schedule  state`); with a name shows the full definition + its scheduled state | rides the config-resource seam (`com.inductiveautomation.eam/eam-tasks`) — definitions answer on STOCK gateways (no controller needed); JSON list data `{tasks: [{name, task_type, schedule_mode, current_state}]}` (all keys always; `current_state` null on list records — find answers carry it); detail data `{name, definition, state}`; an unknown name exits 6 `not_found` |
 | `ign eam task new <NAME> <TYPE> [--target NAME]... [--setting K=V]... [--definition PATH] [--schedule-mode MODE]` | Create a task definition — the typed guard ladder | **the planner-locked ladder**: `eam_backup` + OnDemand (the default schedule) fires UNGUARDED (it never auto-fires and only acts when forced); MUTATING types (`eam_restart`, `eam_sendProject`, `eam_sendResource`, `eam_sendTags`, `eam_activateLicense`, `eam_updateLicense`, `eam_unactivateLicense`) and ANY non-OnDemand `--schedule-mode` (`Immediate`/`Scheduled`/`AtTime`/`AtDelay` — they arm autonomous actions) need `--yes` (exit 2 pre-resolution, zero network); the FLEET-DESTRUCTIVE trio (`eam_restoreBackup`, `eam_installModules`, `eam_remoteUpgrade`) REFUSES outright — exit 6 `eam_task_type_refused` naming the EXT-03 (v2) scope (run them from the EAM console); `--setting K=V` auto-types scalars (bool/int ride typed, else string); `--definition PATH` deep-merges a full-JSON settings file over the composed `config.settings` (objects merge, arrays/scalars replace) — mutually exclusive with `--setting`; the POST body is the config-resource ARRAY shape with the live 8.3.3 profile/settings split (`config.profile` = `{type, scheduleMode}` only; `config.settings` = `{targetGateways, targetGroups, …}`); `targetGateways` defaults to `["_controller"]` when no `--target` is given (the controller itself); JSON data carries the composed definition verbatim |
-| `ign eam task force <NAME> --yes` | Force-dispatch a task NOW (find → owner → POST → history read-back) | **destructive — always `--yes`-guarded** (dispatches to the agent targets immediately; exit 2 pre-resolution without); the owner resolves from the healthcheck's `scheduledTaskState.details.owner` (fallback `eam`); a 2xx is DISPATCH acceptance — the run's OUTCOME lands in history as data (`Failed` + GNET-not-connected detail is the honest shape of an unconfigured agent; trial expiry blocks runs); JSON data `{task, owner, dispatched, history}` |
+| `ign eam task force <NAME> --yes` | Force-dispatch a task NOW (find → owner → POST → history read-back) | **destructive — always `--yes`-guarded** (dispatches to the agent targets immediately; exit 2 pre-resolution without); the guard is the two-tier blast-radius gate (see below): the refusal message IS the preview line naming the task, its agent targets, and the factual impact; the owner resolves from the healthcheck's `scheduledTaskState.details.owner` (fallback `eam`); a 2xx is DISPATCH acceptance — the run's OUTCOME lands in history as data (`Failed` + GNET-not-connected detail is the honest shape of an unconfigured agent; trial expiry blocks runs); JSON data `{task, owner, dispatched, history}` |
+| `ign eam task suspend <NAME> --yes` | Suspend a task definition's scheduled dispatches (runtime seam) | **guarded — the two-tier blast-radius gate** (exit 2 pre-check + preview-in-the-refusal without `--yes`, zero writes; exit 6 `not_found` on a bad name BEFORE any prompt); on a stock gateway the runtime seam honestly refuses exit 6 `eam_not_controller` (manual-flip hint); TASK-scoped — there is NO agent-level suspend on the wire (see the reconciliation note below); JSON data `{task, action, previous_state, config_suspended, pending, fired, reason}` |
+| `ign eam task resume <NAME> --yes` | Resume a suspended task definition (runtime seam) | the suspend inverse — same guard, same seams, same honesty; JSON data as suspend |
+| `ign eam task cancel <NAME> --yes` | Cancel a task's PENDING execution (runtime seam) | same guard; nothing pending is an honest no-op (`fired: false` + the reason ride the data — a write we declined is reported, never disguised); a `canCancel: false` row surfaces the gateway's own refusal |
+| `ign eam task modify <NAME> [--enable\|--disable] [--schedule-mode MODE] [--setting K=V]... [--description TEXT] --yes` | Rewrite targeted keys of a task definition (config seam — works on stock gateways) | full-record read-modify-write: every key the gateway answered rides back, only the targeted keys change, and the body carries the record's `signature` (a stale signature is refused by the gateway); `--enable`/`--disable` conflict (clap-validated); `--setting` reuses the `eam task new` K=V auto-typing and deep-merges over `config.settings` (repeatable); a modify that targets nothing refuses exit 2 pre-network (a no-op PUT would still rotate the server-side signature); **no `--rename` by wire honesty** — the gateway answers a renamed PUT with 404 empty; rename is the create-new + delete-old composite; the guard is the two-tier gate (preview reflects the post-change impact); JSON data `{task, changed, definition, put_outcome, readback}` |
+| `ign eam task delete <NAME> --yes` | Delete a task definition (config seam — works on stock gateways) | **signature-keyed** (the gateway refuses a stale signature) behind the two-tier gate; JSON data `{task, deleted, affected}` — `affected` names the resources the gateway reported |
 | `ign script run --code PY\|--file PATH\|- [--project NAME]` | Execute gateway-side Python (Jython) through the secret-gated `scriptExec` route — non-interactive, the route's entire purpose | **the opt-in is STRUCTURAL, not a flag**: `scriptExec` deploys only via `ign webdev deploy --with-script-exec` (which generates + persists the secret); without it the verb exits 6 `script_exec_not_configured` with ZERO HTTP, hint naming the deploy flag; **no `--yes` by design** — the deploy flag IS the opt-in and agents need it non-interactive; `--code`/`--file` are mutually exclusive (both or neither → exit 2 `invalid_input` before any resolution; `--file -` reads stdin — the agent pipe path); each run probes the route's version handshake then execs (two round trips); JSON data `{stdout, result, elapsedMs}` — ALL keys always; a route-side Python exception surfaces its traceback verbatim (exit 6 `webdev_route_error`); NO server-side execution timeout exists — a long-running script holds the HTTP connection (the client's per-request timeout class applies); the secret NEVER appears in any output mode (see the scriptExec posture below) |
 | `ign lint PATH... [--strict] [-- ARGS...]` | Lint local project files by delegating to `ignition-lint` (PATH-discovered; no gateway, `profile: null`) | **doctor posture**: exit 0 whenever the tool RAN — findings, `child_exit_code`, and the parsed JSON report ride as data (ALL keys always; `report` null + `stdout` verbatim when unparseable; `stderr_preview` capped at 4000 chars); `--strict` exits with the tool's own code for CI (envelope prints first — the one sanctioned success-path exit exception; 1 = findings at the `--fail-on` threshold); PATHS map to `--target <path>` pairs + `--report-format json` on an ARG VECTOR (never a shell string); anything after `--` passes through verbatim; no tool on PATH → exit 6 `lint_tool_absent` with the install hint (`uv tool install ignition-lint-toolkit`); pair with `project export --decode-scripts` to lint the decoded sidecars |
 | `ign api call --method M --path /P [--data TEXT] [--header "Name: Value"]... [--query k=v]...` | Raw passthrough to any gateway REST endpoint — the escape hatch for the uncurated endpoint families (any HTTP verb accepted) | the envelope's `data.result.data` IS the gateway's JSON **verbatim** (no field dropped, no value coerced, key order preserved — the documented contract exception above); a non-JSON 2xx body exits 1 `internal` with the explanation (binary endpoints: use logs/backup downloads); auth-pattern headers (`Authorization`, `X-Ignition-API-Token`, `Cookie` — case-insensitive) refuse exit 2 pre-resolve with ZERO gateway requests (credentials come from the profile); `--path` must start with `/`, refuses host-shaped URLs and embedded `?` (use repeatable `--query k=v` — the ONE query mechanism); `--header` splits on the FIRST `:` (repeatable), `--data` is raw text on ANY method (GET/DELETE bodies allowed — curl parity); exit partition: 401/403→5, 404→6, 503→6, 500→1, every other 4xx→2 `gateway_client_error` with the body verbatim (4 KiB cap + `... [truncated]` marker) |
@@ -579,7 +584,9 @@ exclusions — same mechanics).
 ## EAM tasks (`ign eam`)
 
 The Enterprise Administration Module's task surface — the read-heavy
-family with guarded writes (create/force arrive with `eam task …`).
+family with guarded writes (`eam task new`, `force`, and the
+10-04 lifecycle/mutation verbs: `suspend`/`resume`/`cancel`/
+`modify`/`delete`).
 
 **The controller state gate.** On a stock gateway the EAM module is
 installed but its `module-settings` singleton carries
@@ -611,13 +618,55 @@ trial/license ("Trial timer is expired" blocks runs). These outcomes
 surface as DATA in history rows (`level: Failed` + the gateway's own
 `detail` text) — exit 0 reads, never hidden.
 
-**Deferred reads:** the `scheduled`/`retry` list views and the
-`suspend`/`resume`/`cancel` verbs are v1 backlog (each verb carries
-TUI + golden + README cost; history + definitions are the MVP read
-surface). The EAM archive store (`storage/archived-backups` — a
-controller's fleet-backup inventory, needs `serverids`) is a
-different thing from this gateway's gwbk files and stays out of MVP
-scope.
+**Deferred reads:** the `scheduled`/`retry` list views remain v1
+backlog. The `suspend`/`resume`/`cancel` task verbs shipped (the
+guarded lifecycle set below); agent-level writes did NOT — see the
+reconciliation note. The EAM archive store
+(`storage/archived-backups` — a controller's fleet-backup inventory,
+needs `serverids`) is a different thing from this gateway's gwbk
+files and stays out of MVP scope.
+
+### The guarded task lifecycle verbs (`suspend` / `resume` / `cancel` / `modify` / `delete`)
+
+All five run the **two-tier blast-radius guard**, and `force` composes
+onto the same gate:
+
+1. **Tier 0 — pure precheck** (no network): an empty or whitespace
+   task name (or a `modify` that targets no keys) refuses exit 2
+   `invalid_input` before anything is resolved.
+2. **Tier 1 — preview fetch** (read-only): the CLI finds the
+   definition and its scheduled state and composes the blast radius —
+   task, type, agent targets, pending executions, and the factual
+   controller impact. A bad task name refuses exit 6 `not_found`
+   HERE, before any prompt: the preview IS the pre-flight.
+3. **Tier 2 — confirm-with-preview**: without `--yes` the CLI
+   refuses exit 2 `confirmation_required` and **the refusal message
+   IS the preview line**
+   (`suspend nightly-backup: suspends task nightly-backup … targets:
+   [gw-a, _controller] pending: 1`). The refusal names the task, its
+   agent targets, and the impact — an agent can read the blast
+   radius from stderr alone. Zero mutations have fired.
+4. With `--yes` the action runs — and core re-checks the state it
+   captured (the authoritative re-read), so a race between preview
+   and write still lands honestly (e.g. suspend on an
+   already-suspended task refuses, `fired: false` on cancel with
+   nothing pending).
+
+**The seam honesty:** `suspend`/`resume`/`cancel` ride the RUNTIME
+seam — on a stock gateway they refuse exit 6 `eam_not_controller`
+with the manual-flip hint (the preview fetch's definition read still
+works everywhere; the refusal comes from the write). `modify` and
+`delete` ride the config-resource seam and work on stock gateways.
+
+**The agent-vs-task reconciliation (read this before scripting):**
+the EAM wire has **no agent-level suspend/resume**. Suspend, resume,
+and cancel are TASK-scoped runtime verbs — an "agent" is suspended
+by suspending its tasks, and the blast-radius preview names the
+affected agents through `targetGateways` so the task-scoped verb
+still answers the fleet question. Genuinely agent-level writes DO
+exist on the wire — quarantined-agent delete, agent approve, agent
+upgrade — but they are deliberately NOT exposed in v1.1 (deferred
+scope; nothing plans them).
 
 ### The `eam task new` guard ladder
 
@@ -907,7 +956,10 @@ any profiled gateway, same whole-state replacement — plus the EAM
 writes: `eam task new` for MUTATING types or any non-OnDemand
 schedule (the typed ladder above; `eam_backup` + OnDemand needs no
 `--yes` and the fleet-destructive trio refuses outright instead of
-guarding), and `eam task force`, which dispatches NOW) refuse
+guarding), and `eam task force`, which dispatches NOW, plus the guarded task
+lifecycle verbs `eam task suspend`/`resume`/`cancel`/`modify`/
+`delete` — each refusal carries the blast-radius preview in the
+message (the two-tier gate above)) refuse
 without `--yes`
 (exit 2, `confirmation_required`, hint names both the flag and
 `IGNITION_YES=1`) — non-interactive by design, so scripts and agents
