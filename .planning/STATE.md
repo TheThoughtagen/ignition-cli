@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 EAM write operations: plans 01-05 + 07 executed (captures, client surface, action layer, CLI/TUI/README surface, live gate, UAT-test-10 modal-clip gap closure); 10-06 (live gate lifecycle) in flight with a parallel executor; SC-5 live run blocked on user-provisioned WHK controller env (10-USER-SETUP.md)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 EAM write operations: all 7 plans executed (01-05 original + 06/07 UAT gap closures); SC-5 not closed by a passing gate run — the 10-06 live runs on the disposable controller rig live-proved through-suspend + both code fixes, but the §2 vanish never landed within 90s (×2); follow-up named in 10-LIVE-GATE.md §4 D1/§6
 
 ## Current Position
 
 **Phase:** 10 of 14 (10-eam-write-operations)
-**Current Plan:** 6 of 7 complete (01-05 + gap closure 10-07 — TUI Confirm modal wraps the blast-radius body, UAT test 10 pinned by buffer regression test); 10-06 in flight (parallel executor, code committed at 9f99ed5, SUMMARY pending)
+**Current Plan:** 7
 **Total Plans in Phase:** 7 (5 original + 2 gap closures from 10-UAT)
-**Status:** 10-07 complete — awaiting 10-06 SUMMARY, then `/gsd-verify-work` 10
+**Status:** Plans complete — SC-5 follow-up: capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run; then `/gsd-verify-work` 10
 **Last Activity:** 2026-09-11
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -54,6 +54,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 10 P04 | 3h 43m | 3 tasks | 15 files |
 | Phase 10 P05 | 2h 30m | 2 tasks | 3 files |
 | Phase 10 P07 | 24 min | 2 tasks | 1 files |
+| Phase 10 P06 | 27 min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -121,6 +122,8 @@ Recent decisions affecting current work:
 - [Phase 10]: 10-05: the live gate flips its own scratch task to Scheduled+cron before suspend — capture §1a proves OnDemand suspend = 500 and §1c proves ~80s trigger-registration latency — retried 7x/30s on the Jetty message; pre-write name assertion (find + assert scratch name) runs before EVERY write, enforced in test code — captures are the locked wire truth; plan verify text defers to 10-LIVE-CAPTURES Decision 1
 - [Phase 10]: 10-07: Confirm body split into real Lines before wrapping — ratatui renders embedded \n inside a Span as literal whitespace glyphs, not row breaks (reflow.rs); .wrap() alone would fold the three body lines into one flow with visible newline glyphs and row-split tokens — the height calc already counted body.lines(), proving multi-line intent
 - [Phase 10]: 10-07: wrapped_row_count greedy estimator targets the Ratio(1,2) inner width (frame/2 − 2); over-estimate is the safe side under content-driven-height doctrine; the 80x24 buffer regression test is the arbiter if ratatui's WordWrapper disagrees
+- [Phase 10]: 10-06: gate code stays EXACTLY as-run after the failed live runs — §5 verbatim records must match the committed binary; wording corrections live in the docs and the follow-up gap plan amends wording with its own re-run — Evidence-provenance over cosmetic retrofits
+- [Phase 10]: 10-06: SC-5 live runs on the disposable controller rig both aborted at §2 — grace row persisted >90s twice, contradicting the fresh-rig <48s upper bound; retry budget spent, NO deadline bump — follow-up: capture scheduled/false post-suspend vanish behavior across fresh + long-lived rigs before re-sizing (gate §4 D1/§6) — Re-sizing without understanding the reconcile mechanics is guesswork, forbidden by the failing-step contract
 
 ### Pending Todos
 
@@ -131,9 +134,9 @@ Recent decisions affecting current work:
 
 - [Phase 13 prerequisite]: Confirm licensed-Historian rig access before starting Phase 13 planning — spike cannot proceed without it (documented-limitation fallback is legitimate, but access confirmation must happen first)
 - [Phase 11 prerequisite]: Real multi-level UDT export needed for the derive-vs-Event-loop decision — requires a live rig during Phase 11 planning
-- SC-5 (Phase 10) awaiting user-provisioned WHK controller env: IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN (EAM-rights token, full name:key) — then: cargo test -p ignition-core --test live_gateway live_eam_write_lifecycle -- --ignored --nocapture; append outcomes to 10-LIVE-GATE.md §5 (see 10-USER-SETUP.md)
+- SC-5 (Phase 10) NOT closed by a passing gate run — env blocker RESOLVED via the UAT-recorded disposable-rig substitution (10-06 ran twice on ign-uat-836, torn down clean), but the §2 vanish poll failed both times (grace row >90s ×2; drift recorded 10-LIVE-GATE.md §4 D1). Follow-up gap work: dedicated capture of scheduled/false post-suspend vanish behavior across fresh + long-lived rigs → re-size the 90s deadline (or re-shape the check) → gate re-run. Rig access is a documented recipe (10-RIG-NOTES + gate §5), not a user dependency.
 
 ## Session Continuity
 
-**Last session:** 2026-09-11T11:49:54.036Z
+**Last session:** 2026-09-11T11:52:54.701Z
 **Resume file:** None
