@@ -119,4 +119,147 @@ Fix: `import system` as the first code line. With it, `system.tag.*` resolves id
 
 ---
 
-*(§Probe 3 — multi-level UDT capture + determinism — and §CSV-Coverage follow in the Task-3 sections below.)*
+## Probe 3 — REAL multi-level UDT XML byte shape + determinism (research Open Question 4 — the roadmap's explicit flag)
+
+**Construction (CLI-realistic, via the deployed tagConfig route, not scriptExec):** `MotorType` UDT definition created with `ign tags config create '[default]_types_/MotorType' --file def.json` then `tags config edit` to fix shapes; instances `M1`/`M2` + nested folder `Sub`/`M3` via `tags config create '[default]P11UDT'`. Definition: parameter `MotorNumber` (Int4, value 1), child `Amps` (OPC, opcItemPath parameter-bound, alarm `Low Amps` priority High setpointA 25), child `Doubled` (expression, parameter-bound).
+
+**Construction-shape findings (def JSON round-trip, both rigs):** parameter key must be `value` (a `defaultValue` key is silently dropped — read-back showed `{datatype=Integer, value=null}` until fixed); alarm `mode` key does not bind (stays null, exports as EMPTY `<Property name="mode"/>`); alarm `priority` accepts the string enum (`"High"`) and renders numerically (`3`) in XML.
+
+### The multi-level export (both subtrees in one clean call)
+
+Single-path export of `[default]P11UDT` = 1128 bytes: **instances export as REFERENCES only** — `udtParentType` + own `Parameters`, NO expanded UDT children, NO alarms (the "edited properties only" rule; children live in the type). The CompoundProperty alarms block lives in the TYPE definition, so the artifact capture is a **two-path export** `exportTags(tagPaths=['[default]P11UDT','[default]_types_/MotorType'], exportType='xml')` — which merges cleanly (2218 bytes, NO Unknown corruption: the probe-4 corruption hits leaf-tag sibling lists, not folder-level nodes from different parents).
+
+**Artifact:** `artifacts/udt-multilevel.xml` = the EXACT returned bytes (Rig A, sha256 `11ed152868795fc8451067795176fbf72b5e039a77a8752cbe042bb8e4416c36`, 2218 bytes, never re-indented or edited). Checklist vs actual:
+
+| Expected element | In the capture? |
+| --- | --- |
+| Root `<Tags MinVersion="8.0.0" locale="en_US">` | YES |
+| `type="UdtType"` definition | YES (`MotorType` with expanded children) |
+| `type="UdtInstance"` instance markers | YES (`M1`/`M2`/`M3`) |
+| Nested multi-level Tag elements (folder → instance, folder → folder → instance) | YES |
+| Parameter encoding | YES: `<Parameters><Property name="MotorNumber" type="Integer">2</Property></Parameters>` |
+| **CompoundProperty alarms block** | YES: `<CompoundProperty name="alarms"><PropertySet><Property name="setpointA">25</Property><Property name="mode"/><Property name="name">Low Amps</Property><Property name="priority">3</Property></PropertySet></CompoundProperty>` |
+| Parameter-bound property encoding | YES: `<Property name="opcItemPath" boundValueType="parameter">ns=1;s=[Dairy]Motor {MotorNumber}/Amps</Property>` (matches the official-docs sample shape exactly) |
+| XML declaration | **NO** (none anywhere — consistent with Probe 1) |
+
+JSON interchange cross-reference (trimmed, same two-path scope, Rig A): instances appear as `{"name":"M2","parameters":{"MotorNumber":{"dataType":"Integer","value":2}},"tagType":"UdtInstance","udtParentType":"[default]_types_/MotorType"}`; the type as `"tagType":"UdtType"` with nested `tags` (children) — sibling order M2/Sub/M1 differs from the XML's same-run order (independent map iterations).
+
+### Determinism answers (the fidelity-oracle decision)
+
+**(a) Unchanged-subtree export determinism: BYTE-IDENTICAL.** Three consecutive exports of the unchanged subtree are byte-equal (`e1==e2`, `e2==e3`, `e1==e3` all true) on BOTH rigs (2218 bytes each). The map order is stable within a gateway process for unchanged state.
+
+**(b) Import→re-export byte-identity: NOT ACHIEVABLE — two distinct reasons, both captured:**
+
+1. **`importTags` REFUSES UDT type definitions** (verbatim, BOTH rigs): `Error_Exception("Error importing tags: Udt definitions can only be imported in the UDT Definitions tab.")` — the import lands NOTHING; the subsequent re-export of the target paths yields empty `type="Unknown"` shells (154 bytes, verbatim in probe-outputs). Type-definition-bearing XML files CANNOT round-trip through `importTags` at all.
+2. **Instance-only XML round-trips structurally but NOT byte-identically:** importing the P11UDT-only export into `[default]P11Roundtrip` (`'o'`) succeeds (`Good` ×5) and re-exports at the IDENTICAL length (1128 == 1128) with all elements/attrs/properties equal — but sibling order permutes on the model rebuild (first divergence at byte offset 115: original `M2,Sub,M1` vs re-export `M1,Sub,M2`). Order-normalized comparison (recursive sibling sort + canonical serialize) = **IDENTICAL**.
+
+**NAMED ORACLE STRATEGY (binds 11-06's live gate):**
+
+1. Transport fidelity (always): `sha256(file bytes) == sha256(base64decode(payload_b64))`.
+2. Export determinism (proven): re-export of an UNCHANGED subtree is byte-stable → byte-identity valid for same-subtree re-export without intervening writes.
+3. Import→re-export oracle: byte-identity is INVALID (order permutes on rebuild). Use **order-normalized structural identity** (canonicalize: recursively sort sibling elements, compare serialization) + length equality as a cheap pre-check. Captured pair: orig sha `dcf1c0aab952f287…` vs re-export sha `2d99ed58c2fc4dda…` (equal length, structurally identical).
+4. Files containing `type="UdtType"` are EXCLUDED from the round-trip oracle — the gateway refuses their import (finding b.1); the loss-scan must surface UdtType presence and the gate may only assert the verbatim refusal element for them.
+
+### Cross-rig byte delta (8.3.6 vs 8.3.3)
+
+Same construction repeated on Rig B: export is 2218 bytes, 3× byte-deterministic, and the UdtType import refusal is the identical verbatim string. Rig A sha `11ed1528…` vs Rig B sha `46da5295…` — **the entire delta is sibling order** (the `M1` block occupies a different position; 612 differing bytes, zero header/declaration/indentation/encoding differences). Cross-rig byte comparison of exports is invalid by construction; same-rig same-state comparison is valid.
+
+---
+
+## Probe 5 — Legacy CSV coverage map (research Open Question 6)
+
+**Method note:** the probe CSVs were generated by hand-rolled Jython row builders; two of the failures recorded below (comma-in-`FormatString` column shift; the hunt that followed) are LIVE PROOFS of the research's warning that hand-rolled quoting is the trap the `csv` crate exists to prevent. A Java-side ground-truth check (`TagCSVImporter` + `PROP_COLUMNS` static field read from `common.jar` inside the 8.3.6 container, identical constant on 8.3.3) anchors the vocabulary answer.
+
+### Header grammar (authoritative)
+
+- Structural columns: `Path,Name,Owner,TagType,DataType` (lowercased name-matching — `headers` map keys are `toLowerCase()`d).
+- Property columns = `TagCSVImporter.PROP_COLUMNS`: **exactly 51 names, identical on both rigs**: Value, Enabled, AccessRights, OPCServer, OPCItemPath, ScanClass, DriverName, ScaleMode, RawLow, RawHigh, ScaledLow, ScaledHigh, ClampMode, ScaleFactor, Deadband, DeadbandMode, FormatString, EngUnit, EngLow, EngHigh, EngLimitMode, Tooltip, Documentation, ExpressionType, Expression, AlertMode, AlertAckMode, AlertSendClear, AlertMessageMode, AlertMessageSubject, AlertMessage, AlertDeadband, AlertTimestampSource, AlertNotes, AlertDisplayPath, OPCWriteBackServer, OPCWriteBackItemPath, SQLBindingDatasource, HistoryEnabled, PrimaryHistoryProvider, HistoricalScanclass, HistoricalDeadband, HistoricalDeadbandMode, InterpolationMode, HistoryMaxAgeMode, HistoryMaxAge, HistoryTimestampSource, UDTParentType, PersistValue, SourceDataType, SourceTagPath.
+- vs the official docs' table: the docs' `SQLBindingPollRate` + `Permissions` are **NOT** in PROP_COLUMNS; nine legacy `Alert*` columns exist that the docs table omits. The docs' 47/48-column sample header is therefore neither the parser's vocabulary nor required — ANY header subset of the grammar works (11-col docs sample ✓, 12-col ✓, full 56-col ✓).
+- Two SPECIAL headers outside PROP_COLUMNS are parsed by dedicated code paths: **`Permissions`** and **`AlarmStates`** (bytecode-extracted formats below).
+- Unknown header columns (e.g. modern `TagGroup`, or `NameX`) are **silently ignored** (import Good, column absent from the landed model) — provided every numeric-required cell present. Row-level failures are wholesale: one bad row aborts the import and NOTHING lands (all-or-nothing).
+- Marker row `# version=N` REQUIRED (missing → `Unknown CSV Format`); `N` bounds-checked (1 and 2 accepted; 99 → verbatim `Error_Exception("Error importing tags: Incompatible CSV format (99)")`); version is NOT coupled to header width (version=2 works with the 11-col header).
+
+### The Path/Owner findings (the plan's folder-row assumption, corrected)
+
+- **ANY non-empty `Path` cell NPEs the importer** (verbatim, both rigs): `Error_Exception("Cannot invoke \"String.equals(Object)\" because \"name\" is null")` — the folder-branch of `importInternal` is broken on the script-callable path. Folder structure is INEXPRESSIBLE; only rows with an EMPTY Path import.
+- **The `basePath` argument is IGNORED for CSV imports:** tags land at the PROVIDER ROOT regardless (proven by importing with a pre-created target folder `[default]P11HdrC` — read-back empty, tag landed at `[default]TC1`). This differs from XML imports, which DO land under the basePath (probe 2).
+- **`Owner` non-empty is UNUSABLE:** the value is treated as an import target path → `Bad_Unsupported("The target path '[default]covowner' cannot accept children tags.")`.
+
+### Column-by-column coverage table (the documented lossy-field table 11-04/11-05 cite)
+
+Legend: LANDED = value reaches the modern model (JSON key noted); COERCED = lands but transformed; DROPPED = accepted but absent from the model; UNUSABLE = crashes/aborts; UNTESTED = no positive evidence this run.
+
+| Column | Verdict | Landed as / evidence |
+| --- | --- | --- |
+| Path | **UNUSABLE** | any non-empty value → importer NPE (above) |
+| Name | LANDED | `name` |
+| Owner | **UNUSABLE** | non-empty → `Bad_Unsupported` abort |
+| TagType | COERCED | numeric → `tagType` + valueSource class: 0→`opc`, 1→`memory` (default), 6→`Folder`, 10→`UdtInstance`; 13 (Derived) untested |
+| DataType | COERCED | numeric → `dataType` name: `2`→`Int4`, `7`→`String` (captured pairs) |
+| Value | LANDED | `value` + `defaultValue` (both set); locale-aware numeric coercion (bytecode `coerceNumberForLocale`) |
+| Enabled | LANDED | `enabled` (TRUE/FALSE strings) |
+| AccessRights | LANDED | `Read_Write` accepted; `readOnly` stays false |
+| OPCServer | LANDED | `opcServer` verbatim |
+| OPCItemPath | LANDED | `opcItemPath` verbatim |
+| ScanClass | DROPPED | `Default` not landed (`tagGroup` stays `""`) |
+| DriverName | LANDED | **verbatim key `DriverName`** (non-canonical capitalized key rides the model) |
+| ScaleMode | COERCED | `'1'` → `"Linear"` |
+| RawLow | LANDED | `rawLow` (0-set indistinguishable from default; pair-proven via RawHigh) |
+| RawHigh | LANDED | `rawHigh` 1000.0 |
+| ScaledLow / ScaledHigh | LANDED | `scaledLow` 10.0 / `scaledHigh` 20.0 |
+| ClampMode | COERCED | `'1'` → `"Clamp_Low"` |
+| ScaleFactor | LANDED | `scaleFactor` 2.5 |
+| Deadband | LANDED | `deadband` 0.25 |
+| DeadbandMode | UNTESTED | — |
+| FormatString | LANDED | `formatString` `"#,##0.0"` (**comma-bearing cell must be RFC-4180 quoted** — unquoted shifts every later column; captured both ways) |
+| EngUnit | LANDED | `engUnit` `"PSI"` |
+| EngLow | DROPPED | set `'0'`; absent from model |
+| EngHigh | DROPPED | set `'100'`; export shows 0.0 (likely `EngLimitMode`-gated, untested) |
+| EngLimitMode | UNTESTED | — |
+| Tooltip | LANDED | `tooltip` |
+| Documentation | LANDED | `documentation` |
+| ExpressionType | COERCED | enum → valueSource: `1`→`expr`, `2`→`db`, `3`→`named_query`, `4`/`5`→`memory` (Expression still lands as a stray property on 4/5) |
+| Expression | LANDED | `expression` (ET 1/3/4/5) or `query` (ET 2) |
+| AlertMode … AlertDisplayPath (9 cols) | UNTESTED | every imported tag materializes `AlertAckMode: 0` / `AlertSendClear: 0` defaults regardless |
+| OPCWriteBackServer / OPCWriteBackItemPath | UNTESTED | — |
+| SQLBindingDatasource | UNTESTED | — |
+| HistoryEnabled | LANDED | `historyEnabled` true |
+| PrimaryHistoryProvider | LANDED | `historyProvider` |
+| HistoricalScanclass | LANDED | `historyTagGroup` (`"Default Historical"`) |
+| HistoricalDeadband | LANDED | `historicalDeadband` 0.5 |
+| HistoricalDeadbandMode | COERCED | `'1'` → `"Percent"` |
+| InterpolationMode | COERCED | `'1'` → `historicalDeadbandStyle: "Analog"` |
+| HistoryMaxAgeMode | DROPPED | export keeps `historyMaxAgeUnits: "HOUR"` default |
+| HistoryMaxAge | DROPPED | set `'60'`, export `historyMaxAge: 0` |
+| HistoryTimestampSource | LANDED | **verbatim numeric** `HistoryTimestampSource: 1` (non-canonical key) |
+| UDTParentType | LANDED | `typeId` (`"MotorType"`); UDT children (Amps/Doubled) RIDE from the type into the exported instance |
+| PersistValue | LANDED | `persistValue` true |
+| SourceDataType / SourceTagPath | UNTESTED | derived-tag columns |
+| SQLBindingPollRate | DROPPED | in docs table, NOT in PROP_COLUMNS → silently ignored as unknown |
+| `Permissions` (special header) | PARSED, **effectively DROPPED** | format `zone;role;RW\|RO` entries joined by `$` (bytecode-extracted; `Read_Write`/`Read_Only`/JSON all rejected with `Format of tag permissions model is illegal.`); `*;admin;RW` imports Good but lands `readOnly: false` + **EMPTY** `AllOf` read/write permission sets — no meaningful mapping survives |
+| `AlarmStates` (special header, undocumented) | PARSED, **silently DROPPED** | format `name;SEVERITY;loLimit;hiLimit;flags;loTagPath;hiTagPath;timeDeadband;TIMEUNITS` entries joined by `$` (`MyAlarm;High;0;25;0;x;y;0;SEC` imports Good); severity enum has NO `Critical` (`No enum constant …AlertSeverity.Critical`); **the modern model carries NO alarms after import** — the live proof of the docs' "CSV format does not include support for alarm configurations", and stronger: the drop is SILENT |
+| Modern properties (tagGroup, bindings, UDT parameter overrides, deadband modes, …) | DROPPED | not expressible: unknown columns silently ignored (proven with `TagGroup=MyTagGroup` / `NameX`) |
+
+### Cross-cutting CSV findings
+
+1. **Legacy-default materialization:** every CSV-imported atomic tag carries the full legacy-default property set (`AlertAckMode`, `AlertSendClear`, `deadband`, `rawHigh`, `scaledHigh`, `engHigh`, `formatString`, `historicalDeadband` + `historicalDeadbandStyle`, `historyMaxAge`, `historyTagGroup`, `tagGroup`) that configure-created tags do NOT have (cf. probe-1a's P11Seed T1 export). CSV import is not additive — it instantiates the whole legacy sheet.
+2. **Collision semantics:** `'o'` → `Good`; `'a'` on collision → `Bad_Failure("Tag 'ColX' already exists, and 'abort' collision policy has been specified")` — same QualityCode element pattern as XML (no exception), note the path is rendered WITHOUT the provider prefix in the CSV case.
+3. **All-or-nothing:** any row-level error aborts the whole import; nothing partial ever lands (every failed target exported the `type:"Unknown"` skeleton).
+4. **Rig B (8.3.3) parity: identical** — Path NPE verbatim, UDT-instance/AlarmStates/Permissions Good-shapes identical, `Incompatible CSV format (99)` verbatim, silent alarm drop, empty permission sets.
+5. **Generator implication for 11-04:** the CLI's CSV download can only emit columns from this table's LANDED/COERCED set with numeric `TagType`/`DataType`/`ExpressionType` enums, `# version=1` marker, EMPTY `Path` cells (folders inexpressible), and must warn that alarms/permissions/scaling-adjacent columns (`EngLow`/`EngHigh`, `ScanClass`, `HistoryMaxAge*`) do not survive a CSV round-trip.
+
+---
+
+## Open-Question ledger (all five research questions → answered)
+
+| Research Open Question | Answer | Section |
+| --- | --- | --- |
+| 2: kwargs `exportType='xml'` return form | Returns the full CRLF XML document string (no decl); positional form = filePath fallback | Probe 1 |
+| 3: importTags basePath forms / QualityCode shape / temp write / collision | Subfolder AND provider root both work (no RpcContext constraint); `ArrayList[QualityCode]` str-shapes; JVM `/tmp` writable; collisions ride `Bad_Failure` elements, never exceptions | Probe 2 |
+| 4: multi-level UDT XML byte shape + determinism | Full byte shape captured (artifact); (a) byte-deterministic, (b) round-trip = structural-only + UdtType import refusal | Probe 3 |
+| 5: mixed-parent exportTags | Silent `type="Unknown"` corruption, pre-existing in the JSON baseline too | Probe 4 |
+| 6 (CSV half): legacy CSV column coverage | Full table above; vocabulary = 51 PROP_COLUMNS + structural + 2 special headers; Path/Owner unusable; basePath ignored; alarms/permissions silently non-landing | Probe 5 |
+
+---
+
+*(Rig ops, teardown state = INTENTIONAL KEEP-ALIVE for 11-06: see 11-RIG-NOTES.md. Raw probe JSONs staged outside the repo at `/tmp/ign-p11-rigs/probe-outputs/`.)*

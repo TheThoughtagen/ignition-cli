@@ -1,0 +1,52 @@
+<Tags MinVersion="8.0.0" locale="en_US">
+   <Tag name="P11UDT" type="Folder">
+      <Tags>
+         <Tag name="M2" type="UdtInstance">
+            <Property name="udtParentType" datatype="String">[default]_types_/MotorType</Property>
+            <Parameters>
+               <Property name="MotorNumber" type="Integer">2</Property>
+            </Parameters>
+         </Tag>
+         <Tag name="Sub" type="Folder">
+            <Tags>
+               <Tag name="M3" type="UdtInstance">
+                  <Property name="udtParentType" datatype="String">[default]_types_/MotorType</Property>
+                  <Parameters>
+                     <Property name="MotorNumber" type="Integer">3</Property>
+                  </Parameters>
+               </Tag>
+            </Tags>
+         </Tag>
+         <Tag name="M1" type="UdtInstance">
+            <Property name="udtParentType" datatype="String">[default]_types_/MotorType</Property>
+            <Parameters>
+               <Property name="MotorNumber" type="Integer">1</Property>
+            </Parameters>
+         </Tag>
+      </Tags>
+   </Tag>
+   <Tag name="MotorType" type="UdtType">
+      <Parameters>
+         <Property name="MotorNumber" type="Integer">1</Property>
+      </Parameters>
+      <Tags>
+         <Tag name="Doubled" type="AtomicTag">
+            <Property name="expression" boundValueType="parameter">{MotorNumber} * 2</Property>
+            <Property name="valueSource">expression</Property>
+         </Tag>
+         <Tag name="Amps" type="AtomicTag">
+            <Property name="opcItemPath" boundValueType="parameter">ns=1;s=[Dairy]Motor {MotorNumber}/Amps</Property>
+            <Property name="valueSource">opc</Property>
+            <CompoundProperty name="alarms">
+               <PropertySet>
+                  <Property name="setpointA">25</Property>
+                  <Property name="mode"/>
+                  <Property name="name">Low Amps</Property>
+                  <Property name="priority">3</Property>
+               </PropertySet>
+            </CompoundProperty>
+            <Property name="opcServer">Ignition OPC-UA Server</Property>
+         </Tag>
+      </Tags>
+   </Tag>
+</Tags>
