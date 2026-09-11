@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::Constraint::{Length, Min, Ratio};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
+use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
 
 use crate::state::{AppState, Modal, Screen};
 
@@ -95,6 +95,46 @@ fn render_tab_bar(state: &AppState, frame: &mut Frame, area: ratatui::layout::Re
     frame.render_widget(Tabs::new(titles), area);
 }
 
+/// Greedy wrapped-row estimate for `text` at `max_width` content
+/// columns (10-07): per line, pack whitespace-separated tokens up to
+/// `max_width`; an overlong single token hard-breaks at
+/// `ceil(len / max_width)` rows the way ratatui breaks overlong words.
+/// Char counts stand in for display width (the Confirm body is
+/// ASCII-width), every line costs at least one row, and an
+/// OVER-estimate is deliberately the safe side: under the
+/// content-driven-height doctrine a taller bordered box only widens
+/// its own chrome, while an under-estimate clips the footer hint —
+/// exactly the 10-UAT blast-radius bug. The buffer regression test at
+/// 80x24 (`confirm_modal_wraps_the_blast_radius_body`) is the arbiter
+/// if ratatui's word-wrapping ever disagrees with this estimate.
+fn wrapped_row_count(text: &str, max_width: u16) -> usize {
+    let max = max_width.max(1) as usize;
+    let mut total = 0;
+    for line in text.lines() {
+        let mut rows = 1;
+        let mut used = 0; // chars packed into the current row
+        for token in line.split_whitespace() {
+            let len = token.chars().count();
+            if len > max {
+                // Overlong token: ratatui hard-breaks it. Count the
+                // full ceil rows on their own — an over-estimate when
+                // content precedes the token, never under.
+                rows += len.div_ceil(max);
+                used = 0;
+            } else if used == 0 {
+                used = len;
+            } else if used + 1 + len <= max {
+                used += 1 + len;
+            } else {
+                rows += 1;
+                used = len;
+            }
+        }
+        total += rows;
+    }
+    total
+}
+
 /// The modal overlay: centered rect (the 0.30 `Rect::centered` helpers —
 /// never hand-rolled rect math) over a `Clear`ed region, so whatever the
 /// screen drew underneath disappears.
@@ -105,7 +145,20 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
     // equivalent exact counts for the other shapes). No separate min
     // caps: they caused the UAT's clipped footer hints (06-10).
     let height = match modal {
-        Modal::Confirm { body, .. } => body.lines().count().saturating_add(4),
+        // 10-07: the Confirm body WRAPS (Wrap { trim: false } in the
+        // render arm below), so the raw line count under-counts the
+        // rows the box must hold. Estimate the WRAPPED row count at
+        // the modal's inner width: centered(Ratio(1, 2)) grants half
+        // the frame horizontally, minus the two border columns — the
+        // same geometry the render's centered() call produces. An
+        // over-estimate is safe (content-driven-height doctrine: a
+        // taller box keeps the footer hint inside); an under-estimate
+        // is the UAT clip. The 80x24 buffer regression test is the
+        // arbiter if ratatui's wrapping disagrees with the estimate.
+        Modal::Confirm { body, .. } => {
+            let inner = (frame.area().width / 2).saturating_sub(2);
+            wrapped_row_count(body, inner).saturating_add(4)
+        }
         Modal::Input { hint, .. } => 5 + hint.as_deref().map_or(0, |text| text.lines().count()),
         Modal::Result_ { lines, .. } => lines.len().saturating_add(4),
         Modal::Actions { .. } => crate::state::ACTIONS.len().saturating_add(4),
@@ -135,13 +188,25 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
     frame.render_widget(Clear, area);
     match modal {
         Modal::Confirm { title, body } => {
-            let text = vec![
-                Line::from(body.clone()),
-                Line::default(),
-                Line::from("y to confirm · Esc to cancel"),
-            ];
+            // The body is genuinely multi-line (eam_preview_body joins
+            // the preview + agents + pending lines) — split it into
+            // real Lines so each renders on its own row, and WRAP so
+            // the ~140-char preview line folds within the half-width
+            // box instead of clipping mid-word (10-UAT test 10).
+            // trim: false preserves the body's own leading whitespace
+            // across wrapped rows.
+            let text = body
+                .lines()
+                .map(Line::from)
+                .chain([
+                    Line::default(),
+                    Line::from("y to confirm · Esc to cancel"),
+                ])
+                .collect::<Vec<_>>();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title(title.clone())),
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title(title.clone())),
                 area,
             );
         }
