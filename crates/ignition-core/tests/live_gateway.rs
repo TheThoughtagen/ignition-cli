@@ -628,6 +628,30 @@ impl ScratchTaskGuard {
     }
 }
 
+/// The shared cleanup choreography — find → derive signature → delete →
+/// honest logs. Constructed fresh per Drop path (it owns its client and
+/// identifiers; never drives the test runtime's client from another loop).
+async fn scratch_cleanup_future(url: String, token: String, name: String) {
+    let api = ReqwestGatewayApi::for_tests(&url, Some(Credential::Token(Secret::new(token))));
+    match api.eam_task_find(&name).await {
+        Ok(record) => {
+            if let Some(signature) = record.signature.clone() {
+                match api.eam_task_delete(&name, &signature, false).await {
+                    Ok(_) => eprintln!(
+                        "cleanup: scratch task {name:?} best-effort deleted (Drop path)"
+                    ),
+                    Err(err) => eprintln!(
+                        "cleanup: scratch task {name:?} Drop-time delete FAILED — remove it manually: {err}"
+                    ),
+                }
+            }
+        }
+        Err(_) => eprintln!(
+            "cleanup: scratch task {name:?} not found at Drop (already gone)"
+        ),
+    }
+}
+
 impl Drop for ScratchTaskGuard {
     fn drop(&mut self) {
         let name = self.name.clone();
@@ -637,38 +661,39 @@ impl Drop for ScratchTaskGuard {
         }
         let url = self.url.clone();
         let token = self.token.clone();
-        let name_for_block = name.clone();
+        let name_for_cleanup = name.clone();
         let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("cleanup runtime builds")
-                .block_on(async move {
-                    let api = ReqwestGatewayApi::for_tests(
-                        &url,
-                        Some(Credential::Token(Secret::new(token))),
-                    );
-                    match api.eam_task_find(&name_for_block).await {
-                        Ok(record) => {
-                            if let Some(signature) = record.signature.clone() {
-                                match api
-                                    .eam_task_delete(&name_for_block, &signature, false)
-                                    .await
-                                {
-                                    Ok(_) => eprintln!(
-                                        "cleanup: scratch task {name_for_block:?} best-effort deleted (Drop path)"
-                                    ),
-                                    Err(err) => eprintln!(
-                                        "cleanup: scratch task {name_for_block:?} Drop-time delete FAILED — remove it manually: {err}"
-                                    ),
-                                }
-                            }
-                        }
-                        Err(_) => eprintln!(
-                            "cleanup: scratch task {name_for_block:?} not found at Drop (already gone)"
-                        ),
-                    }
-                });
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Dropped INSIDE the test runtime (the #[tokio::test] unwind
+                // case — the UAT gate failure): block_on from here panics
+                // "Cannot start a runtime from within a runtime", catch_unwind
+                // swallows it, and the scratch task survives. Route the cleanup
+                // through the BLOCKING pool instead of tokio::spawn: a spawned
+                // async task may never be polled after unwind (runtime shutdown
+                // cancels pending tasks), while the blocking pool is JOINED at
+                // runtime drop — and a spawn_blocking thread is not an async
+                // context, so a fresh runtime + block_on is legal there.
+                tokio::runtime::Handle::current()
+                    .spawn_blocking(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("cleanup runtime builds")
+                            .block_on(scratch_cleanup_future(
+                                url.clone(),
+                                token.clone(),
+                                name_for_cleanup.clone(),
+                            ));
+                    });
+            } else {
+                // No ambient runtime (Drop after the test runtime is gone):
+                // the original fresh-current-thread path, verbatim.
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("cleanup runtime builds")
+                    .block_on(scratch_cleanup_future(url, token, name_for_cleanup));
+            }
         }));
         if cleanup.is_err() {
             eprintln!(
@@ -940,4 +965,113 @@ async fn live_eam_write_lifecycle() {
 
     // The test body completed the delete itself — disarm the Drop guard.
     guard.disarm();
+}
+
+// ---------------------------------------------------------------------------
+// 10-06 addition: the UAT-gate failure shape, replayed against wiremock —
+// NOT ignored (this is a mechanism test; no live rig needed). A guard
+// dropped during unwind INSIDE the #[tokio::test] runtime must still fire
+// its remote cleanup: the old Drop path block_on'd from inside the runtime
+// ("Cannot start a runtime from within a runtime"), catch_unwind swallowed
+// the panic, and the scratch task survived. The fix routes cleanup through
+// spawn_blocking (joined at runtime drop). This test proves the fix at the
+// REQUEST level: after catching the unwind, the cleanup find + delete must
+// ARRIVE at the mock.
+// ---------------------------------------------------------------------------
+
+/// The scratch name rides the gate's hyphenated style — which the ONE
+/// locked per-segment encoder over-encodes to `%2D` (eam_contract's
+/// discipline pin; the server decodes before matching).
+const UNWIND_SCRATCH: &str = "ign-live-scratch-unwind";
+const UNWIND_SCRATCH_PATH: &str = "ign%2Dlive%2Dscratch%2Dunwind";
+const UNWIND_SIGNATURE: &str = "sigunwindproof";
+const UNWIND_FIND_PATH: &str = "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/ign%2Dlive%2Dscratch%2Dunwind";
+const UNWIND_DELETE_PATH: &str =
+    "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks/ign%2Dlive%2Dscratch%2Dunwind/sigunwindproof";
+
+#[tokio::test]
+async fn guard_drop_during_unwind_inside_runtime_still_cleans_up() {
+    use wiremock::matchers::{method, path, query_param};
+
+    let server = wiremock::MockServer::start().await;
+
+    // (1) The find route (200 record with a signature — the find fixture
+    //     shape from the eam contract tests) and the delete route
+    //     (200 success:true — the §3b lone-resource shape).
+    wiremock::Mock::given(method("GET"))
+        .and(path(UNWIND_FIND_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({
+                "name": UNWIND_SCRATCH,
+                "collection": "eam-tasks",
+                "type": "com.inductiveautomation.eam",
+                "config": {"profile": {"type": "eam_backup", "scheduleMode": "OnDemand"}},
+                "signature": UNWIND_SIGNATURE,
+                "scheduledTaskState": {
+                    "currentState": "IDLE",
+                    "details": {"owner": "eam", "nextScheduled": null}
+                }
+            }),
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("DELETE"))
+        .and(path(UNWIND_DELETE_PATH))
+        .and(query_param("collection", "core"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "changes": [{"name": UNWIND_SCRATCH,
+                             "type": "com.inductiveautomation.eam/eam-tasks",
+                             "collection": "core",
+                             "newSignature": "postunwindproofsignature"}],
+                "problem": null,
+                "references": []
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    // (2) The guard pointed at the wiremock URL.
+    let guard = ScratchTaskGuard {
+        url: server.uri(),
+        token: "unwind:proof".to_string(),
+        name: UNWIND_SCRATCH.to_string(),
+        disarmed: false,
+    };
+
+    // (3) The failure shape: a scope OWNING the guard panics — the guard
+    //     drops mid-unwind INSIDE the test runtime (exactly the UAT gate
+    //     run's failure shape).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = guard;
+        panic!("mid-test failure shape from the UAT gate run");
+    }));
+    assert!(result.is_err(), "the panic must actually fire");
+
+    // (4) Request-level proof that the nested-runtime panic is gone: the
+    //     cleanup find + delete requests ARRIVED at the mock (poll — the
+    //     blocking-pool cleanup thread needs a beat; the test runtime is
+    //     still alive so the pool runs).
+    let mut arrived = false;
+    for _ in 0..10 {
+        if let Some(requests) = server.received_requests().await {
+            let find = requests
+                .iter()
+                .any(|r| r.method.as_str() == "GET" && r.url.path() == UNWIND_FIND_PATH);
+            let delete = requests
+                .iter()
+                .any(|r| r.method.as_str() == "DELETE" && r.url.path() == UNWIND_DELETE_PATH);
+            if find && delete {
+                arrived = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(
+        arrived,
+        "cleanup find + delete must hit the mock after a mid-runtime unwind drop — \
+         the old nested-runtime panic would leave zero requests"
+    );
 }
