@@ -114,7 +114,15 @@ Plans:
   2. User can bulk-download and bulk-upload tags in CSV with server-byte-faithful passthrough and documented lossy-field behavior
   3. Before importing XML/CSV that would drop or coerce tag fields, user sees a loss-report warning and can abort
 **Research/Planning flags**: RESEARCH REQUIRED for this phase — pull a REAL multi-level UDT export and decide quick-xml serde-derive vs hand-rolled Event-loop before writing code (wiremock fixtures cannot provide this); validate the loss-report design against real exports. If routes change: one atomic WebDev bundle bump, both-direction version-drift tests.
-**Plans**: TBD
+**Planner locks** (no CONTEXT.md; locked during planning, binding on plans): CSV = composite interpretation — XML is full gateway-byte passthrough BOTH directions; CSV upload is byte-faithful to the gateway's importTags parser; CSV download is CLI-generated from the JSON interchange, documented lossy (the gateway cannot export CSV — official 8.3 docs). Libraries: quick-xml 0.41 Event-loop (NO serde feature) + csv crate + base64 envelope carrier. Loss-gate refusal = exit 2 invalid_input (no new slugs); collision matrix stays abort/overwrite.
+**Plans:** 6 plans
+Plans:
+- [ ] 11-01-PLAN.md — Live rig probes (all five roadmap-mandated) + REAL multi-level UDT XML capture + CSV coverage table → 11-LIVE-CAPTURES.md *(capture-first: later plans cite, never re-derive)*
+- [ ] 11-02-PLAN.md — Route surface: exportTags format param (xml→base64) + importTagsFile action + ATOMIC 1.2.0 bundle bump + wiremock pins
+- [ ] 11-02 parallel: 11-03-PLAN.md — TDD loss-report scan module (scan_xml/scan_csv pure fns, validated against the real UDT capture; quick-xml no-serde + csv)
+- [ ] 11-04-PLAN.md — Core transfer actions: XML raw-byte export/import via routes (scan-fed collision pre-check) + generate_legacy_csv + 300s export timeout
+- [ ] 11-05-PLAN.md — CLI surface + TAGS-12 loss gate (--format flags, pre-resolution exit-2 refusal, --yes, stderr prose + envelope loss_report, raw-byte stdout, README CSV honesty)
+- [ ] 11-06-PLAN.md — Live gates on BOTH rigs: XML fidelity round-trip oracle (sha256), CSV round-trip, loss-gate refusal → 11-LIVE-GATE.md evidence
 
 ### Phase 12: 12-tui-theming-degradation
 **Goal**: The cockpit looks right and stays readable on any terminal — named UX themes selected by config, graceful degradation across color capabilities, with tokenization discipline making the style layer maintainable.
