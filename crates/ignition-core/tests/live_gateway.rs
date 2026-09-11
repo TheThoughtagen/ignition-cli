@@ -983,7 +983,6 @@ async fn live_eam_write_lifecycle() {
 /// locked per-segment encoder over-encodes to `%2D` (eam_contract's
 /// discipline pin; the server decodes before matching).
 const UNWIND_SCRATCH: &str = "ign-live-scratch-unwind";
-const UNWIND_SCRATCH_PATH: &str = "ign%2Dlive%2Dscratch%2Dunwind";
 const UNWIND_SIGNATURE: &str = "sigunwindproof";
 const UNWIND_FIND_PATH: &str = "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/ign%2Dlive%2Dscratch%2Dunwind";
 const UNWIND_DELETE_PATH: &str =

@@ -1,10 +1,11 @@
 # Phase 10 — SC-5 Live Gate Record (10-05)
 
-**Status: `blocked-on-env`**
+**Status: `failed-with-findings`** (gap-closure 10-06 re-run: env blocker resolved via the
+UAT-recorded disposable-controller-rig substitution; both runs aborted at the §2 vanish poll)
 
-**Recorded:** 2026-09-10T07:05Z (plan 10-05 execution session)
-**Gate:** `live_eam_write_lifecycle` in `crates/ignition-core/tests/live_gateway.rs` (commit `1293113`)
-**Target rig:** the REAL WHK controller gateway (the roadmap names it specifically — a disposable rig is NOT an acceptable substitute for SC-5)
+**Recorded:** 2026-09-10T07:05Z (plan 10-05 execution session); re-run 2026-09-11 (plan 10-06)
+**Gate:** `live_eam_write_lifecycle` in `crates/ignition-core/tests/live_gateway.rs` (commit `1293113`; 10-06 fix commits `cf33221` + `9f99ed5`)
+**Target rig:** 10-05 originally named the REAL WHK controller gateway. **Superseded by the UAT-recorded decision (10-UAT.md test 12): the user stated WHK has no EAM, and approved the disposable-controller-rig substitution** — the re-run rode the disposable UAT rig `ign-uat-836` (8.3.6, port 18188, controller mode via the 10-RIG-NOTES flip recipe), per 10-06's plan contract. This substitution supersedes 10-05's WHK-only constraint.
 
 ---
 
@@ -85,6 +86,41 @@ gate (phase pitfall 8).
 
 ## 4. Drift vs the wiremock expectations
 
+**10-06 re-run drift (RECORDED — the gate never completed §2; both runs):**
+
+**D1 — the suspended row never left `scheduled/false` within the 90 s poll deadline, twice.**
+The §2 vanish step (10-06's poll-until-vanish fix) observed the scratch row present at
+EVERY poll — always `taskState="Suspended"` (the grace-row shape) — through the full
+~90 s deadline in run 1 (91.31 s, 10 polls) and the honest retry (94.19 s, 10 polls).
+This CONTRADICTS the latency evidence the deadline was sized from:
+
+- Original captures session (2026-09-09, FRESH 8.3.6 + 8.3.3 rigs): the suspended row
+  was gone from `scheduled/false` within the <48 s window between suspend (09:58:51Z)
+  and the next reads (09:59:39Z) — a single upper-bound observation, never a measured
+  latency (10-LIVE-CAPTURES §2).
+- UAT gate run (2026-09-10, this rig): the single-shot check ran ~20 s post-suspend —
+  row still present (that abort is the gap 10-06 closes).
+- 10-06 runs (2026-09-11, this rig, ~22 h uptime, accumulated history): row present at
+  every poll through 90 s, TWICE — the ~48 s bound did not hold.
+
+**Unresolved wire question:** the reconcile mechanics of `scheduled/false` post-suspend
+(when/how the gateway drops the row — scheduler-trigger refresh? execution-history
+processing? uptime/history-volume dependent?) are NOT known. Per this section's contract,
+that is FOLLOW-UP GAP WORK: a dedicated capture session must measure the vanish
+distribution (or its absence) across fresh + long-lived rigs before the gate's deadline
+is re-sized — NOT a blind deadline bump (guesswork is forbidden here by the 10-06 plan).
+
+**What did NOT drift (wire shapes all held, both runs):** create through the action layer,
+the §6a full-record flip, suspend 204 + `isSuspended=true` persistence (Decision 1), the
+grace-row shape itself (`taskState="Suspended"` listed in `scheduled/false` — now
+firmly captured, captures §2), delete cleanup via the Drop guard, and post-run rig state
+(zero scratch tasks before teardown). The 10-05 wiremock-pinned REQUEST shapes were never
+contradicted.
+
+---
+
+**10-05 original section (no live run occurred then):**
+
 **None observable — no live run occurred.** The wire-shape expectations embedded in the
 gate (sync `isSuspended`, §2 scheduled vocabulary, §3b no-confirm delete, §6a echo
 modify, §1c trigger-registration latency) all cite 10-LIVE-CAPTURES.md verbatim. When
@@ -94,19 +130,110 @@ in this plan (the REQUEST pins' provenance chain stays intact).
 
 ## 5. Run record
 
-_(empty — blocked-on-env; populated verbatim on the first provisioned run)_
+**Two runs recorded (2026-09-11, disposable controller rig `ign-uat-836`, 8.3.6, port 18188,
+token staged outside the repo per RIG-NOTES hygiene — shredded at teardown).** The second
+run is the ONE honest retry the 10-06 plan allows (run 1's failure was transient-shaped:
+no HTTP/wire error, timing-variance signature only). Both failed at the same §2 poll —
+the retry budget is spent; the drift is recorded in §4 (D1) and the follow-up named in §6.
+
+### Run 1 — 2026-09-11T11:39:37Z (scratch `ign-live-scratch-1789126777`), 91.31 s, FAILED at §2
+
+```text
+running 1 test
+gate step create: scratch task "ign-live-scratch-1789126777" created (eam_backup/OnDemand, action layer)
+gate step flip: "ign-live-scratch-1789126777" is Scheduled with cron "0/30 * * * * ?" — waiting for the gateway to register the trigger (captured ~80 s, §1c)
+gate step suspend: 204 + read-back isSuspended=true (previous state None)
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+test live_eam_write_lifecycle has been running for over 60 seconds
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+
+thread 'live_eam_write_lifecycle' (41578965) panicked at crates/ignition-core/tests/live_gateway.rs:896:9:
+suspended scratch task must vanish from scheduled/false within ~90s (capture §2) — grace row seen: true; last observed taskState: "Suspended"
+cleanup: scratch task "ign-live-scratch-1789126777" best-effort deleted (Drop path)
+test live_eam_write_lifecycle ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 91.31s
+```
+
+Per-step: create ✅ → flip ✅ → suspend ✅ (first attempt — no trigger-pending retries)
+→ **§2 poll ❌ (grace row present at all 10 polls through the 90 s deadline)** — resume/
+delete steps NOT reached by the gate. Cleanup ✅: the 10-06 Drop guard deleted the
+scratch task on the FAILURE path ("best-effort deleted (Drop path)") — the runtime-safe
+Drop fix live-proven; post-run `list` read confirmed zero scratch tasks.
+
+### Run 2 (honest retry) — 2026-09-11T11:42:25Z (scratch `ign-live-scratch-1789126945`), 94.19 s, FAILED at §2
+
+Identical signature, verbatim:
+
+```text
+running 1 test
+gate step create: scratch task "ign-live-scratch-1789126945" created (eam_backup/OnDemand, action layer)
+gate step flip: "ign-live-scratch-1789126945" is Scheduled with cron "0/30 * * * * ?" — waiting for the gateway to register the trigger (captured ~80 s, §1c)
+gate step suspend: 204 + read-back isSuspended=true (previous state None)
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+test live_eam_write_lifecycle has been running for over 60 seconds
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+gate step verify: grace-period row: taskState=Suspended still listed in scheduled/false — transient, UAT rig 2026-09-10
+
+thread 'live_eam_write_lifecycle' (41615651) panicked at crates/ignition-core/tests/live_gateway.rs:896:9:
+suspended scratch task must vanish from scheduled/false within ~90s (capture §2) — grace row seen: true; last observed taskState: "Suspended"
+cleanup: scratch task "ign-live-scratch-1789126945" best-effort deleted (Drop path)
+test live_eam_write_lifecycle ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 94.19s
+```
+
+Per-step: identical to run 1 — create ✅ → flip ✅ → suspend ✅ (first attempt) →
+**§2 poll ❌ (identical: 10 grace-row polls, deadline panic)**. Cleanup ✅ (Drop guard);
+post-run list read: zero scratch tasks.
+
+**Pre-flight both runs:** `/StatusPing` → `{"state":"RUNNING"}`; token sanity
+(gateway-info 200); controller mode active (`scheduled/false` → 200 `{"items":[],…}`);
+zero pre-existing EAM tasks. **Teardown after both runs:** `docker rm -f -v ign-uat-836`,
+token env shredded (`shred -u`), zero `ign-uat*` containers/volumes, port freed, zero
+scratch tasks at delete time (verified by the pre-teardown list read above).
 
 ## 6. SC-5 verdict
 
-**NOT YET CLOSED — precisely blocked on user-provisioned env access.** Phase 10's fifth
-success criterion ("at least one guarded write live-verified end-to-end against the
-real WHK controller rig, recorded during the phase") is neither proven nor silently
-skipped: the gate exists (compiles, clippy-clean, skips green without env), and the
-single remaining unblock is:
+**STILL NOT CLOSED — the gate has now RUN on a real controller (twice, 2026-09-11) but
+aborted at its own §2 vanish poll both times.** Phase 10's fifth success criterion
+("at least one guarded write live-verified end-to-end") requires the FULL lifecycle
+through resume → delete → not_found; the gate reached neither on either run. This is
+precisely the honest-stop branch the 10-06 plan defined for a failing live step: drift
+recorded (§4 D1), one honest retry logged (§5), no guesswork fix applied.
 
-1. Provision the two env vars (user_setup contract): `IGNITION_LIVE_URL` = the WHK
-   controller gateway's base URL; `IGNITION_LIVE_TOKEN` = a WHK-controller API token
-   with EAM rights (FULL `name:key` string).
-2. Re-run: `cargo test -p ignition-core --test live_gateway live_eam_write_lifecycle -- --ignored --nocapture`
-3. Append the per-step verbatim outcomes to §5 and flip the status to `passed` (or
-   `failed-with-findings` — the orchestrator decides gap-closure).
+**What the 10-06 runs DID live-prove on the disposable controller rig** (both runs, no
+wire-shape drift):
+
+- The two 10-06 code fixes work as designed: the poll replaced the false-failing
+  single-shot check (10 grace-row observations instead of one misleading assert), and
+  the runtime-safe Drop guard deleted BOTH runs' scratch tasks on the FAILURE path —
+  the UAT run's stranded-task failure mode ("Drop cleanup itself panicked") is gone.
+- Through-suspend is live-proven END-TO-END through the action layer: create →
+  Scheduled+cron flip → suspend 204 + `isSuspended=true` persistence (Decision 1),
+  twice, first-attempt suspends both times.
+- The grace-row shape (`taskState="Suspended"` in `scheduled/false`) is firmly captured.
+- resume/delete themselves remain live-proven via the UAT CLI tests on this same rig
+  (10-UAT.md test 12 note) — but NOT by this gate.
+
+**Follow-up gap work (the §4 D1 contract):** a dedicated capture pass measuring the
+`scheduled/false` post-suspend vanish behavior (distribution, or whether the row EVER
+leaves on long-lived rigs) across fresh + long-lived controllers, then re-size the §2
+deadline (or re-shape the check if the vanish is not a stable invariant). Only then does
+the gate re-run for the SC-5 close. The env blocker is gone — rig access is now a
+documented recipe (10-RIG-NOTES + the UAT-recorded substitution), not a user dependency.
