@@ -1012,3 +1012,200 @@ async fn history_query_pins_epoch_ms_body_and_t_stamp_passthrough() {
     assert_eq!(result.row_count, 1);
     assert_eq!(guard.received_requests().await.len(), 1);
 }
+
+// ---- Task 2 (11-02): the tagConfig route's Phase-11 bulk actions ----
+//
+// Pins at the RAW [`GatewayApi::webdev_route_call`] layer — the
+// Rust-side `tags_export` format param lands in 11-04; this plan pins
+// the WIRE those actions will ride. REQUEST-pinning discipline
+// (10-02): full-body `body_json` (the match IS the recorded-request
+// assertion — any drift fails the match) + expect(1) + guard counts.
+
+/// Base64 of the canned export XML — the 11-01 Probe-1b byte-shape
+/// constants (CRLF line endings, 3-space indent, NO `<?xml`
+/// declaration, trailing CRLF). Base64 equality ⇔ decoded-byte
+/// equality (injective), so pinning the string pins the bytes
+/// exactly; no base64 crate in the graph (planner lock).
+const CANNED_XML_B64: &str = "PFRhZ3MgTWluVmVyc2lvbj0iOC4wLjAiIGxvY2FsZT0iZW5fVVMiPg0KICAgPFRhZyBuYW1lPSJUMSIgdHlwZT0iQXRvbWljVGFnIj4NCiAgICAgIDxQcm9wZXJ0eSBuYW1lPSJ2YWx1ZVNvdXJjZSI+bWVtb3J5PC9Qcm9wZXJ0eT4NCiAgICAgIDxQcm9wZXJ0eSBuYW1lPSJ2YWx1ZSI+NDI8L1Byb3BlcnR5Pg0KICAgPC9UYWc+DQo8L1RhZ3M+DQo=";
+
+/// THE exportTags format pin: the recorded request carries BOTH
+/// `format:"xml"` AND the paths (the new body vocabulary), and the
+/// response's base64 payload decodes to the canned XML bytes exactly.
+#[tokio::test]
+async fn export_tags_xml_format_pin_at_the_raw_call_layer() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "exportTags",
+            "paths": ["[default]P5"],
+            "format": "xml"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"payload_b64": CANNED_XML_B64, "format": "xml"}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let data = api
+        .webdev_route_call(
+            "ign-cli",
+            "tagConfig",
+            &serde_json::json!({"action": "exportTags", "paths": ["[default]P5"], "format": "xml"}),
+            &[],
+        )
+        .await
+        .expect("xml export through the raw call layer");
+    assert_eq!(data["format"], "xml");
+    assert_eq!(
+        data["payload_b64"], CANNED_XML_B64,
+        "base64 pinned verbatim — decodes to the canned XML bytes exactly"
+    );
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE importTagsFile body pin: `file_b64`/`basePath`/`collisionPolicy`
+/// ride the request body VERBATIM, and the QualityCode strings parse
+/// through the envelope untouched (str() rendering, never re-modeled).
+#[tokio::test]
+async fn import_tags_file_body_pins_file_b64_base_path_and_policy() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "importTagsFile",
+            "file_b64": CANNED_XML_B64,
+            "basePath": "[default]Tgt",
+            "collisionPolicy": "a"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": ["Good", "Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let data = api
+        .webdev_route_call(
+            "ign-cli",
+            "tagConfig",
+            &serde_json::json!({
+                "action": "importTagsFile",
+                "file_b64": CANNED_XML_B64,
+                "basePath": "[default]Tgt",
+                "collisionPolicy": "a"
+            }),
+            &[],
+        )
+        .await
+        .expect("importTagsFile through the raw call layer");
+    assert_eq!(data["results"], serde_json::json!(["Good", "Good"]));
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// The provider-root denial shape: the route's
+/// `provider_root_unsupported` envelope maps onto the NAMED taxonomy
+/// slug (exit 6) through the raw call layer — the same mapping the
+/// existing tagConfig contract asserts.
+#[tokio::test]
+async fn import_tags_file_provider_root_denial_maps_to_the_named_slug() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "importTagsFile"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "provider_root_unsupported",
+                    "message": "provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder"
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api
+        .webdev_route_call(
+            "ign-cli",
+            "tagConfig",
+            &serde_json::json!({
+                "action": "importTagsFile",
+                "file_b64": CANNED_XML_B64,
+                "basePath": "[default]",
+                "collisionPolicy": "a"
+            }),
+            &[],
+        )
+        .await
+        .expect_err("the provider-root refusal parses");
+    assert_eq!(err.code(), "provider_root_unsupported");
+    assert_eq!(err.exit_code(), 6);
+}
+
+/// The invalid-policy denial shape: `invalid_collision_policy` is a
+/// route-level contract string, NOT a CoreError slug — it rides the
+/// `webdev_route_error` verbatim contract agents branch on (exit 6).
+#[tokio::test]
+async fn import_tags_file_invalid_policy_rides_the_route_error_contract() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "importTagsFile"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "invalid_collision_policy",
+                    "message": "collisionPolicy must be 'a' (abort) or 'o' (overwrite)"
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = api
+        .webdev_route_call(
+            "ign-cli",
+            "tagConfig",
+            &serde_json::json!({
+                "action": "importTagsFile",
+                "file_b64": CANNED_XML_B64,
+                "collisionPolicy": "i"
+            }),
+            &[],
+        )
+        .await
+        .expect_err("the policy refusal parses");
+    assert_eq!(err.code(), "webdev_route_error");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.to_string().contains("invalid_collision_policy"),
+        "the route's code rides the verbatim contract: {err}"
+    );
+}

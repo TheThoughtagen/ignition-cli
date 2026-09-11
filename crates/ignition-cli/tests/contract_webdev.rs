@@ -241,10 +241,10 @@ async fn webdev_status_all_present_golden() {
         stdout_for_golden(&out),
         snapbox::str![[r#"
 [profile: dev]
-tags         present          1.1.0
-tagConfig    present          1.1.0
-alarms       present          1.1.0
-tagHistory   present          1.1.0
+tags         present          1.2.0
+tagConfig    present          1.2.0
+alarms       present          1.2.0
+tagHistory   present          1.2.0
 ok: all always-on routes present with matching versions
 "#]],
     );
@@ -253,7 +253,7 @@ ok: all always-on routes present with matching versions
     assert!(out.status.success());
     snapbox::Assert::new().action_env("SNAPSHOTS").eq(
         stdout_for_golden(&out),
-        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":[{"route":"tags","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"},{"route":"tagConfig","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"},{"route":"alarms","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"},{"route":"tagHistory","status":"present","deployed_version":"1.1.0","expected_version":"1.1.0"}],"ok":true}}"#]],
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"project":"ign-cli","routes":[{"route":"tags","status":"present","deployed_version":"1.2.0","expected_version":"1.2.0"},{"route":"tagConfig","status":"present","deployed_version":"1.2.0","expected_version":"1.2.0"},{"route":"alarms","status":"present","deployed_version":"1.2.0","expected_version":"1.2.0"},{"route":"tagHistory","status":"present","deployed_version":"1.2.0","expected_version":"1.2.0"}],"ok":true}}"#]],
     );
 }
 
