@@ -8,7 +8,15 @@ def doPost(request, session):
 	#   deleteTags       -- {paths: [...]} -> {deleted}
 	#   listUDTTypes     -- {provider='default'} -> {results} (browse entry shape)
 	#   getUDTDefinition -- {provider, name} -> {definition}
-	#   exportTags       -- {paths: [...]} -> {payload: <json string>}
+	#   exportTags       -- {paths: [...], format='json'} -> {payload: <json
+	#                       string>} -- or, format='xml': {payload_b64, format}
+	#                       (base64 of the gateway's CRLF XML document; byte-
+	#                       exact through the JSON envelope)
+	#   importTagsFile   -- {file_b64, basePath='[default]', collisionPolicy='a'}
+	#                       -> {results: [<QualityCode strings>]} -- base64 file
+	#                       bytes to a gateway-side temp file, system.tag.
+	#                       importTags (FILE-PATH-only signature, 11-01
+	#                       Probe 2), temp deleted in a finally
 	#
 	# Body envelope (WebDev IGNORES the 'status' key -- denials ride HTTP 200):
 	#   success: {"ok": true, "data": {...}}
@@ -35,7 +43,7 @@ def doPost(request, session):
 	#     RpcContext WebDev threads don't carry, 8.3.3) -- subtree paths like
 	#     [provider]folder are the supported form.
 
-	ROUTE_VERSION = '1.1.0'  # same constants in every route + ROUTE_BUNDLE_VERSION in ignition-core
+	ROUTE_VERSION = '1.2.0'  # 1.2.0: exportTags format param + importTagsFile (Phase 11)
 	MIN_CLI = '1.0'
 
 	import json, traceback
@@ -170,19 +178,91 @@ def doPost(request, session):
 
 		if action == 'exportTags':
 			paths = data['paths']
+			fmt = data.get('format', 'json')  # the CLI flag's vocabulary; maps to the gateway's exportType kwarg
 			# Provider-root pre-flight scan (07-06): refuse naming the
 			# offending path BEFORE any gateway work.
 			for p in paths:
 				if is_provider_root(p):
 					return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder: ' + str(p))
+			if fmt == 'json':
+				# The contract-frozen JSON interchange -- byte-identical to
+				# the 1.1.0 behavior (existing pins keep passing untouched).
+				try:
+					payload = system.tag.exportTags(tagPaths=paths)  # kwargs ONLY (positional fails)
+				except:
+					# RpcContext translation (07-06): the bare provider form.
+					if 'No RpcContext' in traceback.format_exc():
+						return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
+					raise
+				return ok({'payload': str(payload)})
+			if fmt == 'xml':
+				# XML out: the gateway's full CRLF document rides base64 so
+				# it survives the JSON envelope byte-exactly (research
+				# Pattern 1 -- no string-escaping edge cases). Primary path
+				# is the kwargs+xml form live-proven by 11-01 Probe 1 (both
+				# rigs: full CRLF XML document string, no declaration).
+				import base64
+				try:
+					payload = system.tag.exportTags(tagPaths=paths, exportType='xml')
+				except:
+					if 'No RpcContext' in traceback.format_exc():
+						return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
+					# TEMP-FILE FALLBACK (research Pitfall 1): the kwargs+xml
+					# form may differ from the docs' file-path signature on
+					# some builds -- fall back to the documented positional
+					# form (arg-1 is the filePath the export is WRITTEN to,
+					# 11-01 Probe 1c), read the file, delete it.
+					from java.io import File as _F
+					_tmp = _F.createTempFile('ign-export', '.xml')
+					try:
+						system.tag.exportTags(_tmp.getAbsolutePath(), paths, True, 'xml')
+						_fh = open(_tmp.getAbsolutePath(), 'rb')
+						_bytes = _fh.read()
+						_fh.close()
+						payload = _bytes  # bytes path below handles str-vs-bytes
+					finally:
+						_tmp.delete()
+				# Normalize to a byte string for the b64 carrier: the
+				# kwargs+xml form returns unicode (Jython str = byte str).
+				if isinstance(payload, unicode):
+					payload_bytes = payload.encode('utf-8')
+				else:
+					payload_bytes = str(payload)
+				return ok({'payload_b64': base64.b64encode(payload_bytes), 'format': 'xml'})
+			return err('unsupported_format', 'supported formats: json, xml')
+
+		if action == 'importTagsFile':
+			# File-path import (Phase 11): base64 file bytes in ->
+			# gateway-side temp file -> system.tag.importTags (the
+			# FILE-PATH-only signature, 11-01 Probe 2) -> temp deleted.
+			file_b64 = data['file_b64']
+			base = data.get('basePath', '[default]')
+			policy = data.get('collisionPolicy', 'a')
+			# LOCKED collision matrix (05-05): abort/overwrite only.
+			# The gateway's 'i' (Ignore) exists but is NEVER surfaced.
+			if policy not in ('a', 'o'):
+				return err('invalid_collision_policy', "collisionPolicy must be 'a' (abort) or 'o' (overwrite)")
+			import base64
+			from java.io import File
+			tmp = File.createTempFile('ign-import', '.tagimport')
 			try:
-				payload = system.tag.exportTags(tagPaths=paths)  # kwargs ONLY (positional fails)
-			except:
-				# RpcContext translation (07-06): the bare provider form.
-				if 'No RpcContext' in traceback.format_exc():
-					return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
-				raise
-			return ok({'payload': str(payload)})
+				fh = open(tmp.getAbsolutePath(), 'wb')
+				fh.write(base64.b64decode(file_b64))
+				fh.close()
+				try:
+					results = system.tag.importTags(tmp.getAbsolutePath(), base, policy)
+				except:
+					# 07-06 translation, kept defensively: 11-01 Probe 2
+					# proved importTags FREE of the RpcContext constraint
+					# from a SCRIPT thread (provider-root basePath works);
+					# WebDev-thread truth is the 11-06 live gate's job, so
+					# a No-RpcContext throw here still refuses honestly.
+					if 'No RpcContext' in traceback.format_exc():
+						return err('provider_root_unsupported', 'provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder')
+					raise
+			finally:
+				tmp.delete()  # cleanup on EVERY path -- leaked temp files on a production gateway are a real failure mode
+			return ok({'results': [str(x) for x in results]})
 
 		return err('unknown_action', 'unknown action: ' + str(action))
 	except:

@@ -22,7 +22,7 @@
 
 /// Version of the embedded route bundle — the `version` handshake action
 /// in every route answers with this value (as `routeVersion`).
-pub const ROUTE_BUNDLE_VERSION: &str = "1.1.0";
+pub const ROUTE_BUNDLE_VERSION: &str = "1.2.0";
 
 /// Minimum CLI version the deployed routes require (handshake `minCli`).
 pub const MIN_CLI: &str = "1.0";
