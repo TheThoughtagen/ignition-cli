@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
-**Current Plan:** 2
+**Current Plan:** 3
 **Total Plans in Phase:** 6
-**Status:** 11-01 complete — ready for 11-02 (route design cites 11-LIVE-CAPTURES.md)
+**Status:** 11-02 complete (route actions + atomic 1.2.0 bump + wiremock pins) — 11-03 executing in parallel; ready for 11-04 after
 **Last Activity:** 2026-09-11
 
-**Progress:** [█████████░] 93%
+**Progress:** [█████████░] 94%
 
 ## Performance Metrics
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 8 | 1/6 | 200 min | 200 min |
 | 9 | 0/TBD | - | - |
 | 10 | 0/TBD | - | - |
-| 11 | 1/6 | 56 min | 56 min |
+| 11 | 2/6 | 81 min | 40 min |
 | 12 | 0/TBD | - | - |
 | 13 | 0/TBD | - | - |
 | 14 | 0/TBD | - | - |
@@ -56,6 +56,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 10 P07 | 24 min | 2 tasks | 1 files |
 | Phase 10 P06 | 27 min | 3 tasks | 4 files |
 | Phase 11 P01 | 56 min | 3 tasks | 4 files |
+| Phase 11 P02 | 25min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -132,6 +133,8 @@ Recent decisions affecting current work:
 - [Phase 11 / 11-01]: Legacy CSV grammar locked by jar evidence (TagCSVImporter.PROP_COLUMNS = 51 names, identical both rigs): Path/Owner columns UNUSABLE (folder-branch NPE / Bad_Unsupported), CSV basePath IGNORED (tags land at provider root), alarms (AlarmStates) and Permissions parse Good but silently land NOTHING, unknown columns silently ignored, marker row required + version bounds-checked — docs' 47/48-column table is neither the vocabulary nor required
 - [Phase 11 / 11-01]: scriptExec exec action runs code in a FRESH globals dict — `import system` is the bridge (first live proof of exec semantics; prior gates only hit `version`); applies to all later scriptExec probe/gate use
 - [Phase 11 / 11-01]: Captured XML artifacts are committed `-text` via .gitattributes — core.autocrlf=input silently CRLF→LF-normalized the fixture blob on first commit (caught by sha mismatch); byte-faithful captures must assert blob sha after commit
+- [Phase 11]: [Phase 11 / 11-02]: exportTags format=xml rides the kwargs+xml form Probe-1-proven on both rigs with the documented positional temp-file fallback retained defensively; importTagsFile has NO provider-root pre-flight (Probe 2: importTags is RpcContext-free, script-thread truth) with the No-RpcContext catch kept as honest WebDev-thread defense; XML crosses the envelope as payload_b64 base64 (CRLF document byte-exact); collisionPolicy LOCKED a/o with invalid_collision_policy refusal — 11-02 route design cites 11-LIVE-CAPTURES.md verbatim; WebDev-thread truth deferred to 11-06 live gate
+- [Phase 11]: [Phase 11 / 11-02]: ROUTE_BUNDLE_VERSION 1.1.0 -> 1.2.0 landed ATOMICALLY in one seven-file commit (five route constants + mod.rs + routes/VERSION), MIN_CLI stays 1.0 — the three-way pin test is the enforcement; wiremock REQUEST pins for the new bodies landed at the raw webdev_route_call layer before their action-layer consumers exist (11-04) — Research Pattern 4: bump atomicity machine-enforced; pins precede consumers
 
 ### Pending Todos
 
@@ -143,8 +146,9 @@ Recent decisions affecting current work:
 - [Phase 13 prerequisite]: Confirm licensed-Historian rig access before starting Phase 13 planning — spike cannot proceed without it (documented-limitation fallback is legitimate, but access confirmation must happen first)
 - [Phase 11 prerequisite — RESOLVED by 11-01]: Real multi-level UDT export captured (artifacts/udt-multilevel.xml, sha-pinned) — the derive-vs-Event-loop decision now has its fixture
 - SC-5 (Phase 10) NOT closed by a passing gate run — env blocker RESOLVED via the UAT-recorded disposable-rig substitution (10-06 ran twice on ign-uat-836, torn down clean), but the §2 vanish poll failed both times (grace row >90s ×2; drift recorded 10-LIVE-GATE.md §4 D1). Follow-up gap work: dedicated capture of scheduled/false post-suspend vanish behavior across fresh + long-lived rigs → re-size the 90s deadline (or re-shape the check) → gate re-run. Rig access is a documented recipe (10-RIG-NOTES + gate §5), not a user dependency.
+- Parallel-wave note for 11-03 verify gates: pre-existing fmt drift (live_gateway.rs, ignition-tui/ui/mod.rs — Phase-10 commits) plus 11-03's own by-design RED tag_loss tests make workspace-wide cargo fmt --check / cargo test --workspace red independent of 11-02; 11-02 verified clean in an isolated worktree at 34d6594 (clippy -D warnings green, zero failures outside tag_loss RED tests)
 
 ## Session Continuity
 
-**Last session:** 2026-09-11T16:23:10.945Z
+**Last session:** 2026-09-11T16:53:38.715Z
 **Resume file:** None

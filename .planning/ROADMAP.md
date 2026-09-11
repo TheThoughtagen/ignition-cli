@@ -118,7 +118,7 @@ Plans:
 **Plans:** 6 plans
 Plans:
 - [ ] 11-01-PLAN.md — Live rig probes (all five roadmap-mandated) + REAL multi-level UDT XML capture + CSV coverage table → 11-LIVE-CAPTURES.md *(capture-first: later plans cite, never re-derive)*
-- [ ] 11-02-PLAN.md — Route surface: exportTags format param (xml→base64) + importTagsFile action + ATOMIC 1.2.0 bundle bump + wiremock pins
+- [x] 11-02-PLAN.md — Route surface: exportTags format param (xml→base64) + importTagsFile action + ATOMIC 1.2.0 bundle bump + wiremock pins
 - [ ] 11-02 parallel: 11-03-PLAN.md — TDD loss-report scan module (scan_xml/scan_csv pure fns, validated against the real UDT capture; quick-xml no-serde + csv)
 - [ ] 11-04-PLAN.md — Core transfer actions: XML raw-byte export/import via routes (scan-fed collision pre-check) + generate_legacy_csv + 300s export timeout
 - [ ] 11-05-PLAN.md — CLI surface + TAGS-12 loss gate (--format flags, pre-resolution exit-2 refusal, --yes, stderr prose + envelope loss_report, raw-byte stdout, README CSV honesty)
