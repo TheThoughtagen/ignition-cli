@@ -23,6 +23,7 @@ pub mod restart;
 pub mod rig;
 pub mod script;
 pub mod sessions;
+pub mod tag_loss;
 pub mod tags;
 pub mod version;
 pub mod webdev;

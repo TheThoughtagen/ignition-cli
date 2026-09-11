@@ -1,1 +1,4 @@
 .planning/phases/11-tag-bulk-transfer-xml-csv/artifacts/*.xml -text
+# 11-03: the loss-scan fixture IS a captured gateway artifact (11-01, sha 11ed1528…) —
+# same core.autocrlf=input CRLF-normalization trap as the planning artifacts above
+crates/ignition-core/tests/fixtures/*.xml -text

@@ -24,6 +24,8 @@ tokio = { workspace = true }
 percent-encoding = { workspace = true }
 zip = { workspace = true }
 tempfile = { workspace = true } # promoted from dev (05-02): the resource-surgery temp export file — already in the workspace graph, NOT a new dependency
+quick-xml = { workspace = true } # 11-03 TAGS-12: Event-loop loss scan (no serde feature — see workspace deps rationale)
+csv = { workspace = true } # 11-03 TAGS-12: legacy CSV loss scan + 11-04 generator
 
 [dev-dependencies]
 wiremock = { workspace = true }
