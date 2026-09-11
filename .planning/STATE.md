@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 10 EAM write operations: all 7 plans executed (01-05 original + 06/07 UAT gap closures); SC-5 not closed by a passing gate run — the 10-06 live runs on the disposable controller rig live-proved through-suspend + both code fixes, but the §2 vanish never landed within 90s (×2); follow-up named in 10-LIVE-GATE.md §4 D1/§6
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 11 tag bulk transfer XML/CSV: capture-first plan 11-01 executed (all five roadmap probes answered on both rigs, multi-level UDT XML fixture committed); SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
 
 ## Current Position
 
-**Phase:** 10 of 14 (10-eam-write-operations)
-**Current Plan:** 7
-**Total Plans in Phase:** 7 (5 original + 2 gap closures from 10-UAT)
-**Status:** Plans complete — SC-5 follow-up: capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run; then `/gsd-verify-work` 10
+**Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
+**Current Plan:** 2
+**Total Plans in Phase:** 6
+**Status:** 11-01 complete — ready for 11-02 (route design cites 11-LIVE-CAPTURES.md)
 **Last Activity:** 2026-09-11
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 93%
 
 ## Performance Metrics
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 8 | 1/6 | 200 min | 200 min |
 | 9 | 0/TBD | - | - |
 | 10 | 0/TBD | - | - |
-| 11 | 0/TBD | - | - |
+| 11 | 1/6 | 56 min | 56 min |
 | 12 | 0/TBD | - | - |
 | 13 | 0/TBD | - | - |
 | 14 | 0/TBD | - | - |
@@ -55,6 +55,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 10 P05 | 2h 30m | 2 tasks | 3 files |
 | Phase 10 P07 | 24 min | 2 tasks | 1 files |
 | Phase 10 P06 | 27 min | 3 tasks | 4 files |
+| Phase 11 P01 | 56 min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -124,6 +125,13 @@ Recent decisions affecting current work:
 - [Phase 10]: 10-07: wrapped_row_count greedy estimator targets the Ratio(1,2) inner width (frame/2 − 2); over-estimate is the safe side under content-driven-height doctrine; the 80x24 buffer regression test is the arbiter if ratatui's WordWrapper disagrees
 - [Phase 10]: 10-06: gate code stays EXACTLY as-run after the failed live runs — §5 verbatim records must match the committed binary; wording corrections live in the docs and the follow-up gap plan amends wording with its own re-run — Evidence-provenance over cosmetic retrofits
 - [Phase 10]: 10-06: SC-5 live runs on the disposable controller rig both aborted at §2 — grace row persisted >90s twice, contradicting the fresh-rig <48s upper bound; retry budget spent, NO deadline bump — follow-up: capture scheduled/false post-suspend vanish behavior across fresh + long-lived rigs before re-sizing (gate §4 D1/§6) — Re-sizing without understanding the reconcile mechanics is guesswork, forbidden by the failing-step contract
+- [Phase 11 / 11-01]: The fidelity oracle is THREE-tier (binds 11-06): transport sha256 always; byte-identity ONLY for unchanged-subtree re-export (3× byte-stable, both rigs); import→re-export rides ORDER-NORMALIZED structural identity because sibling order permutes on model rebuild (1128==1128 length, byte-different, structurally identical — captured pair dcf1c0aa/2d99ed58) — Byte-identity after an import is invalid by capture, not by tooling
+- [Phase 11 / 11-01]: importTags REFUSES UDT type definitions (verbatim: "Udt definitions can only be imported in the UDT Definitions tab", both rigs) — UdtType-bearing XML cannot round-trip through importTags at all; loss-scan must surface type="UdtType"; instances DO import (UDTParentType → typeId, children ride from the type)
+- [Phase 11 / 11-01]: exportTags kwargs+xml returns the full CRLF XML document string (NO <?xml declaration, 3-space indent, trailing CRLF) — positional form = filePath-writing fallback (gateway cwd-relative); mixed-parent export SILENTLY corrupts (type="Unknown" empty Tag) and PRE-EXISTS in the JSON baseline — mixed-parent refusal is a both-formats concern
+- [Phase 11 / 11-01]: importTags collision 'a' NEVER throws — failures ride Bad_Failure("Tag 'X' already exists…") QualityCode elements; provider-root basePath WORKS from script threads (07-06 RpcContext constraint is getConfiguration/exportTags-specific) — route/action layer must inspect the QualityCode list, not catch exceptions
+- [Phase 11 / 11-01]: Legacy CSV grammar locked by jar evidence (TagCSVImporter.PROP_COLUMNS = 51 names, identical both rigs): Path/Owner columns UNUSABLE (folder-branch NPE / Bad_Unsupported), CSV basePath IGNORED (tags land at provider root), alarms (AlarmStates) and Permissions parse Good but silently land NOTHING, unknown columns silently ignored, marker row required + version bounds-checked — docs' 47/48-column table is neither the vocabulary nor required
+- [Phase 11 / 11-01]: scriptExec exec action runs code in a FRESH globals dict — `import system` is the bridge (first live proof of exec semantics; prior gates only hit `version`); applies to all later scriptExec probe/gate use
+- [Phase 11 / 11-01]: Captured XML artifacts are committed `-text` via .gitattributes — core.autocrlf=input silently CRLF→LF-normalized the fixture blob on first commit (caught by sha mismatch); byte-faithful captures must assert blob sha after commit
 
 ### Pending Todos
 
@@ -133,10 +141,10 @@ Recent decisions affecting current work:
 ### Blockers/Concerns
 
 - [Phase 13 prerequisite]: Confirm licensed-Historian rig access before starting Phase 13 planning — spike cannot proceed without it (documented-limitation fallback is legitimate, but access confirmation must happen first)
-- [Phase 11 prerequisite]: Real multi-level UDT export needed for the derive-vs-Event-loop decision — requires a live rig during Phase 11 planning
+- [Phase 11 prerequisite — RESOLVED by 11-01]: Real multi-level UDT export captured (artifacts/udt-multilevel.xml, sha-pinned) — the derive-vs-Event-loop decision now has its fixture
 - SC-5 (Phase 10) NOT closed by a passing gate run — env blocker RESOLVED via the UAT-recorded disposable-rig substitution (10-06 ran twice on ign-uat-836, torn down clean), but the §2 vanish poll failed both times (grace row >90s ×2; drift recorded 10-LIVE-GATE.md §4 D1). Follow-up gap work: dedicated capture of scheduled/false post-suspend vanish behavior across fresh + long-lived rigs → re-size the 90s deadline (or re-shape the check) → gate re-run. Rig access is a documented recipe (10-RIG-NOTES + gate §5), not a user dependency.
 
 ## Session Continuity
 
-**Last session:** 2026-09-11T11:52:54.701Z
+**Last session:** 2026-09-11T16:23:10.945Z
 **Resume file:** None
