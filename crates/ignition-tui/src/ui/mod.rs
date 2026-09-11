@@ -769,4 +769,67 @@ mod tests {
             "the arrays/objects refusal rides the hint: {text}"
         );
     }
+
+    /// The Confirm modal's blast-radius BODY (10-07, UAT test 10) —
+    /// the ~140-char preview line plus the agents/pending tails
+    /// composed by workers::eam_preview_body — must word-wrap inside
+    /// the half-width modal at the UAT's 80x24 frame. The old
+    /// single-Line render truncated at the box's right edge mid-word
+    /// ("eam_bac…"), hiding the targets/pending facts the gate exists
+    /// to expose; every distinctive token of the body must be
+    /// readable in the buffer.
+    #[test]
+    fn confirm_modal_wraps_the_blast_radius_body() {
+        // Built in the exact shape workers::eam_preview_body composes:
+        // the CLI-refusal preview line, then the agents line, then
+        // the pending line.
+        let body = "suspends task ign-uat-scratch (eam_backup) — future scheduled dispatches to 1 agent stop until resumed targets: [_controller] pending: 0 is destructive; rerun with --yes to confirm\nagents: _controller\npending executions: 0";
+        let mut state = AppState::new();
+        state.open_modal(Modal::Confirm {
+            title: "suspend eam task".into(),
+            body: body.into(),
+        });
+        let rows = rendered_rows_sized(&state, 80, 24);
+
+        // Scope the assertion to the modal INTERIOR: the rows strictly
+        // between the bordered title row and the matching bottom
+        // border at the same column, sliced to the box's inner width
+        // (Ratio(1,2) of 80 = 40 wide, minus two borders = 38) — the
+        // pane underneath keeps its own glyphs outside the Clear'd
+        // rect and must not influence the verdict.
+        let top = rows
+            .iter()
+            .position(|row| row.contains("┌suspend eam task"))
+            .expect("modal title row renders");
+        // str::find yields a BYTE offset; the box glyphs are 3 bytes
+        // each — convert to the CHAR column the buffer scan needs.
+        let at = rows[top][..rows[top]
+            .find("┌suspend eam task")
+            .expect("modal top-left corner")]
+        .chars()
+        .count();
+        let bottom = (top + 1..rows.len())
+            .find(|&y| rows[y].chars().nth(at) == Some('└'))
+            .expect("modal bottom border renders");
+        let interior = rows[top + 1..bottom]
+            .iter()
+            .map(|row| row.chars().skip(at + 1).take(38).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for token in [
+            "dispatches",
+            "targets:",
+            "pending:",
+            "--yes",
+            "agents: _controller",
+            "pending executions: 0",
+            "y to confirm · Esc to cancel",
+        ] {
+            assert!(
+                interior.contains(token),
+                "blast-radius token {token:?} must be readable in the Confirm modal: {rows:?}"
+            );
+        }
+    }
 }
