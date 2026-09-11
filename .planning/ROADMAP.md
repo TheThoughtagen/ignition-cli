@@ -36,7 +36,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 - [x] **Phase 8: 08-foundations-session-core-config-contract** — Shared execution core, one-shot config schema migration, codified contract discipline *(complete 2026-09-06)*
 - [x] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics *(complete 2026-09-07)*
-- [x] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview *(complete 2026-09-10; SC-5 live gate recorded `blocked-on-env` — user-provisioned WHK controller env pending, gate + record + contract in place)*
+- [x] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview *(complete 2026-09-11; UAT gap closures 10-06/10-07 executed, re-verification passed 5/5 — SC-5 verified-with-documented-residual: through-suspend live-proven ×2 on a disposable controller rig, §2 vanish-poll capture work scoped in 10-LIVE-GATE.md §6)*
 - [ ] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings
 - [ ] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation
 - [ ] **Phase 13: 13-composite-engine-workspace-historian-edit** — Workspace checkout, historian binding closure (spike-first), `ign edit` round-trip
@@ -95,14 +95,14 @@ Plans:
   4. Before any guarded EAM write executes, user sees a blast-radius preview naming the target agent/task and the controller impact
   5. At least one guarded write is live-verified end-to-end against the real WHK controller rig (env-gated live gate recorded during the phase, not bolted on after)
 **Research/Planning flags**: Established v1.0 guard-ladder patterns extended; no research-phase needed. EAM is endpoint-sensitive — both-rig guidance applies where endpoint shapes are involved (v1.0 `debug/eam-create-422.md` is required reading for wire-shape honesty). Gate-first, not gate-last.
-**Plans:** 7 plans (5 executed + 2 gap-closure from UAT)
+**Plans:** 7 plans (all executed — 5 original + 2 gap-closure from UAT)
 Plans:
 - [x] 10-01-PLAN.md — Live wire captures on both rigs (controller-mode provisioning + 12-probe list) → 10-LIVE-CAPTURES.md *(complete 2026-09-09)*
 - [x] 10-02-PLAN.md — Client surface: runtime verb paths + trait methods + wiremock REQUEST pins (capture-locked) *(complete 2026-09-09)*
 - [x] 10-03-PLAN.md — Action layer: suspend/resume/cancel/modify/delete + blast-radius preview composer + authoritative re-checks *(complete 2026-09-09)*
 - [x] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation *(complete 2026-09-10, recovered from executor outage)*
 - [x] 10-05-PLAN.md — Env-gated WHK controller live gate: scratch-task lifecycle, recorded in-phase (SC-5) *(complete 2026-09-10 — gate shipped + recorded `blocked-on-env`: WHK controller env access is user-provisioned; see 10-LIVE-GATE.md + 10-USER-SETUP.md)*
-- [ ] 10-06-PLAN.md — Gap closure (UAT test 12): live gate §2 poll-until-vanish + grace-row tolerance, in-runtime-safe Drop guard, disposable-rig live re-run recorded in 10-LIVE-GATE.md §5
+- [x] 10-06-PLAN.md — Gap closure (UAT test 12): live gate §2 poll-until-vanish + grace-row tolerance, in-runtime-safe Drop guard, disposable-rig live re-run recorded in 10-LIVE-GATE.md §5 *(complete 2026-09-11 — both code fixes shipped + live-exercised; gate runs recorded §5 as `failed-with-findings` at §2 ×2, drift §4 D1, follow-up §6)*
 - [x] 10-07-PLAN.md — Gap closure (UAT test 10): TUI Confirm modal wraps the blast-radius body (wrapped-row-aware height) + buffer-level non-clipping regression test
 
 ### Phase 11: 11-tag-bulk-transfer-xml-csv
@@ -170,7 +170,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 7. Ecosystem Interop & Advanced Ops | v1.0 | 6/6 | Complete | 2026-08-29 |
 | 8. 08-foundations-session-core-config-contract | v1.1 | 6/6 | Complete | 2026-09-06 |
 | 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
-| 10. 10-eam-write-operations | v1.1 | 4/5 | In progress | 2026-09-09 |
+| 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 0/TBD | Not started | - |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |
