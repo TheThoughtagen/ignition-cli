@@ -59,8 +59,12 @@ carry each step's verbatim outcome.
 5. **SUSPEND** through the action layer, retried up to 7×/30 s while the gateway
    registers the trigger (captured late-500 "Task could not be suspended", §1c);
    read-back asserts `config.profile.isSuspended == true` (Decision 1 persistence).
-6. **SCHEDULED VOCABULARY:** the suspended scratch task must be ABSENT from
-   `scheduled/false` (§2).
+6. **SCHEDULED VOCABULARY:** the suspended scratch task must VANISH from
+   `scheduled/false` — deadline-bounded poll, 10 s interval, ~90 s deadline
+   (§2: the vanish takes ~48 s and a transient grace row
+   `taskState="Suspended"` may still be listed immediately post-suspend;
+   the poll tolerates it and only panics at the deadline — a single-shot
+   absence check would false-fail on the grace row).
 7. **RESUME** through the action layer: read-back `isSuspended == false`; the task
    reappears in `scheduled/false` (§2, retry tolerance for load).
 8. **DELETE** through the action layer (find-derived signature, `?collection=core`,

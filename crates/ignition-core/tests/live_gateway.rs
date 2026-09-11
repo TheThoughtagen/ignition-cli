@@ -822,18 +822,62 @@ async fn live_eam_write_lifecycle() {
         suspend.previous_state
     );
 
-    // 5. SCHEDULED VOCABULARY: a suspended task is NOT listed as scheduled
-    //    (capture §2). Only the scratch task's own row is asserted on —
-    //    every other row belongs to the rig and is never touched.
-    let scheduled = api
-        .eam_tasks_scheduled(false)
-        .await
-        .expect("scheduled/false read must answer on a controller");
-    assert!(
-        !scheduled.iter().any(|row| row.name == scratch),
-        "suspended scratch task must vanish from scheduled/false (capture §2)"
+    // 5. SCHEDULED VOCABULARY: a suspended task leaves scheduled/false
+    //    EVENTUALLY, not immediately (capture §2 + the UAT gate run: the
+    //    row lingered ~48 s post-suspend, sometimes as a grace row
+    //    taskState="Suspended" still listed in scheduled/false). The check
+    //    is a deadline-bounded POLL — never a single-shot absence assert
+    //    (the UAT gap this closes). Modeled on the resume-reappear loop
+    //    below. Only the scratch task's own row is asserted on — every
+    //    other row belongs to the rig and is never touched.
+    let mut grace_seen = false;
+    let mut last_state: Option<String> = None;
+    let mut vanished_secs: Option<u64> = None;
+    let poll_start = std::time::Instant::now();
+    let deadline = poll_start + std::time::Duration::from_secs(90);
+    while vanished_secs.is_none() {
+        let scheduled = api
+            .eam_tasks_scheduled(false)
+            .await
+            .expect("scheduled/false read must answer on a controller");
+        match scheduled.iter().find(|row| row.name == scratch) {
+            Some(row) => {
+                last_state = Some(row.task_state.clone());
+                if row.task_state == "Suspended" {
+                    grace_seen = true;
+                    eprintln!(
+                        "gate step verify: grace-period row: taskState=Suspended still listed in \
+                         scheduled/false — transient, UAT rig 2026-09-10"
+                    );
+                } else {
+                    eprintln!(
+                        "gate step verify: scratch row still listed in scheduled/false \
+                         (taskState={:?}) — polling until it vanishes (capture §2)",
+                        row.task_state
+                    );
+                }
+            }
+            None => {
+                vanished_secs = Some(poll_start.elapsed().as_secs());
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+    let vanished_secs = vanished_secs.unwrap_or_else(|| {
+        panic!(
+            "suspended scratch task must vanish from scheduled/false within ~90s (capture §2) — \
+             grace row seen: {grace_seen}; last observed taskState: {:?}",
+            last_state.as_deref().unwrap_or("(row never observed after suspend)")
+        )
+    });
+    eprintln!(
+        "gate step verify: suspended task absent from scheduled/false (capture §2) — vanished \
+         after ~{vanished_secs}s (grace row seen: {grace_seen})"
     );
-    eprintln!("gate step verify: suspended task absent from scheduled/false (capture §2)");
 
     // 6. RESUME — the action layer (fires unconditionally per §1b honesty;
     //    here the task IS suspended so it is the real inverse, §1d).
