@@ -21,10 +21,10 @@ Replace the URL with your development gateway's address. `--token-env` stores th
 ign --json status
 ```
 
-Successful commands normally return an envelope containing `ok`, `profile`, and `data`. See the [reference](reference.md#output-contract-for-agents) for errors and streaming exceptions.
+Successful commands normally return an envelope containing `ok`, `profile`, and `data`. See the [reference](https://thethoughtagen.github.io/ignition-cli/docs/reference/#output-contract-for-agents) for errors and streaming exceptions.
 
 `ign doctor` can finish with exit code zero while reporting failed checks. Read the checks themselves before assuming the connection works.
 
 ## Add other operations when needed
 
-Gateway status and project listing use native REST endpoints. Runtime tag operations need the CLI's WebDev routes. Review those prerequisites and the overwrite behavior of project operations in the [reference](reference.md) before using them.
+Gateway status and project listing use native REST endpoints. Runtime tag operations need the CLI's WebDev routes. Review those prerequisites and the overwrite behavior of project operations in the [reference](https://thethoughtagen.github.io/ignition-cli/docs/reference/) before using them.

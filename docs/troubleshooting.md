@@ -10,7 +10,7 @@ Run `ign doctor`. For an Ignition 8.3 native REST endpoint, use the full API tok
 
 ## WebDev routes are missing
 
-The CLI requires its own route bundle for runtime tags, alarms, and history. Read the WebDev section of the [reference](reference.md) before running `ign webdev deploy`. Deploying replaces the CLI-owned route project.
+The CLI requires its own route bundle for runtime tags, alarms, and history. Read the WebDev section of the [reference](https://thethoughtagen.github.io/ignition-cli/docs/reference/) before running `ign webdev deploy`. Deploying replaces the CLI-owned route project.
 
 ## Import or resource update behaves unexpectedly
 
