@@ -103,7 +103,7 @@ Plans:
 - [x] 10-04-PLAN.md — CLI + two-tier guard dispatch + force preview composition + TUI routes/parity + README reconciliation *(complete 2026-09-10, recovered from executor outage)*
 - [x] 10-05-PLAN.md — Env-gated WHK controller live gate: scratch-task lifecycle, recorded in-phase (SC-5) *(complete 2026-09-10 — gate shipped + recorded `blocked-on-env`: WHK controller env access is user-provisioned; see 10-LIVE-GATE.md + 10-USER-SETUP.md)*
 - [ ] 10-06-PLAN.md — Gap closure (UAT test 12): live gate §2 poll-until-vanish + grace-row tolerance, in-runtime-safe Drop guard, disposable-rig live re-run recorded in 10-LIVE-GATE.md §5
-- [ ] 10-07-PLAN.md — Gap closure (UAT test 10): TUI Confirm modal wraps the blast-radius body (wrapped-row-aware height) + buffer-level non-clipping regression test
+- [x] 10-07-PLAN.md — Gap closure (UAT test 10): TUI Confirm modal wraps the blast-radius body (wrapped-row-aware height) + buffer-level non-clipping regression test
 
 ### Phase 11: 11-tag-bulk-transfer-xml-csv
 **Goal**: Tags move in the formats the ecosystem already speaks — byte-faithful passthrough of what the gateway produces (never CLI-side re-serialization) — with honest warnings about what lossy formats would drop before import commits.
