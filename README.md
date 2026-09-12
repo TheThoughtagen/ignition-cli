@@ -198,8 +198,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign tags config delete <PATH>... [--project NAME]` | Delete tag configurations | **destructive**: exit 2 (`confirmation_required`) without `--yes` — the guard fires before ANY resolution (zero network work); the delete is batch on the wire (`deleteTags {paths}`); JSON data `{project, deleted}` |
 | `ign tags udt types [--provider NAME] [--project NAME]` | List a provider's UDT types (`[provider]_types_` browse) | needs the deployed routes; JSON data `{project, provider, types: [{name, tag_type}]}` |
 | `ign tags udt def <NAME> [--provider NAME] [--project NAME]` | A UDT definition (parameters + nested children, recursive) | needs the deployed routes; the SAME stringified re-parse applies (parameter `defaultValue`s and child values become real JSON); JSON data `{project, provider, name, definition}` |
-| `ign tags export <PATH>... [-o FILE] [--project NAME]` | Export tag subtrees to a JSON file — the bulk-transfer half | needs the deployed routes; **JSON only** — the gateway's native interchange (`exportTags`), xml/csv deferred to backlog as documented format-discretion; the payload is parsed and validated (a list of subtrees) and written PRETTY; default file `<last-path-segment>.json` in the cwd, `-o FILE` overrides, **`-o -` prints the raw pretty payload in every mode** (the fourth sanctioned stdout exception — pipe it into `tags import --file -`); JSON data `{project, paths, file, stdout, tag_count}`; **provider-ROOT paths (`[default]` alone, or a bare provider name like `default`) exit 6 `provider_root_unsupported`** — see the bulk export note below |
-| `ign tags import --file FILE\|- --provider NAME [--collision-policy abort\|overwrite] [--project NAME]` | Import a JSON tag export into a target provider | needs the deployed routes; the provider must exist (`ign tags provider create NAME`); **the locked collision matrix**: abort (default) pre-checks by browsing the target and refuses exit 6 (`tag_collision`, hint names `--collision-policy overwrite`) BEFORE any write, then imports with server-side abort as the backstop; overwrite replaces existing tags — **destructive: exit 2 without `--yes`**, no pre-check (the server is the authority); merge is Designer-only (not a value); JSON data `{project, provider, collision_policy, imported}` |
+| `ign tags export <PATH>... [-o FILE] [--format json\|xml\|csv] [--project NAME]` | Export tag subtrees — the bulk-transfer half | needs the deployed routes; `--format json` (default) fetches the gateway's native JSON interchange: the payload is parsed, validated (a list of subtrees), and written PRETTY — default file `<last-path-segment>.json` in the cwd, `-o FILE` overrides, **`-o -` prints the raw pretty payload in every mode** (the fourth sanctioned stdout exception — pipe it into `tags import --file -`); `--format xml` passes the gateway's own XML through RAW-BYTE (CRLF/no-declaration document verbatim, no added trailing newline; default file `.xml`); `--format csv` is **CLI-GENERATED and LOSSY** — see the CSV honesty note below (default file `.csv`; what was dropped prints on stderr and rides `data.loss_report`); JSON data `{project, paths, file, stdout, tag_count, loss_report?}`; **provider-ROOT paths (`[default]` alone, or a bare provider name like `default`) exit 6 `provider_root_unsupported`** — see the bulk export note below |
+| `ign tags import --file FILE\|- --provider NAME [--format json\|xml\|csv] [--collision-policy abort\|overwrite] [--project NAME]` | Import a tag export into a target provider | needs the deployed routes; the provider must exist (`ign tags provider create NAME`); **the loss gate (TAGS-12)**: xml/csv inputs are SCANNED before anything is sent — if the scan reports losses, the CLI prints the loss report and refuses exit 2 `invalid_input` (profile null, zero requests) unless `--yes`; with `--yes` the structured scan summary rides `data.loss_report`; **the locked collision matrix**: abort (default) pre-checks by browsing the target and refuses exit 6 (`tag_collision`, hint names `--collision-policy overwrite`) BEFORE any write, then imports with server-side abort as the backstop; overwrite replaces existing tags — **destructive: exit 2 without `--yes`**, no pre-check (the server is the authority); merge is Designer-only (not a value); JSON data `{project, provider, collision_policy, imported, format, top_level_names, loss_facts, failed?, loss_report?}` |
 | `ign tags alarms active [--source S] [--priority P] [--state S] [--project NAME]` | List ACTIVE alarms — `eventId (FULL uuid)  source  state  priority  name` | needs the deployed routes; only present filters ride the wire (kwargs passthrough to `system.alarm.queryStatus`); state strings read `'Active, Unacknowledged'` verbatim — never parsed; JSON rows carry `{event_id, source, state, priority, name}` (name null when the event carries none); the printed eventId is copy-pasteable straight into `tags alarms ack` |
 | `ign tags alarms history --start T --end T [--project NAME]` | Query alarm history (journal rows, columns dataset-dependent) | needs the deployed routes; **a journal-provisioned gateway only** — default rigs refuse exit 6 `alarm_journal_missing` with the hint naming the provisioning chain (see **Alarm history** below); `--start/--end` take RFC3339 or epoch-ms; rows ride VERBATIM (the journal schema varies by Ignition version — the header IS the column list) |
 | `ign tags alarms ack ID... --username NAME [--note NOTE] [--project NAME]` | Acknowledge alarms — the count + the unacknowledged remainder | needs the deployed routes; the gateway-scope 3-arg wire form needs the username, so `--username` is REQUIRED (the CLI never guesses one); **NOT `--yes`-guarded by design** — acknowledging never un-acknowledges anything (a state-advancing, read-adjacent verb); ids: full UUIDs pass through verbatim, SHORT prefixes expand against the active-alarm list (ambiguous → exit 2 naming the candidates; unknown → exit 2 naming the miss); the 8.3 return IS the unacknowledged remainder — `acknowledged` is computed honestly (requested − remainder); JSON data `{project, acknowledged, unacknowledged}` |
@@ -929,11 +929,19 @@ transformation to attempt). `-f` follows until Ctrl-C (default process
 kill, no envelope), exactly the `logs -f` pipeline caveat.
 
 `ign tags export -o -` is the FOURTH exception: the export payload IS
-the product, so it prints raw pretty JSON in EVERY mode (no envelope
-even under `--json`/`--compact` — the rig-logs precedent). This is
-what makes the pipe round-trip work:
+the product, so it prints raw in EVERY mode (no envelope even under
+`--json`/`--compact` — the rig-logs precedent). This is what makes the
+pipe round-trip work:
 `ign tags export [default]P5 -o - | ign tags import --file - --provider other`.
 File-mode exports (the default, `-o FILE`) keep the normal envelope.
+Since Phase 11 the exception covers every format: `--format xml` and
+`--format csv` stdout mode write the RAW BYTES — the gateway's XML
+document (CRLF line endings, no declaration, trailing CRLF) or the
+generated CSV, byte-for-byte, never re-encoded, never pretty-printed,
+no added trailing newline. In human mode the artifact summary line
+(`exported … → stdout …`) goes to STDERR so a pipe stays pure; json
+mode keeps stdout data-only. The loss-gate refusal prose (below) is
+stderr-only for the same reason.
 
 ### Destructive operations
 
@@ -1065,14 +1073,71 @@ A minimal memory tag definition: `{"tagType": "AtomicTag",
 ### Bulk export/import (the portability loop)
 
 `tags export` → `tags import` moves a tag subtree between providers
-(or gateways) with values intact — the payload is the gateway's own
-JSON interchange, parsed and written pretty (JSON only; xml/csv were
-a roadmap sketch and stay deferred to backlog — the native format
-round-trips losslessly, which is the whole point). The collision
+(or gateways) with values intact. `--format json` (both sides'
+default) is the gateway's own JSON interchange, parsed and written
+pretty — the lossless round-trip. `--format xml` passes the gateway's
+own XML document through RAW-BYTE both directions (export: the
+gateway's `exportTags format=xml` answer decoded verbatim; import:
+your bytes ride base64 to the gateway's `importTags` untouched — the
+gateway's parser is the only semantic actor). The collision
 conventions are IDENTICAL to project import's (locked in Phase 3):
 abort pre-checks and refuses before any write; overwrite is
 `--yes`-guarded with no pre-check. `export -o -` pipes into
-`import --file -`.
+`import --file -` in any format.
+
+#### The CSV contract (read this before `--format csv`)
+
+The gateway cannot export tags to CSV (official Ignition 8.3 docs:
+"Ignition does not export tags to a CSV format").
+`ign tags export --format csv` output is **CLI-generated** from the
+gateway's JSON interchange and is **LOSSY**:
+
+- **No alarm configurations** — the legacy CSV grammar cannot carry
+  them; alarm data in the source is dropped (live-proven: even a CSV
+  imported with the undocumented `AlarmStates` column lands nothing).
+- **The legacy column set only** — modern properties (tag groups,
+  bindings, UDT parameter overrides, scan-class-adjacent and
+  history-retention columns) have no legacy column and are dropped.
+- **Numeric enum coercion** — `TagType`/`DataType`/`ExpressionType`
+  ride legacy numeric codes; folders flatten (the legacy `Path`
+  column is unusable — any non-empty value crashes the gateway's
+  importer wholesale, so every row carries an empty Path).
+
+The command prints exactly what was dropped on stderr
+(`warning: csv export dropped field(s): …`) and carries the
+structured twin in `data.loss_report` (`{format, dropped_keys,
+coerced, rows}`). Generation is **warn-and-continue, never gated**
+(nothing destructive happens — no gate applies); the column-by-column
+coverage table (what lands, coerces, drops, or crashes) is documented
+in `.planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md`
+§Probe 5, live-proven on 8.3.3 and 8.3.6.
+
+#### The loss gate (imports, TAGS-12)
+
+When importing xml/csv, the CLI SCANS the input before anything is
+sent and reports what the import would drop or coerce — UDT type
+definitions the gateway refuses outright, gateway-export-shaped files
+carrying only edited properties, and (for CSV, unconditionally) the
+no-alarms/legacy-columns facts. If the scan reports losses, the CLI
+prints the loss report as prose on STDERR and **refuses exit 2
+`invalid_input` unless `--yes`** — the refusal happens before any
+network activity (profile null, zero requests). With `--yes` the
+import proceeds and the structured scan summary rides the success
+envelope as `data.loss_report` (`{format, facts, top_level_names}`),
+so agents can read the same findings without parsing prose. The scan
+is advisory — the gateway remains the parsing authority; a clean
+scan never blocks an import, and a gateway-side parse error still
+surfaces as the gateway's own error.
+
+#### Collision policy (xml/csv)
+
+The gateway's `importTags` also accepts an `Ignore` collision policy
+(`'i'`) that silently keeps existing tags. `ign` deliberately
+surfaces only `abort` and `overwrite` (the same two-value matrix as
+`tags import`'s JSON path since 03-02): abort is the safe default
+with a real pre-check, overwrite is honest about being destructive
+and requires `--yes` — a silent-ignore policy has no honest CLI
+story, so it is not a value.
 
 Live-proven payload shapes (05-06): the gateway's `exportTags` never
 answers a bare array — one path yields a SINGLE subtree object,
