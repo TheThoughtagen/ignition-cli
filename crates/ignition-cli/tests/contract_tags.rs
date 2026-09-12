@@ -127,6 +127,12 @@ fn stderr_envelope(out: &std::process::Output) -> Value {
     serde_json::from_str(&stderr[from..]).expect("envelope parses")
 }
 
+/// The compact SUCCESS envelope parsed from stdout (success renders
+/// to stdout in every mode — the stream-discipline convention).
+fn stdout_envelope(out: &std::process::Output) -> Value {
+    serde_json::from_slice(&out.stdout).expect("compact success envelope parses")
+}
+
 /// Mount the provider resource list (two providers — one STANDARD,
 /// the MANAGED System).
 async fn mount_provider_list(server: &wiremock::MockServer) {
@@ -2129,5 +2135,566 @@ async fn tags_export_provider_root_refuses_honestly() {
     assert!(
         !cwd.path().join("default.json").exists(),
         "the refusal precedes any file write"
+    );
+}
+
+// ---- 11-05: --format xml|csv — the TAGS-12 loss gate, the raw-byte
+// stdout/file surfaces, and the honest CSV generation ----
+//
+// Wire truth cited (11-LIVE-CAPTURES.md): Probe 1b's XML byte
+// constants (CRLF / no declaration / trailing CRLF) are the canned
+// payload below; Probe 5's csv_no_alarms/csv_legacy_columns_only
+// facts are UNCONDITIONAL for non-empty CSV (the gate always fires).
+
+use base64::Engine as _;
+
+/// The Probe-1b-shaped canned XML export: CRLF line endings, 3-space
+/// indent, NO declaration, trailing CRLF — the byte-exactness oracle
+/// (raw passthrough must reproduce it verbatim).
+const CANNED_XML: &str = "<Tags MinVersion=\"8.0.0\" locale=\"en_US\">\r\n   <Tag name=\"T1\" type=\"AtomicTag\">\r\n      <Property name=\"valueSource\">memory</Property>\r\n      <Property name=\"defaultValue\">42</Property>\r\n   </Tag>\r\n</Tags>\r\n";
+
+/// Mount ONLY the version probe (expect 0 — the zero-request proof
+/// for pre-resolution refusals: the mount exists so a leaked request
+/// FAILS verification instead of silently connecting nowhere).
+async fn mount_probe_expect_zero(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"version": "1.2.0"}
+            })),
+        )
+        .expect(0)
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {}
+            })),
+        )
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// THE TAGS-12 loss gate (imports): a loss-bearing xml file and a
+/// loss-bearing csv file both refuse exit 2 `invalid_input` WITHOUT
+/// --yes — the prose report rides stderr (human) / error.message
+/// (compact), the refusal is PRE-RESOLUTION (the probe and tagConfig
+/// mocks are mounted at expect(0): zero wire work), and profile is
+/// null. Includes the stdin `-` xml case (symmetric to JSON).
+#[tokio::test]
+async fn tags_import_loss_gate_refusals() {
+    let (_dir, config) = isolated_config();
+
+    // --- xml: MinVersion root attr fires xml_export_edited_only ---
+    let server = wiremock::MockServer::start().await;
+    mount_probe_expect_zero(&server).await;
+    write_profile_config(&config, &server.uri());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("p5.xml");
+    std::fs::write(&xml, CANNED_XML).expect("write xml fixture");
+
+    // Human mode: the prose report IS the error message on stderr.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--format",
+            "xml",
+            "--file",
+            xml.to_str().unwrap(),
+            "--provider",
+            "p5import",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "gate refuses without --yes — stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "loss prose never touches stdout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("loss report (xml): the scan reports 1 finding(s)"),
+        "prose report on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("[xml_export_edited_only]"),
+        "stable scan code named: {stderr}"
+    );
+    assert!(
+        stderr.contains("re-run with --yes to import anyway"),
+        "the one-flag-away abort: {stderr}"
+    );
+
+    // Compact mode: same refusal as the machine envelope — code
+    // invalid_input, profile null.
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--format",
+            "xml",
+            "--file",
+            xml.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input");
+    assert_eq!(envelope["profile"], Value::Null);
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(message.contains("[xml_export_edited_only]"));
+    assert!(message.contains("re-run with --yes"));
+
+    // --- csv: csv_no_alarms fires UNCONDITIONALLY for non-empty CSV
+    // (11-01 Probe 5 — the gate always fires for the format) ---
+    let server = wiremock::MockServer::start().await;
+    mount_probe_expect_zero(&server).await;
+    let csv = dir.path().join("p5.csv");
+    std::fs::write(
+        &csv,
+        "# version=1\nName,TagType,DataType,Value\nT1,1,2,42\n",
+    )
+    .expect("write csv fixture");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--format",
+            "csv",
+            "--file",
+            csv.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "csv gate refuses without --yes");
+    let envelope = stderr_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input");
+    let message = envelope["error"]["message"].as_str().expect("message");
+    assert!(message.contains("loss report (csv)"));
+    assert!(
+        message.contains("[csv_no_alarms]"),
+        "Probe-5 truth: {message}"
+    );
+    assert!(message.contains("[csv_legacy_columns_only]"));
+
+    // --- stdin `-`: the same gate over the pipe (symmetric to JSON) ---
+    let server = wiremock::MockServer::start().await;
+    mount_probe_expect_zero(&server).await;
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--format",
+            "xml",
+            "--file",
+            "-",
+            "--provider",
+            "p5import",
+            "--compact",
+        ],
+        CANNED_XML,
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2), "stdin rides the same gate");
+    assert_eq!(stderr_envelope(&out)["error"]["code"], "invalid_input");
+}
+
+/// The `--yes` flow: the same loss-bearing fixture imports — the
+/// structured scan summary rides the envelope as data.loss_report
+/// (facts + top_level_names), and the importTagsFile REQUEST pin
+/// shows file_b64 == base64(fixture bytes) VERBATIM (the 11-04
+/// base64-only seam, pinned at the binary layer).
+#[tokio::test]
+async fn tags_import_loss_gate_yes_flow() {
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(CANNED_XML);
+
+    let (_dir, config) = isolated_config();
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p5import]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": []}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "importTagsFile",
+            "file_b64": payload_b64,
+            "basePath": "[p5import]",
+            "collisionPolicy": "a"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    write_profile_config(&config, &server.uri());
+
+    // Compact: exit 0, data.loss_report present (structured facts),
+    // the 11-04 loss_facts field still riding.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("p5.xml");
+    std::fs::write(&xml, CANNED_XML).expect("write xml fixture");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--format",
+            "xml",
+            "--file",
+            xml.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = stdout_envelope(&out);
+    assert_eq!(envelope["data"]["format"], "xml");
+    assert_eq!(envelope["data"]["imported"], 1);
+    assert_eq!(
+        envelope["data"]["loss_report"]["format"], "xml",
+        "data.loss_report present with --yes"
+    );
+    assert_eq!(
+        envelope["data"]["loss_report"]["facts"][0]["code"],
+        "xml_export_edited_only"
+    );
+    assert_eq!(envelope["data"]["loss_report"]["top_level_names"][0], "T1");
+    assert_eq!(
+        envelope["data"]["loss_facts"][0]["code"], "xml_export_edited_only",
+        "the 11-04 field still rides (additive, never renamed)"
+    );
+}
+
+/// Human-mode `--yes` import: stdout carries ONLY the summary line;
+/// the loss facts warn on stderr.
+#[tokio::test]
+async fn tags_import_yes_human_stream_discipline() {
+    let (_dir, config) = isolated_config();
+    let server = wiremock::MockServer::start().await;
+    mount_tags_probe(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p5import]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": []}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "importTagsFile"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    write_profile_config(&config, &server.uri());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("p5.xml");
+    std::fs::write(&xml, CANNED_XML).expect("write xml fixture");
+
+    let out = ign(
+        &config,
+        &server.uri(),
+        &[
+            "tags",
+            "import",
+            "--format",
+            "xml",
+            "--file",
+            xml.to_str().unwrap(),
+            "--provider",
+            "p5import",
+            "--yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+imported 1 tag(s) into p5import (abort)
+"#]],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: [xml_export_edited_only]"),
+        "loss facts warn on stderr: {stderr}"
+    );
+}
+
+/// CSV export warn-and-continue (exit 0, NEVER gated): the emitted
+/// bytes are generate_legacy_csv's output EXACTLY (file and stdout),
+/// the stderr warning names the dropped fields (human mode), and
+/// data.loss_report carries the structured twin. JSON mode keeps
+/// stderr prose-free (the envelope IS the report).
+#[tokio::test]
+async fn tags_export_csv_warn_and_continue() {
+    // The canned JSON interchange: one atomic tag with an alarm (the
+    // alarms key has NO legacy column — the reported drop).
+    let payload = serde_json::json!([
+        {"name": "T1", "tagType": "AtomicTag", "dataType": "Int4", "value": 42,
+         "alarms": [{"name": "Hi", "priority": 3}]}
+    ]);
+    let export_data = serde_json::json!({
+        "payload": serde_json::to_string(&payload).expect("serializes")
+    });
+    let subtrees: Vec<Value> = serde_json::from_value(payload).expect("subtrees");
+    let expected =
+        ignition_core::actions::tags::generate_legacy_csv(&subtrees).expect("generator runs");
+    assert!(
+        !expected.dropped_keys.is_empty(),
+        "fixture premise: alarms dropped"
+    );
+
+    let (_dir, config) = isolated_config();
+
+    // File mode: the artifact line names the format; the warning
+    // names the dropped fields on stderr; the file bytes match the
+    // generator EXACTLY (no added trailing newline).
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server, "exportTags", export_data.clone()).await;
+    write_profile_config(&config, &server.uri());
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let out = ign_stdin(
+        &config,
+        &server.uri(),
+        &["tags", "export", "[p5e2e]P5", "--format", "csv"],
+        "",
+        Some(cwd.path()),
+    );
+    assert!(
+        out.status.success(),
+        "warn-and-continue: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+exported 1 path(s) → P5.csv (csv, 1 tag(s))
+"#]],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: csv export dropped field(s): alarms"),
+        "the drop is named: {stderr}"
+    );
+    let written = std::fs::read(cwd.path().join("P5.csv")).expect("csv file written");
+    assert_eq!(
+        written, expected.csv,
+        "file bytes == generate_legacy_csv output, byte for byte"
+    );
+
+    // Stdout mode (`-o -`): raw generator bytes in EVERY mode — even
+    // --compact prints no envelope (there is none in stdout mode);
+    // json-mode stderr stays prose-free.
+    let server_stdout = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server_stdout, "exportTags", export_data.clone()).await;
+    let out = ign(
+        &config,
+        &server_stdout.uri(),
+        &[
+            "tags",
+            "export",
+            "[p5e2e]P5",
+            "--format",
+            "csv",
+            "-o",
+            "-",
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, expected.csv,
+        "stdout bytes == generate_legacy_csv output, byte for byte"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("warning: csv export dropped"),
+        "json mode: no prose warnings (envelope-only): {stderr}"
+    );
+
+    // File mode --compact: the envelope (stdout in json modes) carries
+    // the structured twin of the warning — data.loss_report.
+    let server_env = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server_env, "exportTags", export_data).await;
+    let cwd_env = tempfile::tempdir().expect("tempdir");
+    let out = ign_stdin(
+        &config,
+        &server_env.uri(),
+        &[
+            "tags",
+            "export",
+            "[p5e2e]P5",
+            "--format",
+            "csv",
+            "--compact",
+        ],
+        "",
+        Some(cwd_env.path()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = stdout_envelope(&out);
+    assert_eq!(envelope["data"]["loss_report"]["format"], "csv");
+    assert_eq!(envelope["data"]["loss_report"]["rows"], 1);
+    assert_eq!(envelope["data"]["loss_report"]["dropped_keys"][0], "alarms");
+}
+
+/// XML export raw bytes: `-o -` prints the decoded gateway payload
+/// EXACTLY (byte assert — CRLF/no-declaration/trailing-CRLF intact,
+/// no added trailing newline, no envelope even under --compact);
+/// file mode writes the same bytes with NO trailing newline; human
+/// stdout mode adds the artifact summary on STDERR only.
+#[tokio::test]
+async fn tags_export_xml_raw_bytes() {
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(CANNED_XML);
+    let export_data = serde_json::json!({ "payload_b64": payload_b64 });
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    // Stdout mode: byte-exact passthrough in every mode.
+    let server_stdout = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server_stdout, "exportTags", export_data.clone()).await;
+    let out = ign(
+        &config,
+        &server_stdout.uri(),
+        &[
+            "tags",
+            "export",
+            "[p5e2e]P5",
+            "--format",
+            "xml",
+            "-o",
+            "-",
+            "--compact",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout,
+        CANNED_XML.as_bytes(),
+        "stdout == the decoded gateway payload, byte for byte (no trailing newline added)"
+    );
+
+    // Human stdout mode: raw bytes on stdout; the summary on stderr.
+    let server_human = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server_human, "exportTags", export_data.clone()).await;
+    let out = ign(
+        &config,
+        &server_human.uri(),
+        &["tags", "export", "[p5e2e]P5", "--format", "xml", "-o", "-"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, CANNED_XML.as_bytes());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exported 1 path(s) → stdout (xml, 1 tag(s))"),
+        "human artifact summary on stderr: {stderr}"
+    );
+
+    // File mode: NO trailing newline beyond the gateway's own
+    // trailing CRLF; the artifact line names the format.
+    let server_file = wiremock::MockServer::start().await;
+    mount_tagconfig_action(&server_file, "exportTags", export_data).await;
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let out = ign_stdin(
+        &config,
+        &server_file.uri(),
+        &["tags", "export", "[p5e2e]P5", "--format", "xml"],
+        "",
+        Some(cwd.path()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written = std::fs::read(cwd.path().join("P5.xml")).expect("default .xml file");
+    assert_eq!(written, CANNED_XML.as_bytes(), "file bytes verbatim");
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+exported 1 path(s) → P5.xml (xml, 1 tag(s))
+"#]],
     );
 }

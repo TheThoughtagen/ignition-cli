@@ -136,3 +136,77 @@ fn human_stdout_is_line_pure_under_max_diagnostics() {
         "expected the unknown-key warning on stderr (noise precondition): {stderr}"
     );
 }
+
+/// 11-05 TAGS-12 scenario: the loss-gate REFUSAL prose (multi-line,
+/// loss-report) must appear ONLY on stderr — byte-exact zero stdout
+/// under max diagnostics. The gate runs PRE-resolution, so no
+/// profile or gateway is needed: the refusal happens before any
+/// resolution work and stdout must carry nothing at all.
+#[test]
+fn tags_import_loss_prose_never_touches_stdout() {
+    let (_dir, mut cmd) = noisy_ign();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A gateway-export-shaped file (MinVersion root attr) — the
+    // xml_export_edited_only fact fires the gate.
+    let xml = dir.path().join("p5.xml");
+    std::fs::write(
+        &xml,
+        "<Tags MinVersion=\"8.0.0\" locale=\"en_US\">\r\n   <Tag name=\"T1\" type=\"AtomicTag\">\r\n      <Property name=\"valueSource\">memory</Property>\r\n   </Tag>\r\n</Tags>\r\n",
+    )
+    .expect("write xml fixture");
+    let output = cmd
+        .args([
+            "tags",
+            "import",
+            "--format",
+            "xml",
+            "--file",
+            xml.to_str().expect("utf-8 path"),
+            "--provider",
+            "p5import",
+        ])
+        .output()
+        .expect("spawn ign");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the gate refuses exit 2 pre-resolution"
+    );
+    assert_stdout_bytes(&output.stdout, b"", "loss-gate refusal");
+
+    // The prose really fired — on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("loss report (xml)") && stderr.contains("re-run with --yes"),
+        "expected the loss report prose on stderr: {stderr}"
+    );
+}
+
+/// 11-05 sibling: the stdout-mode raw export (`tags export --format
+/// xml -o -`) writes the payload bytes and NOTHING else to stdout —
+/// but the raw path needs a gateway, so this pins the failure-side
+/// purity instead: any xml/csv export ERROR (precondition refusal)
+/// leaves stdout byte-empty under noise, same invariant, zero wire.
+#[test]
+fn tags_export_error_keeps_stdout_byte_empty() {
+    let (_dir, mut cmd) = noisy_ign();
+    let output = cmd
+        .args([
+            "tags",
+            "export",
+            "[default]P5",
+            "--format",
+            "xml",
+            "-o",
+            "-",
+        ])
+        .output()
+        .expect("spawn ign");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "no gateway configured — must refuse"
+    );
+    assert_stdout_bytes(&output.stdout, b"", "xml export refusal");
+}
