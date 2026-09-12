@@ -42,8 +42,9 @@ pub mod codes {
 
 /// One advisory loss finding: a stable machine code (see [`codes`]) plus a
 /// human-readable detail line (the report content 11-05 renders to stderr and
-/// embeds as `data.loss_report`).
-#[derive(Debug, Clone, PartialEq)]
+/// embeds as `data.loss_report`). `Serialize` lets facts ride the import
+/// result envelope additively (11-04 `TagsImportResult.loss_facts`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LossFact {
     pub code: &'static str,
     pub detail: String,

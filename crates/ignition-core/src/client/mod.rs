@@ -215,6 +215,27 @@ pub trait GatewayApi: Send + Sync {
         body: &serde_json::Value,
         extra_headers: &[(&str, &str)],
     ) -> Result<serde_json::Value, CoreError>;
+    /// POST the route action with a PER-REQUEST timeout override —
+    /// the large-payload escape hatch (the `get_bytes`
+    /// `RequestBuilder::timeout` pattern, 02-04/09-05): the 30 s
+    /// client default would truncate the Phase-11 bulk exportTags
+    /// transfer (research Pitfall 6), so the bulk arms override with
+    /// [`crate::client::tags::TAGS_EXPORT_TIMEOUT`]. Default body =
+    /// the plain call — test doubles and any impl without an
+    /// override path ride the client default (the override only
+    /// lengthens the ceiling; request/response semantics are the
+    /// same classify + envelope parse).
+    async fn webdev_route_call_with_timeout(
+        &self,
+        project: &str,
+        route: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&str, &str)],
+        _timeout: Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.webdev_route_call(project, route, body, extra_headers)
+            .await
+    }
     /// POST the route's `{"action":"version"}` handshake and
     /// discriminate ([`webdev::RouteProbe`]): 200-body-ok →
     /// `Present{route_version}`, 405 → `Absent` (the live-proven 8.3
@@ -765,10 +786,16 @@ impl ReqwestGatewayApi {
         route: &str,
         body: &serde_json::Value,
         extra_headers: &[(&str, &str)],
+        timeout: Option<Duration>,
     ) -> Result<(String, reqwest::Response), CoreError> {
         let path = webdev::route_url(project, route);
         let url = self.url_for(&path);
         let mut request = self.client.post(url.clone()).json(body);
+        if let Some(t) = timeout {
+            // Per-request override WITHOUT a second client — the
+            // RequestBuilder::timeout pattern (02-04/09-05).
+            request = request.timeout(t);
+        }
         for (name, value) in extra_headers {
             request = request.header(*name, *value);
         }
@@ -1086,7 +1113,38 @@ impl GatewayApi for ReqwestGatewayApi {
         // `status`, so denials ride HTTP 200 and the body verdict is
         // the ONLY success oracle (never the status line alone).
         let (url, response) = self
-            .webdev_post_raw(project, route, body, extra_headers)
+            .webdev_post_raw(project, route, body, extra_headers, None)
+            .await?;
+        let response = classify::classify(response, &url, false).await?;
+        let text = response.text().await.unwrap_or_default();
+        match webdev::parse_route_body(&text)? {
+            RouteBody::Ok(data) => Ok(data),
+            RouteBody::Denied {
+                code,
+                message,
+                traceback,
+            } => Err(webdev::denial_to_error(
+                &code,
+                &message,
+                traceback.as_deref(),
+                url,
+            )),
+        }
+    }
+
+    async fn webdev_route_call_with_timeout(
+        &self,
+        project: &str,
+        route: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        // The SAME classify + envelope-parse tail as
+        // `webdev_route_call` — the ONLY delta is the per-request
+        // ceiling (behavior-identical request semantics).
+        let (url, response) = self
+            .webdev_post_raw(project, route, body, extra_headers, Some(timeout))
             .await?;
         let response = classify::classify(response, &url, false).await?;
         let text = response.text().await.unwrap_or_default();
@@ -1121,6 +1179,7 @@ impl GatewayApi for ReqwestGatewayApi {
                 route,
                 &serde_json::json!({"action": "version"}),
                 extra_headers,
+                None,
             )
             .await?;
         let status = response.status();

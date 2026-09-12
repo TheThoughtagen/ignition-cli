@@ -1509,6 +1509,7 @@ fn accept_tags_form(state: &mut AppState, value: &str) {
                         workers::watch::TAGS_PROJECT,
                         std::slice::from_ref(&path),
                         Some(&out),
+                        ignition_core::actions::tags::ExportFormat::Json,
                     )
                     .await
                 });
@@ -1544,8 +1545,9 @@ fn accept_tags_form(state: &mut AppState, value: &str) {
                             &*client,
                             workers::watch::TAGS_PROJECT,
                             &provider,
-                            payload,
+                            &serde_json::to_vec(&payload).expect("Value serializes"),
                             ignition_core::actions::projects::CollisionPolicy::Abort,
+                            ignition_core::actions::tags::ImportFormat::Json,
                         )
                         .await
                     });
@@ -2805,8 +2807,9 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
                         &*client,
                         workers::watch::TAGS_PROJECT,
                         &provider,
-                        payload,
+                        &serde_json::to_vec(&payload).expect("Value serializes"),
                         ignition_core::actions::projects::CollisionPolicy::Overwrite,
+                        ignition_core::actions::tags::ImportFormat::Json,
                     )
                     .await
                 });

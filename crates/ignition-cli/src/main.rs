@@ -1493,6 +1493,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     .await
                     .map(ActionOutput::TagsUdtDef),
                 (TagsCommand::Export { paths, project, .. }, Ok(api)) => {
+                    // 11-04: the format param rides core now; the
+                    // clap --format wiring (json default) lands in
+                    // 11-05's contract layer.
                     actions::tags::tags_export(
                         &*api,
                         project,
@@ -1501,6 +1504,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             .as_ref()
                             .expect("resolved pre-resolution")
                             .as_deref(),
+                        actions::tags::ExportFormat::Json,
                     )
                     .await
                     .map(ActionOutput::TagsExport)
@@ -1513,15 +1517,23 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         ..
                     },
                     Ok(api),
-                ) => actions::tags::tags_import(
-                    &*api,
-                    project,
-                    provider,
-                    json_input.expect("parsed pre-resolution"),
-                    (*collision_policy).into(),
-                )
-                .await
-                .map(ActionOutput::TagsImport),
+                ) => {
+                    // 11-04: core reads RAW BYTES (the xml/csv
+                    // passthrough signature); the raw stdin/file
+                    // dispatch rework is 11-05's — the parsed Value
+                    // re-serializes value-identically.
+                    let parsed = json_input.expect("parsed pre-resolution");
+                    actions::tags::tags_import(
+                        &*api,
+                        project,
+                        provider,
+                        &serde_json::to_vec(&parsed).expect("parsed Value serializes"),
+                        (*collision_policy).into(),
+                        actions::tags::ImportFormat::Json,
+                    )
+                    .await
+                    .map(ActionOutput::TagsImport)
+                }
                 (
                     TagsCommand::Alarms(TagsAlarmsCommand::Active {
                         source,

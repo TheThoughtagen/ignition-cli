@@ -41,6 +41,11 @@ quick-xml = "0.41"
 # generator) — hand-rolled quoting is the CAPTURED failure mode (probe 5:
 # comma-in-FormatString silently shifted every later column).
 csv = "1"
+# Phase 11 (11-04): base64 is the byte-faithful carrier through the JSON
+# envelope — decode(payload_b64)/encode(file_b64) is the ONLY transformation
+# in the transfer path, and it is byte-exact by construction (research
+# Pattern 1; the Jython side already used stdlib base64 in 11-02).
+base64 = "0.22"
 # Phase 6 (TUI): ratatui floor-pinned at 0.30.2 — 0.30.1 bumped MSRV 1.86→1.88
 # in a PATCH release, so patch drift can move MSRV; the floor rides the
 # 1.88-MSRV release and CI (stable) catches future bumps. crossterm takes the

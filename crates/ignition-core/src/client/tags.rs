@@ -52,6 +52,13 @@ use crate::client::projects::encode_segment;
 pub(crate) const TAG_PROVIDERS_LIST_PATH: &str =
     "/data/api/v1/resources/list/ignition/tag-provider";
 
+/// Per-request ceiling for the Phase-11 bulk `exportTags` transfer —
+/// the 09-05 [`BUNDLE_DOWNLOAD_TIMEOUT`] pattern (research Pitfall 6:
+/// the 30 s client default would truncate large exports). The bulk
+/// `importTagsFile` call shares it (the same one-request envelope,
+/// opposite direction). Pinned by unit test at birth.
+pub const TAGS_EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// POST path — create tag providers (the body is a JSON ARRAY of
 /// create records; live-proven shape).
 pub(crate) const TAG_PROVIDERS_CREATE_PATH: &str = "/data/api/v1/resources/ignition/tag-provider";
@@ -170,7 +177,17 @@ pub struct BrowseEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowseEntry, TagProviderCreate, TagProviderRecord};
+    use std::time::Duration;
+
+    use super::{BrowseEntry, TAGS_EXPORT_TIMEOUT, TagProviderCreate, TagProviderRecord};
+
+    /// Birth pin (the 09-05 BUNDLE_DOWNLOAD_TIMEOUT pattern): the
+    /// bulk-transfer override is exactly 300 s — the constant IS the
+    /// contract, never a silent drift.
+    #[test]
+    fn tags_export_timeout_is_pinned_at_300s() {
+        assert_eq!(TAGS_EXPORT_TIMEOUT, Duration::from_secs(300));
+    }
 
     /// A plausible provider list item parses with tagCount/health
     /// passthrough and the signature absent (list records) vs

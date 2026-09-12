@@ -553,7 +553,15 @@ async fn config_get_refuses_routes_not_deployed_zero_tagconfig_calls() {
 // ---- Task 2 (05-05, TAGS-06/09): UDTs + export/import ----
 
 use ignition_core::actions::projects::CollisionPolicy;
-use ignition_core::actions::tags::{tags_export, tags_import, tags_udt_def, tags_udt_types};
+use ignition_core::actions::tags::{
+    ExportFormat, ImportFormat, tags_export, tags_import, tags_udt_def, tags_udt_types,
+};
+
+/// The json-arg bridge for the byte-based import signature (the same
+/// value a CLI-side `--file` read produces).
+fn json_bytes(value: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&value).expect("Value serializes")
+}
 
 /// UDT pins: `listUDTTypes` body + row mapping, `getUDTDefinition`
 /// body + the stringified re-parse applied to the definition.
@@ -656,9 +664,15 @@ async fn export_parses_the_payload_and_writes_the_file() {
     let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("p5.json");
-    let result = tags_export(&api, "ign-cli", &["[p5e2e]P5".to_string()], Some(&out))
-        .await
-        .expect("export through the real client");
+    let result = tags_export(
+        &api,
+        "ign-cli",
+        &["[p5e2e]P5".to_string()],
+        Some(&out),
+        ExportFormat::Json,
+    )
+    .await
+    .expect("export through the real client");
     assert_eq!(result.tag_count, 1);
     let written: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out).expect("file written"))
@@ -709,8 +723,9 @@ async fn import_abort_refuses_collision_with_zero_configure_writes() {
         &api,
         "ign-cli",
         "p5import",
-        serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}]),
+        &json_bytes(serde_json::json!([{"name": "T1", "tagType": "AtomicTag"}])),
         CollisionPolicy::Abort,
+        ImportFormat::Json,
     )
     .await
     .expect_err("collision refuses before any write");
@@ -769,12 +784,14 @@ async fn import_overwrite_pins_configure_body_without_precheck() {
         &api,
         "ign-cli",
         "p5import",
-        payload,
+        &json_bytes(payload),
         CollisionPolicy::Overwrite,
+        ImportFormat::Json,
     )
     .await
     .expect("overwrite imports through the real client");
     assert_eq!(result.collision_policy, "overwrite");
+    assert_eq!(result.format, "json");
     assert_eq!(guard.received_requests().await.len(), 1);
     assert_eq!(browse_guard.received_requests().await.len(), 0);
 }
@@ -1207,5 +1224,107 @@ async fn import_tags_file_invalid_policy_rides_the_route_error_contract() {
     assert!(
         err.to_string().contains("invalid_collision_policy"),
         "the route's code rides the verbatim contract: {err}"
+    );
+}
+
+// ---- 11-04 Task 1: the ACTION-layer xml export (raw-byte passthrough) ----
+//
+// The decoded canned XML — byte-for-byte the 11-01 Probe-1b constants
+// (CRLF line endings, 3-space indent, NO <?xml declaration, trailing
+// CRLF). Byte equality of decode(payload_b64) against THIS string is
+// the transport-fidelity assertion (base64 decode is exact by
+// construction, so string equality ⇔ byte equality here).
+const CANNED_XML: &str = "<Tags MinVersion=\"8.0.0\" locale=\"en_US\">\r\n   <Tag name=\"T1\" type=\"AtomicTag\">\r\n      <Property name=\"valueSource\">memory</Property>\r\n      <Property name=\"value\">42</Property>\r\n   </Tag>\r\n</Tags>\r\n";
+
+/// THE xml export action pin: the recorded request carries
+/// `format:"xml"` + paths, and the action's decoded payload equals
+/// the canned XML bytes EXACTLY (the transport-fidelity seam — zero
+/// parse/normalize/re-serialize between the envelope and the caller).
+#[tokio::test]
+async fn export_xml_action_decodes_gateway_bytes_unchanged() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "exportTags",
+            "paths": ["[default]P11Seed"],
+            "format": "xml"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"payload_b64": CANNED_XML_B64, "format": "xml"}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_export(
+        &api,
+        "ign-cli",
+        &["[default]P11Seed".to_string()],
+        None,
+        ExportFormat::Xml,
+    )
+    .await
+    .expect("xml export through the real client");
+    assert_eq!(result.format, "xml");
+    assert_eq!(result.tag_count, 1, "the tally rides the 11-03 scan");
+    assert_eq!(
+        result.raw.as_deref(),
+        Some(CANNED_XML),
+        "decode(payload_b64) == canned bytes EXACTLY (CRLF + trailing CRLF intact)"
+    );
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE xml file-mode pin: the written file IS the gateway bytes —
+/// NO trailing newline appended (research Pitfall 3: the sha256
+/// oracle breaks otherwise; json mode's trailing newline is json-
+/// mode-only).
+#[tokio::test]
+async fn export_xml_file_mode_writes_gateway_bytes_with_no_trailing_newline() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "exportTags", "format": "xml"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"payload_b64": CANNED_XML_B64, "format": "xml"}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("seed.xml");
+    let result = tags_export(
+        &api,
+        "ign-cli",
+        &["[default]P11Seed".to_string()],
+        Some(&out),
+        ExportFormat::Xml,
+    )
+    .await
+    .expect("xml file export through the real client");
+    assert_eq!(result.file.as_deref(), Some(out.to_str().unwrap()));
+    let written = std::fs::read(&out).expect("file written");
+    assert_eq!(
+        written,
+        CANNED_XML.as_bytes(),
+        "file bytes == gateway bytes — no transformation, no trailing newline"
     );
 }

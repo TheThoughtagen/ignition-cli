@@ -1517,6 +1517,7 @@ name = "ignition-core"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "csv",
  "directories",
  "futures-util",
