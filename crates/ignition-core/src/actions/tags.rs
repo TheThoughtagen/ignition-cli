@@ -2174,6 +2174,573 @@ async fn tags_import_bulk(
     })
 }
 
+// ---- 11-04 Task 3: generate_legacy_csv (the ONE sanctioned CLI-side conversion) ----
+//
+// The gateway cannot export CSV (official docs: "Ignition does not
+// export tags to a CSV format") — this generator is CLI-generated
+// from the gateway's JSON interchange and is DOCUMENTED LOSSY. The
+// fidelity claims below match 11-LIVE-CAPTURES.md §Probe 5 (the
+// CSV-Coverage table) exactly; where the plan sketch and the
+// captures disagreed, the CAPTURES WIN (reconciliation clause):
+// non-empty `Path` cells NPE the importer (all-or-nothing), so every
+// row carries an EMPTY Path and folder nesting is flattened and
+// REPORTED, never silently lost.
+
+/// The legacy CSV header — the official docs sample columns VERBATIM
+/// (11-RESEARCH.md §Legacy CSV skeleton; the docs page's own sample
+/// is identical byte-for-byte). 48 columns: the docs' table itself
+/// carries `SQLBindingPollRate`/`Permissions` that the gateway's
+/// PROP_COLUMNS does not (11-01 probe 5) — they are emitted EMPTY
+/// (the grammar accepts any header subset; the docs sample IS the
+/// generation target).
+pub const LEGACY_CSV_HEADER: [&str; 48] = [
+    "Path",
+    "Name",
+    "Owner",
+    "TagType",
+    "DataType",
+    "Value",
+    "Enabled",
+    "AccessRights",
+    "OPCServer",
+    "OPCItemPath",
+    "ScanClass",
+    "DriverName",
+    "ScaleMode",
+    "RawLow",
+    "RawHigh",
+    "ScaledLow",
+    "ScaledHigh",
+    "ClampMode",
+    "ScaleFactor",
+    "Deadband",
+    "DeadbandMode",
+    "FormatString",
+    "EngUnit",
+    "EngLow",
+    "EngHigh",
+    "EngLimitMode",
+    "Tooltip",
+    "Documentation",
+    "ExpressionType",
+    "Expression",
+    "OPCWriteBackServer",
+    "OPCWriteBackItemPath",
+    "SQLBindingDatasource",
+    "HistoryEnabled",
+    "PrimaryHistoryProvider",
+    "HistoricalScanclass",
+    "HistoricalDeadband",
+    "HistoricalDeadbandMode",
+    "InterpolationMode",
+    "HistoryMaxAgeMode",
+    "HistoryMaxAge",
+    "HistoryTimestampSource",
+    "UDTParentType",
+    "PersistValue",
+    "SourceDataType",
+    "SourceTagPath",
+    "SQLBindingPollRate",
+    "Permissions",
+];
+
+/// What the legacy CSV generation produced and every field it
+/// dropped or coerced — 11-05 warns-and-continues truthfully from
+/// this report (the honesty core of the documented-lossy conversion).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CsvGenerationReport {
+    /// The RFC-4180 CSV bytes: 48-column docs header, the
+    /// `# version=1` marker row, then one row per emitted tag.
+    pub csv: Vec<u8>,
+    /// Emitted data-row count (marker/header excluded).
+    pub rows: usize,
+    /// Source JSON keys with NO legacy column, seen and dropped
+    /// (order-preserving, deduped): alarms, tagGroup, bindings, UDT
+    /// parameters, EngLow/EngHigh, ScanClass, HistoryMaxAge*, … —
+    /// the capture-proven silent-drop vocabulary.
+    pub dropped_keys: Vec<String>,
+    /// Human-readable coercion lines: numeric enum mappings, folder
+    /// flattening, UDT-type placeholders — every value that DID land
+    /// but transformed.
+    pub coerced: Vec<String>,
+}
+
+/// The docs' numeric DataType enum (0..9) — cross-checked against the
+/// live captures (`2`→Int4, `7`→String, 11-01 probe 5).
+fn legacy_data_type(name: &str) -> Option<&'static str> {
+    match name {
+        "Int1" => Some("0"),
+        "Int2" => Some("1"),
+        "Int4" | "Integer" => Some("2"),
+        "Int8" | "Long" => Some("3"),
+        "Float4" => Some("4"),
+        "Float8" | "Double" => Some("5"),
+        "Boolean" => Some("6"),
+        "String" => Some("7"),
+        "DateTime" | "Date" => Some("8"),
+        "DataSet" => Some("9"),
+        _ => None,
+    }
+}
+
+/// `(TagType, ExpressionType)` for an atomic tag's valueSource — the
+/// docs enum (0=OPC, 1=DB-per-ExpressionType, 2=Client) plus the
+/// capture-proven ExpressionType extension (`3`→named_query, 11-01
+/// probe 5).
+fn legacy_tag_type(value_source: Option<&str>) -> (&'static str, &'static str) {
+    match value_source {
+        Some("opc") => ("0", ""),
+        Some("expression") => ("1", "1"),
+        Some("query") | Some("db") => ("1", "2"),
+        Some("named_query") => ("1", "3"),
+        // memory is the TagType-1 default (capture: "1→memory"); an
+        // absent/unknown valueSource lands memory the same way.
+        _ => ("1", ""),
+    }
+}
+
+/// JSON boolean → the legacy sheet's TRUE/FALSE cell style.
+fn legacy_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "TRUE",
+        Some(false) => "FALSE",
+        None => "",
+    }
+}
+
+/// The JSON `value` cell — verbatim: strings as-is, numbers as-is,
+/// booleans in the legacy TRUE/FALSE style, null/absent → empty.
+fn legacy_value(tag: &serde_json::Value, key: &str) -> String {
+    let v = match tag.get(key) {
+        Some(v @ serde_json::Value::String(_)) => return v.as_str().unwrap().to_string(),
+        Some(v @ serde_json::Value::Number(_)) => return v.to_string(),
+        Some(v @ serde_json::Value::Bool(_)) => v,
+        Some(serde_json::Value::Null) | None => {
+            if key == "value" {
+                return legacy_value(tag, "defaultValue");
+            }
+            return String::new();
+        }
+        other => match other {
+            Some(v) => v,
+            None => return String::new(),
+        },
+    };
+    match v.as_bool() {
+        Some(true) => "TRUE".to_string(),
+        Some(false) => "FALSE".to_string(),
+        _ => v.to_string(),
+    }
+}
+
+/// The keys the interchange carries that the legacy CSV CANNOT
+/// express — everything outside the mapped set lands here (the
+/// §CSV-Coverage dropped vocabulary).
+fn record_dropped(dropped: &mut Vec<String>, tag: &serde_json::Value, known: &[&str]) {
+    if let Some(map) = tag.as_object() {
+        for key in map.keys() {
+            if !known.contains(&key.as_str()) && !dropped.iter().any(|k| k == key) {
+                dropped.push(key.clone());
+            }
+        }
+    }
+}
+
+/// The keys the interchange carries that have a legacy landing —
+/// everything else is dropped AND reported (the §CSV-Coverage
+/// dropped vocabulary: alarms, tagGroup, bindings, parameters,
+/// EngLow/EngHigh, ScanClass, HistoryMaxAge*, …).
+const LEGACY_MAPPED_KEYS: &[&str] = &[
+    "name",
+    "tagType",
+    "valueSource",
+    "dataType",
+    "value",
+    "defaultValue",
+    "enabled",
+    "accessRights",
+    "opcServer",
+    "opcItemPath",
+    "DriverName",
+    "driverName",
+    "scaleMode",
+    "rawLow",
+    "rawHigh",
+    "scaledLow",
+    "scaledHigh",
+    "clampMode",
+    "scaleFactor",
+    "deadband",
+    "formatString",
+    "engUnit",
+    "tooltip",
+    "documentation",
+    "expression",
+    "query",
+    "namedQuery",
+    "historyEnabled",
+    "historyProvider",
+    "historyTagGroup",
+    "historicalDeadband",
+    "historicalDeadbandMode",
+    "historicalDeadbandStyle",
+    "historyTimestampSource",
+    "HistoryTimestampSource",
+    "udtParentType",
+    "persistValue",
+    "sourceTagPath",
+];
+
+/// Mutable generator context (the recursive emitter's state).
+struct LegacyCsvWriter {
+    writer: csv::Writer<Vec<u8>>,
+    rows: usize,
+    dropped_keys: Vec<String>,
+    coerced: Vec<String>,
+}
+
+/// Depth-first emitter: one row per tag (folder rows recurse into
+/// their children after emitting), provider-shaped wrappers recurse
+/// without emitting. Every drop/coercion lands in the report.
+fn emit_tag_row(tag: &serde_json::Value, out: &mut LegacyCsvWriter) -> Result<(), CoreError> {
+    let tag_type = tag.get("tagType").and_then(serde_json::Value::as_str);
+    let name = tag
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // Provider-shaped wrapper (empty name + children, live-proven
+    // 05-06): recurse, emit nothing.
+    if name.is_empty() && tag.get("tags").is_some_and(serde_json::Value::is_array) {
+        for child in tag["tags"].as_array().unwrap() {
+            emit_tag_row(child, out)?;
+        }
+        return Ok(());
+    }
+    let idx_of = |column: &str| {
+        LEGACY_CSV_HEADER
+            .iter()
+            .position(|header| *header == column)
+    };
+    record_dropped(&mut out.dropped_keys, tag, LEGACY_MAPPED_KEYS);
+    let mut row: Vec<String> = LEGACY_CSV_HEADER.iter().map(|_| String::new()).collect();
+    if let Some(i) = idx_of("Name") {
+        row[i] = name.to_string();
+    }
+    match tag_type {
+        Some("Folder") => {
+            // Capture-proven reconciliation: the folder ROW emits
+            // (TagType 6) but nesting does NOT ride the Path column
+            // (any non-empty Path NPEs the importer wholesale, probe
+            // 5) — children flatten to the same level, reported.
+            if let Some(i) = idx_of("TagType") {
+                row[i] = "6".to_string();
+            }
+            let note = "folder nesting flattened (empty Path cells — the legacy importer NPEs \
+                        on any non-empty Path, 11-LIVE-CAPTURES §Probe 5)";
+            if !out.coerced.iter().any(|c| c == note) {
+                out.coerced.push(note.to_string());
+            }
+        }
+        Some("UdtType") => {
+            // The legacy format CANNOT express a UDT type definition
+            // (probe 5: no definition column exists — only instances
+            // via UDTParentType). The plan's `_types_/` Path sketch
+            // was reconciled toward the captures: the row emits with
+            // an EMPTY Path (a non-empty one NPEs the import) as a
+            // TagType-13 placeholder; members/parameters drop.
+            if let Some(i) = idx_of("TagType") {
+                row[i] = "13".to_string();
+            }
+            let note = format!(
+                "UDT type definition '{name}' is inexpressible in legacy CSV — emitted as a \
+                 TagType 13 placeholder row (members/parameters dropped)"
+            );
+            if !out.coerced.iter().any(|c| c == &note) {
+                out.coerced.push(note);
+            }
+        }
+        Some("UdtInstance") => {
+            if let Some(i) = idx_of("TagType") {
+                row[i] = "10".to_string();
+            }
+        }
+        Some(other) => {
+            // AtomicTag (and any future atomic-class type): the
+            // numeric TagType/ExpressionType ride the valueSource
+            // mapping.
+            let value_source = tag.get("valueSource").and_then(serde_json::Value::as_str);
+            let (tag_type_num, expression_type_num) = legacy_tag_type(value_source);
+            if let Some(i) = idx_of("TagType") {
+                row[i] = tag_type_num.to_string();
+            }
+            if let Some(i) = idx_of("ExpressionType") {
+                row[i] = expression_type_num.to_string();
+            }
+            if let Some(i) = idx_of("Expression") {
+                row[i] = match value_source {
+                    Some("expression") => tag
+                        .get("expression")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    // ET 2's cell lands as `query` (probe 5) — db and
+                    // query both ride it.
+                    Some("query") | Some("db") => tag
+                        .get("query")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    Some("named_query") => tag
+                        .get("namedQuery")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                };
+            }
+            if let Some(source) = value_source {
+                let note = format!(
+                    "valueSource '{source}' (tag '{name}') → TagType {tag_type_num} / \
+                     ExpressionType {expression_type_num}"
+                );
+                if !out.coerced.iter().any(|c| c == &note) {
+                    out.coerced.push(note);
+                }
+            }
+            if other != "AtomicTag" {
+                let note =
+                    format!("tagType '{other}' (tag '{name}') emitted as an atomic-class row");
+                if !out.coerced.iter().any(|c| c == &note) {
+                    out.coerced.push(note);
+                }
+            }
+            if let (Some(i), Some(dt)) = (
+                idx_of("DataType"),
+                tag.get("dataType").and_then(serde_json::Value::as_str),
+            ) {
+                match legacy_data_type(dt) {
+                    Some(numeric) => row[i] = numeric.to_string(),
+                    None => {
+                        let note = format!(
+                            "dataType '{dt}' (tag '{name}') has no legacy enum — cell left empty"
+                        );
+                        if !out.coerced.iter().any(|c| c == &note) {
+                            out.coerced.push(note);
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            let note = format!("tag '{name}' carries no tagType — emitted as a bare Name row");
+            if !out.coerced.iter().any(|c| c == &note) {
+                out.coerced.push(note);
+            }
+        }
+    }
+    // The string/numeric columns with capture-proven landings
+    // (§CSV-Coverage LANDED set) — verbatim.
+    const COLUMN_KEYS: [(&str, &str); 22] = [
+        ("OPCServer", "opcServer"),
+        ("OPCItemPath", "opcItemPath"),
+        ("DriverName", "DriverName"),
+        ("RawLow", "rawLow"),
+        ("RawHigh", "rawHigh"),
+        ("ScaledLow", "scaledLow"),
+        ("ScaledHigh", "scaledHigh"),
+        ("ScaleFactor", "scaleFactor"),
+        ("Deadband", "deadband"),
+        ("FormatString", "formatString"),
+        ("EngUnit", "engUnit"),
+        ("Tooltip", "tooltip"),
+        ("Documentation", "documentation"),
+        ("PrimaryHistoryProvider", "historyProvider"),
+        ("HistoricalScanclass", "historyTagGroup"),
+        ("HistoricalDeadband", "historicalDeadband"),
+        ("UDTParentType", "udtParentType"),
+        ("SourceTagPath", "sourceTagPath"),
+        // Coverage UNTESTED → emitted EMPTY unless the interchange
+        // carries a value (honest best-effort, never invented).
+        ("OPCWriteBackServer", "opcWriteBackServer"),
+        ("OPCWriteBackItemPath", "opcWriteBackItemPath"),
+        ("SQLBindingDatasource", "sqlBindingDatasource"),
+        ("DeadbandMode", "deadbandMode"),
+    ];
+    for (column, key) in COLUMN_KEYS {
+        if let (Some(i), Some(value)) = (idx_of(column), tag.get(key)) {
+            match value {
+                serde_json::Value::String(s) => row[i] = s.clone(),
+                serde_json::Value::Number(n) => row[i] = n.to_string(),
+                _ => {}
+            }
+        }
+    }
+    if let (Some(i), Some(numeric)) = (
+        idx_of("HistoryTimestampSource"),
+        tag.get("historyTimestampSource")
+            .or_else(|| tag.get("HistoryTimestampSource"))
+            .and_then(serde_json::Value::as_i64),
+    ) {
+        // Coverage: LANDED verbatim NUMERIC (probe 5).
+        row[i] = numeric.to_string();
+    }
+    // The enum-coerced columns (docs tables; capture-proven pairs
+    // cross-checked).
+    type EnumTable = &'static [(&'static str, &'static str)];
+    const ENUM_TABLES: [(&str, &str, EnumTable); 3] = [
+        (
+            "ScaleMode",
+            "scaleMode",
+            &[
+                ("Off", "0"),
+                ("Linear", "1"),
+                ("Square Root", "2"),
+                ("SquareRoot", "2"),
+                ("Exponential Filter", "3"),
+            ],
+        ),
+        (
+            "ClampMode",
+            "clampMode",
+            &[
+                ("Clamp_None", "0"),
+                ("Clamp_Low", "1"),
+                ("Clamp_High", "2"),
+                ("Clamp_Both", "3"),
+                ("None", "0"),
+                ("Low", "1"),
+                ("High", "2"),
+                ("Both", "3"),
+            ],
+        ),
+        (
+            "HistoricalDeadbandMode",
+            "historicalDeadbandMode",
+            &[("Absolute", "0"), ("Percent", "1")],
+        ),
+    ];
+    for (column, key, table) in ENUM_TABLES {
+        if let (Some(i), Some(value)) = (
+            idx_of(column),
+            tag.get(key).and_then(serde_json::Value::as_str),
+        ) {
+            match table.iter().find(|(name, _)| *name == value) {
+                Some((_, numeric)) => row[i] = numeric.to_string(),
+                None => {
+                    let note = format!(
+                        "{column} '{value}' (tag '{name}') has no legacy enum — cell left empty"
+                    );
+                    if !out.coerced.iter().any(|c| c == &note) {
+                        out.coerced.push(note);
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(i), Some(style)) = (
+        idx_of("InterpolationMode"),
+        tag.get("historicalDeadbandStyle")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        // Capture-proven: `1` lands Analog (§CSV-Coverage) — the
+        // docs' own table only lists 0/2/3, the capture wins.
+        row[i] = match style {
+            "Discrete" => "0".to_string(),
+            "Analog" => "1".to_string(),
+            "Analog_Compressed" => "3".to_string(),
+            _ => String::new(),
+        };
+    }
+    // Booleans + the verbatim Value cell.
+    if let Some(i) = idx_of("Value") {
+        row[i] = legacy_value(tag, "value");
+    }
+    if let Some(i) = idx_of("Enabled") {
+        // Absent `enabled` is the gateway default TRUE.
+        row[i] = match tag.get("enabled") {
+            Some(serde_json::Value::Bool(true)) => "TRUE".to_string(),
+            Some(serde_json::Value::Bool(false)) => "FALSE".to_string(),
+            _ => "TRUE".to_string(),
+        };
+    }
+    if let Some(i) = idx_of("HistoryEnabled") {
+        row[i] = legacy_bool(
+            tag.get("historyEnabled")
+                .and_then(serde_json::Value::as_bool),
+        )
+        .to_string();
+    }
+    if let Some(i) = idx_of("PersistValue") {
+        row[i] =
+            legacy_bool(tag.get("persistValue").and_then(serde_json::Value::as_bool)).to_string();
+    }
+    if let Some(i) = idx_of("AccessRights") {
+        row[i] = tag
+            .get("accessRights")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Read_Write")
+            .to_string();
+    }
+    let row_refs: Vec<&str> = row.iter().map(String::as_str).collect();
+    out.writer
+        .write_record(&row_refs)
+        .map_err(|err| CoreError::Internal(format!("csv row write failed: {err}")))?;
+    out.rows += 1;
+    // Folder children flatten to the same level (empty Path cells).
+    if tag_type == Some("Folder")
+        && let Some(children) = tag.get("tags").and_then(serde_json::Value::as_array)
+    {
+        for child in children {
+            emit_tag_row(child, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Generate the legacy 48-column CSV (`# version=1` marker row,
+/// numeric enums) from the JSON interchange subtrees — PURE (no I/O,
+/// no gateway). Every drop or coercion is reported. The emitted
+/// `Path` cells are ALWAYS empty: the live captures prove any
+/// non-empty Path cell NPEs the gateway importer wholesale
+/// (11-LIVE-CAPTURES §Probe 5), so the plan's slash-prefixed-path
+/// sketch was reconciled toward the captures — folder nesting is
+/// flattened (folder ROWS still emit, TagType 6) and the loss is
+/// reported.
+pub fn generate_legacy_csv(
+    subtrees: &[serde_json::Value],
+) -> Result<CsvGenerationReport, CoreError> {
+    let mut writer = csv::WriterBuilder::new().from_writer(Vec::new());
+    writer
+        .write_record(LEGACY_CSV_HEADER)
+        .map_err(|err| CoreError::Internal(format!("csv header write failed: {err}")))?;
+    // The marker row: `# version=1` + the remaining empty cells —
+    // REQUIRED by the importer (missing → "Unknown CSV Format",
+    // probe 5).
+    let mut marker = vec![""; LEGACY_CSV_HEADER.len()];
+    marker[0] = "# version=1";
+    writer
+        .write_record(&marker)
+        .map_err(|err| CoreError::Internal(format!("csv marker write failed: {err}")))?;
+    let mut out = LegacyCsvWriter {
+        writer,
+        rows: 0,
+        dropped_keys: Vec::new(),
+        coerced: Vec::new(),
+    };
+    for subtree in subtrees {
+        emit_tag_row(subtree, &mut out)?;
+    }
+    let csv = out
+        .writer
+        .into_inner()
+        .map_err(|err| CoreError::Internal(format!("csv flush failed: {err}")))?;
+    Ok(CsvGenerationReport {
+        csv,
+        rows: out.rows,
+        dropped_keys: out.dropped_keys,
+        coerced: out.coerced,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::{

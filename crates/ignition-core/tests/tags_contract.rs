@@ -1615,3 +1615,179 @@ async fn import_xml_provider_root_refusal_surfaces_through_the_action() {
     assert_eq!(err.code(), "provider_root_unsupported");
     assert_eq!(err.exit_code(), 6);
 }
+
+// ---- 11-04 Task 3: generate_legacy_csv (the honest lossy conversion) ----
+
+use ignition_core::actions::tags::{LEGACY_CSV_HEADER, generate_legacy_csv};
+
+/// THE full-fixture generation pin: folder + memory + opc + expression
+/// + UDT type + instance (mirroring the probe-5 rig coverage) —
+///
+/// - numeric TagType/DataType/ExpressionType enums (integers, NEVER
+///   strings)
+/// - the `# version=1` marker row
+/// - folder rows with EMPTY Path cells (capture-wins: non-empty Path
+///   NPEs the importer)
+/// - the UDT-type TagType-13 placeholder
+/// - the instance's UDTParentType verbatim
+///
+/// Every drop/coercion rides the report.
+#[test]
+fn generate_legacy_csv_emits_marker_rowed_numeric_enum_rows_and_reports_losses() {
+    let subtrees = serde_json::json!([
+        {"name": "Motors", "tagType": "Folder", "tags": [
+            {"name": "T1", "tagType": "AtomicTag", "valueSource": "memory", "dataType": "Int4", "value": 42},
+            {"name": "T2", "tagType": "AtomicTag", "valueSource": "opc", "dataType": "Float8", "value": 3.5,
+             "opcServer": "Ignition OPC-UA Server", "opcItemPath": "[dev]a/b"},
+            {"name": "T3", "tagType": "AtomicTag", "valueSource": "expression", "expression": "1+1"}
+        ]},
+        {"name": "MotorType", "tagType": "UdtType", "tags": [
+            {"name": "Amps", "tagType": "AtomicTag"}
+        ]},
+        {"name": "M1", "tagType": "UdtInstance", "udtParentType": "[default]_types_/MotorType"}
+    ]);
+    let report = generate_legacy_csv(subtrees.as_array().unwrap()).expect("generates");
+    assert_eq!(
+        report.rows, 6,
+        "folder + 3 leaves + type placeholder + instance"
+    );
+
+    let text = String::from_utf8(report.csv.clone()).expect("utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 8, "header + marker + 6 rows");
+    assert_eq!(
+        lines[0],
+        LEGACY_CSV_HEADER.join(","),
+        "the header is the docs sample VERBATIM"
+    );
+    assert_eq!(
+        lines[1],
+        format!("# version=1{}", ",".repeat(47)),
+        "the marker row is required by the importer"
+    );
+    // Folder row: EMPTY Path (capture-wins), TagType 6.
+    assert!(
+        lines[2].starts_with(",Motors,,6,"),
+        "folder row: empty Path + TagType 6: {}",
+        lines[2]
+    );
+    // Memory leaf: TagType 1 (memory default), DataType 2 = Int4,
+    // Value verbatim, Enabled/AccessRights defaults.
+    assert!(
+        lines[3].starts_with(",T1,,1,2,42,TRUE,Read_Write"),
+        "memory tag row is numeric-enum + verbatim value: {}",
+        lines[3]
+    );
+    // OPC leaf: TagType 0, DataType 5 = Float8, OPC columns land.
+    let t2: Vec<&str> = lines[4].split(',').collect();
+    assert_eq!(t2[0], "", "Path empty");
+    assert_eq!(t2[1], "T2");
+    assert_eq!(t2[3], "0", "opc → TagType 0");
+    assert_eq!(t2[4], "5", "Float8 → DataType 5");
+    assert_eq!(t2[8], "Ignition OPC-UA Server");
+    assert_eq!(t2[9], "[dev]a/b");
+    // Expression leaf: TagType 1 + ExpressionType 1 + Expression cell.
+    let t3: Vec<&str> = lines[5].split(',').collect();
+    assert_eq!(t3[3], "1");
+    assert_eq!(t3[28], "1", "ExpressionType 1 = expression");
+    assert_eq!(t3[29], "1+1");
+    // UDT type placeholder: TagType 13, EMPTY Path (never `_types_/`).
+    assert!(
+        lines[6].starts_with(",MotorType,,13,"),
+        "the type row is a TagType-13 placeholder with empty Path: {}",
+        lines[6]
+    );
+    // Instance: TagType 10 + UDTParentType verbatim.
+    let m1: Vec<&str> = lines[7].split(',').collect();
+    assert_eq!(m1[1], "M1");
+    assert_eq!(m1[3], "10", "UdtInstance → TagType 10");
+    assert_eq!(
+        m1[42], "[default]_types_/MotorType",
+        "UDTParentType verbatim"
+    );
+
+    // The honesty core: drops and coercions are REPORTED.
+    assert!(
+        report.dropped_keys.iter().any(|key| key == "tags"),
+        "the UDT type's members are reported dropped: {:?}",
+        report.dropped_keys
+    );
+    assert!(
+        report
+            .coerced
+            .iter()
+            .any(|c| c.contains("folder nesting flattened")),
+        "the folder-flattening loss is reported: {:?}",
+        report.coerced
+    );
+    assert!(
+        report
+            .coerced
+            .iter()
+            .any(|c| c.contains("UDT type definition 'MotorType' is inexpressible")),
+        "the type-definition coercion is reported: {:?}",
+        report.coerced
+    );
+    assert!(
+        report
+            .coerced
+            .iter()
+            .any(|c| c.contains("valueSource 'opc'") && c.contains("TagType 0")),
+        "the numeric-enum coercion is reported: {:?}",
+        report.coerced
+    );
+}
+
+/// THE alarm-loss pin (the docs' "CSV format does not include support
+/// for alarm configurations", capture-proven silent drop): the
+/// generator surfaces it as a REPORTED drop, never silence.
+#[test]
+fn generate_legacy_csv_reports_dropped_alarms() {
+    let subtrees = serde_json::json!([
+        {"name": "Tank", "tagType": "AtomicTag", "valueSource": "opc",
+         "alarms": [{"name": "Low Amps", "priority": "High", "setpointA": 25}],
+         "tagGroup": "MyTagGroup", "engLow": 0, "engHigh": 100}
+    ]);
+    let report = generate_legacy_csv(subtrees.as_array().unwrap()).expect("generates");
+    for key in ["alarms", "tagGroup", "engLow", "engHigh"] {
+        assert!(
+            report.dropped_keys.iter().any(|k| k == key),
+            "'{key}' has no legacy column and MUST be reported: {:?}",
+            report.dropped_keys
+        );
+    }
+    // And the cells truly stayed empty.
+    let text = String::from_utf8(report.csv).expect("utf-8");
+    let row: Vec<&str> = text.lines().nth(2).unwrap().split(',').collect();
+    assert_eq!(
+        row[2], "",
+        "Owner empty (non-empty = Bad_Unsupported abort)"
+    );
+    assert_eq!(row[10], "", "ScanClass dropped (capture: lands nothing)");
+    assert_eq!(row[23], "", "EngLow dropped (capture: lands nothing)");
+}
+
+/// THE quoting pin (the captured hand-rolled failure): an embedded
+/// newline/quote Expression cell round-trips through the csv crate's
+/// RFC-4180 quoting byte-exactly.
+#[test]
+fn generate_legacy_csv_quotes_embedded_newlines_and_quotes() {
+    let tricky = "if(currentValue > 1,\n  \"high\",\n  \"low\")";
+    let subtrees = serde_json::json!([
+        {"name": "T1", "tagType": "AtomicTag", "valueSource": "expression", "expression": tricky}
+    ]);
+    let report = generate_legacy_csv(subtrees.as_array().unwrap()).expect("generates");
+    // Round-trip: the csv reader must restore the cell EXACTLY.
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(report.csv.as_slice());
+    let records: Vec<Vec<String>> = reader
+        .records()
+        .map(|r| r.expect("parses").into_iter().map(String::from).collect())
+        .collect();
+    assert_eq!(records.len(), 3, "header + marker + 1 row");
+    assert_eq!(
+        records[2][29], tricky,
+        "the Expression cell round-trips exactly"
+    );
+}
