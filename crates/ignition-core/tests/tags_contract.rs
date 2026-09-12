@@ -1328,3 +1328,290 @@ async fn export_xml_file_mode_writes_gateway_bytes_with_no_trailing_newline() {
         "file bytes == gateway bytes — no transformation, no trailing newline"
     );
 }
+
+// ---- 11-04 Task 2: the ACTION-layer importTagsFile (byte-faithful upload) ----
+//
+// REQUEST-pinning discipline (10-02): full-body body_json IS the
+// recorded-request assertion — any drift fails the match — plus
+// expect(1) + scoped guard counts for the zero-write proofs.
+
+/// THE importTagsFile action pin: input bytes ride `file_b64`
+/// VERBATIM (the round-trip proof — encode(decode(CANNED_XML_B64)) ==
+/// CANNED_XML_B64 by injectivity), basePath/collisionPolicy exactly
+/// `[{provider}]`/`a`, and the scan output feeds the result (names +
+/// facts — never a re-parse). The canned XML's MinVersion root attr
+/// fires the advisory `xml_export_edited_only` fact, which rides the
+/// result for 11-05's report.
+#[tokio::test]
+async fn import_xml_action_pins_file_b64_and_scan_fed_result() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    // Clean target: the abort pre-check browses (empty) before the
+    // import — the collision matrix itself is pinned separately.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p11target]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": []}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "importTagsFile",
+            "file_b64": CANNED_XML_B64,
+            "basePath": "[p11target]",
+            "collisionPolicy": "a"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_import(
+        &api,
+        "ign-cli",
+        "p11target",
+        CANNED_XML.as_bytes(),
+        CollisionPolicy::Abort,
+        ImportFormat::Xml,
+    )
+    .await
+    .expect("xml import through the real client");
+    assert_eq!(result.format, "xml");
+    assert_eq!(
+        result.top_level_names,
+        vec!["T1".to_string()],
+        "names come from the 11-03 scan — no re-parse"
+    );
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.collision_policy, "abort");
+    assert!(
+        result.loss_facts.iter().any(
+            |fact| fact.code == ignition_core::actions::tag_loss::codes::XML_EXPORT_EDITED_ONLY
+        ),
+        "the scan's advisory facts ride the result: {:?}",
+        result.loss_facts
+    );
+    assert!(result.failed.is_empty(), "clean import: no Bad_* elements");
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE csv arm pin: legacy CSV bytes ride the SAME importTagsFile
+/// body (basePath/policy verbatim), and the scan-derived top-level
+/// names come from `scan_csv` (empty Path ⇒ the row's own Name).
+#[tokio::test]
+async fn import_csv_action_pins_file_b64_and_csv_scan_names() {
+    // 8-cell docs-sample-shaped CSV (the scan is width-lenient).
+    let csv_input = "Path,Name,Owner,TagType,DataType,Value,Enabled,AccessRights\r\n\
+                     # version=1,,,,,,,,\r\n\
+                     ,T1,,1,7,42,TRUE,Read_Write\r\n";
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "action": "importTagsFile",
+            "file_b64": "UGF0aCxOYW1lLE93bmVyLFRhZ1R5cGUsRGF0YVR5cGUsVmFsdWUsRW5hYmxlZCxBY2Nlc3NSaWdodHMNCiMgdmVyc2lvbj0xLCwsLCwsLCwNCixUMSwsMSw3LDQyLFRSVUUsUmVhZF9Xcml0ZQ0K",
+            "basePath": "[p11target]",
+            "collisionPolicy": "o"
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_import(
+        &api,
+        "ign-cli",
+        "p11target",
+        csv_input.as_bytes(),
+        CollisionPolicy::Overwrite,
+        ImportFormat::Csv,
+    )
+    .await
+    .expect("csv import through the real client");
+    assert_eq!(result.format, "csv");
+    assert_eq!(
+        result.top_level_names,
+        vec!["T1".to_string()],
+        "csv scan names: empty Path ⇒ the row's own Name"
+    );
+    assert_eq!(result.imported, 1);
+    assert_eq!(guard.received_requests().await.len(), 1);
+}
+
+/// THE zero-write collision proof for the bulk arm: the scan-derived
+/// name (`T1`) collides with the browse answer, the action refuses
+/// `tag_collision` (exit 6, the overwrite hint) — the importTagsFile
+/// mock proves ZERO imports ran past the browse read.
+#[tokio::test]
+async fn import_xml_abort_refuses_collision_with_zero_import_writes() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse", "path": "[p11target]"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": [
+                    {"fullPath": "[p11target]T1", "name": "T1", "tagType": "AtomicTag", "hasChildren": false, "dataType": "Int4"}
+                ]}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let import_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_import(
+        &api,
+        "ign-cli",
+        "p11target",
+        CANNED_XML.as_bytes(),
+        CollisionPolicy::Abort,
+        ImportFormat::Xml,
+    )
+    .await
+    .expect_err("scan-fed collision refuses before any write");
+    assert_eq!(err.code(), "tag_collision");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.hint().unwrap().contains("--collision-policy overwrite"),
+        "hint names the fix: {err}"
+    );
+    assert_eq!(
+        import_guard.received_requests().await.len(),
+        0,
+        "ZERO importTagsFile writes past the refusal"
+    );
+}
+
+/// Overwrite on the bulk arm: NO browse pre-check (server authority)
+/// — importTagsFile is the ONLY wire call.
+#[tokio::test]
+async fn import_xml_overwrite_skips_the_precheck() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "importTagsFile"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "data": {"results": ["Good"]}
+            })),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let browse_guard = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "browse"}),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let result = tags_import(
+        &api,
+        "ign-cli",
+        "p11target",
+        CANNED_XML.as_bytes(),
+        CollisionPolicy::Overwrite,
+        ImportFormat::Xml,
+    )
+    .await
+    .expect("overwrite imports through the real client");
+    assert_eq!(result.collision_policy, "overwrite");
+    assert_eq!(guard.received_requests().await.len(), 1);
+    assert_eq!(browse_guard.received_requests().await.len(), 0);
+}
+
+/// The provider-root denial rides the ACTION layer verbatim: the
+/// route's `provider_root_unsupported` envelope (the honest
+/// WebDev-thread translation kept from 11-02 — 11-06 proves the
+/// thread-class truth live) surfaces as the named slug (exit 6).
+#[tokio::test]
+async fn import_xml_provider_root_refusal_surfaces_through_the_action() {
+    let server = wiremock::MockServer::start().await;
+    mount_precondition_ok(&server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/system/webdev/ign-cli/cli/tagConfig",
+        ))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"action": "importTagsFile"}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "provider_root_unsupported",
+                    "message": "provider-root tag paths are not supported on WebDev threads (no RpcContext) -- use a subtree path like [provider]folder"
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let err = tags_import(
+        &api,
+        "ign-cli",
+        "default",
+        CANNED_XML.as_bytes(),
+        CollisionPolicy::Overwrite,
+        ImportFormat::Xml,
+    )
+    .await
+    .expect_err("the provider-root refusal parses through the action");
+    assert_eq!(err.code(), "provider_root_unsupported");
+    assert_eq!(err.exit_code(), 6);
+}
