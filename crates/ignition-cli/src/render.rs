@@ -44,7 +44,7 @@ use ignition_core::actions::rig::{
 use ignition_core::actions::script::ScriptRunResult;
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
 use ignition_core::actions::tags::{
-    BrowseRow, TagBrowseFromExportResult, TagProvidersResult, TagsAlarmsAckResult,
+    BrowseRow, LossReport, TagBrowseFromExportResult, TagProvidersResult, TagsAlarmsAckResult,
     TagsAlarmsActiveResult, TagsAlarmsHistoryResult, TagsBrowseResult, TagsConfigGetResult,
     TagsExportResult, TagsHistoryQueryResult, TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
 };
@@ -104,14 +104,35 @@ pub fn render_ok(out: &ActionOutput, profile: Option<&str>, mode: RenderMode) {
         return;
     }
     // The FOURTH sanctioned stdout exception: a stdout-mode export
-    // (`tags export -o -`) prints its pretty payload raw in EVERY
-    // mode — the payload IS the product (piping `tags export -o -`
-    // into `tags import --file -` is the round-trip); no envelope,
-    // no profile header (README §Streaming).
+    // (`tags export -o -`) prints its payload RAW in EVERY mode —
+    // the payload IS the product (piping `tags export -o -` into
+    // `tags import --file -` is the round-trip); no envelope, no
+    // profile header (README §Streaming). 11-05: xml/csv ride `raw`
+    // (the gateway/generator bytes VERBATIM — no re-encoding, no
+    // added trailing newline); json keeps the pretty payload. Human
+    // mode adds a one-line artifact summary plus the csv lossy
+    // warnings on STDERR — never stdout (the pipe stays pure; json
+    // mode reads the same findings from data.loss_report).
     if let ActionOutput::TagsExport(result) = out
         && result.stdout
     {
-        print!("{}", result.payload.as_deref().unwrap_or_default());
+        let bytes = result
+            .raw
+            .as_deref()
+            .or(result.payload.as_deref())
+            .unwrap_or_default();
+        print!("{bytes}");
+        if mode == RenderMode::Human && result.format != "json" {
+            eprintln!(
+                "exported {} path(s) → stdout ({}, {} tag(s))",
+                result.paths.len(),
+                result.format,
+                result.tag_count
+            );
+            if let Some(report) = &result.loss_report {
+                render_csv_loss_warnings(report);
+            }
+        }
         return;
     }
     // `ign tui` prints NOTHING on success in every mode (LOCKED Phase 6
@@ -294,6 +315,22 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
                 "imported {} tag(s) into {} ({})",
                 result.imported, result.provider, result.collision_policy
             );
+            // 11-05: a confirmed --yes import surfaces its scan
+            // findings on STDERR (loss prose never touches stdout —
+            // the stdout purity lock); json mode reads the same
+            // findings from data.loss_report.
+            if let Some(report) = &result.loss_report {
+                for fact in &report.facts {
+                    eprintln!("warning: [{}] {}", fact.code, fact.detail);
+                }
+            }
+            // The server-side backstop (11-04): Bad_Failure/Error_*
+            // QualityCode ELEMENTS ride the gateway answer — recording
+            // them keeps the honest-failure posture; never silently
+            // reported as success.
+            for failure in &result.failed {
+                eprintln!("warning: gateway reported: {failure}");
+            }
         }
         ActionOutput::TagsAlarmsActive(result) => render_tags_alarms_active_human(result),
         ActionOutput::TagsAlarmsHistory(result) => render_tags_alarms_history_human(result),
@@ -1502,15 +1539,46 @@ fn render_tags_udt_def_human(result: &TagsUdtDefResult) {
 
 /// `ign tags export` human mode: the artifact line (stdout-mode
 /// exports are intercepted in render_ok — the payload already
-/// printed).
+/// printed). json keeps the pre-11-05 line byte-identical; xml/csv
+/// name the format, and csv adds the lossy-generation warnings on
+/// stderr (warn-and-continue — never gated).
 fn render_tags_export_human(result: &TagsExportResult) {
     let file = result.file.as_deref().unwrap_or("stdout");
-    println!(
-        "exported {} path(s) → {} ({} tag(s))",
-        result.paths.len(),
-        file,
-        result.tag_count
-    );
+    if result.format == "json" {
+        println!(
+            "exported {} path(s) → {} ({} tag(s))",
+            result.paths.len(),
+            file,
+            result.tag_count
+        );
+    } else {
+        println!(
+            "exported {} path(s) → {} ({}, {} tag(s))",
+            result.paths.len(),
+            file,
+            result.format,
+            result.tag_count
+        );
+    }
+    if let Some(report) = &result.loss_report {
+        render_csv_loss_warnings(report);
+    }
+}
+
+/// The csv-generation warnings (11-05): the command prints exactly
+/// what was dropped or coerced on STDERR — generation is
+/// warn-and-continue (exit 0), the structured twin rides
+/// `data.loss_report`.
+fn render_csv_loss_warnings(report: &LossReport) {
+    if !report.dropped_keys.is_empty() {
+        eprintln!(
+            "warning: csv export dropped field(s): {}",
+            report.dropped_keys.join(", ")
+        );
+    }
+    for line in &report.coerced {
+        eprintln!("warning: {line}");
+    }
 }
 
 /// One dataset cell → display text: strings unquoted, null as

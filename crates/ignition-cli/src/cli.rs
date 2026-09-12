@@ -588,23 +588,36 @@ pub enum TagsCommand {
     /// a provisioned historian)
     #[command(subcommand)]
     History(TagsHistoryCommand),
-    /// Export tag subtrees to a JSON file (the bulk-transfer half —
-    /// the gateway's native interchange, JSON only)
+    /// Export tag subtrees — json writes the gateway's native JSON
+    /// interchange (the lossless round-trip); xml passes the
+    /// gateway's own XML through byte-for-byte; csv is CLI-GENERATED
+    /// and LOSSY (no alarms, legacy 48-column set, numeric enums —
+    /// the gateway cannot export CSV)
     Export {
         /// Tag paths to export, e.g. `[default]P5` (one or more)
         #[arg(value_name = "PATH", required = true)]
         paths: Vec<String>,
         /// Output file (`-` = stdout — the raw payload, no envelope;
-        /// default: `<last-path-segment>.json` in the cwd)
+        /// default: `<last-path-segment>.<ext>` in the cwd, ext per
+        /// format)
         #[arg(short = 'o', long, value_name = "FILE")]
         output: Option<PathBuf>,
+        /// Payload format: json (the gateway's native interchange —
+        /// default), xml (raw gateway bytes), or csv (CLI-generated
+        /// and LOSSY: no alarms, legacy columns only, numeric enum
+        /// coercion — what was dropped prints on stderr)
+        #[arg(long, value_enum, default_value_t = TransferFormat::Json, value_name = "FORMAT")]
+        format: TransferFormat,
         /// Project holding the deployed routes (default ign-cli)
         #[arg(long, default_value = "ign-cli", value_name = "NAME")]
         project: String,
     },
-    /// Import a JSON tag export into a target provider — abort
-    /// (default) refuses on collisions; overwrite replaces them
-    /// (destructive: requires --yes)
+    /// Import a tag export into a target provider — json is the
+    /// native interchange; xml/csv ride the gateway's importTags
+    /// passthrough. A loss scan reports what xml/csv would drop or
+    /// coerce BEFORE the import and refuses exit 2 unless --yes.
+    /// Collision behavior: abort (default) refuses on collisions;
+    /// overwrite replaces them (destructive: requires --yes)
     Import {
         /// The export file to import (`-` = stdin)
         #[arg(long, value_name = "FILE")]
@@ -613,6 +626,11 @@ pub enum TagsCommand {
         /// create NAME` first)
         #[arg(long, value_name = "NAME")]
         provider: String,
+        /// Payload format: json (the gateway's native interchange —
+        /// default), xml (gateway XML), or csv (legacy CSV — alarms
+        /// never arrive; the loss scan reports the gap)
+        #[arg(long, value_enum, default_value_t = TransferFormat::Json, value_name = "FORMAT")]
+        format: TransferFormat,
         /// Collision policy: abort refuses when tags already exist
         /// (default); overwrite replaces them (destructive:
         /// requires --yes). merge is Designer-only (not a value)
@@ -622,6 +640,36 @@ pub enum TagsCommand {
         #[arg(long, default_value = "ign-cli", value_name = "NAME")]
         project: String,
     },
+}
+
+/// The bulk-transfer payload format (11-05) — the clap surface for
+/// core's `ExportFormat`/`ImportFormat` (core keeps plain enums; the
+/// From impls live beside this one, the CollisionPolicy precedent).
+/// json is the default so every pre-11-05 invocation parses and
+/// behaves byte-identically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum TransferFormat {
+    /// The gateway's JSON interchange (default — lossless)
+    #[default]
+    Json,
+    /// Gateway XML — RAW-BYTE passthrough both directions (no
+    /// parse/normalize in the transfer path)
+    Xml,
+    /// Legacy CSV — import: gateway passthrough (alarms never
+    /// arrive); export: CLI-GENERATED and LOSSY (the gateway cannot
+    /// export CSV)
+    Csv,
+}
+
+impl std::fmt::Display for TransferFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Json => "json",
+            Self::Xml => "xml",
+            Self::Csv => "csv",
+        };
+        f.write_str(label)
+    }
 }
 
 /// `tags config …` — the configuration CRUD subfamily (05-05,

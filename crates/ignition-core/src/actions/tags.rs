@@ -1607,6 +1607,44 @@ pub async fn tags_udt_def(
 
 // ---- bulk export/import (05-05, TAGS-09) ----
 
+/// The structured loss summary riding the success envelope as
+/// `data.loss_report` (11-05). ADDITIVE envelope growth (the 11-04
+/// pattern — new keys, never renames): `skip_serializing_if` keeps
+/// pre-11-05 envelopes byte-identical. Two shapes share the struct —
+/// facts+names for the xml/csv import scan, drops+coercions+rows for
+/// the csv GENERATION report (the warn-and-continue truth source).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LossReport {
+    /// The payload format the report describes (`"xml"` | `"csv"`).
+    pub format: &'static str,
+    /// Advisory loss facts from the 11-03 scan (xml/csv import).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<LossFact>,
+    /// Top-level subtree names in the scanned input (xml/csv import).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_level_names: Vec<String>,
+    /// CSV generation: source JSON keys with no legacy column —
+    /// dropped (the capture-proven silent-drop vocabulary, now
+    /// reported).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_keys: Vec<String>,
+    /// CSV generation: human-readable coercion lines (numeric enum
+    /// mappings, folder flattening, UDT-type placeholders).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub coerced: Vec<String>,
+    /// The count the report describes: emitted CSV data rows
+    /// (csv export; 0 for imports — the import count rides
+    /// `imported`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rows: usize,
+}
+
+/// `skip_serializing_if` helper for [`LossReport::rows`] (usize has
+/// no `is_zero` in std).
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// `ign tags export` result — the artifact line's data (file mode)
 /// or the payload itself (stdout mode, printed raw by the render
 /// layer).
@@ -1633,12 +1671,18 @@ pub struct TagsExportResult {
     /// exception; the ProjectSetResult serde-skip precedent).
     #[serde(skip)]
     pub payload: Option<String>,
-    /// The decoded gateway bytes in xml stdout mode — carried
-    /// VERBATIM (CRLF/no-declaration/trailing-CRLF preserved; the
-    /// render layer decides byte-writing in 11-05). File mode writes
-    /// the bytes directly and leaves this None.
+    /// The decoded gateway bytes in xml/csv stdout mode — carried
+    /// VERBATIM (xml: CRLF/no-declaration/trailing-CRLF preserved;
+    /// csv: exactly what the generator emitted — the render layer
+    /// decides byte-writing, 11-05). File mode writes the bytes
+    /// directly and leaves this None.
     #[serde(skip)]
     pub raw: Option<String>,
+    /// The structured loss report (csv generation: drops +
+    /// coercions) — `data.loss_report`, additive (None keeps the
+    /// pre-11-05 envelope byte-identical).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_report: Option<LossReport>,
 }
 
 /// `ign tags import` result — counts + provider.
@@ -1671,6 +1715,12 @@ pub struct TagsImportResult {
     /// value is the honest server-side backstop record (never
     /// silently swallowed as success).
     pub failed: Vec<String>,
+    /// The structured scan summary riding as `data.loss_report`
+    /// (11-05: present for xml/csv imports the user confirmed with
+    /// --yes; the CLI loss gate attaches it — additive envelope key,
+    /// None keeps json byte-identical).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_report: Option<LossReport>,
 }
 
 /// The default export file name: the FIRST path's last segment
@@ -1822,6 +1872,7 @@ pub async fn tags_export(
                     format: "xml",
                     payload: None,
                     raw: None,
+                    loss_report: None,
                 })
             }
             None => {
@@ -1845,6 +1896,7 @@ pub async fn tags_export(
                     format: "xml",
                     payload: None,
                     raw: Some(text),
+                    loss_report: None,
                 })
             }
         };
@@ -1909,6 +1961,7 @@ pub async fn tags_export(
                 format: "json",
                 payload: None,
                 raw: None,
+                loss_report: None,
             })
         }
         None => Ok(TagsExportResult {
@@ -1920,6 +1973,7 @@ pub async fn tags_export(
             format: "json",
             payload: Some(pretty),
             raw: None,
+            loss_report: None,
         }),
     }
 }
@@ -2057,6 +2111,7 @@ pub async fn tags_import(
         top_level_names: effective_names,
         loss_facts: Vec::new(),
         failed: Vec::new(),
+        loss_report: None, // json: no gate, no scan summary
     })
 }
 
@@ -2171,6 +2226,7 @@ async fn tags_import_bulk(
         top_level_names,
         loss_facts,
         failed,
+        loss_report: None, // the CLI loss gate attaches the scan summary (11-05)
     })
 }
 

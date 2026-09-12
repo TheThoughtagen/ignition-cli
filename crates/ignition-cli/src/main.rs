@@ -1357,29 +1357,69 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 _ => None,
             };
             // The JSON document inputs: config create/edit's
-            // definition and import's payload (`--file PATH` /
-            // `--file -`, parsed — InvalidInput pre-resolution).
+            // definition (`--file PATH` / `--file -`, parsed —
+            // InvalidInput pre-resolution). Import's payload moved to
+            // the format-aware block below (11-05).
             let json_input = match &command {
                 TagsCommand::Config(TagsConfigCommand::Create { file, .. })
-                | TagsCommand::Config(TagsConfigCommand::Edit { file, .. })
-                | TagsCommand::Import { file, .. } => match read_json_input(file).await {
-                    Ok(parsed) => Some(parsed),
-                    Err(err) => return (None, Err(err)),
-                },
+                | TagsCommand::Config(TagsConfigCommand::Edit { file, .. }) => {
+                    match read_json_input(file).await {
+                        Ok(parsed) => Some(parsed),
+                        Err(err) => return (None, Err(err)),
+                    }
+                }
                 _ => None,
+            };
+            // Import's payload input, FORMAT-AWARE (11-05): json
+            // parses + validates pre-resolution exactly as before
+            // (the dispatch re-serializes value-identically — the
+            // wire body stays byte-identical); xml/csv read RAW BYTES
+            // and run THE TAGS-12 loss gate — one function,
+            // pre-resolution, so a refusal exits 2 `invalid_input`
+            // with profile null and ZERO wire work (the guard and
+            // read_json_input precedent).
+            let (import_payload, import_loss): (
+                Option<Vec<u8>>,
+                Option<actions::tags::LossReport>,
+            ) = match &command {
+                TagsCommand::Import { file, format, .. } => {
+                    if matches!(format, cli::TransferFormat::Json) {
+                        match read_json_input(file).await {
+                            Ok(parsed) => (
+                                Some(serde_json::to_vec(&parsed).expect("parsed Value serializes")),
+                                None,
+                            ),
+                            Err(err) => return (None, Err(err)),
+                        }
+                    } else {
+                        let bytes = match read_input_bytes(file).await {
+                            Ok(bytes) => bytes,
+                            Err(err) => return (None, Err(err)),
+                        };
+                        match loss_gate(&bytes, *format, cli.yes) {
+                            Ok(loss) => (Some(bytes), loss),
+                            Err(err) => return (None, Err(err)),
+                        }
+                    }
+                }
+                _ => (None, None),
             };
             // Export's output resolution: `-o -` = stdout (the
             // payload rides the result; render prints it raw — the
             // sanctioned stdout exception), `-o FILE` = that file,
-            // none = the default `<last-segment>.json` (the
-            // export-streaming convention).
+            // none = the default `<last-segment>.<ext>` (the
+            // export-streaming convention; the extension rides the
+            // format, 11-05 — json keeps `.json` byte-identical).
             let export_out = match &command {
-                TagsCommand::Export { paths, output, .. } => Some(match output {
+                TagsCommand::Export {
+                    paths,
+                    output,
+                    format,
+                    ..
+                } => Some(match output {
                     Some(path) if path == std::path::Path::new("-") => None,
                     Some(path) => Some(path.clone()),
-                    None => Some(std::path::PathBuf::from(
-                        actions::tags::default_export_file_name(paths),
-                    )),
+                    None => Some(default_export_path(paths, *format)),
                 }),
                 _ => None,
             };
@@ -1492,11 +1532,18 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 ) => actions::tags::tags_udt_def(&*api, project, provider, udt_name)
                     .await
                     .map(ActionOutput::TagsUdtDef),
-                (TagsCommand::Export { paths, project, .. }, Ok(api)) => {
-                    // 11-04: the format param rides core now; the
-                    // clap --format wiring (json default) lands in
-                    // 11-05's contract layer.
-                    actions::tags::tags_export(
+                (
+                    TagsCommand::Export {
+                        paths,
+                        project,
+                        format,
+                        ..
+                    },
+                    Ok(api),
+                ) => match format {
+                    // json: today verbatim — byte-identical wire
+                    // body, file write, and payload (the JSON lock).
+                    cli::TransferFormat::Json => actions::tags::tags_export(
                         &*api,
                         project,
                         paths,
@@ -1507,32 +1554,82 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         actions::tags::ExportFormat::Json,
                     )
                     .await
-                    .map(ActionOutput::TagsExport)
-                }
+                    .map(ActionOutput::TagsExport),
+                    // xml: RAW gateway bytes — file mode writes them
+                    // with NO trailing newline, stdout mode carries
+                    // them for the render layer's raw write (the
+                    // fourth-exception pattern extended).
+                    cli::TransferFormat::Xml => actions::tags::tags_export(
+                        &*api,
+                        project,
+                        paths,
+                        export_out
+                            .as_ref()
+                            .expect("resolved pre-resolution")
+                            .as_deref(),
+                        actions::tags::ExportFormat::Xml,
+                    )
+                    .await
+                    .map(ActionOutput::TagsExport),
+                    // csv: the gateway cannot export CSV — the JSON
+                    // interchange is fetched exactly as today (same
+                    // wire body) and generate_legacy_csv (the ONE
+                    // sanctioned CLI-side conversion) runs over the
+                    // subtrees; every drop/coercion rides the
+                    // envelope as data.loss_report (warn-and-continue,
+                    // exit 0 — NEVER gated). Mixed-parent note (11-01
+                    // Probe 4): mixed-parent export silently corrupts
+                    // (type="Unknown" skeletons) — PRE-EXISTING in the
+                    // JSON interchange (probe 4c), NOT a hard failure —
+                    // so per the planner lock the constraint is not
+                    // new-format and no pre-resolution gate fires here.
+                    cli::TransferFormat::Csv => export_csv_arm(
+                        &*api,
+                        project,
+                        paths,
+                        export_out
+                            .as_ref()
+                            .expect("resolved pre-resolution")
+                            .as_deref(),
+                    )
+                    .await
+                    .map(ActionOutput::TagsExport),
+                },
                 (
                     TagsCommand::Import {
                         provider,
                         project,
                         collision_policy,
+                        format,
                         ..
                     },
                     Ok(api),
                 ) => {
-                    // 11-04: core reads RAW BYTES (the xml/csv
-                    // passthrough signature); the raw stdin/file
-                    // dispatch rework is 11-05's — the parsed Value
-                    // re-serializes value-identically.
-                    let parsed = json_input.expect("parsed pre-resolution");
+                    let bytes = import_payload.as_ref().expect("parsed pre-resolution");
+                    // json: byte-identical body (the parsed Value
+                    // re-serializes); xml/csv: the raw bytes ride
+                    // base64 to importTagsFile verbatim (11-04's
+                    // base64-only seam). The loss gate already ran
+                    // pre-resolution; a confirmed import attaches the
+                    // structured scan summary as data.loss_report.
+                    let import_format = match format {
+                        cli::TransferFormat::Json => actions::tags::ImportFormat::Json,
+                        cli::TransferFormat::Xml => actions::tags::ImportFormat::Xml,
+                        cli::TransferFormat::Csv => actions::tags::ImportFormat::Csv,
+                    };
                     actions::tags::tags_import(
                         &*api,
                         project,
                         provider,
-                        &serde_json::to_vec(&parsed).expect("parsed Value serializes"),
+                        bytes,
                         (*collision_policy).into(),
-                        actions::tags::ImportFormat::Json,
+                        import_format,
                     )
                     .await
-                    .map(ActionOutput::TagsImport)
+                    .map(|mut result| {
+                        result.loss_report = import_loss.clone();
+                        ActionOutput::TagsImport(result)
+                    })
                 }
                 (
                     TagsCommand::Alarms(TagsAlarmsCommand::Active {
@@ -2681,19 +2778,19 @@ fn parse_write_scalar(raw: &str) -> Result<serde_json::Value, CoreError> {
     }
 }
 
-/// Read a JSON document from `--file PATH` (std::fs) or `--file -`
-/// (tokio stdin) and PARSE it — the resource-put byte-source
-/// precedent (InvalidInput class, pre-resolution: exit 2 with zero
-/// network work on an unreadable file or malformed JSON). Used by
-/// `tags config create|edit` (the definition) and `tags import`
-/// (the payload).
-async fn read_json_input(file: &std::path::Path) -> Result<serde_json::Value, CoreError> {
+/// Read a document from `--file PATH` (std::fs) or `--file -`
+/// (tokio stdin) as RAW BYTES — the xml/csv import source (the
+/// transfer path never parses: bytes ride `file_b64` verbatim,
+/// 11-04's base64-only seam). InvalidInput class, pre-resolution:
+/// exit 2 with zero network work on an unreadable file (the
+/// read_json_input precedent).
+async fn read_input_bytes(file: &std::path::Path) -> Result<Vec<u8>, CoreError> {
     let label = if file == std::path::Path::new("-") {
         "stdin".to_string()
     } else {
         file.display().to_string()
     };
-    let bytes = if file == std::path::Path::new("-") {
+    if file == std::path::Path::new("-") {
         use tokio::io::AsyncReadExt;
         let mut buffer = Vec::new();
         tokio::io::stdin()
@@ -2702,15 +2799,193 @@ async fn read_json_input(file: &std::path::Path) -> Result<serde_json::Value, Co
             .map_err(|err| CoreError::InvalidInput {
                 reason: format!("cannot read stdin: {err}"),
             })?;
-        buffer
+        Ok(buffer)
     } else {
         std::fs::read(file).map_err(|err| CoreError::InvalidInput {
             reason: format!("cannot read {label}: {err}"),
-        })?
+        })
+    }
+}
+
+/// Read a JSON document from `--file PATH` (std::fs) or `--file -`
+/// (tokio stdin) and PARSE it — the resource-put byte-source
+/// precedent (InvalidInput class, pre-resolution: exit 2 with zero
+/// network work on an unreadable file or malformed JSON). Used by
+/// `tags config create|edit` (the definition) and `tags import`
+/// (the json payload — the dispatch re-serializes value-identically,
+/// so the wire body stays byte-identical).
+async fn read_json_input(file: &std::path::Path) -> Result<serde_json::Value, CoreError> {
+    let bytes = read_input_bytes(file).await?;
+    let label = if file == std::path::Path::new("-") {
+        "stdin".to_string()
+    } else {
+        file.display().to_string()
     };
     serde_json::from_slice(&bytes).map_err(|err| CoreError::InvalidInput {
         reason: format!("{label} is not valid JSON: {err}"),
     })
+}
+
+/// THE TAGS-12 loss gate (11-05) — ONE function (the 10-04
+/// preview_then_confirm lesson: one gate means the refusal shape
+/// cannot drift). Scans the RAW xml/csv input bytes (the 11-03
+/// advisory scans — pure, no wire) and, when facts are reported and
+/// `--yes` is absent, refuses exit-2 `invalid_input` with the prose
+/// report AS the message (rendered to stderr in every mode via the
+/// established error path). PRE-RESOLUTION: this runs before any
+/// profile resolution or request, so a refusal does zero wire work.
+/// Imports ONLY — csv GENERATION warns-and-continues and is never
+/// gated. With `--yes` the structured scan summary returns for the
+/// success envelope (`data.loss_report`); json skips the gate
+/// entirely (the byte-identical path).
+fn loss_gate(
+    bytes: &[u8],
+    format: cli::TransferFormat,
+    yes: bool,
+) -> Result<Option<actions::tags::LossReport>, CoreError> {
+    let (label, scan_names, facts) = match format {
+        cli::TransferFormat::Json => return Ok(None),
+        cli::TransferFormat::Xml => {
+            let scan = actions::tag_loss::scan_xml(bytes);
+            ("xml", scan.top_level_names, scan.facts)
+        }
+        cli::TransferFormat::Csv => {
+            let scan = actions::tag_loss::scan_csv(bytes);
+            ("csv", scan.top_level_names, scan.facts)
+        }
+    };
+    if facts.is_empty() {
+        return Ok(None);
+    }
+    let prose = render_loss_prose(label, &facts, &scan_names);
+    if !yes {
+        return Err(CoreError::InvalidInput {
+            reason: format!("{prose}re-run with --yes to import anyway"),
+        });
+    }
+    Ok(Some(actions::tags::LossReport {
+        format: if matches!(format, cli::TransferFormat::Xml) {
+            "xml"
+        } else {
+            "csv"
+        },
+        facts,
+        top_level_names: scan_names,
+        dropped_keys: Vec::new(),
+        coerced: Vec::new(),
+        rows: 0,
+    }))
+}
+
+/// The loss report's prose form — the refusal message's content (and
+/// the shape agents read from the error envelope's `error.message`):
+/// the stable scan codes in brackets, one fact per line, then the
+/// top-level names the import would land. Advisory by contract — the
+/// gateway remains the parsing authority; the scan never refuses on
+/// its own (a clean scan imports without --yes).
+fn render_loss_prose(
+    label: &str,
+    facts: &[actions::tag_loss::LossFact],
+    names: &[String],
+) -> String {
+    let mut out = format!(
+        "loss report ({label}): the scan reports {} finding(s) before the import:\n",
+        facts.len()
+    );
+    for fact in facts {
+        out.push_str(&format!("  - [{}] {}\n", fact.code, fact.detail));
+    }
+    if !names.is_empty() {
+        out.push_str(&format!("top-level tag(s): {}\n", names.join(", ")));
+    }
+    out
+}
+
+/// Export's default destination: `<last-path-segment>.<ext>` with
+/// the extension per format (11-05) — json keeps today's
+/// `<last-segment>.json` byte-identical (the core helper owns the
+/// stem sanitization; only the suffix swaps).
+fn default_export_path(paths: &[String], format: cli::TransferFormat) -> std::path::PathBuf {
+    let json_name = actions::tags::default_export_file_name(paths);
+    let stem = json_name.strip_suffix(".json").unwrap_or(&json_name);
+    let ext = match format {
+        cli::TransferFormat::Json => "json",
+        cli::TransferFormat::Xml => "xml",
+        cli::TransferFormat::Csv => "csv",
+    };
+    std::path::PathBuf::from(format!("{stem}.{ext}"))
+}
+
+/// `tags export --format csv` (11-05) — the ONE sanctioned CLI-side
+/// conversion. The JSON interchange is fetched exactly as today
+/// (same wire body), the subtrees re-parsed from the pretty payload
+/// (our own serialization — value-identical), and
+/// `generate_legacy_csv` produces the legacy bytes plus the full
+/// drop/coercion report. File mode writes the CSV bytes with NO
+/// trailing newline beyond what the csv crate emits; stdout mode
+/// carries them verbatim for the render layer's raw write.
+/// Warn-and-continue: exit 0 even when the report is heavy — the
+/// drops ride `data.loss_report` and human mode warns on stderr.
+async fn export_csv_arm(
+    api: &dyn ignition_core::client::GatewayApi,
+    project: &str,
+    paths: &[String],
+    out: Option<&std::path::Path>,
+) -> Result<actions::tags::TagsExportResult, CoreError> {
+    let json_result =
+        actions::tags::tags_export(api, project, paths, None, actions::tags::ExportFormat::Json)
+            .await?;
+    let pretty = json_result
+        .payload
+        .as_deref()
+        .expect("stdout-mode export carries the pretty payload");
+    let subtrees: Vec<serde_json::Value> = serde_json::from_str(pretty).map_err(|err| {
+        CoreError::Internal(format!("csv export lost the parsed interchange: {err}"))
+    })?;
+    let report = actions::tags::generate_legacy_csv(&subtrees)?;
+    let loss_report = actions::tags::LossReport {
+        format: "csv",
+        facts: Vec::new(),
+        top_level_names: Vec::new(),
+        dropped_keys: report.dropped_keys.clone(),
+        coerced: report.coerced.clone(),
+        rows: report.rows,
+    };
+    match out {
+        Some(path) => {
+            std::fs::write(path, &report.csv).map_err(|err| {
+                CoreError::Internal(format!("cannot write {}: {err}", path.display()))
+            })?;
+            Ok(actions::tags::TagsExportResult {
+                project: project.to_string(),
+                paths: paths.to_vec(),
+                file: Some(path.display().to_string()),
+                stdout: false,
+                tag_count: report.rows,
+                format: "csv",
+                payload: None,
+                raw: None,
+                loss_report: Some(loss_report),
+            })
+        }
+        None => {
+            // The csv crate writes UTF-8 by construction.
+            let text = String::from_utf8(report.csv).map_err(|_| {
+                CoreError::Internal("generated csv bytes are not UTF-8".to_string())
+            })?;
+            Ok(actions::tags::TagsExportResult {
+                project: project.to_string(),
+                paths: paths.to_vec(),
+                file: None,
+                stdout: true,
+                tag_count: report.rows,
+                format: "csv",
+                payload: None,
+                raw: Some(text),
+                loss_report: Some(loss_report),
+            })
+        }
+    }
 }
 
 /// `ign api call --header`/`--query` string parsing (09-03): headers
