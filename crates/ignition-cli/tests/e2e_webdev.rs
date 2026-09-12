@@ -19,7 +19,17 @@
 //! |---|---|---|
 //! | `IGNITION_LIVE_URL` | every test | base URL, e.g. `http://localhost:18088` |
 //! | `IGNITION_LIVE_TOKEN` | every test | full `name:key` API-token string |
-//! | `IGNITION_LIVE_MUTATIONS` | the loop test | `1` to allow the deploys (webdev deploy imports/overwrites the ign-cli project) |
+//! | `IGNITION_LIVE_MUTATIONS` | the loop test + the two 11-06 mutation gates | `1` to allow the deploys / tag-subtree seeding |
+//!
+//! The 11-06 bulk-transfer gates: `live_tags_xml_fidelity_roundtrip`
+//! and `live_tags_csv_roundtrip` MUTATE the gateway (they seed
+//! `P11Live*`/`P11Csv*` subtrees and import) — `IGNITION_LIVE_MUTATIONS=1`
+//! required, same as the loop. `live_tags_loss_gate_refusal` is READ-ONLY:
+//! its refusal is pre-resolution (zero wire work by construction), so it
+//! runs on URL+TOKEN alone — no mutations env. The mutation gates
+//! self-deploy the current bundle FIRST (the redeploy-sequencing lesson,
+//! research Pitfall 5 — any new-format call against a stale 1.x deploy
+//! hits the version-drift refusal).
 //!
 //! ## The loop's contract pins
 //!
@@ -1234,4 +1244,986 @@ async fn live_tags_alarm_lifecycle() {
         ],
     );
     expect_ok("provider delete p5alarm (guarded)", &out);
+}
+
+// ---- 11-06 live gates: the XML fidelity round-trip (the
+// determinism-capture-selected oracle), the CSV round-trip (the
+// coverage table live-diff), and the loss-gate refusal
+// (pre-resolution, read-only). Oracle authority:
+// .planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md
+// Probe 3. ----
+
+use quick_xml::XmlVersion;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::reader::Reader;
+
+/// sha256 hex — the fidelity-oracle evidence values recorded in
+/// 11-LIVE-GATE.md (transport A, round-trip B, per rig).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// One canonical-XML node: element name, SORTED attributes,
+/// ORDER-NORMALIZED children, concatenated meaningful text.
+/// Whitespace-only text (the 3-space indentation) is dropped — the
+/// gateway's own CRLF documents differ only in sibling order after
+/// an import (11-01 Probe 3: "sibling order permutes on the model
+/// rebuild"), so the structural oracle compares canonical SERIALIZATIONS
+/// of order-sorted trees, never raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Canon {
+    name: String,
+    attrs: Vec<(String, String)>,
+    children: Vec<Canon>,
+    text: String,
+}
+
+/// All attributes, normalized + sorted (the tag_loss `collect_attrs`
+/// idiom). Sorting makes attribute order irrelevant to identity —
+/// gateway serializers are stable, but the oracle should not depend
+/// on it.
+fn canon_attrs(element: &BytesStart) -> Vec<(String, String)> {
+    let mut attrs: Vec<(String, String)> = element
+        .attributes()
+        .flatten()
+        .filter_map(|attr| {
+            attr.normalized_value(XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| {
+                    (
+                        String::from_utf8_lossy(attr.key.as_ref()).into_owned(),
+                        v.into_owned(),
+                    )
+                })
+        })
+        .collect();
+    attrs.sort();
+    attrs
+}
+
+/// The canonical serialization: `<name k="v">text<sorted-children/></name>`
+/// (self-closing when empty). Siblings sort by their own serialized
+/// form — a total order, so the sort is stable across runs and rigs.
+fn serialize_canonical(node: &Canon) -> String {
+    let mut out = format!("<{}", node.name);
+    for (key, value) in &node.attrs {
+        out.push_str(&format!(" {key}=\"{value}\""));
+    }
+    let mut kids: Vec<String> = node.children.iter().map(serialize_canonical).collect();
+    kids.sort();
+    if kids.is_empty() && node.text.is_empty() {
+        out.push_str("/>");
+        return out;
+    }
+    out.push('>');
+    out.push_str(&node.text);
+    for kid in kids {
+        out.push_str(&kid);
+    }
+    out.push_str(&format!("</{}>", node.name));
+    out
+}
+
+/// Parse gateway XML into the canonical tree (the tag_loss Reader
+/// idioms; the oracle inputs are gateway exports — a parse error is
+/// a gate bug, never an expected case).
+fn parse_canonical(raw: &[u8]) -> Canon {
+    let mut reader = Reader::from_reader(raw);
+    let mut stack: Vec<Canon> = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => stack.push(Canon {
+                name: String::from_utf8_lossy(e.name().as_ref()).into_owned(),
+                attrs: canon_attrs(e),
+                children: Vec::new(),
+                text: String::new(),
+            }),
+            Ok(Event::Empty(ref e)) => {
+                let node = Canon {
+                    name: String::from_utf8_lossy(e.name().as_ref()).into_owned(),
+                    attrs: canon_attrs(e),
+                    children: Vec::new(),
+                    text: String::new(),
+                };
+                stack
+                    .last_mut()
+                    .expect("Empty event always has a parent")
+                    .children
+                    .push(node);
+            }
+            Ok(Event::End(_)) => {
+                let node = stack.pop().expect("balanced document");
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(node),
+                    None => return node,
+                }
+            }
+            Ok(Event::Text(ref t)) => {
+                let Ok(text) = t.decode() else { continue };
+                if !text.trim().is_empty()
+                    && let Some(parent) = stack.last_mut()
+                {
+                    parent.text.push_str(text.trim());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(err) => panic!("canonicalizer: oracle inputs are gateway exports: {err}"),
+        }
+    }
+    panic!("canonicalizer: unbalanced document (no root End event)");
+}
+
+/// The ORDER-NORMALIZED STRUCTURAL IDENTITY oracle (binds 11-06 per
+/// 11-LIVE-CAPTURES.md Probe 3's determinism answer): byte-identity
+/// is proven ONLY for unchanged-subtree re-export (capture (a));
+/// import→re-export permutes sibling order on the model rebuild
+/// (capture (b) — 1128==1128 length, byte-different, structurally
+/// identical), so byte-identity is INVALID here by capture. The
+/// cheap length pre-check rides at the call site.
+fn structurally_identical(a: &[u8], b: &[u8]) -> bool {
+    serialize_canonical(&parse_canonical(a)) == serialize_canonical(&parse_canonical(b))
+}
+
+/// ONE raw wire probe of the deployed tagConfig route — POST the
+/// exportTags action for `paths` (token auth; the secret gates
+/// scriptExec ONLY — the always-on routes are token-gated) and
+/// return the DECODED payload bytes. This is the transport
+/// assertion's cleaner capture choice (per the plan's either/or):
+/// the raw route response pins the EXACT `payload_b64` the CLI's own
+/// export decodes, so `sha256(file) == sha256(decoded payload_b64)`
+/// witnesses the whole CLI transport (route → base64 → decode →
+/// file) in one assertion — a second CLI export would only prove
+/// two in-process decodes agree.
+async fn raw_tagconfig_export_xml(env: &LiveEnv, paths: &[&str]) -> Vec<u8> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/system/webdev/ign-cli/cli/tagConfig", env.url);
+    let response = client
+        .post(&url)
+        .header("X-Ignition-API-Token", &env.token)
+        .json(&serde_json::json!({
+            "action": "exportTags",
+            "paths": paths,
+            "format": "xml"
+        }))
+        .send()
+        .await
+        .expect("tagConfig exportTags reaches the gateway");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the webdev servlet answers 200"
+    );
+    let body: Value = response.json().await.expect("envelope parses");
+    assert_eq!(body["ok"], Value::Bool(true), "export answered ok: {body}");
+    let payload_b64 = body["data"]["payload_b64"]
+        .as_str()
+        .unwrap_or_else(|| panic!("payload_b64 present: {body}"));
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(payload_b64)
+        .expect("payload_b64 decodes")
+}
+
+/// THE XML fidelity round-trip live gate (11-06, TAGS-10) — the
+/// roadmap SC-1 proof on a REAL multi-level UDT subtree: seed the
+/// probe-3-shaped structure (MotorType UDT definition under
+/// `[default]_types_` + a P11Live folder of two instances and a
+/// nested Sub third), export XML, and assert the capture-selected
+/// oracle at every hop:
+///
+/// 1. **transport** — `sha256(a.xml) == sha256(decoded route
+///    payload_b64)` (raw wire probe, comment at the helper);
+/// 2. **refusal** — the loss gate refuses exit 2 WITHOUT `--yes`
+///    (gateway XML always carries MinVersion → the
+///    `xml_export_edited_only` fact), pre-resolution;
+/// 3. **zero mutation** — the re-export after the refusal is
+///    BYTE-IDENTICAL (unchanged-subtree export determinism, capture
+///    (a), live re-proven — which doubles as the zero-write proof);
+/// 4. **import** — `--yes` proceeds; the QualityCode backstop
+///    (`data.failed`) stays empty;
+/// 5. **round-trip** — the imported subtree re-exports at EQUAL
+///    LENGTH and is ORDER-NORMALIZED STRUCTURALLY IDENTICAL (capture
+///    (b): byte-identity is invalid after an import — sibling order
+///    permutes on the model rebuild; shas printed for the record).
+///
+/// Cleanup deletes the seeded paths + the UDT type + the scratch
+/// provider (the CLI's import target is PROVIDER-scoped — `--provider`,
+/// the shipped 11-05 surface — so the import lands at `[p11live]P11Live`
+/// and the gate exports that path; the plan's basePath-positional
+/// sketch reconciled to the actual CLI, per its own "adjust the
+/// exported path to whatever the import actually landed" note).
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_xml_fidelity_roundtrip() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
+
+    // (1) Self-deploy FIRST (the redeploy-sequencing pin) with the
+    // scriptExec leg so the rig keeps the full standing 5-route
+    // bundle — then the version handshake reads 1.2.0 on every route.
+    let out = ign(
+        &config,
+        &env,
+        &["webdev", "deploy", "--with-script-exec", "--compact"],
+    );
+    expect_ok("deploy (the gate's own precondition)", &out);
+    let out = ign(&config, &env, &["webdev", "status", "--compact"]);
+    expect_ok("status after self-deploy", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["ok"], Value::Bool(true), "{envelope}");
+    for route in ["tags", "tagConfig", "alarms", "tagHistory", "scriptExec"] {
+        let row = status_row(&envelope, route);
+        assert_eq!(row["status"], "present", "{route}: {row}");
+        assert_eq!(
+            row["deployed_version"],
+            ignition_core::webdev::ROUTE_BUNDLE_VERSION,
+            "{route}: the 1.2.0 handshake pin: {row}"
+        );
+    }
+
+    // Pre-clean leftovers from a prior aborted run (idempotent): the
+    // kept-alive 11-01 rigs carry P11UDT*/P11Seed* probe tags — our
+    // namespace is P11Live* (no collision), plus the MotorType the
+    // 11-01 probes may have left under _types_.
+    clean_tag_configs(
+        &config,
+        &env,
+        &["[default]P11Live", "[default]_types_/MotorType"],
+    );
+    clean_provider(&config, &env, "p11live");
+
+    // (2) Seed the probe-3 construction (config files via tempfile):
+    // the MotorType UDT definition (parameter + OPC child with an
+    // alarm + expression child) and the P11Live folder (two
+    // instances + nested Sub third). Parameter values ride the
+    // `value` key (the captured construction finding — `defaultValue`
+    // is silently dropped); the alarm's `mode` key is omitted (it
+    // does not bind — captured); the property bindings ride the
+    // research-recorded JSON dict form.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let type_def = tmp.path().join("motor-type.json");
+    std::fs::write(
+        &type_def,
+        serde_json::json!({
+            "tagType": "UdtType",
+            "parameters": {"MotorNumber": {"dataType": "Integer", "value": 1}},
+            "tags": [
+                {
+                    "name": "Amps",
+                    "tagType": "AtomicTag",
+                    "valueSource": "opc",
+                    "opcServer": "Ignition OPC-UA Server",
+                    "opcItemPath": {
+                        "bindType": "parameter",
+                        "binding": "ns=1;s=[Dairy]Motor {MotorNumber}/Amps"
+                    },
+                    "alarms": [
+                        {"name": "Low Amps", "priority": "High", "setpointA": 25}
+                    ]
+                },
+                {
+                    "name": "Doubled",
+                    "tagType": "AtomicTag",
+                    "valueSource": "expression",
+                    "expression": {"bindType": "parameter", "binding": "{MotorNumber} * 2"}
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write type def");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "create",
+            "[default]_types_/MotorType",
+            "--file",
+            type_def.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("config create the MotorType UDT definition", &out);
+
+    let folder_def = tmp.path().join("p11live.json");
+    std::fs::write(
+        &folder_def,
+        serde_json::json!({
+            "tagType": "Folder",
+            "tags": [
+                {
+                    "name": "M1",
+                    "tagType": "UdtInstance",
+                    "udtParentType": "[default]_types_/MotorType",
+                    "parameters": {"MotorNumber": {"dataType": "Integer", "value": 1}}
+                },
+                {
+                    "name": "M2",
+                    "tagType": "UdtInstance",
+                    "udtParentType": "[default]_types_/MotorType",
+                    "parameters": {"MotorNumber": {"dataType": "Integer", "value": 2}}
+                },
+                {
+                    "name": "Sub",
+                    "tagType": "Folder",
+                    "tags": [
+                        {
+                            "name": "M3",
+                            "tagType": "UdtInstance",
+                            "udtParentType": "[default]_types_/MotorType",
+                            "parameters": {"MotorNumber": {"dataType": "Integer", "value": 3}}
+                        }
+                    ]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write folder def");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "create",
+            "[default]P11Live",
+            "--file",
+            folder_def.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("config create the P11Live folder", &out);
+
+    // (3) Export XML (single path — instance-only: the TYPE lives
+    // under _types_, so the file carries NO UdtType definition and
+    // importTags accepts it; capture (b).2).
+    let a_path = tmp.path().join("a.xml");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[default]P11Live",
+            "--format",
+            "xml",
+            "-o",
+            a_path.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("export [default]P11Live as xml", &out);
+    let a_bytes = std::fs::read(&a_path).expect("a.xml readable");
+    assert!(!a_bytes.is_empty(), "the export is not empty");
+    let sha_a = sha256_hex(&a_bytes);
+
+    // ORACLE TIER 1 — transport fidelity: the file's bytes == the
+    // route's payload_b64 bytes (the raw probe captures the route
+    // response directly — see the helper's comment).
+    let route_bytes = raw_tagconfig_export_xml(&env, &["[default]P11Live"]).await;
+    let sha_route = sha256_hex(&route_bytes);
+    assert_eq!(
+        sha_a, sha_route,
+        "TRANSPORT FIDELITY: sha256(export file) == sha256(route payload_b64)"
+    );
+    println!(
+        "xml transport fidelity: sha256 {sha_a} ({} bytes)",
+        a_bytes.len()
+    );
+
+    // (4) The loss gate refuses WITHOUT --yes: exit 2, invalid_input,
+    // the report prose on stderr (the MinVersion fact fires on any
+    // gateway-export-shaped file) — and PRE-RESOLUTION (profile null,
+    // zero wire work).
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            a_path.to_str().expect("path"),
+            "--format",
+            "xml",
+            "--provider",
+            "p11live",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the loss gate refuses exit 2; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = err_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input", "{envelope}");
+    assert!(
+        envelope["profile"].is_null(),
+        "the refusal is PRE-resolution — no profile resolved: {envelope}"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("loss report (xml)") && message.contains("re-run with --yes"),
+        "the refusal message IS the report prose: {envelope}"
+    );
+
+    // (5) ZERO-MUTATION proof: re-export and byte-compare — the
+    // unchanged-subtree export determinism (capture (a), live
+    // re-proven) IS the nothing-landed evidence.
+    let a2_path = tmp.path().join("a2.xml");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[default]P11Live",
+            "--format",
+            "xml",
+            "-o",
+            a2_path.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("re-export after refusal (the zero-mutation read)", &out);
+    let a2_bytes = std::fs::read(&a2_path).expect("a2.xml readable");
+    assert_eq!(
+        sha256_hex(&a2_bytes),
+        sha_a,
+        "ZERO MUTATION: the refusal left the seeded subtree byte-identical"
+    );
+
+    // (6) The import target: a dedicated scratch provider (the CLI
+    // surface is provider-scoped; native REST create, no route).
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "create", "p11live", "--compact"],
+    );
+    expect_ok("provider create p11live", &out);
+
+    // The guarded import WITH --yes: exit 0, no server-side
+    // Bad_Failure backstop, the loss report rides the envelope.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            a_path.to_str().expect("path"),
+            "--format",
+            "xml",
+            "--provider",
+            "p11live",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("import --yes (the guarded commit)", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["format"], "xml", "{envelope}");
+    assert_eq!(
+        envelope["data"]["failed"].as_array().map(Vec::len),
+        Some(0),
+        "the QualityCode backstop stays empty: {envelope}"
+    );
+    assert!(
+        envelope["data"]["loss_report"].is_object(),
+        "--yes attaches data.loss_report: {envelope}"
+    );
+    assert!(
+        envelope["data"]["top_level_names"]
+            .as_array()
+            .expect("top_level_names[]")
+            .iter()
+            .any(|name| name == "P11Live"),
+        "the scan named the landing subtree: {envelope}"
+    );
+
+    // (7) Re-export the IMPORTED subtree (it landed at
+    // [p11live]P11Live — provider-root basePath) and run the
+    // capture-selected oracle: EQUAL LENGTH pre-check + order-
+    // normalized structural identity. Byte-identity is INVALID here
+    // by capture (b) — sibling order permutes on the model rebuild —
+    // so the shas are printed for the evidence doc, not asserted.
+    let b_path = tmp.path().join("b.xml");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[p11live]P11Live",
+            "--format",
+            "xml",
+            "-o",
+            b_path.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("export the imported [p11live]P11Live", &out);
+    let b_bytes = std::fs::read(&b_path).expect("b.xml readable");
+    assert_eq!(
+        a_bytes.len(),
+        b_bytes.len(),
+        "LENGTH pre-check (capture (b): 1128 == 1128): a={} b={}",
+        a_bytes.len(),
+        b_bytes.len()
+    );
+    let sha_b = sha256_hex(&b_bytes);
+    assert!(
+        structurally_identical(&a_bytes, &b_bytes),
+        "ROUND-TRIP ORACLE: order-normalized structural identity failed \
+         (sha_a {sha_a} vs sha_b {sha_b})"
+    );
+    println!(
+        "xml round-trip: sha_a {sha_a} / sha_b {sha_b} ({} bytes each) — \
+         structurally identical (byte-{})",
+        a_bytes.len(),
+        if sha_a == sha_b {
+            "identical too"
+        } else {
+            "different: sibling order permuted on rebuild, per capture (b)"
+        }
+    );
+
+    // (8) Cleanup: the seeded paths + the UDT type + the scratch
+    // provider (the imported copy rides the provider delete).
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "delete",
+            "[default]P11Live",
+            "[default]_types_/MotorType",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("config delete cleanup (seeded paths + type)", &out);
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "provider",
+            "delete",
+            "p11live",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("provider delete p11live (guarded)", &out);
+}
+
+/// THE CSV round-trip live gate (11-06, TAGS-11) — the roadmap SC-2
+/// proof: a seeded subtree exports as CLI-GENERATED legacy CSV (the
+/// gateway cannot), imports through `importTagsFile`, and the
+/// re-exported JSON's field diff matches the documented lossy
+/// coverage table (11-LIVE-CAPTURES.md §Probe 5) — the live diff IS
+/// the table verification:
+///
+/// - **LANDED**: memory `value` (42), `tooltip`, `engUnit`, the
+///   expression (`1+1`);
+/// - **SILENTLY DROPPED**: alarms (the seeded alarm is ABSENT from
+///   the imported model — the live proof of "CSV does not include
+///   support for alarm configurations", stronger: silent);
+/// - **legacy-default materialization**: every CSV-imported atomic
+///   tag instantiates the full legacy sheet (`AlertAckMode` et al.)
+///   that configure-created tags do NOT carry — asserted as the
+///   original-vs-imported contrast.
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_csv_roundtrip() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
+
+    // Self-deploy FIRST (the redeploy-sequencing pin) — keep the
+    // standing 5-route bundle.
+    let out = ign(
+        &config,
+        &env,
+        &["webdev", "deploy", "--with-script-exec", "--compact"],
+    );
+    expect_ok("deploy (the gate's own precondition)", &out);
+
+    // Pre-clean leftovers (idempotent re-runs).
+    clean_tag_configs(&config, &env, &["[default]P11CsvSeed"]);
+    clean_provider(&config, &env, "p11csv");
+
+    // Seed: a folder with one memory tag (tooltip + engUnit), one
+    // expression tag, one ALARMED tag — the three coverage-table
+    // classes in one subtree.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let seed = tmp.path().join("seed.json");
+    std::fs::write(
+        &seed,
+        serde_json::json!({
+            "tagType": "Folder",
+            "tags": [
+                {
+                    "name": "TMem",
+                    "tagType": "AtomicTag",
+                    "dataType": "Int4",
+                    "value": 42,
+                    "tooltip": "e2e csv",
+                    "engUnit": "PSI"
+                },
+                {
+                    "name": "TExpr",
+                    "tagType": "AtomicTag",
+                    "valueSource": "expression",
+                    "expression": "1+1"
+                },
+                {
+                    "name": "TAlarmed",
+                    "tagType": "AtomicTag",
+                    "dataType": "Int4",
+                    "value": 0,
+                    "alarms": [
+                        {"name": "HighLimit", "mode": "AboveValue", "setpointA": 100, "priority": "High"}
+                    ]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write seed");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "create",
+            "[default]P11CsvSeed",
+            "--file",
+            seed.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("config create the P11CsvSeed folder", &out);
+
+    // The ORIGINAL JSON export — the legacy-sheet contrast baseline
+    // (configure-created tags carry NO AlertAckMode).
+    let orig_path = tmp.path().join("orig.json");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[default]P11CsvSeed",
+            "--format",
+            "json",
+            "-o",
+            orig_path.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("export the original as json", &out);
+    let orig: Value =
+        serde_json::from_slice(&std::fs::read(&orig_path).expect("orig.json readable"))
+            .expect("orig.json parses");
+    let orig_tmem = orig["tags"]
+        .as_array()
+        .expect("children[]")
+        .iter()
+        .find(|tag| tag["name"] == "TMem")
+        .expect("TMem in the original export");
+    assert!(
+        orig_tmem.get("AlertAckMode").is_none(),
+        "baseline: configure-created tags carry NO legacy sheet: {orig_tmem}"
+    );
+
+    // CLI-GENERATED CSV export (the gateway cannot; the lossy
+    // warnings ride stderr — the warn-and-continue posture).
+    let c_path = tmp.path().join("c.csv");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[default]P11CsvSeed",
+            "--format",
+            "csv",
+            "-o",
+            c_path.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("export the seed as generated csv", &out);
+    let csv_text = std::fs::read_to_string(&c_path).expect("c.csv readable");
+    assert!(
+        csv_text.starts_with("Path,Name,") && csv_text.contains("# version=1"),
+        "the generated CSV carries the legacy header + version marker"
+    );
+
+    // Scratch provider + the guarded CSV import (--yes: the csv scan
+    // ALWAYS reports csv_no_alarms + csv_legacy_columns_only on
+    // non-empty files). CAPTURE FACT: the CSV basePath is IGNORED —
+    // rows land at the PROVIDER ROOT regardless ([p11csv]TMem, …).
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "create", "p11csv", "--compact"],
+    );
+    expect_ok("provider create p11csv", &out);
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            c_path.to_str().expect("path"),
+            "--format",
+            "csv",
+            "--provider",
+            "p11csv",
+            "--collision-policy",
+            "overwrite",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("import the generated csv --yes", &out);
+    let envelope = data_envelope(&out);
+    assert_eq!(envelope["data"]["format"], "csv", "{envelope}");
+    assert_eq!(
+        envelope["data"]["failed"].as_array().map(Vec::len),
+        Some(0),
+        "all-or-nothing import answered clean: {envelope}"
+    );
+
+    // Export the imported model back as JSON and diff against the
+    // coverage table.
+    let back_path = tmp.path().join("back.json");
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "export",
+            "[p11csv]TMem",
+            "[p11csv]TExpr",
+            "[p11csv]TAlarmed",
+            "--format",
+            "json",
+            "-o",
+            back_path.to_str().expect("path"),
+            "--compact",
+        ],
+    );
+    expect_ok("export the imported tags as json", &out);
+    let back: Value =
+        serde_json::from_slice(&std::fs::read(&back_path).expect("back.json readable"))
+            .expect("back.json parses");
+    let find = |name: &str| -> Value {
+        back["tags"]
+            .as_array()
+            .expect("children[]")
+            .iter()
+            .find(|tag| tag["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in the imported export: {back}"))
+            .clone()
+    };
+    // LANDED (coverage table): value + tooltip + engUnit.
+    let tmem = find("TMem");
+    assert_eq!(tmem["value"], 42, "CSV Value lands: {tmem}");
+    assert_eq!(tmem["tooltip"], "e2e csv", "CSV Tooltip lands: {tmem}");
+    assert_eq!(tmem["engUnit"], "PSI", "CSV EngUnit lands: {tmem}");
+    // LANDED: the expression.
+    assert_eq!(find("TExpr")["expression"], "1+1", "CSV Expression lands");
+    // SILENTLY DROPPED: the alarm never arrives (csv_no_alarms —
+    // the live proof the docs' one-liner understates: silent).
+    let tal = find("TAlarmed");
+    assert!(
+        tal.get("alarms").is_none(),
+        "CSV alarms are SILENTLY dropped — none may arrive: {tal}"
+    );
+    // Legacy-default materialization: the imported tag instantiates
+    // the legacy sheet its configure-created original lacked.
+    assert!(
+        tmem.get("AlertAckMode").is_some(),
+        "CSV import materializes the legacy sheet (AlertAckMode present): {tmem}"
+    );
+    println!(
+        "csv round-trip diff vs coverage table: value/tooltip/engUnit/expression LANDED; \
+         alarms SILENTLY absent; legacy sheet materialized — live re-proven"
+    );
+
+    // Cleanup: both sides of the transfer.
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "config",
+            "delete",
+            "[default]P11CsvSeed",
+            "[p11csv]TMem",
+            "[p11csv]TExpr",
+            "[p11csv]TAlarmed",
+            "--yes",
+            "--compact",
+        ],
+    );
+    expect_ok("config delete cleanup (both sides)", &out);
+    let out = ign(
+        &config,
+        &env,
+        &["tags", "provider", "delete", "p11csv", "--yes", "--compact"],
+    );
+    expect_ok("provider delete p11csv (guarded)", &out);
+}
+
+/// THE loss-gate refusal live gate (11-06, TAGS-12 / roadmap SC-3) —
+/// READ-ONLY by construction: a loss-bearing XML fixture (a
+/// gateway-shaped document carrying `MinVersion` + a UdtType
+/// definition + a CompoundProperty alarms block) meets
+/// `ign tags import` WITHOUT `--yes` and the gate refuses
+/// PRE-RESOLUTION: exit 2, `invalid_input`, `profile` null (no
+/// resolution ever happened), the report prose on stderr naming the
+/// stable scan codes — and ZERO route calls (provable because the
+/// refusal fires before any wire work: there is no route-layer
+/// envelope or error shape in the answer, and no gateway contact is
+/// even required). No seeding, no mutations env.
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN (read-only — the refusal is pre-resolution, no mutations env needed)"]
+async fn live_tags_loss_gate_refusal() {
+    let Some(env) = ({
+        match (live_url(), live_token()) {
+            (Some(url), Some(token)) => Some(LiveEnv { url, token }),
+            _ => None,
+        }
+    }) else {
+        skip(
+            "IGNITION_LIVE_URL/IGNITION_LIVE_TOKEN not set — nothing to point the read-only refusal at",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+    let _gate = LIVE_GATE.lock().await;
+
+    // The loss-bearing fixture: gateway-shaped (MinVersion root attr
+    // → xml_export_edited_only), carries a UdtType definition
+    // (→ xml_udt_type_definition — importTags refuses those
+    // outright, the captured verbatim refusal) and a CompoundProperty
+    // alarms block.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fixture = tmp.path().join("lossy.xml");
+    std::fs::write(
+        &fixture,
+        r#"<Tags MinVersion="8.0.0" locale="en_US">
+   <Tag name="MotorType" type="UdtType">
+      <Parameters>
+         <Property name="MotorNumber" type="Integer">1</Property>
+      </Parameters>
+      <Tags>
+         <Tag name="Amps" type="AtomicTag">
+            <Property name="valueSource">opc</Property>
+            <CompoundProperty name="alarms">
+               <PropertySet>
+                  <Property name="setpointA">25</Property>
+                  <Property name="name">Low Amps</Property>
+                  <Property name="priority">3</Property>
+               </PropertySet>
+            </CompoundProperty>
+         </Tag>
+      </Tags>
+   </Tag>
+</Tags>
+"#,
+    )
+    .expect("write fixture");
+
+    // NO --yes, default abort policy: the loss gate refuses before
+    // resolution — the provider name is irrelevant (never resolved).
+    let out = ign(
+        &config,
+        &env,
+        &[
+            "tags",
+            "import",
+            "--file",
+            fixture.to_str().expect("path"),
+            "--format",
+            "xml",
+            "--provider",
+            "default",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the loss gate refuses exit 2; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = err_envelope(&out);
+    assert_eq!(envelope["error"]["code"], "invalid_input", "{envelope}");
+    assert!(
+        envelope["profile"].is_null(),
+        "PRE-RESOLUTION: no profile resolved, zero wire work: {envelope}"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("loss report (xml)"),
+        "the report prose leads the refusal: {envelope}"
+    );
+    assert!(
+        message.contains("[xml_export_edited_only]"),
+        "the MinVersion fact is named: {envelope}"
+    );
+    assert!(
+        message.contains("[xml_udt_type_definition]"),
+        "the UdtType-definition fact is named: {envelope}"
+    );
+    assert!(
+        message.contains("re-run with --yes to import anyway"),
+        "the --yes hint closes the prose: {envelope}"
+    );
+    assert!(
+        !message.contains("route_error") && !message.contains("gateway_client_error"),
+        "ZERO route calls: no route-layer error shape anywhere: {envelope}"
+    );
+    println!(
+        "loss-gate refusal: exit 2 pre-resolution, report prose carried \
+         xml_export_edited_only + xml_udt_type_definition, zero route calls"
+    );
 }

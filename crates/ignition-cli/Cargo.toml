@@ -38,3 +38,5 @@ wiremock = { workspace = true } # binary-level gateway contract tests (version e
 reqwest = { workspace = true } # e2e openapi-capture gate fetches /openapi.json directly (03-03)
 zip = { workspace = true } # dev-only (05-02): binary-level goldens build export-zip fixtures — same crate ignition-core already depends on, NOT a new dependency
 base64 = { workspace = true } # dev-only (11-05): the xml/csv pins compute file_b64/payload_b64 expectations byte-exactly — same crate ignition-core already depends on, NOT a new dependency
+sha2 = { workspace = true } # dev-only (11-06): the live fidelity oracle records sha256(A/B) evidence — already in the tree transitively (via zbus), NOT a new dependency
+quick-xml = { workspace = true } # dev-only (11-06): the order-normalized structural oracle's canonicalizer — same crate ignition-core already depends on, NOT a new dependency
