@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
-**Current Plan:** 5
+**Current Plan:** 6
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-12
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 99%
 
 ## Performance Metrics
 
@@ -59,6 +59,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 11 P02 | 25min | 2 tasks | 9 files |
 | Phase 11 P03 | 20h 32m (overnight gap) | 2 tasks | 7 files |
 | Phase 11 P04 | 49 min | 3 tasks | 9 files |
+| Phase 11 P05 | 33 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -142,6 +143,9 @@ Recent decisions affecting current work:
 - [Phase 11]: 11-04: timeout override rides a DEFAULT trait method (webdev_route_call_with_timeout delegating to webdev_route_call) — only GatewayClient overrides; 17 test doubles inherit untouched — minimal blast radius on the 17-impl GatewayApi surface
 - [Phase 11]: 11-04: the transfer seam is base64-only (decode payload_b64 out / encode file_b64 in) — grep-provable: zero XML/CSV Readers in tags.rs; the scan REPLACES a re-parse for names/tallies/facts — the byte-faithfulness invariant, planner lock
 - [Phase 11]: 11-04: CAPTURE-WINS CSV generation — Path cells ALWAYS empty (non-empty Path NPEs the importer, probe 5); folder flattening + TagType-13 UDT-type placeholders REPORTED as coercions; TagsImportResult.failed records Bad_Failure elements verbatim (element-not-exception semantics) — plan reconciliation clause + probe-2d honesty
+- [Phase 11]: TAGS-12 loss gate is ONE function in dispatch (loss_gate): pre-resolution scan, the prose report IS the exit-2 invalid_input refusal (profile null, zero requests), --yes attaches data.loss_report; imports only — csv generation warns-and-continues — 10-04 preview_then_confirm lesson: one gate means the refusal shape cannot drift
+- [Phase 11]: data.loss_report is ONE additive envelope key with two shapes (import scan: facts+top_level_names; csv generation: dropped_keys+coerced+rows) on a LossReport struct skip-serialized at None — pre-11-05 envelopes byte-identical — envelope lock mandates the key; additive-only frozen contract
+- [Phase 11]: Mixed-parent export gets NO gate — Probe 4 proves silent Unknown-corruption PRE-EXISTS in the JSON interchange (not a hard failure, not new-format); xml/csv stdout mode writes RAW bytes in every render mode (fourth exception extended), human summary on stderr — planner lock's own no-check branch + capture-first honesty; pipes stay pure
 
 ### Pending Todos
 
@@ -157,5 +161,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-12T13:58:41.443Z
+**Last session:** 2026-09-12T14:43:51.225Z
 **Resume file:** None
