@@ -198,10 +198,7 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
             let text = body
                 .lines()
                 .map(Line::from)
-                .chain([
-                    Line::default(),
-                    Line::from("y to confirm · Esc to cancel"),
-                ])
+                .chain([Line::default(), Line::from("y to confirm · Esc to cancel")])
                 .collect::<Vec<_>>();
             frame.render_widget(
                 Paragraph::new(text)
@@ -871,8 +868,8 @@ mod tests {
         let at = rows[top][..rows[top]
             .find("┌suspend eam task")
             .expect("modal top-left corner")]
-        .chars()
-        .count();
+            .chars()
+            .count();
         let bottom = (top + 1..rows.len())
             .find(|&y| rows[y].chars().nth(at) == Some('└'))
             .expect("modal bottom border renders");

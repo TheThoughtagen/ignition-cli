@@ -637,18 +637,16 @@ async fn scratch_cleanup_future(url: String, token: String, name: String) {
         Ok(record) => {
             if let Some(signature) = record.signature.clone() {
                 match api.eam_task_delete(&name, &signature, false).await {
-                    Ok(_) => eprintln!(
-                        "cleanup: scratch task {name:?} best-effort deleted (Drop path)"
-                    ),
+                    Ok(_) => {
+                        eprintln!("cleanup: scratch task {name:?} best-effort deleted (Drop path)")
+                    }
                     Err(err) => eprintln!(
                         "cleanup: scratch task {name:?} Drop-time delete FAILED — remove it manually: {err}"
                     ),
                 }
             }
         }
-        Err(_) => eprintln!(
-            "cleanup: scratch task {name:?} not found at Drop (already gone)"
-        ),
+        Err(_) => eprintln!("cleanup: scratch task {name:?} not found at Drop (already gone)"),
     }
 }
 
@@ -673,18 +671,17 @@ impl Drop for ScratchTaskGuard {
                 // cancels pending tasks), while the blocking pool is JOINED at
                 // runtime drop — and a spawn_blocking thread is not an async
                 // context, so a fresh runtime + block_on is legal there.
-                tokio::runtime::Handle::current()
-                    .spawn_blocking(move || {
-                        tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("cleanup runtime builds")
-                            .block_on(scratch_cleanup_future(
-                                url.clone(),
-                                token.clone(),
-                                name_for_cleanup.clone(),
-                            ));
-                    });
+                tokio::runtime::Handle::current().spawn_blocking(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("cleanup runtime builds")
+                        .block_on(scratch_cleanup_future(
+                            url.clone(),
+                            token.clone(),
+                            name_for_cleanup.clone(),
+                        ));
+                });
             } else {
                 // No ambient runtime (Drop after the test runtime is gone):
                 // the original fresh-current-thread path, verbatim.
@@ -896,7 +893,9 @@ async fn live_eam_write_lifecycle() {
         panic!(
             "suspended scratch task must vanish from scheduled/false within ~90s (capture §2) — \
              grace row seen: {grace_seen}; last observed taskState: {:?}",
-            last_state.as_deref().unwrap_or("(row never observed after suspend)")
+            last_state
+                .as_deref()
+                .unwrap_or("(row never observed after suspend)")
         )
     });
     eprintln!(
@@ -985,8 +984,7 @@ async fn live_eam_write_lifecycle() {
 const UNWIND_SCRATCH: &str = "ign-live-scratch-unwind";
 const UNWIND_SIGNATURE: &str = "sigunwindproof";
 const UNWIND_FIND_PATH: &str = "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/ign%2Dlive%2Dscratch%2Dunwind";
-const UNWIND_DELETE_PATH: &str =
-    "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks/ign%2Dlive%2Dscratch%2Dunwind/sigunwindproof";
+const UNWIND_DELETE_PATH: &str = "/data/api/v1/resources/com.inductiveautomation.eam/eam-tasks/ign%2Dlive%2Dscratch%2Dunwind/sigunwindproof";
 
 #[tokio::test]
 async fn guard_drop_during_unwind_inside_runtime_still_cleans_up() {
@@ -999,8 +997,8 @@ async fn guard_drop_during_unwind_inside_runtime_still_cleans_up() {
     //     (200 success:true — the §3b lone-resource shape).
     wiremock::Mock::given(method("GET"))
         .and(path(UNWIND_FIND_PATH))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "name": UNWIND_SCRATCH,
                 "collection": "eam-tasks",
                 "type": "com.inductiveautomation.eam",
@@ -1010,8 +1008,8 @@ async fn guard_drop_during_unwind_inside_runtime_still_cleans_up() {
                     "currentState": "IDLE",
                     "details": {"owner": "eam", "nextScheduled": null}
                 }
-            }),
-        ))
+            })),
+        )
         .mount(&server)
         .await;
     wiremock::Mock::given(method("DELETE"))
