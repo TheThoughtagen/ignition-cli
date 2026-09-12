@@ -5,6 +5,11 @@
 //! it never refuses a file the gateway would accept; partial knowledge rides
 //! the report as [`LossFact`] entries, and hard refusals are the gateway's job.
 
+use quick_xml::XmlVersion;
+use quick_xml::events::BytesStart;
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+
 /// One advisory loss finding: a stable machine code plus a human-readable
 /// detail line (the report content 11-05 renders to stderr and embeds as
 /// `data.loss_report`).
@@ -37,12 +42,264 @@ pub struct CsvScan {
     pub facts: Vec<LossFact>,
 }
 
-pub fn scan_xml(_raw: &[u8]) -> XmlScan {
-    XmlScan::default()
+pub fn scan_xml(raw: &[u8]) -> XmlScan {
+    let mut reader = Reader::from_reader(raw);
+    reader.config_mut().check_end_names = true;
+    let mut buf = Vec::new();
+    let mut scan = XmlScan::default();
+    let mut depth: usize = 0;
+    let mut saw_root = false;
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let name = e.name();
+                if !saw_root {
+                    saw_root = true;
+                    scan.root_attrs = collect_attrs(e);
+                } else if name.as_ref() == b"Tag"
+                    && depth == 1
+                    && let Some(n) = attr_value(e, b"name")
+                {
+                    push_unique(&mut scan.top_level_names, n);
+                }
+                match name.as_ref() {
+                    b"Tag" => {
+                        scan.tag_count += 1;
+                        if let Some(t) = attr_value(e, b"type") {
+                            push_unique(&mut scan.types_seen, t);
+                        }
+                    }
+                    b"CompoundProperty" => scan.has_compound_property = true,
+                    _ => {}
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                if !saw_root {
+                    saw_root = true;
+                    scan.root_attrs = collect_attrs(e);
+                }
+                match name.as_ref() {
+                    b"Tag" => {
+                        scan.tag_count += 1;
+                        if let Some(t) = attr_value(e, b"type") {
+                            push_unique(&mut scan.types_seen, t);
+                        }
+                        if depth == 1
+                            && let Some(n) = attr_value(e, b"name")
+                        {
+                            push_unique(&mut scan.top_level_names, n);
+                        }
+                    }
+                    b"CompoundProperty" => scan.has_compound_property = true,
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                scan.partial = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if scan.partial {
+        scan.facts.push(LossFact {
+            code: "xml_parse_partial",
+            detail: format!(
+                "XML parse ended early (malformed/truncated input); the report reflects the \
+                 {} Tag element(s) readable before the error — the gateway makes the final call",
+                scan.tag_count
+            ),
+        });
+    }
+    if let Some((_, min_version)) = scan
+        .root_attrs
+        .iter()
+        .find(|(k, _)| k == "MinVersion")
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        scan.facts.push(LossFact {
+            code: "xml_export_edited_only",
+            detail: format!(
+                "gateway-export-shaped file (MinVersion=\"{min_version}\"): exports carry ONLY \
+                 edited properties — unset properties ride defaults or the referenced UDT type"
+            ),
+        });
+    }
+    if scan.types_seen.iter().any(|t| t == "UdtType") {
+        scan.facts.push(LossFact {
+            code: "xml_udt_type_definition",
+            detail: "file contains UDT type definition(s) (type=\"UdtType\") — importTags \
+                     refuses them (\"Udt definitions can only be imported in the UDT \
+                     Definitions tab\"), so the import lands nothing"
+                .to_string(),
+        });
+    }
+    scan
 }
 
-pub fn scan_csv(_raw: &[u8]) -> CsvScan {
-    CsvScan::default()
+pub fn scan_csv(raw: &[u8]) -> CsvScan {
+    let mut scan = CsvScan::default();
+    if raw.iter().all(|&b| b.is_ascii_whitespace()) {
+        return scan;
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(raw);
+    let mut records: Vec<Vec<String>> = Vec::new();
+    for record in reader.records().flatten() {
+        // Lenient: malformed records (bad UTF-8, unbalanced quote) are skipped
+        // by the flatten above, never a refusal — the gateway owns the verdict.
+        records.push(record.iter().map(|c| c.to_string()).collect());
+    }
+    let is_marker = |record: &[String]| {
+        record
+            .first()
+            .map(|cell| {
+                cell.trim()
+                    .trim_start_matches('\u{feff}')
+                    .starts_with("# version=")
+            })
+            .unwrap_or(false)
+    };
+    scan.has_version_marker = records.iter().any(|r| is_marker(r));
+    let body: Vec<&Vec<String>> = records.iter().filter(|r| !is_marker(r)).collect();
+    let columns: Vec<String> = body.first().map(|h| (*h).clone()).unwrap_or_default();
+    scan.columns = columns.clone();
+    let data: Vec<&&Vec<String>> = body.iter().skip(1).collect();
+    scan.row_count = data.len();
+
+    let idx_of = |name: &str| {
+        columns.iter().position(|c| {
+            c.trim()
+                .trim_start_matches('\u{feff}')
+                .eq_ignore_ascii_case(name)
+        })
+    };
+    let name_idx = idx_of("name");
+    let path_idx = idx_of("path");
+    let enum_cols: Vec<usize> = ["tagtype", "datatype", "accessrights"]
+        .iter()
+        .filter_map(|c| idx_of(c))
+        .collect();
+
+    for row in &data {
+        let name = name_idx
+            .and_then(|i| row.get(i))
+            .map(|s| s.trim())
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let path = path_idx
+            .and_then(|i| row.get(i))
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let top = if path.is_empty() {
+            name.to_string()
+        } else {
+            match path.find('/') {
+                Some(0) => continue,
+                Some(i) => path[..i].to_string(),
+                None => path.to_string(),
+            }
+        };
+        if !top.is_empty() {
+            push_unique(&mut scan.top_level_names, top);
+        }
+    }
+
+    for (row_num, row) in data.iter().enumerate() {
+        for &col_idx in &enum_cols {
+            if let Some(cell) = row.get(col_idx) {
+                let value = cell.trim();
+                if value.parse::<i64>().is_ok() {
+                    scan.numeric_enum_count += 1;
+                    scan.facts.push(LossFact {
+                        code: "csv_numeric_enum",
+                        detail: format!(
+                            "column {} carries numeric enum value {} (data row {})",
+                            columns[col_idx].trim(),
+                            value,
+                            row_num + 1
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    if !records.is_empty() {
+        scan.facts.push(LossFact {
+            code: "csv_no_alarms",
+            detail: "the legacy CSV format cannot carry alarm configurations — alarms never \
+                     arrive on import (silently dropped even via the undocumented AlarmStates \
+                     column)"
+                .to_string(),
+        });
+        scan.facts.push(LossFact {
+            code: "csv_legacy_columns_only",
+            detail: "file uses the legacy column vocabulary — modern properties (tag groups, \
+                     bindings, UDT parameter overrides) are not expressible in CSV"
+                .to_string(),
+        });
+        if !scan.has_version_marker {
+            scan.facts.push(LossFact {
+                code: "csv_missing_version_marker",
+                detail: "no '# version=N' marker row found — the gateway rejects marker-less \
+                         CSV ('Unknown CSV Format')"
+                    .to_string(),
+            });
+        }
+    }
+    scan
+}
+
+/// First attribute value with the given (byte) key, entity-normalized; `None`
+/// when the attribute is absent or malformed — absence is never an error here.
+/// Normalization assumes XML 1.0 (gateway exports carry no declaration).
+fn attr_value(element: &BytesStart, key: &[u8]) -> Option<String> {
+    element
+        .attributes()
+        .flatten()
+        .find(|attr| attr.key.as_ref() == key)
+        .and_then(|attr| {
+            attr.normalized_value(XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
+        })
+}
+
+/// All root-element attributes in encounter order; malformed entries skipped.
+fn collect_attrs(element: &BytesStart) -> Vec<(String, String)> {
+    element
+        .attributes()
+        .flatten()
+        .filter_map(|attr| {
+            attr.normalized_value(XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| {
+                    (
+                        String::from_utf8_lossy(attr.key.as_ref()).into_owned(),
+                        v.into_owned(),
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Order-preserving dedupe push (report vocabulary, not a multiset).
+fn push_unique(target: &mut Vec<String>, value: String) {
+    if !target.iter().any(|t| t == &value) {
+        target.push(value);
+    }
 }
 
 #[cfg(test)]
@@ -85,14 +342,16 @@ mod tests {
         assert_eq!(scan.types_seen, vec!["AtomicTag".to_string()]);
         assert!(scan.has_compound_property);
         assert_eq!(scan.top_level_names, vec!["Amps".to_string()]);
-        assert!(scan
-            .root_attrs
-            .iter()
-            .any(|(k, v)| k == "MinVersion" && v == "8.0.0"));
-        assert!(scan
-            .root_attrs
-            .iter()
-            .any(|(k, v)| k == "locale" && v == "en_US"));
+        assert!(
+            scan.root_attrs
+                .iter()
+                .any(|(k, v)| k == "MinVersion" && v == "8.0.0")
+        );
+        assert!(
+            scan.root_attrs
+                .iter()
+                .any(|(k, v)| k == "locale" && v == "en_US")
+        );
         assert!(
             has_fact(&scan.facts, "xml_export_edited_only"),
             "MinVersion root attr must trigger the export-shape advisory; got {:?}",
@@ -113,7 +372,10 @@ mod tests {
             "the real capture must parse clean; got facts {:?}",
             scan.facts
         );
-        assert_eq!(scan.tag_count, 8, "P11UDT+M2+Sub+M3+M1+MotorType+Doubled+Amps");
+        assert_eq!(
+            scan.tag_count, 8,
+            "P11UDT+M2+Sub+M3+M1+MotorType+Doubled+Amps"
+        );
         assert!(scan.has_compound_property, "alarms were seeded in 11-01");
         assert_eq!(
             scan.top_level_names,
@@ -126,10 +388,11 @@ mod tests {
                 scan.types_seen
             );
         }
-        assert!(scan
-            .root_attrs
-            .iter()
-            .any(|(k, v)| k == "MinVersion" && v == "8.0.0"));
+        assert!(
+            scan.root_attrs
+                .iter()
+                .any(|(k, v)| k == "MinVersion" && v == "8.0.0")
+        );
         assert!(has_fact(&scan.facts, "xml_export_edited_only"));
         // 11-01 capture decision: the scan must surface UdtType presence —
         // importTags REFUSES type definitions and lands nothing.
@@ -138,14 +401,27 @@ mod tests {
 
     #[test]
     fn scan_xml_truncated_input_reports_partial_without_error() {
-        const TRUNCATED: &[u8] = b"<Tags MinVersion=\"8.0.0\" locale=\"en_US\">\r\n   <Tag name=\"X\"";
+        // One COMPLETE Tag element, then an open tag cut mid-header: quick-xml
+        // never emits a Start event for an unterminated element header, so the
+        // truncation error fires while reading `<Tag name="Y"` — the complete
+        // Tag seen before the error still rides the report.
+        const TRUNCATED: &[u8] =
+            b"<Tags MinVersion=\"8.0.0\" locale=\"en_US\">\r\n   <Tag name=\"X\" type=\"AtomicTag\"/>\r\n   <Tag name=\"Y\"";
         let scan = scan_xml(TRUNCATED);
         assert!(scan.partial, "truncated input must flag partial");
-        assert_eq!(scan.tag_count, 1, "the Tag seen before the error is reported");
+        assert_eq!(
+            scan.tag_count, 1,
+            "the Tag seen before the error is reported"
+        );
         assert!(has_fact(&scan.facts, "xml_parse_partial"));
         assert!(
             scan.top_level_names.contains(&"X".to_string()),
             "whatever was readable before the error rides the report"
+        );
+        assert_eq!(
+            scan.root_attrs.len(),
+            2,
+            "root attrs captured before the error"
         );
     }
 
@@ -253,7 +529,8 @@ P11Csv/,OPC in a folder,,0,2,,TRUE,Read_Write,Ignition OPC-UA Server,[devicename
         // A quoted Expression cell containing a real newline — RFC-4180 quoting.
         // If hand-rolled parsing snuck in, this row would split and row_count
         // would break.
-        const MULTILINE: &str = "Path,Name,TagType,DataType,Expression\r\n,MultiLine,1,7,\"line1\nline2\"\r\n";
+        const MULTILINE: &str =
+            "Path,Name,TagType,DataType,Expression\r\n,MultiLine,1,7,\"line1\nline2\"\r\n";
         let scan = scan_csv(MULTILINE.as_bytes());
         assert_eq!(scan.row_count, 1);
         assert_eq!(scan.top_level_names, vec!["MultiLine".to_string()]);
