@@ -1495,6 +1495,7 @@ name = "ignition-cli"
 version = "1.0.0"
 dependencies = [
  "assert_cmd",
+ "base64",
  "clap",
  "clap_complete",
  "ignition-core",
