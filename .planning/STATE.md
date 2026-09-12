@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
-**Current Plan:** 4
+**Current Plan:** 5
 **Total Plans in Phase:** 6
 **Status:** Ready to execute
 **Last Activity:** 2026-09-12
 
-**Progress:** [██████████] 96%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 11 P01 | 56 min | 3 tasks | 4 files |
 | Phase 11 P02 | 25min | 2 tasks | 9 files |
 | Phase 11 P03 | 20h 32m (overnight gap) | 2 tasks | 7 files |
+| Phase 11 P04 | 49 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -138,6 +139,9 @@ Recent decisions affecting current work:
 - [Phase 11]: [Phase 11 / 11-02]: ROUTE_BUNDLE_VERSION 1.1.0 -> 1.2.0 landed ATOMICALLY in one seven-file commit (five route constants + mod.rs + routes/VERSION), MIN_CLI stays 1.0 — the three-way pin test is the enforcement; wiremock REQUEST pins for the new bodies landed at the raw webdev_route_call layer before their action-layer consumers exist (11-04) — Research Pattern 4: bump atomicity machine-enforced; pins precede consumers
 - [Phase 11]: 11-03: TAGS-12 loss scans are pure advisory fns (scan_xml/scan_csv) that NEVER refuse — partial parses set partial=true + xml_parse_partial fact and report what was readable; refusals are the gateway's job — Planner advisory-posture lock; TDD'd over the real 11-01 UDT capture (8 Tags, P11UDT+MotorType top-level, alarms detected) — roadmap real-export validation flag closed
 - [Phase 11]: 11-03: quick-xml 0.41 default features ONLY (serde-derive rejected, rationale in Cargo.toml); csv_no_alarms + csv_legacy_columns_only are UNCONDITIONAL facts for non-empty CSV scans; xml_udt_type_definition fact surfaces the capture-proven 'importTags refuses type definitions, lands nothing' for 11-04/11-05/11-06; codes are stable pub consts (codes module) — Report contract for the 11-04 import pre-check, 11-05 loss gate, and 11-06 oracle exclusions (types_seen UdtType)
+- [Phase 11]: 11-04: timeout override rides a DEFAULT trait method (webdev_route_call_with_timeout delegating to webdev_route_call) — only GatewayClient overrides; 17 test doubles inherit untouched — minimal blast radius on the 17-impl GatewayApi surface
+- [Phase 11]: 11-04: the transfer seam is base64-only (decode payload_b64 out / encode file_b64 in) — grep-provable: zero XML/CSV Readers in tags.rs; the scan REPLACES a re-parse for names/tallies/facts — the byte-faithfulness invariant, planner lock
+- [Phase 11]: 11-04: CAPTURE-WINS CSV generation — Path cells ALWAYS empty (non-empty Path NPEs the importer, probe 5); folder flattening + TagType-13 UDT-type placeholders REPORTED as coercions; TagsImportResult.failed records Bad_Failure elements verbatim (element-not-exception semantics) — plan reconciliation clause + probe-2d honesty
 
 ### Pending Todos
 
@@ -153,5 +157,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-12T13:02:01.002Z
+**Last session:** 2026-09-12T13:58:41.443Z
 **Resume file:** None

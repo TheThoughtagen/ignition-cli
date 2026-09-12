@@ -179,7 +179,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 8. 08-foundations-session-core-config-contract | v1.1 | 6/6 | Complete | 2026-09-06 |
 | 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
 | 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
-| 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 1/6 | In progress | 11-01 live captures done 2026-09-11 (5/5 probes, UDT XML fixture, CSV coverage table) |
+| 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 4/6 | In progress | 11-01 captures + 11-02 route actions (1.2.0) + 11-03 loss scans + 11-04 core transfer layer done 2026-09-12; 11-05 CLI contract layer next |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |
 | 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |
