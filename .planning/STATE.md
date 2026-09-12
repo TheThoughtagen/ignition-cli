@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
-**Current Plan:** 3
+**Current Plan:** 4
 **Total Plans in Phase:** 6
-**Status:** 11-02 complete (route actions + atomic 1.2.0 bump + wiremock pins) — 11-03 executing in parallel; ready for 11-04 after
-**Last Activity:** 2026-09-11
+**Status:** Ready to execute
+**Last Activity:** 2026-09-12
 
-**Progress:** [█████████░] 94%
+**Progress:** [██████████] 96%
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 10 P06 | 27 min | 3 tasks | 4 files |
 | Phase 11 P01 | 56 min | 3 tasks | 4 files |
 | Phase 11 P02 | 25min | 2 tasks | 9 files |
+| Phase 11 P03 | 20h 32m (overnight gap) | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -135,6 +136,8 @@ Recent decisions affecting current work:
 - [Phase 11 / 11-01]: Captured XML artifacts are committed `-text` via .gitattributes — core.autocrlf=input silently CRLF→LF-normalized the fixture blob on first commit (caught by sha mismatch); byte-faithful captures must assert blob sha after commit
 - [Phase 11]: [Phase 11 / 11-02]: exportTags format=xml rides the kwargs+xml form Probe-1-proven on both rigs with the documented positional temp-file fallback retained defensively; importTagsFile has NO provider-root pre-flight (Probe 2: importTags is RpcContext-free, script-thread truth) with the No-RpcContext catch kept as honest WebDev-thread defense; XML crosses the envelope as payload_b64 base64 (CRLF document byte-exact); collisionPolicy LOCKED a/o with invalid_collision_policy refusal — 11-02 route design cites 11-LIVE-CAPTURES.md verbatim; WebDev-thread truth deferred to 11-06 live gate
 - [Phase 11]: [Phase 11 / 11-02]: ROUTE_BUNDLE_VERSION 1.1.0 -> 1.2.0 landed ATOMICALLY in one seven-file commit (five route constants + mod.rs + routes/VERSION), MIN_CLI stays 1.0 — the three-way pin test is the enforcement; wiremock REQUEST pins for the new bodies landed at the raw webdev_route_call layer before their action-layer consumers exist (11-04) — Research Pattern 4: bump atomicity machine-enforced; pins precede consumers
+- [Phase 11]: 11-03: TAGS-12 loss scans are pure advisory fns (scan_xml/scan_csv) that NEVER refuse — partial parses set partial=true + xml_parse_partial fact and report what was readable; refusals are the gateway's job — Planner advisory-posture lock; TDD'd over the real 11-01 UDT capture (8 Tags, P11UDT+MotorType top-level, alarms detected) — roadmap real-export validation flag closed
+- [Phase 11]: 11-03: quick-xml 0.41 default features ONLY (serde-derive rejected, rationale in Cargo.toml); csv_no_alarms + csv_legacy_columns_only are UNCONDITIONAL facts for non-empty CSV scans; xml_udt_type_definition fact surfaces the capture-proven 'importTags refuses type definitions, lands nothing' for 11-04/11-05/11-06; codes are stable pub consts (codes module) — Report contract for the 11-04 import pre-check, 11-05 loss gate, and 11-06 oracle exclusions (types_seen UdtType)
 
 ### Pending Todos
 
@@ -150,5 +153,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-11T16:53:38.715Z
+**Last session:** 2026-09-12T13:02:01.002Z
 **Resume file:** None
