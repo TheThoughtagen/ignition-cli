@@ -1,25 +1,56 @@
 //! TAGS-12 loss-report advisory scans (11-03).
 //!
 //! Pure functions over raw bytes — no I/O, no gateway, no network. Transfer is
-//! PASSTHROUGH: parsing exists ONLY to warn. The scan is lenient by contract —
-//! it never refuses a file the gateway would accept; partial knowledge rides
-//! the report as [`LossFact`] entries, and hard refusals are the gateway's job.
+//! PASSTHROUGH: parsing exists ONLY to warn (the 11-04/11-05 consumers key on
+//! [`codes`] and `top_level_names` — the scan output REPLACES a re-parse).
+//!
+//! # Advisory posture (planner lock)
+//!
+//! The scan NEVER refuses a file the gateway would accept. It returns a report
+//! of what it saw — `partial: true` plus [`codes::XML_PARSE_PARTIAL`] when the
+//! bytes cut short mid-parse — and hands the hard verdict to the gateway. An
+//! unparseable file is the gateway's error to make, not the scan's.
 
 use quick_xml::XmlVersion;
 use quick_xml::events::BytesStart;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
-/// One advisory loss finding: a stable machine code plus a human-readable
-/// detail line (the report content 11-05 renders to stderr and embeds as
-/// `data.loss_report`).
+/// Stable [`LossFact::code`] vocabulary — the report contract 11-05 renders
+/// and 11-04/11-06 key on. Codes are never renamed, only added.
+pub mod codes {
+    /// XML file is gateway-export-shaped (MinVersion root attr): exports carry
+    /// only EDITED properties, so re-import may differ from the live model.
+    pub const XML_EXPORT_EDITED_ONLY: &str = "xml_export_edited_only";
+    /// XML parse ended early (truncated/malformed input) — partial report.
+    pub const XML_PARSE_PARTIAL: &str = "xml_parse_partial";
+    /// File contains `type="UdtType"` definition(s): importTags refuses them
+    /// ("Udt definitions can only be imported in the UDT Definitions tab") —
+    /// the import lands nothing (11-01 probe 3, both rigs).
+    pub const XML_UDT_TYPE_DEFINITION: &str = "xml_udt_type_definition";
+    /// UNCONDITIONAL for non-empty CSV: the legacy format cannot carry alarm
+    /// configurations — alarms never arrive on import (11-01 probe 5).
+    pub const CSV_NO_ALARMS: &str = "csv_no_alarms";
+    /// UNCONDITIONAL for non-empty CSV: legacy column vocabulary only — modern
+    /// properties (tag groups, bindings, UDT parameter overrides) inexpressible.
+    pub const CSV_LEGACY_COLUMNS_ONLY: &str = "csv_legacy_columns_only";
+    /// A TagType/DataType/AccessRights cell carries a numeric enum value.
+    pub const CSV_NUMERIC_ENUM: &str = "csv_numeric_enum";
+    /// No `# version=N` marker row found — the gateway may reject the file.
+    pub const CSV_MISSING_VERSION_MARKER: &str = "csv_missing_version_marker";
+}
+
+/// One advisory loss finding: a stable machine code (see [`codes`]) plus a
+/// human-readable detail line (the report content 11-05 renders to stderr and
+/// embeds as `data.loss_report`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LossFact {
     pub code: &'static str,
     pub detail: String,
 }
 
-/// What an advisory scan of a tag-exchange XML document saw.
+/// What an advisory scan of a tag-exchange XML document saw: tallies and names
+/// only — never parsed tag models (the parse authority is the gateway).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct XmlScan {
     pub tag_count: usize,
@@ -31,7 +62,7 @@ pub struct XmlScan {
     pub facts: Vec<LossFact>,
 }
 
-/// What an advisory scan of a legacy CSV import saw.
+/// What an advisory scan of a legacy CSV import saw: tallies and names only.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CsvScan {
     pub has_version_marker: bool,
@@ -42,6 +73,11 @@ pub struct CsvScan {
     pub facts: Vec<LossFact>,
 }
 
+/// Advisory scan of a tag-exchange XML document (the gateway's export format).
+///
+/// Lenient by contract: a parse error sets `partial` + a
+/// [`codes::XML_PARSE_PARTIAL`] fact and reports whatever was readable — it
+/// never refuses. Deterministic; tallies and names only, no tag models.
 pub fn scan_xml(raw: &[u8]) -> XmlScan {
     let mut reader = Reader::from_reader(raw);
     reader.config_mut().check_end_names = true;
@@ -110,7 +146,7 @@ pub fn scan_xml(raw: &[u8]) -> XmlScan {
     }
     if scan.partial {
         scan.facts.push(LossFact {
-            code: "xml_parse_partial",
+            code: codes::XML_PARSE_PARTIAL,
             detail: format!(
                 "XML parse ended early (malformed/truncated input); the report reflects the \
                  {} Tag element(s) readable before the error — the gateway makes the final call",
@@ -125,7 +161,7 @@ pub fn scan_xml(raw: &[u8]) -> XmlScan {
         .map(|(k, v)| (k.clone(), v.clone()))
     {
         scan.facts.push(LossFact {
-            code: "xml_export_edited_only",
+            code: codes::XML_EXPORT_EDITED_ONLY,
             detail: format!(
                 "gateway-export-shaped file (MinVersion=\"{min_version}\"): exports carry ONLY \
                  edited properties — unset properties ride defaults or the referenced UDT type"
@@ -134,7 +170,7 @@ pub fn scan_xml(raw: &[u8]) -> XmlScan {
     }
     if scan.types_seen.iter().any(|t| t == "UdtType") {
         scan.facts.push(LossFact {
-            code: "xml_udt_type_definition",
+            code: codes::XML_UDT_TYPE_DEFINITION,
             detail: "file contains UDT type definition(s) (type=\"UdtType\") — importTags \
                      refuses them (\"Udt definitions can only be imported in the UDT \
                      Definitions tab\"), so the import lands nothing"
@@ -144,6 +180,11 @@ pub fn scan_xml(raw: &[u8]) -> XmlScan {
     scan
 }
 
+/// Advisory scan of a legacy CSV import (the gateway's import-only format).
+///
+/// Lenient by contract: malformed records are skipped, never refused. The
+/// `# version=N` marker may sit before OR after the header row (both shapes
+/// seen in the wild); marker rows are excluded from `row_count`.
 pub fn scan_csv(raw: &[u8]) -> CsvScan {
     let mut scan = CsvScan::default();
     if raw.iter().all(|&b| b.is_ascii_whitespace()) {
@@ -223,7 +264,7 @@ pub fn scan_csv(raw: &[u8]) -> CsvScan {
                 if value.parse::<i64>().is_ok() {
                     scan.numeric_enum_count += 1;
                     scan.facts.push(LossFact {
-                        code: "csv_numeric_enum",
+                        code: codes::CSV_NUMERIC_ENUM,
                         detail: format!(
                             "column {} carries numeric enum value {} (data row {})",
                             columns[col_idx].trim(),
@@ -238,21 +279,21 @@ pub fn scan_csv(raw: &[u8]) -> CsvScan {
 
     if !records.is_empty() {
         scan.facts.push(LossFact {
-            code: "csv_no_alarms",
+            code: codes::CSV_NO_ALARMS,
             detail: "the legacy CSV format cannot carry alarm configurations — alarms never \
                      arrive on import (silently dropped even via the undocumented AlarmStates \
                      column)"
                 .to_string(),
         });
         scan.facts.push(LossFact {
-            code: "csv_legacy_columns_only",
+            code: codes::CSV_LEGACY_COLUMNS_ONLY,
             detail: "file uses the legacy column vocabulary — modern properties (tag groups, \
                      bindings, UDT parameter overrides) are not expressible in CSV"
                 .to_string(),
         });
         if !scan.has_version_marker {
             scan.facts.push(LossFact {
-                code: "csv_missing_version_marker",
+                code: codes::CSV_MISSING_VERSION_MARKER,
                 detail: "no '# version=N' marker row found — the gateway rejects marker-less \
                          CSV ('Unknown CSV Format')"
                     .to_string(),
@@ -353,7 +394,7 @@ mod tests {
                 .any(|(k, v)| k == "locale" && v == "en_US")
         );
         assert!(
-            has_fact(&scan.facts, "xml_export_edited_only"),
+            has_fact(&scan.facts, codes::XML_EXPORT_EDITED_ONLY),
             "MinVersion root attr must trigger the export-shape advisory; got {:?}",
             scan.facts
         );
@@ -393,10 +434,10 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "MinVersion" && v == "8.0.0")
         );
-        assert!(has_fact(&scan.facts, "xml_export_edited_only"));
+        assert!(has_fact(&scan.facts, codes::XML_EXPORT_EDITED_ONLY));
         // 11-01 capture decision: the scan must surface UdtType presence —
         // importTags REFUSES type definitions and lands nothing.
-        assert!(has_fact(&scan.facts, "xml_udt_type_definition"));
+        assert!(has_fact(&scan.facts, codes::XML_UDT_TYPE_DEFINITION));
     }
 
     #[test]
@@ -413,7 +454,7 @@ mod tests {
             scan.tag_count, 1,
             "the Tag seen before the error is reported"
         );
-        assert!(has_fact(&scan.facts, "xml_parse_partial"));
+        assert!(has_fact(&scan.facts, codes::XML_PARSE_PARTIAL));
         assert!(
             scan.top_level_names.contains(&"X".to_string()),
             "whatever was readable before the error rides the report"
@@ -480,10 +521,10 @@ P11Csv/,OPC in a folder,,0,2,,TRUE,Read_Write,Ignition OPC-UA Server,[devicename
             "empty Path ⇒ the tag itself; `P11Csv/` prefix ⇒ top-level P11Csv"
         );
         assert!(
-            has_fact(&scan.facts, "csv_no_alarms"),
+            has_fact(&scan.facts, codes::CSV_NO_ALARMS),
             "csv_no_alarms is UNCONDITIONAL — alarms cannot arrive in CSV"
         );
-        assert!(has_fact(&scan.facts, "csv_legacy_columns_only"));
+        assert!(has_fact(&scan.facts, codes::CSV_LEGACY_COLUMNS_ONLY));
         assert_eq!(
             scan.numeric_enum_count, 4,
             "TagType 1/0 + DataType 7/2 are numeric enum coercions"
@@ -498,7 +539,7 @@ P11Csv/,OPC in a folder,,0,2,,TRUE,Read_Write,Ignition OPC-UA Server,[devicename
         let numeric_facts: Vec<&LossFact> = scan
             .facts
             .iter()
-            .filter(|f| f.code == "csv_numeric_enum")
+            .filter(|f| f.code == codes::CSV_NUMERIC_ENUM)
             .collect();
         assert_eq!(numeric_facts.len(), 3);
         for (column, value) in [("TagType", "0"), ("DataType", "2"), ("AccessRights", "1")] {
@@ -519,7 +560,7 @@ P11Csv/,OPC in a folder,,0,2,,TRUE,Read_Write,Ignition OPC-UA Server,[devicename
         assert!(!scan.has_version_marker);
         assert_eq!(scan.row_count, 1);
         assert!(
-            has_fact(&scan.facts, "csv_missing_version_marker"),
+            has_fact(&scan.facts, codes::CSV_MISSING_VERSION_MARKER),
             "the gateway may reject a marker-less file — advisory, never a refusal"
         );
     }
