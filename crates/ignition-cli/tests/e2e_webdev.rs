@@ -1477,7 +1477,9 @@ async fn live_tags_xml_fidelity_roundtrip() {
 
     // (1) Self-deploy FIRST (the redeploy-sequencing pin) with the
     // scriptExec leg so the rig keeps the full standing 5-route
-    // bundle — then the version handshake reads 1.2.0 on every route.
+    // bundle — then the version handshake reads the CURRENT bundle
+    // version (1.3.0: the 11-06 importTagsFile format-suffix fix) on
+    // every route.
     let out = ign(
         &config,
         &env,
@@ -1494,7 +1496,7 @@ async fn live_tags_xml_fidelity_roundtrip() {
         assert_eq!(
             row["deployed_version"],
             ignition_core::webdev::ROUTE_BUNDLE_VERSION,
-            "{route}: the 1.2.0 handshake pin: {row}"
+            "{route}: the current-bundle handshake pin: {row}"
         );
     }
 
@@ -1937,7 +1939,9 @@ async fn live_tags_csv_roundtrip() {
     expect_ok("config create the P11CsvSeed folder", &out);
 
     // The ORIGINAL JSON export — the legacy-sheet contrast baseline
-    // (configure-created tags carry NO AlertAckMode).
+    // (configure-created tags carry NO AlertAckMode). Same-parent
+    // LEAF paths: a multi-path export answers the `{"tags":[...]}`
+    // wrapper (single-path would answer the folder subtree itself).
     let orig_path = tmp.path().join("orig.json");
     let out = ign(
         &config,
@@ -1945,7 +1949,9 @@ async fn live_tags_csv_roundtrip() {
         &[
             "tags",
             "export",
-            "[default]P11CsvSeed",
+            "[default]P11CsvSeed/TMem",
+            "[default]P11CsvSeed/TExpr",
+            "[default]P11CsvSeed/TAlarmed",
             "--format",
             "json",
             "-o",

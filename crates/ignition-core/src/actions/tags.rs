@@ -2193,7 +2193,13 @@ async fn tags_import_bulk(
     // The 300 s bulk-transfer ceiling (TAGS_EXPORT_TIMEOUT) — the
     // same one-request-whole-file envelope as export, opposite
     // direction; the 30 s client default would truncate large
-    // imports the same way.
+    // imports the same way. `format` rides the body so the ROUTE
+    // can suffix the gateway-side temp file correctly: importTags
+    // dispatches its parser on the file EXTENSION (.xml → XML,
+    // .csv → CSV, anything else → JSON) — the 11-06 live-gate
+    // finding (the 1.2.0 '.tagimport' suffix made XML/CSV imports
+    // hit the JSON parser; Probe 2's probe file was '.xml'-suffixed,
+    // which is why the probe passed where the route failed).
     let data = api
         .webdev_route_call_with_timeout(
             project,
@@ -2203,6 +2209,7 @@ async fn tags_import_bulk(
                 "file_b64": BASE64.encode(input),
                 "basePath": format!("[{provider}]"),
                 "collisionPolicy": policy_char,
+                "format": format.label(),
             }),
             &[],
             TAGS_EXPORT_TIMEOUT,

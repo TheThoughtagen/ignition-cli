@@ -12,9 +12,12 @@ def doPost(request, session):
 	#                       string>} -- or, format='xml': {payload_b64, format}
 	#                       (base64 of the gateway's CRLF XML document; byte-
 	#                       exact through the JSON envelope)
-	#   importTagsFile   -- {file_b64, basePath='[default]', collisionPolicy='a'}
+	#   importTagsFile   -- {file_b64, basePath='[default]', collisionPolicy='a',
+	#                       format='json'|'xml'|'csv'}
 	#                       -> {results: [<QualityCode strings>]} -- base64 file
-	#                       bytes to a gateway-side temp file, system.tag.
+	#                       bytes to a gateway-side temp file (suffix per format:
+	#                       importTags dispatches its parser on the file
+	#                       EXTENSION, 11-06 live truth), system.tag.
 	#                       importTags (FILE-PATH-only signature, 11-01
 	#                       Probe 2), temp deleted in a finally
 	#
@@ -43,7 +46,7 @@ def doPost(request, session):
 	#     RpcContext WebDev threads don't carry, 8.3.3) -- subtree paths like
 	#     [provider]folder are the supported form.
 
-	ROUTE_VERSION = '1.2.0'  # 1.2.0: exportTags format param + importTagsFile (Phase 11)
+	ROUTE_VERSION = '1.3.0'  # 1.3.0: importTagsFile format-aware temp suffix (11-06 live-truth fix; 1.2.0: exportTags format param + importTagsFile)
 	MIN_CLI = '1.0'
 
 	import json, traceback
@@ -235,16 +238,31 @@ def doPost(request, session):
 			# File-path import (Phase 11): base64 file bytes in ->
 			# gateway-side temp file -> system.tag.importTags (the
 			# FILE-PATH-only signature, 11-01 Probe 2) -> temp deleted.
+			# 11-06 LIVE-TRUTH FIX: importTags dispatches its parser on
+			# the file EXTENSION (.xml -> XML, .csv -> CSV, anything
+			# else -> JSON) -- the 1.2.0 temp file ('.tagimport') made
+			# XML/CSV imports hit the JSON parser
+			# (Error_Exception("Not a JSON Object: ..."), caught live by
+			# the 11-06 fidelity gate on both rigs; Probe 2's probe file
+			# was '.xml'-suffixed, which is why the probe passed where
+			# the route failed). The body therefore carries an explicit
+			# `format` ('xml'|'csv') and the temp file takes the
+			# matching suffix; json keeps '.tagimport' (the JSON parser
+			# is the any-extension default).
 			file_b64 = data['file_b64']
 			base = data.get('basePath', '[default]')
 			policy = data.get('collisionPolicy', 'a')
+			fmt = data.get('format', 'json')
+			suffix = {'xml': '.xml', 'csv': '.csv'}.get(fmt, '.tagimport')
+			if fmt not in ('xml', 'csv', 'json'):
+				return err('unsupported_format', "supported formats: json, xml, csv")
 			# LOCKED collision matrix (05-05): abort/overwrite only.
 			# The gateway's 'i' (Ignore) exists but is NEVER surfaced.
 			if policy not in ('a', 'o'):
 				return err('invalid_collision_policy', "collisionPolicy must be 'a' (abort) or 'o' (overwrite)")
 			import base64
 			from java.io import File
-			tmp = File.createTempFile('ign-import', '.tagimport')
+			tmp = File.createTempFile('ign-import', suffix)
 			try:
 				fh = open(tmp.getAbsolutePath(), 'wb')
 				fh.write(base64.b64decode(file_b64))

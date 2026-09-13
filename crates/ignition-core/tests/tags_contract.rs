@@ -1370,7 +1370,8 @@ async fn import_xml_action_pins_file_b64_and_scan_fed_result() {
             "action": "importTagsFile",
             "file_b64": CANNED_XML_B64,
             "basePath": "[p11target]",
-            "collisionPolicy": "a"
+            "collisionPolicy": "a",
+            "format": "xml"
         })))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1431,7 +1432,8 @@ async fn import_csv_action_pins_file_b64_and_csv_scan_names() {
             "action": "importTagsFile",
             "file_b64": "UGF0aCxOYW1lLE93bmVyLFRhZ1R5cGUsRGF0YVR5cGUsVmFsdWUsRW5hYmxlZCxBY2Nlc3NSaWdodHMNCiMgdmVyc2lvbj0xLCwsLCwsLCwNCixUMSwsMSw3LDQyLFRSVUUsUmVhZF9Xcml0ZQ0K",
             "basePath": "[p11target]",
-            "collisionPolicy": "o"
+            "collisionPolicy": "o",
+            "format": "csv"
         })))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({

@@ -2353,7 +2353,8 @@ async fn tags_import_loss_gate_yes_flow() {
             "action": "importTagsFile",
             "file_b64": payload_b64,
             "basePath": "[p5import]",
-            "collisionPolicy": "a"
+            "collisionPolicy": "a",
+            "format": "xml"
         })))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
