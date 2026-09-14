@@ -451,6 +451,30 @@ fn import_with_mount_tolerance(config: &Path, env: &LiveEnv, args: &[&str]) -> O
     }
 }
 
+/// Read with the fresh-provider RESOLUTION tolerance (11-06 rig run,
+/// Rig B 8.3.3): an export against a JUST-CREATED provider can
+/// transiently fail with the route's `Provider not found: <name>`
+/// (the tagConfig/getConfiguration path resolves the provider before
+/// its registration fully propagates) — the provider demonstrably
+/// exists (a moments-later manual list shows it). Reads are
+/// side-effect-free, so the helper re-runs the SAME read within a
+/// bounded 30s window while stderr carries that shape; any other
+/// outcome returns immediately for the caller's asserts.
+fn read_with_provider_tolerance(config: &Path, env: &LiveEnv, args: &[&str]) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut out = ign(config, env, args);
+    while !out.status.success() {
+        let transient = String::from_utf8_lossy(&out.stderr).contains("Provider not found:");
+        if !transient || std::time::Instant::now() >= deadline {
+            return out;
+        }
+        eprintln!("read: provider resolution race, retrying (bounded 30s)…");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        out = ign(config, env, args);
+    }
+    out
+}
+
 /// THE live-gate serializer: every live test mutates SHARED gateway
 /// state (the CLI-owned ign-cli deploy project — five concurrent
 /// overwrite-imports race each other — plus tag providers), so the
@@ -1912,7 +1936,7 @@ async fn live_tags_xml_fidelity_roundtrip() {
     // by capture (b) — sibling order permutes on the model rebuild —
     // so the shas are printed for the evidence doc, not asserted.
     let b_path = tmp.path().join("b.xml");
-    let out = ign(
+    let out = read_with_provider_tolerance(
         &config,
         &env,
         &[
@@ -2186,9 +2210,10 @@ async fn live_tags_csv_roundtrip() {
     );
 
     // Export the imported model back as JSON and diff against the
-    // coverage table.
+    // coverage table. (The read rides the provider-resolution
+    // tolerance — see the helper's comment.)
     let back_path = tmp.path().join("back.json");
-    let out = ign(
+    let out = read_with_provider_tolerance(
         &config,
         &env,
         &[
