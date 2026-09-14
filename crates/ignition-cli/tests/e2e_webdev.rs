@@ -1177,21 +1177,42 @@ async fn live_tags_alarm_lifecycle() {
         })
     };
     let mut event = None;
-    // POLL BUDGET (11-06 live-truth): 20×500ms passed on 8.3.6 and on
-    // warm rigs, but the FIRST poll after creating p5alarm on a fresh
-    // 8.3.3 provider once exceeded 10s (the alarm pipeline registers
-    // against the still-mounting provider — the deploy-loop mount-lag
-    // family). 60×1s is the evidence-backed budget: warm re-run
-    // answers in ~3s, the observed cold outlier exceeded 10s.
-    for _ in 0..60 {
-        let out = ign(&config, &env, &["tags", "alarms", "active", "--compact"]);
-        expect_ok("alarms active poll", &out);
-        let envelope = data_envelope(&out);
-        if let Some(found) = find_event(&envelope) {
-            event = Some(found);
+    // POLL + RE-TRIGGER (11-06 live-truth, Rig B 8.3.3): the write's
+    // 0→150 transition can race the alarm engine's subscription to
+    // the JUST-CREATED provider's tag — the only transition is lost
+    // and no event ever fires (observed twice: silent 60s polls with
+    // the write answered ok and the config verifiably landed). The
+    // fix is a state-safe RE-TRIGGER: write below the setpoint, then
+    // past it again — a real transition the (by-now-subscribed)
+    // engine fires. Each attempt: set → poll 8×1s; up to 5 attempts.
+    for attempt in 0..5 {
+        if attempt > 0 {
+            let out = ign(
+                &config,
+                &env,
+                &["tags", "write", tag, "--value", "0", "--compact"],
+            );
+            expect_ok("write below the setpoint (re-trigger clear)", &out);
+            let out = ign(
+                &config,
+                &env,
+                &["tags", "write", tag, "--value", "150", "--compact"],
+            );
+            expect_ok("write past the setpoint (re-trigger set)", &out);
+        }
+        for _ in 0..8 {
+            let out = ign(&config, &env, &["tags", "alarms", "active", "--compact"]);
+            expect_ok("alarms active poll", &out);
+            let envelope = data_envelope(&out);
+            if let Some(found) = find_event(&envelope) {
+                event = Some(found);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if event.is_some() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     let event = event.expect("the alarm event appeared (bounded retries)");
     let event_id = event["event_id"]
