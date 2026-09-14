@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 12 of 14 (12-tui-theming-degradation)
-**Current Plan:** 3
-**Total Plans in Phase:** 4 (12-01, 12-02 done — 12-03 next)
-**Status:** 12-02 complete (theme wiring: ResolvedContext.palette + AppState.palette + both adoption sites, 225 tests green) — 12-03 next
+**Current Plan:** 4
+**Total Plans in Phase:** 4 (12-01, 12-02, 12-03 done — 12-04 remaining)
+**Status:** 12-03 complete (literal migration: zero Color:: outside ui/theme.rs grep-proven + CI-enforced; 09-UAT Gap 2 code half closed — Tabs::select + emphasis token + hidden cursor; 229 tui tests green) — 12-04 next
 **Last Activity:** 2026-09-14
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 99%
 
 ## Performance Metrics
 
@@ -66,6 +66,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 12 P01 | 8 min | 2 tasks | 2 files |
 | Phase 12 P01 | 8 min | 2 tasks | 2 files |
 | Phase 12 P02 | 14 min | 2 tasks | 5 files |
+| Phase 12 P03 | 18 min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -166,10 +167,13 @@ Recent decisions affecting current work:
 - [Phase 12]: 12-02: resolve_palette is private and pure over (name, tier) — build_context is the ONLY real-env detect_tier site; tests pin the helper at fixed tiers — honors 12-01's env-snapshot injection signature; keeps the wiring helper fully testable without ambient-env coupling
 - [Phase 12]: 12-02: unknown [ui].theme warns via tracing::warn! and falls back to default at the same tier; wrong-TYPED values degrade earlier via the existing lenient_ui deserializer — the cockpit always starts — Phase-8 lenient-degradation contract decided at TUI-resolution time; tracing added as a direct ignition-tui dep (Rule 3)
 - [Phase 12]: 12-02: AppState.palette defaults to default-theme @ Mono (all-Reset, no env reads at construction); run_loop + switch_profile adopt ctx.palette in the same block/group as poll_interval — the 08-05 ride-along pattern closes the silent-drop trap class — uniform adoption is the 08-05 lesson; deterministic construction keeps ~100 AppState::new() test callsites signature-stable
+- [Phase 12]: 12-03: CI tokenization grep landed ATOMICALLY with the final literal migration (state.rs/context.rs test-code literals included in the same commit) — the grep goes red the moment it's added — grep-atomicity mandate; plan undercounted the tree's literals
+- [Phase 12]: 12-03: all-Reset pins compare whole-palette equality against the mono-AUTHORED palette — strictly stronger than a slot walk (auto-covers future Palette fields) and tokenization-clean — slot-equality-only doctrine; CI grep forbids literals outside theme.rs
+- [Phase 12]: 12-03: palette threaded into dashboard render fns as &theme::Palette (minimal pure dependency); hide_cursor is best-effort (let _ =) — restore path re-shows on every exit — research doctrine: helpers carry color only, modifiers inline; chrome must not kill the cockpit
 
 ### Pending Todos
 
-- [Phase 12 prerequisite — from 09 UAT test 10, minor]: TUI tab indicator is visually ambiguous — `render_tab_bar` (crates/ignition-tui/src/ui/mod.rs) signals the active tab with BOLD ONLY and the terminal cursor block parks on the tab bar reading as a stuck highlight. Logic is correct; the fix is visual/theming: `Tabs::select(idx)` + a visible `highlight_style` from the token palette + hide the terminal cursor in frame setup. Assigned to Phase 12 (TUIX-03/04) per the 09 UAT diagnosis — NOT a Phase 9 regression. Details: 09-UAT.md Gap 2.
+- [Phase 12 prerequisite — from 09 UAT test 10, minor — CODE HALF CLOSED by 12-03, 2026-09-14]: TUI tab indicator — `render_tab_bar` now uses `Tabs::select(active)` + `highlight_style` from the token palette (emphasis fg + inline BOLD, survives mono) and `run()` hides the terminal cursor after `ratatui::init()`; buffer tests pin active BOLD + emphasis slot at color tier and the mono tier. REMAINING: visual confirmation at phase verification/UAT (the original gap was a visual complaint). Details: 09-UAT.md Gap 2.
 - [Polish, v1.0 code — from 09 UAT re-verification round, minor]: `trial_reset`'s defensive tail (crates/ignition-core/src/actions/rig.rs:589) stuffs the rig URL into `CoreError::SecretUnavailable`'s `profile` slot, so the TUI modal renders `secret unavailable for profile "http://localhost:…"` — the profile NAME and the missing-credential path (IGNITION_USER/IGNITION_PASSWORD) should be named instead. Candidate to ride along with any later error-message/UX pass.
 
 ### Blockers/Concerns
@@ -181,5 +185,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-14T16:19:58.135Z
+**Last session:** 2026-09-14T16:42:19.646Z
 **Resume file:** None
