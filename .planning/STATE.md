@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 12 of 14 (12-tui-theming-degradation)
-**Current Plan:** 2
-**Total Plans in Phase:** 4 (12-01 done, 12-02 next)
-**Status:** 12-01 complete (theme token module: Palette/Tier/registry/detect_tier, 16 structural tests green) — 12-02 next
+**Current Plan:** 3
+**Total Plans in Phase:** 4 (12-01, 12-02 done — 12-03 next)
+**Status:** 12-02 complete (theme wiring: ResolvedContext.palette + AppState.palette + both adoption sites, 225 tests green) — 12-03 next
 **Last Activity:** 2026-09-14
 
-**Progress:** [██████████] 96%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -65,6 +65,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 11 P08 | 12 min | 2 tasks | 5 files |
 | Phase 12 P01 | 8 min | 2 tasks | 2 files |
 | Phase 12 P01 | 8 min | 2 tasks | 2 files |
+| Phase 12 P02 | 14 min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -162,6 +163,9 @@ Recent decisions affecting current work:
 - [Phase 12]: 12-01: degradation is AUTHORED not derived — four themes × four explicit tiers, Rgb confined to truecolor palettes, c16 = ANSI-16 names (+ intentional Reset in default), mono all-Reset at EVERY tier (tier-independent pin for 12-02's ambient-COLORTERM wiring tests)
 - [Phase 12]: 12-01: detect_tier is pure over &dyn Fn(&str)->Option<String> — signature pinned so 12-02 wires it as detect_tier(&|k| std::env::var(k).ok()); priority NO_COLOR non-empty > COLORTERM truecolor|24bit > TERM *256color* > TERM missing/dumb→Mono > C16
 - [Phase 12]: 12-01: palette HUES are planner-discretion and ADJUSTABLE POST-UAT — tests pin structure only (slot equality, containment, all-Reset mono), never literal colors
+- [Phase 12]: 12-02: resolve_palette is private and pure over (name, tier) — build_context is the ONLY real-env detect_tier site; tests pin the helper at fixed tiers — honors 12-01's env-snapshot injection signature; keeps the wiring helper fully testable without ambient-env coupling
+- [Phase 12]: 12-02: unknown [ui].theme warns via tracing::warn! and falls back to default at the same tier; wrong-TYPED values degrade earlier via the existing lenient_ui deserializer — the cockpit always starts — Phase-8 lenient-degradation contract decided at TUI-resolution time; tracing added as a direct ignition-tui dep (Rule 3)
+- [Phase 12]: 12-02: AppState.palette defaults to default-theme @ Mono (all-Reset, no env reads at construction); run_loop + switch_profile adopt ctx.palette in the same block/group as poll_interval — the 08-05 ride-along pattern closes the silent-drop trap class — uniform adoption is the 08-05 lesson; deterministic construction keeps ~100 AppState::new() test callsites signature-stable
 
 ### Pending Todos
 
@@ -177,5 +181,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-14T16:02:33.061Z
+**Last session:** 2026-09-14T16:19:58.135Z
 **Resume file:** None
