@@ -1990,22 +1990,19 @@ async fn live_tags_xml_fidelity_roundtrip() {
     // The guarded import WITH --yes: exit 0, no server-side
     // Bad_Failure backstop, the loss report rides the envelope.
     // (The mount-race tolerance rides the helper — see its comment.)
-    let out = import_with_mount_tolerance(
-        &config,
-        &env,
-        &[
-            "tags",
-            "import",
-            "--file",
-            a_path.to_str().expect("path"),
-            "--format",
-            "xml",
-            "--provider",
-            "p11live",
-            "--yes",
-            "--compact",
-        ],
-    );
+    let import_args = [
+        "tags",
+        "import",
+        "--file",
+        a_path.to_str().expect("path"),
+        "--format",
+        "xml",
+        "--provider",
+        "p11live",
+        "--yes",
+        "--compact",
+    ];
+    let out = import_with_mount_tolerance(&config, &env, &import_args);
     expect_ok("import --yes (the guarded commit)", &out);
     let envelope = data_envelope(&out);
     assert_eq!(envelope["data"]["format"], "xml", "{envelope}");
@@ -2026,6 +2023,35 @@ async fn live_tags_xml_fidelity_roundtrip() {
             .any(|name| name == "P11Live"),
         "the scan named the landing subtree: {envelope}"
     );
+
+    // LANDING VERIFICATION (11-06 Rig B live truth): a clean
+    // failed-empty answer against a JUST-CREATED provider can still
+    // be a SILENT NO-OP (nothing lands — the import raced the mount;
+    // the type=Unknown export shells are the tell). Verify by browse
+    // and re-import (state-safe) bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let probe = read_with_provider_tolerance(
+            &config,
+            &env,
+            &["tags", "browse", "[p11live]", "--compact"],
+        );
+        let landed = probe.status.success()
+            && data_envelope(&probe)["data"]["entries"]
+                .as_array()
+                .map(|entries| entries.iter().any(|row| row["name"] == "P11Live"))
+                .unwrap_or(false);
+        if landed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the xml import never landed (browse kept showing an empty root)"
+        );
+        eprintln!("import: clean answer but nothing landed, re-importing (bounded 30s)…");
+        let out = import_with_mount_tolerance(&config, &env, &import_args);
+        expect_ok("import --yes (re-import)", &out);
+    }
 
     // (7) Re-export the IMPORTED subtree (it landed at
     // [p11live]P11Live — provider-root basePath) and run the
@@ -2280,24 +2306,21 @@ async fn live_tags_csv_roundtrip() {
         &["tags", "provider", "create", "p11csv", "--compact"],
     );
     expect_ok("provider create p11csv", &out);
-    let out = import_with_mount_tolerance(
-        &config,
-        &env,
-        &[
-            "tags",
-            "import",
-            "--file",
-            c_path.to_str().expect("path"),
-            "--format",
-            "csv",
-            "--provider",
-            "p11csv",
-            "--collision-policy",
-            "overwrite",
-            "--yes",
-            "--compact",
-        ],
-    );
+    let import_args = [
+        "tags",
+        "import",
+        "--file",
+        c_path.to_str().expect("path"),
+        "--format",
+        "csv",
+        "--provider",
+        "p11csv",
+        "--collision-policy",
+        "overwrite",
+        "--yes",
+        "--compact",
+    ];
+    let out = import_with_mount_tolerance(&config, &env, &import_args);
     expect_ok("import the generated csv --yes", &out);
     let envelope = data_envelope(&out);
     assert_eq!(envelope["data"]["format"], "csv", "{envelope}");
@@ -2306,6 +2329,36 @@ async fn live_tags_csv_roundtrip() {
         Some(0),
         "all-or-nothing import answered clean: {envelope}"
     );
+
+    // LANDING VERIFICATION (11-06 Rig B live truth): a clean
+    // failed-empty answer against a JUST-CREATED provider can still
+    // be a SILENT NO-OP — nothing lands (the import raced the
+    // provider model mount and lost its write buffer; probe 4's
+    // type="Unknown" export shells are the tell). Verify the landing
+    // by browse and re-import (overwrite — state-safe) bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let probe = read_with_provider_tolerance(
+            &config,
+            &env,
+            &["tags", "browse", "[p11csv]", "--compact"],
+        );
+        let landed = probe.status.success()
+            && data_envelope(&probe)["data"]["entries"]
+                .as_array()
+                .map(|entries| entries.iter().any(|row| row["name"] == "TMem"))
+                .unwrap_or(false);
+        if landed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the csv import never landed (browse kept showing an empty root)"
+        );
+        eprintln!("import: clean answer but nothing landed, re-importing (bounded 30s)…");
+        let out = import_with_mount_tolerance(&config, &env, &import_args);
+        expect_ok("import the generated csv --yes (re-import)", &out);
+    }
 
     // Export the imported model back as JSON and diff against the
     // coverage table. (The read rides the provider-resolution
