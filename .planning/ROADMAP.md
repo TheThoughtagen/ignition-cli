@@ -154,7 +154,17 @@ Plans:
   4. Historian binding resolved honestly per the spike outcome: either binding create/update works via the tag write path on a licensed rig, OR the phase ships "documented limitation, now with Designer-diff evidence" — both are legitimate done states; spike outcome recorded either way
   5. User edits a gateway resource via `ign edit`: fetch → decode → `$EDITOR` → encode → push, with unchanged saves detected (content-hash no-op), invalid encodes refused (fail-closed validation), and stale pushes blocked by a staleness check
 **Research/Planning flags**: MANDATORY SPIKE for the historian slice — confirm licensed-Historian rig access BEFORE phase planning begins; plan 01 is the time-boxed Designer-diff (re-read 05-06 artifacts; both-rig diff). Roadmap deliberately holds the done-definition loose pending the spike. Workspace and edit slices: adversarial-$EDITOR and bijection/manifest pitfalls get plan-level verifications; no research-phase beyond the spike.
-**Plans**: TBD
+**Plans**: 8 plans (5 waves; wave 5 exists for CLI-surface file-ownership sequencing)
+
+Plans:
+- [ ] 13-01-PLAN.md — Historian Designer-diff spike (BOTH trial rigs, 2h-window budget): before/after tags config capture + diff artifacts + tag-write-path replay → 13-LIVE-CAPTURES.md verdict (closure field-set OR documented-limitation-with-evidence) *(has one human-action checkpoint: the Designer binding step)*
+- [ ] 13-02-PLAN.md — MemberSource abstraction (zip + tree sources over the proven engine) + injective hostile-name-safe path mapping with proptest bijection/round-trip/refusal properties (SC-2's property-test mandate; proptest = the only new dev-dep)
+- [ ] 13-03-PLAN.md — Workspace manifest (.ign-workspace.json) + checkout action: --decode-scripts byte-exact round-trip at tree scale, tag-value exclusion pin, clobber-safe refusals
+- [ ] 13-04-PLAN.md — Historian slice closure per the 13-01 spike record (conditional-structured): TAGS-13 history summary in tags config render + TAGS-14 done-state (closure recipe pinned OR documented limitation with diff evidence) + BOTH-rig live gate → 13-LIVE-GATE.md
+- [ ] 13-05-PLAN.md — ign edit core pipeline + Editor seam trait (arg-vector, exit-advisory) + 0700 temp recovery + staleness gate + the FIVE-archetype real-process editor fixture harness
+- [ ] 13-06-PLAN.md — Workspace status (three-way compare, push-relative semantics pinned) + push (manifest-recorded splice into FRESH export, conflicts refuse NOT --yes-able, --delete opt-in, ONE preview_then_confirm gate, zero-write honesty)
+- [ ] 13-07-PLAN.md — Workspace CLI family (checkout/status/push): Session-seam dispatch, routes rows + clap-walk + stdout purity coverage, snapbox refusal goldens (conflict/--yes/preview) + README workspace honesty section
+- [ ] 13-08-PLAN.md — ign edit CLI: clap command + dispatch + guard composition + OutOfBand `edit` row landing ATOMICALLY with the clap command (pinned set → [api call, completions, edit]) + zero-stdout byte-scan pin + scripted-editor binary contract tests + README
 
 ### Phase 14: 14-transports-mcp-lsp
 **Goal**: AI agents and ignition-nvim drive the now-stable command surface over protocols: `ign mcp serve` proves the protocol-mode pattern once (hand-rolled JSON-RPC 2.0 stdio, stdout purity, clap-derived catalog), and `ign lsp` reuses it verbatim to feed live gateway truth to nvim — completing the ignition-mcp replacement.
@@ -189,7 +199,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 6/6 | Complete | 2026-09-14 — 1.3.0 route bundle, loss scans/CLI contract, live gates green on both rigs (11-LIVE-GATE.md) |
 | 12. 12-tui-theming-degradation | v1.1 | 4/4 | Complete | 2026-09-14 — verifier passed 3/3 (12-VERIFICATION.md); themes live via [ui].theme, CI tokenization gate armed, 09-UAT Gap 2 closed |
-| 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |
+| 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/8 | Planned (5 waves) | - |
 | 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |
 
 ---
