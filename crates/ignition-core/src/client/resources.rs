@@ -125,8 +125,10 @@ fn rewrite_options() -> zip::write::SimpleFileOptions {
 /// ignored (the import still answers `{"success":true}` while nothing
 /// lands; verified with AND without zip directory entries).
 /// Intermediate plain folders above the resource folder carry
-/// nothing (the webdev `cli/` precedent).
-const FOLDER_DESCRIPTOR: &str = "resource.json";
+/// nothing (the webdev `cli/` precedent). `pub(crate)` for 13-02:
+/// the workspace `MemberSource::Tree` hashes members under the SAME
+/// descriptor rule without forking the constant.
+pub(crate) const FOLDER_DESCRIPTOR: &str = "resource.json";
 
 /// The parent directory of a member path (`a/b/c` → `a/b`); `None`
 /// for a root-level name.
@@ -403,8 +405,10 @@ pub fn remove_member(zip_bytes: &[u8], member: &str) -> Result<Vec<u8>, CoreErro
 
 /// 64-bit FNV-1a — the member digest. No sha2 dependency: collision
 /// risk (2^-64 per pair on 64-bit hashes) is acceptable for diff UX;
-/// this is change detection, not security.
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// this is change detection, not security. `pub(crate)` for 13-02:
+/// the workspace `MemberSource::Tree` digests checked-out files with
+/// the SAME digest function — hash semantics stay single-source.
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= u64::from(byte);

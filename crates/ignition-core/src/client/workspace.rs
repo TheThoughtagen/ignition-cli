@@ -57,9 +57,10 @@
 //! bijection/round-trip/refusal properties over hostile corpora —
 //! SC-2's "property tests pass" at the mapping layer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use crate::client::resources;
 use crate::error::CoreError;
 
 /// The maximum on-disk segment length the mapping will emit — the
@@ -254,4 +255,169 @@ pub fn build_mapping(members: &[String]) -> Result<BTreeMap<String, PathBuf>, Co
         mapping.insert(member.clone(), local);
     }
     Ok(mapping)
+}
+
+/// The member-content source abstraction (13-02 Task 3): the proven
+/// v1.0 member engine ([`crate::client::resources`], zip-bytes-only)
+/// speaks EITHER a gateway export zip OR a checked-out directory
+/// tree, with ONE implementation behind both — 13-03's checkout and
+/// 13-06's status compare build on this without touching proven code.
+///
+/// - [`MemberSource::Zip`] delegates VERBATIM to the existing
+///   resources.rs functions — descriptor-normalized enumeration/
+///   read/hash semantics stay single-source (no engine function is
+///   copied here).
+/// - [`MemberSource::Tree`] reads a checked-out tree through the
+///   RECORDED mapping with the SAME member-hash semantics: a
+///   member's hash is identical from either source for identical
+///   bytes (equivalence pinned by test). A `resource.json` member
+///   hashes its normalized descriptor exactly as the zip side does —
+///   the same helpers ([`resources::normalize_descriptor`],
+///   [`resources::fnv1a`], [`resources::FOLDER_DESCRIPTOR`]), never
+///   a fork.
+///
+/// Tree strictness (pinned here): the tree is MANIFEST-SCOPED. A
+/// mapped member missing from disk, or a local file not in the
+/// mapping, is an error from the source — 13-06's status handles
+/// unknown files at the action layer, where a human-facing verdict
+/// belongs.
+pub enum MemberSource {
+    /// A gateway project-export zip's raw bytes.
+    Zip(Vec<u8>),
+    /// A checked-out directory tree rooted at `root`, addressed
+    /// through the recorded checkout `mapping` (gateway member →
+    /// local path — [`build_mapping`]'s output, stored in the
+    /// manifest by 13-03).
+    Tree {
+        /// The checkout root the recorded local paths ride under.
+        root: PathBuf,
+        /// The recorded gateway-member → local-path pairs.
+        mapping: BTreeMap<String, PathBuf>,
+    },
+}
+
+impl MemberSource {
+    /// Every resource member's user path. Zip: the export walk in
+    /// member order (the proven [`resources::resource_members`]
+    /// semantics — `project.json`, directory entries, and
+    /// non-`resources`-shaped members skipped). Tree: the recorded
+    /// mapping's keys, sorted.
+    pub fn members(&self) -> Result<Vec<String>, CoreError> {
+        match self {
+            Self::Zip(bytes) => resources::resource_members(bytes),
+            Self::Tree { mapping, .. } => Ok(mapping.keys().cloned().collect()),
+        }
+    }
+
+    /// One member's bytes, verbatim. Zip: the proven
+    /// [`resources::read_member`] (missing → `not_found`). Tree:
+    /// `fs::read` at the mapped local path — a member outside the
+    /// recorded mapping or a missing file is `invalid_input` naming
+    /// the member (the tree is manifest-scoped, so "unmapped" is a
+    /// caller/manifest contract break, not a 404-shaped lookup miss).
+    pub fn read(&self, user_path: &str) -> Result<Vec<u8>, CoreError> {
+        match self {
+            Self::Zip(bytes) => resources::read_member(bytes, user_path),
+            Self::Tree { root, mapping } => {
+                let local = mapping
+                    .get(user_path)
+                    .ok_or_else(|| CoreError::InvalidInput {
+                        reason: format!(
+                            "workspace member \"{user_path}\" is not in the recorded \
+                             checkout mapping"
+                        ),
+                    })?;
+                std::fs::read(root.join(local)).map_err(|err| CoreError::InvalidInput {
+                    reason: format!(
+                        "workspace member \"{user_path}\" cannot be read from the \
+                         checkout tree: {err}"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// User path → FNV-1a digest for every member — the SAME
+    /// descriptor rule both sides: a basename `resource.json` hashes
+    /// its [`resources::normalize_descriptor`] output (the
+    /// lastModification volatility guard), everything else hashes raw
+    /// bytes. Zip: the proven [`resources::member_hashes`]. Tree:
+    /// reads the mapped files after a strictness walk — a mapped
+    /// member missing from disk, or an on-disk file absent from the
+    /// mapping, is `invalid_input` (manifest-scoped tree).
+    pub fn member_hashes(&self) -> Result<BTreeMap<String, u64>, CoreError> {
+        match self {
+            Self::Zip(bytes) => resources::member_hashes(bytes),
+            Self::Tree { root, mapping } => {
+                let found = scan_regular_files(root)?;
+                for (member, local) in mapping {
+                    if !found.contains(local) {
+                        return Err(CoreError::InvalidInput {
+                            reason: format!(
+                                "workspace member \"{member}\" is missing from the \
+                                 checkout tree (expected at \"{}\")",
+                                local.to_string_lossy()
+                            ),
+                        });
+                    }
+                }
+                for file in &found {
+                    if !mapping.values().any(|local| local == file) {
+                        return Err(CoreError::InvalidInput {
+                            reason: format!(
+                                "checkout tree contains local file \"{}\" that is not \
+                                 in the recorded mapping — the tree is manifest-scoped",
+                                file.to_string_lossy()
+                            ),
+                        });
+                    }
+                }
+                let mut hashes = BTreeMap::new();
+                for (member, local) in mapping {
+                    let bytes =
+                        std::fs::read(root.join(local)).map_err(|err| CoreError::InvalidInput {
+                            reason: format!(
+                                "workspace member \"{member}\" cannot be read from \
+                                     the checkout tree: {err}"
+                            ),
+                        })?;
+                    let is_descriptor = local.file_name()
+                        == Some(std::ffi::OsStr::new(resources::FOLDER_DESCRIPTOR));
+                    let content = if is_descriptor {
+                        resources::normalize_descriptor(&bytes).unwrap_or(bytes)
+                    } else {
+                        bytes
+                    };
+                    hashes.insert(member.clone(), resources::fnv1a(&content));
+                }
+                Ok(hashes)
+            }
+        }
+    }
+}
+
+/// Every regular file under `root`, as paths relative to it — the
+/// strictness walk backing [`MemberSource::Tree::member_hashes`].
+fn scan_regular_files(root: &std::path::Path) -> Result<BTreeSet<PathBuf>, CoreError> {
+    fn walk(
+        dir: &std::path::Path,
+        prefix: &std::path::Path,
+        found: &mut BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let relative = prefix.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(&entry.path(), &relative, found)?;
+            } else if file_type.is_file() {
+                found.insert(relative);
+            }
+        }
+        Ok(())
+    }
+    let mut found = BTreeSet::new();
+    walk(root, std::path::Path::new(""), &mut found)
+        .map_err(|err| CoreError::Internal(format!("cannot walk checkout tree {root:?}: {err}")))?;
+    Ok(found)
 }

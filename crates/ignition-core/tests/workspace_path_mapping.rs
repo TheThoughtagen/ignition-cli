@@ -296,6 +296,219 @@ fn build_mapping_is_order_stable() {
     );
 }
 
+// ---- Task 3: MemberSource — Zip vs Tree equivalence (one engine) ----
+
+use ignition_core::client::resources;
+use ignition_core::client::workspace::MemberSource;
+
+/// The equivalence fixture: `project.json` + four members written in
+/// SORTED user-path order (so the zip walk's member order equals the
+/// tree's BTreeMap order and the `members()` lists compare directly):
+/// - `com.example/views/Dashboard/view.json` (plain bytes)
+/// - `ignition/my file%20/x.json` — the HOSTILE name (space + literal
+///   `%20`): rides the escaped local name `my%20file%2520`
+/// - `ignition/script-python/e2e/scratch` (plain bytes)
+/// - `ignition/script-python/uat/resource.json` — a descriptor
+///   carrying the lastModification volatility attributes
+fn member_fixture_zip() -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("project.json", options)
+        .expect("project.json starts");
+    writer
+        .write_all(br#"{"title":"T","enabled":true}"#)
+        .expect("project.json writes");
+    for (member, bytes) in [
+        (
+            "com.example/resources/views/Dashboard/view.json",
+            br#"{"scope":"A"}"#.as_slice(),
+        ),
+        (
+            "ignition/resources/my file%20/x.json",
+            br#"{"payload":"hostile name rides fine"}"#.as_slice(),
+        ),
+        ("ignition/resources/script-python/e2e/scratch", b"print('e2e')"),
+        (
+            "ignition/resources/script-python/uat/resource.json",
+            br#"{"scope":"G","version":1,"files":["scratch.py"],"attributes":{"lastModification":{"actor":"admin","timestamp":"2026-08-28T10:00:00Z","signature":"sig-a"},"lastModificationSignature":"sig-a","notes":"kept"}}"#.as_slice(),
+        ),
+    ] {
+        writer.start_file(member, options).expect("member starts");
+        writer.write_all(bytes).expect("member writes");
+    }
+    writer.finish().expect("zip finalizes").into_inner()
+}
+
+/// The tree-side descriptor byte rewrite: SAME semantics, DIFFERENT
+/// lastModification volatility (as if a checkout-side edit refreshed
+/// them). The normalized hash must still match the zip side — the
+/// volatility guard rides BOTH sources.
+fn rewritten_descriptor(bytes: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).expect("descriptor json");
+    let last_modification = value
+        .get_mut("attributes")
+        .and_then(|attributes| attributes.get_mut("lastModification"))
+        .and_then(|last| last.as_object_mut())
+        .expect("descriptor carries lastModification");
+    last_modification.insert(
+        "timestamp".to_string(),
+        serde_json::json!("2026-08-29T11:30:00Z"),
+    );
+    last_modification.insert("signature".to_string(), serde_json::json!("sig-b"));
+    serde_json::to_vec(&value).expect("rewritten descriptor serializes")
+}
+
+/// Populate a tempdir checkout from the fixture zip through
+/// build_mapping — exactly what 13-03's checkout will do. Returns
+/// (tempdir, mapping, fixture zip bytes).
+fn populated_tree() -> (
+    tempfile::TempDir,
+    std::collections::BTreeMap<String, std::path::PathBuf>,
+    Vec<u8>,
+) {
+    let zip_bytes = member_fixture_zip();
+    let user_paths = resources::resource_members(&zip_bytes).expect("fixture zip walks");
+    let mapping = build_mapping(&user_paths).expect("fixture members map");
+    let temp = tempfile::tempdir().expect("tempdir");
+    for (member, local) in &mapping {
+        let target = temp.path().join(local);
+        std::fs::create_dir_all(target.parent().expect("nested member")).expect("checkout dirs");
+        let bytes = resources::read_member(&zip_bytes, member).expect("fixture member reads");
+        let bytes = if member.ends_with("/resource.json") {
+            rewritten_descriptor(&bytes)
+        } else {
+            bytes
+        };
+        std::fs::write(&target, bytes).expect("checkout file writes");
+    }
+    (temp, mapping, zip_bytes)
+}
+
+/// THE equivalence pin: the same members sourced from the export zip
+/// and from a checked-out tree carry IDENTICAL member lists and
+/// IDENTICAL member-hash maps — including the descriptor normalized
+/// under DIFFERENT lastModification values on each side (the tree
+/// file was rewritten) and the hostile-name member round-tripped
+/// byte-exact through the escaped local name.
+#[test]
+fn zip_and_tree_sources_are_equivalent() {
+    let (temp, mapping, zip_bytes) = populated_tree();
+    let zip_source = MemberSource::Zip(zip_bytes);
+    let tree_source = MemberSource::Tree {
+        root: temp.path().to_path_buf(),
+        mapping,
+    };
+
+    assert_eq!(
+        zip_source.members().expect("zip members"),
+        tree_source.members().expect("tree members"),
+        "identical member lists from both sources"
+    );
+    assert_eq!(
+        zip_source.member_hashes().expect("zip hashes"),
+        tree_source.member_hashes().expect("tree hashes"),
+        "identical member hashes from both sources — descriptor normalization \
+         and hostile-name escaping ride BOTH"
+    );
+
+    // Byte-level read equality: an ordinary member and the hostile
+    // name (space + literal `%20` through its escaped local path).
+    for member in [
+        "ignition/script-python/e2e/scratch",
+        "ignition/my file%20/x.json",
+    ] {
+        assert_eq!(
+            zip_source.read(member).expect("zip read"),
+            tree_source.read(member).expect("tree read"),
+            "byte-identical read from both sources: {member:?}"
+        );
+    }
+}
+
+/// THE tree strictness pins (manifest-scoped source): an on-disk file
+/// absent from the mapping refuses (named); a mapped member missing
+/// from disk refuses (named); reads of missing/unmapped members ride
+/// `invalid_input` naming the member; `members()` stays
+/// mapping-scoped regardless.
+#[test]
+fn tree_source_is_manifest_scoped() {
+    let (temp, mapping, _) = populated_tree();
+    let tree = MemberSource::Tree {
+        root: temp.path().to_path_buf(),
+        mapping,
+    };
+
+    // 1. An unknown local file refuses, named.
+    std::fs::write(temp.path().join("rogue.txt"), b"rogue").expect("rogue writes");
+    let CoreError::InvalidInput { reason } = tree.member_hashes().expect_err("rogue file refuses")
+    else {
+        panic!("strictness refusal must ride InvalidInput");
+    };
+    assert!(reason.contains("rogue.txt"), "rogue named: {reason}");
+    std::fs::remove_file(temp.path().join("rogue.txt")).expect("rogue removed");
+
+    // 2. A mapped member deleted from disk refuses, named.
+    let victim = tree
+        .members()
+        .expect("members list")
+        .first()
+        .expect("nonempty")
+        .clone();
+    let MemberSource::Tree { root, mapping } = &tree else {
+        panic!("tree variant");
+    };
+    let victim_local = mapping.get(&victim).expect("victim is mapped").clone();
+    std::fs::remove_file(root.join(&victim_local)).expect("victim removed");
+    let CoreError::InvalidInput { reason } =
+        tree.member_hashes().expect_err("missing member refuses")
+    else {
+        panic!("strictness refusal must ride InvalidInput");
+    };
+    assert!(
+        reason.contains(&victim),
+        "missing member named: {reason} (victim: {victim})"
+    );
+
+    // 3. Reads: missing-but-mapped and unmapped both ride
+    //    `invalid_input` naming the member.
+    let CoreError::InvalidInput { reason } = tree.read(&victim).expect_err("missing read") else {
+        panic!("read refusal must ride InvalidInput");
+    };
+    assert!(reason.contains(&victim));
+    let CoreError::InvalidInput { reason } =
+        tree.read("nope/never-mapped").expect_err("unmapped read")
+    else {
+        panic!("read refusal must ride InvalidInput");
+    };
+    assert!(reason.contains("nope/never-mapped"));
+
+    // 4. `members()` stays mapping-scoped — no tree walk at all.
+    assert!(
+        tree.members().expect("members").contains(&victim),
+        "members() is the recorded mapping's keys, whatever the disk says"
+    );
+}
+
+/// The Zip variant is a VERBATIM delegation: it answers exactly what
+/// the proven resources.rs functions answer (no re-implementation
+/// drift possible — the calls ARE those functions).
+#[test]
+fn zip_source_matches_resources_functions_directly() {
+    let zip_bytes = member_fixture_zip();
+    let source = MemberSource::Zip(zip_bytes.clone());
+    assert_eq!(
+        source.members().expect("source members"),
+        resources::resource_members(&zip_bytes).expect("direct members")
+    );
+    assert_eq!(
+        source.member_hashes().expect("source hashes"),
+        resources::member_hashes(&zip_bytes).expect("direct hashes")
+    );
+}
+
 // ---- Explicit fixtures pinning the scheme's sharp edges ----
 
 /// Case-variant siblings map BYTE-DISTINCT (per-member injectivity
