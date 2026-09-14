@@ -281,7 +281,32 @@ async fn live_webdev_deploy_status_scriptexec_loop() {
     all_output.push_str(&String::from_utf8_lossy(&out.stdout));
     all_output.push_str(&String::from_utf8_lossy(&out.stderr));
     expect_ok("status after deploy", &out);
-    let envelope = data_envelope(&out);
+    let mut envelope = data_envelope(&out);
+    // LIVE-TRUTH TOLERANCE (11-06 rig run): the FIRST deploy on a
+    // freshly commissioned gateway can answer the immediate status
+    // sweep with an all-absent read (`ok:false`) — the project commit
+    // is not yet visible to the probe (bounded retry, the 09/10
+    // Jetty-retry discipline). The gate still REQUIRES the
+    // all-present handshake; it just allows the gateway its
+    // commit-visibility window instead of asserting on a race.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let all_present = envelope["data"]["ok"] == Value::Bool(true)
+            && ALWAYS_ON
+                .iter()
+                .all(|route| status_row(&envelope, route)["status"] == "present");
+        if all_present {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("status after deploy: routes never became visible within 30s: {envelope}");
+        }
+        eprintln!("status after deploy: commit not yet visible, retrying (bounded 30s)…");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let out = ign(&config, &env, &["webdev", "status", "--compact"]);
+        expect_ok("status after deploy (retry)", &out);
+        envelope = data_envelope(&out);
+    }
     assert_eq!(envelope["data"]["ok"], Value::Bool(true), "{envelope}");
     for route in ALWAYS_ON {
         let row = status_row(&envelope, route);
