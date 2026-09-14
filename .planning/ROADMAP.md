@@ -38,7 +38,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics *(complete 2026-09-07)*
 - [x] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview *(complete 2026-09-11; UAT gap closures 10-06/10-07 executed, re-verification passed 5/5 — SC-5 verified-with-documented-residual: through-suspend live-proven ×2 on a disposable controller rig, §2 vanish-poll capture work scoped in 10-LIVE-GATE.md §6)*
 - [x] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings *(complete 2026-09-14; SC-1/2/3 closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS + 8 recorded live-truth deltas with code fixes)*
-- [x] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation *(complete 2026-09-14; 4/4 plans — authored four-tier palettes + [ui].theme wiring + tokenization CI gate; 12-04 UAT round-trip hardened dark/light hues and wired the dormant border/title/header/accent slots, wire-proven distinct with default/mono byte-identical; pending final user re-verification of the tuned themes)*
+- [x] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation *(complete 2026-09-14; verifier passed 3/3 — authored four-tier palettes + [ui].theme wiring + tokenization CI gate negative-proven; 12-04 UAT round-trip: hues hardened, dormant border/title/header/accent slots wired, then body-content text/muted tint across all screens — user APPROVED; dark = blue-chromed cockpit at WCAG-AAA body contrast, default/mono wire-proven byte-identical pre/post; 09-UAT Gap 2 tab-bar fix closed)*
 - [ ] **Phase 13: 13-composite-engine-workspace-historian-edit** — Workspace checkout, historian binding closure (spike-first), `ign edit` round-trip
 - [ ] **Phase 14: 14-transports-mcp-lsp** — MCP stdio shim (proves the protocol pattern), then LSP for ignition-nvim
 
@@ -138,10 +138,10 @@ Plans:
 **Plans**: 4 plans
 
 Plans:
-- [ ] 12-01-PLAN.md — Theme token module: 12-slot Palette, Tier, four named themes × four authored tiers, detect_tier (ui/theme.rs)
-- [ ] 12-02-PLAN.md — Resolution wiring: [ui].theme → resolve_palette (warn+default) → ResolvedContext.palette → AppState.palette
-- [ ] 12-03-PLAN.md — Token migration (dashboard/logs, 10 literals), tab-bar highlight + cursor hide (09-UAT Gap 2), CI tokenization grep
-- [ ] 12-04-PLAN.md — Enforcement proof (grep negative test) + human degradation-ladder checkpoint
+- [x] 12-01-PLAN.md — Theme token module: 12-slot Palette, Tier, four named themes × four authored tiers, detect_tier (ui/theme.rs)
+- [x] 12-02-PLAN.md — Resolution wiring: [ui].theme → resolve_palette (warn+default) → ResolvedContext.palette → AppState.palette
+- [x] 12-03-PLAN.md — Token migration (dashboard/logs, 10 literals), tab-bar highlight + cursor hide (09-UAT Gap 2), CI tokenization grep
+- [x] 12-04-PLAN.md — Enforcement proof (grep negative test) + human degradation-ladder checkpoint (3-round UAT: palette hardening, dormant-slot wiring, body-content tint)
 
 ### Phase 13: 13-composite-engine-workspace-historian-edit
 **Goal**: The generalized MemberSource diff engine turns local directories into a first-class authoring surface (workspace checkout), the historian gap closes honestly (spike-first: Designer-diff oracle or documented-limitation-with-evidence), and `ign edit` delivers the kubectl-edit loop — hardening decode/encode at workspace scale before edit rides the same codec leg.
@@ -188,7 +188,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
 | 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 6/6 | Complete | 2026-09-14 — 1.3.0 route bundle, loss scans/CLI contract, live gates green on both rigs (11-LIVE-GATE.md) |
-| 12. 12-tui-theming-degradation | v1.1 | 3/4 | In progress | 12-03: literal migration + tab-bar/cursor UAT-gap fix + CI tokenization grep (grep-enforced tree) |
+| 12. 12-tui-theming-degradation | v1.1 | 4/4 | Complete | 2026-09-14 — verifier passed 3/3 (12-VERIFICATION.md); themes live via [ui].theme, CI tokenization gate armed, 09-UAT Gap 2 closed |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |
 | 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |
 

@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 11 tag bulk transfer XML/CSV COMPLETE + gap closures (verifier passed 20/20 must-haves, 3/3 success criteria closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS, 8 live-truth deltas fixed and re-proven, route bundle at 1.3.0; UAT gap 11-08 closed 2026-09-14 — UDT fact corrected + mirrored in README/STATE/captures, 11-07 concurrent); SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 TUI theming & degradation COMPLETE (verifier passed 3/3 success criteria — 12-VERIFICATION.md; named themes via [ui].theme live across all screens, authored 4-tier degradation palettes, tokenization CI grep negative-proven; two UAT-driven tuning rounds: palette hardening 756e888 + dormant-slot wiring, then body-content tint 27df248 — dark = blue-chromed cockpit, WCAG-AAA body contrast, default/mono byte-identical pre/post); next: Phase 13 (Historian rig access confirmation REQUIRED before planning). SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
 
 ## Current Position
 
-**Phase:** 12 of 14 (12-tui-theming-degradation)
+**Phase:** 12 of 14 (12-tui-theming-degradation) — COMPLETE, verified passed 3/3
 **Current Plan:** 4
-**Total Plans in Phase:** 4 (12-01, 12-02, 12-03, 12-04 ALL DONE)
-**Status:** 4/4 plans complete — PENDING final user re-verification of the tuned dark/light themes (`ign tui` should now show dark = blue-chromed panes, light = inverted light look; wire-proven SGR-distinct, default/mono byte-identical) — then phase verification/transition
+**Total Plans in Phase:** 4 (12-01, 12-02, 12-03, 12-04 ALL DONE incl. 3-round human-verify checkpoint)
+**Status:** Phase 12 verified passed (3/3 success criteria, 12-VERIFICATION.md) — user approved tuned themes 2026-09-14; ready for Phase 13 planning (after Historian rig access confirmation)
 **Last Activity:** 2026-09-14
 
 **Progress:** [██████████] 100%
@@ -186,7 +186,7 @@ Recent decisions affecting current work:
 - [Phase 11 prerequisite — RESOLVED by 11-01]: Real multi-level UDT export captured (artifacts/udt-multilevel.xml, sha-pinned) — the derive-vs-Event-loop decision now has its fixture
 - SC-5 (Phase 10) NOT closed by a passing gate run — env blocker RESOLVED via the UAT-recorded disposable-rig substitution (10-06 ran twice on ign-uat-836, torn down clean), but the §2 vanish poll failed both times (grace row >90s ×2; drift recorded 10-LIVE-GATE.md §4 D1). Follow-up gap work: dedicated capture of scheduled/false post-suspend vanish behavior across fresh + long-lived rigs → re-size the 90s deadline (or re-shape the check) → gate re-run. Rig access is a documented recipe (10-RIG-NOTES + gate §5), not a user dependency.
 - Parallel-wave note for 11-03 verify gates: pre-existing fmt drift (live_gateway.rs, ignition-tui/ui/mod.rs — Phase-10 commits) plus 11-03's own by-design RED tag_loss tests make workspace-wide cargo fmt --check / cargo test --workspace red independent of 11-02; 11-02 verified clean in an isolated worktree at 34d6594 (clippy -D warnings green, zero failures outside tag_loss RED tests)
-- Pending: user re-verification of tuned dark/light themes on a real terminal (12-04 UAT round-trip, ROUND 2) — after the body-content tint pass (`27df248`): `ign tui` dark should now be blue-tinted end to end (body text/labels/status/modals, not just borders); default/mono proven byte-identical on the wire pre/post
+- RESOLVED 2026-09-14: user re-verification of tuned dark/light themes — 12-04 UAT round 2 APPROVED by user ("approved") after the body-content tint pass (`27df248`); dark confirmed blue-tinted end to end; default/mono proven byte-identical on the wire pre/post
 
 ## Session Continuity
 

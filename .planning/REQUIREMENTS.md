@@ -39,8 +39,8 @@ Requirements for the v1.1 release. Each maps to roadmap phases (continues v1.0 n
 
 ### TUI Polish
 
-- [ ] **TUIX-03**: User can select a named UX theme (monochrome + color palettes) via top-level `[ui].theme` config
-- [ ] **TUIX-04**: TUI degrades gracefully across terminal capabilities (truecolor → 256 → 16 → mono) without breaking readability
+- [x] **TUIX-03**: User can select a named UX theme (monochrome + color palettes) via top-level `[ui].theme` config *(Phase 12, 2026-09-14)*
+- [x] **TUIX-04**: TUI degrades gracefully across terminal capabilities (truecolor → 256 → 16 → mono) without breaking readability *(Phase 12, 2026-09-14)*
 - [ ] **TUIX-05**: User can configure per-profile polling cadence via `poll_interval_secs` with a hard minimum clamp (sub-second polling refused by config validation)
 
 ### IDE Integration
@@ -99,8 +99,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TAGS-10 | Phase 11 | Pending |
 | TAGS-11 | Phase 11 | Pending |
 | TAGS-12 | Phase 11 | Pending |
-| TUIX-03 | Phase 12 | Pending |
-| TUIX-04 | Phase 12 | Pending |
+| TUIX-03 | Phase 12 | Satisfied 2026-09-14 (verifier 3/3) |
+| TUIX-04 | Phase 12 | Satisfied 2026-09-14 (verifier 3/3) |
 | IDE-04 | Phase 13 | Pending |
 | TAGS-13 | Phase 13 | Pending |
 | TAGS-14 | Phase 13 | Pending |
