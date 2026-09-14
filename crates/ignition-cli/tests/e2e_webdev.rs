@@ -1152,38 +1152,104 @@ async fn live_tags_alarm_lifecycle() {
     let (_dir, config) = isolated_live_config(&env);
     // THE serializer: one live gate at a time (shared gateway state).
     let _gate = LIVE_GATE.lock().await;
-    let tag = "[p5alarm]AlarmTag";
+    // UNIQUE provider name per run (11-06 live-truth): dozens of
+    // same-name delete/recreate cycles on one rig eventually degrade
+    // that name's tag model (Error_Configuration persisting minutes —
+    // seen on both rigs after repeated suite runs). Disposable rigs
+    // get disposable names: each run lands in a virgin namespace.
+    let provider = format!(
+        "p5alarm{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+    );
+    let tag = format!("[{provider}]AlarmTag");
 
     // Routes first: every alarms verb refuses exit 6 without them.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the alarms route's precondition)", &out);
 
-    // Pre-clean a leftover occupant from a prior aborted run, then
-    // WAIT for the deletion to settle (11-06 live-truth, both rigs):
-    // a rapid delete→recreate leaves the provider's tag model
-    // half-bound — reads answer Error_Configuration and writes answer
-    // ok WITHOUT landing (the silently-dropped-write class). Poll the
-    // provider list until the name is gone (bounded 30s).
-    clean_provider(&config, &env, "p5alarm");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let out = ign(&config, &env, &["tags", "provider", "list", "--compact"]);
-        expect_ok("provider list (settle poll)", &out);
-        let envelope = data_envelope(&out);
-        let gone = !envelope["data"]["providers"]
-            .as_array()
-            .expect("providers[]")
-            .iter()
-            .any(|p| p["name"] == "p5alarm");
-        if gone || std::time::Instant::now() >= deadline {
+    // SELF-HEALING SETUP (11-06 live-truth, both rigs): a recreate
+    // can race the old provider model's teardown tail — the fresh
+    // provider's tags answer Error_Configuration, sometimes for a
+    // minute-plus. The observed recovery is simply another
+    // delete→settle→recreate cycle (proven live), so the setup loops:
+    // clean → settle → create → config-create → readiness poll; a
+    // cycle that never reaches Good tears down and retries (3 cycles
+    // × 20s readiness window).
+    for _ in 0..3 {
+        clean_provider(&config, &env, &provider);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let out = ign(&config, &env, &["tags", "provider", "list", "--compact"]);
+            expect_ok("provider list (settle poll)", &out);
+            let envelope = data_envelope(&out);
+            let gone = !envelope["data"]["providers"]
+                .as_array()
+                .expect("providers[]")
+                .iter()
+                .any(|p| p["name"] == provider);
+            if gone || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let out = ign(
+            &config,
+            &env,
+            &["tags", "provider", "create", &provider, "--compact"],
+        );
+        expect_ok("provider create p5alarm", &out);
+        let out = ign_stdin(
+            &config,
+            &env,
+            &["tags", "config", "create", &tag, "--file", "-", "--compact"],
+            r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "alarms": [{"name": "HighLimit", "enabled": true, "mode": "AboveValue", "setpointA": 100, "priority": "High"}]}"#,
+        );
+        expect_ok("config create the alarmed tag", &out);
+        if await_tag_ready(&config, &env, &tag, std::time::Duration::from_secs(20)).await {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        eprintln!("setup: tag model stuck Error_Configuration, tearing down and retrying…");
     }
+    // (The readiness guarantee the rest of the gate relies on — the
+    // loop above either achieved it or the gate panics here.)
+    assert!(
+        await_tag_ready(&config, &env, &tag, std::time::Duration::from_secs(1)).await,
+        "the alarmed tag never reached a Good model after 3 setup cycles"
+    );
 
     // Write with LAND-VERIFICATION (same live-truth class): the write
     // answering ok is not proof the value landed while the provider's
-    // model mounts — verify by read-back and retry (bounded).
+    // model mounts — verify by read-back and retry (bounded). Before
+    // the FIRST write, wait for READS to answer Good: a recreate can
+    // race the old model's teardown tail (list-absence is not model-
+    // freed), leaving Error_Configuration reads that clear once the
+    // fresh model binds.
+    async fn await_tag_ready(
+        config: &Path,
+        env: &LiveEnv,
+        tag: &str,
+        budget: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let out = ign(config, env, &["tags", "read", tag, "--compact"]);
+            expect_ok("read (model-ready poll)", &out);
+            let envelope = data_envelope(&out);
+            let quality = envelope["data"]["results"][0]["quality"]
+                .as_str()
+                .unwrap_or_default();
+            if quality == "Good" {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
     async fn write_verified(config: &Path, env: &LiveEnv, tag: &str, value: &str, what: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -1208,26 +1274,11 @@ async fn live_tags_alarm_lifecycle() {
         }
     }
 
-    // Fresh provider (native REST, self-cleaning).
-    let out = ign(
-        &config,
-        &env,
-        &["tags", "provider", "create", "p5alarm", "--compact"],
-    );
-    expect_ok("provider create p5alarm", &out);
-
-    // Configure the alarmed tag: alarms are a LIST (the name-keyed
-    // dict form is silently ignored — 05-RESEARCH's live finding).
-    let out = ign_stdin(
-        &config,
-        &env,
-        &["tags", "config", "create", tag, "--file", "-", "--compact"],
-        r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "alarms": [{"name": "HighLimit", "enabled": true, "mode": "AboveValue", "setpointA": 100, "priority": "High"}]}"#,
-    );
-    expect_ok("config create the alarmed tag", &out);
+    // (The model-ready gate passed inside the setup loop; writes
+    // below assume it.)
 
     // Trigger: write past the setpoint (land-verified).
-    write_verified(&config, &env, tag, "150", "write past the setpoint").await;
+    write_verified(&config, &env, &tag, "150", "write past the setpoint").await;
 
     // Poll `alarms active` until the event appears (bounded).
     let find_event = |envelope: &Value| -> Option<Value> {
@@ -1237,14 +1288,14 @@ async fn live_tags_alarm_lifecycle() {
                 .find(|alarm| {
                     alarm["source"]
                         .as_str()
-                        .is_some_and(|source| source.contains("p5alarm"))
+                        .is_some_and(|source| source.contains(&provider))
                 })
                 .cloned()
         })
     };
     let mut event = None;
     // POLL + RE-TRIGGER (11-06 live-truth, Rig B 8.3.3): after
-    // creating the p5alarm provider, the alarm engine can take a
+    // creating the provider, the alarm engine can take a
     // LONG bounded window to register the new tag's alarm config —
     // observed: 45s+ of silent ok-polls (the config verifiably landed
     // in the model), with events flowing normally on the next attempt
@@ -1258,7 +1309,7 @@ async fn live_tags_alarm_lifecycle() {
             write_verified(
                 &config,
                 &env,
-                tag,
+                &tag,
                 "0",
                 "write below the setpoint (re-trigger clear)",
             )
@@ -1266,7 +1317,7 @@ async fn live_tags_alarm_lifecycle() {
             write_verified(
                 &config,
                 &env,
-                tag,
+                &tag,
                 "150",
                 "write past the setpoint (re-trigger set)",
             )
@@ -1407,12 +1458,12 @@ async fn live_tags_alarm_lifecycle() {
     let _ = ign(
         &config,
         &env,
-        &["tags", "write", tag, "--value", "0", "--compact"],
+        &["tags", "write", &tag, "--value", "0", "--compact"],
     );
     let out = ign(
         &config,
         &env,
-        &["tags", "config", "delete", tag, "--yes", "--compact"],
+        &["tags", "config", "delete", &tag, "--yes", "--compact"],
     );
     expect_ok("config delete the alarmed tag", &out);
     let out = ign(
@@ -1422,12 +1473,12 @@ async fn live_tags_alarm_lifecycle() {
             "tags",
             "provider",
             "delete",
-            "p5alarm",
+            &provider,
             "--yes",
             "--compact",
         ],
     );
-    expect_ok("provider delete p5alarm (guarded)", &out);
+    expect_ok("provider delete (guarded)", &out);
 }
 
 // ---- 11-06 live gates: the XML fidelity round-trip (the
