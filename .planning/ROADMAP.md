@@ -38,7 +38,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics *(complete 2026-09-07)*
 - [x] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview *(complete 2026-09-11; UAT gap closures 10-06/10-07 executed, re-verification passed 5/5 — SC-5 verified-with-documented-residual: through-suspend live-proven ×2 on a disposable controller rig, §2 vanish-poll capture work scoped in 10-LIVE-GATE.md §6)*
 - [x] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings *(complete 2026-09-14; SC-1/2/3 closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS + 8 recorded live-truth deltas with code fixes)*
-- [ ] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation
+- [x] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation *(complete 2026-09-14; 4/4 plans — authored four-tier palettes + [ui].theme wiring + tokenization CI gate; 12-04 UAT round-trip hardened dark/light hues and wired the dormant border/title/header/accent slots, wire-proven distinct with default/mono byte-identical; pending final user re-verification of the tuned themes)*
 - [ ] **Phase 13: 13-composite-engine-workspace-historian-edit** — Workspace checkout, historian binding closure (spike-first), `ign edit` round-trip
 - [ ] **Phase 14: 14-transports-mcp-lsp** — MCP stdio shim (proves the protocol pattern), then LSP for ignition-nvim
 

@@ -11,11 +11,11 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Phase:** 12 of 14 (12-tui-theming-degradation)
 **Current Plan:** 4
-**Total Plans in Phase:** 4 (12-01, 12-02, 12-03 done — 12-04 remaining)
-**Status:** 12-03 complete (literal migration: zero Color:: outside ui/theme.rs grep-proven + CI-enforced; 09-UAT Gap 2 code half closed — Tabs::select + emphasis token + hidden cursor; 229 tui tests green) — 12-04 next
+**Total Plans in Phase:** 4 (12-01, 12-02, 12-03, 12-04 ALL DONE)
+**Status:** 4/4 plans complete — PENDING final user re-verification of the tuned dark/light themes (`ign tui` should now show dark = blue-chromed panes, light = inverted light look; wire-proven SGR-distinct, default/mono byte-identical) — then phase verification/transition
 **Last Activity:** 2026-09-14
 
-**Progress:** [██████████] 99%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -67,6 +67,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 12 P01 | 8 min | 2 tasks | 2 files |
 | Phase 12 P02 | 14 min | 2 tasks | 5 files |
 | Phase 12 P03 | 18 min | 3 tasks | 7 files |
+| Phase 12 P04 | 50 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -170,6 +171,8 @@ Recent decisions affecting current work:
 - [Phase 12]: 12-03: CI tokenization grep landed ATOMICALLY with the final literal migration (state.rs/context.rs test-code literals included in the same commit) — the grep goes red the moment it's added — grep-atomicity mandate; plan undercounted the tree's literals
 - [Phase 12]: 12-03: all-Reset pins compare whole-palette equality against the mono-AUTHORED palette — strictly stronger than a slot walk (auto-covers future Palette fields) and tokenization-clean — slot-equality-only doctrine; CI grep forbids literals outside theme.rs
 - [Phase 12]: 12-03: palette threaded into dashboard render fns as &theme::Palette (minimal pure dependency); hide_cursor is best-effort (let _ =) — restore path re-shows on every exit — research doctrine: helpers carry color only, modifiers inline; chrome must not kill the cockpit
+- [Phase 12]: 12-04: dark/light hues HARDENED after UAT found the first palettes indistinguishable from default at a glance — dark border/title/header/emphasis carry the accent blue family, light keeps black-text + light-gray-fill structure visible on either terminal background; the reserved post-UAT hue discretion exercised with zero test changes (structure never pinned hues) — UAT verdict 'nothing seems any different' — wire diagnosis proved the mechanism worked end-to-end but palettes were timid; hues were planner-discretion by design
+- [Phase 12]: 12-04: [Rule 1] dormant border/title/header/accent slots wired into the dashboard (pane blocks, sessions header, status-line profile name) — the slots existed in the contract but NO consumer attached them, so panes rendered default-styled in EVERY theme; default/mono proven byte-identical on the wire pre/post (Reset slots), 229 tests unchanged — The true root cause of the UAT verdict — hue tuning alone cannot make unwired slots visible; wiring is the smallest fix that preserves both protected guarantees
 
 ### Pending Todos
 
@@ -182,8 +185,9 @@ Recent decisions affecting current work:
 - [Phase 11 prerequisite — RESOLVED by 11-01]: Real multi-level UDT export captured (artifacts/udt-multilevel.xml, sha-pinned) — the derive-vs-Event-loop decision now has its fixture
 - SC-5 (Phase 10) NOT closed by a passing gate run — env blocker RESOLVED via the UAT-recorded disposable-rig substitution (10-06 ran twice on ign-uat-836, torn down clean), but the §2 vanish poll failed both times (grace row >90s ×2; drift recorded 10-LIVE-GATE.md §4 D1). Follow-up gap work: dedicated capture of scheduled/false post-suspend vanish behavior across fresh + long-lived rigs → re-size the 90s deadline (or re-shape the check) → gate re-run. Rig access is a documented recipe (10-RIG-NOTES + gate §5), not a user dependency.
 - Parallel-wave note for 11-03 verify gates: pre-existing fmt drift (live_gateway.rs, ignition-tui/ui/mod.rs — Phase-10 commits) plus 11-03's own by-design RED tag_loss tests make workspace-wide cargo fmt --check / cargo test --workspace red independent of 11-02; 11-02 verified clean in an isolated worktree at 34d6594 (clippy -D warnings green, zero failures outside tag_loss RED tests)
+- Pending: user re-verification of tuned dark/light themes on a real terminal (12-04 UAT round-trip) — should show visibly distinct palettes now
 
 ## Session Continuity
 
-**Last session:** 2026-09-14T16:42:19.646Z
+**Last session:** 2026-09-14T19:08:12.836Z
 **Resume file:** None
