@@ -718,6 +718,44 @@ async fn live_tags_config_export_import_roundtrip() {
     // refused by contract now).
     assert_eq!(envelope["data"]["imported"], 1, "{envelope}");
 
+    // LANDING VERIFICATION (11-06 Rig A live truth): a clean answer
+    // against a JUST-CREATED provider can be a SILENT NO-OP (see the
+    // 11-06 gates' comments) — and import #2's collision refusal
+    // PRESUPPOSES the landing. Verify by read-back and re-import
+    // (abort policy, clean target — state-safe) bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let out = read_with_provider_tolerance(
+            &config,
+            &env,
+            &["tags", "read", "[p5import]T1", "--compact"],
+        );
+        let landed =
+            out.status.success() && data_envelope(&out)["data"]["results"][0]["quality"] == "Good";
+        if landed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "import #1 never landed (the read-back kept missing T1)"
+        );
+        eprintln!("import: clean answer but nothing landed, re-importing (bounded 30s)…");
+        let out = ign(
+            &config,
+            &env,
+            &[
+                "tags",
+                "import",
+                "--file",
+                export_file.to_str().expect("path"),
+                "--provider",
+                "p5import",
+                "--compact",
+            ],
+        );
+        expect_ok("import #1 (re-import)", &out);
+    }
+
     // Import #2 (abort again): the collision refusal — exit 6,
     // tag_collision, BEFORE any write.
     let out = ign(
