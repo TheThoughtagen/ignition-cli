@@ -402,6 +402,52 @@ fn clean_tag_configs(config: &Path, env: &LiveEnv, paths: &[&str]) {
     let _ = ign(config, env, &args);
 }
 
+/// Import with the fresh-provider MOUNT-RACE tolerance (11-06 rig
+/// run, live-truth delta): importTagsFile against a JUST-CREATED
+/// provider intermittently answers per-row
+/// `Error_Exception("…TagPath.getPathLength()… \"cleanPath\" is null")`
+/// elements — the provider's tag model is still mounting (flaky 2/3
+/// on immediate-import trials on 8.3.6; same lag class as the
+/// deploy-loop first-sweep). Unlike parse-phase errors (wholesale
+/// abort, nothing lands — probe 5's all-or-nothing), this
+/// path-resolution-phase error CAN partially land; a re-import under
+/// the same (overwrite) policy converges the subtree, so the helper
+/// retries the SAME import within a bounded 30s window until an
+/// attempt answers `failed: []`. Any non-transient failure (or a
+/// non-ok exit) returns immediately — the caller's asserts fire on
+/// the last envelope.
+fn import_with_mount_tolerance(config: &Path, env: &LiveEnv, args: &[&str]) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut out = ign(config, env, args);
+    loop {
+        let clean = out.status.success()
+            && data_envelope(&out)["data"]["failed"]
+                .as_array()
+                .map(Vec::len)
+                == Some(0);
+        if clean {
+            return out;
+        }
+        let transient = out.status.success() && {
+            let envelope = data_envelope(&out);
+            let failed = envelope["data"]["failed"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            !failed.is_empty()
+                && failed
+                    .iter()
+                    .all(|f| f.as_str().map(|s| s.contains("cleanPath")).unwrap_or(false))
+        };
+        if !transient || std::time::Instant::now() >= deadline {
+            return out;
+        }
+        eprintln!("import: provider mount race (cleanPath), retrying (bounded 30s)…");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        out = ign(config, env, args);
+    }
+}
+
 /// THE live-gate serializer: every live test mutates SHARED gateway
 /// state (the CLI-owned ign-cli deploy project — five concurrent
 /// overwrite-imports race each other — plus tag providers), so the
@@ -1763,7 +1809,8 @@ async fn live_tags_xml_fidelity_roundtrip() {
 
     // The guarded import WITH --yes: exit 0, no server-side
     // Bad_Failure backstop, the loss report rides the envelope.
-    let out = ign(
+    // (The mount-race tolerance rides the helper — see its comment.)
+    let out = import_with_mount_tolerance(
         &config,
         &env,
         &[
@@ -2038,13 +2085,15 @@ async fn live_tags_csv_roundtrip() {
     // ALWAYS reports csv_no_alarms + csv_legacy_columns_only on
     // non-empty files). CAPTURE FACT: the CSV basePath is IGNORED —
     // rows land at the PROVIDER ROOT regardless ([p11csv]TMem, …).
+    // (The mount-race tolerance rides the helper — see its comment;
+    // the overwrite policy makes each retry converge.)
     let out = ign(
         &config,
         &env,
         &["tags", "provider", "create", "p11csv", "--compact"],
     );
     expect_ok("provider create p11csv", &out);
-    let out = ign(
+    let out = import_with_mount_tolerance(
         &config,
         &env,
         &[
