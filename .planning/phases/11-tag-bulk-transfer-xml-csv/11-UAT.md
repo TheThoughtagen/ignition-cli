@@ -1,9 +1,9 @@
 ---
-status: complete
+status: diagnosed
 phase: 11-tag-bulk-transfer-xml-csv
 source: 11-01-SUMMARY.md, 11-02-SUMMARY.md, 11-03-SUMMARY.md, 11-04-SUMMARY.md, 11-05-SUMMARY.md, 11-06-SUMMARY.md
 started: 2026-09-14T10:43:27Z
-updated: 2026-09-14T05:40:00Z
+updated: 2026-09-14T05:50:00Z
 ---
 
 ## Current Test
@@ -68,17 +68,36 @@ skipped: 0
   reason: "User reported: gate fired correctly (exit 2, report named the UDT-type finding verbatim) but the trailing hint says 'fix the input source — a readable file path via --file, or `-` to pipe the content on stdin' although the file was readable; hint is invalid_input-class boilerplate leaking into the gate path"
   severity: minor
   test: 3
-  root_cause: ""
-  artifacts: []
-  missing: []
-  debug_session: ""
+  root_cause: "Hints attach centrally per error class: render_error prints err.hint() (render.rs:171-173); CoreError::hint()'s InvalidInput arm (error.rs:649-661) defaults to the file-read hint for every reason that is not the exact-match TUI_TTY_REFUSAL sentinel — the loss gate's throw (main.rs:2862-2864) rides InvalidInput, so it inherits the file-read hint although its own prose already carries the correct 're-run with --yes' guidance. The TTY-refusal constructor (error.rs:907-911) is the one sanctioned same-slug/same-exit hint override — the precedent to follow."
+  artifacts:
+    - path: "crates/ignition-core/src/error.rs"
+      issue: "InvalidInput hint arm (649-661) — generic file-read default; only escape is the TTY sentinel"
+    - path: "crates/ignition-cli/src/main.rs"
+      issue: "loss_gate throw (2862-2864) rides InvalidInput with no hint-override mechanism"
+    - path: "crates/ignition-cli/src/render.rs"
+      issue: "central hint attachment (171-173) — class-level, not throw-site"
+  missing:
+    - "Add a CoreError::loss_gate_refusal(prose) constructor mirroring tui_tty_refusal(): stamp the InvalidInput reason with a LOSS_GATE_REFUSAL_MARKER sentinel"
+    - "Branch on the sentinel in hint()'s InvalidInput arm to return the --yes hint (or None — the message already carries guidance)"
+    - "Note (out of scope): ~66 other InvalidInput sites share the generic hint; throw-site hint redesign deferred"
+  debug_session: ".planning/debug/loss-gate-hint-mismatch.md"
 
 - truth: "The xml_udt_type_definition loss fact accurately describes live importTags behavior for UDT type definitions"
   status: failed
   reason: "User reported: --yes import of the UDT fixture landed FULLY (envelope imported:2/failed:[] verified accurate against live rig — MotorType def with members under _types_, P11UDT instance with children), but the fact text claims 'importTags refuses them (\"Udt definitions can only be imported in the UDT Definitions tab\"), so the import lands nothing' — falsified live on 8.3.6 fresh provider via the importTagsFile route; contradicts the 11-01 capture claim"
   severity: minor
   test: 4
-  root_cause: ""
-  artifacts: []
-  missing: []
-  debug_session: ""
+  root_cause: "The 11-01 probe-3(b) capture proved the verbatim refusal ONLY for FOLDER-basePath imports ([default]P11Roundtrip); the shipped CLI import path always sends the PROVIDER-ROOT basePath (format!([{provider}]), tags.rs:2210) where the gateway ACCEPTS UdtType definitions and routes them to [provider]_types_/Name. The capture was true but scope-wrong; the fact text (tag_loss.rs:172-180) generalized a folder-basePath behavior onto the only path the CLI exposes. Live probes (scratch provider uatcsv only) confirmed landing in all three conditions: type-only file, mixed fixture, and type-pre-existing re-import — ruling out any pre-existence condition. 11-06 silently worked around the stale claim (config-creates the type, instance-only seeded XML) so it survived to UAT."
+  artifacts:
+    - path: "crates/ignition-core/src/actions/tag_loss.rs"
+      issue: "falsified detail text (172-180); doc comment (27-30); test comment (439-441 — has_fact assertion itself stays valid)"
+    - path: "README.md"
+      issue: "§The loss gate (~:1118): 'UDT type definitions the gateway refuses outright' repeats the unscoped claim"
+    - path: ".planning/STATE.md"
+      issue: "lines ~134 and ~143 repeat the unscoped claim as phase decisions"
+    - path: ".planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md"
+      issue: "§Probe 3 (b)(1)/oracle item 4 lack a scope marker (capture text accurate for its conditions — needs the Probe-5-style dated scope note)"
+  missing:
+    - "Keep the fact FIRING (detection is correct; real transfer caveats exist) but reword the detail to live truth: definitions DO import and route to [provider]_types_/Name; the verbatim refusal is folder-basePath-only (11-01 capture) and unreachable via this command; include 11-06 delta-4 caveats (provider-qualified udtParentType points at the source provider cross-provider; 8.3.3 silently drops parameter overrides when the target type is unresolvable)"
+    - "Mirror the correction in README.md (loss-gate section) and STATE.md (dated corrections), add the captures-doc scope note, fix the tag_loss.rs test comment"
+  debug_session: ".planning/debug/udt-type-fact-falsified.md"
