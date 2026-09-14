@@ -37,7 +37,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 8: 08-foundations-session-core-config-contract** — Shared execution core, one-shot config schema migration, codified contract discipline *(complete 2026-09-06)*
 - [x] **Phase 9: 09-agent-surface-api-diagnostics** — Raw REST passthrough escape hatch + curated daily-check diagnostics *(complete 2026-09-07)*
 - [x] **Phase 10: 10-eam-write-operations** — Full guarded EAM agent/task write lifecycle with blast-radius preview *(complete 2026-09-11; UAT gap closures 10-06/10-07 executed, re-verification passed 5/5 — SC-5 verified-with-documented-residual: through-suspend live-proven ×2 on a disposable controller rig, §2 vanish-poll capture work scoped in 10-LIVE-GATE.md §6)*
-- [ ] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings
+- [x] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings *(complete 2026-09-14; SC-1/2/3 closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS + 8 recorded live-truth deltas with code fixes)*
 - [ ] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation
 - [ ] **Phase 13: 13-composite-engine-workspace-historian-edit** — Workspace checkout, historian binding closure (spike-first), `ign edit` round-trip
 - [ ] **Phase 14: 14-transports-mcp-lsp** — MCP stdio shim (proves the protocol pattern), then LSP for ignition-nvim
@@ -179,7 +179,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 8. 08-foundations-session-core-config-contract | v1.1 | 6/6 | Complete | 2026-09-06 |
 | 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
 | 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
-| 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 4/6 | In progress | 11-01 captures + 11-02 route actions (1.2.0) + 11-03 loss scans + 11-04 core transfer layer done 2026-09-12; 11-05 CLI contract layer next |
+| 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 6/6 | Complete | 2026-09-14 — 1.3.0 route bundle, loss scans/CLI contract, live gates green on both rigs (11-LIVE-GATE.md) |
 | 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |
 | 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |

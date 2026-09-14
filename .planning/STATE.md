@@ -12,10 +12,10 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 **Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
 **Current Plan:** 6
 **Total Plans in Phase:** 6
-**Status:** Ready to execute
-**Last Activity:** 2026-09-12
+**Status:** Phase complete — ready for verification
+**Last Activity:** 2026-09-14
 
-**Progress:** [██████████] 99%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 11 P03 | 20h 32m (overnight gap) | 2 tasks | 7 files |
 | Phase 11 P04 | 49 min | 3 tasks | 9 files |
 | Phase 11 P05 | 33 min | 3 tasks | 9 files |
+| Phase 11 P06 | 171 min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -146,6 +147,11 @@ Recent decisions affecting current work:
 - [Phase 11]: TAGS-12 loss gate is ONE function in dispatch (loss_gate): pre-resolution scan, the prose report IS the exit-2 invalid_input refusal (profile null, zero requests), --yes attaches data.loss_report; imports only — csv generation warns-and-continues — 10-04 preview_then_confirm lesson: one gate means the refusal shape cannot drift
 - [Phase 11]: data.loss_report is ONE additive envelope key with two shapes (import scan: facts+top_level_names; csv generation: dropped_keys+coerced+rows) on a LossReport struct skip-serialized at None — pre-11-05 envelopes byte-identical — envelope lock mandates the key; additive-only frozen contract
 - [Phase 11]: Mixed-parent export gets NO gate — Probe 4 proves silent Unknown-corruption PRE-EXISTS in the JSON interchange (not a hard failure, not new-format); xml/csv stdout mode writes RAW bytes in every render mode (fourth exception extended), human summary on stderr — planner lock's own no-check branch + capture-first honesty; pipes stay pure
+- [Phase 11]: 11-06: the fidelity oracle held live on both rigs (transport sha equality; order-normalized structural identity after import) — one Rig B run recorded a byte-identical pair, so capture (b)'s sibling permutation is probabilistic, not guaranteed — SC-1 closed on recorded live evidence
+- [Phase 11]: 11-06: importTags silently drops UdtInstance parameter overrides when the referenced type is unresolvable in the TARGET provider (8.3.3; 8.3.6 preserves; overwrite re-import does not heal) — the fidelity gate transfers MotorType via the config surface — A UDT-instance transfer without its type definition is not faithful
+- [Phase 11]: 11-06: 8.3.x async-mounting tolerances are bounded and measurement-backed (servlet first-activation 240s worst; import cleanPath 30s; provider resolution 30s; alarm registration 60s/cycle; landing verification after every import; unique provider names per run) — No blind deadline bumps; every window carries its measurement
+- [Phase 11]: 11-06: generated CSV fills an absent dataType with Int4 (2) and reports it; the legacy-default sheet is PER-COLUMN (header-present columns materialize, absent ones do not) — probe-5's universal sheet claim corrected — Live-truth corrections to the interchange, gate + captures doc updated together
+- [Phase 11]: 11-06 ops: image trial = 2h — budget a full live-suite run inside one window; commissioning a fresh rig costs ~4 min; provisioning script transcription typos surface as gateway 400 MalformedJson — Fifth rig-generation proof; recorded for the next live phase
 
 ### Pending Todos
 
@@ -161,5 +167,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-12T14:43:51.225Z
+**Last session:** 2026-09-14T04:43:10.558Z
 **Resume file:** None
