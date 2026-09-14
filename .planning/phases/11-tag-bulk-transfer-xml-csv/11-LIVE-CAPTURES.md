@@ -151,6 +151,8 @@ JSON interchange cross-reference (trimmed, same two-path scope, Rig A): instance
 **(b) Import→re-export byte-identity: NOT ACHIEVABLE — two distinct reasons, both captured:**
 
 1. **`importTags` REFUSES UDT type definitions** (verbatim, BOTH rigs): `Error_Exception("Error importing tags: Udt definitions can only be imported in the UDT Definitions tab.")` — the import lands NOTHING; the subsequent re-export of the target paths yields empty `type="Unknown"` shells (154 bytes, verbatim in probe-outputs). Type-definition-bearing XML files CANNOT round-trip through `importTags` at all.
+
+    **[SCOPE-CORRECTED live 2026-09-14 by the Phase-11 UAT — see .planning/debug/udt-type-fact-falsified.md]** This refusal was observed with a FOLDER basePath (`[default]P11Roundtrip`). PROVIDER-ROOT imports — the only form the shipped CLI exposes (`tags_import_bulk` sends `[{provider}]`, tags.rs:2210) — ACCEPT UdtType definitions, routing each to `[provider]_types_/Name` regardless of position in the file (live-proven ×3 on 8.3.6: type-only file, mixed fixture with target type absent, re-import with type present; plus the UAT import itself). The capture text above remains true for folder-basePath imports, which this command cannot express.
 2. **Instance-only XML round-trips structurally but NOT byte-identically:** importing the P11UDT-only export into `[default]P11Roundtrip` (`'o'`) succeeds (`Good` ×5) and re-exports at the IDENTICAL length (1128 == 1128) with all elements/attrs/properties equal — but sibling order permutes on the model rebuild (first divergence at byte offset 115: original `M2,Sub,M1` vs re-export `M1,Sub,M2`). Order-normalized comparison (recursive sibling sort + canonical serialize) = **IDENTICAL**.
 
 **NAMED ORACLE STRATEGY (binds 11-06's live gate):**
@@ -158,7 +160,7 @@ JSON interchange cross-reference (trimmed, same two-path scope, Rig A): instance
 1. Transport fidelity (always): `sha256(file bytes) == sha256(base64decode(payload_b64))`.
 2. Export determinism (proven): re-export of an UNCHANGED subtree is byte-stable → byte-identity valid for same-subtree re-export without intervening writes.
 3. Import→re-export oracle: byte-identity is INVALID (order permutes on rebuild). Use **order-normalized structural identity** (canonicalize: recursively sort sibling elements, compare serialization) + length equality as a cheap pre-check. Captured pair: orig sha `dcf1c0aab952f287…` vs re-export sha `2d99ed58c2fc4dda…` (equal length, structurally identical).
-4. Files containing `type="UdtType"` are EXCLUDED from the round-trip oracle — the gateway refuses their import (finding b.1); the loss-scan must surface UdtType presence and the gate may only assert the verbatim refusal element for them.
+4. Files containing `type="UdtType"` are EXCLUDED from the round-trip oracle — the gateway refuses their import (finding b.1); the loss-scan must surface UdtType presence and the gate may only assert the verbatim refusal element for them. **[SCOPE NOTE 2026-09-14, 11-08]** the UdtType refusal behind this exclusion is folder-basePath-only; provider-root imports land definitions in `[provider]_types_`. The exclusion stays correct for the 11-06 oracle's design (instance-only seeded XML + config-surfaced type) — the fidelity guarantee never exercised the folder path.
 
 ### Cross-rig byte delta (8.3.6 vs 8.3.3)
 

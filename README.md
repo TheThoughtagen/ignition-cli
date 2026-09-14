@@ -1116,9 +1116,14 @@ in `.planning/phases/11-tag-bulk-transfer-xml-csv/11-LIVE-CAPTURES.md`
 
 When importing xml/csv, the CLI SCANS the input before anything is
 sent and reports what the import would drop or coerce — UDT type
-definitions the gateway refuses outright, gateway-export-shaped files
-carrying only edited properties, and (for CSV, unconditionally) the
-no-alarms/legacy-columns facts. If the scan reports losses, the CLI
+definition transfer caveats (definitions DO import on this command's
+provider-root path, routing to `[provider]_types_/Name`; but exported
+`udtParentType` stays provider-qualified, so cross-provider imports
+keep pointing at the source provider, and instance parameter overrides
+silently drop when the referenced type is unresolvable in the target
+provider on 8.3.3), gateway-export-shaped files carrying only edited
+properties, and (for CSV, unconditionally) the no-alarms/legacy-columns
+facts. If the scan reports losses, the CLI
 prints the loss report as prose on STDERR and **refuses exit 2
 `invalid_input` unless `--yes`** — the refusal happens before any
 network activity (profile null, zero requests). With `--yes` the
