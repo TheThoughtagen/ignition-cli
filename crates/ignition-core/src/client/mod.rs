@@ -55,6 +55,7 @@ pub mod tags;
 pub mod trial;
 pub mod version;
 pub mod webdev;
+pub mod workspace;
 
 use crate::client::connections::GatewayConnection;
 use crate::client::diagnostics::BundleStatusWire;

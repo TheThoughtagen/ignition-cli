@@ -31,3 +31,4 @@ base64 = { workspace = true } # 11-04: byte-faithful envelope carrier (payload_b
 [dev-dependencies]
 wiremock = { workspace = true }
 tempfile = { workspace = true }
+proptest = "1.11.0"
