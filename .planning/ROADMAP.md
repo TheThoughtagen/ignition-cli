@@ -135,7 +135,13 @@ Plans:
   2. TUI remains readable as terminal capabilities step down truecolor → 256 → 16 → mono (verified in capability-limited terminals — no broken layout, no unreadable contrast)
   3. All `Color::` literals live in the style-tokens module — CI grep enforces tokenization-first discipline; palettes compose from tokens, never scattered literals
 **Research/Planning flags**: Standard patterns (k9s/btop-convergent named palette slots ~15-25 keys; ratatui theme crates rejected by stack research). No research-phase needed.
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+- [ ] 12-01-PLAN.md — Theme token module: 12-slot Palette, Tier, four named themes × four authored tiers, detect_tier (ui/theme.rs)
+- [ ] 12-02-PLAN.md — Resolution wiring: [ui].theme → resolve_palette (warn+default) → ResolvedContext.palette → AppState.palette
+- [ ] 12-03-PLAN.md — Token migration (dashboard/logs, 10 literals), tab-bar highlight + cursor hide (09-UAT Gap 2), CI tokenization grep
+- [ ] 12-04-PLAN.md — Enforcement proof (grep negative test) + human degradation-ladder checkpoint
 
 ### Phase 13: 13-composite-engine-workspace-historian-edit
 **Goal**: The generalized MemberSource diff engine turns local directories into a first-class authoring surface (workspace checkout), the historian gap closes honestly (spike-first: Designer-diff oracle or documented-limitation-with-evidence), and `ign edit` delivers the kubectl-edit loop — hardening decode/encode at workspace scale before edit rides the same codec leg.
