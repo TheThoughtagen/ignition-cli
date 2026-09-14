@@ -2859,6 +2859,10 @@ fn loss_gate(
     }
     let prose = render_loss_prose(label, &facts, &scan_names);
     if !yes {
+        // The prose header "loss report (" is LOSS_GATE_REFUSAL_REASON_PREFIX
+        // (ignition-core::error) — hint() content-addresses the --yes hint off
+        // it. Changing render_loss_prose's header changes the hint; the
+        // contract_tags loss-gate pins are the drift guard.
         return Err(CoreError::InvalidInput {
             reason: format!("{prose}re-run with --yes to import anyway"),
         });

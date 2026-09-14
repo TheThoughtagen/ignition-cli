@@ -2234,6 +2234,21 @@ async fn tags_import_loss_gate_refusals() {
         stderr.contains("re-run with --yes to import anyway"),
         "the one-flag-away abort: {stderr}"
     );
+    // Drift guard for the 11-07 hint fix (.planning/debug/
+    // loss-gate-hint-mismatch.md): the refusal's trailing hint must
+    // match the loss-gate failure — the `hint: ` prefix uniquely
+    // targets the hint line (the error line also says "re-run with
+    // --yes"). If render_loss_prose's header ever drifts off
+    // LOSS_GATE_REFUSAL_REASON_PREFIX, the hint silently regresses to
+    // the generic file-read default and BOTH assertions here fail.
+    assert!(
+        stderr.contains("hint: the loss report above names"),
+        "loss-gate hint names the report + --yes re-run: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fix the input source"),
+        "the generic file-read hint must never leak onto the loss-gate path: {stderr}"
+    );
 
     // Compact mode: same refusal as the machine envelope — code
     // invalid_input, profile null.
@@ -2259,6 +2274,19 @@ async fn tags_import_loss_gate_refusals() {
     let message = envelope["error"]["message"].as_str().expect("message");
     assert!(message.contains("[xml_export_edited_only]"));
     assert!(message.contains("re-run with --yes"));
+    // JSON-mode drift guard (11-07): error.rs embeds `hint: self.hint()`
+    // in the envelope, so agents reading error.hint get the same
+    // corrected guidance as the human stderr line (.planning/debug/
+    // loss-gate-hint-mismatch.md).
+    let envelope_hint = envelope["error"]["hint"].as_str().expect("hint present");
+    assert!(
+        envelope_hint.contains("the loss report above names"),
+        "envelope hint matches the loss-gate failure: {envelope_hint}"
+    );
+    assert!(
+        !envelope_hint.contains("fix the input source"),
+        "the file-read default must never ride the envelope on this path: {envelope_hint}"
+    );
 
     // --- csv: csv_no_alarms fires UNCONDITIONALLY for non-empty CSV
     // (11-01 Probe 5 — the gate always fires for the format) ---
