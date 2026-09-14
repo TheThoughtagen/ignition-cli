@@ -9,13 +9,13 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 
 ## Current Position
 
-**Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv) — post-verification UAT gap closures (11-07, 11-08)
-**Current Plan:** 1
-**Total Plans in Phase:** 2 gap-closure plans (11-07 done, 11-08 in progress)
-**Status:** 11-07 complete (loss-gate hint mismatch closed on sentinel-prefix pins) — 11-08 next
+**Phase:** 12 of 14 (12-tui-theming-degradation)
+**Current Plan:** 2
+**Total Plans in Phase:** 4 (12-01 done, 12-02 next)
+**Status:** 12-01 complete (theme token module: Palette/Tier/registry/detect_tier, 16 structural tests green) — 12-02 next
 **Last Activity:** 2026-09-14
 
-**Progress:** [██████████] 100%
+**Progress:** [██████████] 96%
 
 ## Performance Metrics
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 9 | 0/TBD | - | - |
 | 10 | 0/TBD | - | - |
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
-| 12 | 0/TBD | - | - |
+| 12 | 1/4 | 8 min | 8 min |
 | 13 | 0/TBD | - | - |
 | 14 | 0/TBD | - | - |
 
@@ -63,6 +63,8 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 11 P06 | 171 min | 3 tasks | 4 files |
 | Phase 11 P07 | 12 min | 2 tasks | 3 files |
 | Phase 11 P08 | 12 min | 2 tasks | 5 files |
+| Phase 12 P01 | 8 min | 2 tasks | 2 files |
+| Phase 12 P01 | 8 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -156,6 +158,10 @@ Recent decisions affecting current work:
 - [Phase 11]: 11-06 ops: image trial = 2h — budget a full live-suite run inside one window; commissioning a fresh rig costs ~4 min; provisioning script transcription typos surface as gateway 400 MalformedJson — Fifth rig-generation proof; recorded for the next live phase
 - [Phase 11]: UDT fact correction (11-08): xml_udt_type_definition fires unconditionally with corrected scoped text — provider-root imports DO land UdtType definitions in [provider]_types_/Name; the verbatim refusal is folder-basePath-only; corrections dated across README/STATE/captures, originals preserved
 - [Phase 11]: 11-07: loss-gate hint override rides a PREFIX sentinel (LOSS_GATE_REFUSAL_REASON_PREFIX = the render_loss_prose header literal) content-addressed in hint()'s InvalidInput arm — the 06-07 TTY exact-match pattern adapted for dynamic prose; same slug invalid_input, same exit 2, envelope shape + message prose byte-identical (hints are not slugs — not a Three-Place event); contract_tags drift-guard pins fail if the prose header and the sentinel ever diverge; the ~66 other InvalidInput sites keep the generic hint (deferred design question per the debug session) — UAT test 3: the refusal's trailing hint must match the failure; constructor variant rejected as extra API surface when the precedent already covers it
+- [Phase 12]: 12-01: mono adaptation centralized in style helpers keyed on slot==Reset as the mono marker — the palette IS the resolved tier, so no second Tier parameter can drift; error→BOLD, selection→REVERSED at mono, everything else plain fg
+- [Phase 12]: 12-01: degradation is AUTHORED not derived — four themes × four explicit tiers, Rgb confined to truecolor palettes, c16 = ANSI-16 names (+ intentional Reset in default), mono all-Reset at EVERY tier (tier-independent pin for 12-02's ambient-COLORTERM wiring tests)
+- [Phase 12]: 12-01: detect_tier is pure over &dyn Fn(&str)->Option<String> — signature pinned so 12-02 wires it as detect_tier(&|k| std::env::var(k).ok()); priority NO_COLOR non-empty > COLORTERM truecolor|24bit > TERM *256color* > TERM missing/dumb→Mono > C16
+- [Phase 12]: 12-01: palette HUES are planner-discretion and ADJUSTABLE POST-UAT — tests pin structure only (slot equality, containment, all-Reset mono), never literal colors
 
 ### Pending Todos
 
@@ -171,5 +177,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-14T14:42:27.513Z
+**Last session:** 2026-09-14T16:02:33.061Z
 **Resume file:** None

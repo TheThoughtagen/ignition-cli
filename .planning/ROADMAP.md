@@ -188,7 +188,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 9. 09-agent-surface-api-diagnostics | v1.1 | 8/8 | Complete | 2026-09-07 |
 | 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 6/6 | Complete | 2026-09-14 — 1.3.0 route bundle, loss scans/CLI contract, live gates green on both rigs (11-LIVE-GATE.md) |
-| 12. 12-tui-theming-degradation | v1.1 | 0/TBD | Not started | - |
+| 12. 12-tui-theming-degradation | v1.1 | 1/4 | In progress | 12-01: theme token module (ui/theme.rs — Palette/Tier/registry/detect_tier) |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/TBD | Not started | - |
 | 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |
 
