@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 11 tag bulk transfer XML/CSV: capture-first plan 11-01 executed (all five roadmap probes answered on both rigs, multi-level UDT XML fixture committed); SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 11 tag bulk transfer XML/CSV COMPLETE (6/6 plans; verifier passed 20/20 must-haves, 3/3 success criteria closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS, 8 live-truth deltas fixed and re-proven, route bundle at 1.3.0); SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
 
 ## Current Position
 
-**Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv)
-**Current Plan:** 6
-**Total Plans in Phase:** 6
-**Status:** Phase complete — ready for verification
+**Phase:** 12 of 14 (12-tui-theming-degradation) — Phase 11 complete + verified
+**Current Plan:** 0
+**Total Plans in Phase:** TBD (Phase 11: 6/6 done)
+**Status:** Phase 11 verified (passed 20/20) — ready for `/gsd-plan-phase 12`
 **Last Activity:** 2026-09-14
 
 **Progress:** [██████████] 100%
@@ -21,14 +21,14 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 
 **v1.0 baseline (for comparison):** 41 plans, 118 tasks, 9 days (2026-08-20 → 2026-08-29); avg ~38 min/plan; slowest plans were live-gate/WebDev phases (P03-P04 of Phase 5 at ~400+ min).
 
-**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 complete (8/8 plans incl. 2 gap closures from the UAT, re-verified passed 2026-09-08) — next: `/gsd-verify-work` live re-test of UAT test 8, then Phase 10 planning.
+**v1.1 velocity:** Phase 8 complete (6/6 plans); Phase 9 complete (8/8 incl. 2 gap closures); Phase 10 complete (7/7 incl. 2 gap closures); Phase 11 complete (6/6, verified passed 20/20 — capture-first, both-rig live gates, 8 live-truth deltas fixed in-phase) — next: Phase 12 planning.
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 8 | 1/6 | 200 min | 200 min |
 | 9 | 0/TBD | - | - |
 | 10 | 0/TBD | - | - |
-| 11 | 2/6 | 81 min | 40 min |
+| 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
 | 12 | 0/TBD | - | - |
 | 13 | 0/TBD | - | - |
 | 14 | 0/TBD | - | - |
