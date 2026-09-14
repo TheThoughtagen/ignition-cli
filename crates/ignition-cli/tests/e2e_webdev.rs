@@ -1158,8 +1158,55 @@ async fn live_tags_alarm_lifecycle() {
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the alarms route's precondition)", &out);
 
-    // Pre-clean a leftover occupant from a prior aborted run.
+    // Pre-clean a leftover occupant from a prior aborted run, then
+    // WAIT for the deletion to settle (11-06 live-truth, both rigs):
+    // a rapid delete→recreate leaves the provider's tag model
+    // half-bound — reads answer Error_Configuration and writes answer
+    // ok WITHOUT landing (the silently-dropped-write class). Poll the
+    // provider list until the name is gone (bounded 30s).
     clean_provider(&config, &env, "p5alarm");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let out = ign(&config, &env, &["tags", "provider", "list", "--compact"]);
+        expect_ok("provider list (settle poll)", &out);
+        let envelope = data_envelope(&out);
+        let gone = !envelope["data"]["providers"]
+            .as_array()
+            .expect("providers[]")
+            .iter()
+            .any(|p| p["name"] == "p5alarm");
+        if gone || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    // Write with LAND-VERIFICATION (same live-truth class): the write
+    // answering ok is not proof the value landed while the provider's
+    // model mounts — verify by read-back and retry (bounded).
+    async fn write_verified(config: &Path, env: &LiveEnv, tag: &str, value: &str, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let out = ign(
+                config,
+                env,
+                &["tags", "write", tag, "--value", value, "--compact"],
+            );
+            expect_ok(what, &out);
+            let out = ign(config, env, &["tags", "read", tag, "--compact"]);
+            expect_ok("read-back after write", &out);
+            let envelope = data_envelope(&out);
+            let landed = envelope["data"]["results"][0]["value"].as_i64();
+            if landed == value.parse::<i64>().ok() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: the write never landed (read-back kept disagreeing)"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
 
     // Fresh provider (native REST, self-cleaning).
     let out = ign(
@@ -1179,13 +1226,8 @@ async fn live_tags_alarm_lifecycle() {
     );
     expect_ok("config create the alarmed tag", &out);
 
-    // Trigger: write past the setpoint.
-    let out = ign(
-        &config,
-        &env,
-        &["tags", "write", tag, "--value", "150", "--compact"],
-    );
-    expect_ok("write past the setpoint", &out);
+    // Trigger: write past the setpoint (land-verified).
+    write_verified(&config, &env, tag, "150", "write past the setpoint").await;
 
     // Poll `alarms active` until the event appears (bounded).
     let find_event = |envelope: &Value| -> Option<Value> {
@@ -1204,27 +1246,31 @@ async fn live_tags_alarm_lifecycle() {
     // POLL + RE-TRIGGER (11-06 live-truth, Rig B 8.3.3): after
     // creating the p5alarm provider, the alarm engine can take a
     // LONG bounded window to register the new tag's alarm config —
-    // observed: 45s+ of silent ok-polls (write answered ok, the
-    // config verifiably landed in the model), with events flowing
-    // normally on the next attempt ~50s later; warm rigs answer in
-    // 2–4s. The RE-TRIGGER (write below the setpoint, then past it
-    // again) keeps a real transition available for whichever poll
-    // window the registered engine finally sees. 10 attempts ≈ 100s
-    // worst case; warm runs never leave attempt 1.
+    // observed: 45s+ of silent ok-polls (the config verifiably landed
+    // in the model), with events flowing normally on the next attempt
+    // ~50s later; warm rigs answer in 2–4s. The RE-TRIGGER (write
+    // below the setpoint, then past it again — both land-verified)
+    // keeps a real transition available for whichever poll window the
+    // registered engine finally sees. 10 attempts ≈ 100s worst case;
+    // warm runs never leave attempt 1.
     for attempt in 0..10 {
         if attempt > 0 {
-            let out = ign(
+            write_verified(
                 &config,
                 &env,
-                &["tags", "write", tag, "--value", "0", "--compact"],
-            );
-            expect_ok("write below the setpoint (re-trigger clear)", &out);
-            let out = ign(
+                tag,
+                "0",
+                "write below the setpoint (re-trigger clear)",
+            )
+            .await;
+            write_verified(
                 &config,
                 &env,
-                &["tags", "write", tag, "--value", "150", "--compact"],
-            );
-            expect_ok("write past the setpoint (re-trigger set)", &out);
+                tag,
+                "150",
+                "write past the setpoint (re-trigger set)",
+            )
+            .await;
         }
         for _ in 0..8 {
             let out = ign(&config, &env, &["tags", "alarms", "active", "--compact"]);
@@ -1241,6 +1287,7 @@ async fn live_tags_alarm_lifecycle() {
         }
     }
     let event = event.expect("the alarm event appeared (bounded retries)");
+
     let event_id = event["event_id"]
         .as_str()
         .expect("event_id present")
