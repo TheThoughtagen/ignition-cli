@@ -32,11 +32,19 @@ key-files:
   modified:
     - "crates/ignition-tui/src/ui/theme.rs"
     - "crates/ignition-tui/src/ui/dashboard.rs"
+    - "crates/ignition-tui/src/ui/logs.rs"
+    - "crates/ignition-tui/src/ui/rig.rs"
+    - "crates/ignition-tui/src/ui/projects.rs"
+    - "crates/ignition-tui/src/ui/tags.rs"
+    - "crates/ignition-tui/src/ui/alarms.rs"
+    - "crates/ignition-tui/src/ui/profiles.rs"
+    - "crates/ignition-tui/src/ui/mod.rs"
 
 key-decisions:
   - "12-04: dark/light hues HARDENED after UAT found the first palettes indistinguishable from default at a glance — dark border/title/header/emphasis now carry the accent blue family; hues were the plan's reserved post-UAT discretion and no test pinned them"
   - "12-04: [Rule 1] the border/title/header/accent slots were wired into the dashboard — they existed in the contract but NO consumer attached them (12-03 threaded only error/warning/selection + tab-bar emphasis), so panes rendered default-styled in every theme; wiring preserves default/mono (Reset slots) byte-identically"
   - "12-04: light c256 accent corrected from green Indexed(40) to blue Indexed(26) to match the theme's truecolor blue identity; light selection_bg is a LIGHT gray so black-text structure stays visible even on a dark terminal"
+  - "12-04 round 2: DARK text/muted tinted (text Rgb(196,214,235)/Indexed(189) @ 14.2:1 AAA; muted Rgb(110,140,170)/Indexed(67) @ 6.0:1 AA) and EVERY screen's body content routed through theme::text/muted — the UAT verdict was 'most text is still just white everywhere' because no render site consumed the text/muted slots; c16 keeps White/DarkGray (readability-first step-down); DEFAULT/MONO untouched, byte-identical SGR sets re-proven pre/post"
 
 patterns-established:
   - "Wire-proof capture: uniq'd SGR-set diffs vs default must show border/header/accent codes appearing — more than a red-shade swap proves theme distinctness"
@@ -136,3 +144,76 @@ None - no external service configuration required.
 - [x] Prior plan commits intact (12-01/12-02/12-03 + docs commits)
 - [x] Wire evidence: default/mono identical SGR sets pre/post; dark +`69`/`117`/`75`, light +`26`; truecolor `38;2;…` proven; mono zero color codes
 - [x] 229 tui tests / clippy -D warnings / fmt / tokenization grep all green at commit
+
+---
+
+# UAT Tuning Round 2 (2026-09-14, continuation)
+
+**User verdict on the round-1 tuning: "nice, but most text is still just white everywhere. I see where the things that do change, do, its just not all that much overall."** Diagnosis: every theme's `text` slot was near-white (dark `Indexed(253)` ≈ terminal default), and NO render site consumed `theme::text`/`theme::muted` — body content (table rows, labels, hints, timestamps, modal text) rendered plain `Style::default()`. Round 1 tinted the chrome; round 2 tints the content.
+
+## What Changed
+
+1. **DARK `text`/`muted` slots tinted** (`theme.rs`, palette-only — structure untouched):
+   - `text`: truecolor `Rgb(196,214,235)`, c256 `Indexed(189)` — a soft blue-tinted off-white that is clearly NOT default white but comfortable for long reading. c16 keeps `White` (readability wins at 16 colors — the honest step-down).
+   - `muted`: truecolor `Rgb(110,140,170)`, c256 `Indexed(67)` — clearly dimmer and blue. c16 keeps `DarkGray`.
+   - LIGHT palette untouched from `756e888` (its black text was already distinct); MONO untouched (all-Reset).
+2. **Body-content sweep across every screen** — plain body text → `theme::text`, secondary text → `theme::muted`:
+   - `dashboard.rs`: status/metrics panels split into the k9s two-tone field-row shape (`muted` label column + `text` value column, byte-identical row text); modules rows, session rows, "Loading…"/error-message lines ride `text`; the status line's prefix + tail (freshness/busy/hints) ride `muted` (profile name keeps `accent`).
+   - `logs.rs`: timestamps + logger names ride `muted`, messages ride `text` (LEVEL spans keep their protected semantic slots); status row rides `muted`; the stream pane block wires `border`/`title` (still dormant after round 1).
+   - `rig.rs`: field rows two-tone; services/volumes rows ride `text`; the "none running" hint rides `muted`+DIM; raw compose-log lines ride `text`; status row `muted`; both pane blocks themed.
+   - `projects.rs`/`tags.rs`/`alarms.rs`: field rows two-tone, table rows ride `text`, table headers wired to the `header` slot + BOLD (matching the dashboard), error-message lines ride `text` (BOLD banners untouched), hints/footers/status rows ride `muted`; all pane blocks themed; the tags `refresh_hint` rides `muted`+DIM.
+   - `mod.rs`: modal bodies ride `text`, footer hints ride `muted`, Input hints `muted`+DIM; every modal block (Confirm/Input/Result_/all five action menus/Projects menu) wires `border`/`title`; the Projects menu's descriptions ride `muted`+DIM, labels `text`; the tab bar's base style rides `muted` (inactive tab labels tint; active keeps emphasis+BOLD).
+   - `profiles.rs`/`alarms.rs` modals: palette-threaded (`render_overlay`/`render_ack_overlay` signatures grew the palette param); names/fields ride `text`, hints/labels `muted`, blocks themed.
+
+## Readability Evidence (TUIX-04, computed)
+
+| Color | Relative luminance | Contrast vs black | WCAG verdict |
+|---|---|---|---|
+| `dark.text` Rgb(196,214,235) | 0.658 | **14.17:1** | AAA body text (≥7:1) |
+| `dark.muted` Rgb(110,140,170) | 0.250 | **5.99:1** | AA body text (≥4.5:1) |
+| (reference) pure white | 1.000 | 21.00:1 | — |
+| (reference) old near-white Rgb(220,223,228) | — | 15.72:1 | barely-tinted predecessor |
+| text ↔ muted separation | — | 2.36:1 | visible two-tone hierarchy |
+| c256 Indexed(189) ≈ rgb(215,215,255) | — | 15.05:1 | mirrors truecolor |
+| c256 Indexed(67) ≈ rgb(95,135,175) | — | 5.57:1 | mirrors truecolor |
+
+The text slot sacrifices ~1.5 contrast points vs the old near-white (14.17 vs 15.72 — still deep in AAA territory) in exchange for an always-visible blue identity; muted is deliberately a full step down so labels/hints read as secondary.
+
+## Wire-Level Re-Proof (fresh pty captures, `/tmp/ign-p12-rigs/`)
+
+Pre-change binary built at HEAD `0175bdf`; post-change at `27df248`; C256 via `pty_capture.py` (COLORTERM popped), truecolor via `pty_capture_truecolor.py`.
+
+| Comparison | Unique-SGR-set delta |
+|---|---|
+| **default pre vs post (C256 + truecolor)** | **IDENTICAL** — zero-regression re-proven |
+| **mono pre vs post (C256)** | **IDENTICAL** — all-Reset contract intact |
+| dark pre → post (C256) | +`38;5;189` (text) +`38;5;67` (muted) — **the tinted body code appears where default emits none** |
+| dark pre → post (truecolor) | +`38;2;196;214;235` +`38;2;110;140;170` — authored Rgb values proven on the wire |
+| light pre → post (C256) | +`38;5;8` only (DarkGray muted, from the body wiring — its palette is untouched) |
+| dark vs default post (C256) | dark-only: `38;5;189` `38;5;67` `38;5;69` `38;5;75` `38;5;117` `38;5;203` — chrome AND body |
+| dark vs default post (truecolor) | dark-only: `38;2;196;214;235` `38;2;110;140;170` `38;2;52;152;219` `38;2;120;200;255` `38;2;231;76;60` |
+
+## Gates
+
+- `cargo test -p ignition-tui`: **231 passed** (229 prior + 2 new render-site pins: `body_text_renders_from_the_text_and_muted_slots` [dashboard text/muted], `log_metadata_and_message_render_from_text_and_muted_slots` [logs message text / timestamp muted]); no existing test changed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (2 lints from new code fixed: `needless_option_as_deref`, `collapsible_if`).
+- `cargo fmt --all --check`: clean.
+- CI tokenization grep: clean (no `Color::` outside `theme.rs` — helpers only at render sites).
+
+## Round-2 Commit
+
+- `27df248` — feat(12-04): tint body content — text/muted slots wired across screens (UAT tuning round 2) (9 files: theme.rs + 8 render modules)
+
+## Next Phase Readiness (round 2)
+
+- Phase 12 remains 4/4 plans complete, PENDING the user's round-2 visual re-verification: `ign tui` with `[ui] theme = "dark"` should now read as a blue-tinted cockpit end to end (body text, labels, status lines, modals — not just borders), `light` as the inverted look with tinted metadata, `default`/`mono` pixel-identical to before Phase 12.
+- After re-verification passes, the phase is ready for `/gsd-verify-work 12` / transition.
+
+---
+
+## Self-Check (round 2): PASSED
+
+- [x] Commit `27df248` present (`feat(12-04): tint body content…`, 9 files)
+- [x] Wire evidence: default/mono identical pre/post (C256 + truecolor); dark +`189`/`67`; light +`8`; truecolor `38;2` codes proven
+- [x] 231 tests / clippy -D warnings / fmt / tokenization grep green at commit
+- [x] HARD constraints honored: DEFAULT text stays Reset; MONO all-Reset; mono adaptation logic untouched; semantic level/error/selection styles untouched; LIGHT palette byte-unchanged from `756e888`
