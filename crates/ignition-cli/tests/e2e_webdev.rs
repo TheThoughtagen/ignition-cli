@@ -1937,10 +1937,13 @@ async fn live_tags_xml_fidelity_roundtrip() {
 /// - **SILENTLY DROPPED**: alarms (the seeded alarm is ABSENT from
 ///   the imported model — the live proof of "CSV does not include
 ///   support for alarm configurations", stronger: silent);
-/// - **legacy-default materialization**: every CSV-imported atomic
-///   tag instantiates the full legacy sheet (`AlertAckMode` et al.)
-///   that configure-created tags do NOT carry — asserted as the
-///   original-vs-imported contrast.
+/// - **per-column legacy-sheet materialization** (11-06 live-truth
+///   refinement of the probe-5 note): every column PRESENT in the
+///   CSV header materializes its model default (`deadband`,
+///   `rawHigh`, …) that configure-created tags do NOT carry — and
+///   the generated header's missing Alert* columns mean NO Alert
+///   keys materialize (probe 5's "AlertAckMode … regardless"
+///   overgeneralized; its headers carried Alert columns).
 #[tokio::test]
 #[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
 async fn live_tags_csv_roundtrip() {
@@ -2052,10 +2055,14 @@ async fn live_tags_csv_roundtrip() {
         .iter()
         .find(|tag| tag["name"] == "TMem")
         .expect("TMem in the original export");
-    assert!(
-        orig_tmem.get("AlertAckMode").is_none(),
-        "baseline: configure-created tags carry NO legacy sheet: {orig_tmem}"
-    );
+    // Baseline: configure-created tags carry NONE of the legacy
+    // sheet's keys.
+    for sheet_key in ["AlertAckMode", "deadband", "rawHigh", "tagGroup"] {
+        assert!(
+            orig_tmem.get(sheet_key).is_none(),
+            "baseline: configure-created tags carry no '{sheet_key}': {orig_tmem}"
+        );
+    }
 
     // CLI-GENERATED CSV export (the gateway cannot; the lossy
     // warnings ride stderr — the warn-and-continue posture).
@@ -2163,15 +2170,40 @@ async fn live_tags_csv_roundtrip() {
         tal.get("alarms").is_none(),
         "CSV alarms are SILENTLY dropped — none may arrive: {tal}"
     );
-    // Legacy-default materialization: the imported tag instantiates
-    // the legacy sheet its configure-created original lacked.
+    // Legacy-default materialization — LIVE-TRUTH REFINED (11-06 rig
+    // run; corrects the 11-01 probe-5 note): the sheet is PER-COLUMN —
+    // a column PRESENT in the CSV header materializes its model
+    // default; a column absent from the header materializes nothing.
+    // The generated 48-col docs-sample header has NO Alert* columns,
+    // so AlertAckMode/AlertSendClear never appear (probe 5's
+    // "materializes AlertAckMode … regardless" overgeneralized — its
+    // probe headers carried Alert*/AlarmStates columns). The
+    // deterministic sheet for OUR header set:
+    for sheet_key in [
+        "deadband",
+        "rawHigh",
+        "scaledHigh",
+        "engHigh",
+        "formatString",
+        "historicalDeadband",
+        "historicalDeadbandStyle",
+        "historyMaxAge",
+        "historyTagGroup",
+        "tagGroup",
+    ] {
+        assert!(
+            tmem.get(sheet_key).is_some(),
+            "CSV import materializes '{sheet_key}' (column present in the header): {tmem}"
+        );
+    }
     assert!(
-        tmem.get("AlertAckMode").is_some(),
-        "CSV import materializes the legacy sheet (AlertAckMode present): {tmem}"
+        tmem.get("AlertAckMode").is_none(),
+        "no Alert* column in the header → no Alert key materializes: {tmem}"
     );
     println!(
         "csv round-trip diff vs coverage table: value/tooltip/engUnit/expression LANDED; \
-         alarms SILENTLY absent; legacy sheet materialized — live re-proven"
+         alarms SILENTLY absent; per-column legacy sheet materialized (no Alert keys — \
+         no Alert columns) — live re-proven"
     );
 
     // Cleanup: both sides of the transfer.
