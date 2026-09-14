@@ -7,12 +7,14 @@
 use ratatui::Frame;
 use ratatui::layout::Constraint::{Length, Min, Ratio};
 use ratatui::layout::{Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Row, Table};
 
 use crate::state::{AppState, session_rows};
 use crate::workers::refresh::Snapshot;
+
+use super::theme;
 
 /// Render the dashboard: 2×2 panel grid + a one-row status line.
 pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
@@ -23,9 +25,9 @@ pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
 
     let snapshot = state.dashboard.snapshot.as_ref();
 
-    render_status(snapshot, frame, status_pane);
-    render_metrics(snapshot, frame, metrics_pane);
-    render_modules(snapshot, frame, modules_pane);
+    render_status(&state.palette, snapshot, frame, status_pane);
+    render_metrics(&state.palette, snapshot, frame, metrics_pane);
+    render_modules(&state.palette, snapshot, frame, modules_pane);
     render_sessions(state, snapshot, frame, sessions_pane);
     render_status_line(state, frame, status_line);
 }
@@ -33,7 +35,12 @@ pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
 /// The status panel: gateway identity, running state, uptime, cpu,
 /// memory essentials — derived from the typed result, minimal
 /// formatting (human summary fields, not serde-pretty).
-fn render_status(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
+fn render_status(
+    palette: &theme::Palette,
+    snapshot: Option<&Snapshot>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let block = Block::bordered().title("status");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -41,7 +48,7 @@ fn render_status(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
     let text = match panel(snapshot, |s| (&s.status, &s.status_error)) {
         PanelState::Loading => vec![Line::from("Loading…")],
         PanelState::Error(message) => vec![
-            Line::from(Span::styled("error", Style::default().fg(Color::Red))),
+            Line::from(Span::styled("error", theme::error(palette))),
             Line::from(
                 message
                     .chars()
@@ -91,7 +98,12 @@ fn render_status(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
 }
 
 /// The modules panel: name / state / license table.
-fn render_modules(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
+fn render_modules(
+    palette: &theme::Palette,
+    snapshot: Option<&Snapshot>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let block = Block::bordered().title("modules");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -99,7 +111,7 @@ fn render_modules(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
     let text = match panel(snapshot, |s| (&s.modules, &s.modules_error)) {
         PanelState::Loading => vec![Line::from("Loading…")],
         PanelState::Error(message) => vec![
-            Line::from(Span::styled("error", Style::default().fg(Color::Red))),
+            Line::from(Span::styled("error", theme::error(palette))),
             Line::from(
                 message
                     .chars()
@@ -124,7 +136,12 @@ fn render_modules(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
 }
 
 /// The metrics panel: the key gauges (cpu %, heap, threads).
-fn render_metrics(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
+fn render_metrics(
+    palette: &theme::Palette,
+    snapshot: Option<&Snapshot>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let block = Block::bordered().title("metrics");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -132,7 +149,7 @@ fn render_metrics(snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
     let text = match panel(snapshot, |s| (&s.metrics, &s.metrics_error)) {
         PanelState::Loading => vec![Line::from("Loading…")],
         PanelState::Error(message) => vec![
-            Line::from(Span::styled("error", Style::default().fg(Color::Red))),
+            Line::from(Span::styled("error", theme::error(palette))),
             Line::from(message.clone()),
         ],
         PanelState::Loaded(result) => vec![
@@ -165,7 +182,7 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
         PanelState::Error(message) => {
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(Span::styled("error", Style::default().fg(Color::Red))),
+                    Line::from(Span::styled("error", theme::error(&state.palette))),
                     Line::from(message.clone()),
                 ]),
                 inner,
@@ -197,7 +214,7 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
                 Row::new(vec!["id", "type", "user"])
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
-            .row_highlight_style(Style::default().bg(Color::DarkGray))
+            .row_highlight_style(theme::selection(&state.palette))
             .highlight_symbol("▸ ");
             // render takes &AppState — a copied cursor keeps update the
             // single owner of selection mutations (TableState is Copy).
@@ -293,9 +310,11 @@ fn fmt_mib(bytes: f64) -> String {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     use super::render;
     use crate::state::AppState;
+    use crate::ui::theme::{Theme, Tier};
 
     /// Render `state` on an 80x24 TestBackend; the joined buffer text.
     fn rendered(state: &AppState) -> String {
@@ -312,6 +331,19 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Render `state` on an 80x24 TestBackend; the CLONED buffer for
+    /// style-level (fg/bg/modifier) assertions. Tests compare cells
+    /// against PALETTE SLOTS only — never a `Color` literal (12-03:
+    /// the CI tokenization gate forbids literals outside theme.rs, and
+    /// the theme's hues are its own business).
+    fn buffer_of(state: &AppState) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| render(state, frame, frame.area()))
+            .expect("draw");
+        terminal.backend().buffer().clone()
     }
 
     /// Fresh state (no snapshot): all four panels render Loading —
@@ -376,5 +408,113 @@ mod tests {
             "every panel errors: {text}"
         );
         assert!(!text.contains("Loading"), "not loading — errored: {text}");
+    }
+
+    /// The all-error snapshot (dead gateway) drives every panel's
+    /// "error" label — and each label's fg must come from the
+    /// palette's ERROR slot (dark @ C16 here). Slot equality only:
+    /// dark.c16.error happens to BE a familiar red, but the test never
+    /// names it (12-03).
+    #[tokio::test]
+    async fn error_labels_render_from_the_palette_error_slot() {
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            "http://127.0.0.1:1/",
+            None,
+        ));
+        let snap = crate::workers::refresh::snapshot(&api).await;
+
+        let mut state = AppState::new();
+        state.palette = Theme::by_name("dark").unwrap().resolve(Tier::C16);
+        let p = state.palette;
+        state.dashboard.snapshot = Some(snap);
+
+        let buf = buffer_of(&state);
+        let mut labels = 0;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            // Only the STANDALONE label line matches: its whole inner
+            // row is exactly "error" (an error MESSAGE may start with
+            // the same word — prose rides Span::raw and must not vote).
+            if row.trim_matches(|c| c == ' ' || c == '│') != "error" {
+                continue;
+            }
+            labels += 1;
+            let at = row.find("error").expect("row is the error label");
+            // Byte offset → char column (│ is 3 bytes).
+            let x = row[..at].chars().count() as u16;
+            assert_eq!(
+                buf[(x, y)].fg,
+                p.error,
+                "panel error label renders from the palette's error slot"
+            );
+        }
+        assert!(labels >= 1, "at least one error label rendered");
+    }
+
+    /// The sessions table's selected row renders from the palette's
+    /// SELECTION slot at BOTH tiers (12-03's mono-contract proof at
+    /// the render site): color tier = bg fill, no reversal; mono tier
+    /// = REVERSED with a Reset bg (compared slot-wise — the Reset
+    /// value rides the mono-authored palette, never a literal).
+    #[tokio::test]
+    async fn session_selection_renders_from_the_palette_at_both_tiers() {
+        let server = wiremock::MockServer::start().await;
+        crate::workers::refresh::test_support::mount_gateway(&server).await;
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            &server.uri(),
+            None,
+        ));
+        let snap = crate::workers::refresh::snapshot(&api).await;
+
+        let mut state = AppState::new();
+        state.dashboard.snapshot = Some(snap);
+        state.dashboard.sessions_table.select(Some(0));
+
+        // Color tier: dark @ C16 — the highlighted row fills with
+        // selection_bg and stays unreversed (fill, not flip).
+        state.palette = Theme::by_name("dark").unwrap().resolve(Tier::C16);
+        let p = state.palette;
+        let buf = buffer_of(&state);
+        let (x, y) = highlighted_row_cell(&buf).expect("selected row renders");
+        assert_eq!(buf[(x, y)].bg, p.selection_bg, "selection bg from the slot");
+        assert!(
+            !buf[(x, y)].modifier.contains(Modifier::REVERSED),
+            "color tier selection is a fill, not a reversal"
+        );
+
+        // Mono tier: the selection flips to REVERSED — the k9s/btop
+        // mono-cursor move — with the bg slot at Reset (invisible-fill
+        // guard inverted by the helper).
+        state.palette = Theme::by_name("mono").unwrap().resolve(Tier::Mono);
+        let p_mono = state.palette;
+        let buf = buffer_of(&state);
+        let (x, y) = highlighted_row_cell(&buf).expect("selected row renders");
+        assert!(
+            buf[(x, y)].modifier.contains(Modifier::REVERSED),
+            "mono tier selection = REVERSED"
+        );
+        assert_eq!(
+            buf[(x, y)].bg,
+            p_mono.selection_bg,
+            "mono tier selection bg is the Reset slot"
+        );
+    }
+
+    /// First content cell of the highlighted sessions row: the "▸"
+    /// highlight symbol is unique to the table's selected row on this
+    /// screen, so its row + the first content column after it is the
+    /// cell to inspect.
+    fn highlighted_row_cell(buf: &ratatui::buffer::Buffer) -> Option<(u16, u16)> {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].symbol() == "▸" {
+                    let cx = (x + 2).min(buf.area.width - 1);
+                    return Some((cx, y));
+                }
+            }
+        }
+        None
     }
 }
