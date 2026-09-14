@@ -398,6 +398,34 @@ pub fn accent(p: &Palette) -> Style {
     Style::default().fg(p.accent)
 }
 
+/// Map terminal-capability env conventions to a [`Tier`]. Pure over an
+/// injected env snapshot — tests never touch the real environment
+/// (edition 2024 `set_var` is unsafe; the crate's `ENV_LOCK` exists but
+/// injection is cleaner). Priority order matters:
+///
+/// 1. `NO_COLOR` set non-empty -> [`Tier::Mono`] (no-color.org convention)
+/// 2. `COLORTERM` `truecolor`|`24bit` -> [`Tier::Truecolor`] (de-facto convention)
+/// 3. `TERM` contains `"256color"` -> [`Tier::C256`]
+/// 4. `TERM` missing or `"dumb"` -> [`Tier::Mono`]
+/// 5. otherwise -> [`Tier::C16`]
+///
+/// 12-02's `build_context` will call it as
+/// `detect_tier(&|k| std::env::var(k).ok())` — the signature is exactly
+/// `&dyn Fn(&str) -> Option<String>` so that closure coerces.
+pub fn detect_tier(env: &dyn Fn(&str) -> Option<String>) -> Tier {
+    if env("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return Tier::Mono;
+    }
+    if let Some("truecolor" | "24bit") = env("COLORTERM").as_deref() {
+        return Tier::Truecolor;
+    }
+    match env("TERM").as_deref() {
+        None | Some("dumb") => Tier::Mono,
+        Some(term) if term.contains("256color") => Tier::C256,
+        Some(_) => Tier::C16,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +614,71 @@ mod tests {
     #[test]
     fn tier_default_is_mono_strictest_tier() {
         assert_eq!(Tier::default(), Tier::Mono);
+    }
+
+    /// Env snapshot for detect_tier — a plain `HashMap` behind a
+    /// closure. NO real-environment access anywhere (no ENV_LOCK
+    /// needed): the injected snapshot makes every rule branch
+    /// deterministic.
+    fn detect(vars: &[(&str, &str)]) -> Tier {
+        let map: std::collections::HashMap<&str, String> =
+            vars.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+        detect_tier(&|key| map.get(key).cloned())
+    }
+
+    #[test]
+    fn no_color_wins_over_everything() {
+        assert_eq!(
+            detect(&[
+                ("NO_COLOR", "1"),
+                ("COLORTERM", "truecolor"),
+                ("TERM", "xterm-256color"),
+            ]),
+            Tier::Mono,
+            "NO_COLOR set non-empty forces Mono even with truecolor + 256color signals"
+        );
+    }
+
+    #[test]
+    fn empty_no_color_falls_through_the_rest_of_the_matrix() {
+        // Empty NO_COLOR means unset per the convention — the tier must
+        // come from the TERM/COLORTERM rules, not a Mono short-circuit.
+        assert_eq!(detect(&[("NO_COLOR", ""), ("TERM", "xterm")]), Tier::C16);
+        assert_eq!(
+            detect(&[("NO_COLOR", ""), ("COLORTERM", "truecolor")]),
+            Tier::Truecolor
+        );
+        assert_eq!(
+            detect(&[("NO_COLOR", ""), ("TERM", "xterm-256color")]),
+            Tier::C256
+        );
+    }
+
+    #[test]
+    fn colorterm_truecolor_and_24bit_map_to_truecolor() {
+        assert_eq!(detect(&[("COLORTERM", "truecolor")]), Tier::Truecolor);
+        assert_eq!(detect(&[("COLORTERM", "24bit")]), Tier::Truecolor);
+        // COLORTERM wins before TERM is even consulted
+        assert_eq!(
+            detect(&[("COLORTERM", "truecolor"), ("TERM", "xterm")]),
+            Tier::Truecolor
+        );
+    }
+
+    #[test]
+    fn term_256color_maps_to_c256() {
+        assert_eq!(detect(&[("TERM", "xterm-256color")]), Tier::C256);
+        assert_eq!(detect(&[("TERM", "screen-256color")]), Tier::C256);
+    }
+
+    #[test]
+    fn term_absent_or_dumb_maps_to_mono() {
+        assert_eq!(detect(&[]), Tier::Mono, "TERM absent = no reliable color");
+        assert_eq!(detect(&[("TERM", "dumb")]), Tier::Mono);
+    }
+
+    #[test]
+    fn plain_term_maps_to_c16() {
+        assert_eq!(detect(&[("TERM", "xterm")]), Tier::C16);
     }
 }
