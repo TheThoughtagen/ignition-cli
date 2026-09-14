@@ -1177,7 +1177,13 @@ async fn live_tags_alarm_lifecycle() {
         })
     };
     let mut event = None;
-    for _ in 0..20 {
+    // POLL BUDGET (11-06 live-truth): 20×500ms passed on 8.3.6 and on
+    // warm rigs, but the FIRST poll after creating p5alarm on a fresh
+    // 8.3.3 provider once exceeded 10s (the alarm pipeline registers
+    // against the still-mounting provider — the deploy-loop mount-lag
+    // family). 60×1s is the evidence-backed budget: warm re-run
+    // answers in ~3s, the observed cold outlier exceeded 10s.
+    for _ in 0..60 {
         let out = ign(&config, &env, &["tags", "alarms", "active", "--compact"]);
         expect_ok("alarms active poll", &out);
         let envelope = data_envelope(&out);
@@ -1185,7 +1191,7 @@ async fn live_tags_alarm_lifecycle() {
             event = Some(found);
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     let event = event.expect("the alarm event appeared (bounded retries)");
     let event_id = event["event_id"]
