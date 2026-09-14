@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 11 tag bulk transfer XML/CSV COMPLETE (6/6 plans; verifier passed 20/20 must-haves, 3/3 success criteria closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS, 8 live-truth deltas fixed and re-proven, route bundle at 1.3.0); SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 11 tag bulk transfer XML/CSV COMPLETE + gap closures (verifier passed 20/20 must-haves, 3/3 success criteria closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS, 8 live-truth deltas fixed and re-proven, route bundle at 1.3.0; UAT gap 11-08 closed 2026-09-14 — UDT fact corrected + mirrored in README/STATE/captures, 11-07 concurrent); SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
 
 ## Current Position
 
-**Phase:** 12 of 14 (12-tui-theming-degradation) — Phase 11 complete + verified
-**Current Plan:** 0
-**Total Plans in Phase:** TBD (Phase 11: 6/6 done)
-**Status:** Phase 11 verified (passed 20/20) — ready for `/gsd-plan-phase 12`
+**Phase:** 11 of 14 (11-tag-bulk-transfer-xml-csv) — post-verification UAT gap closures (11-07, 11-08)
+**Current Plan:** 1
+**Total Plans in Phase:** 2 gap-closure plans (11-07 done, 11-08 in progress)
+**Status:** 11-07 complete (loss-gate hint mismatch closed on sentinel-prefix pins) — 11-08 next
 **Last Activity:** 2026-09-14
 
 **Progress:** [██████████] 100%
@@ -61,6 +61,8 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 11 P04 | 49 min | 3 tasks | 9 files |
 | Phase 11 P05 | 33 min | 3 tasks | 9 files |
 | Phase 11 P06 | 171 min | 3 tasks | 4 files |
+| Phase 11 P07 | 12 min | 2 tasks | 3 files |
+| Phase 11 P08 | 12 min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -152,6 +154,8 @@ Recent decisions affecting current work:
 - [Phase 11]: 11-06: 8.3.x async-mounting tolerances are bounded and measurement-backed (servlet first-activation 240s worst; import cleanPath 30s; provider resolution 30s; alarm registration 60s/cycle; landing verification after every import; unique provider names per run) — No blind deadline bumps; every window carries its measurement
 - [Phase 11]: 11-06: generated CSV fills an absent dataType with Int4 (2) and reports it; the legacy-default sheet is PER-COLUMN (header-present columns materialize, absent ones do not) — probe-5's universal sheet claim corrected — Live-truth corrections to the interchange, gate + captures doc updated together
 - [Phase 11]: 11-06 ops: image trial = 2h — budget a full live-suite run inside one window; commissioning a fresh rig costs ~4 min; provisioning script transcription typos surface as gateway 400 MalformedJson — Fifth rig-generation proof; recorded for the next live phase
+- [Phase 11]: UDT fact correction (11-08): xml_udt_type_definition fires unconditionally with corrected scoped text — provider-root imports DO land UdtType definitions in [provider]_types_/Name; the verbatim refusal is folder-basePath-only; corrections dated across README/STATE/captures, originals preserved
+- [Phase 11]: 11-07: loss-gate hint override rides a PREFIX sentinel (LOSS_GATE_REFUSAL_REASON_PREFIX = the render_loss_prose header literal) content-addressed in hint()'s InvalidInput arm — the 06-07 TTY exact-match pattern adapted for dynamic prose; same slug invalid_input, same exit 2, envelope shape + message prose byte-identical (hints are not slugs — not a Three-Place event); contract_tags drift-guard pins fail if the prose header and the sentinel ever diverge; the ~66 other InvalidInput sites keep the generic hint (deferred design question per the debug session) — UAT test 3: the refusal's trailing hint must match the failure; constructor variant rejected as extra API surface when the precedent already covers it
 
 ### Pending Todos
 
@@ -167,5 +171,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-14T04:43:10.558Z
+**Last session:** 2026-09-14T14:42:27.513Z
 **Resume file:** None
