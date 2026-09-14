@@ -282,17 +282,18 @@ async fn live_webdev_deploy_status_scriptexec_loop() {
     all_output.push_str(&String::from_utf8_lossy(&out.stderr));
     expect_ok("status after deploy", &out);
     let mut envelope = data_envelope(&out);
-    // LIVE-TRUTH TOLERANCE (11-06 rig run): the FIRST deploy on a
+    // LIVE-TRUTH TOLERANCE (11-06 rig runs): the FIRST deploy on a
     // freshly commissioned gateway can answer the immediate status
     // sweep with an all-absent read (`ok:false`) — the webdev servlet
     // mounts the new project asynchronously (405=absent until it
-    // does). MEASURED first-mount windows: 8.3.6 < 3s; 8.3.3
-    // ~30–35s (the 30s window expired while the routes were
-    // demonstrably serving seconds later — hence the 90s budget,
-    // evidence-backed, not a blind bump; the 09/10 Jetty-retry
-    // discipline). The gate still REQUIRES the all-present handshake;
-    // it just allows the gateway its mount window.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    // does). MEASURED first-mount windows: 8.3.6 < 3s; 8.3.3 warm
+    // ~30–35s; 8.3.3 FIRST-EVER servlet activation >90s (routes
+    // served at ~95–105s on the fresh-rig run — hence the 240s
+    // budget; every bump carries its measurement, no blind bumps —
+    // the 09/10 Jetty-retry discipline). The gate still REQUIRES the
+    // all-present handshake; it just allows the gateway its mount
+    // window.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
     loop {
         let all_present = envelope["data"]["ok"] == Value::Bool(true)
             && ALWAYS_ON
@@ -302,9 +303,9 @@ async fn live_webdev_deploy_status_scriptexec_loop() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("status after deploy: routes never became visible within 90s: {envelope}");
+            panic!("status after deploy: routes never became visible within 240s: {envelope}");
         }
-        eprintln!("status after deploy: servlet mount not yet visible, retrying (bounded 90s)…");
+        eprintln!("status after deploy: servlet mount not yet visible, retrying (bounded 240s)…");
         std::thread::sleep(std::time::Duration::from_secs(3));
         let out = ign(&config, &env, &["webdev", "status", "--compact"]);
         expect_ok("status after deploy (retry)", &out);
