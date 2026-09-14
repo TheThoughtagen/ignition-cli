@@ -26,10 +26,10 @@ pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
     render_status(state, frame, status);
 }
 
-/// One retained entry as a display line: `LEVEL time logger message`,
-/// level color-coded through the palette. The level span carries the
-/// color; the rest stays default so long messages never inherit a
-/// shouty hue.
+/// One retained entry as a display line: `LEVEL time logger message`.
+/// The LEVEL span keeps its semantic level color (protected); the
+/// timestamp + logger ride `muted` (secondary metadata — 12-04 UAT
+/// round 2) and the message rides `text` (body content).
 fn log_line(
     entry: &ignition_core::client::logs::LogEntry,
     palette: &theme::Palette,
@@ -39,12 +39,15 @@ fn log_line(
             format!("{:>5}", entry.level),
             level_style(&entry.level, palette),
         ),
-        Span::raw(" "),
-        Span::raw(time_of_day(entry.timestamp)),
-        Span::raw(" "),
-        Span::raw(entry.logger_name.chars().take(28).collect::<String>()),
-        Span::raw("  "),
-        Span::raw(entry.message.clone()),
+        Span::styled(" ", theme::muted(palette)),
+        Span::styled(time_of_day(entry.timestamp), theme::muted(palette)),
+        Span::styled(" ", theme::muted(palette)),
+        Span::styled(
+            entry.logger_name.chars().take(28).collect::<String>(),
+            theme::muted(palette),
+        ),
+        Span::styled("  ", theme::muted(palette)),
+        Span::styled(entry.message.clone(), theme::text(palette)),
     ])
 }
 
@@ -80,7 +83,13 @@ fn time_of_day(ms: i64) -> String {
 /// The stream pane: the filtered ring windowed onto the visible
 /// height, ending `scroll_offset` lines above the newest.
 fn render_stream(state: &AppState, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("logs");
+    // The pane chrome rides the border/title slots (12-04 round 2:
+    // this block was still dormant — every non-dashboard screen
+    // rendered default-styled panes).
+    let block = Block::bordered()
+        .title("logs")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -123,7 +132,11 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
         logs.ring.len(),
         LOG_RING_CAP,
     );
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    // Status facts + key hints ride `muted` (secondary — 12-04 round 2).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme::muted(&state.palette)))),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -284,6 +297,52 @@ mod tests {
             }
         }
         panic!("ERROR line rendered nowhere");
+    }
+
+    /// Log metadata + message are THEMED (12-04 UAT round 2): with a
+    /// dark @ C16 palette the message cell renders from the palette's
+    /// TEXT slot and the timestamp cell from MUTED; the LEVEL span
+    /// keeps its semantic slot (asserted by `level_colors_are_coded`).
+    #[test]
+    fn log_metadata_and_message_render_from_text_and_muted_slots() {
+        let mut state = AppState::new();
+        state.palette = crate::ui::theme::Theme::by_name("dark")
+            .unwrap()
+            .resolve(crate::ui::theme::Tier::C16);
+        let p = state.palette;
+        state
+            .logs
+            .push_line(entry(3_600_000, "INFO", "hello tinted world"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| render(&state, frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            let Some(msg_at) = row.find("hello tinted world") else {
+                continue;
+            };
+            let msg_x = row[..msg_at].chars().count() as u16;
+            assert_eq!(
+                buffer[(msg_x, y)].fg,
+                p.text,
+                "the log message rides the text slot"
+            );
+            // The timestamp is the row's first field (right-aligned 5
+            // + 1 + 12 chars before the logger), well inside the line.
+            let time_x = (6).min(buffer.area.width - 1);
+            assert_eq!(
+                buffer[(time_x, y)].fg,
+                p.muted,
+                "the timestamp rides the muted slot"
+            );
+            return;
+        }
+        panic!("INFO line rendered nowhere");
     }
 
     /// The render-side filter: with filter=Warn, only WARN+ entries

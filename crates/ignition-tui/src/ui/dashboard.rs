@@ -49,50 +49,60 @@ fn render_status(
     frame.render_widget(block, area);
 
     let text = match panel(snapshot, |s| (&s.status, &s.status_error)) {
-        PanelState::Loading => vec![Line::from("Loading…")],
+        PanelState::Loading => vec![Line::from(Span::styled("Loading…", theme::text(palette)))],
         PanelState::Error(message) => vec![
             Line::from(Span::styled("error", theme::error(palette))),
-            Line::from(
+            Line::from(Span::styled(
                 message
                     .chars()
                     .take(inner.width as usize - 1)
                     .collect::<String>(),
-            ),
+                theme::text(palette),
+            )),
         ],
         PanelState::Loaded(result) => {
+            // Two-tone body (12-04 UAT round 2): the label column rides
+            // `muted`, the value rides `text` — k9s' field-row shape.
+            // Default/mono keep the exact look (both slots Reset there).
+            let field = |label: &str, value: String| {
+                Line::from(vec![
+                    Span::styled(format!("{label:<9}"), theme::muted(palette)),
+                    Span::styled(value, theme::text(palette)),
+                ])
+            };
             let mut lines = vec![
-                Line::from(format!(
-                    "gateway  {} ({})",
-                    result.gateway.name.as_deref().unwrap_or("unnamed"),
-                    result.gateway.edition.as_deref().unwrap_or("?")
-                )),
-                Line::from(format!("version  {}", result.gateway.ignition_version)),
-                Line::from(format!("state    {}", result.state)),
-                Line::from(format!(
-                    "uptime   {}",
-                    fmt_duration(result.overview.uptime_ms)
-                )),
-                Line::from(format!(
-                    "cpu      {:.1}%",
-                    result.overview.cpu_fraction * 100.0
-                )),
+                field(
+                    "gateway",
+                    format!(
+                        "{} ({})",
+                        result.gateway.name.as_deref().unwrap_or("unnamed"),
+                        result.gateway.edition.as_deref().unwrap_or("?")
+                    ),
+                ),
+                field("version", result.gateway.ignition_version.clone()),
+                field("state", result.state.clone()),
+                field("uptime", fmt_duration(result.overview.uptime_ms)),
+                field(
+                    "cpu",
+                    format!("{:.1}%", result.overview.cpu_fraction * 100.0),
+                ),
             ];
             if let [used, max, ..] = result.overview.memory.as_slice() {
-                lines.push(Line::from(format!(
-                    "heap     {} / {}",
-                    fmt_mib(*used as f64),
-                    fmt_mib(*max as f64)
-                )));
+                lines.push(field(
+                    "heap",
+                    format!("{} / {}", fmt_mib(*used as f64), fmt_mib(*max as f64)),
+                ));
             }
             if let Some(license) = &result.overview.license {
-                lines.push(Line::from(match license.trial_remaining_s {
+                let value = match license.trial_remaining_s {
                     Some(secs) => format!(
-                        "license  {} (trial {} left)",
+                        "{} (trial {} left)",
                         license.state,
                         fmt_duration(secs * 1000)
                     ),
-                    None => format!("license  {}", license.state),
-                }));
+                    None => license.state.clone(),
+                };
+                lines.push(field("license", value));
             }
             lines
         }
@@ -115,25 +125,29 @@ fn render_modules(
     frame.render_widget(block, area);
 
     let text = match panel(snapshot, |s| (&s.modules, &s.modules_error)) {
-        PanelState::Loading => vec![Line::from("Loading…")],
+        PanelState::Loading => vec![Line::from(Span::styled("Loading…", theme::text(palette)))],
         PanelState::Error(message) => vec![
             Line::from(Span::styled("error", theme::error(palette))),
-            Line::from(
+            Line::from(Span::styled(
                 message
                     .chars()
                     .take(inner.width as usize - 1)
                     .collect::<String>(),
-            ),
+                theme::text(palette),
+            )),
         ],
         PanelState::Loaded(result) => result
             .items
             .iter()
             .map(|module| {
-                Line::from(format!(
-                    "{:<20} {:<8} {}",
-                    module.name.chars().take(20).collect::<String>(),
-                    module.state.as_deref().unwrap_or("?"),
-                    module.license_state.as_deref().unwrap_or("?")
+                Line::from(Span::styled(
+                    format!(
+                        "{:<20} {:<8} {}",
+                        module.name.chars().take(20).collect::<String>(),
+                        module.state.as_deref().unwrap_or("?"),
+                        module.license_state.as_deref().unwrap_or("?")
+                    ),
+                    theme::text(palette),
                 ))
             })
             .collect(),
@@ -156,23 +170,37 @@ fn render_metrics(
     frame.render_widget(block, area);
 
     let text = match panel(snapshot, |s| (&s.metrics, &s.metrics_error)) {
-        PanelState::Loading => vec![Line::from("Loading…")],
+        PanelState::Loading => vec![Line::from(Span::styled("Loading…", theme::text(palette)))],
         PanelState::Error(message) => vec![
             Line::from(Span::styled("error", theme::error(palette))),
-            Line::from(message.clone()),
+            Line::from(Span::styled(message.clone(), theme::text(palette))),
         ],
-        PanelState::Loaded(result) => vec![
-            Line::from(format!("cpu     {:.1}%", result.current.cpu)),
-            Line::from(format!(
-                "heap    {} / {}",
-                fmt_mib(result.current.heap_memory),
-                fmt_mib(result.current.max_memory)
-            )),
-            Line::from(format!(
-                "threads {} run / {} wait / {} blocked",
-                result.threads.running, result.threads.waiting, result.threads.blocked
-            )),
-        ],
+        PanelState::Loaded(result) => {
+            let field = |label: &str, value: String| {
+                Line::from(vec![
+                    Span::styled(format!("{label:<8}"), theme::muted(palette)),
+                    Span::styled(value, theme::text(palette)),
+                ])
+            };
+            vec![
+                field("cpu", format!("{:.1}%", result.current.cpu)),
+                field(
+                    "heap",
+                    format!(
+                        "{} / {}",
+                        fmt_mib(result.current.heap_memory),
+                        fmt_mib(result.current.max_memory)
+                    ),
+                ),
+                field(
+                    "threads",
+                    format!(
+                        "{} run / {} wait / {} blocked",
+                        result.threads.running, result.threads.waiting, result.threads.blocked
+                    ),
+                ),
+            ]
+        }
     };
     frame.render_widget(Paragraph::new(text), inner);
 }
@@ -189,13 +217,19 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
 
     match panel(snapshot, |s| (&s.sessions, &s.sessions_error)) {
         PanelState::Loading => {
-            frame.render_widget(Paragraph::new("Loading…"), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         PanelState::Error(message) => {
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(Span::styled("error", theme::error(&state.palette))),
-                    Line::from(message.clone()),
+                    Line::from(Span::styled(message.clone(), theme::text(&state.palette))),
                 ]),
                 inner,
             );
@@ -203,7 +237,13 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
         PanelState::Loaded(result) => {
             let rows = session_rows(result);
             if rows.is_empty() {
-                frame.render_widget(Paragraph::new("no active sessions"), inner);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "no active sessions",
+                        theme::text(&state.palette),
+                    ))),
+                    inner,
+                );
                 return;
             }
             let table = Table::new(
@@ -214,6 +254,7 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
                             row.kind.as_str().to_string(),
                             row.user.clone(),
                         ])
+                        .style(theme::text(&state.palette))
                     })
                     .collect::<Vec<Row>>(),
                 [
@@ -266,15 +307,17 @@ fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
         format!("{freshness}{busy}{in_flight} · p profiles · a actions · r refresh · t terminate");
     // The profile NAME rides the palette's accent slot (12-04 UAT
     // tuning: the slot existed but nothing consumed it — the status
-    // line was default-styled in every theme). Default/mono keep the
-    // exact look: their accent slot is Reset = default fg.
+    // line was default-styled in every theme). UAT round 2: the
+    // prefix + tail (freshness/busy markers/key hints) ride `muted` —
+    // they're status facts and hints, not body content. Default/mono
+    // keep the exact look: their slots are Reset = default fg.
     let line = if profile_name.is_empty() {
-        Line::from(tail)
+        Line::from(Span::styled(tail, theme::muted(&state.palette)))
     } else {
         Line::from(vec![
-            Span::raw("profile: "),
+            Span::styled("profile: ", theme::muted(&state.palette)),
             Span::styled(profile_name, theme::accent(&state.palette)),
-            Span::raw(format!(" · {tail}")),
+            Span::styled(format!(" · {tail}"), theme::muted(&state.palette)),
         ])
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -539,5 +582,60 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Body text is THEMED, not default-white (12-04 UAT round 2 — the
+    /// "most text is still just white everywhere" verdict): with an
+    /// explicit dark @ C16 palette the status panel's value column
+    /// renders from the palette's TEXT slot and the label column from
+    /// MUTED. Slot equality only — never a Color literal (12-03).
+    #[tokio::test]
+    async fn body_text_renders_from_the_text_and_muted_slots() {
+        let server = wiremock::MockServer::start().await;
+        crate::workers::refresh::test_support::mount_gateway(&server).await;
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            &server.uri(),
+            None,
+        ));
+        let snap = crate::workers::refresh::snapshot(&api).await;
+
+        let mut state = AppState::new();
+        state.palette = Theme::by_name("dark").unwrap().resolve(Tier::C16);
+        let p = state.palette;
+        state.dashboard.snapshot = Some(snap);
+
+        let buf = buffer_of(&state);
+        let mut value_cell = None;
+        let mut label_cell = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            // The value column: the state row's RUNNING token.
+            if value_cell.is_none()
+                && let Some(at) = row.find("RUNNING")
+            {
+                let x = row[..at].chars().count() as u16;
+                value_cell = Some(buf[(x, y)].clone());
+            }
+            // The label column: the version row's leading label.
+            if label_cell.is_none()
+                && row.contains("version")
+                && let Some(at) = row.find("version")
+            {
+                let x = row[..at].chars().count() as u16;
+                label_cell = Some(buf[(x, y)].clone());
+            }
+        }
+        assert_eq!(
+            value_cell.expect("state value renders").fg,
+            p.text,
+            "body value text renders from the palette's text slot"
+        );
+        assert_eq!(
+            label_cell.expect("version label renders").fg,
+            p.muted,
+            "the label column renders from the palette's muted slot"
+        );
     }
 }

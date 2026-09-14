@@ -24,13 +24,16 @@ use ignition_core::actions::tags::{BrowseRow, TagProviderRow, TagReadRow};
 
 use crate::state::{AppState, DetailRead};
 
+use super::theme;
+
 /// The error panes' recovery hint (06-09): `r` re-fires the deepest
 /// visible read, so an honestly-earned stale error (the UAT's
-/// trial-reset 402) always names its one-key way out.
-fn refresh_hint() -> Line<'static> {
+/// trial-reset 402) always names its one-key way out. Rides `muted` +
+/// DIM (12-04 round 2 — hints are secondary; modifiers stay inline).
+fn refresh_hint(palette: &theme::Palette) -> Line<'static> {
     Line::from(Span::styled(
         "press r to refresh",
-        Style::default().add_modifier(Modifier::DIM),
+        theme::muted(palette).add_modifier(Modifier::DIM),
     ))
 }
 
@@ -93,14 +96,23 @@ fn provider_cells(provider: &TagProviderRow) -> Vec<Cell<'static>> {
 /// first load, the honest error when it failed, the rows when they
 /// landed — "no providers" (a state, not a crash) when empty.
 fn render_providers(state: &AppState, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("tags — providers");
+    let block = Block::bordered()
+        .title("tags — providers")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let tags = &state.tags;
     match (&tags.providers, &tags.providers_error) {
         (None, None) => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         (None, Some(message)) => {
             frame.render_widget(
@@ -109,20 +121,27 @@ fn render_providers(state: &AppState, frame: &mut Frame, area: Rect) {
                         "provider load error",
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(
+                    Line::from(Span::styled(
                         message
                             .chars()
                             .take(inner.width as usize - 1)
                             .collect::<String>(),
-                    ),
-                    refresh_hint(),
+                        theme::text(&state.palette),
+                    )),
+                    refresh_hint(&state.palette),
                 ]),
                 inner,
             );
         }
         (Some(rows), _) => {
             if rows.is_empty() {
-                frame.render_widget(Paragraph::new(Line::from("no tag providers")), inner);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "no tag providers",
+                        theme::text(&state.palette),
+                    ))),
+                    inner,
+                );
                 return;
             }
             let header = Row::new(vec![
@@ -131,10 +150,10 @@ fn render_providers(state: &AppState, frame: &mut Frame, area: Rect) {
                 Cell::from("tags"),
                 Cell::from("health"),
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD));
+            .style(theme::header(&state.palette).add_modifier(Modifier::BOLD));
             let table_rows: Vec<Row> = rows
                 .iter()
-                .map(|row| Row::new(provider_cells(row)))
+                .map(|row| Row::new(provider_cells(row)).style(theme::text(&state.palette)))
                 .collect();
             let widths = [Min(10), Length(7), Length(5), Length(9)];
             let table = Table::new(table_rows, widths)
@@ -170,13 +189,22 @@ fn render_tree(state: &AppState, frame: &mut Frame, area: Rect) {
     let Some(level) = state.tags.stack.last() else {
         return;
     };
-    let block = Block::bordered().title(format!("tags — {}", level.path));
+    let block = Block::bordered()
+        .title(format!("tags — {}", level.path))
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match (&level.entries, &level.error) {
         (None, None) => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         (None, Some(message)) => {
             frame.render_widget(
@@ -185,20 +213,27 @@ fn render_tree(state: &AppState, frame: &mut Frame, area: Rect) {
                         "browse error",
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(
+                    Line::from(Span::styled(
                         message
                             .chars()
                             .take(inner.width as usize - 1)
                             .collect::<String>(),
-                    ),
-                    refresh_hint(),
+                        theme::text(&state.palette),
+                    )),
+                    refresh_hint(&state.palette),
                 ]),
                 inner,
             );
         }
         (Some(rows), _) => {
             if rows.is_empty() {
-                frame.render_widget(Paragraph::new(Line::from("(empty folder)")), inner);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "(empty folder)",
+                        theme::text(&state.palette),
+                    ))),
+                    inner,
+                );
                 return;
             }
             let header = Row::new(vec![
@@ -206,12 +241,14 @@ fn render_tree(state: &AppState, frame: &mut Frame, area: Rect) {
                 Cell::from("type"),
                 Cell::from("dataType"),
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD));
+            .style(theme::header(&state.palette).add_modifier(Modifier::BOLD));
             let depth = state.tags.stack.len();
             let watched = &state.tags.watched;
             let table_rows: Vec<Row> = rows
                 .iter()
-                .map(|row| Row::new(tree_cells(depth, row, watched)))
+                .map(|row| {
+                    Row::new(tree_cells(depth, row, watched)).style(theme::text(&state.palette))
+                })
                 .collect();
             let widths = [Min(24), Length(11), Length(8)];
             let table = Table::new(table_rows, widths)
@@ -227,46 +264,61 @@ fn render_tree(state: &AppState, frame: &mut Frame, area: Rect) {
 /// read (value raw JSON, quality/timestamp verbatim — quality IS
 /// data). Enter refires the read; Esc ascends back to the tree.
 fn render_detail(state: &AppState, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("tags — detail");
+    let block = Block::bordered()
+        .title("tags — detail")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let Some(detail) = &state.tags.detail else {
         return;
     };
+    // Two-tone field rows (12-04 round 2): label rides `muted`, value
+    // rides `text` — the dashboard/rig/projects field-line shape.
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label:<8}"), theme::muted(&state.palette)),
+            Span::styled(value, theme::text(&state.palette)),
+        ])
+    };
     let mut lines = vec![
-        Line::from(format!("path    {}", detail.path)),
-        Line::from(format!("name    {}", detail.name)),
-        Line::from(format!("type    {}", detail.tag_type)),
-        Line::from(format!(
-            "dtype   {}",
-            detail.data_type.as_deref().unwrap_or("-")
-        )),
+        field("path", detail.path.clone()),
+        field("name", detail.name.clone()),
+        field("type", detail.tag_type.clone()),
+        field(
+            "dtype",
+            detail.data_type.clone().unwrap_or_else(|| "-".into()),
+        ),
         Line::default(),
     ];
     match &detail.read {
-        DetailRead::Loading => lines.push(Line::from("value   Loading…")),
+        DetailRead::Loading => lines.push(field("value", "Loading…".into())),
         DetailRead::Error(message) => {
             lines.push(Line::from(Span::styled(
                 "read error",
                 Style::default().add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::from(
+            lines.push(Line::from(Span::styled(
                 message
                     .chars()
                     .take(inner.width as usize - 1)
                     .collect::<String>(),
-            ));
-            lines.push(refresh_hint());
+                theme::text(&state.palette),
+            )));
+            lines.push(refresh_hint(&state.palette));
         }
         DetailRead::Loaded(row) => {
-            lines.push(Line::from(format!("value   {}", row.value)));
-            lines.push(Line::from(format!("quality {}", row.quality)));
-            lines.push(Line::from(format!("time    {}", row.timestamp)));
+            lines.push(field("value", row.value.to_string()));
+            lines.push(field("quality", row.quality.clone()));
+            lines.push(field("time", row.timestamp.clone()));
         }
     }
     lines.push(Line::default());
-    lines.push(Line::from("Enter re-read · Esc back"));
+    lines.push(Line::from(Span::styled(
+        "Enter re-read · Esc back",
+        theme::muted(&state.palette),
+    )));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -283,7 +335,10 @@ fn render_watch(state: &AppState, frame: &mut Frame, area: Rect) {
         crate::workers::watch::WATCH_PERIOD.as_secs(),
         tags.watched.len()
     );
-    let block = Block::bordered().title(title);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -294,19 +349,26 @@ fn render_watch(state: &AppState, frame: &mut Frame, area: Rect) {
                     "poll error",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
-                Line::from(
+                Line::from(Span::styled(
                     message
                         .chars()
                         .take(inner.width as usize - 1)
                         .collect::<String>(),
-                ),
+                    theme::text(&state.palette),
+                )),
             ]),
             inner,
         );
         return;
     }
     if tags.watch_rows.is_empty() {
-        frame.render_widget(Paragraph::new(Line::from("polling every 2s…")), inner);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "polling every 2s…",
+                theme::muted(&state.palette),
+            ))),
+            inner,
+        );
         return;
     }
     let header = Row::new(vec![
@@ -315,11 +377,13 @@ fn render_watch(state: &AppState, frame: &mut Frame, area: Rect) {
         Cell::from("quality"),
         Cell::from("time"),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(theme::header(&state.palette).add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = tags
         .watch_rows
         .iter()
-        .map(|row| Row::new(watch_cells(row, &tags.watch_changed)))
+        .map(|row| {
+            Row::new(watch_cells(row, &tags.watch_changed)).style(theme::text(&state.palette))
+        })
         .collect();
     let widths = [Min(18), Length(10), Length(12), Min(10)];
     frame.render_widget(Table::new(rows, widths).header(header), inner);
@@ -357,7 +421,11 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
         tags.stack.len(),
         tags.watched.len(),
     );
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    // Status facts + key hints ride `muted` (secondary — 12-04 round 2).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme::muted(&state.palette)))),
+        area,
+    );
 }
 
 #[cfg(test)]

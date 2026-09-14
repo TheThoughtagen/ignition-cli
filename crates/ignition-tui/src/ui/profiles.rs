@@ -7,16 +7,19 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::state::Modal;
 
+use super::theme;
+
 /// Render the switcher list modal inside `area` (caller centered +
 /// cleared it): every profile name, the active one bolded + marked,
-/// the cursor arrowed, key hints at the bottom.
-pub fn render_profiles(modal: &Modal, frame: &mut Frame, area: Rect) {
+/// the cursor arrowed, key hints at the bottom. Names ride `text`,
+/// hints `muted` (12-04 round 2); the active row keeps BOLD.
+pub fn render_profiles(palette: &theme::Palette, modal: &Modal, frame: &mut Frame, area: Rect) {
     let Modal::Profiles {
         names,
         active,
@@ -30,50 +33,81 @@ pub fn render_profiles(modal: &Modal, frame: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(index, name)| {
             let marker = if index == *selected { "▸ " } else { "  " };
+            let style = theme::text(palette);
             if Some(name) == active.as_ref() {
                 Line::from(format!("{marker}{name} · active"))
-                    .style(Style::default().add_modifier(Modifier::BOLD))
+                    .style(style.add_modifier(Modifier::BOLD))
             } else {
-                Line::from(format!("{marker}{name}"))
+                Line::from(format!("{marker}{name}")).style(style)
             }
         })
         .collect();
     if names.is_empty() {
-        lines.push(Line::from("no profiles configured"));
+        lines.push(Line::from(Span::styled(
+            "no profiles configured",
+            theme::text(palette),
+        )));
     }
     lines.push(Line::default());
-    lines.push(Line::from("Enter switch · a add · Esc close"));
-    lines.push(Line::from("auth refs: `ign profile add --help`"));
+    lines.push(Line::from(Span::styled(
+        "Enter switch · a add · Esc close",
+        theme::muted(palette),
+    )));
+    lines.push(Line::from(Span::styled(
+        "auth refs: `ign profile add --help`",
+        theme::muted(palette),
+    )));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("profiles")),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title("profiles")
+                .border_style(theme::border(palette))
+                .title_style(theme::title(palette)),
+        ),
         area,
     );
 }
 
 /// Render the add form: name + url fields, the edited one arrowed,
-/// Tab toggles, Enter submits.
-pub fn render_add(modal: &Modal, frame: &mut Frame, area: Rect) {
+/// Tab toggles, Enter submits. Field values ride `text`, the field
+/// labels + hints ride `muted`.
+pub fn render_add(palette: &theme::Palette, modal: &Modal, frame: &mut Frame, area: Rect) {
     let Modal::ProfileAdd { name, url, field } = modal else {
         return;
     };
     let cursor = |active: bool| if active { "▸ " } else { "  " };
+    let field_line = |marker_label: String, value: String| {
+        Line::from(vec![
+            Span::styled(marker_label, theme::muted(palette)),
+            Span::styled(value, theme::text(palette)),
+        ])
+    };
     let lines = vec![
-        Line::from(format!(
-            "{}name  {name}{}",
-            cursor(*field == 0),
-            if *field == 0 { "▏" } else { "" }
-        )),
-        Line::from(format!(
-            "{}url   {url}{}",
-            cursor(*field == 1),
-            if *field == 1 { "▏" } else { "" }
-        )),
+        field_line(
+            format!("{}name  ", cursor(*field == 0)),
+            format!("{name}{}", if *field == 0 { "▏" } else { "" }),
+        ),
+        field_line(
+            format!("{}url   ", cursor(*field == 1)),
+            format!("{url}{}", if *field == 1 { "▏" } else { "" }),
+        ),
         Line::default(),
-        Line::from("Tab next field · Enter add · Esc cancel"),
-        Line::from("auth refs (token/keyring/basic): `ign profile add --help`"),
+        Line::from(Span::styled(
+            "Tab next field · Enter add · Esc cancel",
+            theme::muted(palette),
+        )),
+        Line::from(Span::styled(
+            "auth refs (token/keyring/basic): `ign profile add --help`",
+            theme::muted(palette),
+        )),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("profile add")),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title("profile add")
+                .border_style(theme::border(palette))
+                .title_style(theme::title(palette)),
+        ),
         area,
     );
 }
@@ -94,13 +128,14 @@ pub fn modal_area(modal: &Modal, frame: &Rect) -> Rect {
 }
 
 /// Overlay entry: clear + render (mirrors ui::render_modal's shape for
-/// the two variants it delegates here).
-pub fn render_overlay(modal: &Modal, frame: &mut Frame) {
+/// the two variants it delegates here). The palette rides through —
+/// the modal's chrome + content are themed like every other surface.
+pub fn render_overlay(palette: &theme::Palette, modal: &Modal, frame: &mut Frame) {
     let area = modal_area(modal, &frame.area());
     frame.render_widget(Clear, area);
     match modal {
-        Modal::Profiles { .. } => render_profiles(modal, frame, area),
-        Modal::ProfileAdd { .. } => render_add(modal, frame, area),
+        Modal::Profiles { .. } => render_profiles(palette, modal, frame, area),
+        Modal::ProfileAdd { .. } => render_add(palette, modal, frame, area),
         _ => {}
     }
 }
@@ -112,12 +147,18 @@ mod tests {
 
     use super::render_overlay;
     use crate::state::Modal;
+    use crate::ui::theme::{Theme, Tier};
 
     /// Render a modal on an 80x24 TestBackend; joined buffer text.
+    /// Runs the dark @ C16 palette — the tests below pin TEXT content,
+    /// so any tier works; this one keeps the render-site call honest.
     fn rendered(modal: Modal) -> String {
+        let palette = Theme::by_name("dark")
+            .expect("dark in registry")
+            .resolve(Tier::C16);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         terminal
-            .draw(|frame| render_overlay(&modal, frame))
+            .draw(|frame| render_overlay(&palette, &modal, frame))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)

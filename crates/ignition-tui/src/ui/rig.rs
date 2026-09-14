@@ -21,6 +21,8 @@ use ignition_core::actions::rig::{RigStatusResult, StatusService};
 
 use crate::state::{AppState, RIG_LOG_RING_CAP};
 
+use super::theme;
+
 /// Render the rig body: the status summary, the optional logs pane
 /// (bottom 40% when on), and the one-row status line.
 pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
@@ -40,9 +42,17 @@ pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
 /// One indented `label value` row under a section header — the
 /// label column padded to nine so values clear the longest label
 /// (`compose`) by two spaces (the projects screen's field_line
-/// shape, widened for the section indent).
-fn field_line(label: &str, value: &str) -> Line<'static> {
-    Line::from(format!("  {label:<9} {value}"))
+/// shape, widened for the section indent). 12-04 UAT round 2: the
+/// label column rides `muted`, the value rides `text` (the
+/// dashboard field-row shape).
+fn field_line(palette: &theme::Palette, label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        // The trailing space keeps the byte-identical separator column
+        // (label pad + one space before the value — same as the old
+        // single-format-string shape).
+        Span::styled(format!("  {label:<9} "), theme::muted(palette)),
+        Span::styled(value.to_string(), theme::text(palette)),
+    ])
 }
 
 /// A bold section header (the dashboard table-header convention —
@@ -108,13 +118,22 @@ fn render_summary(state: &AppState, frame: &mut Frame, area: Rect) {
         Some(status) => format!("rig — {}", status.rig),
         None => "rig".to_string(),
     };
-    let block = Block::bordered().title(title);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match (&rig.status, &rig.status_error) {
         (None, None) => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         (None, Some(message)) => {
             frame.render_widget(
@@ -123,19 +142,20 @@ fn render_summary(state: &AppState, frame: &mut Frame, area: Rect) {
                         "status error".to_string(),
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(
+                    Line::from(Span::styled(
                         message
                             .chars()
                             .take(inner.width.saturating_sub(1) as usize)
                             .collect::<String>(),
-                    ),
+                        theme::text(&state.palette),
+                    )),
                 ]),
                 inner,
             );
         }
         (Some(status), _) => {
             frame.render_widget(
-                Paragraph::new(summary_lines(status, inner.width as usize)),
+                Paragraph::new(summary_lines(status, inner.width as usize, &state.palette)),
                 inner,
             );
         }
@@ -150,7 +170,11 @@ fn render_summary(state: &AppState, frame: &mut Frame, area: Rect) {
 /// long real-world paths stay identifiable. Layout and grouping
 /// only — no new color usage (the monochrome-theme overhaul is
 /// backlog).
-fn summary_lines(status: &RigStatusResult, width: usize) -> Vec<Line<'static>> {
+fn summary_lines(
+    status: &RigStatusResult,
+    width: usize,
+    palette: &theme::Palette,
+) -> Vec<Line<'static>> {
     let down = status.services.is_empty();
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![
@@ -168,16 +192,17 @@ fn summary_lines(status: &RigStatusResult, width: usize) -> Vec<Line<'static>> {
         )),
         Line::from(""),
         section("identity"),
-        field_line("rig", &status.rig),
+        field_line(palette, "rig", &status.rig),
     ];
     // The allowlist carries rig and project separately; today both
     // are the resolved project name, so the row renders only when
     // they actually differ (a COMPOSE_PROJECT_NAME rename is exactly
     // when the distinction matters).
     if status.project != status.rig {
-        lines.push(field_line("project", &status.project));
+        lines.push(field_line(palette, "project", &status.project));
     }
     lines.push(field_line(
+        palette,
         "compose",
         &fit_tail(
             &status.compose_file,
@@ -189,7 +214,7 @@ fn summary_lines(status: &RigStatusResult, width: usize) -> Vec<Line<'static>> {
     if status.services.is_empty() {
         lines.push(Line::from(Span::styled(
             "  none running — the rig is down (exit-0 data, `up` brings it back)".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
+            theme::muted(palette).add_modifier(Modifier::DIM),
         )));
     } else {
         for service in &status.services {
@@ -198,22 +223,28 @@ fn summary_lines(status: &RigStatusResult, width: usize) -> Vec<Line<'static>> {
                 .exit_code
                 .map(|code| format!(" exit:{code}"))
                 .unwrap_or_default();
-            lines.push(Line::from(format!(
-                "  {:<14} {:<9} {:<9} {}{exit}",
-                service.name,
-                service.state,
-                health,
-                ports_cell(service),
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {:<14} {:<9} {:<9} {}{exit}",
+                    service.name,
+                    service.state,
+                    health,
+                    ports_cell(service),
+                ),
+                theme::text(palette),
             )));
         }
     }
     lines.push(Line::from(""));
     lines.push(section("volumes"));
     if status.volumes.is_empty() {
-        lines.push(Line::from("  -"));
+        lines.push(Line::from(Span::styled("  -", theme::text(palette))));
     } else {
         for volume in &status.volumes {
-            lines.push(Line::from(format!("  {volume}")));
+            lines.push(Line::from(Span::styled(
+                format!("  {volume}"),
+                theme::text(palette),
+            )));
         }
     }
     lines
@@ -223,7 +254,10 @@ fn summary_lines(status: &RigStatusResult, width: usize) -> Vec<Line<'static>> {
 /// visible height (follow the newest — the raw-pane contract, no
 /// envelope, no level coloring: compose passthrough lines).
 fn render_stream(state: &AppState, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("rig logs");
+    let block = Block::bordered()
+        .title("rig logs")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -234,7 +268,12 @@ fn render_stream(state: &AppState, frame: &mut Frame, area: Rect) {
     let lines: Vec<Line> = ring
         .iter()
         .skip(start)
-        .map(|line| Line::from(line.chars().take(inner.width as usize).collect::<String>()))
+        .map(|line| {
+            Line::from(Span::styled(
+                line.chars().take(inner.width as usize).collect::<String>(),
+                theme::text(&state.palette),
+            ))
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -253,7 +292,11 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
         "logs:off".to_string()
     };
     let text = format!(" {pane} · a actions · r refresh · l logs");
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    // Status facts + key hints ride `muted` (secondary — 12-04 round 2).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme::muted(&state.palette)))),
+        area,
+    );
 }
 
 #[cfg(test)]

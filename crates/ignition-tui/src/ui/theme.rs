@@ -28,9 +28,11 @@
 //! EXPECTED to be tuned after UAT. Tests deliberately never pin literal
 //! hues — they pin structural contracts only: palette-slot equality,
 //! registry behavior, tier containment, and the all-Reset mono rule.
-//! (That reservation was exercised on 2026-09-14: UAT found the first
-//! `dark`/`light` hues too conservative to tell apart from `default`,
-//! and the palettes were hardened without touching a single test.)
+//! (That reservation was exercised twice on 2026-09-14: UAT round 1
+//! found the first `dark`/`light` hues too conservative to tell apart
+//! from `default`, and round 2 found the body text still default-white
+//! — the palettes and their render-site consumers were both extended
+//! without touching a single structural test.)
 //!
 //! # Mono adaptation is centralized here
 //!
@@ -208,14 +210,22 @@ const MONO: Theme = Theme {
 /// HARDENED after the 2026-09-14 UAT pass (the first hues were so
 /// conservative the theme was indistinguishable from `default` at a
 /// glance): border/title/header/emphasis now carry the `accent` blue so
-/// the theme reads as a different cockpit immediately; the c16 tier
-/// keeps the readable ANSI families (Blue/LightBlue). Hues remain
+/// the theme reads as a different cockpit immediately. UAT round 2
+/// (same day) extended the tint to the BODY: the user's verdict was
+/// "most text is still just white everywhere" — every theme's `text`
+/// slot was near-white and no render site consumed `text`/`muted` at
+/// all. `text` is now a soft blue-tinted off-white (readability first:
+/// ~14:1 contrast on black, WCAG-AAA body territory) and `muted` a
+/// clearly dimmer blue (~6:1, still AA) for hints/labels/secondary
+/// text; the c16 tier deliberately KEEPS White/DarkGray — at 16
+/// colors, readability wins over tint (the honest step-down story).
+/// The c256 tier mirrors via `Indexed(189)`/`Indexed(67)`. Hues remain
 /// planner-discretion — tests pin structure, not hues.
 const DARK: Theme = Theme {
     name: "dark",
     truecolor: Palette {
-        text: Color::Rgb(220, 223, 228),
-        muted: Color::Rgb(127, 140, 141),
+        text: Color::Rgb(196, 214, 235),
+        muted: Color::Rgb(110, 140, 170),
         emphasis: Color::Rgb(120, 200, 255),
         border: Color::Rgb(52, 152, 219),
         title: Color::Rgb(120, 200, 255),
@@ -228,8 +238,8 @@ const DARK: Theme = Theme {
         accent: Color::Rgb(52, 152, 219),
     },
     c256: Palette {
-        text: Color::Indexed(253),
-        muted: Color::Indexed(244),
+        text: Color::Indexed(189),
+        muted: Color::Indexed(67),
         emphasis: Color::Indexed(117),
         border: Color::Indexed(69),
         title: Color::Indexed(117),

@@ -25,11 +25,13 @@ use crate::state::{AppState, Modal, Screen};
 /// The Projects actions menu's lines (06-05, regrouped 06-10):
 /// noun-group sections (bold headers, blank-separated — driven by the
 /// entries' `group` field), entries as `▸ label — consequence` with
-/// the description dimmed, and the shared footer hint. Both the
+/// the description muted+dimmed, and the shared footer hint. Both the
 /// render and the height formula walk THIS builder, so the modal's
 /// geometry always fits its content exactly (descriptions count as
-/// content).
-fn projects_action_lines(selected: usize) -> Vec<Line<'static>> {
+/// content). 12-04 UAT round 2: labels ride `text`, descriptions and
+/// the footer hint ride `muted` (modifiers stay inline — DIM is
+/// not-a-color doctrine).
+fn projects_action_lines(selected: usize, palette: &theme::Palette) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut last_group = "";
     for (index, action) in crate::state::PROJECT_ACTIONS.iter().enumerate() {
@@ -45,15 +47,18 @@ fn projects_action_lines(selected: usize) -> Vec<Line<'static>> {
         }
         let marker = if index == selected { "▸ " } else { "  " };
         lines.push(Line::from(vec![
-            Span::raw(format!("{marker}{}", action.label)),
+            Span::styled(format!("{marker}{}", action.label), theme::text(palette)),
             Span::styled(
                 format!(" — {}", action.description),
-                Style::default().add_modifier(Modifier::DIM),
+                theme::muted(palette).add_modifier(Modifier::DIM),
             ),
         ]));
     }
     lines.push(Line::default());
-    lines.push(Line::from("Enter to run · Esc to cancel"));
+    lines.push(Line::from(Span::styled(
+        "Enter to run · Esc to cancel",
+        theme::muted(palette),
+    )));
     lines
 }
 
@@ -74,7 +79,7 @@ pub fn render(state: &AppState, frame: &mut Frame) {
     }
 
     if let Some(modal) = &state.modal {
-        render_modal(modal, frame);
+        render_modal(&state.palette, modal, frame);
     }
 }
 
@@ -93,11 +98,18 @@ fn render_tab_bar(state: &AppState, frame: &mut Frame, area: ratatui::layout::Re
         .iter()
         .position(|screen| *screen == state.screen)
         .unwrap_or(0);
-    let tabs = Tabs::new(titles).select(active).highlight_style(
-        Style::default()
-            .fg(state.palette.emphasis)
-            .add_modifier(Modifier::BOLD),
-    );
+    // Base style = `muted`: the INACTIVE tab labels tint with the
+    // theme's muted slot (12-04 round 2), the active one overrides
+    // via highlight_style (emphasis + BOLD). At the default/mono
+    // tiers muted is Reset — the exact prior look.
+    let tabs = Tabs::new(titles)
+        .select(active)
+        .style(theme::muted(&state.palette))
+        .highlight_style(
+            Style::default()
+                .fg(state.palette.emphasis)
+                .add_modifier(Modifier::BOLD),
+        );
     frame.render_widget(tabs, area);
 }
 
@@ -143,8 +155,10 @@ fn wrapped_row_count(text: &str, max_width: u16) -> usize {
 
 /// The modal overlay: centered rect (the 0.30 `Rect::centered` helpers —
 /// never hand-rolled rect math) over a `Clear`ed region, so whatever the
-/// screen drew underneath disappears.
-fn render_modal(modal: &Modal, frame: &mut Frame) {
+/// screen drew underneath disappears. The palette rides in from the
+/// caller: body text rides `text`, hints/footers `muted`, chrome the
+/// border/title slots (12-04 UAT round 2).
+fn render_modal(palette: &theme::Palette, modal: &Modal, frame: &mut Frame) {
     // Height is CONTENT-DRIVEN: every formula counts the rows the
     // modal actually renders — entries + the footer hint + the blank
     // separator + the two border rows (len + 4 for menu modals; the
@@ -173,9 +187,9 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         // The noun-grouped menu (06-10): its lines come from the
         // shared builder so descriptions and headers count as
         // content, plus the two border rows.
-        Modal::ProjectsActions { selected } => {
-            projects_action_lines(*selected).len().saturating_add(2)
-        }
+        Modal::ProjectsActions { selected } => projects_action_lines(*selected, palette)
+            .len()
+            .saturating_add(2),
         Modal::RigActions { .. } => crate::state::RIG_ACTIONS.len().saturating_add(4),
         // The profiles modals compute their own centered geometry in
         // the delegated render — these values keep the match total.
@@ -200,35 +214,42 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
             // the ~140-char preview line folds within the half-width
             // box instead of clipping mid-word (10-UAT test 10).
             // trim: false preserves the body's own leading whitespace
-            // across wrapped rows.
+            // across wrapped rows. Body rides `text`, the footer hint
+            // `muted` (12-04 round 2).
             let text = body
                 .lines()
-                .map(Line::from)
-                .chain([Line::default(), Line::from("y to confirm · Esc to cancel")])
+                .map(|line| Line::from(Span::styled(line.to_string(), theme::text(palette))))
+                .chain([
+                    Line::default(),
+                    footer_hint(palette, "y to confirm · Esc to cancel"),
+                ])
                 .collect::<Vec<_>>();
             frame.render_widget(
                 Paragraph::new(text)
                     .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(title.clone())),
+                    .block(modal_block(palette, title.clone())),
                 area,
             );
         }
         // The profile switcher modals own their rendering (06-02's
         // screen-owned module) — centered geometry included.
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => {
-            profiles::render_overlay(modal, frame);
+            profiles::render_overlay(palette, modal, frame);
         }
         // The ack form owns its rendering too (06-03's screen-owned
         // module — the alarms twin of the profiles pattern).
         Modal::Ack { .. } => {
-            alarms::render_ack_overlay(modal, frame);
+            alarms::render_ack_overlay(palette, modal, frame);
         }
         Modal::Input {
             title,
             hint,
             buffer,
         } => {
-            let mut text = vec![Line::from(format!("{buffer}▏"))];
+            let mut text = vec![Line::from(Span::styled(
+                format!("{buffer}▏"),
+                theme::text(palette),
+            ))];
             if let Some(hint) = hint {
                 // Rule reminders may use deliberate line breaks so
                 // critical guidance is never clipped by the locked
@@ -236,14 +257,14 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 text.extend(hint.lines().map(|line| {
                     Line::from(Span::styled(
                         line.to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
+                        theme::muted(palette).add_modifier(Modifier::DIM),
                     ))
                 }));
             }
             text.push(Line::default());
-            text.push(Line::from("Enter to accept · Esc to cancel"));
+            text.push(footer_hint(palette, "Enter to accept · Esc to cancel"));
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title(title.clone())),
+                Paragraph::new(text).block(modal_block(palette, title.clone())),
                 area,
             );
         }
@@ -254,16 +275,16 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
         } => {
             let text: Vec<Line> = lines
                 .iter()
-                .map(|line| Line::from(line.clone()))
+                .map(|line| Line::from(Span::styled(line.clone(), theme::text(palette))))
                 .chain([
                     Line::default(),
-                    Line::from("PgUp/PgDn scroll · Esc to close"),
+                    footer_hint(palette, "PgUp/PgDn scroll · Esc to close"),
                 ])
                 .collect();
             frame.render_widget(
                 Paragraph::new(text)
                     .scroll((*scroll, 0))
-                    .block(Block::bordered().title(title.clone())),
+                    .block(modal_block(palette, title.clone())),
                 area,
             );
         }
@@ -273,12 +294,18 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 .enumerate()
                 .map(|(index, action)| {
                     let marker = if index == *selected { "▸ " } else { "  " };
-                    Line::from(format!("{marker}{action}"))
+                    Line::from(Span::styled(
+                        format!("{marker}{action}"),
+                        theme::text(palette),
+                    ))
                 })
-                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .chain([
+                    Line::default(),
+                    footer_hint(palette, "Enter to run · Esc to cancel"),
+                ])
                 .collect();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title("actions")),
+                Paragraph::new(text).block(modal_block(palette, "actions".into())),
                 area,
             );
         }
@@ -290,12 +317,18 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 .enumerate()
                 .map(|(index, action)| {
                     let marker = if index == *selected { "▸ " } else { "  " };
-                    Line::from(format!("{marker}{action}"))
+                    Line::from(Span::styled(
+                        format!("{marker}{action}"),
+                        theme::text(palette),
+                    ))
                 })
-                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .chain([
+                    Line::default(),
+                    footer_hint(palette, "Enter to run · Esc to cancel"),
+                ])
                 .collect();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title("actions")),
+                Paragraph::new(text).block(modal_block(palette, "actions".into())),
                 area,
             );
         }
@@ -307,24 +340,30 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 .enumerate()
                 .map(|(index, action)| {
                     let marker = if index == *selected { "▸ " } else { "  " };
-                    Line::from(format!("{marker}{action}"))
+                    Line::from(Span::styled(
+                        format!("{marker}{action}"),
+                        theme::text(palette),
+                    ))
                 })
-                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .chain([
+                    Line::default(),
+                    footer_hint(palette, "Enter to run · Esc to cancel"),
+                ])
                 .collect();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title("actions")),
+                Paragraph::new(text).block(modal_block(palette, "actions".into())),
                 area,
             );
         }
         // The Projects screen's menu (06-05, regrouped 06-10): the
         // noun-grouped render — bold section headers, `label —
-        // consequence` entries with the description dimmed — from the
+        // consequence` entries with the description muted — from the
         // shared line builder (the height formula walks the same
         // lines).
         Modal::ProjectsActions { selected } => {
             frame.render_widget(
-                Paragraph::new(projects_action_lines(*selected))
-                    .block(Block::bordered().title("actions")),
+                Paragraph::new(projects_action_lines(*selected, palette))
+                    .block(modal_block(palette, "actions".into())),
                 area,
             );
         }
@@ -336,16 +375,37 @@ fn render_modal(modal: &Modal, frame: &mut Frame) {
                 .enumerate()
                 .map(|(index, action)| {
                     let marker = if index == *selected { "▸ " } else { "  " };
-                    Line::from(format!("{marker}{action}"))
+                    Line::from(Span::styled(
+                        format!("{marker}{action}"),
+                        theme::text(palette),
+                    ))
                 })
-                .chain([Line::default(), Line::from("Enter to run · Esc to cancel")])
+                .chain([
+                    Line::default(),
+                    footer_hint(palette, "Enter to run · Esc to cancel"),
+                ])
                 .collect();
             frame.render_widget(
-                Paragraph::new(text).block(Block::bordered().title("actions")),
+                Paragraph::new(text).block(modal_block(palette, "actions".into())),
                 area,
             );
         }
     }
+}
+
+/// The modal chrome: bordered + titled through the palette's
+/// border/title slots (12-04 round 2 — the same proven pattern as the
+/// dashboard panes; Reset slots keep default/mono byte-identical).
+fn modal_block(palette: &theme::Palette, title: String) -> Block<'static> {
+    Block::bordered()
+        .title(title)
+        .border_style(theme::border(palette))
+        .title_style(theme::title(palette))
+}
+
+/// A modal's footer key hint — secondary text, rides `muted`.
+fn footer_hint(palette: &theme::Palette, hint: &str) -> Line<'static> {
+    Line::from(Span::styled(hint.to_string(), theme::muted(palette)))
 }
 
 #[cfg(test)]

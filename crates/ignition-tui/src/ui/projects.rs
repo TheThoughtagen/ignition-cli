@@ -24,6 +24,8 @@ use ignition_core::client::projects::ProjectRecord;
 
 use crate::state::{AppState, ProjectRecordState, ResourceDetail, ResourceGetState};
 
+use super::theme;
+
 /// Render the projects body: whichever level owns the surface (the
 /// resource preview, the project detail, or the list) + the one-row
 /// status line.
@@ -54,21 +56,39 @@ fn project_cells(project: &ProjectSummary) -> Vec<Cell<'static>> {
 /// first load, the honest error when it failed, the rows when they
 /// landed — "no projects" (a state, not a crash) when empty.
 fn render_list(state: &AppState, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("projects");
+    let block = Block::bordered()
+        .title("projects")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let projects = &state.projects;
     match (&projects.list, &projects.list_error) {
         (None, None) => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         (None, Some(message)) => {
-            frame.render_widget(error_lines("list error", message, inner), inner);
+            frame.render_widget(
+                error_lines(&state.palette, "list error", message, inner),
+                inner,
+            );
         }
         (Some(rows), _) => {
             if rows.is_empty() {
-                frame.render_widget(Paragraph::new(Line::from("no projects")), inner);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "no projects",
+                        theme::text(&state.palette),
+                    ))),
+                    inner,
+                );
                 return;
             }
             let header = Row::new(vec![
@@ -77,10 +97,10 @@ fn render_list(state: &AppState, frame: &mut Frame, area: Rect) {
                 Cell::from("enabled"),
                 Cell::from("parent"),
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD));
+            .style(theme::header(&state.palette).add_modifier(Modifier::BOLD));
             let table_rows: Vec<Row> = rows
                 .iter()
-                .map(|row| Row::new(project_cells(row)))
+                .map(|row| Row::new(project_cells(row)).style(theme::text(&state.palette)))
                 .collect();
             let widths = [Min(12), Min(12), Length(7), Min(8)];
             let table = Table::new(table_rows, widths)
@@ -92,25 +112,37 @@ fn render_list(state: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
-/// The shared per-pane error shape (the tags screen's convention).
-fn error_lines(banner: &str, message: &str, inner: Rect) -> Paragraph<'static> {
+/// The shared per-pane error shape (the tags screen's convention): the
+/// banner keeps its BOLD weight; the message rides `text` (12-04 round
+/// 2 — body detail content, not a semantic level label).
+fn error_lines(
+    palette: &theme::Palette,
+    banner: &str,
+    message: &str,
+    inner: Rect,
+) -> Paragraph<'static> {
     Paragraph::new(vec![
         Line::from(Span::styled(
             banner.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(
+        Line::from(Span::styled(
             message
                 .chars()
                 .take(inner.width as usize - 1)
                 .collect::<String>(),
-        ),
+            theme::text(palette),
+        )),
     ])
 }
 
-/// One record field line, `label value` with `-` for None.
-fn field_line(label: &str, value: Option<&str>) -> Line<'static> {
-    Line::from(format!("{label:<7} {}", value.unwrap_or("-")))
+/// One record field line, `label value` with `-` for None — the label
+/// column rides `muted`, the value rides `text` (12-04 round 2).
+fn field_line(palette: &theme::Palette, label: &str, value: Option<&str>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<7} "), theme::muted(palette)),
+        Span::styled(value.unwrap_or("-").to_string(), theme::text(palette)),
+    ])
 }
 
 /// The project detail level: the find's full record (left) + the
@@ -125,42 +157,74 @@ fn render_detail(state: &AppState, frame: &mut Frame, area: Rect) {
         Layout::horizontal([Percentage(45), Percentage(55)]).areas(area);
 
     // Left: the record.
-    let block = Block::bordered().title(format!("project — {}", detail.name));
+    let block = Block::bordered()
+        .title(format!("project — {}", detail.name))
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(record_pane);
     frame.render_widget(block, record_pane);
     match &detail.record {
         ProjectRecordState::Loading => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         ProjectRecordState::Error(message) => {
-            frame.render_widget(error_lines("find error", message, inner), inner);
+            frame.render_widget(
+                error_lines(&state.palette, "find error", message, inner),
+                inner,
+            );
         }
         ProjectRecordState::Loaded(record) => {
-            frame.render_widget(Paragraph::new(record_lines(record)), inner);
+            frame.render_widget(Paragraph::new(record_lines(record, &state.palette)), inner);
         }
     }
 
     // Right: the resources list.
-    let block = Block::bordered().title(format!("resources — {}", detail.name));
+    let block = Block::bordered()
+        .title(format!("resources — {}", detail.name))
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(resources_pane);
     frame.render_widget(block, resources_pane);
     match (&detail.resources, &detail.resources_error) {
         (None, None) => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         (None, Some(message)) => {
-            frame.render_widget(error_lines("resources error", message, inner), inner);
+            frame.render_widget(
+                error_lines(&state.palette, "resources error", message, inner),
+                inner,
+            );
         }
         (Some(paths), _) => {
             if paths.is_empty() {
-                frame.render_widget(Paragraph::new(Line::from("no resources")), inner);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "no resources",
+                        theme::text(&state.palette),
+                    ))),
+                    inner,
+                );
                 return;
             }
             let header = Row::new(vec![Cell::from("path")])
-                .style(Style::default().add_modifier(Modifier::BOLD));
+                .style(theme::header(&state.palette).add_modifier(Modifier::BOLD));
             let table_rows: Vec<Row> = paths
                 .iter()
-                .map(|path| Row::new(vec![Cell::from(path.clone())]))
+                .map(|path| {
+                    Row::new(vec![Cell::from(path.clone())]).style(theme::text(&state.palette))
+                })
                 .collect();
             let table = Table::new(table_rows, [Min(20)])
                 .header(header)
@@ -174,22 +238,27 @@ fn render_detail(state: &AppState, frame: &mut Frame, area: Rect) {
 /// The record's display lines: the six summary fields PLUS the
 /// defaultDb/tagProvider/userSource passthrough the detail pane
 /// uniquely shows.
-fn record_lines(record: &ProjectRecord) -> Vec<Line<'static>> {
+fn record_lines(record: &ProjectRecord, palette: &theme::Palette) -> Vec<Line<'static>> {
     vec![
-        field_line("name", Some(&record.name)),
-        field_line("title", record.title.as_deref()),
-        field_line("desc", record.description.as_deref()),
-        field_line("enabled", Some(if record.enabled { "yes" } else { "no" })),
-        field_line("parent", record.parent.as_deref()),
+        field_line(palette, "name", Some(&record.name)),
+        field_line(palette, "title", record.title.as_deref()),
+        field_line(palette, "desc", record.description.as_deref()),
         field_line(
+            palette,
+            "enabled",
+            Some(if record.enabled { "yes" } else { "no" }),
+        ),
+        field_line(palette, "parent", record.parent.as_deref()),
+        field_line(
+            palette,
             "inherit",
             record
                 .inheritable
                 .map(|flag| if flag { "yes" } else { "no" }),
         ),
-        field_line("db", record.default_db.as_deref()),
-        field_line("tagprov", record.tag_provider.as_deref()),
-        field_line("usersrc", record.user_source.as_deref()),
+        field_line(palette, "db", record.default_db.as_deref()),
+        field_line(palette, "tagprov", record.tag_provider.as_deref()),
+        field_line(palette, "usersrc", record.user_source.as_deref()),
     ]
 }
 
@@ -203,29 +272,53 @@ fn render_resource(state: &AppState, frame: &mut Frame, area: Rect) {
     let Some(resource) = &state.projects.resource else {
         return;
     };
-    let block =
-        Block::bordered().title(format!("resource — {}/{}", resource.project, resource.path));
+    let block = Block::bordered()
+        .title(format!("resource — {}/{}", resource.project, resource.path))
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match &resource.state {
         ResourceGetState::Loading => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         ResourceGetState::Error(message) => {
-            frame.render_widget(error_lines("get error", message, inner), inner);
+            frame.render_widget(
+                error_lines(&state.palette, "get error", message, inner),
+                inner,
+            );
         }
         ResourceGetState::Loaded(result) => {
             let body_height = inner.height;
+            let field = |label: &str, value: String| {
+                Line::from(vec![
+                    Span::styled(format!("{label:<8}"), theme::muted(&state.palette)),
+                    Span::styled(value, theme::text(&state.palette)),
+                ])
+            };
             let mut lines = vec![
-                Line::from(format!("project {}", resource.project)),
-                Line::from(format!("path    {}", resource.path)),
-                Line::from(format!("kind    {}", result.content_kind)),
+                field("project", resource.project.clone()),
+                field("path", resource.path.clone()),
+                field("kind", result.content_kind.clone()),
                 Line::default(),
             ];
-            lines.extend(content_preview_lines(result));
+            lines.extend(
+                content_preview_lines(result)
+                    .into_iter()
+                    .map(|line| line.style(theme::text(&state.palette))),
+            );
             lines.push(Line::default());
-            lines.push(Line::from("↑↓ scroll · Enter re-get · Esc back"));
+            lines.push(Line::from(Span::styled(
+                "↑↓ scroll · Enter re-get · Esc back",
+                theme::muted(&state.palette),
+            )));
             // Clamp the scroll to the content (the state side only
             // advances; the truth of the height lives here).
             let max_scroll = lines
@@ -258,7 +351,11 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
     };
     let count = state.projects.list.as_ref().map_or(0, Vec::len);
     let text = format!(" {level} · {count} projects · Enter open · a actions · Esc back",);
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    // Status facts + key hints ride `muted` (secondary — 12-04 round 2).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme::muted(&state.palette)))),
+        area,
+    );
 }
 
 #[cfg(test)]

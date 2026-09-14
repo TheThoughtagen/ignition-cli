@@ -16,6 +16,8 @@ use ratatui::layout::Constraint::Ratio;
 
 use crate::state::{AppState, Modal};
 
+use super::theme;
+
 /// Render the alarms body: the table pane + the one-row status line.
 pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
     let [table, status] = Layout::vertical([Min(0), Length(1)]).areas(area);
@@ -40,14 +42,23 @@ fn alarm_cells(alarm: &AlarmRow) -> Vec<Cell<'static>> {
 /// poll, the honest error when a poll failed, the rows when they
 /// landed — "no active alarms" (a state, not a crash) when empty.
 fn render_table(state: &AppState, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("alarms");
+    let block = Block::bordered()
+        .title("alarms")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let alarms = &state.alarms;
     match (&alarms.active, &alarms.error) {
         (None, None) => {
-            frame.render_widget(Paragraph::new(Line::from("Loading…")), inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Loading…",
+                    theme::text(&state.palette),
+                ))),
+                inner,
+            );
         }
         (None, Some(message)) => {
             frame.render_widget(
@@ -56,21 +67,29 @@ fn render_table(state: &AppState, frame: &mut Frame, area: Rect) {
                         "poll error",
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(
+                    Line::from(Span::styled(
                         message
                             .chars()
                             .take(inner.width as usize - 1)
                             .collect::<String>(),
-                    ),
+                        theme::text(&state.palette),
+                    )),
                 ]),
                 inner,
             );
         }
         (Some(rows), error) => {
             if rows.is_empty() {
-                let mut lines = vec![Line::from("no active alarms")];
+                let mut lines = vec![Line::from(Span::styled(
+                    "no active alarms",
+                    theme::text(&state.palette),
+                ))];
                 if let Some(message) = error {
-                    lines.push(Line::from(format!("(last poll note: {message})")));
+                    // A stale-poll note is secondary info — rides muted.
+                    lines.push(Line::from(Span::styled(
+                        format!("(last poll note: {message})"),
+                        theme::muted(&state.palette),
+                    )));
                 }
                 frame.render_widget(Paragraph::new(lines), inner);
                 return;
@@ -81,10 +100,10 @@ fn render_table(state: &AppState, frame: &mut Frame, area: Rect) {
                 Cell::from("name"),
                 Cell::from("state"),
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD));
+            .style(theme::header(&state.palette).add_modifier(Modifier::BOLD));
             let rows: Vec<Row> = rows
                 .iter()
-                .map(|alarm| Row::new(alarm_cells(alarm)))
+                .map(|alarm| Row::new(alarm_cells(alarm)).style(theme::text(&state.palette)))
                 .collect();
             // The UUID column is a FIXED 36 — the must-have; the source
             // column flexes (invisible below ~80 cols, room on wide
@@ -115,13 +134,17 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
         .unwrap_or_else(|| "not polled yet".to_string());
     let busy = if alarms.busy { " · refreshing" } else { "" };
     let text = format!(" {count} · {age}{busy} · a ack · h history · ↑↓ select");
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    // Status facts + key hints ride `muted` (secondary — 12-04 round 2).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme::muted(&state.palette)))),
+        area,
+    );
 }
 
 /// The ack form overlay (the screen-owned modal pattern): target UUID,
 /// username (required) + note (optional) fields, the edited one
 /// arrowed, Enter submits — disabled until the username is non-empty.
-pub fn render_ack_overlay(modal: &Modal, frame: &mut Frame) {
+pub fn render_ack_overlay(palette: &theme::Palette, modal: &Modal, frame: &mut Frame) {
     let Modal::Ack {
         event_id,
         username,
@@ -136,29 +159,49 @@ pub fn render_ack_overlay(modal: &Modal, frame: &mut Frame) {
     let cursor = |active: bool| if active { "▸ " } else { "  " };
     // The target UUID rides BARE on its own line — 36 chars fit the
     // half-width modal's inner area where a prefixed line would not,
-    // and a bare UUID is one clean selection for copy-paste.
+    // and a bare UUID is one clean selection for copy-paste. Body
+    // content rides `text`, labels `muted`, hints `muted` (12-04
+    // round 2).
     let lines = vec![
-        Line::from(event_id.clone()),
+        Line::from(Span::styled(event_id.clone(), theme::text(palette))),
         Line::default(),
-        Line::from(format!(
-            "{}user  {username}{}",
-            cursor(*field == 0),
-            if *field == 0 { "▏" } else { "" }
-        )),
-        Line::from(format!(
-            "{}note  {note}{}",
-            cursor(*field == 1),
-            if *field == 1 { "▏" } else { "" }
-        )),
+        Line::from(vec![
+            Span::styled(
+                format!("{}user  ", cursor(*field == 0)),
+                theme::muted(palette),
+            ),
+            Span::styled(
+                format!("{username}{}", if *field == 0 { "▏" } else { "" }),
+                theme::text(palette),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{}note  ", cursor(*field == 1)),
+                theme::muted(palette),
+            ),
+            Span::styled(
+                format!("{note}{}", if *field == 1 { "▏" } else { "" }),
+                theme::text(palette),
+            ),
+        ]),
         Line::default(),
-        Line::from(if username.trim().is_empty() {
-            "username REQUIRED (the 3-arg wire form)"
-        } else {
-            "Enter acknowledge · Esc cancel"
-        }),
+        Line::from(Span::styled(
+            if username.trim().is_empty() {
+                "username REQUIRED (the 3-arg wire form)"
+            } else {
+                "Enter acknowledge · Esc cancel"
+            },
+            theme::muted(palette),
+        )),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("ack alarm")),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title("ack alarm")
+                .border_style(theme::border(palette))
+                .title_style(theme::title(palette)),
+        ),
         area,
     );
 }
@@ -292,7 +335,13 @@ mod tests {
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         terminal
-            .draw(|frame| super::render_ack_overlay(state.modal.as_ref().expect("modal"), frame))
+            .draw(|frame| {
+                super::render_ack_overlay(
+                    &state.palette,
+                    state.modal.as_ref().expect("modal"),
+                    frame,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let text: String = (0..buffer.area.height)
