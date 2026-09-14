@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "profile": "p13r833",
+  "data": {
+    "project": "ign-cli",
+    "path": "[default]P13H/T1",
+    "tag_type": "AtomicTag",
+    "config": {
+      "dataType": "Int4",
+      "defaultValue": 0,
+      "name": "T1",
+      "path": "[default]P13H/T1",
+      "tagType": "AtomicTag",
+      "value": 0
+    }
+  }
+}
