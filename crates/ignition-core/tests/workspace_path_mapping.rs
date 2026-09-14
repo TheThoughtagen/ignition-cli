@@ -20,7 +20,9 @@
 
 use std::path::Path;
 
-use ignition_core::client::workspace::{local_path_for, segment_escape, segment_unescape};
+use ignition_core::client::workspace::{
+    build_mapping, local_path_for, segment_escape, segment_unescape,
+};
 use ignition_core::error::CoreError;
 use proptest::prelude::*;
 use proptest::string::string_regex;
@@ -169,6 +171,129 @@ fn unescape_local(local: &Path) -> String {
         );
     }
     parts.join("/")
+}
+
+// ---- P5–P6: set-level injectivity (Task 2 — build_mapping) ----
+
+/// A generated member SET (deduplicated by construction — exact
+/// duplicates are the caller-bug refusal, pinned separately).
+fn member_set() -> impl Strategy<Value = std::collections::BTreeSet<String>> {
+    proptest::collection::btree_set(valid_member_path(), 1..=8)
+}
+
+proptest! {
+    /// P5 — for every generated member SET that passes
+    /// [`build_mapping`], the result is a TOTAL function (every input
+    /// member present as a key) and pairwise-injective byte-wise.
+    #[test]
+    fn p5_build_mapping_total_and_pairwise_injective(members in member_set()) {
+        let input: Vec<String> = members.into_iter().collect();
+        let mapping = match build_mapping(&input) {
+            Ok(mapping) => mapping,
+            Err(_) => {
+                prop_assume!(false, "refused set — the fold-collision class is P6's corpus");
+                unreachable!()
+            }
+        };
+        prop_assert_eq!(mapping.len(), input.len(), "total: one entry per member");
+        for member in &input {
+            prop_assert!(mapping.contains_key(member), "member {:?} missing from map", member);
+        }
+        let rendered: Vec<String> = mapping
+            .values()
+            .map(|local| local.to_string_lossy().into_owned())
+            .collect();
+        for (index, a) in rendered.iter().enumerate() {
+            for b in rendered.iter().skip(index + 1) {
+                prop_assert_ne!(a, b, "two members rendered the same local path");
+            }
+        }
+    }
+}
+
+/// P6 — the APFS fold-collision class (Pitfall W1's core) refuses
+/// naming BOTH member paths, and the refusal message is order-stable
+/// (deterministic sorted iteration).
+#[test]
+fn p6_case_fold_collision_refuses_naming_both() {
+    for (a, b) in [("P13/A", "p13/a"), ("Foo", "foo")] {
+        let err = build_mapping(&[a.to_string(), b.to_string()])
+            .expect_err("fold-colliding members must refuse");
+        let CoreError::InvalidInput { reason } = err else {
+            panic!("refusal must ride InvalidInput (no new slugs)");
+        };
+        assert!(
+            reason.contains(a) && reason.contains(b),
+            "refusal must name BOTH colliding members ({a:?}, {b:?}): {reason}"
+        );
+
+        // Order-stable: the same pair reversed refuses with the SAME
+        // message (sorted iteration — 13-03's error surfaces verbatim
+        // regardless of member order in the export).
+        let reversed = build_mapping(&[b.to_string(), a.to_string()]).expect_err("reversed");
+        let CoreError::InvalidInput {
+            reason: reason_reversed,
+        } = reversed
+        else {
+            panic!("refusal must ride InvalidInput (no new slugs)");
+        };
+        assert_eq!(reason, reason_reversed, "collision message is order-stable");
+    }
+
+    // Sanity: same folded DIRECTORY, different folded FILE — no
+    // collision (`P13/A/x` folds to `p13/a/x`, `p13/B` to `p13/b`).
+    let ok = build_mapping(&["P13/A/x".to_string(), "p13/B".to_string()])
+        .expect("distinct folded paths map");
+    assert_eq!(ok.len(), 2);
+}
+
+/// P6 — the exact duplicate refuses (the same member listed twice is
+/// a caller bug, not something to absorb silently).
+#[test]
+fn p6_exact_duplicate_refuses() {
+    let err = build_mapping(&[
+        "ignition/script-python/a".to_string(),
+        "ignition/script-python/a".to_string(),
+    ])
+    .expect_err("exact duplicate must refuse");
+    let CoreError::InvalidInput { reason } = err else {
+        panic!("refusal must ride InvalidInput (no new slugs)");
+    };
+    assert!(
+        reason.contains("ignition/script-python/a"),
+        "refusal names the duplicate: {reason}"
+    );
+}
+
+/// Unicode case is NOT folded beyond ASCII (planner pin): NFC and NFD
+/// variants differ byte-wise and both map — staying distinct files,
+/// the recorded manifest holding the exact pairs either way.
+#[test]
+fn p6_unicode_variants_are_not_fold_collisions() {
+    let nfc = "caf\u{e9}/view.json".to_string();
+    let nfd = "cafe\u{301}/view.json".to_string();
+    let mapping = build_mapping(&[nfc.clone(), nfd.clone()])
+        .expect("byte-distinct members are not fold collisions");
+    assert_eq!(mapping.len(), 2);
+    assert_ne!(mapping[&nfc], mapping[&nfd]);
+}
+
+/// build_mapping is deterministic: the same set in any order yields
+/// the identical map (13-03 records stable pairs regardless of
+/// export member order).
+#[test]
+fn build_mapping_is_order_stable() {
+    let members: Vec<String> = vec![
+        "ignition/script-python/b".into(),
+        "com.example/views/Dash/view.json".into(),
+        "ignition/script-python/a".into(),
+    ];
+    let mut reversed = members.clone();
+    reversed.reverse();
+    assert_eq!(
+        build_mapping(&members).unwrap(),
+        build_mapping(&reversed).unwrap()
+    );
 }
 
 // ---- Explicit fixtures pinning the scheme's sharp edges ----
