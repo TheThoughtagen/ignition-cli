@@ -115,7 +115,7 @@ Plans:
   3. Before importing XML/CSV that would drop or coerce tag fields, user sees a loss-report warning and can abort
 **Research/Planning flags**: RESEARCH REQUIRED for this phase — pull a REAL multi-level UDT export and decide quick-xml serde-derive vs hand-rolled Event-loop before writing code (wiremock fixtures cannot provide this); validate the loss-report design against real exports. If routes change: one atomic WebDev bundle bump, both-direction version-drift tests.
 **Planner locks** (no CONTEXT.md; locked during planning, binding on plans): CSV = composite interpretation — XML is full gateway-byte passthrough BOTH directions; CSV upload is byte-faithful to the gateway's importTags parser; CSV download is CLI-generated from the JSON interchange, documented lossy (the gateway cannot export CSV — official 8.3 docs). Libraries: quick-xml 0.41 Event-loop (NO serde feature) + csv crate + base64 envelope carrier. Loss-gate refusal = exit 2 invalid_input (no new slugs); collision matrix stays abort/overwrite.
-**Plans:** 6 plans
+**Plans:** 8 plans (6 executed + 2 gap-closure from UAT)
 Plans:
 - [ ] 11-01-PLAN.md — Live rig probes (all five roadmap-mandated) + REAL multi-level UDT XML capture + CSV coverage table → 11-LIVE-CAPTURES.md *(capture-first: later plans cite, never re-derive)*
 - [x] 11-02-PLAN.md — Route surface: exportTags format param (xml→base64) + importTagsFile action + ATOMIC 1.2.0 bundle bump + wiremock pins
@@ -123,6 +123,8 @@ Plans:
 - [ ] 11-04-PLAN.md — Core transfer actions: XML raw-byte export/import via routes (scan-fed collision pre-check) + generate_legacy_csv + 300s export timeout
 - [ ] 11-05-PLAN.md — CLI surface + TAGS-12 loss gate (--format flags, pre-resolution exit-2 refusal, --yes, stderr prose + envelope loss_report, raw-byte stdout, README CSV honesty)
 - [ ] 11-06-PLAN.md — Live gates on BOTH rigs: XML fidelity round-trip oracle (sha256), CSV round-trip, loss-gate refusal → 11-LIVE-GATE.md evidence
+- [ ] 11-07-PLAN.md — Gap closure (UAT test 3): loss-gate refusal hint = LOSS_GATE_REFUSAL_REASON_PREFIX sentinel branch in CoreError::hint() (TTY-refusal pattern) + contract drift-guard pins
+- [ ] 11-08-PLAN.md — Gap closure (UAT test 4): xml_udt_type_definition fact text reworded to live truth (provider-root imports land definitions in _types_; refusal is folder-basePath-only) + README/STATE/captures dated corrections
 
 ### Phase 12: 12-tui-theming-degradation
 **Goal**: The cockpit looks right and stays readable on any terminal — named UX themes selected by config, graceful degradation across color capabilities, with tokenization discipline making the style layer maintainable.
