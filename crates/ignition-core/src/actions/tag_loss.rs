@@ -24,9 +24,13 @@ pub mod codes {
     pub const XML_EXPORT_EDITED_ONLY: &str = "xml_export_edited_only";
     /// XML parse ended early (truncated/malformed input) — partial report.
     pub const XML_PARSE_PARTIAL: &str = "xml_parse_partial";
-    /// File contains `type="UdtType"` definition(s): importTags refuses them
-    /// ("Udt definitions can only be imported in the UDT Definitions tab") —
-    /// the import lands nothing (11-01 probe 3, both rigs).
+    /// File contains `type="UdtType"` definition(s): they DO import via the CLI's
+    /// provider-root path, routed to `[provider]_types_/Name`; the verbatim
+    /// refusal ("Udt definitions can only be imported in the UDT Definitions
+    /// tab") is folder-basePath-only (11-01 probe 3) — unreachable via this
+    /// command. Fires unconditionally: the transfer is not lossless
+    /// (definition routing + cross-provider udtParentType / parameter-override
+    /// caveats — see the fact detail).
     pub const XML_UDT_TYPE_DEFINITION: &str = "xml_udt_type_definition";
     /// UNCONDITIONAL for non-empty CSV: the legacy format cannot carry alarm
     /// configurations — alarms never arrive on import (11-01 probe 5).
@@ -172,9 +176,16 @@ pub fn scan_xml(raw: &[u8]) -> XmlScan {
     if scan.types_seen.iter().any(|t| t == "UdtType") {
         scan.facts.push(LossFact {
             code: codes::XML_UDT_TYPE_DEFINITION,
-            detail: "file contains UDT type definition(s) (type=\"UdtType\") — importTags \
-                     refuses them (\"Udt definitions can only be imported in the UDT \
-                     Definitions tab\"), so the import lands nothing"
+            detail: "file contains UDT type definition(s) (type=\"UdtType\") — this import \
+                     DOES land them: provider-root imports route each definition to \
+                     [provider]_types_/Name regardless of its position in the file; the \
+                     gateway's refusal (\"Udt definitions can only be imported in the UDT \
+                     Definitions tab\") is a FOLDER-basePath behavior (11-01 capture) this \
+                     command cannot hit; real caveats: exported udtParentType is \
+                     provider-qualified so cross-provider imports keep pointing at the \
+                     SOURCE provider, and instance parameter overrides silently drop when \
+                     the referenced type is unresolvable in the target provider (8.3.3; \
+                     8.3.6 preserves)"
                 .to_string(),
         });
     }
@@ -437,7 +448,9 @@ mod tests {
         );
         assert!(has_fact(&scan.facts, codes::XML_EXPORT_EDITED_ONLY));
         // 11-01 capture decision: the scan must surface UdtType presence —
-        // importTags REFUSES type definitions and lands nothing.
+        // the transfer is not lossless (definitions route to _types_; the
+        // folder-basePath refusal of 11-01 probe 3 is unreachable via the
+        // CLI's provider-root import).
         assert!(has_fact(&scan.facts, codes::XML_UDT_TYPE_DEFINITION));
     }
 

@@ -2546,9 +2546,9 @@ async fn live_tags_loss_gate_refusal() {
 
     // The loss-bearing fixture: gateway-shaped (MinVersion root attr
     // → xml_export_edited_only), carries a UdtType definition
-    // (→ xml_udt_type_definition — importTags refuses those
-    // outright, the captured verbatim refusal) and a CompoundProperty
-    // alarms block.
+    // (→ xml_udt_type_definition — definitions DO land via the CLI's
+    // provider-root import, routed to _types_; the transfer is not
+    // lossless) and a CompoundProperty alarms block.
     let tmp = tempfile::tempdir().expect("tempdir");
     let fixture = tmp.path().join("lossy.xml");
     std::fs::write(
