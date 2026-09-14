@@ -19,6 +19,19 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Phase 12 tokenization-first discipline: Color:: literals live ONLY
+      # in the style-tokens module (ui/theme.rs). Also catches the import
+      # and alias forms that could smuggle usage past a bare-Color:: grep.
+      - name: style tokens only (Color:: confined to ui/theme.rs)
+        run: |
+          offenders=$(grep -rn -e 'Color::' -e 'style::Color' -e 'Color as' crates/ \
+            --include='*.rs' \
+            | grep -v 'src/ui/theme.rs' || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::Color:: outside ui/theme.rs — add a slot instead:"
+            echo "$offenders"
+            exit 1
+          fi
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace

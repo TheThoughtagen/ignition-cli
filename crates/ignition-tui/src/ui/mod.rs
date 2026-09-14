@@ -78,22 +78,27 @@ pub fn render(state: &AppState, frame: &mut Frame) {
     }
 }
 
-/// The tab bar: every screen, active tab bolded.
+/// The tab bar: every screen, the ACTIVE one selected — highlighted
+/// via `Tabs::select` + a token style (09-UAT Gap 2 fix: BOLD-only
+/// left the active tab visually ambiguous). Emphasis carries only the
+/// color; BOLD composes INLINE at the call site (modifiers are not
+/// colors, research doctrine). At the mono tier fg is Reset but BOLD
+/// survives — the active tab stays visible on ANY terminal.
 fn render_tab_bar(state: &AppState, frame: &mut Frame, area: ratatui::layout::Rect) {
     let titles: Vec<Line> = Screen::ALL
         .iter()
-        .map(|screen| {
-            Line::from(if *screen == state.screen {
-                Span::styled(
-                    screen.title().to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw(screen.title().to_string())
-            })
-        })
+        .map(|screen| Line::from(screen.title().to_string()))
         .collect();
-    frame.render_widget(Tabs::new(titles), area);
+    let active = Screen::ALL
+        .iter()
+        .position(|screen| *screen == state.screen)
+        .unwrap_or(0);
+    let tabs = Tabs::new(titles).select(active).highlight_style(
+        Style::default()
+            .fg(state.palette.emphasis)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(tabs, area);
 }
 
 /// Greedy wrapped-row estimate for `text` at `max_width` content
@@ -461,6 +466,43 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD),
             "inactive tab (Dashboard) must not be bold"
+        );
+    }
+
+    /// The active tab's highlight is TOKEN-driven (09-UAT Gap 2, 12-03):
+    /// with an explicit dark @ C16 palette the selected title renders
+    /// BOLD with fg from the palette's EMPHASIS slot, and the inactive
+    /// titles carry an EMPTY modifier — selection lives in the widget's
+    /// highlight_style, not in per-title span styles.
+    #[test]
+    fn active_tab_highlights_via_the_palette_tokens() {
+        let mut state = AppState::new();
+        state.screen = Screen::Logs;
+        state.palette = crate::ui::theme::Theme::by_name("dark")
+            .unwrap()
+            .resolve(crate::ui::theme::Tier::C16);
+        let p = state.palette;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal.draw(|frame| render(&state, frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        // "Logs" starts after " Dashboard │ " = 13 cells.
+        let logs_cell = &buffer[(13, 0)];
+        assert!(
+            logs_cell.modifier.contains(ratatui::style::Modifier::BOLD),
+            "active tab (Logs) must be bold"
+        );
+        assert_eq!(
+            logs_cell.fg, p.emphasis,
+            "active tab fg renders from the palette's emphasis slot"
+        );
+
+        // "Dashboard" (inactive now) at x=1 is completely unstyled.
+        let dashboard_cell = &buffer[(1, 0)];
+        assert_eq!(
+            dashboard_cell.modifier,
+            ratatui::style::Modifier::empty(),
+            "inactive tab must carry an empty modifier"
         );
     }
 

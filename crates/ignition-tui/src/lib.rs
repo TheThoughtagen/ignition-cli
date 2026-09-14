@@ -64,6 +64,12 @@ pub async fn run(profile_flag: Option<String>) -> Result<(), CoreError> {
     let ctx = context::resolve(profile_flag.as_deref())?;
 
     let mut terminal = ratatui::init();
+    // The cursor must never park on the tab bar reading as a stuck
+    // highlight (09-UAT Gap 2): hide it for the cockpit's lifetime.
+    // Best-effort chrome — a failed hide (unsupported terminal) must
+    // not kill the cockpit, and the restore path below (plus init's
+    // panic hook) re-shows the cursor either way.
+    let _ = terminal.hide_cursor();
     let app_result = run_loop(&mut terminal, ctx).await;
     ratatui::restore();
     app_result

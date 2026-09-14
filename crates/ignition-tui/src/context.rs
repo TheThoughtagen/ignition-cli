@@ -220,7 +220,6 @@ mod tests {
     use crate::ui::theme::{Theme, Tier};
     use ignition_core::config::{self, AuthRef, Config, Profile};
     use ignition_core::error::CoreError;
-    use ratatui::style::Color;
 
     use std::path::PathBuf;
     use std::time::Duration;
@@ -554,27 +553,20 @@ poll_interval_secs = 5
     // detected tier → palette), including the lenient-degradation
     // shapes the load already guarantees for `[ui]`.
 
-    /// The all-Reset mono pin, slot by slot — shared by the mono-theme
-    /// fixture test (tier-INDEPENDENT: the mono theme is authored
-    /// all-Reset at every tier, so this holds against ANY ambient
-    /// COLORTERM/TERM).
+    /// The all-Reset mono pin — shared by the mono-theme fixture test
+    /// (tier-INDEPENDENT: the mono theme is authored all-Reset at every
+    /// tier, so this holds against ANY ambient COLORTERM/TERM).
+    /// Equality against the mono-AUTHORED palette (12-03) pins every
+    /// slot without naming a literal — the CI tokenization gate
+    /// forbids that outside theme.rs.
     fn assert_all_reset(palette: crate::ui::theme::Palette, context: &str) {
-        for (slot, name) in [
-            (palette.text, "text"),
-            (palette.muted, "muted"),
-            (palette.emphasis, "emphasis"),
-            (palette.border, "border"),
-            (palette.title, "title"),
-            (palette.header, "header"),
-            (palette.selection_bg, "selection_bg"),
-            (palette.indicator, "indicator"),
-            (palette.error, "error"),
-            (palette.warning, "warning"),
-            (palette.success, "success"),
-            (palette.accent, "accent"),
-        ] {
-            assert_eq!(slot, Color::Reset, "{context}: slot `{name}` must be Reset");
-        }
+        let mono = Theme::by_name("mono")
+            .unwrap_or_else(|| panic!("mono is a registered theme"))
+            .mono;
+        assert_eq!(
+            palette, mono,
+            "{context}: every slot must be Reset (the mono-authored palette)"
+        );
     }
 
     /// A known theme name resolves to EXACTLY the theme's authored

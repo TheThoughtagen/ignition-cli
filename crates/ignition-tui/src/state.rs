@@ -1513,35 +1513,23 @@ mod tests {
     }
 
     /// The pre-resolve default palette is the STRICTEST tier (12-02):
-    /// every slot is `Color::Reset` — construction never reads env
-    /// (COLORTERM/TERM are run_loop's business, via the resolved
-    /// context). Pinning each named slot individually keeps the test
-    /// honest if `Palette` ever grows a field.
+    /// every slot Reset — construction never reads env (COLORTERM/TERM
+    /// are run_loop's business, via the resolved context). Equality
+    /// against the mono-AUTHORED palette (12-03) pins every slot — and
+    /// auto-covers any future `Palette` field — without naming a
+    /// literal: the CI tokenization gate forbids that outside theme.rs.
     #[test]
     fn app_state_default_palette_is_mono_reset() {
         use super::AppState;
-        use ratatui::style::Color;
+        use crate::ui::theme::Theme;
 
-        let palette = AppState::new().palette;
-        for (slot, name) in [
-            (palette.text, "text"),
-            (palette.muted, "muted"),
-            (palette.emphasis, "emphasis"),
-            (palette.border, "border"),
-            (palette.title, "title"),
-            (palette.header, "header"),
-            (palette.selection_bg, "selection_bg"),
-            (palette.indicator, "indicator"),
-            (palette.error, "error"),
-            (palette.warning, "warning"),
-            (palette.success, "success"),
-            (palette.accent, "accent"),
-        ] {
-            assert_eq!(
-                slot,
-                Color::Reset,
-                "default AppState slot `{name}` must be Reset (Mono tier)"
-            );
-        }
+        let mono = Theme::by_name("mono")
+            .unwrap_or_else(|| panic!("mono is a registered theme"))
+            .mono;
+        assert_eq!(
+            AppState::new().palette,
+            mono,
+            "default AppState palette must be the all-Reset mono-authored palette"
+        );
     }
 }
