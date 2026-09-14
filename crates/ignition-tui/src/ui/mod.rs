@@ -12,6 +12,7 @@ pub mod profiles;
 pub mod projects;
 pub mod rig;
 pub mod tags;
+pub mod theme;
 
 use ratatui::Frame;
 use ratatui::layout::Constraint::{Length, Min, Ratio};
