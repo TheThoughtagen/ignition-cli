@@ -11,11 +11,13 @@
 use ratatui::Frame;
 use ratatui::layout::Constraint::{Length, Min};
 use ratatui::layout::{Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::state::{AppState, LOG_RING_CAP};
+
+use super::theme;
 
 /// Render the logs body: the stream pane + the one-row status line.
 pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
@@ -25,11 +27,18 @@ pub fn render(state: &AppState, frame: &mut Frame, area: Rect) {
 }
 
 /// One retained entry as a display line: `LEVEL time logger message`,
-/// level color-coded. The level span carries the color; the rest stays
-/// default so long messages never inherit a shouty hue.
-fn log_line(entry: &ignition_core::client::logs::LogEntry) -> Line<'static> {
+/// level color-coded through the palette. The level span carries the
+/// color; the rest stays default so long messages never inherit a
+/// shouty hue.
+fn log_line(
+    entry: &ignition_core::client::logs::LogEntry,
+    palette: &theme::Palette,
+) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{:>5}", entry.level), level_style(&entry.level)),
+        Span::styled(
+            format!("{:>5}", entry.level),
+            level_style(&entry.level, palette),
+        ),
         Span::raw(" "),
         Span::raw(time_of_day(entry.timestamp)),
         Span::raw(" "),
@@ -39,12 +48,15 @@ fn log_line(entry: &ignition_core::client::logs::LogEntry) -> Line<'static> {
     ])
 }
 
-/// Level → color (must-have: ERROR red, WARN yellow, INFO default,
-/// DEBUG dim; FATAL joins ERROR, TRACE joins DEBUG).
-fn level_style(level: &str) -> Style {
+/// Level → style (must-have: ERROR themed, WARN themed, INFO default,
+/// DEBUG dim; FATAL joins ERROR, TRACE joins DEBUG). Error rides
+/// [`theme::error`] — at the mono tier it shouts by WEIGHT (BOLD),
+/// never by hue; WARN stays plain fg (advisory by design); the
+/// DEBUG/TRACE DIM is capability-universal and stays inline.
+fn level_style(level: &str, palette: &theme::Palette) -> Style {
     match level {
-        "ERROR" | "FATAL" => Style::default().fg(Color::Red),
-        "WARN" => Style::default().fg(Color::Yellow),
+        "ERROR" | "FATAL" => theme::error(palette),
+        "WARN" => theme::warning(palette),
         "DEBUG" | "TRACE" => Style::default().add_modifier(Modifier::DIM),
         _ => Style::default(),
     }
@@ -88,7 +100,7 @@ fn render_stream(state: &AppState, frame: &mut Frame, area: Rect) {
     let start = end.saturating_sub(inner.height as usize);
     let lines: Vec<Line> = filtered[start..end]
         .iter()
-        .map(|entry| log_line(entry))
+        .map(|entry| log_line(entry, &state.palette))
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -118,6 +130,7 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     use super::render;
     use crate::state::{AppState, LOG_RING_CAP, LogLevelFilter, LogsData};
@@ -192,11 +205,17 @@ mod tests {
         assert_eq!(super::time_of_day(86_400_999), "00:00:00.999");
     }
 
-    /// Level colors: ERROR red, WARN yellow, DEBUG dim, INFO default —
-    /// asserted at the buffer-cell style level.
+    /// Level colors: ERROR from the palette's error slot, WARN from
+    /// the warning slot, DEBUG dim, INFO default — asserted at the
+    /// buffer-cell level against SLOTS (12-03: never a Color literal —
+    /// the CI tokenization gate forbids it outside theme.rs).
     #[test]
     fn level_colors_are_coded() {
         let mut state = AppState::new();
+        state.palette = crate::ui::theme::Theme::by_name("dark")
+            .unwrap()
+            .resolve(crate::ui::theme::Tier::C16);
+        let p = state.palette;
         state.logs.push_line(entry(1, "ERROR", "e"));
         state.logs.push_line(entry(2, "WARN", "w"));
         state.logs.push_line(entry(3, "DEBUG", "d"));
@@ -206,37 +225,65 @@ mod tests {
             .expect("draw");
         let buffer = terminal.backend().buffer();
 
-        // Find each level token's row; read the color at the FIRST
+        // Find each level token's row; read the CELL at the FIRST
         // character of the level string (inside the styled span — the
         // span includes the right-align pad, so index at the token
         // start itself, not past it).
-        let mut colors = std::collections::HashMap::new();
+        let mut cells = std::collections::HashMap::new();
         for y in 0..buffer.area.height {
             let row: String = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol().to_string())
                 .collect();
             for token in ["ERROR", "WARN", "DEBUG"] {
                 if let Some(at) = row.find(token) {
-                    colors.insert(token.to_string(), buffer[(at as u16, y)].fg);
+                    cells.insert(token.to_string(), buffer[(at as u16, y)].clone());
                 }
             }
         }
+        let error_cell = cells.get("ERROR").expect("ERROR line present");
+        assert_eq!(error_cell.fg, p.error, "ERROR renders from the error slot");
+        let warn_cell = cells.get("WARN").expect("WARN line present");
         assert_eq!(
-            colors.get("ERROR"),
-            Some(&ratatui::style::Color::Red),
-            "ERROR is red: {colors:?}"
+            warn_cell.fg, p.warning,
+            "WARN renders from the warning slot"
         );
-        assert_eq!(
-            colors.get("WARN"),
-            Some(&ratatui::style::Color::Yellow),
-            "WARN is yellow: {colors:?}"
-        );
-        let debug_cell_fg = *colors.get("DEBUG").expect("DEBUG line present");
+        let debug_cell_fg = cells.get("DEBUG").expect("DEBUG line present").fg;
         assert_ne!(
-            debug_cell_fg,
-            ratatui::style::Color::Red,
-            "DEBUG not red; dim is a modifier (asserting not-shouty)"
+            debug_cell_fg, p.error,
+            "DEBUG not error-shouty; dim is a modifier (asserting not-shouty)"
         );
+    }
+
+    /// Mono tier: the ERROR level stays visible WITHOUT hue — the
+    /// theme::error adaptation renders it BOLD (errors shout by
+    /// weight, never by color). The render-site half of 12-03's
+    /// mono-contract proof.
+    #[test]
+    fn error_level_stays_visible_on_mono_via_bold() {
+        let mut state = AppState::new();
+        state.palette = crate::ui::theme::Theme::by_name("mono")
+            .unwrap()
+            .resolve(crate::ui::theme::Tier::Mono);
+        state.logs.push_line(entry(1, "ERROR", "e"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| render(&state, frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(at) = row.find("ERROR") {
+                assert!(
+                    buffer[(at as u16, y)].modifier.contains(Modifier::BOLD),
+                    "mono-tier ERROR renders BOLD: {row:?}"
+                );
+                return;
+            }
+        }
+        panic!("ERROR line rendered nowhere");
     }
 
     /// The render-side filter: with filter=Warn, only WARN+ entries
