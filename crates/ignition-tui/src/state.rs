@@ -1322,6 +1322,11 @@ pub struct AppState {
     /// default. Read by `spawn_refresh` at every (re)spawn — the
     /// profile switch adopts the NEW profile's value before re-spawning.
     pub poll_interval: Duration,
+    /// The resolved theme palette (TUIX-03/04): `[ui].theme` at the
+    /// detected capability tier. Defaults to the default theme at the
+    /// MONO tier — deterministic, no env reads at construction;
+    /// run_loop overwrites with the real detection.
+    pub palette: crate::ui::theme::Palette,
     /// The AppEvent rail — a clone of the loop's sender, so update can
     /// arm workers (spawn helpers take their copy from here).
     pub events_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -1354,7 +1359,10 @@ impl Default for AppState {
     /// MANUAL Default (not derive): `poll_interval` must default to the
     /// 5 s REFRESH_PERIOD, never `Duration::ZERO` — derive would give
     /// zero, and `tokio::time::interval(0)` panics inside the spawned
-    /// worker. Every other field keeps its derived default.
+    /// worker. `palette` likewise defaults DETERMINISTICALLY (default
+    /// theme at the strictest [`Tier::Mono`], no env reads at
+    /// construction — run_loop overwrites with real detection). Every
+    /// other field keeps its derived default.
     fn default() -> Self {
         Self {
             should_quit: false,
@@ -1365,6 +1373,9 @@ impl Default for AppState {
             client: None,
             profile_url: None,
             poll_interval: crate::workers::refresh::REFRESH_PERIOD,
+            palette: crate::ui::theme::Theme::by_name("default")
+                .expect("default theme exists")
+                .resolve(crate::ui::theme::Tier::default()),
             events_tx: None,
             refresh_shutdown: None,
             dashboard: DashboardData::default(),

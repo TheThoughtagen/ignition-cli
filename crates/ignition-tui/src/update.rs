@@ -596,6 +596,10 @@ fn switch_profile(state: &mut AppState, name: &str) {
     // spawn_refresh reads it — miss this assignment and the dashboard
     // silently keeps the OLD profile's interval after every switch.
     state.poll_interval = ctx.poll_interval;
+    // Theme rides the same adoption (12-02): global config, so the
+    // value is normally identical — but rebuild() re-resolved it, and
+    // uniform adoption closes the silent-drop trap class.
+    state.palette = ctx.palette;
     state.profile = Some(ctx.profile_name.clone());
     state.dashboard = crate::state::DashboardData::default();
     state.logs = crate::state::LogsData::default();

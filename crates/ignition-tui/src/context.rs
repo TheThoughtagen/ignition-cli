@@ -30,7 +30,25 @@ use ignition_core::config;
 use ignition_core::error::CoreError;
 use ignition_core::session::Session;
 
+use crate::ui::theme::{Palette, Theme, Tier, detect_tier};
 use crate::workers::refresh::REFRESH_PERIOD;
+
+/// Resolve `[ui].theme` to a Palette at `tier`. Unknown names WARN and
+/// fall back to the default theme — the lenient-degradation contract
+/// (Phase 8: a typo in a NEW key must never fail the load), decided at
+/// TUI-resolution time where `load_for_tui` already degrades new-schema
+/// surface. Pure over `(name, tier)`: tests pin it at fixed tiers,
+/// [`build_context`] supplies the real detected tier.
+fn resolve_palette(name: Option<&str>, tier: Tier) -> Palette {
+    let theme = Theme::by_name(name.unwrap_or("default")).unwrap_or_else(|| {
+        tracing::warn!(
+            theme = name.unwrap_or(""),
+            "unknown [ui].theme — using default theme"
+        );
+        Theme::by_name("default").expect("default theme exists")
+    });
+    theme.resolve(tier)
+}
 
 /// The cockpit's opening context: everything resolution knows about the
 /// selected world, carried as ONE value so callers adopt the pieces in
@@ -48,6 +66,10 @@ pub struct ResolvedContext {
     /// default when absent or degraded. THE single source the refresh
     /// worker reads via `AppState.poll_interval`.
     pub poll_interval: Duration,
+    /// The resolved theme palette — `[ui].theme` at the detected
+    /// capability tier; adopted by run_loop and the profile switch like
+    /// [`ResolvedContext::poll_interval`].
+    pub palette: Palette,
     /// The authed client handle (Session-constructed — the ONLY
     /// construction site the cockpit's world uses).
     pub api: Arc<ReqwestGatewayApi>,
@@ -94,10 +116,16 @@ fn build_context(profile_flag: Option<&str>) -> Result<ResolvedContext, CoreErro
             .poll_interval_secs
             .unwrap_or(REFRESH_PERIOD.as_secs()),
     );
+    // Theme tier detection is the ONLY real-environment call in the
+    // module — injected as an env snapshot so the pure `resolve_palette`
+    // stays fixed-tier testable.
+    let tier = detect_tier(&|k| std::env::var(k).ok());
+    let palette = resolve_palette(config.ui.theme.as_deref(), tier);
     Ok(ResolvedContext {
         profile_name: session.profile_name().to_string(),
         profile_url: profile.url.to_string(),
         poll_interval,
+        palette,
         api: session.api_handle(),
     })
 }

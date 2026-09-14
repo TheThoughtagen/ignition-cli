@@ -86,6 +86,7 @@ async fn run_loop(
     state.profile = Some(ctx.profile_name);
     state.profile_url = Some(ctx.profile_url);
     state.poll_interval = ctx.poll_interval;
+    state.palette = ctx.palette;
     state.events_tx = Some(events_tx.clone());
     workers::refresh::spawn_refresh(&mut state);
 

@@ -20,6 +20,9 @@ futures-util = { workspace = true }
 # spawn_action's one-shot result serialization (pretty JSON to the
 # result modal — the LOCKED one-mechanism display); both already in the
 # workspace graph
+# 12-02: the unknown-[ui].theme warn + default fallback rides tracing
+# (workspace graph — core and bin already carry it)
+tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -33,6 +36,6 @@ wiremock = { workspace = true }
 # fixture payloads for client-model test constructors (workspace graph)
 serde_json = { workspace = true }
 # implementing the ComposeRunner seam for the rig-stream worker test
-# (the trait is #[async_trait] — implementors need the macro; already
-# in the workspace graph)
+# (the trait is #[async_trait] — implementors need the macro; already in the
+# workspace graph)
 async-trait = { workspace = true }
