@@ -7,7 +7,7 @@
 use ratatui::Frame;
 use ratatui::layout::Constraint::{Length, Min, Ratio};
 use ratatui::layout::{Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Row, Table};
 
@@ -41,7 +41,10 @@ fn render_status(
     frame: &mut Frame,
     area: Rect,
 ) {
-    let block = Block::bordered().title("status");
+    let block = Block::bordered()
+        .title("status")
+        .border_style(theme::border(palette))
+        .title_style(theme::title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -104,7 +107,10 @@ fn render_modules(
     frame: &mut Frame,
     area: Rect,
 ) {
-    let block = Block::bordered().title("modules");
+    let block = Block::bordered()
+        .title("modules")
+        .border_style(theme::border(palette))
+        .title_style(theme::title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -142,7 +148,10 @@ fn render_metrics(
     frame: &mut Frame,
     area: Rect,
 ) {
-    let block = Block::bordered().title("metrics");
+    let block = Block::bordered()
+        .title("metrics")
+        .border_style(theme::border(palette))
+        .title_style(theme::title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -171,7 +180,10 @@ fn render_metrics(
 /// The sessions panel: selectable id / type / user table (the terminate
 /// target — Task 2 wires `t`/Enter to the confirm modal).
 fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("sessions");
+    let block = Block::bordered()
+        .title("sessions")
+        .border_style(theme::border(&state.palette))
+        .title_style(theme::title(&state.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -212,7 +224,7 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
             )
             .header(
                 Row::new(vec!["id", "type", "user"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                    .style(theme::header(&state.palette).add_modifier(Modifier::BOLD)),
             )
             .row_highlight_style(theme::selection(&state.palette))
             .highlight_symbol("▸ ");
@@ -231,11 +243,10 @@ fn render_sessions(state: &AppState, snapshot: Option<&Snapshot>, frame: &mut Fr
 /// ("running: wait gateway") — long waits never block input, the label
 /// is the only footprint.
 fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
-    let profile = state
+    let profile_name = state
         .banner
         .clone()
         .or_else(|| state.profile.clone())
-        .map(|name| format!("profile: {name} · "))
         .unwrap_or_default();
     let freshness = match state.dashboard.last_refresh {
         None => "refresh: pending".to_string(),
@@ -251,10 +262,22 @@ fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
         .in_flight
         .map(|label| format!(" · running: {label}"))
         .unwrap_or_default();
-    let text = format!(
-        "{profile}{freshness}{busy}{in_flight} · p profiles · a actions · r refresh · t terminate"
-    );
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    let tail =
+        format!("{freshness}{busy}{in_flight} · p profiles · a actions · r refresh · t terminate");
+    // The profile NAME rides the palette's accent slot (12-04 UAT
+    // tuning: the slot existed but nothing consumed it — the status
+    // line was default-styled in every theme). Default/mono keep the
+    // exact look: their accent slot is Reset = default fg.
+    let line = if profile_name.is_empty() {
+        Line::from(tail)
+    } else {
+        Line::from(vec![
+            Span::raw("profile: "),
+            Span::styled(profile_name, theme::accent(&state.palette)),
+            Span::raw(format!(" · {tail}")),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// A panel's tri-state, projected out of the snapshot (RESEARCH

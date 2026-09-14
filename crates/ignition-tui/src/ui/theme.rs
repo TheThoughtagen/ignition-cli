@@ -28,6 +28,9 @@
 //! EXPECTED to be tuned after UAT. Tests deliberately never pin literal
 //! hues — they pin structural contracts only: palette-slot equality,
 //! registry behavior, tier containment, and the all-Reset mono rule.
+//! (That reservation was exercised on 2026-09-14: UAT found the first
+//! `dark`/`light` hues too conservative to tell apart from `default`,
+//! and the palettes were hardened without touching a single test.)
 //!
 //! # Mono adaptation is centralized here
 //!
@@ -201,19 +204,22 @@ const MONO: Theme = Theme {
     mono: all_reset(),
 };
 
-/// `dark` — the full color cockpit for dark-background terminals. The
-/// showcase palette; hues are conservative ANSI-family at the c16 tier
-/// so the 16-color fallback stays readable, and ARE ADJUSTABLE POST-UAT
-/// (tests pin structure, not hues).
+/// `dark` — the full color cockpit for dark-background terminals. Hues
+/// HARDENED after the 2026-09-14 UAT pass (the first hues were so
+/// conservative the theme was indistinguishable from `default` at a
+/// glance): border/title/header/emphasis now carry the `accent` blue so
+/// the theme reads as a different cockpit immediately; the c16 tier
+/// keeps the readable ANSI families (Blue/LightBlue). Hues remain
+/// planner-discretion — tests pin structure, not hues.
 const DARK: Theme = Theme {
     name: "dark",
     truecolor: Palette {
         text: Color::Rgb(220, 223, 228),
         muted: Color::Rgb(127, 140, 141),
-        emphasis: Color::Rgb(244, 246, 248),
-        border: Color::Rgb(90, 98, 110),
-        title: Color::Rgb(244, 246, 248),
-        header: Color::Rgb(244, 246, 248),
+        emphasis: Color::Rgb(120, 200, 255),
+        border: Color::Rgb(52, 152, 219),
+        title: Color::Rgb(120, 200, 255),
+        header: Color::Rgb(120, 200, 255),
         selection_bg: Color::Rgb(60, 64, 72),
         indicator: Color::Rgb(52, 152, 219),
         error: Color::Rgb(231, 76, 60),
@@ -224,10 +230,10 @@ const DARK: Theme = Theme {
     c256: Palette {
         text: Color::Indexed(253),
         muted: Color::Indexed(244),
-        emphasis: Color::Indexed(255),
-        border: Color::Indexed(60),
-        title: Color::Indexed(255),
-        header: Color::Indexed(255),
+        emphasis: Color::Indexed(117),
+        border: Color::Indexed(69),
+        title: Color::Indexed(117),
+        header: Color::Indexed(117),
         selection_bg: Color::Indexed(238),
         indicator: Color::Indexed(75),
         error: Color::Indexed(203),
@@ -238,12 +244,12 @@ const DARK: Theme = Theme {
     c16: Palette {
         text: Color::White,
         muted: Color::DarkGray,
-        emphasis: Color::White,
-        border: Color::Gray,
-        title: Color::White,
-        header: Color::White,
+        emphasis: Color::LightBlue,
+        border: Color::Blue,
+        title: Color::LightBlue,
+        header: Color::LightBlue,
         selection_bg: Color::DarkGray,
-        indicator: Color::White,
+        indicator: Color::Blue,
         error: Color::Red,
         warning: Color::Yellow,
         success: Color::Green,
@@ -256,7 +262,14 @@ const DARK: Theme = Theme {
 /// assumptions (Pitfall 4). Warning rides ratatui's `Yellow` (SGR brown,
 /// SGR 33 — readable on white; never the `Light*` variants per RESEARCH
 /// Pitfall 2). The truecolor tier darkens warning/accent with `Rgb` for
-/// contrast on white; c256 mirrors via `Indexed`.
+/// contrast on white; c256 mirrors via `Indexed`. UAT-TUNED 2026-09-14:
+/// `selection_bg` is a LIGHT gray (truecolor `Rgb`, c256 `Indexed(252)`)
+/// so black text stays readable on the fill — and, deliberately, the
+/// black-text + light-fill pairing is visible structure on a DARK
+/// terminal too, so a mis-configured light theme degrades to "obviously
+/// inverted", never "invisible". c256 `accent` matches the truecolor
+/// blue family (`Indexed(26)`, not the green `Indexed(40)` the first
+/// draft carried — that fought the theme's blue identity).
 const LIGHT: Theme = Theme {
     name: "light",
     truecolor: Palette {
@@ -266,7 +279,7 @@ const LIGHT: Theme = Theme {
         border: Color::Black,
         title: Color::Black,
         header: Color::Black,
-        selection_bg: Color::Gray,
+        selection_bg: Color::Rgb(208, 214, 220),
         indicator: Color::Blue,
         error: Color::Red,
         warning: Color::Rgb(176, 128, 0),
@@ -280,12 +293,12 @@ const LIGHT: Theme = Theme {
         border: Color::Black,
         title: Color::Black,
         header: Color::Black,
-        selection_bg: Color::Gray,
+        selection_bg: Color::Indexed(252),
         indicator: Color::Blue,
         error: Color::Red,
         warning: Color::Indexed(136),
         success: Color::Green,
-        accent: Color::Indexed(40),
+        accent: Color::Indexed(26),
     },
     c16: Palette {
         text: Color::Black,
