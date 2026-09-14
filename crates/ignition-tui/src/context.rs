@@ -216,9 +216,11 @@ pub fn rig_token_only() -> Result<String, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rebuild, resolve};
+    use super::{detect_tier, rebuild, resolve, resolve_palette};
+    use crate::ui::theme::{Theme, Tier};
     use ignition_core::config::{self, AuthRef, Config, Profile};
     use ignition_core::error::CoreError;
+    use ratatui::style::Color;
 
     use std::path::PathBuf;
     use std::time::Duration;
@@ -540,6 +542,184 @@ poll_interval_secs = 5
         };
         assert!(matches!(err, CoreError::ConfigInvalid { .. }));
         assert_eq!(err.exit_code(), 3);
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
+    }
+
+    // ---- Theme resolution (12-02) ----
+    //
+    // Two levels, both pinned: the PURE helper `resolve_palette` at
+    // fixed tiers (no env dependence — fallback + by_name plumbing) and
+    // the full `resolve` integration through `build_context` (config →
+    // detected tier → palette), including the lenient-degradation
+    // shapes the load already guarantees for `[ui]`.
+
+    /// The all-Reset mono pin, slot by slot — shared by the mono-theme
+    /// fixture test (tier-INDEPENDENT: the mono theme is authored
+    /// all-Reset at every tier, so this holds against ANY ambient
+    /// COLORTERM/TERM).
+    fn assert_all_reset(palette: crate::ui::theme::Palette, context: &str) {
+        for (slot, name) in [
+            (palette.text, "text"),
+            (palette.muted, "muted"),
+            (palette.emphasis, "emphasis"),
+            (palette.border, "border"),
+            (palette.title, "title"),
+            (palette.header, "header"),
+            (palette.selection_bg, "selection_bg"),
+            (palette.indicator, "indicator"),
+            (palette.error, "error"),
+            (palette.warning, "warning"),
+            (palette.success, "success"),
+            (palette.accent, "accent"),
+        ] {
+            assert_eq!(slot, Color::Reset, "{context}: slot `{name}` must be Reset");
+        }
+    }
+
+    /// A known theme name resolves to EXACTLY the theme's authored
+    /// palette at the given tier — pure plumbing, no env involved.
+    #[test]
+    fn resolve_palette_known_name_fixed_tier() {
+        for (name, tier) in [
+            ("dark", Tier::C16),
+            ("light", Tier::Truecolor),
+            ("default", Tier::C256),
+            ("mono", Tier::Mono),
+        ] {
+            let expected = Theme::by_name(name)
+                .unwrap_or_else(|| panic!("{name} is a registered theme"))
+                .resolve(tier);
+            assert_eq!(
+                resolve_palette(Some(name), tier),
+                expected,
+                "known name `{name}` must resolve to its authored palette at the tier"
+            );
+        }
+    }
+
+    /// An unknown name falls back to the default theme at the SAME
+    /// tier — identical to the `None` path (the warn rides the
+    /// fallback, it does not change the outcome).
+    #[test]
+    fn resolve_palette_unknown_name_falls_back_to_default() {
+        let fallback = resolve_palette(None, Tier::Mono);
+        assert_eq!(
+            resolve_palette(Some("banana"), Tier::Mono),
+            fallback,
+            "an unknown name takes exactly the None path"
+        );
+        assert_eq!(
+            fallback,
+            Theme::by_name("default")
+                .expect("default theme exists")
+                .resolve(Tier::Mono),
+            "the fallback IS the default theme at the same tier"
+        );
+    }
+
+    /// `None` (no `[ui].theme`, or degraded away by lenient_ui) is the
+    /// default theme — here at C256.
+    #[test]
+    fn resolve_palette_none_is_default() {
+        assert_eq!(
+            resolve_palette(None, Tier::C256),
+            Theme::by_name("default")
+                .expect("default theme exists")
+                .resolve(Tier::C256),
+        );
+    }
+
+    /// `[ui] theme = "mono"` flows config → build_context → palette.
+    /// TIER-INDEPENDENT by design (12-01 authored mono all-Reset at
+    /// every tier): the assertion holds under whatever COLORTERM/TERM
+    /// the CI or dev shell happens to carry — no ambient-env coupling.
+    #[test]
+    fn resolve_carries_configured_mono_theme_tier_independently() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[ui]
+theme = "mono"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let ctx = resolve(None).expect("the mono theme resolves");
+        assert_all_reset(ctx.palette, "theme = mono at the detected tier");
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
+    }
+
+    /// `theme = "banana"` (unknown name): `resolve` SUCCEEDS and the
+    /// palette equals the fallback computed in-process under the SAME
+    /// ambient env — proving the fallback actually flowed through
+    /// build_context (helper-only evidence would not cover the wiring).
+    #[test]
+    fn resolve_degrades_unknown_theme_to_default_at_detected_tier() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[ui]
+theme = "banana"
+
+[profiles.dev]
+url = "http://localhost:9088/"
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let ctx = resolve(None).expect("an unknown theme name must warn-and-fallback, not fail");
+        let expected = resolve_palette(None, detect_tier(&|k| std::env::var(k).ok()));
+        assert_eq!(
+            ctx.palette, expected,
+            "the unknown name fell back to the default at the detected tier"
+        );
+
+        teardown(&["IGNITION_TOKEN".to_string()]);
+    }
+
+    /// `theme = 42` (wrong-TYPED): the existing `lenient_ui`
+    /// deserializer degrades the whole `[ui]` table to defaults —
+    /// `resolve` still succeeds and lands the default palette at the
+    /// detected tier (mirrors the `poll_interval_secs = "banana"`
+    /// degradation test).
+    #[test]
+    fn resolve_degrades_wrong_typed_theme_to_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        isolate_raw_config(
+            &dir,
+            r#"
+active = "dev"
+
+[ui]
+theme = 42
+
+[profiles.dev]
+url = "http://localhost:9088/"
+"#,
+        );
+        unsafe { std::env::set_var("IGNITION_TOKEN", "t") };
+
+        let ctx =
+            resolve(None).expect("a wrong-typed [ui].theme degrades via lenient_ui, not fails");
+        let expected = resolve_palette(None, detect_tier(&|k| std::env::var(k).ok()));
+        assert_eq!(
+            ctx.palette, expected,
+            "the degraded table lands the default palette at the detected tier"
+        );
 
         teardown(&["IGNITION_TOKEN".to_string()]);
     }

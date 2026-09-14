@@ -1511,4 +1511,37 @@ mod tests {
             .count();
         assert_eq!(changes, 2, "exactly two group boundaries");
     }
+
+    /// The pre-resolve default palette is the STRICTEST tier (12-02):
+    /// every slot is `Color::Reset` — construction never reads env
+    /// (COLORTERM/TERM are run_loop's business, via the resolved
+    /// context). Pinning each named slot individually keeps the test
+    /// honest if `Palette` ever grows a field.
+    #[test]
+    fn app_state_default_palette_is_mono_reset() {
+        use super::AppState;
+        use ratatui::style::Color;
+
+        let palette = AppState::new().palette;
+        for (slot, name) in [
+            (palette.text, "text"),
+            (palette.muted, "muted"),
+            (palette.emphasis, "emphasis"),
+            (palette.border, "border"),
+            (palette.title, "title"),
+            (palette.header, "header"),
+            (palette.selection_bg, "selection_bg"),
+            (palette.indicator, "indicator"),
+            (palette.error, "error"),
+            (palette.warning, "warning"),
+            (palette.success, "success"),
+            (palette.accent, "accent"),
+        ] {
+            assert_eq!(
+                slot,
+                Color::Reset,
+                "default AppState slot `{name}` must be Reset (Mono tier)"
+            );
+        }
+    }
 }
