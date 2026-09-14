@@ -2577,11 +2577,11 @@ fn emit_tag_row(tag: &serde_json::Value, out: &mut LegacyCsvWriter) -> Result<()
                     out.coerced.push(note);
                 }
             }
-            if let (Some(i), Some(dt)) = (
+            match (
                 idx_of("DataType"),
                 tag.get("dataType").and_then(serde_json::Value::as_str),
             ) {
-                match legacy_data_type(dt) {
+                (Some(i), Some(dt)) => match legacy_data_type(dt) {
                     Some(numeric) => row[i] = numeric.to_string(),
                     None => {
                         let note = format!(
@@ -2591,7 +2591,30 @@ fn emit_tag_row(tag: &serde_json::Value, out: &mut LegacyCsvWriter) -> Result<()
                             out.coerced.push(note);
                         }
                     }
+                },
+                // LIVE-TRUTH FIX (11-06 rig run, Rig A 8.3.6): an
+                // atomic row with a PRESENT-but-EMPTY DataType cell
+                // kills the import wholesale (all-or-nothing) —
+                // `Error on row N: For input string: ""` (the importer
+                // parseInts DataType for every atomic-class row). A
+                // MISSING DataType column imports clean and lands
+                // `dataType: "Int4"` — the sheet's own default
+                // materialization (live-proven on the same run). So a
+                // tag with NO explicit dataType fills the cell with
+                // Int4 (2): semantically identical to the no-column
+                // import, and REPORTED here.
+                (Some(i), None) => {
+                    row[i] = "2".to_string();
+                    let note = format!(
+                        "tag '{name}' carries no explicit dataType — DataType filled with Int4 \
+                         (2), the legacy sheet's default materialization (the importer refuses \
+                         an empty DataType cell on atomic rows, 11-06 live gate)"
+                    );
+                    if !out.coerced.iter().any(|c| c == &note) {
+                        out.coerced.push(note);
+                    }
                 }
+                (None, _) => {}
             }
         }
         None => {
@@ -4849,5 +4872,53 @@ mod tests {
         let err = browse_rows_from_export(empty.path(), true, None).expect_err("empty dir refuses");
         assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains("not a tag export layout"), "{err}");
+    }
+
+    /// THE 11-06 live-truth regression pin (Rig A 8.3.6): an atomic
+    /// row with a PRESENT-but-EMPTY DataType cell kills the import
+    /// wholesale (`Error on row N: For input string: ""`), so the
+    /// generator must NEVER emit an empty DataType cell for an
+    /// atomic-class row — a tag with no explicit dataType fills the
+    /// cell with Int4 (2), the importer's own default materialization
+    /// (live-proven: a missing DataType column lands `dataType:
+    /// "Int4"`), and REPORTS the fill.
+    #[test]
+    fn csv_generation_fills_absent_data_type_with_the_legacy_default() {
+        let subtrees = vec![serde_json::json!({
+            "name": "Folder", "tagType": "Folder",
+            "tags": [
+                // No dataType key at all (the TExpr shape).
+                {"name": "TExpr", "tagType": "AtomicTag",
+                 "valueSource": "expression", "expression": "1+1"},
+                // Explicit dataType still maps verbatim.
+                {"name": "TMem", "tagType": "AtomicTag",
+                 "dataType": "String", "value": "x"}
+            ]
+        })];
+        let report = super::generate_legacy_csv(&subtrees).expect("generator runs");
+        let text = String::from_utf8(report.csv).expect("utf8");
+        let expr_row = text
+            .lines()
+            .find(|line| line.contains(",TExpr,"))
+            .expect("TExpr row present");
+        // DataType is the 5th column; its cell must be `2`, not empty.
+        let cells: Vec<&str> = expr_row.split(',').collect();
+        assert_eq!(cells[4], "2", "absent dataType → Int4 (2): {expr_row}");
+        // The explicit mapping still rides its own enum.
+        let mem_row = text
+            .lines()
+            .find(|line| line.contains(",TMem,"))
+            .expect("TMem row present");
+        let cells: Vec<&str> = mem_row.split(',').collect();
+        assert_eq!(cells[4], "7", "String → 7: {mem_row}");
+        // The fill is REPORTED (advisory honesty).
+        assert!(
+            report
+                .coerced
+                .iter()
+                .any(|note: &String| note.contains("TExpr") && note.contains("Int4 (2)")),
+            "the fill is reported: {:?}",
+            report.coerced
+        );
     }
 }
