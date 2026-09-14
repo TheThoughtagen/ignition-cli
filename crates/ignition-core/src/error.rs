@@ -977,8 +977,7 @@ pub struct ErrorBody {
 mod tests {
     use super::{
         CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
-        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
-        truncate_api_body,
+        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX, truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
