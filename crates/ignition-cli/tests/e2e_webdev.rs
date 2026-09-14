@@ -754,6 +754,13 @@ async fn live_tags_config_export_import_roundtrip() {
                 "--compact",
             ],
         );
+        if out.status.code() == Some(6) {
+            // A collision refusal is itself LANDING EVIDENCE — the
+            // read-back raced the model, but the tag demonstrably
+            // exists (11-06 live truth: the read raced, the abort
+            // import then saw the existing T1).
+            break;
+        }
         expect_ok("import #1 (re-import)", &out);
     }
 
@@ -1247,7 +1254,12 @@ async fn live_tags_alarm_lifecycle() {
             r#"{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "alarms": [{"name": "HighLimit", "enabled": true, "mode": "AboveValue", "setpointA": 100, "priority": "High"}]}"#,
         );
         expect_ok("config create the alarmed tag", &out);
-        if await_tag_ready(&config, &env, &tag, std::time::Duration::from_secs(20)).await {
+        // 60s per cycle: the FIRST provider creation on a fresh
+        // 8.3.3 gateway initializes the tag-provider subsystem and
+        // can hold Error_Configuration past a 20s window (measured
+        // on the fresh-rig run — three 20s cycles all missed; a
+        // later attempt answers in seconds).
+        if await_tag_ready(&config, &env, &tag, std::time::Duration::from_secs(60)).await {
             break;
         }
         eprintln!("setup: tag model stuck Error_Configuration, tearing down and retrying…");
