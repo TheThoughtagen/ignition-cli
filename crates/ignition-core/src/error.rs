@@ -29,6 +29,18 @@ use serde::Serialize;
 /// [`CoreError::tui_tty_refusal`] so the reason/hint pair cannot drift.
 pub const TUI_TTY_REFUSAL_REASON: &str = "ign tui requires a terminal (stdout is not a TTY)";
 
+/// The TAGS-12 loss-gate refusal reason prefix (11-07 gap closure). The
+/// InvalidInput hint is content-addressed off this literal: the loss
+/// gate's reason is DYNAMIC prose (the CLI's `render_loss_prose` header
+/// `loss report ({label}): …` plus per-fact lines), so unlike
+/// [`TUI_TTY_REFUSAL_REASON`] the sentinel cannot be the whole reason —
+/// it is the stable header prefix instead. Same slug (`invalid_input`),
+/// same exit 2 (frozen taxonomy; only the hint differs) — the 06-07
+/// TTY-refusal pattern at one removal. The contract_tags loss-gate
+/// pins are the drift guard: if the prose header ever changes, the
+/// hint silently regresses to the generic default and those pins fail.
+pub const LOSS_GATE_REFUSAL_REASON_PREFIX: &str = "loss report (";
+
 /// The api-call catch-all's body cap (09-01): a gateway 4xx body rides
 /// [`CoreError::GatewayClientError`] VERBATIM up to this many bytes; a
 /// larger body is truncated at [`truncate_api_body`] with the explicit
@@ -653,6 +665,13 @@ impl CoreError {
                     // --file/stdin default is meaningless for a pipe.
                     "run `ign tui` in an interactive terminal (the cockpit \
                      needs a TTY on stdout — not a pipe or redirect)"
+                } else if reason.starts_with(LOSS_GATE_REFUSAL_REASON_PREFIX) {
+                    // The loss-gate refusal (11-07): the message above already names
+                    // every finding and ends with the actionable guidance — the hint
+                    // restates it for envelope readers instead of the file-read
+                    // default, which is meaningless here (the file WAS readable).
+                    "the loss report above names what this import would drop or \
+                     coerce — re-run with --yes to import anyway"
                 } else {
                     "fix the input source — a readable file path via --file, or `-` \
                      to pipe the content on stdin"
@@ -958,7 +977,8 @@ pub struct ErrorBody {
 mod tests {
     use super::{
         CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
-        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, truncate_api_body,
+        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
+        truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -1688,6 +1708,69 @@ mod tests {
         assert!(
             truncated
                 .is_char_boundary(truncated.len() - GATEWAY_CLIENT_BODY_TRUNCATION_MARKER.len())
+        );
+    }
+
+    /// The loss-gate hint override (11-07 gap closure): a reason with the
+    /// [`LOSS_GATE_REFUSAL_REASON_PREFIX`] sentinel carries the --yes
+    /// hint, while every OTHER InvalidInput reason (generic file-read)
+    /// and the TTY-refusal precedent keep their hints byte-identically.
+    /// The loss-gate reason is built from the CONST via format! — a
+    /// string literal of the sentinel text here would be a third
+    /// production-literal hit and break the prefix-uniqueness gate the
+    /// plan's verify pins.
+    #[test]
+    fn loss_gate_hint_override_and_neighbors_unchanged() {
+        // Sentinel-prefixed reason (dynamic prose after the header):
+        // the --yes hint, never the file-read default.
+        let loss_gate = CoreError::InvalidInput {
+            reason: format!(
+                "{}xml): the scan reports 2 finding(s) before the import:\nre-run \
+                 with --yes to import anyway",
+                LOSS_GATE_REFUSAL_REASON_PREFIX
+            ),
+        };
+        assert_eq!(loss_gate.code(), "invalid_input", "slug unchanged");
+        assert_eq!(loss_gate.exit_code(), 2, "usage class unchanged");
+        let hint = loss_gate.hint().expect("hint required");
+        assert!(
+            hint.contains("--yes"),
+            "loss-gate hint must name the --yes re-run: {hint}"
+        );
+        assert!(
+            hint.contains("loss report above"),
+            "loss-gate hint must point back at the report: {hint}"
+        );
+        assert!(
+            !hint.contains("fix the input source"),
+            "the file-read default must never leak onto the loss-gate path: {hint}"
+        );
+
+        // Generic InvalidInput: the file-read default UNCHANGED (the
+        // regression pin for every other raise site).
+        let generic = CoreError::InvalidInput {
+            reason: "x is not valid JSON: expected value at line 1".into(),
+        };
+        let hint = generic.hint().expect("hint required");
+        assert!(
+            hint.contains("--file") && hint.contains("stdin"),
+            "resource-put hint unchanged: {hint}"
+        );
+        assert!(
+            !hint.contains("--yes"),
+            "the --yes hint must not leak onto generic reasons: {hint}"
+        );
+
+        // The TTY-refusal precedent intact (06-07).
+        let tty = CoreError::tui_tty_refusal();
+        let hint = tty.hint().expect("hint required");
+        assert!(
+            hint.contains("interactive terminal"),
+            "TTY hint unchanged: {hint}"
+        );
+        assert!(
+            !hint.contains("--yes"),
+            "the --yes hint must not leak onto the TTY path: {hint}"
         );
     }
 }
