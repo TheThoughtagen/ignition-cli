@@ -505,10 +505,13 @@ async fn live_tags_provider_browse_read_write_loop() {
 /// THE tagConfig live round-trip (05-05) — the research-proven loop
 /// that closes TAGS-05/09: config create an Int4 memory tag (value
 /// 123) → read back Good/123 (05-04's read IS the oracle) → export
-/// the provider → import into a fresh provider (abort first: the
+/// the tag subtree → import into a fresh provider (abort first: the
 /// second import refuses `tag_collision`, then overwrite --yes
 /// replaces) → read the IMPORTED tag == 123/Good (values intact —
 /// TAGS-09's live proof) → config delete cleanup → provider deletes.
+/// (11-06 reconciliation: the export rides the `[p5e2e]T1` SUBTREE —
+/// the 1.2.0 route contract-refuses provider-root exports, so the
+/// Phase-5 provider-scope wrapper workflow is gone by design.)
 #[tokio::test]
 #[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
 async fn live_tags_config_export_import_roundtrip() {
@@ -568,7 +571,13 @@ async fn live_tags_config_export_import_roundtrip() {
     assert_eq!(envelope["data"]["results"][0]["quality"], "Good");
     assert_eq!(envelope["data"]["results"][0]["value"], 123);
 
-    // Export the provider subtree → a JSON file.
+    // Export the tag subtree → a JSON file. SUBTREE path, not the
+    // provider root: the 1.2.0 route codified the 07-06/8.3.3 truth
+    // (getConfiguration/exportTags need an RpcContext WebDev threads
+    // don't carry) into a deterministic provider-root refusal — the
+    // Phase-5 provider-scope export this gate originally rode is
+    // route-refused by contract now (first live proof: the 11-06
+    // rig run).
     let tmp = tempfile::tempdir().expect("tempdir");
     let export_file = tmp.path().join("p5e2e.json");
     let out = ign(
@@ -577,13 +586,13 @@ async fn live_tags_config_export_import_roundtrip() {
         &[
             "tags",
             "export",
-            "[p5e2e]",
+            "[p5e2e]T1",
             "-o",
             export_file.to_str().expect("path"),
             "--compact",
         ],
     );
-    expect_ok("export [p5e2e]", &out);
+    expect_ok("export [p5e2e]T1", &out);
     let envelope = data_envelope(&out);
     assert_eq!(envelope["data"]["tag_count"], 1, "one top-level subtree");
     assert_eq!(envelope["data"]["file"], export_file.display().to_string());
@@ -605,10 +614,11 @@ async fn live_tags_config_export_import_roundtrip() {
     );
     expect_ok("import #1 (abort, clean target)", &out);
     let envelope = data_envelope(&out);
-    // The provider-shaped export wrapper (empty name) lands its
-    // CHILDREN at the target — the effective top-level count is the
-    // children's (T1 + the provider's _types_ folder).
-    assert_eq!(envelope["data"]["imported"], 2, "{envelope}");
+    // The export is the T1 SUBTREE (named) — it lands itself at the
+    // target; the effective top-level count is 1 (the provider-
+    // wrapper workflow the original Phase-5 count rode is route-
+    // refused by contract now).
+    assert_eq!(envelope["data"]["imported"], 1, "{envelope}");
 
     // Import #2 (abort again): the collision refusal — exit 6,
     // tag_collision, BEFORE any write.
@@ -1960,12 +1970,13 @@ async fn live_tags_csv_roundtrip() {
         ],
     );
     expect_ok("export the original as json", &out);
-    let orig: Value =
+    // The export FILE holds the normalized LIST-OF-SUBTREES (the
+    // CLI's interchange format — the raw gateway wrapper never
+    // reaches the file).
+    let orig: Vec<Value> =
         serde_json::from_slice(&std::fs::read(&orig_path).expect("orig.json readable"))
-            .expect("orig.json parses");
-    let orig_tmem = orig["tags"]
-        .as_array()
-        .expect("children[]")
+            .expect("orig.json parses as a subtree list");
+    let orig_tmem = orig
         .iter()
         .find(|tag| tag["name"] == "TMem")
         .expect("TMem in the original export");
@@ -2055,16 +2066,13 @@ async fn live_tags_csv_roundtrip() {
         ],
     );
     expect_ok("export the imported tags as json", &out);
-    let back: Value =
+    let back: Vec<Value> =
         serde_json::from_slice(&std::fs::read(&back_path).expect("back.json readable"))
-            .expect("back.json parses");
+            .expect("back.json parses as a subtree list");
     let find = |name: &str| -> Value {
-        back["tags"]
-            .as_array()
-            .expect("children[]")
-            .iter()
+        back.iter()
             .find(|tag| tag["name"] == name)
-            .unwrap_or_else(|| panic!("{name} in the imported export: {back}"))
+            .unwrap_or_else(|| panic!("{name} in the imported export: {back:?}"))
             .clone()
     };
     // LANDED (coverage table): value + tooltip + engUnit.
