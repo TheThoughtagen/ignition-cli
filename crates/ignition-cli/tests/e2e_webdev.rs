@@ -1177,15 +1177,17 @@ async fn live_tags_alarm_lifecycle() {
         })
     };
     let mut event = None;
-    // POLL + RE-TRIGGER (11-06 live-truth, Rig B 8.3.3): the write's
-    // 0→150 transition can race the alarm engine's subscription to
-    // the JUST-CREATED provider's tag — the only transition is lost
-    // and no event ever fires (observed twice: silent 60s polls with
-    // the write answered ok and the config verifiably landed). The
-    // fix is a state-safe RE-TRIGGER: write below the setpoint, then
-    // past it again — a real transition the (by-now-subscribed)
-    // engine fires. Each attempt: set → poll 8×1s; up to 5 attempts.
-    for attempt in 0..5 {
+    // POLL + RE-TRIGGER (11-06 live-truth, Rig B 8.3.3): after
+    // creating the p5alarm provider, the alarm engine can take a
+    // LONG bounded window to register the new tag's alarm config —
+    // observed: 45s+ of silent ok-polls (write answered ok, the
+    // config verifiably landed in the model), with events flowing
+    // normally on the next attempt ~50s later; warm rigs answer in
+    // 2–4s. The RE-TRIGGER (write below the setpoint, then past it
+    // again) keeps a real transition available for whichever poll
+    // window the registered engine finally sees. 10 attempts ≈ 100s
+    // worst case; warm runs never leave attempt 1.
+    for attempt in 0..10 {
         if attempt > 0 {
             let out = ign(
                 &config,
