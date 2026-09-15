@@ -41,9 +41,9 @@ use ignition_cli::cli::{
     LicenseArgs, LicenseCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs,
     ProfileCmd, ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs,
     ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs,
-    SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
-    TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
-    WebdevCommand, WorkspaceArgs, WorkspaceCommand,
+    SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
+    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    WorkspaceArgs, WorkspaceCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -2671,16 +2671,20 @@ async fn dispatch_edit(
     let profile_name = session.profile_name().to_string();
     // 3. The pipeline; every refusal rides the standard envelope
     //    verbatim (stable prefixes intact).
-    let staged =
-        match actions::edit::edit_pipeline(&*session, &TokioEditor, &args.project, Some(&args.resource_path))
-            .await
-        {
-            Ok(staged) => staged,
-            Err(err) => {
-                render_error(&err, Some(&profile_name), mode);
-                return ExitCode::from(err.exit_code());
-            }
-        };
+    let staged = match actions::edit::edit_pipeline(
+        &*session,
+        &TokioEditor,
+        &args.project,
+        Some(&args.resource_path),
+    )
+    .await
+    {
+        Ok(staged) => staged,
+        Err(err) => {
+            render_error(&err, Some(&profile_name), mode);
+            return ExitCode::from(err.exit_code());
+        }
+    };
     match staged.status {
         // Content-decided no-op: no push, no prompt, clean exit 0.
         EditStatus::NoOp => {
