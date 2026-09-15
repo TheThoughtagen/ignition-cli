@@ -71,6 +71,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P02 | 19 min | 3 tasks | 5 files |
 | Phase 13 P03 | 31 min | 2 tasks | 3 files |
 | Phase 13 P01 | 14 min (close session; full plan 21:46Z Sep-14 → 02:22Z Sep-15) | 3 tasks | 6 files |
+| Phase 13 P04 | 12h 24m (incl. ~2h live-rig windows + wedged-boot recovery) | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -186,6 +187,9 @@ Recent decisions affecting current work:
 - [Phase 13]: 13-01: historical-tag-group key NOT required for a functional binding (gateway default group at sampleMode=TagGroup — data-row cadence proof); historicalScanclass never pre-committed anywhere — answers the research OQ mystery without a guessed key; 13-04 recipe stays 3 keys
 - [Phase 13]: 13-01: provider-API routes corrected by live proof — find is /resources/find/{module}/{type}/{name} (not {create-path}/find/{name}); delete /resources/{module}/{type}/{name}/{signature}; e2e_webdev.rs:899 historian delete identified as silent no-op (non-200→'already gone') — 13-04 to fix harness — recorded finding; zero product code in 13-01
 - [Phase 13]: 13-01: tags config edit REPLACES the whole node (dataType/defaultValue dropped, value→null) — the TAGS-14 closure recipe must carry the complete node shape in one edit — read-back side effect captured on both rigs
+- [Phase 13]: 13-04: TAGS-13 landed additive-only — history_summary pure view (None when no history keys → byte-identical render, pinned) over the capture-locked names [historyEnabled, historyProvider, sampleMode]; historical_group stays None (no captured key, never guessed); compact envelope untouched — passthrough posture per planner locks
+- [Phase 13]: 13-04: TAGS-14 closure branch live-proven on BOTH rigs (13-LIVE-GATE.md passed) — gate asserts the WRITTEN 44 in history (not merely non-null rows); harness historian delete fixed (corrected /resources/find route + re-find-404 verification), closing 13-01's recorded no-op follow-up — SC-3/SC-4 close with both-rig evidence on the identical final binary 65456a9
+- [Phase 13]: 13-04 live-truth: deploy imports can half-land (mount race → sweep-verify + one heal redeploy) and tags created inside the deploy model-rebuild tail read back fine but NEVER register with the historian (3 self-healing delete→settle→recreate bind cycles; unique names extend to TAG paths); a volume that survived a wedged first boot keeps a dead historian storage engine — fresh-volume re-stage beats diagnosis — all four hardenings live-motivated, each separately committed (0ab99d6, 513ee87, 76be84b, 65456a9)
 
 ### Pending Todos
 
