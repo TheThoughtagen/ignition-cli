@@ -1341,6 +1341,14 @@ async fn live_tags_history_bindings() {
 
 /// The gate's asserting body, Result-shaped so the FINALLY above
 /// always runs (ensure_ok instead of expect_ok inside).
+///
+/// The bind→write→prove sequence runs inside a 3-cycle SELF-HEALING
+/// loop (the 11-06 live-truth recovery, proven again on 13-04 rig A):
+/// a tag created in the deploy import's model-rebuild tail can read
+/// back its config, answer writes Good, and yet NEVER register with
+/// the historian (rows stay empty from birth — rig A runs 2–4, while
+/// identical probes created OUTSIDE that window flowed on the first
+/// write). The proven recovery is delete → settle → recreate.
 async fn historian_binding_body(
     config: &Path,
     env: &LiveEnv,
@@ -1350,119 +1358,132 @@ async fn historian_binding_body(
     // (1) The historian — native REST, no database.
     provision_internal_historian(env, historian).await;
 
-    // (2) The bound tag — the closure recipe, complete node shape +
-    // the captured three-key field set.
-    let out = ign_stdin(
-        config,
-        env,
-        &["tags", "config", "create", tag, "--file", "-", "--compact"],
-        &format!(
-            r#"{{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "historyEnabled": true, "historyProvider": "{historian}", "sampleMode": "TagGroup"}}"#
-        ),
-    );
-    ensure_ok("config create the bound tag (closure recipe)", &out)?;
-
-    // (3) TAGS-13 live assert — the HUMAN render carries the additive
-    // history block with the LIVE provider name (no --compact).
-    let out = ign(config, env, &["tags", "config", "get", tag]);
-    ensure_ok("config get the bound tag", &out)?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for needle in [
-        "history:",
-        "  enabled: true",
-        &format!("  provider: {historian}"),
-        "  sample mode: TagGroup",
-    ] {
-        assert!(
-            stdout.contains(needle),
-            "TAGS-13 live render missing {needle:?}:\n{stdout}"
-        );
-    }
-    println!("TAGS-13 live: history block present for {tag} (provider {historian})");
-
-    // (4) Write values (spaced), then poll the query until the
-    // WRITTEN 44 lands — the tag-group scan stores at 40–50 s
-    // cadence (13-01 data probe), so the poll is bounded and patient.
-    let start_ms = now_ms() - 60_000;
-    for value in [42, 43, 44] {
-        let out = ign(
-            config,
-            env,
-            &[
-                "tags",
-                "write",
-                tag,
-                "--value",
-                &value.to_string(),
-                "--compact",
-            ],
-        );
-        ensure_ok("write a history value", &out)?;
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    }
-    let end_ms = now_ms() + 5_000;
-    let query_args = |start_ms: i64, end_ms: i64| {
-        vec![
-            "tags".to_string(),
-            "history".to_string(),
-            "query".to_string(),
-            tag.to_string(),
-            "--start".to_string(),
-            start_ms.to_string(),
-            "--end".to_string(),
-            end_ms.to_string(),
-            "--compact".to_string(),
-        ]
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
-    loop {
-        let args = query_args(start_ms, end_ms);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = ign(config, env, &refs);
-        ensure_ok("history query", &out)?;
-        let envelope = data_envelope(&out);
-        // Structural pins while we're here (the 05-06 wire truths):
-        // t_stamp leads, the tag column rides provider-relative.
-        let columns = envelope["data"]["columns"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if columns.first().and_then(Value::as_str) != Some("t_stamp") {
-            return Err(format!("history query lost the t_stamp column: {envelope}"));
-        }
-        let relative = tag
-            .trim_start_matches('[')
-            .split_once(']')
-            .map(|(_, rest)| rest)
-            .unwrap_or(tag);
-        if !columns
-            .iter()
-            .any(|column| column.as_str() == Some(relative))
-        {
-            return Err(format!(
-                "the tag column rides provider-relative: {envelope}"
-            ));
-        }
-        if history_rows_contain(&envelope, 44) {
-            println!("SC-4 closure evidence: written value 44 proven in history ({historian})");
-            break;
-        }
-        eprintln!(
-            "history: no 44 yet (tag-group scan cadence 40–50 s) — rows so far: {}",
-            serde_json::to_string(&envelope["data"]["rows"]).unwrap_or_default()
-        );
-        if std::time::Instant::now() >= deadline {
-            return Err(
-                "CLOSURE DRIFT FINDING: the 13-01 recipe live-proved data flow, but 150 s of \
-                 polling never surfaced the written 44 — record in 13-LIVE-GATE.md (capture \
-                 wins; never code around it)"
-                    .to_string(),
+    let mut last_miss = String::new();
+    for cycle in 1..=3 {
+        if cycle > 1 {
+            eprintln!(
+                "bind cycle {cycle}: prior cycle stored nothing — delete → settle → recreate"
             );
         }
-        eprintln!("history: no 44 yet (tag-group scan cadence 40–50 s) — polling…");
+        // Settle FIRST (the deploy import's model-rebuild tail on
+        // cycle 1; the recreate tail on later cycles), then clear any
+        // prior cycle's node.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        clean_tag_configs(config, env, std::slice::from_ref(&tag));
+
+        // (2) The bound tag — the closure recipe, complete node shape
+        // + the captured three-key field set.
+        let out = ign_stdin(
+            config,
+            env,
+            &["tags", "config", "create", tag, "--file", "-", "--compact"],
+            &format!(
+                r#"{{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "historyEnabled": true, "historyProvider": "{historian}", "sampleMode": "TagGroup"}}"#
+            ),
+        );
+        ensure_ok("config create the bound tag (closure recipe)", &out)?;
+
+        // (3) TAGS-13 live assert — the HUMAN render carries the
+        // additive history block with the LIVE provider name (no
+        // --compact).
+        let out = ign(config, env, &["tags", "config", "get", tag]);
+        ensure_ok("config get the bound tag", &out)?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for needle in [
+            "history:",
+            "  enabled: true",
+            &format!("  provider: {historian}"),
+            "  sample mode: TagGroup",
+        ] {
+            if !stdout.contains(needle) {
+                return Err(format!("TAGS-13 live render missing {needle:?}:\n{stdout}"));
+            }
+        }
+        println!("TAGS-13 live: history block present for {tag} (provider {historian})");
+
+        // (4) Write values (spaced), then poll the query until the
+        // WRITTEN 44 lands — the stored row can ride the write
+        // directly (~seconds, live-proven) or the tag-group scan
+        // (40–50 s cadence, the 13-01 data probe), so the per-cycle
+        // poll is bounded and patient.
+        let start_ms = now_ms() - 60_000;
+        for value in [42, 43, 44] {
+            let out = ign(
+                config,
+                env,
+                &[
+                    "tags",
+                    "write",
+                    tag,
+                    "--value",
+                    &value.to_string(),
+                    "--compact",
+                ],
+            );
+            ensure_ok("write a history value", &out)?;
+            tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        }
+        let end_ms = now_ms() + 5_000;
+        let query_args = |start_ms: i64, end_ms: i64| {
+            vec![
+                "tags".to_string(),
+                "history".to_string(),
+                "query".to_string(),
+                tag.to_string(),
+                "--start".to_string(),
+                start_ms.to_string(),
+                "--end".to_string(),
+                end_ms.to_string(),
+                "--compact".to_string(),
+            ]
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(75);
+        loop {
+            let args = query_args(start_ms, end_ms);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = ign(config, env, &refs);
+            ensure_ok("history query", &out)?;
+            let envelope = data_envelope(&out);
+            // Structural pins while we're here (the 05-06 wire
+            // truths): t_stamp leads, the tag column rides
+            // provider-relative.
+            let columns = envelope["data"]["columns"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if columns.first().and_then(Value::as_str) != Some("t_stamp") {
+                return Err(format!("history query lost the t_stamp column: {envelope}"));
+            }
+            let relative = tag
+                .trim_start_matches('[')
+                .split_once(']')
+                .map(|(_, rest)| rest)
+                .unwrap_or(tag);
+            if !columns
+                .iter()
+                .any(|column| column.as_str() == Some(relative))
+            {
+                return Err(format!(
+                    "the tag column rides provider-relative: {envelope}"
+                ));
+            }
+            if history_rows_contain(&envelope, 44) {
+                println!("SC-4 closure evidence: written value 44 proven in history ({historian})");
+                return Ok(());
+            }
+            last_miss = serde_json::to_string(&envelope["data"]["rows"]).unwrap_or_default();
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            eprintln!("history: no 44 yet (scan cadence 40–50 s) — rows so far: {last_miss}");
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
     }
-    Ok(())
+    Err(format!(
+        "CLOSURE DRIFT FINDING: the 13-01 recipe live-proved data flow, but 3 self-healing \
+         cycles of polling never surfaced the written 44 (last rows: {last_miss}) — record \
+         in 13-LIVE-GATE.md (capture wins; never code around it)"
+    ))
 }
 
 /// THE alarm lifecycle live fixture (05-06, TAGS-07) — configure a
