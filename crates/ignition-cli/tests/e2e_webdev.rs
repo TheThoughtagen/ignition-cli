@@ -977,7 +977,8 @@ fn history_has_data(envelope: &Value) -> bool {
 /// Do the history rows carry a SPECIFIC numeric value anywhere beyond
 /// the t_stamp column? The closure data oracle (13-01's proof shape:
 /// the WRITTEN value proven in history — stronger than any-non-null,
-/// which the binding's initial 0 row would satisfy).
+/// which the binding's initial 0 row would satisfy). Int-matched with
+/// a float fallback (wire serialization may differ across 8.3.x).
 fn history_rows_contain(envelope: &Value, value: i64) -> bool {
     envelope["data"]["rows"]
         .as_array()
@@ -985,10 +986,9 @@ fn history_rows_contain(envelope: &Value, value: i64) -> bool {
             rows.iter().any(|row| {
                 row.as_array()
                     .map(|cells| {
-                        cells
-                            .iter()
-                            .skip(1)
-                            .any(|cell| cell.as_i64() == Some(value))
+                        cells.iter().skip(1).any(|cell| {
+                            cell.as_i64() == Some(value) || cell.as_f64() == Some(value as f64)
+                        })
                     })
                     .unwrap_or(false)
             })
@@ -1044,7 +1044,7 @@ async fn live_tags_history_historian_and_binding_spike() {
     // Pre-clean leftovers from a prior aborted run (idempotent):
     // the tag first (create over an existing node would abort), then
     // the historian.
-    clean_tag_configs(&config, &env, &[tag]);
+    clean_tag_configs(&config, &env, &[&tag]);
     delete_internal_historian(&env, "p5hist").await;
 
     // Routes first: history query refuses exit 6 without them.
@@ -1278,14 +1278,19 @@ async fn live_tags_history_bindings() {
     let (_dir, config) = isolated_live_config(&env);
     // THE serializer: one live gate at a time (shared gateway state).
     let _gate = LIVE_GATE.lock().await;
-    // UNIQUE historian name per run (the 11-06 discipline — dozens of
-    // same-name cycles degrade a rig's tag model; virgin namespaces).
-    let historian = format!("p13hist{}", now_ms());
-    let tag = "[default]P13H/T1";
+    // UNIQUE historian AND tag name per run (the 11-06 discipline —
+    // dozens of same-name cycles degrade a rig's tag model; virgin
+    // namespaces. The 13-04 rig-A runs proved the class applies to
+    // TAG paths too: a delete/recreated [default]P13H/T1 never
+    // re-registered with the historian while a fresh path flowed on
+    // the first scan).
+    let suffix = now_ms();
+    let historian = format!("p13hist{suffix}");
+    let tag = format!("[default]P13H/T{suffix}");
 
     // Pre-clean leftovers (idempotent re-runs): the tag first (create
     // over an existing node would abort), then the historian.
-    clean_tag_configs(&config, &env, &[tag]);
+    clean_tag_configs(&config, &env, &[&tag]);
     delete_internal_historian(&env, &historian).await;
 
     // Routes first: history query refuses exit 6 without them. The
@@ -1322,11 +1327,11 @@ async fn live_tags_history_bindings() {
         );
     }
 
-    let outcome = historian_binding_body(&config, &env, &historian, tag).await;
+    let outcome = historian_binding_body(&config, &env, &historian, &tag).await;
 
     // FINALLY: self-cleaning regardless of the body's outcome (the
     // corrected historian chain verifies gone).
-    clean_tag_configs(&config, &env, &[tag]);
+    clean_tag_configs(&config, &env, &[&tag]);
     delete_internal_historian(&env, &historian).await;
 
     if let Err(message) = outcome {
@@ -1401,7 +1406,7 @@ async fn historian_binding_body(
             "tags".to_string(),
             "history".to_string(),
             "query".to_string(),
-            (*tag).to_string(),
+            tag.to_string(),
             "--start".to_string(),
             start_ms.to_string(),
             "--end".to_string(),
@@ -1442,6 +1447,10 @@ async fn historian_binding_body(
             println!("SC-4 closure evidence: written value 44 proven in history ({historian})");
             break;
         }
+        eprintln!(
+            "history: no 44 yet (tag-group scan cadence 40–50 s) — rows so far: {}",
+            serde_json::to_string(&envelope["data"]["rows"]).unwrap_or_default()
+        );
         if std::time::Instant::now() >= deadline {
             return Err(
                 "CLOSURE DRIFT FINDING: the 13-01 recipe live-proved data flow, but 150 s of \
