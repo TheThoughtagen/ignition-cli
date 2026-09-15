@@ -30,9 +30,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::resources::export_zip_bytes;
 use crate::client::GatewayApi;
-use crate::client::resources::{member_hashes, read_member, resource_members};
+use crate::client::resources::{
+    FOLDER_DESCRIPTOR, fnv1a, member_hashes, normalize_descriptor, read_member, resource_members,
+};
 use crate::client::scripts_codec;
-use crate::client::workspace::build_mapping;
+use crate::client::workspace::{MemberSource, build_mapping};
 use crate::error::CoreError;
 
 /// The workspace manifest's filename at the tree root — dot-prefixed
@@ -429,6 +431,320 @@ fn write_gitignore(root: &Path) -> Result<(), CoreError> {
     body.push('\n');
     std::fs::write(&path, body)
         .map_err(|err| CoreError::Internal(format!("cannot write {}: {err}", path.display())))
+}
+
+// ---- status (13-06 Task 1) -----------------------------------------------------
+
+/// `ign workspace status`'s result model (serde for 13-07's envelope —
+/// actions never print). Envelope discipline: `rows` is ALL-rows-always
+/// — every row that exists is present; there are no null placeholders
+/// (the sessions-family semantics), and `clean` summarizes so agents
+/// never have to walk the rows to know the verdict.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceStatus {
+    /// The project the workspace is checked out from (echoed from the
+    /// manifest after the caller's `project` argument is verified
+    /// against it).
+    pub project: String,
+    /// True iff every row is [`StatusKind::Clean`] (additions,
+    /// deletions, untracked files, and drift all make this false).
+    pub clean: bool,
+    /// Every row: one per manifest member, then gateway-only members,
+    /// then untracked files — sorted within each group (deterministic
+    /// render order for 13-07).
+    pub rows: Vec<StatusRow>,
+}
+
+/// One status row. `path` is the GATEWAY member path for
+/// manifest/gateway rows (the manifest's keys) and the local
+/// tree-relative path for [`StatusKind::Untracked`] rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatusRow {
+    /// The member path the row is about.
+    pub path: String,
+    /// The verdict — PUSH-RELATIVE (see [`StatusKind`]).
+    pub kind: StatusKind,
+}
+
+/// The three-way-compare verdict for one path.
+///
+/// ## Direction semantics — PUSH-RELATIVE (planner lock, load-bearing)
+///
+/// Every row describes what `workspace push` would do to the
+/// GATEWAY. This is the projects.rs:535-555 lesson applied
+/// explicitly: `diff` speaks B-relative while sync speaks
+/// source→target, and agents misread mixed-direction labels. Here
+/// there is exactly one direction, pinned in code and tests:
+///
+/// - [`StatusKind::LocalEdit`] — the local side changed since
+///   checkout and the gateway still matches the recorded baseline:
+///   push would WRITE this member to the gateway.
+/// - [`StatusKind::GatewayDrift`] — the gateway moved on since
+///   checkout and the local side still matches the baseline: push
+///   would NOT touch this member (a pull/refresh would).
+/// - [`StatusKind::Conflict`] — BOTH sides diverged from the
+///   recorded baseline: push REFUSES outright (never `--yes`-able —
+///   clobbering a concurrent Designer edit is beyond any flag,
+///   Pitfall W2).
+/// - [`StatusKind::Clean`] — both sides still match the baseline.
+///
+/// Set-difference verdicts (not from [`classify`]'s matrix):
+///
+/// - [`StatusKind::Deleted`] — a manifest member gone from one
+///   side. `local: true` = deleted locally (push `--delete` would
+///   remove it gateway-side; without `--delete` push reports it as
+///   skipped). `local: false` = deleted gateway-side since checkout
+///   (pull territory — push would not touch it).
+/// - [`StatusKind::Added`] — a member present in the fresh gateway
+///   export but not in the manifest (exported since checkout;
+///   `local: false` — bringing it into the tree is checkout
+///   `--refresh` territory, which is manual in v1).
+/// - [`StatusKind::Untracked`] — a local file that is not a
+///   checkout member and not workspace machinery. Push IGNORES
+///   untracked files (never imports them): bringing a file into
+///   the gateway is checkout/replace territory, not push's job.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusKind {
+    /// Both sides match the recorded checkout baseline.
+    Clean,
+    /// Local changed, gateway at baseline — push would write.
+    LocalEdit,
+    /// Gateway moved on, local at baseline — push would not touch.
+    GatewayDrift,
+    /// Both sides diverged — push refuses, never `--yes`-able.
+    Conflict,
+    /// Member in the fresh export but not in the manifest.
+    Added {
+        /// Always `false` in v1 (gateway-side additions; checkout
+        /// `--refresh` is manual — the payload exists so a future
+        /// local-add flow can reuse the kind additively).
+        local: bool,
+    },
+    /// Manifest member gone from one side.
+    Deleted {
+        /// `true` = deleted locally (push `--delete` territory);
+        /// `false` = deleted gateway-side (pull territory).
+        local: bool,
+    },
+    /// Local file that is not a checkout member; push ignores it.
+    Untracked,
+}
+
+/// THE three-way matrix — pure, total over all 8 `Option`
+/// combinations, unit-tested exhaustively. `manifest` is the
+/// recorded checkout hash, `local`/`gateway` are `None` when that
+/// side lacks the member (local file deleted; member absent from
+/// the fresh export). Returns only the four primary kinds — the
+/// set-difference verdicts ([`StatusKind::Deleted`]/
+/// [`StatusKind::Added`]/[`StatusKind::Untracked`]) are refined by
+/// the caller, which knows which side the absence came from.
+///
+/// None-handling (pinned by test): an absent side never EQUALS a
+/// present hash, so it counts as "moved" in the primary matrix —
+/// the caller then refines `LocalEdit`-with-local-absent into
+/// [`StatusKind::Deleted { local: true }`] and
+/// `GatewayDrift`-with-gateway-absent into
+/// [`StatusKind::Deleted { local: false }`]. The one special case:
+/// a baseline member absent from BOTH sides classifies
+/// [`StatusKind::Clean`] — both sides deleted it since checkout, so
+/// there is nothing to reconcile (push has nothing to delete — the
+/// member is already gone from the fresh export; a refresh
+/// re-checkout drops the stale manifest entry).
+pub fn classify(manifest: Option<u64>, local: Option<u64>, gateway: Option<u64>) -> StatusKind {
+    let Some(m) = manifest else {
+        // No recorded baseline — cannot happen for manifest-driven
+        // rows in production (the caller only feeds manifest
+        // members); totaled for the matrix with the honest verdict:
+        // sides that agree need nothing, sides that disagree get the
+        // refusal (no arbiter to pick a winner).
+        return if local == gateway {
+            StatusKind::Clean
+        } else {
+            StatusKind::Conflict
+        };
+    };
+    if local.is_none() && gateway.is_none() {
+        // Baseline member absent from BOTH sides: both deleted it
+        // since checkout — nothing to reconcile (push has nothing to
+        // delete; the member is already gone from the fresh export).
+        return StatusKind::Clean;
+    }
+    let local_same = local == Some(m);
+    let gateway_same = gateway == Some(m);
+    match (local_same, gateway_same) {
+        (true, true) => StatusKind::Clean,
+        (false, true) => StatusKind::LocalEdit,
+        (true, false) => StatusKind::GatewayDrift,
+        (false, false) => StatusKind::Conflict,
+    }
+}
+
+/// The tolerant, per-member Tree-equivalent hash — the SAME
+/// primitives [`MemberSource::Tree::member_hashes`] uses
+/// ([`normalize_descriptor`] for a `resource.json` basename,
+/// [`fnv1a`] for the content) read at the RECORDED local path (the
+/// manifest is the mapping truth — never re-derived). Status owns
+/// the absence verdict, so a `NotFound` is `Ok(None)` (a local
+/// deletion, not an error); any OTHER read failure refuses naming
+/// the member (a permission problem is not a verdict).
+fn local_member_hash(
+    root: &Path,
+    recorded: &ManifestMember,
+    member: &str,
+) -> Result<Option<u64>, CoreError> {
+    match std::fs::read(root.join(&recorded.local_path)) {
+        Ok(bytes) => {
+            let is_descriptor = Path::new(&recorded.local_path).file_name()
+                == Some(std::ffi::OsStr::new(FOLDER_DESCRIPTOR));
+            let content = if is_descriptor {
+                normalize_descriptor(&bytes).unwrap_or(bytes)
+            } else {
+                bytes
+            };
+            Ok(Some(fnv1a(&content)))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(CoreError::InvalidInput {
+            reason: format!(
+                "workspace member \"{member}\" cannot be read from the checkout \
+                 tree (expected at \"{}\"): {err}",
+                recorded.local_path
+            ),
+        }),
+    }
+}
+
+/// Local files that are the workspace's OWN machinery or codec
+/// artifacts — never reported as [`StatusKind::Untracked`]: the two
+/// checkout-owned root files, the codec manifest, and `.py` files
+/// (the decode sidecars — the workspace `.gitignore`'s own
+/// convention). Anything else in the tree that is not a checkout
+/// member is a genuine untracked file the human created.
+fn workspace_owned_or_artifact(rel: &str) -> bool {
+    rel == WORKSPACE_MANIFEST_NAME
+        || rel == ".gitignore"
+        || rel == scripts_codec::MANIFEST_NAME
+        || rel.ends_with(".py")
+}
+
+/// Every regular file under `root`, relative + `/`-separated,
+/// EXCLUDING workspace-owned files and recorded member paths — the
+/// untracked candidate set. Sorted (BTreeSet) so the rows are
+/// deterministic.
+fn untracked_files(
+    root: &Path,
+    member_locals: &BTreeSet<String>,
+) -> Result<Vec<String>, CoreError> {
+    fn walk(dir: &Path, prefix: &str, found: &mut BTreeSet<String>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.path().is_dir() {
+                walk(&entry.path(), &rel, found)?;
+            } else if entry.path().is_file() {
+                found.insert(rel);
+            }
+        }
+        Ok(())
+    }
+    let mut found = BTreeSet::new();
+    walk(root, "", &mut found).map_err(|err| {
+        CoreError::Internal(format!("cannot walk workspace tree {root:?}: {err}"))
+    })?;
+    Ok(found
+        .into_iter()
+        .filter(|rel| !workspace_owned_or_artifact(rel) && !member_locals.contains(rel))
+        .collect())
+}
+
+/// `ign workspace status`'s core: the manifest three-way compare.
+/// Reads the RECORDED manifest (strict read ownership — a missing
+/// manifest refuses with 13-03's stable prefix), verifies the
+/// caller's `project` against it, exports the FRESH gateway zip
+/// (ONE read GET — status is read-only on the wire), and classifies
+/// every path through the ONE hash/normalize implementation:
+/// gateway hashes ride [`MemberSource::Zip::member_hashes`]
+/// (descriptor-normalized — `lastModification` volatility never
+/// masquerades as drift); local hashes ride the Tree-equivalent
+/// per-member hash at the recorded local paths ([`fnv1a`] +
+/// [`normalize_descriptor`], never a second implementation). No
+/// byte-compare anywhere: `resource.json` members compare
+/// descriptor-normalized on both sides.
+pub async fn workspace_status(
+    root: &Path,
+    api: &dyn GatewayApi,
+    project: &str,
+) -> Result<WorkspaceStatus, CoreError> {
+    let manifest = read_manifest(root)?;
+    if manifest.project != project {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "workspace at {} is checked out from project {:?} — refusing to \
+                 status {:?}",
+                root.display(),
+                manifest.project,
+                project
+            ),
+        });
+    }
+
+    // The fresh gateway side — the ONE transport, descriptor-
+    // normalized hashes (identical semantics to checkout's recording).
+    let zip = export_zip_bytes(api, project).await?;
+    let gateway_hashes = MemberSource::Zip(zip).member_hashes()?;
+
+    // Per-manifest-path matrix + absence refinement.
+    let mut rows = Vec::new();
+    for (member, recorded) in &manifest.members {
+        let local = local_member_hash(root, recorded, member)?;
+        let gateway = gateway_hashes.get(member).copied();
+        let kind = match classify(Some(recorded.hash), local, gateway) {
+            StatusKind::LocalEdit if local.is_none() => StatusKind::Deleted { local: true },
+            StatusKind::GatewayDrift if gateway.is_none() => StatusKind::Deleted { local: false },
+            other => other,
+        };
+        rows.push(StatusRow {
+            path: member.clone(),
+            kind,
+        });
+    }
+
+    // Set differences: gateway members the manifest never recorded —
+    // exported since checkout (pull/refresh territory, never push's).
+    for member in gateway_hashes.keys() {
+        if !manifest.members.contains_key(member) {
+            rows.push(StatusRow {
+                path: member.clone(),
+                kind: StatusKind::Added { local: false },
+            });
+        }
+    }
+
+    // Untracked local files — reported, never pushed.
+    let member_locals: BTreeSet<String> = manifest
+        .members
+        .values()
+        .map(|recorded| recorded.local_path.clone())
+        .collect();
+    for rel in untracked_files(root, &member_locals)? {
+        rows.push(StatusRow {
+            path: rel,
+            kind: StatusKind::Untracked,
+        });
+    }
+
+    let clean = rows.iter().all(|row| matches!(row.kind, StatusKind::Clean));
+    Ok(WorkspaceStatus {
+        project: project.to_string(),
+        clean,
+        rows,
+    })
 }
 
 /// Now, RFC3339 UTC (`…Z`, millisecond precision) — hand-rolled
