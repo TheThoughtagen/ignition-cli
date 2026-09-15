@@ -1044,7 +1044,7 @@ async fn live_tags_history_historian_and_binding_spike() {
     // Pre-clean leftovers from a prior aborted run (idempotent):
     // the tag first (create over an existing node would abort), then
     // the historian.
-    clean_tag_configs(&config, &env, &[&tag]);
+    clean_tag_configs(&config, &env, &[tag]);
     delete_internal_historian(&env, "p5hist").await;
 
     // Routes first: history query refuses exit 6 without them.
@@ -1315,7 +1315,7 @@ async fn live_tags_history_bindings() {
                     .all(|route| {
                         data_envelope(&out)["data"]["routes"]
                             .as_array()
-                            .map_or(false, |rows| {
+                            .is_some_and(|rows| {
                                 rows.iter().any(|row| {
                                     row["route"].as_str() == Some(*route)
                                         && row["status"].as_str() == Some("present")

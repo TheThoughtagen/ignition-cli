@@ -168,6 +168,9 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign project import <NAME> --file PATH\|--file - [--collision-policy abort\|overwrite]` | Import a project from a ZIP (`-` reads stdin) | default policy **abort**: importing over an existing name exits 6 (`project_exists`) BEFORE any upload; **overwrite** is destructive — exit 2 without `--yes` and it REPLACES the entire project (resources absent from the ZIP are deleted; merge is Designer-only); a non-ZIP, >512 MB, or structurally-corrupt (truncated) input exits 2 (`invalid_import_file`) before any network I/O — every member is validated up front because the gateway would otherwise accept a truncated ZIP and wipe the target (live-witnessed); a gateway import refusal riding HTTP 200 (`{success:false}`) exits 6 (`import_denied`) with the gateway's problem text; 300 s per-request timeout |
 | `ign project diff <PROFILE_A> <PROFILE_B> --project <NAME>` | Compare a project across two gateway profiles — per-resource `added`/`removed`/`changed`/`same` statuses (read-only, no guard) | **statuses are B-relative-to-A**: `added` = in B only, `removed` = in A only, `changed` = differing content after `resource.json` normalization (`attributes.lastModification`/`…Signature` stripped, keys canonicalized — identical content exported from two gateways reports `same`); each side exports once and NOTHING is imported; the envelope's `profile` stays the ACTIVE profile while the data carries `profile_a`/`profile_b`; the root `project.json` rides `project_meta` (title/enabled/parent deltas), never the resource entries; diffing a profile against itself exits 2 `invalid_input`; scope is project-only (see the tag-promotion pipe below); a missing project on either side exits 6 `not_found` |
 | `ign project sync <PROFILE_A> <PROFILE_B> --project <NAME> --resource PATH... [--all-changed] [--delete]` | Promote selected resources from A into B (direction is ALWAYS A→B — source A, target B) | **destructive on B**: the whole project is overwrite-imported — exit 2 (`confirmation_required`, profile null, ZERO requests) without `--yes`; at least one of `--resource` (repeatable) or `--all-changed` required (else exit 2 pre-resolution); `--all-changed` promotes everything A has that B lacks or differs on (the diff's `removed`+`changed` under B-relative-to-A labels); default is upsert-ONLY — B's extra resources are never deleted unless `--delete` is passed (then the diff's `added` set — B-only — is removed; an explicit `--resource` path absent in A is a deletion request under `--delete`, `not_found` without); replace_member's descriptor-merge landing rules ride free; B's `project.json` is never touched; `--all-changed` with nothing changed performs NO import (zero-write honesty); JSON data `{scope, profile_a, profile_b, project, synced, removed}` |
+| `ign workspace checkout <PROJECT> <TARGET> [--decode-scripts]` | Check a project's resources out to a local tree — mapped paths + the recorded `.ign-workspace.json` manifest + an idempotent `.gitignore` | read-only on the wire (one export GET, ZERO imports); an unrelated non-empty target refuses exit 2 (never clobbered — the pre-existing file is untouched), a corrupt or foreign-manifest target refuses naming what it found, a same-project re-checkout refreshes; `--decode-scripts` decodes embedded JSON scripts to editable `.py` sidecars (nvim-editable; the UNEDITED re-encode is byte-exact — see the workspace section and Script decode/encode below); profile NAME rides into the manifest; JSON data `{project, target, member_count, scripts_decoded}` |
+| `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
+| `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}` |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
 | `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource member (upsert: created if absent, replaced if present) | **destructive**: the whole project is re-imported (`overwrite=true`) after the member surgery — exit 2 (`confirmation_required`) without `--yes`; content is sniffed (json/text); binary input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; concurrent Designer edits are REPLACED (see the resource section) |
@@ -910,6 +913,75 @@ surgery implementation against a real gateway, including two-sided
 put honesty (the export before a put carries the member's old
 content; the export after carries the new).
 
+### Workspace — the local edit loop (checkout / status / push)
+
+`ign workspace` is a git-like loop over a project's resources: check
+the resources out to a local tree, edit them with any tool, then push
+guarded changes back to the gateway.
+
+```bash
+ign workspace checkout PlantFloor ./plantfloor --decode-scripts
+# ...edit ./plantfloor/... with your editor; commit the tree...
+ign workspace status ./plantfloor
+ign workspace push ./plantfloor --yes --delete
+```
+
+**Scope honesty.** The workspace is PROJECT RESOURCES only — the
+source is strictly the project export zip. Tag values NEVER appear in
+the tree (tags are `ign tags` verbs, and this is structural: checkout
+ingests the export zip and nothing else, so tag data cannot ride in).
+
+**The manifest is the workspace identity.** Checkout records
+`.ign-workspace.json` at the tree root: the project, the profile it
+resolved against, the checkout time, and every member's
+gateway↔local path pair plus a content hash (descriptor-normalized —
+gateway `lastModification` volatility never masquerades as drift).
+Status and push READ that manifest and never re-derive anything, so
+the project is never re-typed. **Commit `.ign-workspace.json`;**
+checkout also writes an idempotent `.gitignore` covering
+`scripts-manifest.json` and `*.py` — the decode artifacts are
+generated, not source.
+
+**Status states are push-relative** — one direction, every row names
+what push would do to the GATEWAY:
+
+| State | Meaning | What push does |
+|-------|---------|----------------|
+| `clean` | both sides match checkout | nothing |
+| `local_edit` | changed locally, gateway at baseline | writes the member |
+| `gateway_drift` | gateway moved, local at baseline | untouched (re-checkout to refresh) |
+| `conflict` | BOTH sides diverged since checkout | refuses — see below |
+| `deleted (local)` | member removed locally | removes gateway-side under `--delete`, else reported as skipped |
+| `deleted (gateway)` | member removed gateway-side | untouched (re-checkout to refresh) |
+| `added` | exported gateway-side since checkout | untouched (re-checkout brings it in) |
+| `untracked` | a local file that is not a member | ignored — never imported |
+
+Human mode includes `clean` rows (agents diff the full state) and
+ends with the `x local edits, y gateway drift, z conflicts,
+n untracked` summary; the JSON's `clean` flag is the same verdict in
+one key.
+
+**Push is guarded, spliced, and honest.** The refusal without `--yes`
+carries the blast-radius preview AS its message — exactly which
+members would be written and deleted. Conflicts refuse EVEN WITH
+`--yes`: writing over a concurrent Designer edit is beyond any flag,
+so reconcile manually (keep your local change or the gateway's) and
+re-checkout. The splice rides the manifest-recorded local bytes into
+a FRESH export — never a stale full zip, so members the gateway
+deleted since checkout are not resurrected — and imports exactly
+once. Deletions are `--delete` opt-in (without it, locally-deleted
+members are reported as `skipped`). Untracked files are never
+imported. An empty selection performs zero mutations and never
+prompts.
+
+**`--decode-scripts` round-trip guarantee.** Embedded JSON scripts
+decode to counter-named `<member>.<n>.py` sidecars keyed by
+`scripts-manifest.json` (also gitignored); the UNEDITED tree
+re-encodes through the codec BYTE-EXACTLY per member — proven at tree
+scale by the checkout contract suite. See
+[Script decode/encode](#script-decodeencode---decode-scripts--encode-scripts)
+for the codec contract.
+
 ### Streaming output (the stdout exceptions)
 
 `ign logs -f` is a STREAM: entries print to stdout as they arrive, so
@@ -951,7 +1023,10 @@ Commands that change gateway state (`sessions terminate`,
 promotion — overwrite-imports the whole project on its TARGET
 profile), `resource put`, `resource delete`
 (both re-import the whole project — their refusal messages name the
-consequence), `tags provider delete`, `tags config delete`, and
+consequence), `workspace push` (splices local edits into a fresh
+export of the workspace's project — its refusal message IS the
+blast-radius preview, and its conflict refusal fires even with
+`--yes`), `tags provider delete`, `tags config delete`, and
 `tags import --collision-policy overwrite` (abort-policy imports need
 no `--yes` — the pre-check fails safely before any write),
 `restart` — the
