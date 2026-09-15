@@ -177,7 +177,15 @@ Plans:
   4. `ign lsp` is registered in ignition-nvim's detection order (one-line sibling-repo patch) and verified end-to-end in that repo
   5. Both protocol modes own stdout completely — byte-scan tests over the real spawned binaries fail on any stray byte; `ping` never starves behind a gateway call
 **Research/Planning flags**: LSP slice needs verification of the sync dispatch loop + in-process tokio `block_on` pattern under the existing tracing setup, plus scripted-client harness design. MCP slice: transport decision settled by stack research (hand-rolled, not rmcp); protocolVersion pin "2025-06-18" is an implementation-time live smoke test against Claude Code/Claude Desktop, not research-phase.
-**Plans**: TBD
+**Planner locks** (no CONTEXT.md; locked during planning from research recommendations): GUARDED_OPS single-source const registry + source-scan drift test (catalog reads only the const); full static catalog with exclusion set exactly {completions, mcp, lsp, tui, edit}, no pagination; named-query enumeration rides the export/resource_members path; `ign lsp` resolves profile ambiently (IGNITION_PROFILE → config active); protocolVersion pinned "2025-06-18" with echo-if-equal negotiation.
+**Plans**: 6 plans (5 waves)
+Plans:
+- [ ] 14-01-PLAN.md — `ign mcp serve` core: hidden clap command + OutOfBand row (atomic) + GUARDED_OPS registry with drift test + clap-derived catalog with parity test + JSON-RPC 2.0 framing + concurrent serve loop + confirm-gated dispatch bridge
+- [ ] 14-02-PLAN.md — MCP contract suite: scripted-client byte-scan harness over the real binary, full 2025-06-18 lifecycle, envelope-verbatim + confirm-refusal + ping-starvation pins, Python mcp SDK oracle
+- [ ] 14-03-PLAN.md — `ign lsp` core: lsp-server 0.10 sync loop scaffold + narrow capabilities + OutOfBand row (atomic) + GatewayCache TTL snapshot + background refresher thread (soft-degrade)
+- [ ] 14-04-PLAN.md — LSP handlers (three-family completions, TTL-stamped hover, cached diagnostics) + contract_lsp.rs Content-Length byte-scan suite incl. dead-gateway cache-only proof
+- [ ] 14-05-PLAN.md — ignition-nvim composition: second client registration (ignition_live) in the sibling repo + headless end-to-end verification + sibling-repo commit
+- [ ] 14-06-PLAN.md — Phase-final checkpoint: live MCP smoke against Claude Code/Claude Desktop + nvim composition verification (human)
 
 ## Progress
 
