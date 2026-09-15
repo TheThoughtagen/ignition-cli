@@ -1,5 +1,7 @@
 # ign — operate Ignition 8.3+ gateways from the terminal
 
+[Documentation](https://thethoughtagen.github.io/ignition-cli/) · [Releases](https://github.com/TheThoughtagen/ignition-cli/releases) · [Issues](https://github.com/TheThoughtagen/ignition-cli/issues)
+
 One binary that lets a developer (or an AI agent) fully operate and inspect an
 Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the
 gateway webpage or Designer. Every subcommand is non-interactive by default
