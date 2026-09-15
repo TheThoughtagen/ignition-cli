@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use crate::actions::resources::export_zip_bytes;
 use crate::client::GatewayApi;
 use crate::client::resources::{
-    FOLDER_DESCRIPTOR, fnv1a, member_hashes, normalize_descriptor, read_member, resource_members,
+    FOLDER_DESCRIPTOR, fnv1a, member_hashes, normalize_descriptor, read_member, remove_member,
+    replace_member, resource_members,
 };
 use crate::client::scripts_codec;
 use crate::client::workspace::{MemberSource, build_mapping};
@@ -744,6 +745,227 @@ pub async fn workspace_status(
         project: project.to_string(),
         clean,
         rows,
+    })
+}
+
+// ---- push (13-06 Task 2) -------------------------------------------------------
+
+/// The push blast radius (serde for 13-07's envelope): the full
+/// status plus the effective selection — what push would write and
+/// what `--delete` would remove. This IS the confirmation gate's
+/// message ([`render_push_preview`]); there is no second preview
+/// shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct PushPreview {
+    /// The full status rows (all kinds — the agent sees the whole
+    /// picture, including what push will NOT touch).
+    pub rows: Vec<StatusRow>,
+    /// The members push would WRITE (the [`StatusKind::LocalEdit`]
+    /// rows, in status order).
+    pub would_write: Vec<String>,
+    /// The members `--delete` would REMOVE gateway-side (the
+    /// [`StatusKind::Deleted { local: true }`] rows, in status
+    /// order). Empty without `--delete`.
+    pub would_delete: Vec<String>,
+}
+
+/// `ign workspace push`'s result model. Honest bookkeeping: `wrote`
+/// and `deleted` are exactly what landed in the ONE import; `skipped`
+/// records locally-deleted members left alone for want of `--delete`
+/// (and deletions that turned out to have nothing to remove).
+#[derive(Debug, Clone, Serialize)]
+pub struct PushOutcome {
+    /// The project pushed to (echoed from the manifest after
+    /// verification).
+    pub project: String,
+    /// Members written into the fresh export (and imported).
+    pub wrote: Vec<String>,
+    /// Members actually removed from the fresh export (and
+    /// imported). A locally-deleted member the fresh export no
+    /// longer carries is skipped, not deleted.
+    pub deleted: Vec<String>,
+    /// Locally-deleted members NOT removed because `--delete` was
+    /// absent (reported, never silently dropped), plus deletions
+    /// that found nothing to remove.
+    pub skipped: Vec<String>,
+}
+
+/// The deterministic preview render — the gate's message text (ONE
+/// fn so the CLI refusal and any future TUI body agree; the 10-04
+/// pattern). Line-set, status order, no dramatization.
+fn render_push_preview(preview: &PushPreview) -> String {
+    let mut lines = vec![format!(
+        "workspace push would write {} member(s) and delete {} member(s)",
+        preview.would_write.len(),
+        preview.would_delete.len()
+    )];
+    for path in &preview.would_write {
+        lines.push(format!("  write: {path}"));
+    }
+    for path in &preview.would_delete {
+        lines.push(format!("  delete: {path}"));
+    }
+    lines.join("\n")
+}
+
+/// THE single confirmation site for workspace push (the 10-04
+/// one-gate lesson): the preview_then_confirm composition's confirm
+/// step — build the [`PushPreview`], render it
+/// ([`render_push_preview`]), and require confirmation. The refusal's
+/// message IS the preview (it rides `ConfirmationRequired`'s
+/// `operation`, exit 2, with the destructive-operation hint
+/// attached). One gate function means the refusal shape cannot
+/// drift per branch — there are no per-branch guards.
+fn require_confirmation(yes: bool, preview: &PushPreview) -> Result<(), CoreError> {
+    if yes {
+        return Ok(());
+    }
+    Err(CoreError::ConfirmationRequired {
+        operation: render_push_preview(preview),
+    })
+}
+
+/// `ign workspace push`'s core: splice the manifest-recorded local
+/// edits into a FRESH gateway export behind ONE composed gate.
+///
+/// Order (each step before any mutation):
+/// 1. Status first ([`workspace_status`]) — the three-way compare.
+/// 2. Conflict refusal: ANY [`StatusKind::Conflict`] row refuses
+///    outright with every diverged member named and the resolution
+///    hint. NOT gated by `--yes` — clobbering a concurrent Designer
+///    edit is beyond any flag (Pitfall W2).
+/// 3. Selection: would_write = LocalEdit rows; would_delete =
+///    locally-deleted rows ONLY when `delete` is true (project_sync's
+///    opt-in semantics — without it, locally-deleted members are
+///    REPORTED as skipped, never removed gateway-side).
+/// 4. Zero-write honesty: an empty effective selection returns
+///    immediately with ZERO mutation requests (projects.rs:577
+///    precedent) — and never prompts.
+/// 5. The ONE gate ([`require_confirmation`]) unless `yes`.
+/// 6. Execute: a FRESH export (never push a stale full zip — the
+///    stale base would resurrect members deleted gateway-side since
+///    checkout; conflict detection protects the concurrent writer,
+///    the fresh base protects the tree), each would_write member
+///    spliced from its RECORDED local path via
+///    [`replace_member`] (descriptor landing rules ride free), each
+///    confirmed delete via [`remove_member`] (a member the fresh
+///    export already lost is skipped, not an error), then exactly
+///    ONE [`project_import`]. Splice = raw local bytes — no
+///    re-serialization of member content anywhere in the push path.
+pub async fn workspace_push(
+    root: &Path,
+    api: &dyn GatewayApi,
+    project: &str,
+    yes: bool,
+    delete: bool,
+) -> Result<PushOutcome, CoreError> {
+    // 1. Status — the three-way compare (one read export inside).
+    let status = workspace_status(root, api, project).await?;
+
+    // 2. Conflicts refuse outright — BEFORE selection, BEFORE the
+    // gate, NEVER --yes-able (planner lock).
+    let conflicts: Vec<&str> = status
+        .rows
+        .iter()
+        .filter_map(|row| matches!(row.kind, StatusKind::Conflict).then_some(row.path.as_str()))
+        .collect();
+    if !conflicts.is_empty() {
+        let named: Vec<String> = conflicts.iter().map(|path| format!("\"{path}\"")).collect();
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "workspace push refused — {} member(s) changed on BOTH sides since \
+                 checkout: {}; pull a fresh checkout or reconcile manually — conflicts \
+                 are never force-pushed",
+                conflicts.len(),
+                named.join(", ")
+            ),
+        });
+    }
+
+    // 3. Selection — push-relative rows.
+    let would_write: Vec<String> = status
+        .rows
+        .iter()
+        .filter_map(|row| matches!(row.kind, StatusKind::LocalEdit).then_some(row.path.clone()))
+        .collect();
+    let locally_deleted: Vec<String> = status
+        .rows
+        .iter()
+        .filter_map(|row| {
+            matches!(row.kind, StatusKind::Deleted { local: true }).then_some(row.path.clone())
+        })
+        .collect();
+    let (would_delete, mut skipped): (Vec<String>, Vec<String>) = if delete {
+        (locally_deleted.clone(), Vec::new())
+    } else {
+        (Vec::new(), locally_deleted.clone())
+    };
+
+    // 4. Zero-write honesty: empty effective selection — ZERO
+    // mutation requests, no gate, no second export.
+    if would_write.is_empty() && would_delete.is_empty() {
+        return Ok(PushOutcome {
+            project: project.to_string(),
+            wrote: Vec::new(),
+            deleted: Vec::new(),
+            skipped,
+        });
+    }
+
+    // 5. THE gate — the refusal message IS the preview.
+    let preview = PushPreview {
+        rows: status.rows.clone(),
+        would_write: would_write.clone(),
+        would_delete: would_delete.clone(),
+    };
+    require_confirmation(yes, &preview)?;
+
+    // 6. Execute — the splice rides the RECORDED manifest mapping
+    // (never re-derived) into a FRESH export.
+    let manifest = read_manifest(root)?;
+    let fresh = export_zip_bytes(api, project).await?;
+    let mut spliced = fresh;
+    let mut wrote = Vec::new();
+    for member in &would_write {
+        let recorded = &manifest.members[member];
+        let bytes = std::fs::read(root.join(&recorded.local_path)).map_err(|err| {
+            CoreError::InvalidInput {
+                reason: format!(
+                    "workspace member \"{member}\" cannot be read from the checkout \
+                     tree (expected at \"{}\"): {err}",
+                    recorded.local_path
+                ),
+            }
+        })?;
+        spliced = replace_member(&spliced, member, &bytes)?;
+        wrote.push(member.clone());
+    }
+    let mut deleted = Vec::new();
+    for member in &would_delete {
+        match remove_member(&spliced, member) {
+            Ok(next) => {
+                spliced = next;
+                deleted.push(member.clone());
+            }
+            // The fresh export already lost it (deleted gateway-side
+            // between status and splice) — nothing to remove, report
+            // honestly.
+            Err(CoreError::NotFound { .. }) => skipped.push(member.clone()),
+            Err(other) => return Err(other),
+        }
+    }
+
+    // Exactly ONE import of the spliced fresh zip (overwrite — the
+    // existing import call; the splice rides proven replace/remove
+    // landing rules, so "import answers ok while nothing lands" stays
+    // closed).
+    api.project_import(project, spliced, true).await?;
+
+    Ok(PushOutcome {
+        project: project.to_string(),
+        wrote,
+        deleted,
+        skipped,
     })
 }
 

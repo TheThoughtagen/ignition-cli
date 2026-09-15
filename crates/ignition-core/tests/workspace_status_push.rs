@@ -573,3 +573,415 @@ async fn pristine_checkout_statuses_clean() {
             .all(|row| matches!(row.kind, StatusKind::Clean))
     );
 }
+
+// ---- Task 2: push — the guarded splice ---------------------------------------
+
+use ignition_core::actions::workspace::workspace_push;
+use ignition_core::error::CoreError;
+use std::io::Read as _;
+
+/// Open recorded import-body bytes for member inspection.
+fn open_zip(bytes: &[u8]) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+    zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("zip opens")
+}
+
+fn zip_member_bytes(
+    archive: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    name: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    archive
+        .by_name(name)
+        .unwrap_or_else(|_| panic!("member {name} present"))
+        .read_to_end(&mut bytes)
+        .expect("member reads");
+    bytes
+}
+
+/// A wiremock server that answers EVERY export of `demo` with `zip`,
+/// and records imports (zero expected by default).
+async fn export_server(zip: Vec<u8>, expected_exports: usize) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/demo",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(zip, "application/zip"))
+        .expect(expected_exports as u64)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The import mock — mounted scoped with the expected count, returns
+/// the guard so tests can re-parse the recorded BODY. With
+/// `expected_imports: 0` any stray import fails verification loudly
+/// at scope drop.
+async fn import_guard(
+    server: &wiremock::MockServer,
+    expected_imports: usize,
+) -> wiremock::MockGuard {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/demo",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status":"imported"})),
+        )
+        .expect(expected_imports as u64)
+        .mount_as_scoped(server)
+        .await
+}
+
+/// THE refusal traffic pin: without `--yes`, a push with work to do
+/// refuses at the ONE gate — exactly the status read GET, ZERO import
+/// calls, and the preview text riding the error envelope verbatim.
+#[tokio::test]
+async fn refused_push_pins_exact_traffic_and_preview_in_envelope() {
+    let (target, zip) = checkout_baseline().await;
+    let manifest = read_manifest(target.path()).expect("manifest");
+    std::fs::write(
+        target.path().join(&manifest.members[NESTED].local_path),
+        nested_json(99),
+    )
+    .expect("local edit");
+
+    let server = export_server(zip.clone(), 1).await; // status only — no splice export
+    let _imports = import_guard(&server, 0).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    let err = workspace_push(target.path(), &api, "demo", false, false)
+        .await
+        .expect_err("refuses without --yes");
+    match &err {
+        CoreError::ConfirmationRequired { operation } => {
+            assert_eq!(
+                operation,
+                &format!(
+                    "workspace push would write 1 member(s) and delete 0 member(s)\n  write: {NESTED}"
+                ),
+                "the refusal message IS the preview, deterministic"
+            );
+        }
+        other => panic!("confirmation_required expected, got {other}"),
+    }
+    assert_eq!(err.exit_code(), 2, "same class as usage");
+    assert!(
+        err.to_string()
+            .contains("workspace push would write 1 member(s)"),
+        "preview rides the Display: {}",
+        err
+    );
+}
+
+/// Zero-write honesty: a clean workspace push is a no-op — Ok even
+/// WITHOUT `--yes` (nothing destructive to confirm), exactly the
+/// status read GET, zero imports, empty wrote/deleted/skipped.
+#[tokio::test]
+async fn empty_selection_performs_zero_mutations_and_never_prompts() {
+    let (target, zip) = checkout_baseline().await;
+    let server = export_server(zip.clone(), 1).await;
+    let _imports = import_guard(&server, 0).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    let outcome = workspace_push(target.path(), &api, "demo", false, false)
+        .await
+        .expect("a no-op push never refuses");
+    assert_eq!(outcome.wrote, Vec::<String>::new());
+    assert_eq!(outcome.deleted, Vec::<String>::new());
+    assert_eq!(outcome.skipped, Vec::<String>::new());
+    assert_eq!(outcome.project, "demo");
+}
+
+/// `--delete` opt-in semantics: a locally-deleted member WITHOUT
+/// `--delete` is REPORTED as skipped — and because the effective
+/// selection is then empty, the push performs ZERO mutations.
+#[tokio::test]
+async fn local_deletion_without_delete_flag_is_skipped_with_zero_mutations() {
+    let (target, zip) = checkout_baseline().await;
+    let manifest = read_manifest(target.path()).expect("manifest");
+    std::fs::remove_file(target.path().join(&manifest.members[EXTRA].local_path))
+        .expect("local deletion");
+
+    let server = export_server(zip.clone(), 1).await;
+    let _imports = import_guard(&server, 0).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    let outcome = workspace_push(target.path(), &api, "demo", true, false)
+        .await
+        .expect("--yes; the refusal would only be about nothing");
+    assert_eq!(
+        outcome.skipped,
+        vec![EXTRA.to_string()],
+        "reported, never dropped"
+    );
+    assert_eq!(outcome.wrote, Vec::<String>::new());
+    assert_eq!(outcome.deleted, Vec::<String>::new());
+}
+
+/// With `--delete`, the locally-deleted member is REMOVED from the
+/// spliced fresh zip — the recorded import body provably lacks it,
+/// while every other member rides.
+#[tokio::test]
+async fn delete_opt_in_removes_only_the_locally_deleted_member() {
+    let (target, zip) = checkout_baseline().await;
+    let manifest = read_manifest(target.path()).expect("manifest");
+    std::fs::remove_file(target.path().join(&manifest.members[EXTRA].local_path))
+        .expect("local deletion");
+
+    let server = export_server(zip.clone(), 2).await; // status + splice
+    let imports = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/demo",
+        ))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status":"imported"})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    let outcome = workspace_push(target.path(), &api, "demo", true, true)
+        .await
+        .expect("push");
+    assert_eq!(outcome.deleted, vec![EXTRA.to_string()]);
+    assert_eq!(outcome.wrote, Vec::<String>::new());
+    assert_eq!(outcome.skipped, Vec::<String>::new());
+
+    let requests = imports.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import");
+    assert_eq!(
+        requests[0].url.path(),
+        "/data/api/v1/projects/import/demo",
+        "the recorded import is THE import"
+    );
+    let mut body = open_zip(&requests[0].body);
+    assert_eq!(
+        body.len(),
+        6,
+        "project.json + baseline minus the deleted member"
+    );
+    assert!(
+        body.by_name(EXTRA_RAW).is_err(),
+        "the spliced zip provably lacks the deleted member"
+    );
+    for present in [VIEW_RAW, DESC_RAW, NESTED_RAW, SCRIPT_RAW, GONE_RAW] {
+        assert!(
+            body.by_name(present).is_ok(),
+            "{present} rides the fresh base"
+        );
+    }
+}
+
+/// Conflict refusal: BOTH diverged members named, resolution hint
+/// attached, and it fires even WITH `--yes` — conflicts are beyond
+/// any flag (Pitfall W2). Traffic: the status read only.
+#[tokio::test]
+async fn conflict_refusal_fires_even_with_yes() {
+    let (target, zip) = checkout_baseline().await;
+    let manifest = read_manifest(target.path()).expect("manifest");
+    std::fs::write(
+        target.path().join(&manifest.members[DESC].local_path),
+        desc_json_v(3, 1_757_904_000_000, "sig-local"),
+    )
+    .expect("local semantic edit");
+    let moved = replace_member(
+        &zip,
+        DESC,
+        desc_json_v(2, 1_757_990_400_000, "sig-gw").as_bytes(),
+    )
+    .expect("gateway semantic edit");
+
+    let server = export_server(moved, 1).await;
+    let _imports = import_guard(&server, 0).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    let err = workspace_push(target.path(), &api, "demo", true, false)
+        .await
+        .expect_err("conflicts refuse even with --yes");
+    assert!(matches!(err, CoreError::InvalidInput { .. }), "{err}");
+    assert_eq!(err.exit_code(), 2);
+    let message = err.to_string();
+    assert!(message.contains("changed on BOTH sides"), "{message}");
+    assert!(
+        message.contains(DESC),
+        "names the diverged member: {message}"
+    );
+    assert!(
+        message.contains("pull a fresh checkout or reconcile manually"),
+        "resolution hint: {message}"
+    );
+    assert!(
+        message.contains("conflicts are never force-pushed"),
+        "{message}"
+    );
+}
+
+/// THE splice-into-fresh proof: the gateway diverges on an UNRELATED
+/// member between checkout and push — the pushed zip carries the
+/// GATEWAY's version of that member (not checkout's), while the
+/// edited member carries the LOCAL bytes. Traffic: two read exports
+/// (status + splice) and ONE import whose recorded body is re-parsed.
+#[tokio::test]
+async fn yes_push_splices_local_edits_into_a_fresh_export() {
+    let zip0 = baseline_zip();
+    let zip1 = replace_member(&zip0, SCRIPT, SCRIPT_GW).expect("gateway drift");
+
+    let server = wiremock::MockServer::start().await;
+    // Matching rides MOUNT ORDER: the zip0 mock (up to once) answers
+    // checkout; every later export sees the MOVED-ON zip1.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/demo",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_raw(zip0.clone(), "application/zip"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/demo",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_raw(zip1.clone(), "application/zip"),
+        )
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let target = tempfile::tempdir().expect("target");
+    workspace_checkout(&api, "demo", target.path(), "test-profile", false)
+        .await
+        .expect("checkout from zip0");
+
+    // Local edit while the gateway moves on (zip1).
+    let manifest = read_manifest(target.path()).expect("manifest");
+    std::fs::write(
+        target.path().join(&manifest.members[NESTED].local_path),
+        nested_json(99),
+    )
+    .expect("local edit");
+
+    let imports = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/demo",
+        ))
+        .and(wiremock::matchers::query_param("overwrite", "true"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status":"imported"})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let outcome = workspace_push(target.path(), &api, "demo", true, false)
+        .await
+        .expect("push");
+    assert_eq!(outcome.wrote, vec![NESTED.to_string()]);
+    assert!(outcome.deleted.is_empty() && outcome.skipped.is_empty());
+
+    let requests = imports.received_requests().await;
+    assert_eq!(requests.len(), 1, "exactly ONE import");
+    let mut body = open_zip(&requests[0].body);
+    assert_eq!(
+        zip_member_bytes(&mut body, NESTED_RAW),
+        nested_json(99).into_bytes(),
+        "the edited member carries the LOCAL bytes"
+    );
+    assert_eq!(
+        zip_member_bytes(&mut body, SCRIPT_RAW),
+        SCRIPT_GW.to_vec(),
+        "the unrelated member carries the GATEWAY's fresh version — never checkout's"
+    );
+    assert_eq!(
+        zip_member_bytes(&mut body, GONE_RAW),
+        GONE_BYTES.to_vec(),
+        "untouched members ride the fresh base verbatim"
+    );
+    assert_eq!(
+        body.len(),
+        7,
+        "project.json + six members — nothing resurrected, nothing lost"
+    );
+}
+
+/// A locally-deleted member the fresh export has ALREADY lost is a
+/// skipped no-op, not a removal error: status sees it as
+/// Deleted{local:true} (the gateway still had it), then the gateway
+/// drops it before the splice export — remove finds nothing, the
+/// outcome reports skipped honestly, and the ONE import still rides
+/// the fresh base.
+#[tokio::test]
+async fn delete_of_an_already_gone_member_is_skipped_not_an_error() {
+    let zip0 = baseline_zip();
+    let zip_late = remove_member(&zip0, EXTRA).expect("gateway drops EXTRA late");
+    let server = wiremock::MockServer::start().await;
+    // MOUNT ORDER matching: zip0 answers checkout AND the status
+    // export (EXTRA still present gateway-side → Deleted{local:true}),
+    // the late mock answers the SPLICE export (EXTRA already gone).
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/demo",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_raw(zip0.clone(), "application/zip"),
+        )
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/demo",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_raw(zip_late.clone(), "application/zip"),
+        )
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let target = tempfile::tempdir().expect("target");
+    workspace_checkout(&api, "demo", target.path(), "test-profile", false)
+        .await
+        .expect("checkout");
+    let manifest = read_manifest(target.path()).expect("manifest");
+    std::fs::remove_file(target.path().join(&manifest.members[EXTRA].local_path))
+        .expect("local deletion");
+
+    let imports = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/import/demo",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status":"imported"})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let outcome = workspace_push(target.path(), &api, "demo", true, true)
+        .await
+        .expect("the vanished member is skipped, not an error");
+    assert_eq!(outcome.skipped, vec![EXTRA.to_string()], "honest skip");
+    assert_eq!(outcome.deleted, Vec::<String>::new());
+    assert_eq!(outcome.wrote, Vec::<String>::new());
+    let requests = imports.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the selection was non-empty at the gate — ONE import"
+    );
+    let mut body = open_zip(&requests[0].body);
+    assert!(
+        body.by_name(EXTRA_RAW).is_err(),
+        "the imported zip carries the gateway's own deletion"
+    );
+}
