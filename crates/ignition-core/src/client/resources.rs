@@ -67,7 +67,10 @@ pub struct ResourceEntry {
 /// silently not adopted (no parent descriptor can exist), and a file
 /// named `resources` collides with the module's reserved resources
 /// container (HTTP 500, "module folder must have folder flag set").
-fn member_path(user_path: &str) -> String {
+/// `pub(crate)` for 13-05: the edit pipeline locates a member's
+/// decoded file inside the raw-name decode tree with the SAME
+/// mapping (single source — never a re-implementation).
+pub(crate) fn member_path(user_path: &str) -> String {
     match user_path.split_once('/') {
         Some((collection, rest)) => format!("{collection}/resources/{rest}"),
         None => format!("{user_path}/resources/{user_path}"),

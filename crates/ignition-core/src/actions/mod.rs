@@ -10,6 +10,7 @@ pub mod connections;
 pub mod diagnostics;
 pub mod doctor;
 pub mod eam;
+pub mod edit;
 pub mod gan;
 pub mod inspect;
 pub mod license;
