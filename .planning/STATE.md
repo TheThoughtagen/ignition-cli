@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 TUI theming & degradation COMPLETE (verifier passed 3/3 success criteria — 12-VERIFICATION.md; named themes via [ui].theme live across all screens, authored 4-tier degradation palettes, tokenization CI grep negative-proven; two UAT-driven tuning rounds: palette hardening 756e888 + dormant-slot wiring, then body-content tint 27df248 — dark = blue-chromed cockpit, WCAG-AAA body contrast, default/mono byte-identical pre/post); next: Phase 13 (Historian rig access confirmation REQUIRED before planning). SC-5 (Phase 10) follow-up still open — capture scheduled/false post-suspend vanish behavior (fresh + long-lived rigs), re-size/re-shape the §2 check, gate re-run
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 COMPLETE+verified; Phase 13 historian spike CLOSED (13-01: user declined the Designer step 2026-09-15 → write-path replay proved the binding recipe live on BOTH trial rigs, SPIKE VERDICT: closure, field set [historyEnabled, historyProvider, sampleMode]; 13-02 MemberSource landed) — next: 13-03 (workspace file engine)
 
 ## Current Position
 
-**Phase:** 12 of 14 (12-tui-theming-degradation) — COMPLETE, verified passed 3/3
-**Current Plan:** 4
-**Total Plans in Phase:** 4 (12-01, 12-02, 12-03, 12-04 ALL DONE incl. 3-round human-verify checkpoint)
-**Status:** Phase 12 verified passed (3/3 success criteria, 12-VERIFICATION.md) — user approved tuned themes 2026-09-14; ready for Phase 13 planning (after Historian rig access confirmation)
-**Last Activity:** 2026-09-14
+**Phase:** 13 of 14 (composite-engine-workspace-historian-edit) — IN PROGRESS
+**Current Plan:** 13-03 (next unexecuted; 13-01 and 13-02 COMPLETE with summaries)
+**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03…13-08 pending)
+**Status:** 13-01 closed — spike verdict: closure (Designer branch skipped by user decision; write-path replay proved the recipe on both rigs); zero product code
+**Last Activity:** 2026-09-15
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 93%
 
 ## Performance Metrics
 
@@ -29,8 +29,8 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 9 | 0/TBD | - | - |
 | 10 | 0/TBD | - | - |
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
-| 12 | 1/4 | 8 min | 8 min |
-| 13 | 0/TBD | - | - |
+| 12 | 4/4 | 90 min | 22 min avg |
+| 13 | 2/8 | 33 min | ~17 min avg |
 | 14 | 0/TBD | - | - |
 
 *Updated after each plan completion*
@@ -69,6 +69,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 12 P03 | 18 min | 3 tasks | 7 files |
 | Phase 12 P04 | 50 min | 2 tasks | 2 files |
 | Phase 13 P02 | 19 min | 3 tasks | 5 files |
+| Phase 13 P01 | 14 min (close session; full plan 21:46Z Sep-14 → 02:22Z Sep-15) | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -178,6 +179,10 @@ Recent decisions affecting current work:
 - [Phase 13 / 13-02]: workspace path mapping is per-segment percent-escaping over the safe alphabet [A-Za-z0-9._-] with %XX as the ONLY escape form (no double-decode trap — literal %2e never collapses to .); refusals fail-closed riding invalid_input exit 2: ./.. segments, NUL, empty segments (same class as .), 255-byte cap checked on the ESCAPED name — the SC-2 bijection/round-trip/refusal properties are machine-proven by proptest P1–P4 over hostile corpora (case pairs, percent traps, control bytes, NFC/NFD, deep nesting) — 13-03 writes files through this mapping and RECORDS gateway↔local pairs; status/push never re-derive (Pitfall W1)
 - [Phase 13 / 13-02]: set-level injectivity enforced at build_mapping — ASCII case-fold collisions refuse naming BOTH members with order-stable messages (the APFS Pitfall-W1 class), exact duplicates refuse, unicode folding stays OFF (NFC/NFD remain distinct files); sabotage check performed (fold-guard disabled → P6 red → reverted) proving the tests bite
 - [Phase 13 / 13-02]: MemberSource (Zip | Tree) gives the proven resources.rs engine TWO transports with ONE implementation — Zip delegates verbatim (only fnv1a + FOLDER_DESCRIPTOR widened to pub(crate)), Tree reads through the recorded mapping with identical descriptor-normalized hash semantics (equivalence test-pinned incl. differing lastModification values); tree is MANIFEST-SCOPED strict (unknown file / missing member = invalid_input) — 13-06's status handles unknown files at the action layer; proptest is a dev-dependency of ignition-core ONLY (lean build never compiles it)
+- [Phase 13]: 13-01: Designer-diff oracle ABORTED by user decision 2026-09-15 ('we can assume it works') — replaced by a live write-path replay; SPIKE VERDICT: closure — field set [historyEnabled, historyProvider, sampleMode] landed + read back on BOTH rigs, written value 44 proven in history on both — 13-04 implements the TAGS-14 closure branch from the pinned field-set table in 13-LIVE-CAPTURES.md; its own live gate re-proves
+- [Phase 13]: 13-01: historical-tag-group key NOT required for a functional binding (gateway default group at sampleMode=TagGroup — data-row cadence proof); historicalScanclass never pre-committed anywhere — answers the research OQ mystery without a guessed key; 13-04 recipe stays 3 keys
+- [Phase 13]: 13-01: provider-API routes corrected by live proof — find is /resources/find/{module}/{type}/{name} (not {create-path}/find/{name}); delete /resources/{module}/{type}/{name}/{signature}; e2e_webdev.rs:899 historian delete identified as silent no-op (non-200→'already gone') — 13-04 to fix harness — recorded finding; zero product code in 13-01
+- [Phase 13]: 13-01: tags config edit REPLACES the whole node (dataType/defaultValue dropped, value→null) — the TAGS-14 closure recipe must carry the complete node shape in one edit — read-back side effect captured on both rigs
 
 ### Pending Todos
 
@@ -186,7 +191,7 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- [Phase 13 prerequisite]: Confirm licensed-Historian rig access before starting Phase 13 planning — spike cannot proceed without it (documented-limitation fallback is legitimate, but access confirmation must happen first)
+- [Phase 13 prerequisite — RESOLVED 2026-09-14/15]: licensed-Historian rig access confirmed via resettable 2h trial windows; the spike itself closed 13-01 with a CLOSURE verdict — 13-04 implements the TAGS-14 closure branch (recipe pinned in 13-LIVE-CAPTURES.md) and should also fold in the e2e harness find/delete route fix (harness historian delete was a silent no-op)
 - [Phase 11 prerequisite — RESOLVED by 11-01]: Real multi-level UDT export captured (artifacts/udt-multilevel.xml, sha-pinned) — the derive-vs-Event-loop decision now has its fixture
 - SC-5 (Phase 10) NOT closed by a passing gate run — env blocker RESOLVED via the UAT-recorded disposable-rig substitution (10-06 ran twice on ign-uat-836, torn down clean), but the §2 vanish poll failed both times (grace row >90s ×2; drift recorded 10-LIVE-GATE.md §4 D1). Follow-up gap work: dedicated capture of scheduled/false post-suspend vanish behavior across fresh + long-lived rigs → re-size the 90s deadline (or re-shape the check) → gate re-run. Rig access is a documented recipe (10-RIG-NOTES + gate §5), not a user dependency.
 - Parallel-wave note for 11-03 verify gates: pre-existing fmt drift (live_gateway.rs, ignition-tui/ui/mod.rs — Phase-10 commits) plus 11-03's own by-design RED tag_loss tests make workspace-wide cargo fmt --check / cargo test --workspace red independent of 11-02; 11-02 verified clean in an isolated worktree at 34d6594 (clippy -D warnings green, zero failures outside tag_loss RED tests)
@@ -194,5 +199,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-14T19:08:12.836Z
+**Last session:** 2026-09-15T02:21:53.356Z
 **Resume file:** None
