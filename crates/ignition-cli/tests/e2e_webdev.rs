@@ -1301,21 +1301,32 @@ async fn live_tags_history_bindings() {
     // ONCE on a miss.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the tagHistory route's precondition)", &out);
+    // The sweep itself is POLLED (30 s): a just-imported servlet's
+    // first activation can lag seconds-to-minutes (the 11-06
+    // first-activation tolerance) — a single-shot sweep would fail
+    // the heal path spuriously (13-04 rig-B run 1).
     let sweep_all_present = |config: &Path, env: &LiveEnv| -> bool {
-        let out = ign(config, env, &["webdev", "status", "--compact"]);
-        out.status.success()
-            && ["tags", "tagConfig", "alarms", "tagHistory"]
-                .iter()
-                .all(|route| {
-                    data_envelope(&out)["data"]["routes"]
-                        .as_array()
-                        .map_or(false, |rows| {
-                            rows.iter().any(|row| {
-                                row["route"].as_str() == Some(*route)
-                                    && row["status"].as_str() == Some("present")
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let out = ign(config, env, &["webdev", "status", "--compact"]);
+            let healthy = out.status.success()
+                && ["tags", "tagConfig", "alarms", "tagHistory"]
+                    .iter()
+                    .all(|route| {
+                        data_envelope(&out)["data"]["routes"]
+                            .as_array()
+                            .map_or(false, |rows| {
+                                rows.iter().any(|row| {
+                                    row["route"].as_str() == Some(*route)
+                                        && row["status"].as_str() == Some("present")
+                                })
                             })
-                        })
-                })
+                    });
+            if healthy || std::time::Instant::now() >= deadline {
+                return healthy;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
     };
     if !sweep_all_present(&config, &env) {
         eprintln!("deploy: mount race (a core route absent) — redeploying once (11-06 lesson)");
@@ -1366,9 +1377,10 @@ async fn historian_binding_body(
             );
         }
         // Settle FIRST (the deploy import's model-rebuild tail on
-        // cycle 1; the recreate tail on later cycles), then clear any
-        // prior cycle's node.
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        // cycle 1; the recreate tail on later cycles — 30 s, rig B's
+        // just-RUNNING gateway orphaned every 15 s settle), then
+        // clear any prior cycle's node.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         clean_tag_configs(config, env, std::slice::from_ref(&tag));
 
         // (2) The bound tag — the closure recipe, complete node shape
