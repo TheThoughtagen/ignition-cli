@@ -6,8 +6,8 @@
 
 | Rig | Window START (UTC) | RUNNING (UTC) | Window END (UTC) | Note |
 | --- | ------------------ | ------------- | ---------------- | ---- |
-| A (8.3.6) | 21:46:32 (container created) | 21:49:41 | _pending — recorded at Task 3 teardown_ | 2h image-trial budget ends ~23:46Z |
-| B (8.3.3) | 21:46:47 (container created) | 21:50:01 | _pending — recorded at Task 3 teardown_ | same |
+| A (8.3.6) | 21:46:32 (container created, 2026-09-14) | 21:49:41 | 02:15:47 (2026-09-15, teardown) | 2h image-trial window re-armed ~01:50Z (7199 s, exp. ~03:50Z) for the 09-15 session; trials were re-armed WITHOUT restarting the gateways — all staged state (provider, tag, token, bundle) survived |
+| B (8.3.3) | 21:46:47 (container created, 2026-09-14) | 21:50:01 | 02:15:50 (2026-09-15, teardown) | same |
 
 Pre-flight (21:44Z): Docker/OrbStack up; **port 18188 was held by `ign-uat-836`** — the Phase-10 UAT disposable rig (that phase complete and verified). Removed (`docker rm -f ign-uat-836`) to free the plan-mandated port; ports 18188/19188 confirmed LISTEN-free before launch. Stale EXITED `ign-p11-*` containers from Phase 11 (torn down after 11-06, exit 137) left as-is — no port conflict; the new rigs use fresh names (`ign-p13-*`). Both images cached locally (Phases 4–11).
 
@@ -59,13 +59,21 @@ The unchanged `provision_token.sh` (Phases 4–11 recipe) with names **`p13tok83
 
 - `ign tags config get '[default]P13H/T1' --json` → `artifacts/config-before-836.json` / `artifacts/config-before-833.json` (both exit 0, JSON-parse clean). Unbound baseline: no history keys present.
 
-## Post-Designer capture (staged, one command)
+## Staged capture scripts (Task 1) — superseded by the aborted Designer branch
 
-`/tmp/ign-p13-rigs/capture.sh` (executable, syntax-checked): per rig runs the AFTER `tags config get`, validates JSON, and writes `artifacts/designer-diff-{836,833}.txt` via `diff <(jq -S . before) <(jq -S . after)` — machine-generated, never hand-edited. **The window's only interactive step is the Designer binding itself (Task 2 checkpoint).**
+`/tmp/ign-p13-rigs/capture.sh` was staged for the post-Designer BEFORE/AFTER diff (machine-generated via `diff <(jq -S . before) <(jq -S . after)`), but the Designer step was declined (user decision 2026-09-15) and it was never run — replaced by `replay.sh` (write-path replay) + `cleanup.sh`, below.
 
-## Teardown state — INTENTIONAL KEEP-ALIVE (pending Task 3)
+## Provider-API route finding (corrected 2026-09-15, live-proven both rigs)
 
-Both rigs are deliberately KEPT ALIVE through the Task-2 Designer checkpoint (containers `ign-p13-836` / `ign-p13-833-ignition-1`, named volume `ign-p13-833_gateway_data`, scratch dir `/tmp/ign-p13-rigs/` with tokens.env/config.toml/capture.sh intact). Task 3 performs the spike cleanup per rig (`tags config delete` both spike tags, historian provider delete per the e2e_webdev.rs:899 find→signature→DELETE shape) and records the window END times + final teardown here. If the 2h window expires while Task 2 waits: re-spin per this file's recipe with a NEW unique provider suffix and repeat only the Designer step.
+`GET /data/api/v1/resources/com.inductiveautomation.historian/historian-provider/find/{name}` — the plan-recorded e2e_webdev.rs:899 shape — **does not exist**: Jetty HTML 404 "No route match" on both rigs (collection GET and `GET {create-path}/{name}` likewise 404; only the POST create route exists on that mount). The e2e harness's non-200→"already gone" tolerance masked this — its historian DELETE was always a silent no-op. WORKING routes (see 13-LIVE-CAPTURES.md §Provider API wire finding for the table): find `GET /data/api/v1/resources/find/{module}/{type}/{name}` (200, carries `signature`), list `GET /resources/list/{module}/{type}`, delete `DELETE /resources/{module}/{type}/{name}/{signature}` (success: true, HTTP 200). Left as a recorded follow-up for 13-04 — this plan touches zero product code.
+
+## Cleanup + teardown (modified Task 3, 2026-09-15)
+
+Per rig via `/tmp/ign-p13-rigs/cleanup.sh` (log in `/tmp/ign-p13-rigs/cleanup-out/`): spike tag deleted (`deleted: 1` both; final get reports `tag_type: "Unknown"`) → provider find → signature → DELETE (success true, HTTP 200 both) → verified gone (find 404, list 0 items). Replay evidence scripted by `/tmp/ign-p13-rigs/replay.sh` (log `replay-run.log`).
+
+## Teardown state — COMPLETE (02:15:47–02:15:50Z, 2026-09-15)
+
+Rig A `docker rm -f ign-p13-836` — removed. Rig B `docker compose -p ign-p13-833 --project-directory /tmp/ign-p13-rigs/ign-p13-833 down -v` — container/network/named volume (`ign-p13-833_gateway_data`) removed. Post-teardown: zero `ign-p13*` containers, zero `ign-p13*` volumes. Scratch dir `/tmp/ign-p13-rigs/` (tokens.env 0600, config.toml, replay.sh, cleanup.sh, logs) remains outside the repo for forensics; no secret material ever entered the repo.
 
 ---
-*Executed: 2026-09-14, Task 1 of 13-01 (GSD executor, autonomous run). Window T0 21:46Z.*
+*Executed: 2026-09-14 (Task 1 staging) + 2026-09-15 (modified Task 3 replay/cleanup/teardown, GSD executor continuation). Task-2 Designer branch skipped by user decision 2026-09-15 — see 13-LIVE-CAPTURES.md §Aborted Designer branch.*
