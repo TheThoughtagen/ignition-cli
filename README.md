@@ -1091,6 +1091,36 @@ byte-identically to the pre-TAGS-13 output (pinned by test), and the
 compact/JSON envelope is unchanged (the full `config` passthrough
 already carries the keys there).
 
+**The binding recipe (TAGS-14, live-proven on both trial rigs):**
+binding a tag to a storage provider is a plain tag-config write —
+the CLI's existing `tags config create|edit` passthrough needs NO
+new surface. Provision an InternalHistorian first (native REST, no
+database: `POST /data/api/v1/resources/com.inductiveautomation.historian/historian-provider`
+with the array body `[{name, type: "com.inductiveautomation.historian/historian-provider",
+collection: "core", enabled: true, config: {profile: {type:
+"InternalHistorian"}, settings: {}}}]`), then send the COMPLETE node
+shape plus the three history keys in ONE write:
+
+```json
+{"tagType": "AtomicTag", "dataType": "Int4", "value": 0,
+ "historyEnabled": true, "historyProvider": "my-historian",
+ "sampleMode": "TagGroup"}
+```
+
+Two wire truths make the "complete node shape" mandatory (both from
+the 13-01 captures): (1) `tags config` writes REPLACE the whole node
+— an edit that sends only the history keys silently drops
+`dataType`/`defaultValue` and nulls `value`; (2) NO historical-group
+key is needed — at `sampleMode: "TagGroup"` the gateway binds its
+DEFAULT historical group. Follow-through: write tag values, then
+`ign tags history query` — the tag-group scan stores at 40–50 s
+cadence, so allow a couple of scans before expecting the written
+values as DATA rows (live-proven on 8.3.6 AND 8.3.3; the e2e gate
+`live_tags_history_bindings` re-proves the full chain). Provider
+cleanup rides the generic resources API: find
+`GET /data/api/v1/resources/find/{module}/{type}/{name}` → signature
+→ `DELETE /data/api/v1/resources/{module}/{type}/{name}/{signature}`.
+
 ### Bulk export/import (the portability loop)
 
 `tags export` → `tags import` moves a tag subtree between providers
@@ -1257,17 +1287,14 @@ historian: an **InternalHistorian needs no database** — creatable
 via native REST
 (`POST /data/api/v1/resources/com.inductiveautomation.historian/historian-provider`,
 profile type `InternalHistorian`; the e2e gate provisions one
-live). The e2e gate also runs the bounded tag↔historian **binding
-spike** (05-RESEARCH's open question): the base shape
-(`historyEnabled: true` + `historicalProvider` on the tag) stores
-and the historian registers, but queryTagHistory still answers null
-— none of the documented candidates (execution scan-class keys,
-aggregation variations, browseHistoricalTags cross-check) produced
-data within the budget. **Outcome: documented limitation** — the
-query capability is the phase criterion; the Designer-diff
-follow-up (create one history tag by hand in the Designer, `tags
-config get` it via this CLI, diff the shapes) is the resolution
-path.
+live). **The tag↔historian binding is CLOSED (13-01 spike, both
+rigs):** the Phase-5 "documented limitation" was a key-name typo —
+`historicalProvider` never bound; the captured field set
+`historyEnabled` + `historyProvider` + `sampleMode: "TagGroup"`
+(discussed in **Tag↔historian bindings** above) landed, read back,
+and returned WRITTEN values from history on 8.3.6 AND 8.3.3. The
+e2e gate `live_tags_history_bindings` re-proves the full chain on
+licensed trial rigs.
 
 ### Phase 5 requirement map
 

@@ -21,6 +21,12 @@
 //! | `IGNITION_LIVE_TOKEN` | every test | full `name:key` API-token string |
 //! | `IGNITION_LIVE_MUTATIONS` | the loop test + the two 11-06 mutation gates | `1` to allow the deploys / tag-subtree seeding |
 //!
+//! The 13-04 historian binding gate (`live_tags_history_bindings`)
+//! also MUTATES (provisions a unique `p13hist<run>` InternalHistorian
+//! plus a bound tag) — `IGNITION_LIVE_MUTATIONS=1` required, and
+//! it re-proves the 13-01 closure recipe end-to-end (bind → TAGS-13
+//! render → written value proven in history).
+//!
 //! The 11-06 bulk-transfer gates: `live_tags_xml_fidelity_roundtrip`
 //! and `live_tags_csv_roundtrip` MUTATE the gateway (they seed
 //! `P11Live*`/`P11Csv*` subtrees and import) — `IGNITION_LIVE_MUTATIONS=1`
@@ -893,25 +899,35 @@ async fn provision_internal_historian(env: &LiveEnv, name: &str) {
     println!("historian {name} provisioned (HTTP {status})");
 }
 
-/// Delete the InternalHistorian (find → signature → DELETE — the
-/// tag-provider delete chain's shape). A find miss means it is
-/// already gone.
+/// Delete the InternalHistorian — the CORRECTED resources-API chain
+/// (13-01's live-proven route finding): find is the GENERIC mount
+/// `GET /data/api/v1/resources/find/{module}/{type}/{name}` (the
+/// provider-prefixed `…/resources/{module}/{type}/find/{name}` shape
+/// used here before 13-04 returns Jetty-404 "No route match" on every
+/// rig — the old non-200→"already gone" tolerance made this delete a
+/// SILENT NO-OP for its whole life), and delete takes the signature:
+/// `DELETE /data/api/v1/resources/{module}/{type}/{name}/{signature}`.
+/// The delete is VERIFIED: re-find must answer 404 — the
+/// teardown-clean contract, no more silent no-ops. A 404 on the
+/// first find means it is already gone.
 async fn delete_internal_historian(env: &LiveEnv, name: &str) {
     let client = reqwest::Client::new();
-    let find_url = format!("{}{HISTORIAN_PROVIDER_PATH}/find/{name}", env.url);
+    let find_url = format!(
+        "{}/data/api/v1/resources/find/com.inductiveautomation.historian/historian-provider/{name}",
+        env.url
+    );
     let response = client
         .get(&find_url)
         .header("X-Ignition-API-Token", &env.token)
         .send()
         .await
         .expect("historian find reaches the gateway");
-    if response.status().as_u16() != 200 {
-        println!(
-            "historian {name} already gone (find → {})",
-            response.status()
-        );
+    let status = response.status().as_u16();
+    if status == 404 {
+        println!("historian {name} already gone (find → 404)");
         return;
     }
+    assert_eq!(status, 200, "historian find answered HTTP {status}");
     let record: Value = response.json().await.expect("find record parses");
     let Some(signature) = record.get("signature").and_then(Value::as_str) else {
         println!("historian {name} find record carried no signature — leaving it (manual cleanup)");
@@ -924,10 +940,25 @@ async fn delete_internal_historian(env: &LiveEnv, name: &str) {
         .send()
         .await
         .expect("historian delete reaches the gateway");
-    println!(
-        "historian {name} deleted (HTTP {})",
-        response.status().as_u16()
+    let status = response.status().as_u16();
+    assert_eq!(
+        status, 200,
+        "historian {name} delete answered HTTP {status}"
     );
+    // VERIFY gone: the re-find must answer 404 (the 13-01 cleanup
+    // chain's proof, now in-harness).
+    let response = client
+        .get(&find_url)
+        .header("X-Ignition-API-Token", &env.token)
+        .send()
+        .await
+        .expect("historian re-find reaches the gateway");
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "historian {name} still findable after delete — the teardown was NOT clean"
+    );
+    println!("historian {name} deleted + verified gone (find → 404)");
 }
 
 /// Do the history rows carry ANY non-null value cell (beyond the
@@ -941,6 +972,43 @@ fn history_has_data(envelope: &Value) -> bool {
             .map(|cells| cells.iter().skip(1).any(|cell| !cell.is_null()))
             .unwrap_or(false)
     })
+}
+
+/// Do the history rows carry a SPECIFIC numeric value anywhere beyond
+/// the t_stamp column? The closure data oracle (13-01's proof shape:
+/// the WRITTEN value proven in history — stronger than any-non-null,
+/// which the binding's initial 0 row would satisfy).
+fn history_rows_contain(envelope: &Value, value: i64) -> bool {
+    envelope["data"]["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter().any(|row| {
+                row.as_array()
+                    .map(|cells| {
+                        cells
+                            .iter()
+                            .skip(1)
+                            .any(|cell| cell.as_i64() == Some(value))
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// expect_ok's Result twin for gate bodies that must ALWAYS reach
+/// their cleanup (the finally pattern): same failure detail, no
+/// panic — the caller cleans up, THEN propagates.
+fn ensure_ok(what: &str, out: &Output) -> Result<(), String> {
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} FAILED (exit {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
 }
 
 /// THE tag-history live fixture + binding spike (05-06, TAGS-08 —
@@ -1173,6 +1241,189 @@ async fn live_tags_history_historian_and_binding_spike() {
     );
     expect_ok("config delete the history tag", &out);
     delete_internal_historian(&env, "p5hist").await;
+}
+
+/// THE historian binding live gate (13-04, TAGS-14 CLOSURE branch —
+/// the 13-01 spike recipe re-proven end-to-end; field set
+/// capture-locked to 13-LIVE-CAPTURES.md §Field-set table):
+///
+/// 1. provision `InternalHistorian` with a UNIQUE `p13hist<run>`
+///    name via native REST (no database — the 05-RESEARCH recipe),
+/// 2. create the bound tag — the CLOSURE RECIPE: the COMPLETE node
+///    shape (`tags config` writes REPLACE the whole node — 13-01
+///    wire truth) plus the captured three-key field set
+///    (`historyEnabled` + `historyProvider` + `sampleMode:
+///    "TagGroup"`; the historical-group key is NOT needed — the
+///    gateway's DEFAULT group binds, 13-01 bonus finding),
+/// 3. TAGS-13 live assert: `ign tags config get` HUMAN output
+///    carries the additive `history:` block naming the live provider,
+/// 4. write 42/43/44, then poll `tags history query` (bounded — the
+///    tag-group scan stores at 40–50 s cadence, 13-01 data probe)
+///    until the WRITTEN 44 appears: DATA rows are the closure
+///    evidence. A null-data outcome on this branch is a DRIFT
+///    FINDING (the gate fails loudly; 13-LIVE-GATE.md records it —
+///    capture wins, never code around it),
+/// 5. FINALLY: tag + historian deletion runs regardless of the
+///    body's outcome, and the historian delete VERIFIES gone
+///    (re-find → 404 — the corrected harness chain).
+#[tokio::test]
+#[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN + IGNITION_LIVE_MUTATIONS=1"]
+async fn live_tags_history_bindings() {
+    let Some(env) = live_env_mutations() else {
+        skip(
+            "IGNITION_LIVE_MUTATIONS=1 (with URL+TOKEN) not set — refusing to touch a live gateway",
+        );
+        return;
+    };
+    let (_dir, config) = isolated_live_config(&env);
+    // THE serializer: one live gate at a time (shared gateway state).
+    let _gate = LIVE_GATE.lock().await;
+    // UNIQUE historian name per run (the 11-06 discipline — dozens of
+    // same-name cycles degrade a rig's tag model; virgin namespaces).
+    let historian = format!("p13hist{}", now_ms());
+    let tag = "[default]P13H/T1";
+
+    // Pre-clean leftovers (idempotent re-runs): the tag first (create
+    // over an existing node would abort), then the historian.
+    clean_tag_configs(&config, &env, &[tag]);
+    delete_internal_historian(&env, &historian).await;
+
+    // Routes first: history query refuses exit 6 without them.
+    let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
+    expect_ok("deploy (the tagHistory route's precondition)", &out);
+
+    let outcome = historian_binding_body(&config, &env, &historian, tag).await;
+
+    // FINALLY: self-cleaning regardless of the body's outcome (the
+    // corrected historian chain verifies gone).
+    clean_tag_configs(&config, &env, &[tag]);
+    delete_internal_historian(&env, &historian).await;
+
+    if let Err(message) = outcome {
+        panic!("{message}");
+    }
+}
+
+/// The gate's asserting body, Result-shaped so the FINALLY above
+/// always runs (ensure_ok instead of expect_ok inside).
+async fn historian_binding_body(
+    config: &Path,
+    env: &LiveEnv,
+    historian: &str,
+    tag: &str,
+) -> Result<(), String> {
+    // (1) The historian — native REST, no database.
+    provision_internal_historian(env, historian).await;
+
+    // (2) The bound tag — the closure recipe, complete node shape +
+    // the captured three-key field set.
+    let out = ign_stdin(
+        config,
+        env,
+        &["tags", "config", "create", tag, "--file", "-", "--compact"],
+        &format!(
+            r#"{{"tagType": "AtomicTag", "dataType": "Int4", "value": 0, "historyEnabled": true, "historyProvider": "{historian}", "sampleMode": "TagGroup"}}"#
+        ),
+    );
+    ensure_ok("config create the bound tag (closure recipe)", &out)?;
+
+    // (3) TAGS-13 live assert — the HUMAN render carries the additive
+    // history block with the LIVE provider name (no --compact).
+    let out = ign(config, env, &["tags", "config", "get", tag]);
+    ensure_ok("config get the bound tag", &out)?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "history:",
+        "  enabled: true",
+        &format!("  provider: {historian}"),
+        "  sample mode: TagGroup",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "TAGS-13 live render missing {needle:?}:\n{stdout}"
+        );
+    }
+    println!("TAGS-13 live: history block present for {tag} (provider {historian})");
+
+    // (4) Write values (spaced), then poll the query until the
+    // WRITTEN 44 lands — the tag-group scan stores at 40–50 s
+    // cadence (13-01 data probe), so the poll is bounded and patient.
+    let start_ms = now_ms() - 60_000;
+    for value in [42, 43, 44] {
+        let out = ign(
+            config,
+            env,
+            &[
+                "tags",
+                "write",
+                tag,
+                "--value",
+                &value.to_string(),
+                "--compact",
+            ],
+        );
+        ensure_ok("write a history value", &out)?;
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    }
+    let end_ms = now_ms() + 5_000;
+    let query_args = |start_ms: i64, end_ms: i64| {
+        vec![
+            "tags".to_string(),
+            "history".to_string(),
+            "query".to_string(),
+            (*tag).to_string(),
+            "--start".to_string(),
+            start_ms.to_string(),
+            "--end".to_string(),
+            end_ms.to_string(),
+            "--compact".to_string(),
+        ]
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+    loop {
+        let args = query_args(start_ms, end_ms);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = ign(config, env, &refs);
+        ensure_ok("history query", &out)?;
+        let envelope = data_envelope(&out);
+        // Structural pins while we're here (the 05-06 wire truths):
+        // t_stamp leads, the tag column rides provider-relative.
+        let columns = envelope["data"]["columns"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if columns.first().and_then(Value::as_str) != Some("t_stamp") {
+            return Err(format!("history query lost the t_stamp column: {envelope}"));
+        }
+        let relative = tag
+            .trim_start_matches('[')
+            .split_once(']')
+            .map(|(_, rest)| rest)
+            .unwrap_or(tag);
+        if !columns
+            .iter()
+            .any(|column| column.as_str() == Some(relative))
+        {
+            return Err(format!(
+                "the tag column rides provider-relative: {envelope}"
+            ));
+        }
+        if history_rows_contain(&envelope, 44) {
+            println!("SC-4 closure evidence: written value 44 proven in history ({historian})");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "CLOSURE DRIFT FINDING: the 13-01 recipe live-proved data flow, but 150 s of \
+                 polling never surfaced the written 44 — record in 13-LIVE-GATE.md (capture \
+                 wins; never code around it)"
+                    .to_string(),
+            );
+        }
+        eprintln!("history: no 44 yet (tag-group scan cadence 40–50 s) — polling…");
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+    Ok(())
 }
 
 /// THE alarm lifecycle live fixture (05-06, TAGS-07) — configure a
