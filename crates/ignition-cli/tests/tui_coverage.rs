@@ -32,8 +32,8 @@
 //!
 //! ## The sanctioned stdout exceptions
 //!
-//! The OutOfBand row set is exactly `["completions", "api call"]` —
-//! the LEAF-REPRESENTABLE sanctioned stdout exceptions. The
+//! The OutOfBand row set is exactly `["api call", "completions",
+//! "edit"]` — the LEAF-REPRESENTABLE sanctioned stdout exceptions. The
 //! flag-value / stream-form exceptions are NOT distinct leaves and
 //! carry no rows: `logs -f` NDJSON is a FLAG on the Screen-mapped
 //! `logs` leaf; `tags export -o -` is a FLAG VALUE on the Screen-
@@ -41,10 +41,12 @@
 //! Streamed. The exceptions stay traceable through the routes.rs
 //! comments.
 //!
-//! Reserved OutOfBand slugs (`mcp`, `lsp`, `edit` — 08-06): sanctioned
+//! Reserved OutOfBand slugs (`mcp`, `lsp` — 08-06): sanctioned
 //! out-of-band FUTURES, pre-declared with justification at the pinned
 //! OutOfBand test and in routes.rs; rows land with their clap commands
-//! in Phases 13/14, not before (orphan rows fail the walk by design).
+//! in Phase 14, not before (orphan rows fail the walk by design).
+//! `edit` joined the set in 13-08 — the 08-06 reservation fulfilled
+//! with its clap command in the same landing.
 
 #![cfg(feature = "tui")]
 
@@ -120,8 +122,8 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 
 /// Mapping-kind sanity: the OutOfBand row set is pinned to the
 /// leaf-representable sanctioned stdout exceptions — exactly
-/// `["completions", "api call"]` (compared as a SET: order-free by
-/// design, so a routes() re-ordering cannot churn the pin).
+/// `["api call", "completions", "edit"]` (compared as a SET: order-free
+/// by design, so a routes() re-ordering cannot churn the pin).
 ///
 /// Why `api call` belongs here (09-03 justification): raw passthrough
 /// to ARBITRARY gateway REST endpoints is not a cockpit verb — there
@@ -131,15 +133,18 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 /// product. Same genre as `completions`: the CLI speaks directly to a
 /// consumer (a shell, an agent), not to a human at a dashboard.
 ///
-/// RESERVED OutOfBand slugs (`mcp`, `lsp`, `edit` — 08-06): sanctioned
-/// out-of-band FUTURES, pre-declared with justification here and in
-/// routes.rs; rows land with their clap commands in Phases 13/14
-/// (sibling `every_row_requiring_cli_node_is_mapped_and_no_orphans`
-/// asserts bidirectional equality with the live clap tree, so rows for
-/// not-yet-existing commands fail as orphans BY DESIGN). When the
-/// `mcp`/`lsp`/`edit` clap commands land, their OutOfBand rows extend
-/// THIS vec alongside this test's expected set, and both sides move
-/// together.
+/// Why `edit` belongs here (13-08 justification): the kubectl-edit
+/// loop hands the terminal to a child $EDITOR process and writes ALL
+/// prose to stderr — the edit loop IS the product, so no cockpit
+/// surface can host it (completions/api-call genre). Edit's concrete
+/// OutOfBand meaning is ZERO stdout bytes in every mode, byte-scan
+/// pinned by contract_edit.rs over the real binary.
+///
+/// This landing FULFILLS the Phase-8 pre-declaration (08-06): `edit`
+/// was reserved with written justification since 08-06 with zero
+/// rows — orphan rows fail the sibling clap walk by design, so the
+/// row and its clap command HAD to land together, and they did (this
+/// commit). `mcp`/`lsp` remain reserved for Phase 14.
 #[test]
 fn out_of_band_rows_are_pinned() {
     let mut out_of_band: Vec<&str> = routes()
@@ -150,9 +155,10 @@ fn out_of_band_rows_are_pinned() {
     out_of_band.sort_unstable();
     assert_eq!(
         out_of_band,
-        vec!["api call", "completions"],
-        "the OutOfBand set must stay exactly [completions, api call] — a new \
-         member needs a written justification here AND in routes.rs"
+        vec!["api call", "completions", "edit"],
+        "the OutOfBand set must stay exactly [api call, completions, edit] — \
+         a new member needs a written justification here AND in routes.rs, \
+         landing in the SAME task as its clap command"
     );
 }
 

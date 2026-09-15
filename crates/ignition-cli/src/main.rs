@@ -26,6 +26,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use ignition_core::actions;
+use ignition_core::client::GatewayApi as _;
 use ignition_core::config::{self, Config, Credential};
 use ignition_core::error::CoreError;
 use ignition_core::session::Session;
@@ -36,13 +37,13 @@ use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
     ApiArgs, ApiCommand, BackupArgs, BackupCommand, BundleCommand, Cli, Commands, DiagnosticsArgs,
-    DiagnosticsCommand, EamArgs, EamCommand, EamTaskCommand, GanArgs, GanCommand, LicenseArgs,
-    LicenseCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs, ProfileCmd,
-    ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs, ResourceCommand,
-    RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd,
-    TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
-    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
-    WorkspaceArgs, WorkspaceCommand,
+    DiagnosticsCommand, EamArgs, EamCommand, EamTaskCommand, EditArgs, GanArgs, GanCommand,
+    LicenseArgs, LicenseCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs,
+    ProfileCmd, ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs,
+    ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs,
+    SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand,
+    TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs,
+    WebdevCommand, WorkspaceArgs, WorkspaceCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -420,6 +421,21 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("failed to build async runtime");
+    // 13-08: `ign edit` is the OutOfBand verb — the child $EDITOR owns
+    // the terminal, so edit writes ZERO bytes to stdout in every mode
+    // (byte-scan pinned by contract_edit.rs) and its prose renders to
+    // stderr. No ActionOutput variant exists for it BY DESIGN (a
+    // success variant would route through render_ok's stdout —
+    // exactly what the OutOfBand declaration forbids — and render.rs
+    // stays untouched), so edit dispatches on its own seam HERE:
+    // after the ONE mode decision, still one ExitCode decision point
+    // in main; its refusals ride the SAME render_error envelope
+    // (stderr in every mode).
+    if let Commands::Edit(args) = cli.command {
+        let profile_flag = cli.profile.clone();
+        let yes = cli.yes;
+        return runtime.block_on(dispatch_edit(args, profile_flag.as_deref(), yes, mode));
+    }
     // dispatch resolves the profile context and returns it alongside the
     // result so BOTH the success and the error envelope echo it (CORE-01).
     let (profile, result) = runtime.block_on(dispatch(cli, mode));
@@ -2569,6 +2585,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 Err(err) => (None, Err(err)),
             },
         },
+        // Runtime-unreachable: main returns early for Edit (13-08's
+        // OutOfBand seam dispatches on its own BEFORE the normal
+        // chassis — a success variant would route through render_ok's
+        // stdout, which the zero-stdout contract forbids); the arm
+        // exists only for match exhaustiveness.
+        Commands::Edit(_) => {
+            unreachable!("edit handled by dispatch_edit before the chassis")
+        }
         // Runtime-unreachable: dispatch returns early for Completions
         // before config load (a broken config must not break `completions`);
         // the arm exists only for match exhaustiveness.
@@ -2592,6 +2616,125 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             }
         }
     }
+}
+
+/// `ign edit`'s OutOfBand dispatch (13-08): the kubectl-edit loop with
+/// the guard composed at ONE site. Order is the contract:
+///
+/// 1. **editor env FIRST** — `VISUAL`/`EDITOR` resolution refuses
+///    PRE-resolve (usage-class: exit 2, envelope profile null, ZERO
+///    requests — the api-call usage-guard convention);
+/// 2. `Session::resolve` — the Phase-8 seam, no second construction
+///    path;
+/// 3. 13-05's `edit_pipeline` — fetch → decode → $EDITOR →
+///    content-decided no-op → fail-closed encode → staleness gate →
+///    staged payload. Its refusals — the stable `no $EDITOR set`,
+///    codec-verbatim, `changed on gateway since fetch`, and
+///    `preserved at <path>` prefixes — propagate VERBATIM through the
+///    standard error envelope. The staleness gate stays NOT
+///    --yes-able: dispatch adds no override.
+/// 4. **THE ONE GATE** — the staged diff summary is composed once:
+///    without `--yes` it IS the refusal (`require_confirmation`'s
+///    operation string, the 10-04 preview_then_confirm shape); with
+///    it, the same text renders as the blast-radius prose ahead of
+///    the push.
+/// 5. the existing project-import client call pushes the staged zip
+///    (`overwrite=true` — replace, the resource-put precedent;
+///    ImportDenied honesty rides the client seam).
+///
+/// Zero stdout in every mode: success prose is stderr `eprintln!`s
+/// and NOTHING routes through render_ok (no ActionOutput::Edit
+/// variant exists BY DESIGN).
+async fn dispatch_edit(
+    args: EditArgs,
+    profile_flag: Option<&str>,
+    yes: bool,
+    mode: RenderMode,
+) -> ExitCode {
+    use actions::edit::{EditStatus, TokioEditor};
+
+    // 1. The editor env resolves BEFORE any profile/secret/request
+    //    work: a missing VISUAL/EDITOR is a usage-class refusal (the
+    //    profile never resolves, so the envelope echoes null).
+    if let Err(err) = TokioEditor::resolve_command() {
+        render_error(&err, None, mode);
+        return ExitCode::from(err.exit_code());
+    }
+    // 2. The one session seam.
+    let session = match Session::resolve(profile_flag) {
+        Ok(session) => session,
+        Err(err) => {
+            render_error(&err, error_profile(&err).as_deref(), mode);
+            return ExitCode::from(err.exit_code());
+        }
+    };
+    let profile_name = session.profile_name().to_string();
+    // 3. The pipeline; every refusal rides the standard envelope
+    //    verbatim (stable prefixes intact).
+    let staged =
+        match actions::edit::edit_pipeline(&*session, &TokioEditor, &args.project, Some(&args.resource_path))
+            .await
+        {
+            Ok(staged) => staged,
+            Err(err) => {
+                render_error(&err, Some(&profile_name), mode);
+                return ExitCode::from(err.exit_code());
+            }
+        };
+    match staged.status {
+        // Content-decided no-op: no push, no prompt, clean exit 0.
+        EditStatus::NoOp => {
+            eprintln!("edit: no changes — nothing pushed");
+            ExitCode::SUCCESS
+        }
+        EditStatus::Ready { changed } => {
+            let zip = staged
+                .import_zip
+                .expect("Ready always carries the staged import zip");
+            // 4. THE ONE GATE (the 10-04 preview_then_confirm shape):
+            //    the summary text is composed once — it IS the refusal
+            //    without --yes, the blast-radius prose with it.
+            let summary = render_edit_summary(&args.project, &changed);
+            if let Err(err) = require_confirmation(yes, &summary) {
+                render_error(&err, Some(&profile_name), mode);
+                return ExitCode::from(err.exit_code());
+            }
+            eprintln!("{summary}");
+            // 5. The existing project-import client call with the
+            //    staged zip — overwrite replace (the resource-put
+            //    precedent); the client seam carries the ImportDenied
+            //    honesty.
+            match session.project_import(&args.project, zip, true).await {
+                Ok(_) => {
+                    eprintln!(
+                        "edit: pushed {} member(s) to {}",
+                        changed.len(),
+                        args.project
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    render_error(&err, Some(&profile_name), mode);
+                    ExitCode::from(err.exit_code())
+                }
+            }
+        }
+    }
+}
+
+/// The staged edit's changed-members summary — the blast radius. The
+/// SAME text is the refusal message (without `--yes`) and the
+/// pre-push prose (with it); it mirrors the workspace push preview's
+/// shape (write lines under a count header, 13-06's
+/// render_push_preview genre). Lives here, NOT in render.rs — edit's
+/// prose is deliberately dispatch-arm stderr output (OutOfBand: no
+/// envelope involvement).
+fn render_edit_summary(project: &str, changed: &[String]) -> String {
+    let mut summary = format!("edit would write {} member(s) to {project}", changed.len());
+    for path in changed {
+        summary.push_str(&format!("\n  write: {path}"));
+    }
+    summary
 }
 
 /// Selection-only profile resolution for the TWO consumers that need the

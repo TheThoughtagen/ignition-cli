@@ -132,6 +132,15 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Workspace(WorkspaceArgs),
 
+    /// Fetch a gateway resource, edit it in $EDITOR, push back
+    /// (guarded) — the kubectl-edit loop over ONE resource:
+    /// unchanged saves are clean no-ops (nothing pushed, never
+    /// prompted), a gateway changed since fetch refuses (never
+    /// force-pushed), a JSON-breaking save refuses fail-closed with
+    /// the temp tree kept (path printed). Zero stdout in every mode —
+    /// the editor owns the terminal (see README's edit section)
+    Edit(EditArgs),
+
     /// Manage a project's individual resources: list, get, put,
     /// delete — the surgical edit loop (change one view/script
     /// without re-importing everything)
@@ -473,6 +482,21 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         delete: bool,
     },
+}
+
+/// `ign edit` args (13-08): the kubectl-edit loop over ONE resource.
+/// The resource path scopes what $EDITOR opens (the whole tree still
+/// decodes for encode-back context); the push rides the
+/// project-import wire behind the ONE confirmation gate. `--yes` is
+/// the GLOBAL flag (globals-once) — never redeclared here.
+#[derive(Debug, clap::Args)]
+pub struct EditArgs {
+    /// Project containing the resource
+    pub project: String,
+    /// Resource user path to open in $EDITOR (e.g.
+    /// `ignition/script-python/e2e/scratch` — `ign resource list`
+    /// names the valid members)
+    pub resource_path: String,
 }
 
 /// Resource subcommands (03-03, PROJ-05). `delete` is the family's
