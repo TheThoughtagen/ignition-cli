@@ -47,6 +47,7 @@ use ignition_core::actions::tags::{
     BrowseRow, LossReport, TagBrowseFromExportResult, TagProvidersResult, TagsAlarmsAckResult,
     TagsAlarmsActiveResult, TagsAlarmsHistoryResult, TagsBrowseResult, TagsConfigGetResult,
     TagsExportResult, TagsHistoryQueryResult, TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
+    history_summary,
 };
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::client::logs::LogEntry;
@@ -1513,11 +1514,30 @@ fn render_tags_read_human(result: &TagsReadResult) {
 /// `ign tags config get` human mode: the path + tagType header then
 /// the config as PRETTY JSON (agents and humans both want the
 /// object — the stringified re-parse already applied upstream).
+/// TAGS-13: when the config carries history-binding keys, an
+/// additive `history:` block follows (captured field names only —
+/// the 13-01 field-set table); absence of history keys renders
+/// BYTE-IDENTICAL to the pre-TAGS-13 shape (the pinned contract).
 fn render_tags_config_get_human(result: &TagsConfigGetResult) {
     let tag_type = result.tag_type.as_deref().unwrap_or("-");
     println!("{}  {}", result.path, tag_type);
     let pretty = serde_json::to_string_pretty(&result.config).unwrap_or_default();
     println!("{pretty}");
+    if let Some(summary) = history_summary(&result.config) {
+        println!("history:");
+        if let Some(enabled) = summary.enabled {
+            println!("  enabled: {enabled}");
+        }
+        if let Some(provider) = &summary.provider {
+            println!("  provider: {provider}");
+        }
+        if let Some(sample_mode) = &summary.sample_mode {
+            println!("  sample mode: {sample_mode}");
+        }
+        if let Some(group) = &summary.historical_group {
+            println!("  historical group: {group}");
+        }
+    }
 }
 
 /// `ign tags udt types` human mode: the provider header then one

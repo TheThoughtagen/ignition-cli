@@ -192,7 +192,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign tags browse --from-export PATH [--filter SUBSTR] [--include-properties]` | Browse a tag export OFFLINE — no gateway, no credential, no deployed routes (`profile: null`; the positional browse path and this flag are mutually exclusive) | THREE layouts accepted: the CLI's own `tags export` JSON (the interchange file — provider = file stem), a legacy `<provider>.json` whole tree, or a **git-module directory** (a `tags/` root, or the dir itself when it holds provider folders/`.json` files) — per provider: individual `.json`-per-leaf files (folders = directories, `_types_/*.json` = UDT definitions, names decoded from `%XX`-encoded filenames, dot-entries skipped, `System` excluded, `.tag-config.json` ignored) OR the legacy single-file tree; the output reuses the SAME tree render + flat JSON row shape as the live browse; a nonexistent path or unparseable JSON exits 2 `invalid_input` (zero network) |
 | `ign tags read <PATH>... [--project NAME]` | Read one or more tag values — `path  =  value  [quality]  timestamp` | needs the deployed routes; always batch on the wire (a single path is a one-element batch); rows pass through VERBATIM — quality strings carry their own detail (`Good`, `Bad_NotFound`, …) and are never parsed further: a missing tag is DATA (exit 0, quality `Bad_NotFound`), not an error |
 | `ign tags write <PATH> --value V [--project NAME]` | Write a value to a tag — returns the post-write quality | needs the deployed routes; **the write-scalar-is-JSON rule**: `--value` parses as a JSON scalar (`42`, `1.5`, `true`, `null`, `"quoted"`); text that does not parse is sent as the bare string (`--value hello` is the string `hello`); arrays/objects refuse exit 2 (`invalid_input`) before any network I/O — the tag value wire slot is a scalar; a nonexistent target writes back a `Bad…` quality (quality is data) |
-| `ign tags config get <PATH> [--project NAME]` | A tag's configuration as (pretty) JSON — the surgical edit loop's read half | needs the deployed routes; the gateway hands `value`/`defaultValue` back as STRINGIFIED JSON — the CLI re-parses them into real JSON objects/arrays so agents see structured data, not JSON-in-a-string (unparseable and scalar-parse strings stay strings); JSON data carries `{project, path, tag_type, config}`; a missing tag exits 6 (`not_found` — the route's own denial); **provider-ROOT paths (`[default]` alone) exit 6 `provider_root_unsupported`** (see the bulk export note below) |
+| `ign tags config get <PATH> [--project NAME]` | A tag's configuration as (pretty) JSON — the surgical edit loop's read half | needs the deployed routes; the gateway hands `value`/`defaultValue` back as STRINGIFIED JSON — the CLI re-parses them into real JSON objects/arrays so agents see structured data, not JSON-in-a-string (unparseable and scalar-parse strings stay strings); JSON data carries `{project, path, tag_type, config}`; a missing tag exits 6 (`not_found` — the route's own denial); **provider-ROOT paths (`[default]` alone) exit 6 `provider_root_unsupported`** (see the bulk export note below); a config carrying history bindings appends an additive `history:` block in human mode (see **Tag↔historian bindings** below) |
 | `ign tags config create <PATH> --file FILE\|- [--project NAME]` | Create a tag from a JSON definition (`-` = stdin) | needs the deployed routes; the definition is the configure shape — see the **configure-shape traps table** below; the CLI splits the path into configure's basePath + per-tag name (a bare path rides under `[default]`; the path-derived name wins over any `name` in the definition) and does NOT otherwise reshape the dict; collision policy `'a'` (abort): creating over an existing node refuses server-side; `--file` JSON errors exit 2 (`invalid_input`) pre-resolution |
 | `ign tags config edit <PATH> --file FILE\|- [--project NAME]` | Edit a tag's configuration from a JSON definition (`-` = stdin) | the same configure call with collision policy `'o'` scoped to the single named node (edit = overwrite that node); NOT `--yes`-guarded — a single-node edit is not a project-wide destructive |
 | `ign tags config delete <PATH>... [--project NAME]` | Delete tag configurations | **destructive**: exit 2 (`confirmation_required`) without `--yes` — the guard fires before ANY resolution (zero network work); the delete is batch on the wire (`deleteTags {paths}`); JSON data `{project, deleted}` |
@@ -1069,6 +1069,27 @@ table):
 
 A minimal memory tag definition: `{"tagType": "AtomicTag",
 "dataType": "Int4", "value": 123}`.
+
+### Tag↔historian bindings — the surfaced field set (TAGS-13)
+
+When a tag's config carries history-binding keys, `tags config get`
+human mode appends an additive `history:` block after the pretty
+JSON — one line per present field. The key names are CAPTURE-LOCKED
+to the 13-01 live spike record (both trial rigs, read-back + data
+proof; provenance: `.planning/phases/13-composite-engine-workspace-historian-edit/13-LIVE-CAPTURES.md`
+§Field-set table). No name below is guessed:
+
+| Config key | Type | `history:` line | Meaning |
+|------------|------|-----------------|---------|
+| `historyEnabled` | Boolean | `enabled: true` | The binding switch |
+| `historyProvider` | String | `provider: <name>` | The storage provider's name (the doc-corrected key — `historicalProvider` is a documented typo that does NOT bind) |
+| `sampleMode` | Enum | `sample mode: TagGroup` | The capture enum VERBATIM (`"TagGroup"` binds via the gateway's DEFAULT historical group — no group key is needed and none is guessed) |
+| — (no captured key) | — | `historical group: …` | Rendered only if a key is ever captured; the spike bound without one |
+
+Additive-only contract: a config WITHOUT history keys renders
+byte-identically to the pre-TAGS-13 output (pinned by test), and the
+compact/JSON envelope is unchanged (the full `config` passthrough
+already carries the keys there).
 
 ### Bulk export/import (the portability loop)
 

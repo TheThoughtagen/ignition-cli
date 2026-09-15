@@ -658,6 +658,141 @@ async fn tags_config_get_golden() {
     );
 }
 
+/// TAGS-13 render contract (13-01 field-set table — capture-locked
+/// names `historyEnabled`/`historyProvider`/`sampleMode`):
+/// (a) a history-bound config → the additive `history:` block with
+///     one line per present field;
+/// (b) a config WITHOUT history keys → human output BYTE-IDENTICAL
+///     to the pre-TAGS-13 shape (the additive-only render pin);
+/// (c) partial shape (`historyEnabled` alone) → enabled-only block
+///     honesty.
+/// The compact envelope is NOT part of this contract — the full
+/// config passthrough already carries the keys there.
+#[tokio::test]
+async fn tags_config_get_history_render_contract() {
+    // (a) the full captured field set (the 13-01 after-capture shape).
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(
+        &server,
+        "getConfig",
+        serde_json::json!({"config": {
+            "tagType": "AtomicTag",
+            "dataType": "Int4",
+            "value": 44,
+            "historyEnabled": true,
+            "historyProvider": "p13hist836",
+            "sampleMode": "TagGroup"
+        }}),
+    )
+    .await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "get", "[default]P13H/T1"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+[default]P13H/T1  AtomicTag
+{
+  "dataType": "Int4",
+  "historyEnabled": true,
+  "historyProvider": "p13hist836",
+  "sampleMode": "TagGroup",
+  "tagType": "AtomicTag",
+  "value": 44
+}
+history:
+  enabled: true
+  provider: p13hist836
+  sample mode: TagGroup
+"#]],
+    );
+
+    // (b) THE byte-identity pin: a realistic pre-binding node (the
+    // committed before-capture shape) renders with NO history block —
+    // identical to the pre-TAGS-13 output.
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(
+        &server,
+        "getConfig",
+        serde_json::json!({"config": {
+            "tagType": "AtomicTag",
+            "dataType": "Int4",
+            "defaultValue": 0,
+            "value": 42
+        }}),
+    )
+    .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "get", "[default]P13H/T1"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+[default]P13H/T1  AtomicTag
+{
+  "dataType": "Int4",
+  "defaultValue": 0,
+  "tagType": "AtomicTag",
+  "value": 42
+}
+"#]],
+    );
+
+    // (c) partial-shape honesty: `historyEnabled` alone → the block
+    // names enabled only.
+    let server = wiremock::MockServer::start().await;
+    mount_tagconfig_action(
+        &server,
+        "getConfig",
+        serde_json::json!({"config": {
+            "tagType": "AtomicTag",
+            "historyEnabled": false
+        }}),
+    )
+    .await;
+    let out = ign(
+        &config,
+        &server.uri(),
+        &["tags", "config", "get", "[default]P13H/T1"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&out),
+        snapbox::str![[r#"
+[profile: dev]
+[default]P13H/T1  AtomicTag
+{
+  "historyEnabled": false,
+  "tagType": "AtomicTag"
+}
+history:
+  enabled: false
+"#]],
+    );
+}
+
 /// config create/edit goldens: the definition rides `--file -`
 /// (stdin, resource-put precedent), the configure body pins the
 /// basePath split + collisionPolicy char, and the success lines name

@@ -1262,6 +1262,60 @@ pub struct TagsConfigGetResult {
     pub config: serde_json::Value,
 }
 
+/// TAGS-13: the tag↔historian binding VIEW extracted from a tag's
+/// config object — an extraction, never a typed model (Pitfall 12:
+/// history properties ride `config` as passthrough `Value`; this view
+/// only NAMES them). Every field name below is capture-locked to the
+/// 13-01 spike record's field-set table (13-LIVE-CAPTURES.md):
+/// `historyEnabled`, `historyProvider`, `sampleMode`. No key name
+/// appears here that is absent from the committed after-captures.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistorySummary {
+    /// `historyEnabled` — the binding switch (Boolean on the wire).
+    pub enabled: Option<bool>,
+    /// `historyProvider` — the storage provider's name (String; the
+    /// DOC-CORRECTED key — 05-06's `historicalProvider` is the typo
+    /// the 13-01 replay falsified with live data flow).
+    pub provider: Option<String>,
+    /// `sampleMode` — the capture enum string VERBATIM (`"TagGroup"`
+    /// on the spike rigs; never re-cased).
+    pub sample_mode: Option<String>,
+    /// The historical tag group. NO captured config key name exists:
+    /// the spike bound to the gateway's DEFAULT historical group at
+    /// `sampleMode: "TagGroup"` without any group key being sent
+    /// (13-LIVE-CAPTURES.md §Research Open Questions — bonus
+    /// finding). This stays `None` until a live capture names the
+    /// key; it is never guessed.
+    pub historical_group: Option<String>,
+}
+
+/// Extract the history-binding summary from a tag's config object —
+/// a pure view, no wire work. Returns `None` when NONE of the three
+/// captured history keys are present in the object: the absent case
+/// is the additive-only render contract (output byte-identical to
+/// the pre-TAGS-13 shape). Unknown additional history keys are
+/// IGNORED by the summary (passthrough posture — the full config
+/// still reaches the user via the pretty JSON above the block).
+pub fn history_summary(config: &serde_json::Value) -> Option<HistorySummary> {
+    let obj = config.as_object()?;
+    let enabled = obj.get("historyEnabled");
+    let provider = obj.get("historyProvider");
+    let sample_mode = obj.get("sampleMode");
+    if enabled.is_none() && provider.is_none() && sample_mode.is_none() {
+        return None;
+    }
+    Some(HistorySummary {
+        enabled: enabled.and_then(serde_json::Value::as_bool),
+        provider: provider
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        sample_mode: sample_mode
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        historical_group: None,
+    })
+}
+
 /// `ign tags config create|edit PATH` result — the configure
 /// quality IS the success contract (quality is data).
 #[derive(Debug, Serialize)]
@@ -3634,6 +3688,89 @@ mod tests {
             calls[0],
             serde_json::json!({"action": "getConfig", "tagPath": "[default]T1"}),
             "the getConfig body is exactly action+tagPath (STRING arg)"
+        );
+    }
+
+    // ---- TAGS-13: history_summary (the binding VIEW) ----
+
+    use super::{HistorySummary, history_summary};
+
+    /// The captured binding shape reads back per the 13-01 field-set
+    /// table — names verbatim, sampleMode verbatim ("TagGroup", never
+    /// re-cased), historical_group None (no captured group key).
+    #[test]
+    fn history_summary_reads_the_captured_field_set() {
+        let config = serde_json::json!({
+            "tagType": "AtomicTag",
+            "dataType": "Int4",
+            "value": 44,
+            "historyEnabled": true,
+            "historyProvider": "p13hist836",
+            "sampleMode": "TagGroup"
+        });
+        assert_eq!(
+            history_summary(&config),
+            Some(HistorySummary {
+                enabled: Some(true),
+                provider: Some("p13hist836".into()),
+                sample_mode: Some("TagGroup".into()),
+                historical_group: None,
+            })
+        );
+    }
+
+    /// THE absent case: no history keys → None — the additive-only
+    /// render contract (output byte-identical to the pre-TAGS-13
+    /// shape). A pre-binding node shape per the committed before-
+    /// captures.
+    #[test]
+    fn history_summary_none_when_no_history_keys() {
+        let config = serde_json::json!({
+            "tagType": "AtomicTag",
+            "dataType": "Int4",
+            "defaultValue": 0,
+            "value": 42
+        });
+        assert_eq!(history_summary(&config), None);
+        assert_eq!(history_summary(&serde_json::json!({})), None);
+    }
+
+    /// Partial-shape honesty: `historyEnabled` alone → only the
+    /// enabled field rides.
+    #[test]
+    fn history_summary_partial_shape_carries_present_fields_only() {
+        let config = serde_json::json!({"tagType": "AtomicTag", "historyEnabled": false});
+        assert_eq!(
+            history_summary(&config),
+            Some(HistorySummary {
+                enabled: Some(false),
+                provider: None,
+                sample_mode: None,
+                historical_group: None,
+            })
+        );
+    }
+
+    /// Passthrough posture: unknown extra history-ish keys are
+    /// IGNORED by the summary (never guessed into fields); non-bool/
+    /// non-string wire values simply don't populate a field — but key
+    /// presence still yields Some (the block is the "history keys are
+    /// here" signal; the pretty JSON above it shows the raw values).
+    #[test]
+    fn history_summary_ignores_unknown_keys_and_bad_types_still_signal_presence() {
+        let config = serde_json::json!({
+            "historyEnabled": true,
+            "historicalDeadbandMode": "Analog"  // known-name, NOT in the field set
+        });
+        let summary = history_summary(&config).expect("historyEnabled present");
+        assert_eq!(summary.provider, None, "unknown keys never guessed");
+        assert_eq!(summary.sample_mode, None);
+
+        let weird = serde_json::json!({"historyProvider": 42});
+        let summary = history_summary(&weird).expect("key presence drives Some");
+        assert_eq!(
+            summary.provider, None,
+            "non-string provider value doesn't populate the field"
         );
     }
 
