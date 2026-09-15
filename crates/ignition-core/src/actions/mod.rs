@@ -27,3 +27,4 @@ pub mod tag_loss;
 pub mod tags;
 pub mod version;
 pub mod webdev;
+pub mod workspace;
