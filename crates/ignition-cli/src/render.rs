@@ -385,25 +385,15 @@ fn workspace_state_label(kind: &StatusKind) -> &'static str {
 }
 
 /// `ign workspace status` human render (13-07): a stable two-column
-/// PATH / STATE table (aligned to the widest path), clean rows
-/// INCLUDED — agents diff full state — then the four-counter summary
-/// line. Rows arrive from core in deterministic order (manifest
-/// members sorted by gateway path, then gateway-only additions, then
-/// untracked sorted) and render in that order.
+/// PATH / STATE table (two-space join, the project-list table
+/// convention), clean rows INCLUDED — agents diff full state — then
+/// the four-counter summary line. Rows arrive from core in
+/// deterministic order (manifest members sorted by gateway path,
+/// then gateway-only additions, then untracked sorted) and render in
+/// that order.
 fn render_workspace_status_human(result: &WorkspaceStatus) {
-    let width = result
-        .rows
-        .iter()
-        .map(|row| row.path.chars().count())
-        .max()
-        .unwrap_or(0);
     for row in &result.rows {
-        println!(
-            "{:<width$}  {}",
-            row.path,
-            workspace_state_label(&row.kind),
-            width = width
-        );
+        println!("{}  {}", row.path, workspace_state_label(&row.kind));
     }
     let local_edits = result
         .rows

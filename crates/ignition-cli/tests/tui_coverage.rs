@@ -176,6 +176,7 @@ fn bare_option_forms_are_row_requiring_nodes() {
     for group in [
         "wait",
         "project",
+        "workspace",
         "tags",
         "rig",
         "rig trial",
@@ -186,6 +187,36 @@ fn bare_option_forms_are_row_requiring_nodes() {
         assert!(
             !cli_set.contains(group),
             "the required-subcommand group {group:?} must not be a row of its own"
+        );
+    }
+}
+
+/// The 13-07 workspace family rows land with their clap commands
+/// (the family-atomicity pin, the diagnostics-rows shape): exactly
+/// the three WorkspaceCommand leaves, all on the Projects screen
+/// (normal envelope verbs — workspace is NOT OutOfBand; the pinned
+/// OutOfBand set is untouched and `edit` joins it in 13-08, not
+/// here).
+#[test]
+fn workspace_rows_cover_the_family() {
+    let rows: Vec<&ignition_tui::routes::CliRoute> = routes()
+        .iter()
+        .filter(|route| route.path.starts_with("workspace"))
+        .collect();
+    let expected = ["workspace checkout", "workspace status", "workspace push"];
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "exactly the workspace leaves that exist: {rows:?}"
+    );
+    for path in expected {
+        let row = rows
+            .iter()
+            .find(|route| route.path == path)
+            .unwrap_or_else(|| panic!("workspace route row {path:?} missing"));
+        assert!(
+            matches!(row.mapping, Mapping::Screen(Screen::Projects)),
+            "{path} maps to the Projects screen"
         );
     }
 }

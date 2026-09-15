@@ -210,3 +210,79 @@ fn tags_export_error_keeps_stdout_byte_empty() {
     );
     assert_stdout_bytes(&output.stdout, b"", "xml export refusal");
 }
+
+/// 13-07: the workspace family joins the purity harness — the three
+/// new verbs are normal envelope verbs, so every refusal renders as
+/// the contract error envelope on STDERR and stdout stays byte-empty
+/// under max diagnostics. `workspace status` refuses PRE-resolution
+/// (the missing-manifest read needs no gateway): profile null, exit
+/// 2, zero requests, zero stdout bytes.
+#[test]
+fn workspace_status_missing_manifest_refusal_never_touches_stdout() {
+    let (_dir, mut cmd) = noisy_ign();
+    let missing = tempfile::tempdir().expect("tempdir").path().join("nope");
+    let output = cmd
+        .args(["workspace", "status", missing.to_str().expect("utf-8 path")])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the pre-resolve refusal exits 2"
+    );
+    assert_stdout_bytes(&output.stdout, b"", "missing-manifest refusal");
+
+    // 13-03's stable refusal prefix really fired — on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not an ign workspace"),
+        "expected the stable manifest refusal on stderr: {stderr}"
+    );
+}
+
+/// 13-07 sibling: the same purity invariant for `workspace push`
+/// (the PRE-resolve missing-manifest refusal — the reachable
+/// zero-gateway case) and `workspace checkout` against a DEAD PORT —
+/// the action-layer network refusal must also leave stdout untouched
+/// under noise.
+#[test]
+fn workspace_push_and_checkout_refusals_keep_stdout_byte_empty() {
+    // push: pre-resolve manifest refusal (no gateway involved).
+    let (_dir, mut cmd) = noisy_ign();
+    let absent = tempfile::tempdir().expect("tempdir");
+    let missing = absent.path().join("nope");
+    let output = cmd
+        .args(["workspace", "push", missing.to_str().expect("utf-8 path")])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the pre-resolve refusal exits 2"
+    );
+    assert_stdout_bytes(&output.stdout, b"", "push missing-manifest refusal");
+
+    // checkout: resolution succeeds against a profile whose URL is a
+    // dead port — the action-layer network refusal (exit 6) rides the
+    // envelope on stderr too.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "active = \"dev\"\n\n[profiles.dev]\nurl = \"http://127.0.0.1:9\"\nauth = { token_env = \"IGNITION_TOKEN\" }\n",
+    )
+    .expect("write dead-port config");
+    let output = Command::cargo_bin("ign")
+        .expect("binary 'ign' not found")
+        .env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_LOG", "trace")
+        .env_remove("IGNITION_PROFILE")
+        .env_remove("IGNITION_JSON")
+        .env_remove("IGNITION_YES")
+        .args(["workspace", "checkout", "proj", "/tmp/ign-purity-checkout"])
+        .output()
+        .expect("spawn ign");
+    assert_ne!(output.status.code(), Some(0), "a dead port must refuse");
+    assert_stdout_bytes(&output.stdout, b"", "checkout network refusal");
+}

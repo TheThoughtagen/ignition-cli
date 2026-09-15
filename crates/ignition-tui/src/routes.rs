@@ -344,6 +344,27 @@ pub fn routes() -> &'static [CliRoute] {
             path: "project sync",
             mapping: Mapping::Screen(Screen::Projects),
         },
+        // 13-07: the workspace family (checkout/status/push) — the
+        // local edit loop over the project-export interchange. Normal
+        // envelope verbs, NOT OutOfBand: the status table and the
+        // guarded-push refusals ARE the product (agent-facing), the
+        // same genre as `project diff`/`project sync`. Hosted on the
+        // Projects screen beside the family they compose with
+        // (checkout rides the project export; push rides the
+        // overwrite import). Rows land in the SAME task as their clap
+        // commands (Pitfall 5: a command family is atomic).
+        CliRoute {
+            path: "workspace checkout",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "workspace status",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
+        CliRoute {
+            path: "workspace push",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
         CliRoute {
             path: "resource list",
             mapping: Mapping::Screen(Screen::Projects),
