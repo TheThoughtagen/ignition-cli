@@ -1288,9 +1288,39 @@ async fn live_tags_history_bindings() {
     clean_tag_configs(&config, &env, &[tag]);
     delete_internal_historian(&env, &historian).await;
 
-    // Routes first: history query refuses exit 6 without them.
+    // Routes first: history query refuses exit 6 without them. The
+    // import can race a partial route mount on a fresh gateway (the
+    // 13-04 rig-A run: three routes landed, `tags` answered 405 — the
+    // documented 11-06 mount-race class; the redeploy-overwrite heals
+    // it), so the step VERIFIES the sweep afterwards and redeploys
+    // ONCE on a miss.
     let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
     expect_ok("deploy (the tagHistory route's precondition)", &out);
+    let sweep_all_present = |config: &Path, env: &LiveEnv| -> bool {
+        let out = ign(config, env, &["webdev", "status", "--compact"]);
+        out.status.success()
+            && ["tags", "tagConfig", "alarms", "tagHistory"]
+                .iter()
+                .all(|route| {
+                    data_envelope(&out)["data"]["routes"]
+                        .as_array()
+                        .map_or(false, |rows| {
+                            rows.iter().any(|row| {
+                                row["route"].as_str() == Some(*route)
+                                    && row["status"].as_str() == Some("present")
+                            })
+                        })
+                })
+    };
+    if !sweep_all_present(&config, &env) {
+        eprintln!("deploy: mount race (a core route absent) — redeploying once (11-06 lesson)");
+        let out = ign(&config, &env, &["webdev", "deploy", "--compact"]);
+        expect_ok("redeploy (mount-race heal)", &out);
+        assert!(
+            sweep_all_present(&config, &env),
+            "core routes still absent after the heal redeploy"
+        );
+    }
 
     let outcome = historian_binding_body(&config, &env, &historian, tag).await;
 
