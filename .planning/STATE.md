@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 COMPLETE+verified; Phase 13 historian spike CLOSED (13-01: user declined the Designer step 2026-09-15 → write-path replay proved the binding recipe live on BOTH trial rigs, SPIKE VERDICT: closure, field set [historyEnabled, historyProvider, sampleMode]; 13-02 MemberSource landed) — next: 13-03 (workspace file engine)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 COMPLETE+verified; Phase 13 wave 3 COMPLETE (13-05 edit pipeline: content-decided no-op, fail-closed encode, staleness gate, five-archetype real-process harness; 13-06 workspace status/push) — next: 13-07 (workspace CLI family)
 
 ## Current Position
 
 **Phase:** 13 of 14 (composite-engine-workspace-historian-edit) — IN PROGRESS
-**Current Plan:** 13-03 (next unexecuted; 13-01 and 13-02 COMPLETE with summaries)
-**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03…13-08 pending)
-**Status:** 13-01 closed — spike verdict: closure (Designer branch skipped by user decision; write-path replay proved the recipe on both rigs); zero product code
+**Current Plan:** 13-07 (next unexecuted; 13-01 through 13-06 COMPLETE with summaries)
+**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03 ✅, 13-04 ✅, 13-05 ✅, 13-06 ✅, 13-07/13-08 pending)
+**Status:** wave 3 complete — 13-05 landed the edit core loop at the action layer (Editor seam + TokioEditor arg-vector spawn, EditTempDir 0700/keep recovery, StagedEdit ends at the staged payload — push out of core, one gate site for 13-08); 13-06 landed workspace status/push
 **Last Activity:** 2026-09-15
 
-**Progress:** [█████████░] 93%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 10 | 0/TBD | - | - |
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
 | 12 | 4/4 | 90 min | 22 min avg |
-| 13 | 2/8 | 33 min | ~17 min avg |
+| 13 | 6/8 | 841 min (incl. 13-04 live-rig windows) | ~140 min avg |
 | 14 | 0/TBD | - | - |
 
 *Updated after each plan completion*
@@ -73,6 +73,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P01 | 14 min (close session; full plan 21:46Z Sep-14 → 02:22Z Sep-15) | 3 tasks | 6 files |
 | Phase 13 P04 | 12h 24m (incl. ~2h live-rig windows + wedged-boot recovery) | 3 tasks | 6 files |
 | Phase 13 P06 | 23 min | 2 tasks | 2 files |
+| Phase 13 P05 | ~10 min continuation (Task 1 @ 15:12Z; full span 15:12Z→19:15Z across the 13-06 interleave) | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -193,6 +194,10 @@ Recent decisions affecting current work:
 - [Phase 13]: 13-04 live-truth: deploy imports can half-land (mount race → sweep-verify + one heal redeploy) and tags created inside the deploy model-rebuild tail read back fine but NEVER register with the historian (3 self-healing delete→settle→recreate bind cycles; unique names extend to TAG paths); a volume that survived a wedged first boot keeps a dead historian storage engine — fresh-volume re-stage beats diagnosis — all four hardenings live-motivated, each separately committed (0ab99d6, 513ee87, 76be84b, 65456a9)
 - [Phase 13]: 13-06: StatusKind is PUSH-RELATIVE by planner lock and the doc direction is contract (include_str!-prose test pins it) — local_edit=push would write, gateway_drift=untouched, conflict=refused; classify() is total over all 8 Option combos (absent side counts as moved, refined into Deleted{local} by the caller; both-absent=Clean; local-deleted+gateway-moved and local-edited+gateway-deleted are both Conflict — the W2 clobber class, never --yes-able)
 - [Phase 13]: 13-06: push gate lives IN CORE — require_confirmation(yes, preview) is defined once and called from exactly one push code path, the refusal message IS the deterministic preview (rides ConfirmationRequired.operation verbatim, exit 2); conflicts refuse BEFORE the gate unconditionally; --delete opt-in with locally-deleted members reported as skipped otherwise; empty selection = Ok with ZERO mutation requests and no prompt (traffic-pinned: 1 read GET, 0 imports); splice = recorded-manifest raw local bytes into a FRESH export (staleness-safe), exactly ONE import — 13-07 renders these refusals as its goldens
+- [Phase 13 / 13-05]: the no-op comparator is the ORIGINAL export's RE-ENCODE (second untouched decode + encode), never raw gateway zip bytes — our zip writer sorts and re-compresses, so container bytes differ from the gateway's even with identical member content; encode-vs-encode of identical trees is the byte-stable invariant (13-03's round-trip, made whole-tree); baseline computed PRE-edit so a codec failure on an unedited tree refuses before burning the editing session
+- [Phase 13 / 13-05]: push stays OUT of edit_pipeline's signature — StagedEdit{project, status, import_zip} ends at the staged payload and NoOp ⇒ import_zip None makes no-push/no-prompt STRUCTURAL (the caller cannot push bytes that do not exist); gate composition is the dispatch layer's (13-08), the 10-04 one-gate-site lesson
+- [Phase 13 / 13-05]: the editor exit status is ADVISORY by contract (Pitfall E1) — spawn rides tokio::process ARG VECTOR via ONE production site (run_editor_argv, lint.rs precedent, `sh -c`/`cmd /c` grep-absent); daemon archetype pinned BOTH content directions (unchanged-at-encode → NoOp; landed garbage → codec-verbatim fail-closed despite exit 0; a post-encode write cannot flip the verdict)
+- [Phase 13 / 13-05]: staleness gate reuses member_hashes unchanged (invents NO etag), TARGET-member hash only, drift = InvalidInput "resource \"<path>\" changed on gateway since fetch — re-run to fetch fresh", NOT --yes-able (forcing clobbers concurrent Designer edits); fail-closed encode rides encode_member's InvalidInput VERBATIM with EditTempDir::keep() — stable refusal prefixes are 13-07's golden anchors ("no $EDITOR set", "changed on gateway since fetch", "preserved at <path>")
 
 ### Pending Todos
 
@@ -209,5 +214,5 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-15T15:32:33.574Z
+**Last session:** 2026-09-15T19:18:27.203Z
 **Resume file:** None
