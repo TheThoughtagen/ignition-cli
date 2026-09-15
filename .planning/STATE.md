@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 COMPLETE+verified; Phase 13 wave 3 COMPLETE (13-05 edit pipeline: content-decided no-op, fail-closed encode, staleness gate, five-archetype real-process harness; 13-06 workspace status/push) — next: 13-07 (workspace CLI family)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 COMPLETE+verified; Phase 13 wave 4 COMPLETE (13-07 workspace CLI family: checkout/status/push verbs, routes parity, purity coverage, contract goldens, README contract) — next: 13-08 (edit CLI, wave 5; owns the `edit` clap command + OutOfBand row atomically; edits the same CLI-surface files sequentially)
 
 ## Current Position
 
 **Phase:** 13 of 14 (composite-engine-workspace-historian-edit) — IN PROGRESS
-**Current Plan:** 13-07 (next unexecuted; 13-01 through 13-06 COMPLETE with summaries)
-**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03 ✅, 13-04 ✅, 13-05 ✅, 13-06 ✅, 13-07/13-08 pending)
-**Status:** wave 3 complete — 13-05 landed the edit core loop at the action layer (Editor seam + TokioEditor arg-vector spawn, EditTempDir 0700/keep recovery, StagedEdit ends at the staged payload — push out of core, one gate site for 13-08); 13-06 landed workspace status/push
+**Current Plan:** 13-08 (next unexecuted; 13-01 through 13-07 COMPLETE with summaries)
+**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03 ✅, 13-04 ✅, 13-05 ✅, 13-06 ✅, 13-07 ✅, 13-08 pending)
+**Status:** wave 4 complete — 13-07 landed the `ign workspace checkout|status|push` CLI family (Session-seam dispatch, pre-resolve manifest guards, three-mode render, Projects-screen routes rows + clap walk, stdout-purity coverage, 7-test contract_workspace.rs, README contract section)
 **Last Activity:** 2026-09-15
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 99%
 
 ## Performance Metrics
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 10 | 0/TBD | - | - |
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
 | 12 | 4/4 | 90 min | 22 min avg |
-| 13 | 6/8 | 841 min (incl. 13-04 live-rig windows) | ~140 min avg |
+| 13 | 7/8 | 892 min (incl. 13-04 live-rig windows) | ~127 min avg |
 | 14 | 0/TBD | - | - |
 
 *Updated after each plan completion*
@@ -74,6 +74,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P04 | 12h 24m (incl. ~2h live-rig windows + wedged-boot recovery) | 3 tasks | 6 files |
 | Phase 13 P06 | 23 min | 2 tasks | 2 files |
 | Phase 13 P05 | ~10 min continuation (Task 1 @ 15:12Z; full span 15:12Z→19:15Z across the 13-06 interleave) | 2 tasks | 3 files |
+| Phase 13 P07 | 51min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -198,6 +199,9 @@ Recent decisions affecting current work:
 - [Phase 13 / 13-05]: push stays OUT of edit_pipeline's signature — StagedEdit{project, status, import_zip} ends at the staged payload and NoOp ⇒ import_zip None makes no-push/no-prompt STRUCTURAL (the caller cannot push bytes that do not exist); gate composition is the dispatch layer's (13-08), the 10-04 one-gate-site lesson
 - [Phase 13 / 13-05]: the editor exit status is ADVISORY by contract (Pitfall E1) — spawn rides tokio::process ARG VECTOR via ONE production site (run_editor_argv, lint.rs precedent, `sh -c`/`cmd /c` grep-absent); daemon archetype pinned BOTH content directions (unchanged-at-encode → NoOp; landed garbage → codec-verbatim fail-closed despite exit 0; a post-encode write cannot flip the verdict)
 - [Phase 13 / 13-05]: staleness gate reuses member_hashes unchanged (invents NO etag), TARGET-member hash only, drift = InvalidInput "resource \"<path>\" changed on gateway since fetch — re-run to fetch fresh", NOT --yes-able (forcing clobbers concurrent Designer edits); fail-closed encode rides encode_member's InvalidInput VERBATIM with EditTempDir::keep() — stable refusal prefixes are 13-07's golden anchors ("no $EDITOR set", "changed on gateway since fetch", "preserved at <path>")
+- [Phase 13]: 13-07: workspace status/push read the manifest PRE-resolution (read_manifest is pure fs) — the 13-03 stable refusal prefixes render as exit 2 / profile null / zero-request usage errors (api-call posture); checkout rides the action's clobber ladder post-resolution — usage-class errors cost nothing and never touch the gateway; no core change needed
+- [Phase 13]: 13-07: workspace routes rows map Screen(Projects) beside the project family (checkout rides export, push rides import) — normal envelope verbs, OutOfBand set stays exactly [completions, api call], the `edit` OutOfBand row remains 13-08's atomic landing — plan's map-like-diff/sync directive; keeps the pinned Dashboard count and OutOfBand set untouched
+- [Phase 13]: 13-07: human status table rides the project-family two-space join (not computed-width padding) with direction-bearing STATE labels (deleted (local) vs deleted (gateway)); clean rows included per plan — codebase table convention + stable snapbox goldens
 
 ### Pending Todos
 
@@ -214,5 +218,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-15T19:18:27.203Z
+**Last session:** 2026-09-15T20:16:01.966Z
+**Stopped At:** Completed 13-07-PLAN.md
 **Resume file:** None

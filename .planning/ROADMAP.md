@@ -163,7 +163,7 @@ Plans:
 - [x] 13-04-PLAN.md — Historian slice closure per the 13-01 spike record (conditional-structured): TAGS-13 history summary in tags config render + TAGS-14 done-state (closure recipe pinned OR documented limitation with diff evidence) + BOTH-rig live gate → 13-LIVE-GATE.md — **DONE 2026-09-15 (13-LIVE-GATE.md passed both rigs, SC-3 + SC-4 closed)**
 - [x] 13-05-PLAN.md — ign edit core pipeline + Editor seam trait (arg-vector, exit-advisory) + 0700 temp recovery + staleness gate + the FIVE-archetype real-process editor fixture harness — **DONE 2026-09-15 (content-decided no-op, fail-closed encode w/ kept-tree recovery, NOT---yes-able staleness gate; all five archetypes real spawned processes)**
 - [x] 13-06-PLAN.md — Workspace status (three-way compare, push-relative semantics pinned) + push (manifest-recorded splice into FRESH export, conflicts refuse NOT --yes-able, --delete opt-in, ONE preview_then_confirm gate, zero-write honesty) — **DONE 2026-09-15**
-- [ ] 13-07-PLAN.md — Workspace CLI family (checkout/status/push): Session-seam dispatch, routes rows + clap-walk + stdout purity coverage, snapbox refusal goldens (conflict/--yes/preview) + README workspace honesty section
+- [x] 13-07-PLAN.md — Workspace CLI family (checkout/status/push): Session-seam dispatch, routes rows + clap-walk + stdout purity coverage, snapbox refusal goldens (conflict/--yes/preview) + README workspace honesty section — **DONE 2026-09-15 (7-test contract_workspace.rs; OutOfBand set untouched; push-refusal golden = 13-06 preview byte-for-byte)**
 - [ ] 13-08-PLAN.md — ign edit CLI: clap command + dispatch + guard composition + OutOfBand `edit` row landing ATOMICALLY with the clap command (pinned set → [api call, completions, edit]) + zero-stdout byte-scan pin + scripted-editor binary contract tests + README
 
 ### Phase 14: 14-transports-mcp-lsp
@@ -199,7 +199,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 10. 10-eam-write-operations | v1.1 | 7/7 | Complete | 2026-09-11 |
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 6/6 | Complete | 2026-09-14 — 1.3.0 route bundle, loss scans/CLI contract, live gates green on both rigs (11-LIVE-GATE.md) |
 | 12. 12-tui-theming-degradation | v1.1 | 4/4 | Complete | 2026-09-14 — verifier passed 3/3 (12-VERIFICATION.md); themes live via [ui].theme, CI tokenization gate armed, 09-UAT Gap 2 closed |
-| 13. 13-composite-engine-workspace-historian-edit | v1.1 | 0/8 | Planned (5 waves) | - |
+| 13. 13-composite-engine-workspace-historian-edit | v1.1 | 7/8 | In progress (waves 1-4 done; 13-08 next) | - |
 | 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |
 
 ---
