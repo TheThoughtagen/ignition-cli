@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "profile": "p13r833",
+  "data": {
+    "project": "ign-cli",
+    "path": "[default]P13H/T1",
+    "tag_type": "AtomicTag",
+    "config": {
+      "historyEnabled": true,
+      "historyProvider": "p13hist833",
+      "name": "T1",
+      "path": "[default]P13H/T1",
+      "sampleMode": "TagGroup",
+      "tagType": "AtomicTag",
+      "value": null
+    }
+  }
+}

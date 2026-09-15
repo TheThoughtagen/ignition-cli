@@ -1,0 +1,12 @@
+4,5c4,5
+<       "dataType": "Int4",
+<       "defaultValue": 0,
+---
+>       "historyEnabled": true,
+>       "historyProvider": "p13hist836",
+7a8
+>       "sampleMode": "TagGroup",
+9c10
+<       "value": 0
+---
+>       "value": null
