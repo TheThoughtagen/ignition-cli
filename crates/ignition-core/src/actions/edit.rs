@@ -29,6 +29,14 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
+use crate::actions::resources::export_zip_bytes;
+use crate::client::GatewayApi;
+use crate::client::resources::{
+    MemberStatus, diff_members, member_hashes, member_path, resource_members,
+};
+use crate::client::scripts_codec::{decode_export_tree, encode_export_tree};
 use crate::error::CoreError;
 
 /// The editor seam: open one file path in the user's editor.
@@ -162,6 +170,208 @@ impl EditTempDir {
     pub fn keep(self) -> PathBuf {
         self.0.keep()
     }
+}
+
+// ---- The edit pipeline (13-05) ----------------------------------------------
+
+/// The pipeline verdict. `NoOp` means the editor changed NOTHING —
+/// decided by CONTENT (byte-identical re-encode), never by the
+/// editor's exit code. `Ready` carries the member-level blast
+/// radius: `changed` lists every resource member the staged push
+/// would write ([`diff_members`]' B-relative non-same paths, with
+/// the ORIGINAL export as A and the re-encode as B).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EditStatus {
+    /// Nothing changed — the caller must NOT push and must NOT
+    /// prompt (no guard, no confirmation, a silent clean exit).
+    NoOp,
+    /// An edit is staged; `changed` = what a push would write.
+    Ready {
+        /// Resource paths the staged import zip would change.
+        changed: Vec<String>,
+    },
+}
+
+/// The pipeline's terminal product: the staged edit the CALLER (the
+/// 13-08 CLI, via the guard ladder) decides what to do with. Push is
+/// deliberately OUT of core's signature — the pipeline ENDS at the
+/// staged payload, keeping gate composition at the dispatch layer
+/// (the 10-04 preview_then_confirm lesson: one gate site).
+/// `import_zip` is `None` EXACTLY when `status` is `NoOp` — there
+/// are no bytes to push, so the caller cannot push.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StagedEdit {
+    /// The project the edit targets (the push destination).
+    pub project: String,
+    /// The verdict + blast radius.
+    pub status: EditStatus,
+    /// The re-encoded import zip — `Some` only on `Ready`.
+    pub import_zip: Option<Vec<u8>>,
+}
+
+/// `ign edit`'s core loop (SC-5's mechanics), in order:
+///
+/// 1. **fetch** — one project export (`export_zip_bytes`).
+/// 2. **snapshot** — `member_hashes` of the fetch (descriptor-
+///    normalized; the staleness baseline).
+/// 3. **decode** — the WHOLE tree into a fresh private
+///    [`EditTempDir`] (`decode_export_tree`; the encode-back needs
+///    full context even though `resource_path` scopes the editor).
+/// 4. **baseline** — re-encode a SECOND decode of the SAME export
+///    untouched. This — not the raw original zip container — is the
+///    no-op comparator (planner lock: "the ORIGINAL export zip's
+///    re-encode"): our zip writer sorts and re-compresses, so
+///    container bytes differ from the gateway's even with identical
+///    member content; what is byte-stable is encode-vs-encode of
+///    identical trees (13-03's member-level round-trip invariant,
+///    made whole-tree by determinism). Computing it BEFORE the
+///    editor runs means a codec failure on an unedited tree refuses
+///    before burning the user's editing session.
+/// 5. **target** — `resource_path` (a USER path) must be a resource
+///    member; its decoded file is `member_path(user)` inside the
+///    edit tree. Its sidecars (`<member>.<n>.py`, embedded scripts)
+///    decode beside it and splice back through the manifest — the
+///    editor opens the member file; untouched sidecars re-encode
+///    byte-identically. `None` refuses with the member list:
+///    editing "the whole tree" is `ign workspace checkout`'s job —
+///    edit is ONE resource.
+/// 6. **edit** — `Editor::open(target)`; the exit status is
+///    advisory (Pitfall E1).
+/// 7. **re-encode** — `encode_export_tree`, FAIL-CLOSED: a member
+///    broken in the editor refuses via the codec's own
+///    [`encode_member`] `InvalidInput` (verbatim), and the edit tree
+///    is KEPT — the error message carries its path so the user can
+///    recover the edit.
+/// 8. **no-op** — the re-encoded bytes equal the baseline ⇒
+///    [`EditStatus::NoOp`] with `import_zip: None`. Content
+///    decided; no push, no prompt, no guard.
+/// 9. **staleness** — a FRESH export + the target member's hash vs
+///    the fetch snapshot; drift refuses with
+///    `resource "<path>" changed on gateway since fetch` — NOT
+///    `--yes`-able (forcing it would clobber a concurrent Designer
+///    edit; re-run to fetch fresh).
+/// 10. **stage** — [`EditStatus::Ready`] with the diff summary and
+///     `import_zip = Some(re-encoded bytes)`. The pipeline NEVER
+///     pushes; the caller does (with the gate of its own).
+pub async fn edit_pipeline(
+    api: &dyn GatewayApi,
+    editor: &dyn Editor,
+    project: &str,
+    resource_path: Option<&str>,
+) -> Result<StagedEdit, CoreError> {
+    // 1+2. Fetch + snapshot.
+    let zip = export_zip_bytes(api, project).await?;
+    let snapshot = member_hashes(&zip)?;
+
+    // 3. Decode the whole tree into the private edit dir.
+    let temp = EditTempDir::new()?;
+    let scripts = decode_export_tree(&zip, temp.path())?;
+    tracing::debug!(scripts, "decoded the export tree for edit");
+
+    // 4. Baseline re-encode of an untouched second decode (see the
+    //    doc: this is the no-op comparator, computed pre-edit).
+    let baseline = {
+        let baseline_dir = EditTempDir::new()?;
+        decode_export_tree(&zip, baseline_dir.path())?;
+        encode_export_tree(baseline_dir.path())?
+    };
+
+    // 5. Resolve the editor target.
+    let members = resource_members(&zip)?;
+    let Some(user) = resource_path else {
+        let list = if members.is_empty() {
+            "the project has no resource members".to_string()
+        } else {
+            format!("valid members: {}", members.join(", "))
+        };
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "edit needs one resource to edit — the whole tree is \
+                 `ign workspace checkout`'s job ({list})"
+            ),
+        });
+    };
+    if !members.iter().any(|member| member == user) {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "\"{user}\" is not a resource member of {project} — valid members: {}",
+                members.join(", ")
+            ),
+        });
+    }
+    let target = temp.path().join(member_path(user));
+    if !target.exists() {
+        // Defensive (the membership check above already gates this):
+        // a resource member missing from its own decode tree is an
+        // export-contract violation, not user error.
+        return Err(CoreError::Internal(format!(
+            "resource member \"{user}\" decoded to nothing — the export \
+             zip is inconsistent with its member list"
+        )));
+    }
+
+    // 6. Edit. Exit status is advisory; content decides.
+    editor.open(&target).await?;
+
+    // 7. Re-encode, fail-closed: the codec's own InvalidInput rides
+    //    VERBATIM (the bare reason, not a re-wrapped display), and
+    //    the edit tree is KEPT (its path rides the message) so the
+    //    user's edit survives the failed run.
+    let reencoded = match encode_export_tree(temp.path()) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let codec_reason = match err {
+                CoreError::InvalidInput { reason } => reason,
+                other => other.to_string(),
+            };
+            let kept = temp.keep();
+            return Err(CoreError::InvalidInput {
+                reason: format!(
+                    "{codec_reason}; the edit tree is preserved at {} — fix \
+                     the member by hand and re-run to retry",
+                    kept.display()
+                ),
+            });
+        }
+    };
+
+    // 8. The no-op decision: CONTENT, never the exit code.
+    if reencoded == baseline {
+        return Ok(StagedEdit {
+            project: project.to_string(),
+            status: EditStatus::NoOp,
+            import_zip: None,
+        });
+    }
+
+    // 9. Staleness gate — fresh export, target-member hash vs the
+    //    fetch snapshot. Reuses member_hashes unchanged (invents NO
+    //    etag); NOT --yes-able (planner lock, Pitfall E2).
+    let fresh = export_zip_bytes(api, project).await?;
+    let fresh_hashes = member_hashes(&fresh)?;
+    if fresh_hashes.get(user) != snapshot.get(user) {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "resource \"{user}\" changed on gateway since fetch — \
+                 re-run to fetch fresh"
+            ),
+        });
+    }
+
+    // 10. Stage: Ready with the member-level blast radius.
+    let diff = diff_members(&zip, &reencoded)?;
+    let changed: Vec<String> = diff
+        .entries
+        .into_iter()
+        .filter(|entry| entry.status != MemberStatus::Same)
+        .map(|entry| entry.path)
+        .collect();
+    Ok(StagedEdit {
+        project: project.to_string(),
+        status: EditStatus::Ready { changed },
+        import_zip: Some(reencoded),
+    })
 }
 
 #[cfg(test)]
