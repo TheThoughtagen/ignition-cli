@@ -162,8 +162,7 @@ async fn export_mock(server: &wiremock::MockServer, expected_gets: u64) -> wirem
             "/data/api/v1/projects/export/proj",
         ))
         .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_raw(fixture_zip(), "application/zip"),
+            wiremock::ResponseTemplate::new(200).set_body_raw(fixture_zip(), "application/zip"),
         )
         .expect(expected_gets)
         .mount_as_scoped(server)
@@ -192,6 +191,64 @@ fn stderr_envelope(out: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let start = stderr.find('{').unwrap_or(0);
     stderr[start..].to_string()
+}
+
+// ---- Full-loop machinery (Task 3): sequencing + temp-tree proof ------------
+
+/// Serves the FETCH export on every even hit and the FRESH export on
+/// every odd hit. Each edit run performs exactly TWO export GETs
+/// (fetch, then the pipeline's staleness re-check), so even/odd
+/// alternation pairs them correctly across any number of sequential
+/// runs inside one test — the fetch-vs-recheck divergence the
+/// staleness gate exists for.
+#[derive(Clone)]
+struct AlternatingResponder {
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fetch: std::sync::Arc<Vec<u8>>,
+    fresh: std::sync::Arc<Vec<u8>>,
+}
+
+impl AlternatingResponder {
+    fn new(fetch: Vec<u8>, fresh: Vec<u8>) -> Self {
+        use std::sync::atomic::AtomicUsize;
+        Self {
+            hits: std::sync::Arc::new(AtomicUsize::new(0)),
+            fetch: std::sync::Arc::new(fetch),
+            fresh: std::sync::Arc::new(fresh),
+        }
+    }
+}
+
+impl wiremock::Respond for AlternatingResponder {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        use std::sync::atomic::Ordering;
+        let n = self.hits.fetch_add(1, Ordering::SeqCst);
+        let body = if n.is_multiple_of(2) {
+            &self.fetch
+        } else {
+            &self.fresh
+        };
+        wiremock::ResponseTemplate::new(200).set_body_raw(
+            std::sync::Arc::unwrap_or_clone(body.clone()),
+            "application/zip",
+        )
+    }
+}
+
+/// An `ign-edit-*` directory inside `dir` (the EditTempDir prefix),
+/// when one lingers. `dir` is the spawned binary's TMPDIR — tests
+/// redirect it so the scan is race-free (only THIS command's edit
+/// trees can be present).
+fn lingering_edit_tree(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ign-edit-"))
+        })
 }
 
 // ---- Task 2: the OutOfBand stdout purity byte-scan --------------------------
@@ -228,7 +285,14 @@ async fn edit_stdout_is_byte_pure_under_max_diagnostics() {
         let out = ign_cmd(&config, &server.uri())
             .env("EDITOR", &editor)
             .env("IGNITION_LOG", "trace")
-            .args(["edit", "proj", NESTED, "--verbose", "--verbose", "--verbose"])
+            .args([
+                "edit",
+                "proj",
+                NESTED,
+                "--verbose",
+                "--verbose",
+                "--verbose",
+            ])
             .output()
             .expect("spawn ign");
         assert!(
@@ -465,4 +529,269 @@ hint: this operation is destructive; re-run with --yes or set IGNITION_YES=1
             "the message IS the staged diff summary: {message}"
         );
     } // scope drop verifies: ZERO imports fired — the guard held
+}
+
+// ---- Task 3: the full loop — splice, staleness, fail-closed, no-op ---------
+
+/// THE happy path at the binary level: the editor modifies ONE
+/// member, `--yes` passes the ONE gate, and the recorded import
+/// request carries the SPLICED bytes — re-parsed from the recorded
+/// body: the edited member rides the new content, every untouched
+/// member rides byte-exactly (13-03's round-trip invariant through
+/// the REAL binary), and `project.json` survives. EXACTLY ONE import
+/// fires; the temp edit tree is gone afterwards (the recovery path
+/// only exists for failures).
+#[tokio::test]
+async fn edit_happy_path_pushes_the_spliced_member_exactly_once() {
+    let (_dir, config) = isolated_config();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let tmp = tempfile::tempdir().expect("tmpdir redirection");
+    let server = wiremock::MockServer::start().await;
+    write_profile_config(&config, &server.uri());
+    let editor = editor_script(scratch.path(), "set99-editor", SET99_EDITOR);
+    {
+        let _gets = export_mock(&server, 2).await;
+        let imports = import_mock(&server, 1).await;
+        let out = ign_cmd(&config, &server.uri())
+            .env("EDITOR", &editor)
+            .env("TMPDIR", tmp.path())
+            .args(["edit", "proj", NESTED, "--yes"])
+            .output()
+            .expect("spawn ign");
+        assert!(
+            out.status.success(),
+            "the guarded push succeeds: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "zero stdout, always");
+
+        // The recorded import body re-parsed: the spliced member +
+        // the byte-exact untouched members + project.json.
+        let requests = imports.received_requests().await;
+        assert_eq!(requests.len(), 1, "EXACTLY ONE import fired");
+        let body = &requests[0].body;
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(body.as_slice())).expect("walkable zip");
+        let mut read_member = |name: &str| -> String {
+            use std::io::Read as _;
+            let mut member = archive
+                .by_name(name)
+                .expect("member present in the import zip");
+            let mut bytes = Vec::new();
+            member.read_to_end(&mut bytes).expect("member reads");
+            String::from_utf8(bytes).expect("member is UTF-8")
+        };
+        assert_eq!(
+            read_member(NESTED_ZIP),
+            nested_json(99),
+            "the edited member rides the SPLICED content"
+        );
+        assert_eq!(
+            read_member(VIEW_ZIP),
+            VIEW_JSON,
+            "the untouched codec member rides byte-exactly"
+        );
+        assert_eq!(
+            read_member("project.json"),
+            r#"{"title":"T","enabled":true}"#,
+            "project.json survives the surgery"
+        );
+
+        // The success prose (stderr): the blast-radius summary, then
+        // the pushed line.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("edit would write 1 member(s) to proj")
+                && stderr.contains("edit: pushed 1 member(s) to proj"),
+            "the success prose renders on stderr: {stderr}"
+        );
+
+        // The private edit tree is REMOVED on the success path (no
+        // ign-edit-* entries linger in the redirected TMPDIR).
+        assert!(
+            lingering_edit_tree(tmp.path()).is_none(),
+            "the temp edit tree is removed on success"
+        );
+    } // scope drop: 2 GETs (fetch + staleness re-check), 1 import
+}
+
+/// The staleness gate at the binary level: the gateway's export
+/// DIVERGES between the fetch and the pipeline's re-check → exit 2
+/// with the stable `changed on gateway since fetch` message — and it
+/// fires IDENTICALLY WITH `--yes` (the 13-05 planner lock carries
+/// through dispatch: forcing would clobber a concurrent Designer
+/// edit). Traffic: both runs fetch + re-check (4 GETs), ZERO imports.
+#[tokio::test]
+async fn edit_staleness_refusal_fires_with_and_without_yes() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let editor = editor_script(scratch.path(), "set99-editor", SET99_EDITOR);
+    let server = wiremock::MockServer::start().await;
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, &server.uri());
+    // Mount the fetch/fresh alternation: even hits serve value 42
+    // (the fetch), odd hits serve 43 (the fresh export) — the target
+    // member's hash drifts between the pipeline's snapshot and its
+    // re-check, on every run.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/projects/export/proj",
+        ))
+        .respond_with(AlternatingResponder::new(fixture_zip(), {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("project.json", options)
+                .expect("project.json starts");
+            writer
+                .write_all(br#"{"title":"T","enabled":true}"#)
+                .expect("project.json writes");
+            writer
+                .start_file(VIEW_ZIP, options)
+                .expect("view member starts");
+            writer.write_all(VIEW_JSON.as_bytes()).expect("writes");
+            writer
+                .start_file(NESTED_ZIP, options)
+                .expect("nested member starts");
+            writer
+                .write_all(nested_json(43).as_bytes())
+                .expect("writes");
+            writer.finish().expect("zip finalizes").into_inner()
+        }))
+        .expect(4)
+        .mount(&server)
+        .await;
+    {
+        let _imports = import_mock(&server, 0).await;
+
+        // WITHOUT --yes.
+        let out = ign_cmd(&config, &server.uri())
+            .env("EDITOR", &editor)
+            .args(["edit", "proj", NESTED])
+            .output()
+            .expect("spawn ign");
+        assert_eq!(out.status.code(), Some(2), "stale refusals exit 2");
+        assert!(out.stdout.is_empty(), "refusals keep stdout empty");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(NESTED) && stderr.contains("changed on gateway since fetch"),
+            "the stable staleness message names the member: {stderr}"
+        );
+        assert!(
+            stderr.contains("re-run to fetch fresh"),
+            "the recovery advice rides the message: {stderr}"
+        );
+
+        // WITH --yes — the refusal fires anyway (never --yes-able).
+        let out = ign_cmd(&config, &server.uri())
+            .env("EDITOR", &editor)
+            .args(["edit", "proj", NESTED, "--yes"])
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "staleness refuses EVEN WITH --yes"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("changed on gateway since fetch"),
+            "the same refusal with --yes: {stderr}"
+        );
+    } // scope drop verifies: ZERO imports on both runs
+}
+
+/// The fail-closed recovery at the binary level: a JSON-breaking
+/// editor corrupts the codec-scanned view member → exit 2 with the
+/// codec-verbatim reason + the kept-tree clause, and the printed
+/// `preserved at <path>` tree REALLY EXISTS on disk afterwards (the
+/// user's edit survives the failed run). The test redirects TMPDIR so
+/// the kept tree provably lands where the message says.
+#[tokio::test]
+async fn edit_fail_closed_keeps_the_tree_at_the_printed_path() {
+    let (_dir, config) = isolated_config();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let tmp = tempfile::tempdir().expect("tmpdir redirection");
+    let server = wiremock::MockServer::start().await;
+    write_profile_config(&config, &server.uri());
+    let editor = editor_script(scratch.path(), "breaker-editor", BREAKER_EDITOR);
+    {
+        let _gets = export_mock(&server, 1).await;
+        let _imports = import_mock(&server, 0).await;
+        let out = ign_cmd(&config, &server.uri())
+            .env("EDITOR", &editor)
+            .env("TMPDIR", tmp.path())
+            .args(["edit", "proj", VIEW])
+            .output()
+            .expect("spawn ign");
+        assert_eq!(out.status.code(), Some(2), "fail-closed refuses exit 2");
+        assert!(out.stdout.is_empty(), "refusals keep stdout empty");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // The kept-path clause + the recovery advice.
+        let marker = "preserved at ";
+        assert!(
+            stderr.contains(marker) && stderr.contains("fix the member by hand and re-run"),
+            "the kept-tree recovery clause renders: {stderr}"
+        );
+        let at = stderr.find(marker).expect("marker present");
+        let raw = &stderr[at + marker.len()..];
+        let kept = PathBuf::from(raw.split(" — ").next().expect("path before the dash"));
+
+        // The tree REALLY exists, inside the redirected TMPDIR, still
+        // carrying the user's broken edit for hand-repair. The decode
+        // tree lays members out at their RAW zip names (the
+        // `<collection>/resources/<rest>` form member_path maps to).
+        assert!(kept.exists(), "the kept edit tree exists: {kept:?}");
+        assert!(
+            kept.starts_with(tmp.path()),
+            "the kept path is the redirected TMPDIR tree: {kept:?}"
+        );
+        let broken =
+            std::fs::read_to_string(kept.join(VIEW_ZIP)).expect("the broken member survives");
+        assert!(
+            broken.contains("{ broken"),
+            "the user's (broken) edit is preserved for hand-repair: {broken:?}"
+        );
+    } // scope drop: 1 GET (the codec fails before any staleness re-check), 0 imports
+}
+
+/// The structural no-op at the binary level: a byte-compare editor
+/// (opens, touches nothing) exits 0 as a clean no-op — zero import
+/// traffic (nothing to push, nothing to prompt), stdout empty, and
+/// the private edit tree REMOVED (the recovery path exists only for
+/// failures).
+#[tokio::test]
+async fn edit_noop_is_clean_and_cleans_its_temp_tree() {
+    let (_dir, config) = isolated_config();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let tmp = tempfile::tempdir().expect("tmpdir redirection");
+    let server = wiremock::MockServer::start().await;
+    write_profile_config(&config, &server.uri());
+    let editor = editor_script(scratch.path(), "noop-editor", NOOP_EDITOR);
+    {
+        let _gets = export_mock(&server, 1).await;
+        let _imports = import_mock(&server, 0).await;
+        let out = ign_cmd(&config, &server.uri())
+            .env("EDITOR", &editor)
+            .env("TMPDIR", tmp.path())
+            .args(["edit", "proj", NESTED])
+            .output()
+            .expect("spawn ign");
+        assert!(
+            out.status.success(),
+            "the no-op exits clean: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "zero stdout, always");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("edit: no changes — nothing pushed"),
+            "the no-op prose renders on stderr: {stderr}"
+        );
+        assert!(
+            lingering_edit_tree(tmp.path()).is_none(),
+            "the temp edit tree is removed on the no-op path"
+        );
+    } // scope drop: exactly 1 GET (a no-op never re-checks staleness), ZERO imports
 }

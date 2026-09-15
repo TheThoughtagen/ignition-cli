@@ -171,6 +171,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign workspace checkout <PROJECT> <TARGET> [--decode-scripts]` | Check a project's resources out to a local tree — mapped paths + the recorded `.ign-workspace.json` manifest + an idempotent `.gitignore` | read-only on the wire (one export GET, ZERO imports); an unrelated non-empty target refuses exit 2 (never clobbered — the pre-existing file is untouched), a corrupt or foreign-manifest target refuses naming what it found, a same-project re-checkout refreshes; `--decode-scripts` decodes embedded JSON scripts to editable `.py` sidecars (nvim-editable; the UNEDITED re-encode is byte-exact — see the workspace section and Script decode/encode below); profile NAME rides into the manifest; JSON data `{project, target, member_count, scripts_decoded}` |
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}` |
+| `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
 | `ign resource put <PROJECT> <PATH> --file PATH\|--file -` | Write ONE resource member (upsert: created if absent, replaced if present) | **destructive**: the whole project is re-imported (`overwrite=true`) after the member surgery — exit 2 (`confirmation_required`) without `--yes`; content is sniffed (json/text); binary input refuses exit 6 `resource_binary` before any network I/O; an unreadable file/stdin exits 2 `invalid_input`; concurrent Designer edits are REPLACED (see the resource section) |
@@ -982,6 +983,51 @@ scale by the checkout contract suite. See
 [Script decode/encode](#script-decodeencode---decode-scripts--encode-scripts)
 for the codec contract.
 
+Editing ONE resource without checking out the whole tree is
+[`ign edit`](#edit---the-kubectl-edit-loop-over-one-resource-ign-edit)'s
+job — the workspace is for whole-tree authoring.
+
+### Edit — the kubectl-edit loop over one resource (`ign edit`)
+
+`ign edit <PROJECT> <RESOURCE_PATH>` is the single-resource
+counterpart of the workspace loop: fetch the project export → decode
+the whole tree into a private (0700) temp directory → open the ONE
+resource in `$EDITOR` → on save, re-encode, gate, and push the
+spliced result back with exactly one project import.
+
+```bash
+EDITOR="code --wait" ign edit PlantFloor ignition/script-python/e2e/scratch
+```
+
+**The `$EDITOR` contract.** `VISUAL` wins over `EDITOR` (trimmed; an
+empty value counts as unset); both unset refuses exit 2 BEFORE
+anything resolves — the envelope's `profile` is null and zero
+requests hit the gateway. The variable may carry flags:
+`EDITOR="code --wait"` splits into an argument vector with the file
+path appended LAST (never a shell string) — IDE users need the wait
+flag INSIDE `EDITOR` so the CLI observes the saved file, not just the
+opened one. The editor's exit code is ADVISORY: whether an edit
+happened is decided by CONTENT (a byte-compare of the re-encode
+against the untouched re-encode), never by the exit code — editors
+that daemonize or fork cannot flip a verdict.
+
+**Behavior table.**
+
+| What you did | What happens |
+|--------------|--------------|
+| saved unchanged | clean no-op — `edit: no changes — nothing pushed`, exit 0; nothing is pushed, nothing is prompted |
+| saved a change | the blast-radius summary renders (exactly which members the push would write); without `--yes` that same summary IS the refusal (exit 2 `confirmation_required`); with `--yes` the push rides one overwrite import |
+| the gateway moved since the fetch | refuses exit 2 `invalid_input` — `changed on gateway since fetch` — **EVEN WITH `--yes`** (forcing would clobber a concurrent Designer edit); re-run to fetch fresh and retry |
+| saved something the codec cannot encode | refuses FAIL-CLOSED exit 2 with the codec's own reason, and the temp edit tree is KEPT — its path is printed (`the edit tree is preserved at …`); fix the member by hand and re-run to retry |
+
+**Stdout contract.** `ign edit` writes ZERO bytes to stdout in EVERY
+mode — the child `$EDITOR` owns the terminal, so all prose (the
+no-op line, the blast-radius summary, the pushed line, and every
+refusal) renders to stderr. The contract is byte-scan pinned at the
+binary level under maximum diagnostics. Success prose is stable and
+greppable: `edit: no changes — nothing pushed` and
+`edit: pushed N member(s) to <PROJECT>`.
+
 ### Streaming output (the stdout exceptions)
 
 `ign logs -f` is a STREAM: entries print to stdout as they arrive, so
@@ -1015,6 +1061,12 @@ no added trailing newline. In human mode the artifact summary line
 mode keeps stdout data-only. The loss-gate refusal prose (below) is
 stderr-only for the same reason.
 
+`ign edit` is the inverted FIFTH exception: it writes NOTHING to
+stdout in ANY mode — the child `$EDITOR` owns the terminal and all
+prose renders to stderr — so it never participates in the envelope
+system at all (see the
+[edit section](#edit---the-kubectl-edit-loop-over-one-resource-ign-edit)).
+
 ### Destructive operations
 
 Commands that change gateway state (`sessions terminate`,
@@ -1026,7 +1078,10 @@ profile), `resource put`, `resource delete`
 consequence), `workspace push` (splices local edits into a fresh
 export of the workspace's project — its refusal message IS the
 blast-radius preview, and its conflict refusal fires even with
-`--yes`), `tags provider delete`, `tags config delete`, and
+`--yes`), `edit` (the single-resource loop — its guarded push
+re-imports the project and its refusal message IS the staged diff
+summary; its staleness and fail-closed refusals fire regardless of
+any flag), `tags provider delete`, `tags config delete`, and
 `tags import --collision-policy overwrite` (abort-policy imports need
 no `--yes` — the pre-check fails safely before any write),
 `restart` — the
