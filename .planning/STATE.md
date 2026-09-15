@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 12 COMPLETE+verified; Phase 13 wave 4 COMPLETE (13-07 workspace CLI family: checkout/status/push verbs, routes parity, purity coverage, contract goldens, README contract) — next: 13-08 (edit CLI, wave 5; owns the `edit` clap command + OutOfBand row atomically; edits the same CLI-surface files sequentially)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (all 8 plans executed with summaries; 13-08 landed `ign edit` + the `edit` OutOfBand row atomically — SC-5 closed, all 5 SCs carry binary-level evidence) — next: /gsd-verify-work 13, then Phase 14 planning (mcp/lsp transports)
 
 ## Current Position
 
 **Phase:** 13 of 14 (composite-engine-workspace-historian-edit) — IN PROGRESS
-**Current Plan:** 13-08 (next unexecuted; 13-01 through 13-07 COMPLETE with summaries)
-**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03 ✅, 13-04 ✅, 13-05 ✅, 13-06 ✅, 13-07 ✅, 13-08 pending)
-**Status:** wave 4 complete — 13-07 landed the `ign workspace checkout|status|push` CLI family (Session-seam dispatch, pre-resolve manifest guards, three-mode render, Projects-screen routes rows + clap walk, stdout-purity coverage, 7-test contract_workspace.rs, README contract section)
+**Current Plan:** 13-08 COMPLETE (13-01 through 13-08 all executed with summaries)
+**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03 ✅, 13-04 ✅, 13-05 ✅, 13-06 ✅, 13-07 ✅, 13-08 ✅)
+**Status:** Phase complete — ready for verification
 **Last Activity:** 2026-09-15
 
-**Progress:** [██████████] 99%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -75,6 +75,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P06 | 23 min | 2 tasks | 2 files |
 | Phase 13 P05 | ~10 min continuation (Task 1 @ 15:12Z; full span 15:12Z→19:15Z across the 13-06 interleave) | 2 tasks | 3 files |
 | Phase 13 P07 | 51min | 3 tasks | 8 files |
+| Phase 13 P08 | 57 min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -202,6 +203,8 @@ Recent decisions affecting current work:
 - [Phase 13]: 13-07: workspace status/push read the manifest PRE-resolution (read_manifest is pure fs) — the 13-03 stable refusal prefixes render as exit 2 / profile null / zero-request usage errors (api-call posture); checkout rides the action's clobber ladder post-resolution — usage-class errors cost nothing and never touch the gateway; no core change needed
 - [Phase 13]: 13-07: workspace routes rows map Screen(Projects) beside the project family (checkout rides export, push rides import) — normal envelope verbs, OutOfBand set stays exactly [completions, api call], the `edit` OutOfBand row remains 13-08's atomic landing — plan's map-like-diff/sync directive; keeps the pinned Dashboard count and OutOfBand set untouched
 - [Phase 13]: 13-07: human status table rides the project-family two-space join (not computed-width padding) with direction-bearing STATE labels (deleted (local) vs deleted (gateway)); clean rows included per plan — codebase table convention + stable snapbox goldens
+- [Phase 13]: Edit dispatches on a main-level OutOfBand seam (before the normal chassis, Completions-precedent shape): the plan's no-ActionOutput-variant + render.rs-untouched locks leave no in-chassis shape that can exit 0 with zero stdout; refusals still ride the standard render_error envelope
+- [Phase 13]: Edit's push is the client-level project_import(zip, overwrite=true) — ImportDenied 200-denial honesty rides the client seam; the guard renders the staged summary once (refusal message without --yes, pre-push prose with it), and staleness stays NOT --yes-able through dispatch
 
 ### Pending Todos
 
@@ -218,6 +221,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-15T20:16:01.966Z
-**Stopped At:** Completed 13-07-PLAN.md
+**Last session:** 2026-09-15T21:18:26.850Z
+**Stopped At:** Completed 13-08-PLAN.md — Phase 13 all 8 plans executed; ready for /gsd-verify-work
 **Resume file:** None
