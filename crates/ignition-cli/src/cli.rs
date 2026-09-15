@@ -125,6 +125,13 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Project(ProjectArgs),
 
+    /// Check out a project's resources to a local tree, inspect drift,
+    /// push guarded changes — the local edit loop over the
+    /// project-export interchange (project RESOURCES only; tag values
+    /// never appear in the tree — tags remain `ign tags` verbs)
+    #[command(arg_required_else_help = true)]
+    Workspace(WorkspaceArgs),
+
     /// Manage a project's individual resources: list, get, put,
     /// delete — the surgical edit loop (change one view/script
     /// without re-importing everything)
@@ -405,6 +412,64 @@ pub enum ProjectCommand {
         all_changed: bool,
         /// Also remove B's resources the diff reports removed
         /// (default: upsert-only, nothing is ever deleted)
+        #[arg(long)]
+        delete: bool,
+    },
+}
+
+/// Workspace subcommands (13-07): the local edit loop. `checkout`
+/// writes the mapped tree + records `.ign-workspace.json` (the
+/// manifest IS the workspace identity — status/push read it and the
+/// user never re-types the project); `status` reports PUSH-RELATIVE
+/// drift (every row says what push would do); `push` is the guarded
+/// splice of local edits into a FRESH gateway export.
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceArgs {
+    #[command(subcommand)]
+    pub command: WorkspaceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    /// Check out a project's resources to a local tree — mapped
+    /// paths + the recorded `.ign-workspace.json` manifest + an
+    /// idempotent `.gitignore` (manifest committed; codec artifacts
+    /// ignored). Read-only on the wire: one export GET, zero imports.
+    Checkout {
+        /// Project name to check out
+        project: String,
+        /// Target directory for the workspace tree (created if
+        /// absent; an unrelated non-empty directory refuses — never
+        /// clobbered)
+        target: PathBuf,
+        /// Decode embedded JSON scripts to editable .py sidecars
+        /// (nvim-editable; encodes back cleanly — an unedited
+        /// re-encode is byte-exact; `scripts-manifest.json` keys the
+        /// splice)
+        #[arg(long)]
+        decode_scripts: bool,
+    },
+    /// Report workspace drift against the gateway — states are
+    /// PUSH-RELATIVE (each row names what push would do: write /
+    /// leave / refuse); the project comes from the workspace
+    /// manifest, never re-typed. Read-only: one export GET.
+    Status {
+        /// Workspace root (default: the current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Push local edits to the gateway — guarded (refused without
+    /// --yes; the refusal message IS the blast-radius preview);
+    /// conflicts refuse EVEN WITH --yes (manual reconciliation);
+    /// deletions need --delete (default: reported, skipped);
+    /// untracked files are never imported; an empty selection
+    /// writes nothing.
+    Push {
+        /// Workspace root (default: the current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Also delete gateway members removed locally (default:
+        /// reported, skipped)
         #[arg(long)]
         delete: bool,
     },

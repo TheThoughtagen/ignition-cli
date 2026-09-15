@@ -42,6 +42,7 @@ use ignition_cli::cli::{
     RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd,
     TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
     TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
+    WorkspaceArgs, WorkspaceCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -271,6 +272,16 @@ enum ActionOutput {
     /// `ign tags history query` — the dataset with t_stamp
     /// preserved exactly.
     TagsHistoryQuery(actions::tags::TagsHistoryQueryResult),
+    /// `ign workspace checkout` — the mapped tree + recorded
+    /// manifest outcome (13-07): {project, target, member_count,
+    /// scripts_decoded}.
+    WorkspaceCheckout(actions::workspace::CheckoutOutcome),
+    /// `ign workspace status` — the PUSH-RELATIVE three-way compare
+    /// (13-06): {project, clean, rows}.
+    WorkspaceStatus(actions::workspace::WorkspaceStatus),
+    /// `ign workspace push` — the splice bookkeeping (13-06):
+    /// {project, wrote, deleted, skipped}.
+    WorkspacePush(actions::workspace::PushOutcome),
     /// `ign tui` — the cockpit ran and exited. Renders NOTHING in every
     /// mode (LOCKED stdout decision: the TUI owns the alternate screen
     /// and prints nothing on success; errors after restore flow the
@@ -383,6 +394,9 @@ impl ActionOutput {
             ActionOutput::TagsAlarmsHistory(result) => render_success(profile, result, compact),
             ActionOutput::TagsAlarmsAck(result) => render_success(profile, result, compact),
             ActionOutput::TagsHistoryQuery(result) => render_success(profile, result, compact),
+            ActionOutput::WorkspaceCheckout(result) => render_success(profile, result, compact),
+            ActionOutput::WorkspaceStatus(result) => render_success(profile, result, compact),
+            ActionOutput::WorkspacePush(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts TuiExited
             // before mode dispatch — the cockpit prints nothing).
             #[cfg(feature = "tui")]
@@ -1124,6 +1138,83 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Err(err) => Err(err),
                 };
                 (active, result)
+            }
+        },
+        // Workspace (13-07): the local edit loop over the
+        // project-export interchange. `status`/`push` derive the
+        // project from the RECORDED manifest — the user never
+        // re-types it — and the manifest read needs NO gateway, so
+        // its refusals (13-03's stable prefixes: missing / corrupt /
+        // foreign-schema) fire PRE-resolution: exit 2, envelope
+        // profile null, ZERO requests (the api-call usage-guard
+        // convention). `checkout` takes the project as an explicit
+        // arg and rides the action's own clobber/refusal ladder
+        // post-resolution (still exit 2; the profile echoes because
+        // resolution already succeeded). Everything dispatches
+        // through `Session::resolve` — the Phase-8 seam, NO second
+        // construction path.
+        Commands::Workspace(WorkspaceArgs { command }) => match command {
+            WorkspaceCommand::Checkout {
+                project,
+                target,
+                decode_scripts,
+            } => match Session::resolve(cli.profile.as_deref()) {
+                Ok(session) => {
+                    let name = session.profile_name().to_string();
+                    let result = actions::workspace::workspace_checkout(
+                        &*session,
+                        &project,
+                        &target,
+                        &name,
+                        decode_scripts,
+                    )
+                    .await
+                    .map(ActionOutput::WorkspaceCheckout);
+                    (Some(name), result)
+                }
+                Err(err) => (error_profile(&err), Err(err)),
+            },
+            WorkspaceCommand::Status { path } => {
+                let manifest = match actions::workspace::read_manifest(&path) {
+                    Ok(manifest) => manifest,
+                    Err(err) => return (None, Err(err)),
+                };
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::workspace::workspace_status(
+                            &path,
+                            &*session,
+                            &manifest.project,
+                        )
+                        .await
+                        .map(ActionOutput::WorkspaceStatus);
+                        (Some(name), result)
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
+            WorkspaceCommand::Push { path, delete } => {
+                let manifest = match actions::workspace::read_manifest(&path) {
+                    Ok(manifest) => manifest,
+                    Err(err) => return (None, Err(err)),
+                };
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::workspace::workspace_push(
+                            &path,
+                            &*session,
+                            &manifest.project,
+                            cli.yes,
+                            delete,
+                        )
+                        .await
+                        .map(ActionOutput::WorkspacePush);
+                        (Some(name), result)
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
             }
         },
         // Resources (05-02 re-point): the surgical edit loop riding

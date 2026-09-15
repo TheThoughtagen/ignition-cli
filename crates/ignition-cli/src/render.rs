@@ -50,6 +50,9 @@ use ignition_core::actions::tags::{
     history_summary,
 };
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
+use ignition_core::actions::workspace::{
+    CheckoutOutcome, PushOutcome, StatusKind, WorkspaceStatus,
+};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
 use ignition_core::error::CoreError;
@@ -337,10 +340,116 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::TagsAlarmsHistory(result) => render_tags_alarms_history_human(result),
         ActionOutput::TagsAlarmsAck(result) => render_tags_alarms_ack_human(result),
         ActionOutput::TagsHistoryQuery(result) => render_tags_history_query_human(result),
+        ActionOutput::WorkspaceCheckout(result) => render_workspace_checkout_human(result),
+        ActionOutput::WorkspaceStatus(result) => render_workspace_status_human(result),
+        ActionOutput::WorkspacePush(result) => render_workspace_push_human(result),
         // Unreachable: render_ok intercepts TuiExited before mode
         // dispatch (the prints-nothing decision).
         #[cfg(feature = "tui")]
         ActionOutput::TuiExited => {}
+    }
+}
+
+/// `ign workspace checkout` human lines (13-07): the outcome line
+/// plus the decode note when the codec leg ran.
+fn render_workspace_checkout_human(result: &CheckoutOutcome) {
+    println!(
+        "checked out {} members → {}",
+        result.member_count,
+        result.target.display()
+    );
+    if result.scripts_decoded {
+        println!(
+            "scripts decoded — *.py sidecars + scripts-manifest.json; an unedited \
+             re-encode is byte-exact"
+        );
+    }
+}
+
+/// The push-relative STATE token for one status row (13-06's
+/// [`StatusKind`] vocabulary, human form). Direction-bearing where
+/// the direction matters: `deleted (local)` is push `--delete`
+/// territory, `deleted (gateway)` is pull territory.
+fn workspace_state_label(kind: &StatusKind) -> &'static str {
+    match kind {
+        StatusKind::Clean => "clean",
+        StatusKind::LocalEdit => "local_edit",
+        StatusKind::GatewayDrift => "gateway_drift",
+        StatusKind::Conflict => "conflict",
+        StatusKind::Added { local: false } => "added",
+        StatusKind::Added { local: true } => "added (local)",
+        StatusKind::Deleted { local: true } => "deleted (local)",
+        StatusKind::Deleted { local: false } => "deleted (gateway)",
+        StatusKind::Untracked => "untracked",
+    }
+}
+
+/// `ign workspace status` human render (13-07): a stable two-column
+/// PATH / STATE table (aligned to the widest path), clean rows
+/// INCLUDED — agents diff full state — then the four-counter summary
+/// line. Rows arrive from core in deterministic order (manifest
+/// members sorted by gateway path, then gateway-only additions, then
+/// untracked sorted) and render in that order.
+fn render_workspace_status_human(result: &WorkspaceStatus) {
+    let width = result
+        .rows
+        .iter()
+        .map(|row| row.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    for row in &result.rows {
+        println!(
+            "{:<width$}  {}",
+            row.path,
+            workspace_state_label(&row.kind),
+            width = width
+        );
+    }
+    let local_edits = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, StatusKind::LocalEdit))
+        .count();
+    let drift = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, StatusKind::GatewayDrift))
+        .count();
+    let conflicts = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, StatusKind::Conflict))
+        .count();
+    let untracked = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, StatusKind::Untracked))
+        .count();
+    println!(
+        "{local_edits} local edits, {drift} gateway drift, {conflicts} conflicts, \
+         {untracked} untracked"
+    );
+}
+
+/// `ign workspace push` human render (13-07): the bookkeeping header
+/// plus the wrote/deleted/skipped lists (only non-empty lists print
+/// lines — a zero-write push stays one honest line).
+fn render_workspace_push_human(result: &PushOutcome) {
+    println!(
+        "pushed {} — wrote {}, deleted {}, skipped {}",
+        result.project,
+        result.wrote.len(),
+        result.deleted.len(),
+        result.skipped.len()
+    );
+    for path in &result.wrote {
+        println!("  wrote: {path}");
+    }
+    for path in &result.deleted {
+        println!("  deleted: {path}");
+    }
+    for path in &result.skipped {
+        println!("  skipped: {path}");
     }
 }
 
