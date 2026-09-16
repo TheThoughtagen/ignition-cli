@@ -9,3 +9,5 @@
 /website/build/
 /website/.docusaurus/
 /docs/reference.md
+/docs/reference/
+/website/static/search-index.json

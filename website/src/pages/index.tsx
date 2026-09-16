@@ -1,7 +1,7 @@
 import React from 'react';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
-const cards = [{"title": "Connect a gateway", "description": "Create a profile and inspect gateway status.", "path": "quickstart"}, {"title": "Read the command reference", "description": "Find commands, JSON output contracts, and operation-specific limits.", "path": "reference"}, {"title": "Diagnose a connection", "description": "Check profile selection, API authentication, and gateway access.", "path": "troubleshooting"}];
+const cards = [{"title": "Connect a gateway", "description": "Create a profile and inspect gateway status.", "path": "quickstart"}, {"title": "Read the command reference", "description": "Find commands, JSON output contracts, and operation-specific limits.", "path": "reference"}, {"title": "Drive it with agents", "description": "MCP transport, LSP for editors, and the agent-skills playbook.", "path": "reference/agent-transports-mcp-ign-mcp-serve-and-lsp-ign-lsp"}, {"title": "Diagnose a connection", "description": "Check profile selection, API authentication, and gateway access.", "path": "troubleshooting"}];
 export default function Home(): React.JSX.Element {
  return <Layout title="ignition-cli" description="Inspect Ignition 8.3+ gateways, manage projects, and automate repeatable tasks with the ign binary.">
   <main><section className="launch-hero"><p className="launch-label">IGNITION / DEVELOPER TOOLS</p><h1>Work with Ignition from the terminal.</h1><p className="lead">Inspect Ignition 8.3+ gateways, manage projects, and automate repeatable tasks with the ign binary.</p>

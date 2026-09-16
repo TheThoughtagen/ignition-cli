@@ -1,3 +1,6 @@
+---
+sidebar_position: 1
+---
 # Install ignition-cli
 
 The executable is named `ign`. It targets Ignition 8.3+ gateways.
@@ -20,6 +23,8 @@ npx skills add TheThoughtagen/ignition-cli -g
 ```
 
 Claude Code can alternatively load them as a plugin: `/plugin marketplace add TheThoughtagen/ignition-cli` → `/plugin install ignition-ops@ignition-cli`.
+
+Installation is interactive by default (source → skills → agents → scope) and always explicit — nothing installs itself, and the skills run only in agents you choose. Already installed? Re-running the same command updates in place (same paths, no duplicates), or use `npx skills update`.
 
 The command reference on this site follows the repository's main branch. Use `ign --help` and each subcommand's `--help` to check the interface available in your installed release.
 

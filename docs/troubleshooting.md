@@ -1,3 +1,6 @@
+---
+sidebar_position: 10
+---
 # Troubleshooting
 
 ## No active profile
@@ -16,7 +19,7 @@ Tag value/config verbs refuse with `routes_not_deployed` until the CLI's routes 
 
 After any upgrade, make sure the client launches the NEW binary: PATH resolves the installed `~/.cargo/bin/ign`, not a repo build — run `ign --version` exactly as the client would see it, and re-run `cargo install ignition-cli` after transport-affecting changes. `ign mcp serve` clients that see connection-closed on startup are almost always launching a stale pre-transport binary.
 
-The CLI requires its own route bundle for runtime tags, alarms, and history. Read the WebDev section of the [reference](https://thethoughtagen.github.io/ignition-cli/docs/reference/) before running `ign webdev deploy`. Deploying replaces the CLI-owned route project.
+The CLI requires its own route bundle for runtime tags, alarms, and history. Read the WebDev section of the [reference](https://thethoughtagen.github.io/ignition-cli/docs/reference/commands/) before running `ign webdev deploy`. Deploying replaces the CLI-owned route project.
 
 ## Import or resource update behaves unexpectedly
 
