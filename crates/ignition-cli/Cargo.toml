@@ -28,6 +28,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+# 14-03: the LSP transport — lsp-server owns the fiddly base protocol
+# (framing/handshake/shutdown, the Don't-Hand-Roll table); lsp-types is the
+# spec's data model. The phase's ONLY new dependencies (workspace-carried).
+lsp-server = { workspace = true }
+lsp-types = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

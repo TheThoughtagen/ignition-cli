@@ -223,6 +223,13 @@ pub enum Commands {
     #[command(hide = true)]
     Mcp(McpArgs),
 
+    /// Serve LSP over stdio (hidden; for ignition-nvim — the
+    /// Content-Length-framed LSP stream IS the stdout product; the
+    /// routes.rs OutOfBand row lands atomically with this command,
+    /// 08-06 contract)
+    #[command(hide = true)]
+    Lsp,
+
     /// Interactive TUI cockpit
     #[cfg(feature = "tui")]
     Tui,

@@ -34,7 +34,10 @@ pub enum Mapping {
     /// server's stdout stream IS the product (newline-delimited
     /// JSON-RPC 2.0 answered for an MCP client) — again the same genre,
     /// fulfilling that reservation with its clap command atomically.
-    /// `lsp` remains reserved for its own transport plan.
+    /// 14-03 added `lsp`: the LSP server's stdout stream IS the product
+    /// (Content-Length-framed JSON-RPC 2.0 answered for nvim's LSP
+    /// client) — fulfilling the last 08-06 reservation with its clap
+    /// command in the same landing.
     OutOfBand,
 }
 
@@ -103,6 +106,23 @@ pub fn routes() -> &'static [CliRoute] {
         // 5; an orphan row would fail the clap walk by design).
         CliRoute {
             path: "mcp",
+            mapping: Mapping::OutOfBand,
+        },
+        // 14-03: `ign lsp` (the 08-06 pre-declared reservation
+        // FULFILLED) — OutOfBand with written justification: the LSP
+        // server's stdout stream IS the product — Content-Length-
+        // framed JSON-RPC 2.0 answered for an LSP client (nvim's;
+        // completions/api-call/edit/mcp genre: the CLI talks to a
+        // consumer, not to a human at a dashboard). OutOfBand means
+        // "not the envelope render path", NOT "silent" — diagnostics
+        // and log prose go to stderr per the LSP convention. The
+        // pinned OutOfBand test in ignition-cli's tui_coverage.rs was
+        // extended to exactly [api call, completions, edit, mcp, lsp]
+        // in the SAME task — row + clap command land together
+        // (Pitfall 5; an orphan row would fail the clap walk by
+        // design).
+        CliRoute {
+            path: "lsp",
             mapping: Mapping::OutOfBand,
         },
         // 09-04: the three curated morning-check reads (EXT-02) —
@@ -447,19 +467,20 @@ pub fn routes() -> &'static [CliRoute] {
         // and `tags export -o -` (a FLAG VALUE on the Screen-mapped
         // `tags export` leaf) — are NOT distinct leaves and carry no
         // rows; the leaf-representable exceptions are `completions`,
-        // `api call` (since 09-03), `edit` (since 13-08), and `mcp`
-        // (since 14-01 — the pinned OutOfBand test carries all four).
+        // `api call` (since 09-03), `edit` (since 13-08), `mcp`
+        // (since 14-01), and `lsp` (since 14-03 — the pinned
+        // OutOfBand test carries all five).
         //
         // Reserved OutOfBand slugs (08-06): `mcp` and `lsp` were
         // PRE-DECLARED for Phase 14 — MCP stdio and LSP speak their
         // own protocols on stdout (a cockpit would fight them for the
-        // terminal). `edit` joined the set in 13-08, its row landing
-        // TOGETHER with its clap command; `mcp` joined in 14-01 the
-        // same way. The remaining row (`lsp`) lands with its clap
-        // command in its own plan; rows added before the commands
-        // exist are orphans and the clap walk refuses them by
-        // design — this comment plus the pinned OutOfBand test ARE
-        // the pre-declaration.
+        // terminal). `edit` joined the set in 13-08 and `mcp` in
+        // 14-01, each row landing TOGETHER with its clap command;
+        // `lsp` joined in 14-03 the same way — the last 08-06
+        // reservation is FULFILLED and the set is closed. Rows added
+        // before their commands exist are orphans and the clap walk
+        // refuses them by design — this comment plus the pinned
+        // OutOfBand test ARE the pre-declaration.
         CliRoute {
             path: "rig up",
             mapping: Mapping::Screen(Screen::Rig),

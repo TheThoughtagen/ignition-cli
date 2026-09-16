@@ -57,6 +57,13 @@ sha2 = "0.10"
 # 0.29 dep keeps the graph single-major (ratatui-crossterm defaults to 0.29).
 ratatui = "0.30.2"
 crossterm = { version = "0.29", features = ["event-stream"] }
+# Phase 14 (14-03): the LSP transport's ONLY new dependencies — lsp-server
+# (rust-lang) owns Content-Length framing + handshake + io threads; lsp-types
+# carries the spec's type surface. Capabilities stay NARROW (completion/hover/
+# full-sync) by design — Python ignition-lsp owns the statics (composition).
+# crossbeam-channel arrives transitively with lsp-server — never a direct dep.
+lsp-server = "0.10"
+lsp-types = "0.97"
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

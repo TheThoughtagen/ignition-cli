@@ -17,6 +17,7 @@
 //! - No direct exit calls anywhere outside clap's `Error::exit`.
 
 mod completions;
+mod lsp;
 mod mcp;
 mod render;
 
@@ -453,6 +454,22 @@ fn main() -> ExitCode {
     if let Commands::Mcp(args) = cli.command {
         let profile_flag = cli.profile.clone();
         return runtime.block_on(mcp::serve(args, profile_flag.as_deref()));
+    }
+    // 14-03: `ign lsp` is the OutOfBand protocol verb — the LSP client
+    // (nvim) owns stdout with Content-Length-framed JSON-RPC 2.0 (the
+    // protocol stream IS the product; the routes.rs OutOfBand row
+    // landed atomically with this command, 08-06 contract). No
+    // ActionOutput variant exists BY DESIGN (same reason as mcp/edit),
+    // so lsp dispatches on its own seam HERE, beside mcp's. The seam
+    // is a PLAIN SYNC return: lsp-server's loop is crossbeam-sync, so
+    // the roadmap flag's block_on question resolves as NO block_on at
+    // this level — the runtime lives ONLY inside the refresher thread
+    // (lsp.rs), which is not an LSP request. The ambient profile flag
+    // rides in resolved ONCE by apply_env_defaults (CORE-09) and is
+    // consumed by the refresher thread.
+    if let Commands::Lsp = cli.command {
+        let profile_flag = cli.profile.clone();
+        return lsp::serve(profile_flag.as_deref());
     }
     // dispatch resolves the profile context and returns it alongside the
     // result so BOTH the success and the error envelope echo it (CORE-01).
@@ -2634,6 +2651,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // for match exhaustiveness.
         Commands::Mcp(_) => {
             unreachable!("mcp handled by mcp::serve before the chassis")
+        }
+        // Runtime-unreachable: main returns early for Lsp (14-03's
+        // OutOfBand seam — the protocol stream IS stdout, so no
+        // ActionOutput variant may exist for it); the arm exists only
+        // for match exhaustiveness.
+        Commands::Lsp => {
+            unreachable!("lsp handled by lsp::serve before the chassis")
         }
         // Runtime-unreachable: dispatch returns early for Completions
         // before config load (a broken config must not break `completions`);

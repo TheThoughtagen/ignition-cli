@@ -33,7 +33,7 @@
 //! ## The sanctioned stdout exceptions
 //!
 //! The OutOfBand row set is exactly `["api call", "completions",
-//! "edit", "mcp"]` — the LEAF-REPRESENTABLE sanctioned stdout
+//! "edit", "mcp", "lsp"]` — the LEAF-REPRESENTABLE sanctioned stdout
 //! exceptions. The flag-value / stream-form exceptions are NOT
 //! distinct leaves and carry no rows: `logs -f` NDJSON is a FLAG on
 //! the Screen-mapped `logs` leaf; `tags export -o -` is a FLAG VALUE
@@ -47,7 +47,8 @@
 //! in Phase 14, not before (orphan rows fail the walk by design).
 //! `edit` joined the set in 13-08 and `mcp` joined in 14-01 — both
 //! 08-06 reservations fulfilled with their clap commands in the same
-//! landings. `lsp` remains reserved for its own transport plan.
+//! landings. `lsp` joined in 14-03 the same way — the last 08-06
+//! reservation is FULFILLED and the set is closed.
 
 #![cfg(feature = "tui")]
 
@@ -123,9 +124,9 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 
 /// Mapping-kind sanity: the OutOfBand row set is pinned to the
 /// leaf-representable sanctioned stdout exceptions — exactly
-/// `["api call", "completions", "edit", "mcp"]` (compared as a SET:
-/// order-free by design, so a routes() re-ordering cannot churn the
-/// pin).
+/// `["api call", "completions", "edit", "mcp", "lsp"]` (compared as a
+/// SET: order-free by design, so a routes() re-ordering cannot churn
+/// the pin).
 ///
 /// Why `api call` belongs here (09-03 justification): raw passthrough
 /// to ARBITRARY gateway REST endpoints is not a cockpit verb — there
@@ -148,13 +149,20 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 /// envelope render path", NOT "silent" (completions/api-call/edit
 /// genre, one more consumer: the protocol client itself).
 ///
+/// Why `lsp` belongs here (14-03 justification): the LSP server's
+/// stdout stream IS the product — Content-Length-framed JSON-RPC 2.0
+/// answered for an LSP client (nvim's); OutOfBand means "not the
+/// envelope render path", NOT "silent" — the LSP convention routes
+/// diagnostics and log prose to stderr (mcp genre, one more
+/// protocol client).
+///
 /// These landings FULFILL the Phase-8 pre-declaration (08-06): `edit`
 /// was reserved with written justification since 08-06 with zero rows
 /// and landed with its clap command in 13-08; `mcp` was reserved the
-/// same way and landed with its clap command in 14-01 — orphan rows
-/// fail the sibling clap walk by design, so each row and its clap
-/// command HAD to land together, and they did. `lsp` remains reserved
-/// for its own transport plan.
+/// same way and landed with its clap command in 14-01; `lsp` landed
+/// with its clap command in 14-03 — orphan rows fail the sibling clap
+/// walk by design, so each row and its clap command HAD to land
+/// together, and they did. The 08-06 reservation set is closed.
 #[test]
 fn out_of_band_rows_are_pinned() {
     let mut out_of_band: Vec<&str> = routes()
@@ -165,8 +173,8 @@ fn out_of_band_rows_are_pinned() {
     out_of_band.sort_unstable();
     assert_eq!(
         out_of_band,
-        vec!["api call", "completions", "edit", "mcp"],
-        "the OutOfBand set must stay exactly [api call, completions, edit, mcp] — \
+        vec!["api call", "completions", "edit", "lsp", "mcp"],
+        "the OutOfBand set must stay exactly [api call, completions, edit, mcp, lsp] — \
          a new member needs a written justification here AND in routes.rs, \
          landing in the SAME task as its clap command"
     );
