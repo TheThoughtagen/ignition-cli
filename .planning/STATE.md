@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 14 of 14 (transports-mcp-lsp) — IN PROGRESS
-**Current Plan:** 14-04 COMPLETE (LSP handlers: 3-family completions + TTL-stamped hover + frame-derived diagnostics via crossbeam select! loop; contract_lsp.rs byte-scan + dead-gateway cache-only proof) — next: 14-05
-**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04 ✅, 14-05–14-06 pending)
+**Current Plan:** 14-05 COMPLETE (ignition-nvim live-client wiring: second `ignition_live` client `cmd {'ign','lsp'}` guarded + additive beside the statics client; headless e2e BOTH_CLIENTS with narrow-cap proof; sibling commit 0d6bd55 on `claude/ign-lsp-live-client`) — next: 14-06
+**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04 ✅, 14-05 ✅, 14-06 pending)
 **Status:** Executing
 **Last Activity:** 2026-09-16
 
-**Progress:** [██████████] 98%
+**Progress:** [██████████] 99%
 
 ## Performance Metrics
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
 | 12 | 4/4 | 90 min | 22 min avg |
 | 13 | 7/8 | 892 min (incl. 13-04 live-rig windows) | ~127 min avg |
-| 14 | 1/6 | 61 min | 61 min |
+| 14 | 5/6 | 228 min | ~46 min avg |
 
 *Updated after each plan completion*
 | Phase 08 P02 | 200 min | 2 tasks | 3 files |
@@ -80,6 +80,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 14 P02 | 45 min | 2 tasks | 2 files |
 | Phase 14 P03 | 46 min | 2 tasks | 7 files |
 | Phase 14 P04 | 55 min | 2 tasks | 4 files |
+| Phase 14 P05 | 21 min | 2 tasks | 1 file (sibling repo) |
 
 ## Accumulated Context
 
@@ -222,6 +223,8 @@ Recent decisions affecting current work:
 - [Phase 14]: 14-04: dead-gateway honesty ladder — unhealthy snapshot publishes EMPTY diagnostics (no cached oracle = no verdict, never unknown-provider spam); contract test pins per-request latency (send→answer) so process startup cannot mask a network-blocking handler
 - [Phase 14]: 14-04: [Rule 1] named-query populate filter fixed — real export members arrive as {collection}/named-query/{path}/resource.json post user_path, so the old starts_with('named-query/') would never fire; named_query_path() normalizes any path containing the named-query/ segment
 - [Phase 14]: 14-04: docs map keys on the URI string (clippy mutable_key_type on lsp_types::Uri's interior-mutable innards; lsp-types compares Uris by string anyway); crossbeam-channel promoted to a direct dep (the select! loop requires it; supersedes 14-03's transitive-only comment)
+- [Phase 14]: 14-05: ignition_live is a SEPARATE guarded FileType autocmd beside the statics one, and registers BEFORE M.setup's statics early-return — the existing callback early-returns when ignition_lsp is already attached (a co-located live start would be skipped in the normal case) and doesn't exist at all without the venv; sibling autocmd keeps the statics path byte-identical and serves both venv-present and venv-absent machines
+- [Phase 14]: 14-05: sibling patch committed on NEW branch claude/ign-lsp-live-client off the checkout's current HEAD (fix/preview-flex-spill) — the repo was mid-WIP with a dirty unrelated file; per-feature-branch + conventional commits is that repo's own convention, their WIP untouched; global ~/.cargo/config.toml redirects cargo output to ~/Library/Caches/cargo-target so the repo-local target/debug/ign is a stale leftover — PATH-scope the cache dir for fresh-binary runs
 
 ### Pending Todos
 
@@ -238,6 +241,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-16T04:30:13.778Z
-**Stopped At:** Completed 14-04-PLAN.md
+**Last session:** 2026-09-16T11:43:36.915Z
+**Stopped At:** Completed 14-05-PLAN.md (ignition-nvim live-client wiring; sibling commit 0d6bd55) — next: 14-06
 **Resume file:** None

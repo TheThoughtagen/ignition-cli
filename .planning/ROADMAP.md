@@ -180,11 +180,11 @@ Plans:
 **Planner locks** (no CONTEXT.md; locked during planning from research recommendations): GUARDED_OPS single-source const registry + source-scan drift test (catalog reads only the const); full static catalog with exclusion set exactly {completions, mcp, lsp, tui, edit}, no pagination; named-query enumeration rides the export/resource_members path; `ign lsp` resolves profile ambiently (IGNITION_PROFILE → config active); protocolVersion pinned "2025-06-18" with echo-if-equal negotiation.
 **Plans**: 6 plans (5 waves)
 Plans:
-- [ ] 14-01-PLAN.md — `ign mcp serve` core: hidden clap command + OutOfBand row (atomic) + GUARDED_OPS registry with drift test + clap-derived catalog with parity test + JSON-RPC 2.0 framing + concurrent serve loop + confirm-gated dispatch bridge
-- [ ] 14-02-PLAN.md — MCP contract suite: scripted-client byte-scan harness over the real binary, full 2025-06-18 lifecycle, envelope-verbatim + confirm-refusal + ping-starvation pins, Python mcp SDK oracle
-- [ ] 14-03-PLAN.md — `ign lsp` core: lsp-server 0.10 sync loop scaffold + narrow capabilities + OutOfBand row (atomic) + GatewayCache TTL snapshot + background refresher thread (soft-degrade)
-- [ ] 14-04-PLAN.md — LSP handlers (three-family completions, TTL-stamped hover, cached diagnostics) + contract_lsp.rs Content-Length byte-scan suite incl. dead-gateway cache-only proof
-- [ ] 14-05-PLAN.md — ignition-nvim composition: second client registration (ignition_live) in the sibling repo + headless end-to-end verification + sibling-repo commit
+- [x] 14-01-PLAN.md — `ign mcp serve` core: hidden clap command + OutOfBand row (atomic) + GUARDED_OPS registry with drift test + clap-derived catalog with parity test + JSON-RPC 2.0 framing + concurrent serve loop + confirm-gated dispatch bridge
+- [x] 14-02-PLAN.md — MCP contract suite: scripted-client byte-scan harness over the real binary, full 2025-06-18 lifecycle, envelope-verbatim + confirm-refusal + ping-starvation pins, Python mcp SDK oracle
+- [x] 14-03-PLAN.md — `ign lsp` core: lsp-server 0.10 sync loop scaffold + narrow capabilities + OutOfBand row (atomic) + GatewayCache TTL snapshot + background refresher thread (soft-degrade)
+- [x] 14-04-PLAN.md — LSP handlers (three-family completions, TTL-stamped hover, cached diagnostics) + contract_lsp.rs Content-Length byte-scan suite incl. dead-gateway cache-only proof
+- [x] 14-05-PLAN.md — ignition-nvim composition: second client registration (ignition_live) in the sibling repo + headless end-to-end verification + sibling-repo commit (0d6bd55, branch claude/ign-lsp-live-client)
 - [ ] 14-06-PLAN.md — Phase-final checkpoint: live MCP smoke against Claude Code/Claude Desktop + nvim composition verification (human)
 
 ## Progress
