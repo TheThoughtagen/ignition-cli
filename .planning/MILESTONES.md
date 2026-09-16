@@ -20,3 +20,24 @@
 **Archives:** [v1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md) · [v1.0-REQUIREMENTS.md](milestones/v1.0-REQUIREMENTS.md) (all 44 v1 requirements shipped)
 
 ---
+## v1.1 Agent Surface & IDE Integration (Shipped: 2026-09-16)
+
+**Phases:** 8-14 · **Plans:** 47 · **Tasks:** 113 · **Timeline:** 12 days (2026-09-04 → 2026-09-16)
+**Code:** ~107,954 lines Rust (up from ~73,900 at v1.0) · **Tests:** ~1,255 Rust test fns
+**Git range:** v1.0 tag → fdf7777 (docs(phase-14): complete phase execution) · 236 commits, 263 files changed (+76,357/−2,351)
+
+**Delivered:** `ign` v1.1 — the agent surface and IDE integration: raw API passthrough + curated diagnostics, full guarded EAM writes with blast-radius preview, byte-faithful XML/CSV tag transfer with loss gates, historian binding closed, workspace checkout/push + `ign edit` round-trip, and MCP/LSP transports that make `ign` drivable by AI agents (live-proven by a real Claude Code client) and by nvim — all 25 v1.1 requirements shipped across 7 phases.
+
+**Key accomplishments:**
+- Agent surface — `ign api call` raw REST passthrough (gateway-verbatim `data`, catch-all 4xx→exit-2, auth-header refusal) + curated daily checks (`license status`, `redundancy status`, `gan status`, diagnostics bundle generate/status/wait/download), live-verified on both 8.3.3 and 8.3.6 rigs
+- Guarded EAM writes — full suspend/resume/cancel/force/modify/delete lifecycle behind a blast-radius preview gate (CLI refusal prose IS the preview; TUI Confirm modals); capture-first wire truth on both rigs, through-suspend live-proven on a disposable WHK controller rig
+- Tag gaps closed — byte-faithful XML transfer (gateway bytes verbatim, sha256 round-trip fidelity oracle both rigs), CLI-generated CSV with documented losses, loss-report advisory gate before imports (route bundle atomically bumped 1.1.0→1.3.0); historian binding spike verdict CLOSURE — `[historyEnabled, historyProvider, sampleMode]` live-proven on both trial rigs, written values proven in history
+- IDE integration — `ign workspace checkout/status/push` over the generalized MemberSource engine (injective hostile-name-safe path mapping, proptest-proven; manifest three-way compare; guarded push) and `ign edit` fetch→decode→$EDITOR→encode→push with content-hash no-op detection, fail-closed encode, staleness gate; `ign lsp` feeds ignition-nvim completions/hover/diagnostics from TTL-cached gateway truth (headless e2e'd; nvim patch on branch claude/ign-lsp-live-client pending user merge)
+- MCP transport — `ign mcp serve` (hand-rolled JSON-RPC 2.0 stdio, 83-tool clap-derived catalog with CI parity, confirm-gate refusal as tool result) proven live by a real Claude Code client: initialize → tools/list → tools/call, honest evidence ledger in 14-06-SUMMARY.md
+- TUI polish — four named themes × four capability tiers with authored degradation (WCAG-AAA dark body contrast; default/mono wire-proven byte-identical), CI tokenization gate, per-profile polling cadence with sub-second clamp; user-approved after 3-round UAT
+- Foundation refactor — `ignition-core::Session` single execution seam (zero second client construction, grep-proven), one-migration config schema with lenient degradation, executable contract rituals (Three-Place slug rule CI, OutOfBand taxonomy, stdout-purity byte-scan over the real binary)
+
+**Archives:** [v1.1-ROADMAP.md](milestones/v1.1-ROADMAP.md) · [v1.1-REQUIREMENTS.md](milestones/v1.1-REQUIREMENTS.md) (all 25 v1.1 requirements shipped)
+
+---
+
