@@ -50,6 +50,20 @@ marker. Auth-pattern headers (`Authorization`, `X-Ignition-API-Token`,
 `Cookie` — case-insensitive) are refused exit 2 BEFORE any request:
 credentials come from the profile, full stop.
 
+### The MCP refusal-prose exception (2026-09-16)
+
+The frozen envelope governs the CLI's own stdout/stderr only —
+byte-for-byte, always. Over the MCP transport (`ign mcp serve`), a
+`confirmation_required` refusal is the SECOND dated envelope-transport
+exception (alongside `ign api call` above): its `message`/`hint` PROSE
+adapts to the transport — the JSON names `confirm: true` (the
+MCP-native confirmation) and marks `--yes`/`IGNITION_YES=1` CLI-only —
+while the shape stays byte-stable (same keys, same order,
+`ok:false`/`code`/`profile:null`/`endpoint:null` untouched). The MCP
+input schema correspondingly keeps `confirm` OUT of `required` for
+guarded verbs: schema-required would invite agents to auto-fill
+`confirm:true`, so omission is legal and answered by the refusal.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs

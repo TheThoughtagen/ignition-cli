@@ -14,16 +14,19 @@
 //!   independent walk, so catalog drift from the CLI surface is
 //!   structurally impossible.
 //! - **SC-2 (confirm gate)**: every leaf whose clap path appears in
-//!   [`crate::GUARDED_OPS`] carries a synthetic REQUIRED
-//!   `confirm: boolean` schema property; the dispatch bridge sets
-//!   `--yes` ONLY from that field. `IGNITION_YES` (merged by
-//!   `apply_env_defaults` for the human CLI) can never reach the
-//!   protocol path — the bridge bypasses `apply_env_defaults` for the
-//!   inner parse by construction. A confirmation_required refusal on
-//!   a guarded verb rides as TWO text blocks: the frozen envelope
-//!   byte-verbatim FIRST, then MCP-specific guidance (the envelope's
-//!   own hint names CLI-only confirmations — 14-06 checkpoint
-//!   feedback); every other envelope stays single-block verbatim.
+//!   [`crate::GUARDED_OPS`] carries a synthetic `confirm: boolean`
+//!   schema property that is deliberately ABSENT from `required`
+//!   (schema-required would invite agents to auto-fill `confirm:true`);
+//!   the dispatch bridge sets `--yes` ONLY from that field.
+//!   `IGNITION_YES` (merged by `apply_env_defaults` for the human CLI)
+//!   can never reach the protocol path — the bridge bypasses
+//!   `apply_env_defaults` for the inner parse by construction. A
+//!   confirmation_required refusal on a guarded verb rides as ONE text
+//!   block whose envelope shape is byte-stable but whose message/hint
+//!   PROSE is MCP-native (names `confirm: true`, marks `--yes`/
+//!   `IGNITION_YES` CLI-only) — the second dated envelope-transport
+//!   exception, alongside 09-03's api-call one (14-06 checkpoint round
+//!   2). Every other envelope stays single-block verbatim.
 //! - **Purity**: compact serialization only (`serde_json::to_string`)
 //!   — one message per line, never pretty-printed (embedded newlines
 //!   are a spec violation and a protocol death). Diagnostics ride the
@@ -148,8 +151,12 @@ fn walk_catalog(cmd: &clap::Command, prefix: &str, out: &mut Vec<CatalogEntry>) 
 /// (json/compact), overridden by the ambient profile flag (profile),
 /// confirm-gated (`yes` — replaced by the synthetic `confirm`
 /// property), or stderr-only noise (verbose). A leaf present in
-/// GUARDED_OPS gains the synthetic REQUIRED `confirm` boolean — the
-/// catalog reads ONLY that const (single source, SC-2).
+/// GUARDED_OPS gains the synthetic `confirm` boolean — the
+/// catalog reads ONLY that const (single source, SC-2). `confirm` is
+/// deliberately NOT in `required` (14-06 checkpoint round 2): a
+/// schema-required confirm invites agents to auto-fill `confirm:true`
+/// and defeat the gate — omission is legal and answered by the
+/// refusal envelope.
 fn leaf_entry(path: &str, cmd: &clap::Command) -> CatalogEntry {
     let guarded = GUARDED_OPS
         .iter()
@@ -227,12 +234,15 @@ fn leaf_entry(path: &str, cmd: &clap::Command) -> CatalogEntry {
             "confirm".into(),
             json!({
                 "type": "boolean",
-                "description": "Explicit confirmation for this destructive operation — the ONLY \
-                               way --yes is reachable over MCP. Omitted or false returns the \
-                               refusal envelope as an error tool result."
+                "description": "Set true to execute this destructive operation; omit or \
+                                false to receive the refusal."
             }),
         );
-        required.push(Value::String("confirm".into()));
+        // FIX B (14-06 checkpoint round 2): `confirm` stays OUT of
+        // `required`. Schema-required advertises "you must confirm to
+        // call this", which agents satisfy reflexively with
+        // confirm:true — the optional form plus the refusal envelope
+        // is the SC-2 behavior.
     }
 
     let mut schema = serde_json::Map::new();
@@ -577,30 +587,32 @@ async fn execute(
     // In-process dispatch in compact-json mode.
     let mode = RenderMode::resolve(true, true);
     let (profile, result) = crate::dispatch(inner, mode).await;
-    let envelope = match result {
-        Ok(out) => success_envelope(&out, profile.as_deref()),
-        Err(err) => failure_envelope(&err, profile.as_deref()),
+
+    // 14-06 checkpoint round 2 (FIX A): when a GUARDED verb is refused
+    // on the confirmation_required path with confirm missing/false, the
+    // envelope's message/hint prose is REWRITTEN to MCP-native advice —
+    // the frozen CLI prose names `--yes`/IGNITION_YES, which 14-01
+    // live-proved can never reach this protocol path, and an agent
+    // that parses only the JSON must get the advice that works on its
+    // transport. The rewrite rides the SAME locked envelope struct, so
+    // shape/keys/field order/ok:false/code/profile:null/endpoint:null
+    // are byte-stable; the CLI's own stdout/stderr prose NEVER changes
+    // (second dated envelope-transport exception, alongside 09-03's
+    // api-call one). Every other envelope stays verbatim, and every
+    // result — refusal included — is ONE text block.
+    let confirm_refusal = match &result {
+        Err(err) => confirm != Some(true) && is_guarded && err.code() == "confirmation_required",
+        Ok(_) => false,
+    };
+    let envelope = match &result {
+        Ok(out) => success_envelope(out, profile.as_deref()),
+        Err(err) if confirm_refusal => {
+            mcp_confirm_refusal_envelope(err, profile.as_deref(), &entry.path)
+        }
+        Err(err) => failure_envelope(err, profile.as_deref()),
     };
     let is_error = envelope_reports_failure(&envelope);
-
-    // 14-06 (live-smoke checkpoint feedback): when a GUARDED verb is
-    // refused on the confirmation_required path with confirm
-    // missing/false, append a SECOND text block pointing MCP callers
-    // at the argument that CAN confirm — the envelope's own hint names
-    // `--yes`/IGNITION_YES, which 14-01 live-proved can never reach
-    // this protocol path. Block 1 stays the frozen envelope
-    // byte-verbatim (SC-2's verbatim pin is scoped to the first
-    // block); every other ok:false envelope — and any refusal on a
-    // non-guarded verb (whose schema has no confirm argument to pass)
-    // — stays single-block verbatim.
-    let confirm_refusal = is_error
-        && confirm != Some(true)
-        && is_guarded
-        && envelope_error_code(&envelope).as_deref() == Some("confirmation_required");
-    let mut content = vec![json!({ "type": "text", "text": envelope })];
-    if confirm_refusal {
-        content.push(json!({ "type": "text", "text": MCP_CONFIRM_GUIDANCE }));
-    }
+    let content = vec![json!({ "type": "text", "text": envelope })];
     Ok(json!({
         "content": content,
         "isError": is_error,
@@ -617,29 +629,37 @@ fn success_envelope(out: &crate::ActionOutput, profile: Option<&str>) -> String 
 
 /// The FROZEN failure passthrough: EXACTLY the string `render_error`
 /// writes to stderr in CompactJson mode (the compact serialization of
-/// the LOCKED error envelope). Refusals — including the
-/// confirmation_required one when `confirm` is omitted on a guarded
-/// verb — ride this shape verbatim as error tool results (SC-2); the
-/// confirm refusal additionally carries a SECOND, non-envelope
-/// guidance block (see [`MCP_CONFIRM_GUIDANCE`]).
+/// the LOCKED error envelope). Refusals ride this shape verbatim
+/// everywhere EXCEPT the MCP confirmation_required one (see
+/// [`mcp_confirm_refusal_envelope`]) — and even that exception only
+/// swaps two prose fields inside the same struct.
 fn failure_envelope(err: &CoreError, profile: Option<&str>) -> String {
     serde_json::to_string(&err.envelope(profile)).expect("envelope serialization cannot fail")
 }
 
-/// The MCP-specific guidance appended as a SECOND text block to the
-/// confirmation_required refusal of a GUARDED verb (14-06, live-smoke
-/// checkpoint feedback): the envelope's own hint names the CLI-only
-/// confirmations, so this block names the argument that works over
-/// MCP. Never part of the envelope itself — the envelope stays
-/// byte-verbatim in block 1.
-const MCP_CONFIRM_GUIDANCE: &str = "MCP callers: re-run this tool with {\"confirm\": true} in the arguments. (--yes and IGNITION_YES=1 are CLI-only — they cannot confirm a call made over MCP.)";
-
-/// The frozen failure envelope's `/error/code` — the identifier the
-/// confirm-guidance path keys on (defensive: a payload that does not
-/// parse as the envelope carries no code, so no guidance).
-fn envelope_error_code(envelope: &str) -> Option<String> {
-    let parsed: Value = serde_json::from_str(envelope).ok()?;
-    parsed.pointer("/error/code")?.as_str().map(str::to_string)
+/// THE transport-aware refusal (14-06 checkpoint round 2 — the second
+/// dated envelope-transport exception, alongside 09-03's api-call
+/// one): the frozen envelope governs CLI stdout/stderr ONLY. Over MCP,
+/// the confirmation_required refusal's message and hint PROSE are
+/// MCP-native — an agent that parses only the JSON must get the advice
+/// that works on its own transport (`--yes`/IGNITION_YES are
+/// CLI-only and provably unreachable here), so the message names
+/// `confirm: true` and the hint spells the argument form out. The
+/// rewrite builds on the SAME locked envelope struct
+/// ([`CoreError::envelope`]), so the shape/keys/field order and the
+/// ok:false / code / profile:null / endpoint:null facts are
+/// byte-stable by construction — only the two prose strings differ
+/// from the CLI's refusal.
+fn mcp_confirm_refusal_envelope(err: &CoreError, profile: Option<&str>, verb: &str) -> String {
+    let mut env = err.envelope(profile);
+    env.error.message = format!("{verb} is destructive; rerun with confirm: true to confirm");
+    env.error.hint = Some(
+        "Set {\"confirm\": true} in the tool arguments to execute it. (--yes and \
+         IGNITION_YES=1 are CLI-only confirmations — they cannot confirm a call made \
+         over MCP.)"
+            .to_string(),
+    );
+    serde_json::to_string(&env).expect("envelope serialization cannot fail")
 }
 
 /// isError = the envelope says `ok:false`. A payload that is not a
@@ -726,10 +746,13 @@ mod tests {
         assert_eq!(catalog.len(), tree.len(), "bidirectional set equality");
     }
 
-    /// SC-2's catalog half: every GUARDED_OPS leaf advertises a
-    /// REQUIRED `confirm` boolean; a read-only verb advertises none.
+    /// SC-2's catalog half: every GUARDED_OPS leaf advertises an
+    /// OPTIONAL `confirm` boolean (present in properties, ABSENT from
+    /// `required` — a schema-required confirm would invite agents to
+    /// auto-fill it and defeat the gate); a read-only verb advertises
+    /// none.
     #[test]
-    fn guarded_leaves_carry_required_confirm_and_readonly_leaves_do_not() {
+    fn guarded_leaves_carry_optional_confirm_and_readonly_leaves_do_not() {
         let catalog = build_catalog();
 
         let delete = catalog
@@ -751,8 +774,9 @@ mod tests {
             .and_then(Value::as_array)
             .expect("required array");
         assert!(
-            delete_required.iter().any(|v| v == "confirm"),
-            "confirm is REQUIRED on project_delete: {delete_required:?}"
+            !delete_required.iter().any(|v| v == "confirm"),
+            "confirm must be OPTIONAL on project_delete \
+             (schema-required invites reflexive auto-fill): {delete_required:?}"
         );
 
         let status = catalog
@@ -898,6 +922,91 @@ mod tests {
             parsed.pointer("/error/code").and_then(Value::as_str),
             Some("confirmation_required"),
             "the refusal rides the frozen envelope verbatim"
+        );
+    }
+
+    /// THE transport-aware refusal pin (14-06 checkpoint round 2): the
+    /// MCP confirmation_required envelope carries MCP-native
+    /// message/hint prose — and NOTHING else changes vs. the CLI
+    /// refusal: same locked field order (byte-level prefix pin), same
+    /// ok:false / code / profile:null / endpoint:null facts. Swapping
+    /// the two prose strings back for the CLI's own turns the payload
+    /// into a byte-equal twin of [`failure_envelope`]'s output —
+    /// proving shape-preserved, prose-adapted.
+    #[test]
+    fn mcp_confirm_refusal_adapts_prose_only_shape_byte_stable() {
+        let err = CoreError::ConfirmationRequired {
+            operation: "project delete".to_string(),
+        };
+        let cli = failure_envelope(&err, Some("dev"));
+        let mcp = mcp_confirm_refusal_envelope(&err, Some("dev"), "project delete");
+
+        // The locked field order survives: ok, profile, error.code —
+        // the serialized bytes start exactly where the CLI envelope
+        // starts.
+        let stable_prefix =
+            r#"{"ok":false,"profile":"dev","error":{"code":"confirmation_required","#;
+        assert!(
+            mcp.starts_with(stable_prefix),
+            "the MCP refusal must serialize in the LOCKED field order: {mcp}"
+        );
+
+        let mcp_parsed: Value = serde_json::from_str(&mcp).expect("valid envelope JSON");
+        let cli_parsed: Value = serde_json::from_str(&cli).expect("valid envelope JSON");
+        assert_eq!(
+            mcp_parsed.get("ok"),
+            cli_parsed.get("ok"),
+            "ok:false both ways"
+        );
+        assert_eq!(
+            mcp_parsed.get("profile"),
+            cli_parsed.get("profile"),
+            "profile echo unchanged"
+        );
+        assert_eq!(
+            mcp_parsed.pointer("/error/code"),
+            cli_parsed.pointer("/error/code"),
+            "the stable slug is unchanged"
+        );
+        assert_eq!(
+            mcp_parsed.pointer("/error/endpoint"),
+            cli_parsed.pointer("/error/endpoint"),
+            "endpoint is unchanged (null on the pre-network refusal)"
+        );
+
+        // The prose: MCP-native both fields.
+        let message = mcp_parsed
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .expect("message present");
+        assert_eq!(
+            message, "project delete is destructive; rerun with confirm: true to confirm",
+            "the message names the MCP-native confirmation: {message}"
+        );
+        let hint = mcp_parsed
+            .pointer("/error/hint")
+            .and_then(Value::as_str)
+            .expect("hint present");
+        assert!(hint.contains("confirm"), "hint names confirm: {hint}");
+        assert!(
+            hint.contains("CLI-only"),
+            "hint marks the CLI paths: {hint}"
+        );
+        assert!(
+            hint.contains("IGNITION_YES"),
+            "hint marks the env path: {hint}"
+        );
+
+        // Shape-preserved, prose-adapted: restoring the CLI's two prose
+        // strings makes the payloads EQUAL (parsed comparison is
+        // key-order-insensitive; the byte prefix pin above covers
+        // order).
+        let mut repaired = mcp_parsed.clone();
+        repaired["error"]["message"] = cli_parsed["error"]["message"].clone();
+        repaired["error"]["hint"] = cli_parsed["error"]["hint"].clone();
+        assert_eq!(
+            repaired, cli_parsed,
+            "only message/hint may differ from the frozen CLI envelope"
         );
     }
 

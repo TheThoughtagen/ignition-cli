@@ -410,10 +410,10 @@ fn ping_answers_promptly_with_an_empty_result() {
 
 /// tools/list returns a NON-EMPTY catalog where every entry carries
 /// name/description/inputSchema — and the catalog spot-pins cannot
-/// drift: `project_delete` is guarded (confirm in required +
-/// properties), `status` is read-only (no confirm), and the
-/// planner-locked exclusions (mcp/lsp/tui/completions/edit) are
-/// absent.
+/// drift: `project_delete` is guarded (confirm in properties, ABSENT
+/// from required — optional confirm, 14-06 round 2), `status` is
+/// read-only (no confirm), and the planner-locked exclusions
+/// (mcp/lsp/tui/completions/edit) are absent.
 #[test]
 fn tools_list_carries_the_catalog_with_the_pinned_shape() {
     let mut client = ScriptedClient::spawn(&[]);
@@ -461,12 +461,14 @@ fn tools_list_carries_the_catalog_with_the_pinned_shape() {
             .unwrap_or_else(|| panic!("tool {name} present in the catalog"))
     }
 
-    // SC-2's catalog half over the wire: the guarded verb advertises a
-    // REQUIRED boolean confirm; the read verb carries none.
+    // SC-2's catalog half over the wire: the guarded verb advertises
+    // confirm as an OPTIONAL boolean — present in properties, ABSENT
+    // from required (schema-required would invite agents to auto-fill
+    // confirm:true and defeat the gate; 14-06 checkpoint round 2).
     let delete_required = required_of(&tools, "project_delete");
     assert!(
-        delete_required.iter().any(|r| r == "confirm"),
-        "project_delete requires confirm on the wire: {delete_required:?}"
+        !delete_required.iter().any(|r| r == "confirm"),
+        "confirm must be OPTIONAL on the wire — absent from required: {delete_required:?}"
     );
     let delete_props = tools
         .iter()
@@ -477,6 +479,13 @@ fn tools_list_carries_the_catalog_with_the_pinned_shape() {
         delete_props.get("type").and_then(Value::as_str),
         Some("boolean"),
         "confirm is a boolean property on the wire"
+    );
+    assert!(
+        delete_props
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|d| d.contains("true")),
+        "the confirm description tells the agent what true does: {delete_props}"
     );
 
     let status = tools
@@ -578,7 +587,7 @@ fn sample_token(property: &Value) -> String {
 }
 
 /// SC-1 round-trip smoke: for a deterministic sample of catalog tools
-/// — EVERY wire-guarded verb (required contains `confirm`) plus five
+/// — EVERY wire-guarded verb (properties carry `confirm`) plus five
 /// read verbs — the bridge's argv construction (`["ign"] + leaf path +
 /// one token per schema-required arg`, confirm → `--yes`) must PARSE
 /// against the real clap tree. Catalog names cannot drift from
@@ -589,15 +598,12 @@ fn catalog_sample_round_trips_through_clap_parse() {
     let tools = client.tools();
     let leaves = clap_leaf_map();
 
-    // The deterministic sample: every guarded-on-the-wire verb plus a
-    // fixed set of read verbs spanning the family shapes.
+    // The deterministic sample: every guarded-on-the-wire verb
+    // (confirm in properties — required never carries it, 14-06 round
+    // 2) plus a fixed set of read verbs spanning the family shapes.
     let mut sample: Vec<String> = tools
         .iter()
-        .filter(|tool| {
-            tool.pointer("/inputSchema/required")
-                .and_then(Value::as_array)
-                .is_some_and(|required| required.iter().any(|v| v.as_str() == Some("confirm")))
-        })
+        .filter(|tool| tool.pointer("/inputSchema/properties/confirm").is_some())
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .map(str::to_string)
         .collect();
@@ -634,7 +640,8 @@ fn catalog_sample_round_trips_through_clap_parse() {
         // The bridge's argv shape: leaf-path segments in order, then
         // one token per REQUIRED arg (positionals raw, value flags as
         // --long=value with the wire enum's first value, booleans as
-        // bare flags), then --yes for the synthetic confirm.
+        // bare flags), then --yes for the guarded verb's synthetic
+        // confirm (the confirm:true execution form).
         let mut argv: Vec<String> = vec!["ign".to_string()];
         argv.extend(leaf.path.split(' ').map(str::to_string));
         for arg in &leaf.args {
@@ -651,7 +658,7 @@ fn catalog_sample_round_trips_through_clap_parse() {
                 argv.push(format!("--{}={}", arg.key, sample_token(property)));
             }
         }
-        if required.iter().any(|r| r == "confirm") {
+        if properties.contains_key("confirm") {
             argv.push("--yes".to_string());
         }
 
@@ -818,18 +825,22 @@ async fn tools_call_returns_the_frozen_envelope_verbatim() {
     );
 }
 
-/// SC-2, refusal half, ENV-PROOF + the 14-06 guidance block: `tools/
-/// call project_delete` with confirm OMITTED returns isError:true with
-/// exactly TWO text blocks — block 1 is the frozen
-/// `confirmation_required` envelope BYTE-FOR-BYTE (equal to the
-/// envelope the direct `ign project delete` prints to stderr), block 2
-/// is MCP-specific guidance naming the `confirm` argument and marking
-/// `--yes`/`IGNITION_YES` CLI-only — and `IGNITION_YES=1` exported
-/// into the spawned server's environment changes NOTHING (the
-/// apply_env_defaults bypass is behavioral, pinned here over the real
-/// binary).
+/// SC-2, refusal half, TRANSPORT-AWARE BOTH WAYS + the IGNITION_YES
+/// env-proof (14-06 checkpoint round 2): `tools/call project_delete`
+/// with confirm OMITTED returns isError:true with EXACTLY ONE text
+/// block — the refusal envelope whose SHAPE is byte-stable (same
+/// locked field order, ok:false, code confirmation_required, profile
+/// null, endpoint null) but whose message/hint PROSE is MCP-native:
+/// the message names `confirm: true`, the hint spells
+/// `{"confirm": true}` out and marks `--yes`/`IGNITION_YES` CLI-only.
+/// The SAME test file proves the other direction: the direct CLI
+/// refusal STILL prints the frozen `--yes` prose — the two envelopes
+/// are shape-twins differing in exactly those two prose fields — and
+/// `IGNITION_YES=1` exported into the spawned server's environment
+/// changes nothing (the apply_env_defaults bypass is behavioral,
+/// pinned here over the real binary).
 #[tokio::test]
-async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
+async fn confirm_omitted_refuses_with_mcp_native_prose_and_cli_prose_survives_directly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "bogus_key = 1\n").expect("write noisy config");
@@ -845,7 +856,7 @@ async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
     assert_eq!(
         result.get("isError"),
         Some(&json!(true)),
-        "the refusal rides isError:true: {result}"
+        "the refusal rides isError:true (IGNITION_YES=1 could not confirm it): {result}"
     );
     let content = result
         .get("content")
@@ -853,50 +864,76 @@ async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
         .expect("the refusal carries content blocks");
     assert_eq!(
         content.len(),
-        2,
-        "the confirm refusal carries the envelope + the MCP guidance block: {content:?}"
+        1,
+        "the refusal is ONE self-sufficient block (the JSON itself is MCP-native): {content:?}"
     );
 
-    // Block 1: the frozen refusal envelope rides verbatim.
     let envelope_text = content[0]
         .get("text")
         .and_then(Value::as_str)
-        .expect("block 1 is text content");
+        .expect("the single block is text content");
     let envelope: Value = serde_json::from_str(envelope_text)
         .expect("the refusal text parses as the frozen envelope");
     assert_eq!(envelope.get("ok").and_then(Value::as_bool), Some(false));
     assert_eq!(
         envelope.pointer("/error/code").and_then(Value::as_str),
         Some("confirmation_required"),
-        "the frozen refusal envelope rides verbatim: {envelope}"
+        "the stable slug is unchanged: {envelope}"
     );
     assert!(
-        envelope.pointer("/error/message").is_some(),
-        "the refusal carries the LOCKED error envelope shape"
+        envelope.get("profile").is_some_and(Value::is_null),
+        "profile echoes null on the pre-network refusal"
+    );
+    assert!(
+        envelope
+            .pointer("/error/endpoint")
+            .is_some_and(Value::is_null),
+        "endpoint is null (zero requests)"
     );
 
-    // Block 2: MCP-specific guidance — names the argument that CAN
-    // confirm over MCP and marks the env/flag confirmations CLI-only.
-    let guidance = content[1]
-        .get("text")
+    // The MCP-native prose lives INSIDE the JSON — an agent that
+    // parses only the envelope gets advice that works on its own
+    // transport.
+    let message = envelope
+        .pointer("/error/message")
         .and_then(Value::as_str)
-        .expect("block 2 is text content");
+        .expect("message present");
     assert!(
-        guidance.contains("confirm"),
-        "guidance names the confirm argument: {guidance}"
+        message.contains("confirm: true"),
+        "the message names the MCP-native confirmation: {message}"
+    );
+    let hint = envelope
+        .pointer("/error/hint")
+        .and_then(Value::as_str)
+        .expect("hint present");
+    assert!(
+        hint.contains("confirm"),
+        "the hint names the confirm argument: {hint}"
     );
     assert!(
-        guidance.contains("CLI-only"),
-        "guidance marks --yes/IGNITION_YES as CLI-only: {guidance}"
+        hint.contains("CLI-only"),
+        "the hint marks --yes/IGNITION_YES CLI-only: {hint}"
+    );
+    assert!(
+        hint.contains("IGNITION_YES"),
+        "the hint names the env var as CLI-only: {hint}"
     );
 
-    // Block 1 == the envelope the direct CLI prints for the same
-    // invocation, byte-for-byte. The refusal is pre-network (zero
-    // requests), so no auth/profile is needed and the profile echoes
-    // null in both shapes. The direct stderr may carry tracing
-    // diagnostics ahead of it (the unknown-config-key WARN fires even
-    // at the default level) — the envelope is the FINAL line the
-    // chassis prints.
+    // Byte-stable shape: the serialization rides the LOCKED field
+    // order (ok, profile, error{code, message, ...}) — the bytes start
+    // exactly where the frozen envelope starts.
+    let stable_prefix = r#"{"ok":false,"profile":null,"error":{"code":"confirmation_required","#;
+    assert!(
+        envelope_text.starts_with(stable_prefix),
+        "the MCP refusal must serialize in the LOCKED field order: {envelope_text}"
+    );
+
+    // THE BOTH-WAYS TRANSPORT PROOF: the direct CLI refusal of the
+    // same invocation STILL prints the frozen `--yes` prose (the CLI
+    // contract is untouched) and carries none of the MCP-native
+    // wording. The refusal is pre-network (zero requests), so no
+    // auth/profile is needed. The direct stderr may carry tracing
+    // diagnostics ahead of it — the envelope is the FINAL line.
     let direct = AssertCommand::cargo_bin("ign")
         .expect("binary 'ign' not found")
         .args(["--json", "--compact", "project", "delete", "x"])
@@ -911,10 +948,40 @@ async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
         "the direct refusal must fail (usage-class exit)"
     );
     let direct_stderr = String::from_utf8(direct.stderr).expect("utf-8 stderr");
-    let direct_envelope = direct_stderr.lines().last().unwrap_or_default();
+    let direct_envelope_text = direct_stderr.lines().last().unwrap_or_default();
+    let direct_envelope: Value = serde_json::from_str(direct_envelope_text)
+        .expect("the direct CLI prints a parseable refusal envelope");
+    let direct_message = direct_envelope
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .expect("direct message present");
+    assert!(
+        direct_message.contains("--yes"),
+        "the CLI golden prose names --yes, unchanged: {direct_message}"
+    );
+    assert!(
+        !direct_message.contains("confirm: true"),
+        "the CLI prose must NOT carry MCP wording: {direct_message}"
+    );
+    let direct_hint = direct_envelope
+        .pointer("/error/hint")
+        .and_then(Value::as_str)
+        .expect("direct hint present");
+    assert!(
+        direct_hint.contains("IGNITION_YES"),
+        "the CLI hint still names the env confirmation: {direct_hint}"
+    );
+
+    // Shape-twins: restoring the CLI's two prose strings into the MCP
+    // envelope makes the payloads EQUAL — only message/hint adapt to
+    // the transport (parsed comparison is key-order-insensitive; the
+    // byte-prefix pin above covers order).
+    let mut repaired = envelope.clone();
+    repaired["error"]["message"] = direct_envelope["error"]["message"].clone();
+    repaired["error"]["hint"] = direct_envelope["error"]["hint"].clone();
     assert_eq!(
-        envelope_text, direct_envelope,
-        "MCP block 1 must equal the direct CLI refusal envelope byte-for-byte"
+        repaired, direct_envelope,
+        "only message/hint prose may differ between the transports"
     );
 }
 
