@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 EXECUTING — 14-01 landed `ign mcp serve` (clap-derived 86-tool catalog, GUARDED_OPS confirm gate, frozen envelope passthrough, SC-5 live-proven non-starvation; OutOfBand row + pinned set [api call, completions, edit, mcp] atomic) — next: 14-02 contract test suite
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 EXECUTING — 14-01 landed `ign mcp serve`; 14-02 landed the MCP contract wall (byte-scan harness, envelope-verbatim, env-proof confirm gate, starvation pin, mcp-SDK oracle) — 14-03 (LSP) in flight in parallel
 
 ## Current Position
 
 **Phase:** 14 of 14 (transports-mcp-lsp) — IN PROGRESS
-**Current Plan:** 14-01 COMPLETE (mcp transport) — next: 14-02 (MCP contract test suite)
-**Total Plans in Phase:** 6 (14-01 ✅, 14-02 through 14-06 pending)
+**Current Plan:** 14-02 COMPLETE (MCP contract test suite) — next: 14-03 (LSP transport, running in parallel)
+**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 in flight, 14-04–14-06 pending)
 **Status:** Executing
 **Last Activity:** 2026-09-16
 
-**Progress:** [█████████░] 94%
+**Progress:** [██████████] 95%
 
 ## Performance Metrics
 
@@ -77,6 +77,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P07 | 51min | 3 tasks | 8 files |
 | Phase 13 P08 | 57 min | 3 tasks | 6 files |
 | Phase 14 P01 | 61 min | 2 tasks | 5 files |
+| Phase 14 P02 | 45 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -210,6 +211,8 @@ Recent decisions affecting current work:
 - [Phase 14]: 14-01: global clap args excluded from every tool schema (json/compact forced, profile rides ambient flag, yes replaced by synthetic confirm, verbose stderr-only) + fail-closed unknown-key validation so a hostile yes property refuses -32602 — SC-2 defense-in-depth
 - [Phase 14]: 14-01: rig_logs (always) and logs --follow refuse at the MCP bridge — their dispatch arms print through in-dispatch println sinks and a stray stdout byte is protocol death (Pitfall 3); catalog/pins untouched, refusal names the terminal form
 - [Phase 14]: 14-01: GUARDED_OPS = the 24 verbs guarded in main.rs dispatch arms (planner-locked site list); workspace push's core-side guard (13-06) is out of registry scope — it still refuses safely via core as an isError result but the catalog does not advertise confirm for it (14-02 follow-up candidate)
+- [Phase 14]: 14-02: the starvation pin hangs on a bound-but-never-accepting TcpListener (backlog-accepted connect, client's own 30s timeout as the only escape) and asserts ordering with an unfiltered recv_next (FIRST arrival must be the ping) — a refused dead-port would error instantly (nothing to order) and id-filtered waiting would silently swallow a wrongly-early tool result
+- [Phase 14]: 14-02: the Python mcp-SDK oracle is an #[ignore] gate test reusing the wiremock fixtures + CARGO_BIN_EXE_ign (uv test-time only, green-skips without uv, defensive input_schema/is_error spellings) — the SDK oracle must survive mcp-SDK version drift since uv pulls latest at run time; never a Cargo dependency on Python
 
 ### Pending Todos
 
@@ -226,6 +229,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-16T02:24:21.362Z
-**Stopped At:** Completed 14-01-PLAN.md — mcp transport; next: 14-02 (MCP contract test suite)
+**Last session:** 2026-09-16T03:16:37.620Z
+**Stopped At:** Completed 14-02-PLAN.md — MCP contract test suite; 14-03 (LSP) continues in parallel
 **Resume file:** None
