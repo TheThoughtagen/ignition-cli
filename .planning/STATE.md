@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (all 8 plans executed with summaries; 13-08 landed `ign edit` + the `edit` OutOfBand row atomically — SC-5 closed, all 5 SCs carry binary-level evidence) — next: /gsd-verify-work 13, then Phase 14 planning (mcp/lsp transports)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 EXECUTING — 14-01 landed `ign mcp serve` (clap-derived 86-tool catalog, GUARDED_OPS confirm gate, frozen envelope passthrough, SC-5 live-proven non-starvation; OutOfBand row + pinned set [api call, completions, edit, mcp] atomic) — next: 14-02 contract test suite
 
 ## Current Position
 
-**Phase:** 13 of 14 (composite-engine-workspace-historian-edit) — IN PROGRESS
-**Current Plan:** 13-08 COMPLETE (13-01 through 13-08 all executed with summaries)
-**Total Plans in Phase:** 8 (13-01 ✅, 13-02 ✅, 13-03 ✅, 13-04 ✅, 13-05 ✅, 13-06 ✅, 13-07 ✅, 13-08 ✅)
-**Status:** Phase complete — ready for verification
-**Last Activity:** 2026-09-15
+**Phase:** 14 of 14 (transports-mcp-lsp) — IN PROGRESS
+**Current Plan:** 14-01 COMPLETE (mcp transport) — next: 14-02 (MCP contract test suite)
+**Total Plans in Phase:** 6 (14-01 ✅, 14-02 through 14-06 pending)
+**Status:** Executing
+**Last Activity:** 2026-09-16
 
-**Progress:** [██████████] 100%
+**Progress:** [█████████░] 94%
 
 ## Performance Metrics
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
 | 12 | 4/4 | 90 min | 22 min avg |
 | 13 | 7/8 | 892 min (incl. 13-04 live-rig windows) | ~127 min avg |
-| 14 | 0/TBD | - | - |
+| 14 | 1/6 | 61 min | 61 min |
 
 *Updated after each plan completion*
 | Phase 08 P02 | 200 min | 2 tasks | 3 files |
@@ -76,6 +76,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P05 | ~10 min continuation (Task 1 @ 15:12Z; full span 15:12Z→19:15Z across the 13-06 interleave) | 2 tasks | 3 files |
 | Phase 13 P07 | 51min | 3 tasks | 8 files |
 | Phase 13 P08 | 57 min | 3 tasks | 6 files |
+| Phase 14 P01 | 61 min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -205,6 +206,10 @@ Recent decisions affecting current work:
 - [Phase 13]: 13-07: human status table rides the project-family two-space join (not computed-width padding) with direction-bearing STATE labels (deleted (local) vs deleted (gateway)); clean rows included per plan — codebase table convention + stable snapbox goldens
 - [Phase 13]: Edit dispatches on a main-level OutOfBand seam (before the normal chassis, Completions-precedent shape): the plan's no-ActionOutput-variant + render.rs-untouched locks leave no in-chassis shape that can exit 0 with zero stdout; refusals still ride the standard render_error envelope
 - [Phase 13]: Edit's push is the client-level project_import(zip, overwrite=true) — ImportDenied 200-denial honesty rides the client seam; the guard renders the staged summary once (refusal message without --yes, pre-push prose with it), and staleness stays NOT --yes-able through dispatch
+- [Phase 14]: 14-01: serve is a restricted positional (value_parser=[serve]), NOT a subcommand — a subcommand leaf mcp serve would yield a second row-requiring node, forcing a second routes() row and breaking the pinned four-member OutOfBand set; the pinned tests are the binding truths
+- [Phase 14]: 14-01: global clap args excluded from every tool schema (json/compact forced, profile rides ambient flag, yes replaced by synthetic confirm, verbose stderr-only) + fail-closed unknown-key validation so a hostile yes property refuses -32602 — SC-2 defense-in-depth
+- [Phase 14]: 14-01: rig_logs (always) and logs --follow refuse at the MCP bridge — their dispatch arms print through in-dispatch println sinks and a stray stdout byte is protocol death (Pitfall 3); catalog/pins untouched, refusal names the terminal form
+- [Phase 14]: 14-01: GUARDED_OPS = the 24 verbs guarded in main.rs dispatch arms (planner-locked site list); workspace push's core-side guard (13-06) is out of registry scope — it still refuses safely via core as an isError result but the catalog does not advertise confirm for it (14-02 follow-up candidate)
 
 ### Pending Todos
 
@@ -221,6 +226,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-15T21:18:26.850Z
-**Stopped At:** Completed 13-08-PLAN.md — Phase 13 all 8 plans executed; ready for /gsd-verify-work
+**Last session:** 2026-09-16T02:24:21.362Z
+**Stopped At:** Completed 14-01-PLAN.md — mcp transport; next: 14-02 (MCP contract test suite)
 **Resume file:** None
