@@ -17,6 +17,7 @@
 //! - No direct exit calls anywhere outside clap's `Error::exit`.
 
 mod completions;
+mod mcp;
 mod render;
 
 #[cfg(feature = "tui")]
@@ -532,6 +533,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 id,
                 message,
             }) => {
+                // guarded:sessions terminate
                 if let Err(err) = require_confirmation(cli.yes, "sessions terminate") {
                     return (None, Err(err));
                 }
@@ -657,6 +659,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     name: logger,
                     level,
                 }) => {
+                    // guarded:logs loggers set
                     if let Err(err) = require_confirmation(cli.yes, "logs loggers set") {
                         return (None, Err(err));
                     }
@@ -670,6 +673,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     (name, result)
                 }
                 Some(LoggersCmd::Reset) => {
+                    // guarded:logs loggers reset
                     if let Err(err) = require_confirmation(cli.yes, "logs loggers reset") {
                         return (None, Err(err));
                     }
@@ -694,6 +698,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             timeout,
             interval,
         } => {
+            // guarded:restart
             if let Err(err) = require_confirmation(cli.yes, "restart") {
                 return (None, Err(err));
             }
@@ -923,6 +928,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // refuses (exit 2, confirmation_required, profile null)
                 // BEFORE any profile/secret/client resolution — a
                 // refusal costs nothing and never touches the gateway.
+                // guarded:project delete
                 if let Err(err) = require_confirmation(cli.yes, "project delete") {
                     return (None, Err(err));
                 }
@@ -990,6 +996,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 collision_policy,
                 encode_scripts,
             } => {
+                // guarded:project import
                 if matches!(collision_policy, cli::CollisionPolicy::Overwrite)
                     && let Err(err) =
                         require_confirmation(cli.yes, "project import --collision-policy overwrite")
@@ -1118,6 +1125,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         }),
                     );
                 }
+                // guarded:project sync
                 if let Err(err) = require_confirmation(
                     cli.yes,
                     &format!(
@@ -1305,6 +1313,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // The operation string names the consequence: the
                 // replace-not-merge import wipes concurrent Designer
                 // edits (research's accepted-tradeoff language).
+                // guarded:resource put
                 if let Err(err) = require_confirmation(
                     cli.yes,
                     "resource put (re-imports the project; concurrent Designer edits are replaced)",
@@ -1327,6 +1336,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // refusal costs nothing and never touches the gateway.
                 // 05-02: the operation string names the consequence —
                 // delete re-imports the project without the member.
+                // guarded:resource delete
                 if let Err(err) = require_confirmation(
                     cli.yes,
                     "resource delete (re-imports the project; concurrent Designer edits are replaced)",
@@ -1441,10 +1451,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 return (None, result);
             }
             let guard_operation = match &command {
+                // guarded:tags provider delete
                 TagsCommand::Provider(TagsProviderCommand::Delete { .. }) => {
                     Some("tags provider delete")
                 }
+                // guarded:tags config delete
                 TagsCommand::Config(TagsConfigCommand::Delete { .. }) => Some("tags config delete"),
+                // guarded:tags import
                 TagsCommand::Import {
                     collision_policy: cli::CollisionPolicy::Overwrite,
                     ..
@@ -1812,8 +1825,11 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // (binary-pinned: exit 2 in a cwd with no rig
             // discoverable at all). The message names the ACTUAL verb.
             let guarded_operation = match &command {
+                // guarded:rig reset
                 RigCommand::Reset { .. } => Some("rig reset"),
+                // guarded:rig restore
                 RigCommand::Restore { .. } => Some("rig restore"),
+                // guarded:rig trial reset
                 RigCommand::Trial(trial_args) => match trial_args.command {
                     cli::TrialCommand::Reset { .. } => Some("rig trial reset"),
                     cli::TrialCommand::Status => None,
@@ -2047,6 +2063,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (name, result)
             }
             BackupCommand::Restore { file } => {
+                // guarded:backup restore
                 if let Err(err) = require_confirmation(
                     cli.yes,
                     "backup restore (overwrites this gateway's state from the gwbk — \
@@ -2139,6 +2156,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                     r#type
                                 )
                             };
+                            // guarded:eam task new
                             if let Err(err) = require_confirmation(cli.yes, &operation) {
                                 return (None, Err(err));
                             }
@@ -2593,6 +2611,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         Commands::Edit(_) => {
             unreachable!("edit handled by dispatch_edit before the chassis")
         }
+        // Runtime-unreachable: main returns early for Mcp (14-01's
+        // OutOfBand seam — the protocol stream IS stdout, so no
+        // ActionOutput variant may exist for it); the arm exists only
+        // for match exhaustiveness.
+        Commands::Mcp(_) => {
+            unreachable!("mcp handled by mcp::serve before the chassis")
+        }
         // Runtime-unreachable: dispatch returns early for Completions
         // before config load (a broken config must not break `completions`);
         // the arm exists only for match exhaustiveness.
@@ -2699,6 +2724,7 @@ async fn dispatch_edit(
             //    the summary text is composed once — it IS the refusal
             //    without --yes, the blast-radius prose with it.
             let summary = render_edit_summary(&args.project, &changed);
+            // guarded:edit
             if let Err(err) = require_confirmation(yes, &summary) {
                 render_error(&err, Some(&profile_name), mode);
                 return ExitCode::from(err.exit_code());
@@ -2979,6 +3005,108 @@ fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
     }
 }
 
+/// The guarded-verb registry (14-01): ONE const enumerating every
+/// `--yes`-guarded clap leaf as `(clap leaf path, refusal operation
+/// prose)` pairs. `--yes` is a GLOBAL arg, so guardedness is invisible
+/// to the clap walk — the guards live as `require_confirmation` call
+/// sites in the dispatch arms. This const is the MCP catalog's single
+/// source for the synthetic required `confirm` boolean property
+/// (mcp.rs reads ONLY this — SC-2), and the drift test in `mod tests`
+/// pins it against the live dispatch sites (the 12-03 grep-CI genre:
+/// a new guarded verb landing unregistered goes red — the safety
+/// direction).
+///
+/// Prose column: for STATIC-literal sites, the exact
+/// `require_confirmation` literal (the drift test byte-matches it);
+/// for DYNAMIC-prose sites (`&format!`/variable second args), a
+/// representative rendering of the refusal text. Every site also
+/// carries an adjacent marker comment keyed to the path column — the
+/// drift test walks both directions.
+pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
+    // 02-03: the first destructive verb (sessions terminate).
+    ("sessions terminate", "sessions terminate"),
+    // 05-02: logger-level writes rewrite the registry.
+    ("logs loggers set", "logs loggers set"),
+    ("logs loggers reset", "logs loggers reset"),
+    // 02-04: gateway restart.
+    ("restart", "restart"),
+    // 02-04: gateway restart.
+    // 03-01: the project family's ONE destructive verb.
+    ("project delete", "project delete"),
+    // 03-02: overwrite-import REPLACES the whole project.
+    (
+        "project import",
+        "project import --collision-policy overwrite",
+    ),
+    // 07-01: the guarded cross-gateway promotion (dynamic prose
+    // names the overwritten target profile B).
+    (
+        "project sync",
+        "project sync (overwrite-import the whole project on <profile-b> — \
+         replaces concurrent Designer edits)",
+    ),
+    // 05-02: resource put/delete re-import the project wholesale.
+    (
+        "resource put",
+        "resource put (re-imports the project; concurrent Designer edits are replaced)",
+    ),
+    (
+        "resource delete",
+        "resource delete (re-imports the project; concurrent Designer edits are replaced)",
+    ),
+    // 05-04: the tags guards (one shared match table above the
+    // family's single require_confirmation call).
+    ("tags provider delete", "tags provider delete"),
+    ("tags config delete", "tags config delete"),
+    ("tags import", "tags import --collision-policy overwrite"),
+    // 04-01/04-03: the rig guards (one shared match table).
+    ("rig reset", "rig reset"),
+    ("rig restore", "rig restore"),
+    ("rig trial reset", "rig trial reset"),
+    // 07-02: standalone restore overwrites THIS gateway's state.
+    (
+        "backup restore",
+        "backup restore (overwrites this gateway's state from the gwbk — gateway \
+         restarts and blocks ~minutes)",
+    ),
+    // 07-02 Task 3: the eam guard ladder (dynamic prose names WHICH
+    // rung fired — the schedule mode or the mutating task type).
+    (
+        "eam task new",
+        "eam task new (scheduleMode <mode> arms autonomous gateway actions)",
+    ),
+    // 10-04: the two-tier blast-radius verbs — the refusal prose IS
+    // the render_preview_line output (task + agent targets + impact),
+    // so these carry representative prose.
+    (
+        "eam task force",
+        "eam task force <task> <blast-radius preview line>",
+    ),
+    (
+        "eam task suspend",
+        "eam task suspend <task> <blast-radius preview line>",
+    ),
+    (
+        "eam task resume",
+        "eam task resume <task> <blast-radius preview line>",
+    ),
+    (
+        "eam task cancel",
+        "eam task cancel <task> <blast-radius preview line>",
+    ),
+    (
+        "eam task modify",
+        "eam task modify <task> <blast-radius preview line>",
+    ),
+    (
+        "eam task delete",
+        "eam task delete <task> <blast-radius preview line>",
+    ),
+    // 13-08: the kubectl-edit loop's push gate (dynamic prose: the
+    // staged-changed summary IS the refusal message).
+    ("edit", "edit would write <N> member(s) to <project>"),
+];
+
 /// The guarded lifecycle verbs' Tier-2 gate (10-04): the blast-radius
 /// preview fetch (read-only — a bad task name refuses `not_found`
 /// HERE, before any prompt) followed by `require_confirmation` whose
@@ -2994,6 +3122,12 @@ async fn preview_then_confirm(
 ) -> Result<(), CoreError> {
     let preview = actions::eam::build_blast_radius(api, verb, task_name).await?;
     let operation = actions::eam::render_preview_line(&preview);
+    // guarded:eam task force
+    // guarded:eam task suspend
+    // guarded:eam task resume
+    // guarded:eam task cancel
+    // guarded:eam task modify
+    // guarded:eam task delete
     require_confirmation(yes, &operation)
 }
 
@@ -3302,7 +3436,9 @@ fn init_tracing(verbosity: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::require_confirmation;
+    use std::collections::BTreeSet;
+
+    use super::{GUARDED_OPS, require_confirmation};
 
     /// CORE-06 guard proof: without `--yes` → usage-class error (exit 2,
     /// `confirmation_required` slug) with a hint naming BOTH the flag and
@@ -3326,5 +3462,203 @@ mod tests {
         );
 
         require_confirmation(true, "project delete").expect("--yes confirms");
+    }
+
+    /// Extract the SECOND top-level argument text of every
+    /// `require_confirmation` call site in `src` — string-literal
+    /// sites only (a `&format!`/variable second arg yields `None`:
+    /// those are the dynamic-prose sites, covered by the markers).
+    /// Balanced-paren walk with in-string awareness (refusal prose
+    /// carries literal parens), no regex dependency. NOTE: the
+    /// needle this scans for must never appear in a comment here —
+    /// the scan reads the whole file including its own source.
+    fn second_call_argument(call_inner: &str) -> Option<&str> {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, b) in call_inner.bytes().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'(' => depth += 1,
+                b')' => return None,
+                b',' if depth == 0 => return Some(call_inner[i + 1..].trim()),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Unquote a Rust string-literal token: `\"` `\\` `\n` `\t` plus
+    /// the line-continuation form (backslash + newline + following
+    /// whitespace elided) that multi-line refusal literals use.
+    fn unquote_rust_string(token: &str) -> String {
+        let inner = &token[1..token.len() - 1];
+        let mut out = String::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some('\n') => {
+                        while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => {}
+                },
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// Scan `src` for static-literal `require_confirmation` sites and
+    /// return their unquoted literals.
+    fn static_guard_literals(src: &str) -> Vec<String> {
+        const NEEDLE: &str = "require_confirmation(";
+        let mut literals = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = src[from..].find(NEEDLE) {
+            let start = from + found + NEEDLE.len();
+            // Walk to the matching close paren (string-aware).
+            let mut depth = 1usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut end = None;
+            for (i, b) in src[start..].bytes().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else { break };
+            let inner = &src[start..start + end];
+            if let Some(second) = second_call_argument(inner)
+                && second.starts_with('"')
+                && second.ends_with('"')
+            {
+                literals.push(unquote_rust_string(second));
+            }
+            from = start + end;
+        }
+        literals
+    }
+
+    /// Extract the leaf paths from the dispatch-site marker comments
+    /// (lines of the form: two slashes, a space, "guarded:", a colon,
+    /// then the clap leaf path — lowercase words separated by single
+    /// spaces). The validator shape keeps stray prose out of the pin.
+    fn guarded_site_markers(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("// guarded:") else {
+                continue;
+            };
+            let path = rest.trim();
+            if !path.is_empty() && path.bytes().all(|b| b.is_ascii_lowercase() || b == b' ') {
+                out.push(path.to_string());
+            }
+        }
+        out
+    }
+
+    /// The 14-01 guarded-verb drift pin (the 12-03 grep-CI genre):
+    /// the scan goes red the moment a new guarded dispatch site lands
+    /// UNREGISTERED — the safety direction, so the MCP catalog's
+    /// synthetic `confirm` field can never silently miss a guarded
+    /// verb (nor advertise one that does not exist).
+    ///
+    /// (a) Every STATIC guarded dispatch site — one whose second
+    ///     argument is a plain string literal — contributes that
+    ///     literal, and it must be the prose column of exactly one
+    ///     GUARDED_OPS entry (dynamic-prose sites — second args
+    ///     starting with a `&`/variable — carry representative prose
+    ///     and are pinned by the markers instead).
+    /// (b) Every guarded dispatch site carries an adjacent marker
+    ///     comment keyed to its clap leaf path, and the marker set
+    ///     pins GUARDED_OPS paths in BOTH directions.
+    #[test]
+    fn guarded_ops_registry_tracks_every_dispatch_site() {
+        let src = include_str!("main.rs");
+
+        // (a) static literals → exactly one prose-column entry each.
+        let literals = static_guard_literals(src);
+        assert!(
+            !literals.is_empty(),
+            "the literal scan found the guarded sites"
+        );
+        for literal in &literals {
+            let hits: Vec<_> = GUARDED_OPS
+                .iter()
+                .filter(|(_, prose)| *prose == literal)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "static refusal literal {literal:?} must be the prose column of \
+                 exactly one GUARDED_OPS entry"
+            );
+        }
+
+        // (b) markers ↔ GUARDED_OPS paths, both directions.
+        let markers = guarded_site_markers(src);
+        let marker_set: BTreeSet<&str> = markers.iter().map(String::as_str).collect();
+        let path_set: BTreeSet<&str> = GUARDED_OPS.iter().map(|(path, _)| *path).collect();
+        let unregistered: Vec<_> = marker_set.difference(&path_set).collect();
+        assert!(
+            unregistered.is_empty(),
+            "dispatch-site marker with no GUARDED_OPS entry (register it): {unregistered:?}"
+        );
+        let unmarked: Vec<_> = path_set.difference(&marker_set).collect();
+        assert!(
+            unmarked.is_empty(),
+            "GUARDED_OPS entry with no dispatch-site marker (mark the site): {unmarked:?}"
+        );
+        assert_eq!(
+            marker_set.len(),
+            markers.len(),
+            "duplicate markers at dispatch sites are forbidden"
+        );
+        assert_eq!(
+            path_set.len(),
+            GUARDED_OPS.len(),
+            "duplicate GUARDED_OPS paths are forbidden"
+        );
     }
 }

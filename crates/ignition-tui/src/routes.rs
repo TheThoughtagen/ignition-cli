@@ -30,7 +30,11 @@ pub enum Mapping {
     /// genre). 13-08 added `edit`: the kubectl-edit loop hands the
     /// terminal to a child $EDITOR and writes all prose to stderr —
     /// fulfilling the 08-06 reservation with its clap command in the
-    /// same landing.
+    /// same landing. 14-01 added `mcp`: the Model Context Protocol
+    /// server's stdout stream IS the product (newline-delimited
+    /// JSON-RPC 2.0 answered for an MCP client) — again the same genre,
+    /// fulfilling that reservation with its clap command atomically.
+    /// `lsp` remains reserved for its own transport plan.
     OutOfBand,
 }
 
@@ -84,6 +88,21 @@ pub fn routes() -> &'static [CliRoute] {
         // walk by design).
         CliRoute {
             path: "edit",
+            mapping: Mapping::OutOfBand,
+        },
+        // 14-01: `ign mcp` (the 08-06 pre-declared reservation
+        // FULFILLED) — OutOfBand with written justification: the Model
+        // Context Protocol server's stdout stream IS the product —
+        // newline-delimited JSON-RPC 2.0 answered for an MCP client
+        // (completions/api-call/edit genre: the CLI talks to a
+        // consumer, not to a human at a dashboard). OutOfBand means
+        // "not the envelope render path", NOT "silent". The pinned
+        // OutOfBand test in ignition-cli's tui_coverage.rs was
+        // extended to exactly [api call, completions, edit, mcp] in
+        // the SAME task — row + clap command land together (Pitfall
+        // 5; an orphan row would fail the clap walk by design).
+        CliRoute {
+            path: "mcp",
             mapping: Mapping::OutOfBand,
         },
         // 09-04: the three curated morning-check reads (EXT-02) —
@@ -428,18 +447,19 @@ pub fn routes() -> &'static [CliRoute] {
         // and `tags export -o -` (a FLAG VALUE on the Screen-mapped
         // `tags export` leaf) — are NOT distinct leaves and carry no
         // rows; the leaf-representable exceptions are `completions`,
-        // `api call` (since 09-03), and `edit` (since 13-08 — the
-        // pinned OutOfBand test carries all three).
+        // `api call` (since 09-03), `edit` (since 13-08), and `mcp`
+        // (since 14-01 — the pinned OutOfBand test carries all four).
         //
-        // Reserved OutOfBand slugs (08-06): `mcp` and `lsp` are
+        // Reserved OutOfBand slugs (08-06): `mcp` and `lsp` were
         // PRE-DECLARED for Phase 14 — MCP stdio and LSP speak their
         // own protocols on stdout (a cockpit would fight them for the
         // terminal). `edit` joined the set in 13-08, its row landing
-        // TOGETHER with its clap command. The remaining rows land with
-        // their clap commands; rows added before the commands exist
-        // are orphans and the clap walk refuses them by design — this
-        // comment plus the pinned OutOfBand test ARE the
-        // pre-declaration.
+        // TOGETHER with its clap command; `mcp` joined in 14-01 the
+        // same way. The remaining row (`lsp`) lands with its clap
+        // command in its own plan; rows added before the commands
+        // exist are orphans and the clap walk refuses them by
+        // design — this comment plus the pinned OutOfBand test ARE
+        // the pre-declaration.
         CliRoute {
             path: "rig up",
             mapping: Mapping::Screen(Screen::Rig),

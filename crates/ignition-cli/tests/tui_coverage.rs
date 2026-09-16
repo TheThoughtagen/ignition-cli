@@ -33,20 +33,21 @@
 //! ## The sanctioned stdout exceptions
 //!
 //! The OutOfBand row set is exactly `["api call", "completions",
-//! "edit"]` — the LEAF-REPRESENTABLE sanctioned stdout exceptions. The
-//! flag-value / stream-form exceptions are NOT distinct leaves and
-//! carry no rows: `logs -f` NDJSON is a FLAG on the Screen-mapped
-//! `logs` leaf; `tags export -o -` is a FLAG VALUE on the Screen-
-//! mapped `tags export` leaf; `rig logs` raw passthrough maps as
-//! Streamed. The exceptions stay traceable through the routes.rs
-//! comments.
+//! "edit", "mcp"]` — the LEAF-REPRESENTABLE sanctioned stdout
+//! exceptions. The flag-value / stream-form exceptions are NOT
+//! distinct leaves and carry no rows: `logs -f` NDJSON is a FLAG on
+//! the Screen-mapped `logs` leaf; `tags export -o -` is a FLAG VALUE
+//! on the Screen-mapped `tags export` leaf; `rig logs` raw passthrough
+//! maps as Streamed. The exceptions stay traceable through the
+//! routes.rs comments.
 //!
 //! Reserved OutOfBand slugs (`mcp`, `lsp` — 08-06): sanctioned
 //! out-of-band FUTURES, pre-declared with justification at the pinned
 //! OutOfBand test and in routes.rs; rows land with their clap commands
 //! in Phase 14, not before (orphan rows fail the walk by design).
-//! `edit` joined the set in 13-08 — the 08-06 reservation fulfilled
-//! with its clap command in the same landing.
+//! `edit` joined the set in 13-08 and `mcp` joined in 14-01 — both
+//! 08-06 reservations fulfilled with their clap commands in the same
+//! landings. `lsp` remains reserved for its own transport plan.
 
 #![cfg(feature = "tui")]
 
@@ -122,8 +123,9 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 
 /// Mapping-kind sanity: the OutOfBand row set is pinned to the
 /// leaf-representable sanctioned stdout exceptions — exactly
-/// `["api call", "completions", "edit"]` (compared as a SET: order-free
-/// by design, so a routes() re-ordering cannot churn the pin).
+/// `["api call", "completions", "edit", "mcp"]` (compared as a SET:
+/// order-free by design, so a routes() re-ordering cannot churn the
+/// pin).
 ///
 /// Why `api call` belongs here (09-03 justification): raw passthrough
 /// to ARBITRARY gateway REST endpoints is not a cockpit verb — there
@@ -140,11 +142,19 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 /// OutOfBand meaning is ZERO stdout bytes in every mode, byte-scan
 /// pinned by contract_edit.rs over the real binary.
 ///
-/// This landing FULFILLS the Phase-8 pre-declaration (08-06): `edit`
-/// was reserved with written justification since 08-06 with zero
-/// rows — orphan rows fail the sibling clap walk by design, so the
-/// row and its clap command HAD to land together, and they did (this
-/// commit). `mcp`/`lsp` remain reserved for Phase 14.
+/// Why `mcp` belongs here (14-01 justification): the Model Context
+/// Protocol server's stdout stream IS the product — newline-delimited
+/// JSON-RPC 2.0 answered for an MCP client; OutOfBand means "not the
+/// envelope render path", NOT "silent" (completions/api-call/edit
+/// genre, one more consumer: the protocol client itself).
+///
+/// These landings FULFILL the Phase-8 pre-declaration (08-06): `edit`
+/// was reserved with written justification since 08-06 with zero rows
+/// and landed with its clap command in 13-08; `mcp` was reserved the
+/// same way and landed with its clap command in 14-01 — orphan rows
+/// fail the sibling clap walk by design, so each row and its clap
+/// command HAD to land together, and they did. `lsp` remains reserved
+/// for its own transport plan.
 #[test]
 fn out_of_band_rows_are_pinned() {
     let mut out_of_band: Vec<&str> = routes()
@@ -155,8 +165,8 @@ fn out_of_band_rows_are_pinned() {
     out_of_band.sort_unstable();
     assert_eq!(
         out_of_band,
-        vec!["api call", "completions", "edit"],
-        "the OutOfBand set must stay exactly [api call, completions, edit] — \
+        vec!["api call", "completions", "edit", "mcp"],
+        "the OutOfBand set must stay exactly [api call, completions, edit, mcp] — \
          a new member needs a written justification here AND in routes.rs, \
          landing in the SAME task as its clap command"
     );

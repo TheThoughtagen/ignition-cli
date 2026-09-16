@@ -216,9 +216,33 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Profile(ProfileArgs),
 
+    /// Serve the Model Context Protocol over stdio (hidden; for MCP
+    /// clients — the newline-delimited JSON-RPC 2.0 stream IS the
+    /// stdout product; the routes.rs OutOfBand row lands atomically
+    /// with this command, 08-06 contract)
+    #[command(hide = true)]
+    Mcp(McpArgs),
+
     /// Interactive TUI cockpit
     #[cfg(feature = "tui")]
     Tui,
+}
+
+/// Hidden args for `ign mcp serve` (14-01). `serve` is a RESTRICTED
+/// POSITIONAL — not a subcommand — so the clap walk (tui_coverage.rs)
+/// yields exactly ONE row-requiring node, `mcp` itself: an `mcp
+/// serve` subcommand leaf would need a second routes() row and extend
+/// the pinned OutOfBand set past its four-member contract (an orphan
+/// row fails the walk by design). clap's `value_parser = ["serve"]`
+/// keeps every other spelling (`ign mcp`, `ign mcp bogus`) a
+/// usage-class clap error — exit 2 BEFORE any protocol byte is
+/// written. Zero stdout-facing behavior here — the mode owns its own
+/// I/O entirely (`mcp::serve`).
+#[derive(Debug, clap::Args)]
+pub struct McpArgs {
+    /// Start the stdio MCP server
+    #[arg(value_parser = ["serve"], value_name = "SERVE")]
+    pub serve: String,
 }
 
 /// Wait targets (02-05, HLTH-11). `gateway` and `restart` poll the
