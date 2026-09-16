@@ -9,7 +9,17 @@ cargo install ignition-cli
 ign --help
 ```
 
-Release assets cover macOS arm64 / x86_64 and Linux arm64 / x86_64. Read the selected release's notes before updating.
+Release assets cover macOS arm64 / x86_64 and Linux arm64 / x86_64 (there is no Windows build). Read the selected release's notes before updating.
+
+## Agent harnesses
+
+Install the playbook alongside the binary — five skills (contract, gateway, tags, workspace, rigs) for any [skills-CLI](https://github.com/vercel-labs/agent-skills)-compatible agent:
+
+```sh
+npx skills add TheThoughtagen/ignition-cli -g
+```
+
+Claude Code can alternatively load them as a plugin: `/plugin marketplace add TheThoughtagen/ignition-cli` → `/plugin install ignition-ops@ignition-cli`.
 
 The command reference on this site follows the repository's main branch. Use `ign --help` and each subcommand's `--help` to check the interface available in your installed release.
 

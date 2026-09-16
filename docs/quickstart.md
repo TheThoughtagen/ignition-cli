@@ -25,6 +25,42 @@ Successful commands normally return an envelope containing `ok`, `profile`, and 
 
 `ign doctor` can finish with exit code zero while reporting failed checks. Read the checks themselves before assuming the connection works.
 
+## The daily check
+
+One pass over gateway health, all curated reads:
+
+```sh
+ign status
+ign license status
+ign redundancy status
+ign gan status
+```
+
+For anything the curated commands don't cover, `ign api call --method GET --path /some/endpoint` passes through to the gateway verbatim.
+
 ## Add other operations when needed
 
 Gateway status and project listing use native REST endpoints. Runtime tag operations need the CLI's WebDev routes. Review those prerequisites and the overwrite behavior of project operations in the [reference](https://thethoughtagen.github.io/ignition-cli/docs/reference/) before using them.
+
+## Try the editing loop
+
+Projects check out to a real directory tree and push back guarded — conflict and staleness refusals are never force-able:
+
+```sh
+ign workspace checkout MyProject ./MyProject
+ign workspace status ./MyProject
+ign workspace push ./MyProject --yes
+```
+
+Single resources take the shorter `ign edit MyProject path/to/resource.json` (fetch → `$EDITOR` → encode → push; unchanged saves are clean no-ops).
+
+## Use it from an AI agent
+
+Every command's JSON contract is agent-ready on its own; the transports remove the last mile:
+
+```sh
+claude mcp add ign -- ign mcp serve    # MCP: the whole CLI as tools
+npx skills add TheThoughtagen/ignition-cli -g   # agent skills (the playbook)
+```
+
+`ign lsp` serves live gateway completions/hover/diagnostics to editors — see [ignition-ide-plugins](https://github.com/TheThoughtagen/ignition-ide-plugins) for the nvim client.

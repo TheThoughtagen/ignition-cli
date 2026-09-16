@@ -6,7 +6,12 @@ One binary that lets a developer (or an AI agent) fully operate and inspect an
 Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the
 gateway webpage or Designer. Every subcommand is non-interactive by default
 and scriptable with JSON output; `ign tui` (below) is the interactive
-cockpit over the same actions layer.
+cockpit over the same actions layer. v1.1 completes the agent surface end
+to end: `ign api call` passthrough + curated daily checks, guarded EAM
+write lifecycle with blast-radius preview, byte-faithful XML/CSV tag
+transfer, a workspace checkout / `ign edit` round-trip, and protocol
+transports — MCP (`ign mcp serve`) and LSP (`ign lsp`) — so agents and
+editors drive the same binary humans do.
 
 ## Install
 
@@ -18,6 +23,20 @@ cargo install ignition-cli
 [releases](https://github.com/TheThoughtagen/ignition-cli/releases) —
 macOS arm64/x86_64, Linux x86_64/arm64). Requires Rust 1.88+ when building
 from source. The binary is `ign`.
+
+Agent harnesses can also install the playbook: the
+[`ignition-ops` skills](claude-code-plugin/README.md) (5 SKILL.md files —
+contract, gateway, tags, workspace, rigs) ride any
+[skills-CLI](https://github.com/vercel-labs/agent-skills)-compatible
+agent:
+
+```
+npx skills add TheThoughtagen/ignition-cli -g
+```
+
+Claude Code can alternatively load them as a plugin (see
+[Agent transports](#agent-transports--mcp-ign-mcp-serve-and-lsp-ign-lsp)
+below).
 
 ## Output contract (for agents)
 
@@ -317,6 +336,30 @@ Behavior contract:
   `logs`, `logs loggers` forms) has a TUI mapping and no orphan rows
   exist — adding a CLI command without a cockpit surface FAILS CI.
   The only unmapped leaf is `completions` (out-of-band by design).
+
+### Themes & capability degradation (`[ui].theme`)
+
+Four named themes — `default`, `dark`, `light`, `mono` — selected by the
+top-level `[ui].theme` config key (set it with any TOML editor; `ign
+profile` never needs to be involved). Every theme is AUTHORED at four
+capability tiers — truecolor, ANSI-256, ANSI-16, mono — detected at
+startup from `NO_COLOR` / `COLORTERM` / `TERM`: the palette steps down
+without breaking layout or contrast. `default` and `mono` render
+byte-identically at every tier (their non-mono slots are Reset);
+`dark` carries WCAG-AAA body contrast (14.2:1 text on black); `light`
+keeps black-text structure on either terminal background. Discipline is
+CI-enforced: `Color::` literals live ONLY in the style-tokens module
+(`ui/theme.rs`) — a grep gate fails any style literal anywhere else.
+A wrong-typed or unknown `[ui].theme` value warns and falls back to
+default — a config typo never kills TUI startup.
+
+### Polling cadence (`poll_interval_secs`)
+
+Each profile takes an optional `poll_interval_secs` — the Dashboard
+refresh period, default 5 s, with ONE source of truth in the code.
+Sub-second values are refused at config load (`poll_interval_too_small`,
+exit 3 — the hard floor against hammering the gateway). The active value
+adopts live across profile switches (same ride-along path as the theme).
 
 ## Rigs (Docker compose lifecycle)
 
@@ -1568,4 +1611,77 @@ tool's own flags (`--profile perspective`, `--checks naming`,
 `--fail-on warning`, …). Spawning is an arg VECTOR — never a shell
 string. Pair it with `project export --decode-scripts`: lint the
 decoded `.py` sidecars, then re-import with `--encode-scripts`.
+
+## Agent transports — MCP (`ign mcp serve`) and LSP (`ign lsp`)
+
+v1.1 exposes the whole command surface over protocols. Both modes own
+stdout completely — the streaming exceptions above apply doubly, since
+inside a protocol stream a single stray byte is protocol death. Both are
+thin lenses: the command surface they mirror is the CLI's own, so a new
+CLI verb becomes an MCP tool or an LSP capability through derivation,
+never a second hand-written catalog.
+
+### `ign mcp serve` — the MCP transport
+
+Register with any stdio MCP client:
+
+```
+claude mcp add ign -- ign mcp serve    # Claude Code
+# generic client: command `ign`, args ["mcp", "serve"]
+```
+
+- **The tool catalog derives from `Cli::command()`** — every CLI verb
+  surfaces as a tool automatically (83 at v1.1) with global args folded
+  into each schema (`--json`/`--compact` forced on, `--yes` replaced by
+  the `confirm` field, profile ambient). A CI parity test walks the live
+  clap tree, so the catalog structurally cannot drift from the CLI.
+- **The frozen envelope rides verbatim** as tool-result content — the
+  two documented prose exceptions (`ign api call`'s gateway-verbatim
+  data, MCP's own refusal prose below) are dated above and in the
+  Contract exceptions section.
+- **Guarded writes translate `--yes` to a `confirm` tool-call field.**
+  `confirm` is deliberately OPTIONAL in every guarded schema — a
+  required field would invite agents to auto-fill it, defeating the
+  human-in-the-loop gate. Omitting it returns the same refusal envelope
+  (blast radius and all) as the tool result; unknown keys fail closed
+  with `-32602`.
+- **`ping` never starves**: tool calls are served concurrently while one
+  blocks on the gateway. `protocolVersion` negotiates `2025-06-18`
+  (echo-if-equal).
+- **Raw-stdout verbs refuse at the bridge**: `ign rig logs` and `ign
+  logs --follow` print through in-dispatch sinks, so the MCP bridge
+  refuses them before they can corrupt the stream — the refusal names
+  the terminal form.
+
+### `ign lsp` — live gateway truth for editors
+
+A stdio LSP server (sync dispatch loop) serving three completion
+families (tag paths, named queries, providers), TTL-stamped hover, and
+diagnostics from a TTL-cached gateway snapshot:
+
+- **Never a blocking network call inside an LSP request** — handlers
+  are pure functions over one snapshot Arc; the request path cannot
+  hang the editor.
+- **A dead gateway degrades honestly**: diagnostics publish EMPTY (no
+  cached oracle, no verdict) instead of spamming errors; the background
+  refresher re-resolves per cycle so recovery appears next cycle.
+- **Composition, not replacement**: Python `ignition-lsp` keeps statics
+  ownership (definition, codeAction, workspace symbols); nvim's native
+  multi-client merge composes the two servers. The nvim/zed clients
+  live in [ignition-ide-plugins](https://github.com/TheThoughtagen/ignition-ide-plugins)
+  (`ignition_live` registers `ign lsp` beside the statics client when
+  `ign` is on PATH; virtual buffers re-attach across restarts for both
+  clients).
+
+### Agent skills — the playbook layer
+
+The [`ignition-ops`](claude-code-plugin/README.md) skills teach agents
+the contract rules this README codifies (envelope streams, exit
+taxonomy, guarded-write semantics, loss gates) without reading 1,600
+lines first: `ign-contract`, `ign-gateway`, `ign-tags`,
+`ign-workspace`, `ign-rigs`. Install with `npx skills add
+TheThoughtagen/ignition-cli` (any harness the skills CLI supports) or
+as a Claude Code plugin: `/plugin marketplace add
+TheThoughtagen/ignition-cli` → `/plugin install
+ignition-ops@ignition-cli`.
 
