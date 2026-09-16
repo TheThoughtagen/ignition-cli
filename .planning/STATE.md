@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 EXECUTING — 14-01 landed `ign mcp serve`; 14-02 landed the MCP contract wall (byte-scan harness, envelope-verbatim, env-proof confirm gate, starvation pin, mcp-SDK oracle) — 14-03 (LSP) in flight in parallel
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 EXECUTING — 14-01 landed `ign mcp serve`; 14-02 landed the MCP contract wall (byte-scan harness, envelope-verbatim, env-proof confirm gate, starvation pin, mcp-SDK oracle) — 14-03 landed the LSP transport (`ign lsp` + GatewayCache); 14-04 landed the LSP handlers + contract wall (3-family completions, TTL-stamped hover, frame-derived diagnostics, select! loop, byte-scan + dead-gateway proofs)
 
 ## Current Position
 
 **Phase:** 14 of 14 (transports-mcp-lsp) — IN PROGRESS
-**Current Plan:** 14-03 COMPLETE (LSP transport: ign lsp + GatewayCache + OutOfBand pin closed at 5 members) — next: 14-04 (LSP handlers + contract suite)
-**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04–14-06 pending)
+**Current Plan:** 14-04 COMPLETE (LSP handlers: 3-family completions + TTL-stamped hover + frame-derived diagnostics via crossbeam select! loop; contract_lsp.rs byte-scan + dead-gateway cache-only proof) — next: 14-05
+**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04 ✅, 14-05–14-06 pending)
 **Status:** Executing
 **Last Activity:** 2026-09-16
 
-**Progress:** [██████████] 97%
+**Progress:** [██████████] 98%
 
 ## Performance Metrics
 
@@ -79,6 +79,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 14 P01 | 61 min | 2 tasks | 5 files |
 | Phase 14 P02 | 45 min | 2 tasks | 2 files |
 | Phase 14 P03 | 46 min | 2 tasks | 7 files |
+| Phase 14 P04 | 55 min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -217,6 +218,10 @@ Recent decisions affecting current work:
 - [Phase 14]: GatewaySource owns its current-thread Runtime and uses Runtime::block_on — a cloned Handle::block_on into an idle current-thread runtime does not drive its reactor (connect future hung forever; caught by the unreachable-gateway live smoke)
 - [Phase 14]: LSP refresher re-attempts Session::resolve per cycle only while unresolved — one construction site on the happy path, gateway recovery seen next cycle when degraded
 - [Phase 14]: Tag populate: one webdev precondition per cycle then direct browse-action calls (same route as ign tags browse), node-capped at 5000/provider; refresher spawn failure degrades (unhealthy cache) rather than killing the server
+- [Phase 14]: 14-04: LSP handlers are pure fns over (&Snapshot, text, position) — the request path is ONE cache.snapshot() Arc clone + pure functions; the loop's only structural change is crossbeam_channel::select! over connection.receiver + the refresher version channel (diagnostics republish after EVERY refresh cycle; refresher death swaps in never() instead of spinning)
+- [Phase 14]: 14-04: dead-gateway honesty ladder — unhealthy snapshot publishes EMPTY diagnostics (no cached oracle = no verdict, never unknown-provider spam); contract test pins per-request latency (send→answer) so process startup cannot mask a network-blocking handler
+- [Phase 14]: 14-04: [Rule 1] named-query populate filter fixed — real export members arrive as {collection}/named-query/{path}/resource.json post user_path, so the old starts_with('named-query/') would never fire; named_query_path() normalizes any path containing the named-query/ segment
+- [Phase 14]: 14-04: docs map keys on the URI string (clippy mutable_key_type on lsp_types::Uri's interior-mutable innards; lsp-types compares Uris by string anyway); crossbeam-channel promoted to a direct dep (the select! loop requires it; supersedes 14-03's transitive-only comment)
 
 ### Pending Todos
 
@@ -233,6 +238,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-16T03:29:00.684Z
-**Stopped At:** Completed 14-03-PLAN.md (LSP transport — ign lsp + GatewayCache; next: 14-04 handlers + contract suite)
+**Last session:** 2026-09-16T04:30:13.778Z
+**Stopped At:** Completed 14-04-PLAN.md
 **Resume file:** None
