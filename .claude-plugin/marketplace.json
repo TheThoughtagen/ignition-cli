@@ -1,0 +1,24 @@
+{
+  "name": "ignition-cli",
+  "owner": {
+    "name": "Whiskey House"
+  },
+  "metadata": {
+    "description": "Agent skills for operating Ignition 8.3+ gateways with the ign CLI"
+  },
+  "plugins": [
+    {
+      "name": "ignition-ops",
+      "source": "./claude-code-plugin",
+      "description": "Operate Ignition 8.3+ gateways with ign — agent contract, gateway health, tags with byte-faithful transfer, workspace/edit, and Docker test rigs",
+      "version": "0.1.0",
+      "author": {
+        "name": "Whiskey House"
+      },
+      "homepage": "https://github.com/TheThoughtagen/ignition-cli",
+      "repository": "https://github.com/TheThoughtagen/ignition-cli",
+      "license": "MIT",
+      "keywords": ["ignition", "gateway", "scada", "ics", "inductive-automation", "cli", "agents", "mcp"]
+    }
+  ]
+}
