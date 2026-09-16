@@ -136,9 +136,9 @@ impl ScriptedClient {
         }
     }
 
-    /// Write one raw JSON value as exactly one newline-terminated
-    /// stdin frame. (Compact serialization — embedded newlines would
-    /// be client-side framing bugs.)
+    /// Write one JSON value as exactly one newline-terminated stdin
+    /// frame. (Compact serialization — embedded newlines would be
+    /// client-side framing bugs.)
     fn send(&mut self, message: &Value) {
         let stdin = self
             .stdin
@@ -149,6 +149,36 @@ impl ScriptedClient {
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
             .expect("write a protocol frame to the server");
+    }
+
+    /// Write one raw (possibly non-JSON) stdin frame — the
+    /// malformed-input survival probe.
+    fn send_raw_line(&mut self, raw: &str) {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .expect("server stdin is open (a closed stdin fails every later step)");
+        stdin
+            .write_all(raw.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .expect("write a raw frame to the server");
+    }
+
+    /// THE next message with a hard budget — no id matching, no
+    /// skipping: the strict-ordering assertions need the FIRST arrival
+    /// after a send, unfiltered.
+    fn recv_next(&self, secs: u64) -> Value {
+        match self.lines.recv_timeout(Duration::from_secs(secs)) {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("no stdout message arrived within {secs}s — protocol death or starvation")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the reader thread died — stdout closed mid-protocol or the byte-scan \
+                 rejected a stray byte (see the panicked thread's message above)"
+            ),
+        }
     }
 
     /// Send a JSON-RPC request with the given id shape (numeric OR
@@ -416,7 +446,7 @@ fn tools_list_carries_the_catalog_with_the_pinned_shape() {
         names.push(name);
     }
 
-    fn required_of<'a>(tools: &'a [Value], name: &str) -> Vec<String> {
+    fn required_of(tools: &[Value], name: &str) -> Vec<String> {
         tools
             .iter()
             .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
@@ -635,4 +665,459 @@ fn catalog_sample_round_trips_through_clap_parse() {
             parsed.err().map(|e| e.to_string())
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// tools/call contract (SC-2 + frozen-envelope + error mapping + SC-5 pin)
+// ---------------------------------------------------------------------------
+
+use assert_cmd::Command as AssertCommand;
+
+/// The live-captured gateway-info fixture (contract_status.rs verbatim).
+async fn mount_gateway_info(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/gateway-info"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "ign-mock",
+                "redundancyRole": "Independent",
+                "edition": "standard",
+                "ignitionVersion": "8.3.6 (b2026042713)",
+                "jvmVersion": "17.0.11",
+                "license": {"mode": "Trial", "expirationDate": "2026-08-24T19:00:00Z"}
+            })),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// The live-captured overview fixture (contract_status.rs verbatim —
+/// every number pinned, so the status envelope is fixture-stable).
+async fn mount_overview(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/overview"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": "8.3.6 (b2026042713)",
+            "redundancy": {"role": "Independent", "activityLevel": "ACTIVE", "projectState": "RUNNING"},
+            "java": {"version": "17.0.11", "vendor": "Azul Systems, Inc.", "name": "OpenJDK 64-Bit Server VM"},
+            "os": {"name": "Linux", "arch": "amd64", "version": "5.15.0"},
+            "uptime": 338137,
+            "memory": [338137088i64, 1073741824i64],
+            "cpu": 0.0031,
+            "disk": {"total": 62661259264i64, "used": 12272824320i64},
+            "license": {"state": "trial", "trialRemaining": 7017}
+        })))
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// The readiness probe fixture.
+async fn mount_status_ping(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/StatusPing"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"state": "RUNNING"})),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// All three endpoints the `status` verb touches — the envelope is
+/// fixture-stable, which is what makes byte-equality with a direct run
+/// possible.
+async fn mount_status_fixtures(server: &wiremock::MockServer) {
+    mount_gateway_info(server).await;
+    mount_overview(server).await;
+    mount_status_ping(server).await;
+}
+
+/// A one-profile config pointing at `url` (the contract_status recipe)
+/// plus the byte-scan's unknown-key noise. Auth rides IGNITION_TOKEN.
+fn write_wiremock_profile_config(config: &Path, url: &str) {
+    std::fs::write(
+        config,
+        format!(
+            "bogus_key = 1\nactive = \"dev\"\n\n[profiles.dev]\nurl = \
+             \"{url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
+        ),
+    )
+    .expect("write wiremock profile config");
+}
+
+const MOCK_TOKEN: &str = "mock:name-key";
+
+/// THE frozen-envelope verbatim pin (SC-2's wire half): a tools/call
+/// over the real binary against a wiremock-backed profile returns the
+/// tool-result text that is BYTE-FOR-BYTE the envelope the same
+/// invocation prints directly (`ign --json --compact status`) — the
+/// protocol path may never reshape an envelope.
+#[tokio::test]
+async fn tools_call_returns_the_frozen_envelope_verbatim() {
+    let server = wiremock::MockServer::start().await;
+    mount_status_fixtures(&server).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    write_wiremock_profile_config(&config, &server.uri());
+
+    let mut client =
+        ScriptedClient::spawn_with_config(&config, dir, &[("IGNITION_TOKEN", MOCK_TOKEN)]);
+    client.handshake();
+    client.request(
+        json!(10),
+        "tools/call",
+        json!({ "name": "status", "arguments": {} }),
+    );
+    let response = client.expect_response(&json!(10), RESPONSE_BUDGET_SECS);
+    let result = response.get("result").expect("tools/call answers a result");
+    assert_eq!(
+        result.get("isError"),
+        Some(&json!(false)),
+        "a successful envelope is isError:false: {result}"
+    );
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("the tool result carries text content");
+    let envelope: Value = serde_json::from_str(text).expect("the envelope text parses");
+    assert_eq!(envelope.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        envelope.get("profile").and_then(Value::as_str),
+        Some("dev"),
+        "the envelope echoes the resolved profile"
+    );
+
+    // The SAME invocation, run directly: byte-for-byte equality of the
+    // two envelope strings (the direct stdout's single trailing
+    // println! newline stripped).
+    let direct = AssertCommand::cargo_bin("ign")
+        .expect("binary 'ign' not found")
+        .args(["--json", "--compact", "status"])
+        .env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", MOCK_TOKEN)
+        .env("IGNITION_LOG", "trace")
+        .env_remove("IGNITION_PROFILE")
+        .env_remove("IGNITION_JSON")
+        .env_remove("IGNITION_YES")
+        .output()
+        .expect("spawn ign status directly");
+    assert!(
+        direct.status.success(),
+        "direct run must succeed: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct_stdout = String::from_utf8(direct.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        text,
+        direct_stdout.strip_suffix('\n').unwrap_or(&direct_stdout),
+        "MCP tool result must equal the direct CLI envelope byte-for-byte"
+    );
+}
+
+/// SC-2, refusal half, ENV-PROOF: `tools/call project_delete` with
+/// confirm OMITTED returns the frozen `confirmation_required` failure
+/// envelope AS the tool result (isError:true, content = the envelope
+/// JSON) — and `IGNITION_YES=1` exported into the spawned server's
+/// environment changes NOTHING (the apply_env_defaults bypass is
+/// behavioral, pinned here over the real binary).
+#[tokio::test]
+async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
+    let mut client = ScriptedClient::spawn(&[("IGNITION_YES", "1")]);
+    client.handshake();
+    client.request(
+        json!(11),
+        "tools/call",
+        json!({ "name": "project_delete", "arguments": { "name": "x" } }),
+    );
+    let response = client.expect_response(&json!(11), RESPONSE_BUDGET_SECS);
+    let result = response.get("result").expect("tools/call answers a result");
+    assert_eq!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "the refusal rides isError:true: {result}"
+    );
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("the refusal rides as text content");
+    let envelope: Value =
+        serde_json::from_str(text).expect("the refusal text parses as the frozen envelope");
+    assert_eq!(envelope.get("ok").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        envelope.pointer("/error/code").and_then(Value::as_str),
+        Some("confirmation_required"),
+        "the frozen refusal envelope rides verbatim: {envelope}"
+    );
+    assert!(
+        envelope.pointer("/error/message").is_some(),
+        "the refusal carries the LOCKED error envelope shape"
+    );
+}
+
+/// SC-2, execution half: `confirm:true` is the ONLY way `--yes` is
+/// reachable — the guarded verb executes against the gateway (the
+/// wiremock records the DELETE carrying the server's own confirm=true
+/// query param) and returns the success envelope.
+#[tokio::test]
+async fn confirm_true_executes_the_guarded_verb_on_the_wire() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+        .and(wiremock::matchers::path("/data/api/v1/projects/x"))
+        .and(wiremock::matchers::query_param("confirm", "true"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1..)
+        .mount_as_scoped(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    write_wiremock_profile_config(&config, &server.uri());
+
+    let mut client =
+        ScriptedClient::spawn_with_config(&config, dir, &[("IGNITION_TOKEN", MOCK_TOKEN)]);
+    client.handshake();
+    client.request(
+        json!(12),
+        "tools/call",
+        json!({ "name": "project_delete", "arguments": { "name": "x", "confirm": true } }),
+    );
+    let response = client.expect_response(&json!(12), RESPONSE_BUDGET_SECS);
+    let result = response.get("result").expect("tools/call answers a result");
+    assert_eq!(
+        result.get("isError"),
+        Some(&json!(false)),
+        "confirm:true executes: {result}"
+    );
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("text content");
+    let envelope: Value = serde_json::from_str(text).expect("envelope parses");
+    assert_eq!(envelope.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        envelope.pointer("/data/deleted").and_then(Value::as_str),
+        Some("x"),
+        "the frozen success envelope rides verbatim: {envelope}"
+    );
+
+    // The wire proof: exactly one DELETE, carrying confirm=true.
+    let requests = guard.received_requests().await;
+    assert_eq!(requests.len(), 1, "one DELETE per invocation");
+    let query = requests[0].url.query().expect("query present");
+    assert!(
+        query.contains("confirm=true"),
+        "the server's own guard rode the wire: {query}"
+    );
+}
+
+/// Error mapping + survival: unknown tool → -32601; invalid params
+/// (missing required arg, hostile unknown key) → -32602; a malformed
+/// (non-JSON) stdin line produces NO stdout bytes and the server keeps
+/// serving — a subsequent ping answers promptly.
+#[tokio::test]
+async fn protocol_errors_map_correctly_and_survive_malformed_input() {
+    let mut client = ScriptedClient::spawn(&[]);
+    client.handshake();
+
+    // Unknown tool → -32601.
+    client.request(
+        json!(20),
+        "tools/call",
+        json!({ "name": "no_such_tool", "arguments": {} }),
+    );
+    let response = client.expect_response(&json!(20), RESPONSE_BUDGET_SECS);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32601),
+        "unknown tool is a protocol-level method error: {response}"
+    );
+    assert!(
+        response
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.contains("no_such_tool")),
+        "the error names the offending tool"
+    );
+
+    // Missing required argument → -32602 (clap parse failure is NEVER
+    // e.exit() — the process must survive the protocol).
+    client.request(
+        json!(21),
+        "tools/call",
+        json!({ "name": "tags_read", "arguments": {} }),
+    );
+    let response = client.expect_response(&json!(21), RESPONSE_BUDGET_SECS);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32602),
+        "invalid params map to -32602: {response}"
+    );
+
+    // THE SC-2 wire probe: a hostile `yes` property (not in any tool
+    // schema — globals are excluded) refuses -32602 and can never
+    // reach --yes.
+    client.request(
+        json!(22),
+        "tools/call",
+        json!({ "name": "status", "arguments": { "yes": true } }),
+    );
+    let response = client.expect_response(&json!(22), RESPONSE_BUDGET_SECS);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32602),
+        "the hostile-yes probe refuses as invalid params: {response}"
+    );
+    assert!(
+        response
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.contains("yes")),
+        "the refusal names the offending key"
+    );
+
+    // A malformed stdin line: NO recoverable id → the server stays
+    // QUIET (warns on stderr only), keeps serving, and answers the
+    // next ping promptly.
+    client.send_raw_line("this is not json at all");
+    client.expect_silence(QUIET_WINDOW_MS);
+    let start = Instant::now();
+    client.request(json!(23), "ping", json!({}));
+    let response = client.expect_response(&json!(23), 2);
+    assert_eq!(
+        response.get("result"),
+        Some(&json!({})),
+        "the protocol survived the malformed input"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "post-malformed ping still prompt: {:?}",
+        start.elapsed()
+    );
+}
+
+/// SC-5, THE PERMANENT STARVATION PIN: with an in-flight tools/call
+/// hung on a dead gateway (a bound-but-never-accepting listener — the
+/// TCP connect SUCCEEDS into the kernel backlog, so the reqwest client
+/// is stuck waiting for a response that never comes until its own
+/// 30s timeout), the ping response must arrive FIRST. Starvation is
+/// structurally impossible: tools/call runs off the reader loop and
+/// ping answers inline.
+#[tokio::test]
+async fn ping_never_starves_behind_an_in_flight_dead_gateway_call() {
+    // The dead gateway: bound, never accepted. Held alive to the end
+    // of the test — dropping it would RST the connection and could
+    // error the call early.
+    let dead_gateway = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead gateway");
+    let dead_url = format!(
+        "http://127.0.0.1:{}/",
+        dead_gateway.local_addr().unwrap().port()
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    write_wiremock_profile_config(&config, &dead_url);
+
+    let mut client =
+        ScriptedClient::spawn_with_config(&config, dir, &[("IGNITION_TOKEN", MOCK_TOKEN)]);
+    client.handshake();
+
+    // The call first (its gateway check hangs ≥ the client's own
+    // 30s timeout), then IMMEDIATELY the ping.
+    client.request(
+        json!(30),
+        "tools/call",
+        json!({ "name": "version", "arguments": {} }),
+    );
+    client.request(json!(31), "ping", json!({}));
+
+    // ORDERING: the FIRST message after the sends must be the ping.
+    let first = client.recv_next(10);
+    assert_eq!(
+        first.get("id"),
+        Some(&json!(31)),
+        "ping must answer BEFORE the hung tool result: {first}"
+    );
+    assert_eq!(first.get("result"), Some(&json!({})), "ping's empty result");
+
+    // Then the tool result lands (after the client's own gateway
+    // timeout) — completing the ordering fact and proving the server
+    // neither wedged nor dropped the call.
+    let second = client.recv_next(75);
+    assert_eq!(
+        second.get("id"),
+        Some(&json!(30)),
+        "the in-flight call's result still arrives: {second}"
+    );
+    assert!(
+        second.get("result").is_some() || second.get("error").is_some(),
+        "the dead-gateway call resolves into a well-formed response: {second}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Python mcp-SDK conformance oracle (optional gate, green-skips without uv)
+// ---------------------------------------------------------------------------
+
+/// The oracle's optional gate (the 10-USER-SETUP live-gate green-skip
+/// genre): a REAL mcp-SDK Python client drives the full lifecycle over
+/// the spawned binary against a wiremock-backed profile. Run
+/// explicitly — NEVER a Cargo dependency on Python:
+///
+/// ```text
+/// cargo test -p ignition-cli --test contract_mcp mcp_oracle -- --ignored
+/// ```
+///
+/// Without `uv` on PATH this gate green-skips (prints the reason and
+/// passes); with uv it runs `uv run --with mcp` — the mcp SDK is
+/// fetched test-time only.
+#[tokio::test]
+#[ignore = "conformance oracle: needs uv + the mcp SDK — run with `cargo test -p \
+            ignition-cli --test contract_mcp mcp_oracle -- --ignored`"]
+async fn mcp_oracle_gate_drives_a_real_mcp_sdk_client() {
+    let probe = Command::new("uv").arg("--version").output();
+    let probe = match probe {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            eprintln!("green-skip: uv not available — the mcp SDK oracle gate is skipped");
+            return;
+        }
+    };
+    let _ = probe;
+
+    let server = wiremock::MockServer::start().await;
+    mount_status_fixtures(&server).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    write_wiremock_profile_config(&config, &server.uri());
+
+    let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_oracle.py");
+    let output = Command::new("uv")
+        .args([
+            "run",
+            "--with",
+            "mcp",
+            "python",
+            oracle.to_string_lossy().as_ref(),
+            "--",
+            env!("CARGO_BIN_EXE_ign"),
+        ])
+        .env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", MOCK_TOKEN)
+        .output()
+        .expect("run the oracle under uv");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the mcp SDK oracle failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("ORACLE OK"),
+        "the oracle did not report success: {stdout}"
+    );
 }
