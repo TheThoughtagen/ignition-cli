@@ -19,7 +19,8 @@ ign rig reset --yes      # fresh volumes — destructive (guarded)
 ```
 
 - **Compose discovery is 5-level**: the CLI finds the compose file walking up/down the usual layout — run `rig` verbs from inside or beside the rig directory.
-- `rig up` blocks until the gateway answers and is **commissioned** (no `/welcome` redirect) — never hand-poll; the wait is built in.
+- `rig up` waits for the containers to reach running — but a **fresh volume terminally reports exit 0 with `state: "uncommissioned"`** and the wizard URL in `warnings`. Commissioning is NOT automatic: check the result for `state`, and when it is `"uncommissioned"`, complete the `/welcome` wizard (URL from the warnings) **before** running commissioned-only operations. `ign doctor`'s commissioning check is the oracle.
+- `rig up` blocks until the gateway answers — never hand-poll HTTP; the wait is built in. Commissioning is the one state it does not guarantee.
 - `rig` verbs need **no profile** — they talk to Docker, not the gateway.
 
 ## Trial state (2-hour licensed windows)
@@ -27,8 +28,8 @@ ign rig reset --yes      # fresh volumes — destructive (guarded)
 Fresh rigs boot into an OIDC trial — 2 hours of licensed behavior (historian, EAM controller, etc.) per window:
 
 ```bash
-ign rig trial --json     # trial state + remaining countdown
-ign rig trial reset      # native OIDC reset — live-proven on 8.3.3 + 8.3.6
+ign rig trial --json          # trial state + remaining countdown
+ign rig trial reset --yes     # native OIDC reset — guarded; refused exit 2 without --yes
 ```
 
 Budget verification work to fit inside a window: a full live-suite run comfortably fits in one; commissioning a fresh rig takes ~4 minutes.

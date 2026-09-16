@@ -36,8 +36,8 @@ Failure: {"ok": false, "profile": <name|null>, "error": {"code": "<slug>", "mess
 Rules:
 
 - Parse `ok`, then branch. `error.code` is a **stable slug** — key automation on slugs, never on message prose (messages may improve between releases).
-- Diagnostics go to **stderr**; stdout carries only the envelope (or raw payload, see exceptions). A clean pipe is guaranteed.
-- **Exceptions** (raw stdout, never JSON-wrapped): `ign completions <SHELL>` (sourced by shells), `ign tags export --format xml -- -` and CSV/XML file payloads (byte-faithful gateway passthrough), and `ign edit` (zero stdout — the editor owns the terminal).
+- **Streams matter**: a successful dispatch writes the envelope to **stdout**; a failed dispatch writes the failure envelope to **stderr** (`render_error`'s JSON branch) — the exit code carries the same signal either way. Automation must read `error.code` / `error.message` from **stderr** when the exit code is nonzero; stdout stays empty on failure.
+- **Exceptions** (raw stdout, never JSON-wrapped): `ign completions <SHELL>` (sourced by shells), `ign tags export --format xml -- -` and CSV/XML file payloads (byte-faithful gateway passthrough), and `ign rig logs` (streams compose log lines directly to stdout in both default and `--json` forms — never parse them as JSON), plus `ign edit` (zero stdout — the editor owns the terminal).
 
 ## Exit codes
 

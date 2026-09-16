@@ -71,13 +71,14 @@ ign wait ready --json              # poll until the gateway answers
 
 ```bash
 #!/bin/sh
-# morning check — fails loudly only on network/auth (exit 4/5)
+# morning check — aborts on any nonzero exit from the ign commands below
+# (set -e trips on usage exit 2 and config exit 3 too, not just network/auth)
 set -e
-ign status      --json > /tmp/gw-status.json
-ign license     --json > /tmp/gw-license.json
-ign redundancy  --json > /tmp/gw-redundancy.json
+ign status          --json > /tmp/gw-status.json
+ign license status  --json > /tmp/gw-license.json
+ign redundancy status --json > /tmp/gw-redundancy.json
 jq -e '.ok' /tmp/gw-status.json > /dev/null && echo "gateway up"
 jq -r '.data.trial // empty' /tmp/gw-license.json && echo "trial active" || true
 ```
 
-Field names inside `data` are stable per release; prefer `jq -e '.ok'` gates and slug-based `error.code` matching over message text.
+Notes: `license` and `redundancy` have a **required `status` subcommand** — the bare form is a clap usage error (exit 2). The `jq` lines sit in `&&`/`||` lists, so their failures do not trigger `set -e`. Field names inside `data` are stable per release; prefer `jq -e '.ok'` gates and slug-based `error.code` matching (on **stderr**) over message text.

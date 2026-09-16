@@ -68,7 +68,7 @@ ign tags import --provider NewProvider --file line1.json --json
 ign tags export "[Provider]Line1" --format csv --out line1.csv
 ```
 
-**Loss gate (imports):** XML/CSV imports run a loss scan **before** the import and **refuse exit 2** with a prose report of what would drop or coerce (alarms, permissions, UDT type definitions land differently, legacy column limits). Pass `--yes` to proceed anyway; the report rides the envelope as `data.loss_report`. The scan is advisory — the gateway's own refusals (e.g. collisions) still apply on top.
+**Loss gate (imports):** XML/CSV imports run a loss scan **before** the import. Without `--yes` the import is **refused exit 2** (`invalid_input`) and the prose report of what would drop or coerce rides `error.message` in the stderr failure envelope — read it there, not from stdout. With `--yes`, the import proceeds and the **structured** report attaches to the success envelope as `data.loss_report`. The scan is advisory — the gateway's own refusals (e.g. collisions) still apply on top.
 
 - `stdout` mode (`-` as output file) emits the raw payload — no envelope (documented exception).
 - Collisions: `abort` (default) refuses; `overwrite` replaces — destructive, needs `--yes`.
