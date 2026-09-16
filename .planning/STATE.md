@@ -5,17 +5,17 @@
 See: .planning/PROJECT.md (updated 2026-09-04)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 EXECUTING — 14-01 landed `ign mcp serve`; 14-02 landed the MCP contract wall (byte-scan harness, envelope-verbatim, env-proof confirm gate, starvation pin, mcp-SDK oracle) — 14-03 landed the LSP transport (`ign lsp` + GatewayCache); 14-04 landed the LSP handlers + contract wall (3-family completions, TTL-stamped hover, frame-derived diagnostics, select! loop, byte-scan + dead-gateway proofs)
+**Current Focus:** Milestone v1.1 Agent Surface & IDE Integration — Phase 13 COMPLETE (verified-ready); Phase 14 COMPLETE (6/6) — `ign mcp serve` (hand-rolled JSON-RPC 2.0 stdio, clap-derived catalog) + contract wall (byte-scan, envelope-verbatim, confirm gate, starvation pin, mcp-SDK oracle); `ign lsp` + GatewayCache + handlers + contract suite; ignition-nvim ignition_live client (headless-e2e'd, branch claude/ign-lsp-live-client); live MCP smoke closed by real Claude Code client with honest evidence ledger
 
 ## Current Position
 
-**Phase:** 14 of 14 (transports-mcp-lsp) — IN PROGRESS
-**Current Plan:** 14-05 COMPLETE (ignition-nvim live-client wiring: second `ignition_live` client `cmd {'ign','lsp'}` guarded + additive beside the statics client; headless e2e BOTH_CLIENTS with narrow-cap proof; sibling commit 0d6bd55 on `claude/ign-lsp-live-client`) — next: 14-06
-**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04 ✅, 14-05 ✅, 14-06 pending)
-**Status:** Executing
+**Phase:** 14 of 14 (transports-mcp-lsp) — COMPLETE
+**Current Plan:** 14-06 COMPLETE — checkpoint RESOLVED. Real-client live smoke executed by the user across 3 rounds (2 fix loops: b3b6208 envelope-verbatim guidance, 096a068 MCP-native refusal prose + optional confirm): Claude Code completed initialize → tools/list → tools/call (83 tools), network-error envelope parsed live by the agent, refusal arrived as tool result with zero requests (user-confirmed verbatim round 3). Evidence ledger (14-06-SUMMARY.md): #1 real-client flow VERIFIED, #2 MCP-native refusal VERIFIED, #3 protocolVersion 2025-06-18 PASS on machine evidence (handshake capture + SDK oracle rerun) with manual log inspection WAIVED, #4 nvim composition PASS on committed headless e2e (14-05) with visual confirmation WAIVED. Round-0 CONNECTION_CLOSED root-caused to a STALE ~/.cargo/bin/ign (environmental, not a server defect). Phase 14 all 6 plans executed (6/6)
+**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04 ✅, 14-05 ✅, 14-06 ✅)
+**Status:** Phase complete — ready for /gsd-verify-work 14
 **Last Activity:** 2026-09-16
 
-**Progress:** [██████████] 99%
+**Progress:** [██████████] 100%
 
 ## Performance Metrics
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | 11 | 6/6 | 334 min (excl. 11-03) | 67 min avg |
 | 12 | 4/4 | 90 min | 22 min avg |
 | 13 | 7/8 | 892 min (incl. 13-04 live-rig windows) | ~127 min avg |
-| 14 | 5/6 | 228 min | ~46 min avg |
+| 14 | 6/6 | 398 min (incl. 14-06 live-smoke rounds) | ~66 min avg |
 
 *Updated after each plan completion*
 | Phase 08 P02 | 200 min | 2 tasks | 3 files |
@@ -81,6 +81,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 14 P03 | 46 min | 2 tasks | 7 files |
 | Phase 14 P04 | 55 min | 2 tasks | 4 files |
 | Phase 14 P05 | 21 min | 2 tasks | 1 file (sibling repo) |
+| Phase 14 P06 | 2h 50m (incl. 3 user live-smoke rounds + 2 fix loops) | 1 task | 5 code files (fix loops) + 3 planning docs |
 
 ## Accumulated Context
 
@@ -225,9 +226,15 @@ Recent decisions affecting current work:
 - [Phase 14]: 14-04: docs map keys on the URI string (clippy mutable_key_type on lsp_types::Uri's interior-mutable innards; lsp-types compares Uris by string anyway); crossbeam-channel promoted to a direct dep (the select! loop requires it; supersedes 14-03's transitive-only comment)
 - [Phase 14]: 14-05: ignition_live is a SEPARATE guarded FileType autocmd beside the statics one, and registers BEFORE M.setup's statics early-return — the existing callback early-returns when ignition_lsp is already attached (a co-located live start would be skipped in the normal case) and doesn't exist at all without the venv; sibling autocmd keeps the statics path byte-identical and serves both venv-present and venv-absent machines
 - [Phase 14]: 14-05: sibling patch committed on NEW branch claude/ign-lsp-live-client off the checkout's current HEAD (fix/preview-flex-spill) — the repo was mid-WIP with a dirty unrelated file; per-feature-branch + conventional commits is that repo's own convention, their WIP untouched; global ~/.cargo/config.toml redirects cargo output to ~/Library/Caches/cargo-target so the repo-local target/debug/ign is a stale leftover — PATH-scope the cache dir for fresh-binary runs
+- [Phase 14 / 14-06]: stale ~/.cargo/bin/ign caused the round-0 CONNECTION_CLOSED at live smoke (`unrecognized subcommand 'mcp'` → exit) — cargo install refresh is the REQUIRED step after any transport-affecting change; PATH resolution launches the INSTALLED binary, not the repo build — environmental, not a server defect; stray-stdout (Pitfall 3) ruled out by the fresh binary's clean handshake
+- [Phase 14 / 14-06]: MCP confirmation_required refusal prose is transport-aware (dated envelope-transport exception #2 in README beside 09-03's api-call note) — CLI envelope byte-frozen with --yes prose; MCP rides the SAME locked envelope struct with MCP-native message/hint in ONE self-sufficient text block (no trailing guidance prose after the JSON); transport-awareness pinned both ways in contract_mcp.rs (shape-twins modulo the two prose fields)
+- [Phase 14 / 14-06]: confirm is OPTIONAL in MCP tool schemas by design — schema-required would invite agents to auto-fill it, defeating the human-in-the-loop gate; omission routes to the envelope refusal (no -32602); sabotage discipline: re-adding required → red → revert
+- [Phase 14 / 14-06]: protocolVersion closed on MACHINE EVIDENCE (manual handshake capture vs installed binary echoed 2025-06-18 + Python mcp-SDK oracle initialize in 14-02 AND the round-2 loop + contract_mcp echo-if-equal pin) with manual log inspection WAIVED; nvim composition closed on committed headless e2e (14-05) with visual confirmation WAIVED — checkpoint ledger labels each item verified / machine-evidenced / waived, never silently merged
+- [Phase 14 / 14-06]: ignition-nvim patch lives on unmerged branch claude/ign-lsp-live-client (commit 0d6bd55) — merging to that repo's main is the user's sequencing; carry-forward item
 
 ### Pending Todos
 
+- [Carry-forward from 14-06 — user-owned sequencing]: merge ignition-nvim branch claude/ign-lsp-live-client (commit 0d6bd55, ignition_live client registration) to that repo's main — headless e2e evidence is committed on the branch; nvim visual check was waived at the 14-06 checkpoint ("assume pass on nvim")
 - [Phase 12 prerequisite — from 09 UAT test 10, minor — CODE HALF CLOSED by 12-03, 2026-09-14]: TUI tab indicator — `render_tab_bar` now uses `Tabs::select(active)` + `highlight_style` from the token palette (emphasis fg + inline BOLD, survives mono) and `run()` hides the terminal cursor after `ratatui::init()`; buffer tests pin active BOLD + emphasis slot at color tier and the mono tier. REMAINING: visual confirmation at phase verification/UAT (the original gap was a visual complaint). Details: 09-UAT.md Gap 2.
 - [Polish, v1.0 code — from 09 UAT re-verification round, minor]: `trial_reset`'s defensive tail (crates/ignition-core/src/actions/rig.rs:589) stuffs the rig URL into `CoreError::SecretUnavailable`'s `profile` slot, so the TUI modal renders `secret unavailable for profile "http://localhost:…"` — the profile NAME and the missing-credential path (IGNITION_USER/IGNITION_PASSWORD) should be named instead. Candidate to ride along with any later error-message/UX pass.
 
@@ -241,6 +248,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-16T11:43:36.915Z
-**Stopped At:** Completed 14-05-PLAN.md (ignition-nvim live-client wiring; sibling commit 0d6bd55) — next: 14-06
+**Last session:** 2026-09-16T14:35:00Z
+**Stopped At:** 14-06 COMPLETE — checkpoint evidence ledger recorded (2 VERIFIED, 1 machine-evidenced + waiver, 1 headless-e2e + waiver); Phase 14 fully executed 6/6; next: /gsd-verify-work 14
 **Resume file:** None

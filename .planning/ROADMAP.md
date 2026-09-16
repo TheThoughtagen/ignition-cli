@@ -40,7 +40,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 - [x] **Phase 11: 11-tag-bulk-transfer-xml-csv** — Server-byte-faithful XML/CSV bulk transfer with loss warnings *(complete 2026-09-14; SC-1/2/3 closed on live-gateway evidence — 11-LIVE-GATE.md both-rig PASS + 8 recorded live-truth deltas with code fixes)*
 - [x] **Phase 12: 12-tui-theming-degradation** — Named UX themes + graceful terminal-capability degradation *(complete 2026-09-14; verifier passed 3/3 — authored four-tier palettes + [ui].theme wiring + tokenization CI gate negative-proven; 12-04 UAT round-trip: hues hardened, dormant border/title/header/accent slots wired, then body-content text/muted tint across all screens — user APPROVED; dark = blue-chromed cockpit at WCAG-AAA body contrast, default/mono wire-proven byte-identical pre/post; 09-UAT Gap 2 tab-bar fix closed)*
 - [x] **Phase 13: 13-composite-engine-workspace-historian-edit** — Workspace checkout, historian binding closure (spike-first), `ign edit` round-trip *(complete 2026-09-15 — all 8 plans executed; all 5 SCs carry binary-level evidence; SC-5 closed by 13-05's pipeline + 13-08's CLI surface)*
-- [ ] **Phase 14: 14-transports-mcp-lsp** — MCP stdio shim (proves the protocol pattern), then LSP for ignition-nvim
+- [x] **Phase 14: 14-transports-mcp-lsp** — MCP stdio shim (proves the protocol pattern), then LSP for ignition-nvim *(complete 2026-09-16 — all 6 plans executed; all 5 SCs closed: real Claude Code client completed initialize → tools/list → tools/call live (SC-1), MCP-native confirm refusal as tool result after two user-driven fix loops b3b6208/096a068 (SC-2), nvim composition headless-e2e'd + waived visual (SC-3/4), byte-scan held in production (SC-5); protocolVersion 2025-06-18 live smoke closed on machine evidence; honest evidence ledger in 14-06-SUMMARY.md)*
 
 ## Phase Details
 
@@ -185,7 +185,7 @@ Plans:
 - [x] 14-03-PLAN.md — `ign lsp` core: lsp-server 0.10 sync loop scaffold + narrow capabilities + OutOfBand row (atomic) + GatewayCache TTL snapshot + background refresher thread (soft-degrade)
 - [x] 14-04-PLAN.md — LSP handlers (three-family completions, TTL-stamped hover, cached diagnostics) + contract_lsp.rs Content-Length byte-scan suite incl. dead-gateway cache-only proof
 - [x] 14-05-PLAN.md — ignition-nvim composition: second client registration (ignition_live) in the sibling repo + headless end-to-end verification + sibling-repo commit (0d6bd55, branch claude/ign-lsp-live-client)
-- [ ] 14-06-PLAN.md — Phase-final checkpoint: live MCP smoke against Claude Code/Claude Desktop + nvim composition verification (human)
+- [x] 14-06-PLAN.md — Phase-final checkpoint: live MCP smoke against Claude Code/Claude Desktop + nvim composition verification (human)
 
 ## Progress
 
@@ -208,7 +208,7 @@ Phases 9-12 are order-independent of each other (all depend only on Phase 8). Ph
 | 11. 11-tag-bulk-transfer-xml-csv | v1.1 | 6/6 | Complete | 2026-09-14 — 1.3.0 route bundle, loss scans/CLI contract, live gates green on both rigs (11-LIVE-GATE.md) |
 | 12. 12-tui-theming-degradation | v1.1 | 4/4 | Complete | 2026-09-14 — verifier passed 3/3 (12-VERIFICATION.md); themes live via [ui].theme, CI tokenization gate armed, 09-UAT Gap 2 closed |
 | 13. 13-composite-engine-workspace-historian-edit | v1.1 | 8/8 | Complete | 2026-09-15 — workspace family + edit loop live (SC-1..SC-5 binary-evidenced); `edit` OutOfBand reservation fulfilled atomically |
-| 14. 14-transports-mcp-lsp | v1.1 | 0/TBD | Not started | - |
+| 14. 14-transports-mcp-lsp | v1.1 | 6/6 | Complete | 2026-09-16 — `ign mcp serve` + `ign lsp` transports with binary-level contract walls; real-client live smoke closed all 5 SCs (evidence ledger in 14-06-SUMMARY.md); nvim patch on branch claude/ign-lsp-live-client pending user merge |
 
 ---
 *Roadmap created: 2026-09-04 — milestone v1.1 (25 v1.1 requirements mapped across 7 phases)*
