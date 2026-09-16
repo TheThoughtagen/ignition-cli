@@ -818,15 +818,22 @@ async fn tools_call_returns_the_frozen_envelope_verbatim() {
     );
 }
 
-/// SC-2, refusal half, ENV-PROOF: `tools/call project_delete` with
-/// confirm OMITTED returns the frozen `confirmation_required` failure
-/// envelope AS the tool result (isError:true, content = the envelope
-/// JSON) — and `IGNITION_YES=1` exported into the spawned server's
-/// environment changes NOTHING (the apply_env_defaults bypass is
-/// behavioral, pinned here over the real binary).
+/// SC-2, refusal half, ENV-PROOF + the 14-06 guidance block: `tools/
+/// call project_delete` with confirm OMITTED returns isError:true with
+/// exactly TWO text blocks — block 1 is the frozen
+/// `confirmation_required` envelope BYTE-FOR-BYTE (equal to the
+/// envelope the direct `ign project delete` prints to stderr), block 2
+/// is MCP-specific guidance naming the `confirm` argument and marking
+/// `--yes`/`IGNITION_YES` CLI-only — and `IGNITION_YES=1` exported
+/// into the spawned server's environment changes NOTHING (the
+/// apply_env_defaults bypass is behavioral, pinned here over the real
+/// binary).
 #[tokio::test]
 async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
-    let mut client = ScriptedClient::spawn(&[("IGNITION_YES", "1")]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "bogus_key = 1\n").expect("write noisy config");
+    let mut client = ScriptedClient::spawn_with_config(&config, dir, &[("IGNITION_YES", "1")]);
     client.handshake();
     client.request(
         json!(11),
@@ -840,12 +847,23 @@ async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
         Some(&json!(true)),
         "the refusal rides isError:true: {result}"
     );
-    let text = result
-        .pointer("/content/0/text")
+    let content = result
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("the refusal carries content blocks");
+    assert_eq!(
+        content.len(),
+        2,
+        "the confirm refusal carries the envelope + the MCP guidance block: {content:?}"
+    );
+
+    // Block 1: the frozen refusal envelope rides verbatim.
+    let envelope_text = content[0]
+        .get("text")
         .and_then(Value::as_str)
-        .expect("the refusal rides as text content");
-    let envelope: Value =
-        serde_json::from_str(text).expect("the refusal text parses as the frozen envelope");
+        .expect("block 1 is text content");
+    let envelope: Value = serde_json::from_str(envelope_text)
+        .expect("the refusal text parses as the frozen envelope");
     assert_eq!(envelope.get("ok").and_then(Value::as_bool), Some(false));
     assert_eq!(
         envelope.pointer("/error/code").and_then(Value::as_str),
@@ -855,6 +873,48 @@ async fn confirm_omitted_refuses_the_frozen_envelope_even_with_ignition_yes() {
     assert!(
         envelope.pointer("/error/message").is_some(),
         "the refusal carries the LOCKED error envelope shape"
+    );
+
+    // Block 2: MCP-specific guidance — names the argument that CAN
+    // confirm over MCP and marks the env/flag confirmations CLI-only.
+    let guidance = content[1]
+        .get("text")
+        .and_then(Value::as_str)
+        .expect("block 2 is text content");
+    assert!(
+        guidance.contains("confirm"),
+        "guidance names the confirm argument: {guidance}"
+    );
+    assert!(
+        guidance.contains("CLI-only"),
+        "guidance marks --yes/IGNITION_YES as CLI-only: {guidance}"
+    );
+
+    // Block 1 == the envelope the direct CLI prints for the same
+    // invocation, byte-for-byte. The refusal is pre-network (zero
+    // requests), so no auth/profile is needed and the profile echoes
+    // null in both shapes. The direct stderr may carry tracing
+    // diagnostics ahead of it (the unknown-config-key WARN fires even
+    // at the default level) — the envelope is the FINAL line the
+    // chassis prints.
+    let direct = AssertCommand::cargo_bin("ign")
+        .expect("binary 'ign' not found")
+        .args(["--json", "--compact", "project", "delete", "x"])
+        .env("IGNITION_CLI_CONFIG", &config)
+        .env_remove("IGNITION_PROFILE")
+        .env_remove("IGNITION_JSON")
+        .env_remove("IGNITION_YES")
+        .output()
+        .expect("spawn ign project delete directly");
+    assert!(
+        !direct.status.success(),
+        "the direct refusal must fail (usage-class exit)"
+    );
+    let direct_stderr = String::from_utf8(direct.stderr).expect("utf-8 stderr");
+    let direct_envelope = direct_stderr.lines().last().unwrap_or_default();
+    assert_eq!(
+        envelope_text, direct_envelope,
+        "MCP block 1 must equal the direct CLI refusal envelope byte-for-byte"
     );
 }
 

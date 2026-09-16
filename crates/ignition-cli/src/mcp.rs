@@ -19,7 +19,11 @@
 //!   `--yes` ONLY from that field. `IGNITION_YES` (merged by
 //!   `apply_env_defaults` for the human CLI) can never reach the
 //!   protocol path — the bridge bypasses `apply_env_defaults` for the
-//!   inner parse by construction.
+//!   inner parse by construction. A confirmation_required refusal on
+//!   a guarded verb rides as TWO text blocks: the frozen envelope
+//!   byte-verbatim FIRST, then MCP-specific guidance (the envelope's
+//!   own hint names CLI-only confirmations — 14-06 checkpoint
+//!   feedback); every other envelope stays single-block verbatim.
 //! - **Purity**: compact serialization only (`serde_json::to_string`)
 //!   — one message per line, never pretty-printed (embedded newlines
 //!   are a spec violation and a protocol death). Diagnostics ride the
@@ -476,8 +480,9 @@ async fn execute(
     // NEVER ride through (SC-2 defense-in-depth — it is not a leaf
     // arg here because globals are excluded from every schema).
     let arguments = arguments.cloned().unwrap_or_default();
+    let is_guarded = GUARDED_OPS.iter().any(|(path, _)| *path == entry.path);
     let mut known: HashSet<&str> = entry.args.iter().map(|spec| spec.key.as_str()).collect();
-    if GUARDED_OPS.iter().any(|(path, _)| *path == entry.path) {
+    if is_guarded {
         known.insert("confirm");
     }
     let unknown: Vec<&str> = arguments
@@ -577,8 +582,27 @@ async fn execute(
         Err(err) => failure_envelope(&err, profile.as_deref()),
     };
     let is_error = envelope_reports_failure(&envelope);
+
+    // 14-06 (live-smoke checkpoint feedback): when a GUARDED verb is
+    // refused on the confirmation_required path with confirm
+    // missing/false, append a SECOND text block pointing MCP callers
+    // at the argument that CAN confirm — the envelope's own hint names
+    // `--yes`/IGNITION_YES, which 14-01 live-proved can never reach
+    // this protocol path. Block 1 stays the frozen envelope
+    // byte-verbatim (SC-2's verbatim pin is scoped to the first
+    // block); every other ok:false envelope — and any refusal on a
+    // non-guarded verb (whose schema has no confirm argument to pass)
+    // — stays single-block verbatim.
+    let confirm_refusal = is_error
+        && confirm != Some(true)
+        && is_guarded
+        && envelope_error_code(&envelope).as_deref() == Some("confirmation_required");
+    let mut content = vec![json!({ "type": "text", "text": envelope })];
+    if confirm_refusal {
+        content.push(json!({ "type": "text", "text": MCP_CONFIRM_GUIDANCE }));
+    }
     Ok(json!({
-        "content": [{ "type": "text", "text": envelope }],
+        "content": content,
         "isError": is_error,
     }))
 }
@@ -595,9 +619,27 @@ fn success_envelope(out: &crate::ActionOutput, profile: Option<&str>) -> String 
 /// writes to stderr in CompactJson mode (the compact serialization of
 /// the LOCKED error envelope). Refusals — including the
 /// confirmation_required one when `confirm` is omitted on a guarded
-/// verb — ride this shape verbatim as error tool results (SC-2).
+/// verb — ride this shape verbatim as error tool results (SC-2); the
+/// confirm refusal additionally carries a SECOND, non-envelope
+/// guidance block (see [`MCP_CONFIRM_GUIDANCE`]).
 fn failure_envelope(err: &CoreError, profile: Option<&str>) -> String {
     serde_json::to_string(&err.envelope(profile)).expect("envelope serialization cannot fail")
+}
+
+/// The MCP-specific guidance appended as a SECOND text block to the
+/// confirmation_required refusal of a GUARDED verb (14-06, live-smoke
+/// checkpoint feedback): the envelope's own hint names the CLI-only
+/// confirmations, so this block names the argument that works over
+/// MCP. Never part of the envelope itself — the envelope stays
+/// byte-verbatim in block 1.
+const MCP_CONFIRM_GUIDANCE: &str = "MCP callers: re-run this tool with {\"confirm\": true} in the arguments. (--yes and IGNITION_YES=1 are CLI-only — they cannot confirm a call made over MCP.)";
+
+/// The frozen failure envelope's `/error/code` — the identifier the
+/// confirm-guidance path keys on (defensive: a payload that does not
+/// parse as the envelope carries no code, so no guidance).
+fn envelope_error_code(envelope: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(envelope).ok()?;
+    parsed.pointer("/error/code")?.as_str().map(str::to_string)
 }
 
 /// isError = the envelope says `ok:false`. A payload that is not a
