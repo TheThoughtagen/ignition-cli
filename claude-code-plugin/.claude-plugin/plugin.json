@@ -1,0 +1,14 @@
+{
+  "name": "ignition-ops",
+  "description": "Operate Ignition 8.3+ gateways with ign — agent contract (JSON envelope, exit codes, guarded writes), gateway health checks, tag lifecycle with byte-faithful bulk transfer, workspace/edit workflows, and Docker test-rig lifecycle",
+  "version": "0.1.0",
+  "author": {
+    "name": "Whiskey House",
+    "url": "https://github.com/TheThoughtagen"
+  },
+  "homepage": "https://github.com/TheThoughtagen/ignition-cli",
+  "repository": "https://github.com/TheThoughtagen/ignition-cli",
+  "license": "MIT",
+  "keywords": ["ignition", "gateway", "scada", "ics", "inductive-automation", "cli", "agents", "mcp"],
+  "skills": "./skills/"
+}
