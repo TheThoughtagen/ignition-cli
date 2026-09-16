@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "ignition-cli"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "ignition-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "ignition-tui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "crossterm",
