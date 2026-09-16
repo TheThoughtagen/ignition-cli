@@ -10,12 +10,12 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 ## Current Position
 
 **Phase:** 14 of 14 (transports-mcp-lsp) — IN PROGRESS
-**Current Plan:** 14-02 COMPLETE (MCP contract test suite) — next: 14-03 (LSP transport, running in parallel)
-**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 in flight, 14-04–14-06 pending)
+**Current Plan:** 14-03 COMPLETE (LSP transport: ign lsp + GatewayCache + OutOfBand pin closed at 5 members) — next: 14-04 (LSP handlers + contract suite)
+**Total Plans in Phase:** 6 (14-01 ✅, 14-02 ✅, 14-03 ✅, 14-04–14-06 pending)
 **Status:** Executing
 **Last Activity:** 2026-09-16
 
-**Progress:** [██████████] 95%
+**Progress:** [██████████] 97%
 
 ## Performance Metrics
 
@@ -78,6 +78,7 @@ See: .planning/PROJECT.md (updated 2026-09-04)
 | Phase 13 P08 | 57 min | 3 tasks | 6 files |
 | Phase 14 P01 | 61 min | 2 tasks | 5 files |
 | Phase 14 P02 | 45 min | 2 tasks | 2 files |
+| Phase 14 P03 | 46 min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -213,6 +214,9 @@ Recent decisions affecting current work:
 - [Phase 14]: 14-01: GUARDED_OPS = the 24 verbs guarded in main.rs dispatch arms (planner-locked site list); workspace push's core-side guard (13-06) is out of registry scope — it still refuses safely via core as an isError result but the catalog does not advertise confirm for it (14-02 follow-up candidate)
 - [Phase 14]: 14-02: the starvation pin hangs on a bound-but-never-accepting TcpListener (backlog-accepted connect, client's own 30s timeout as the only escape) and asserts ordering with an unfiltered recv_next (FIRST arrival must be the ping) — a refused dead-port would error instantly (nothing to order) and id-filtered waiting would silently swallow a wrongly-early tool result
 - [Phase 14]: 14-02: the Python mcp-SDK oracle is an #[ignore] gate test reusing the wiremock fixtures + CARGO_BIN_EXE_ign (uv test-time only, green-skips without uv, defensive input_schema/is_error spellings) — the SDK oracle must survive mcp-SDK version drift since uv pulls latest at run time; never a Cargo dependency on Python
+- [Phase 14]: GatewaySource owns its current-thread Runtime and uses Runtime::block_on — a cloned Handle::block_on into an idle current-thread runtime does not drive its reactor (connect future hung forever; caught by the unreachable-gateway live smoke)
+- [Phase 14]: LSP refresher re-attempts Session::resolve per cycle only while unresolved — one construction site on the happy path, gateway recovery seen next cycle when degraded
+- [Phase 14]: Tag populate: one webdev precondition per cycle then direct browse-action calls (same route as ign tags browse), node-capped at 5000/provider; refresher spawn failure degrades (unhealthy cache) rather than killing the server
 
 ### Pending Todos
 
@@ -229,6 +233,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-**Last session:** 2026-09-16T03:16:37.620Z
-**Stopped At:** Completed 14-02-PLAN.md — MCP contract test suite; 14-03 (LSP) continues in parallel
+**Last session:** 2026-09-16T03:29:00.684Z
+**Stopped At:** Completed 14-03-PLAN.md (LSP transport — ign lsp + GatewayCache; next: 14-04 handlers + contract suite)
 **Resume file:** None
