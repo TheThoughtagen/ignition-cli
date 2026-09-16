@@ -26,20 +26,19 @@
 //!   stderr-only tracing init in `main` — stdout carries protocol
 //!   messages and nothing else.
 
-// TEMP (14-01): the serve loop + dispatch bridge arrive in this
-// plan's next task — until they consume the catalog, tolerate
-// dead code so the Task-1 commit stays clippy-clean. REMOVED by
-// Task 2.
-#![allow(dead_code)]
-
+use std::collections::HashSet;
+use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 use serde_json::{Value, json};
+use tokio::io::AsyncBufReadExt;
 
-use ignition_cli::cli::Cli;
+use ignition_cli::cli::{Cli, McpArgs};
+use ignition_core::error::CoreError;
 
 use crate::GUARDED_OPS;
+use crate::render::RenderMode;
 
 /// The single served MCP protocol revision (2025-06-18 spec,
 /// planner-locked pin; OQ5). Negotiation per spec: a requested version
@@ -67,9 +66,6 @@ pub(crate) struct ArgSpec {
     pub positional: bool,
     /// `ArgAction::SetTrue` → boolean property, emitted as `--long`.
     pub boolean: bool,
-    /// `ArgAction::Append` (repeatable) → the argument's array is
-    /// spread into repeated `--long=…` tokens.
-    pub repeatable: bool,
 }
 
 /// One derived tool: the wire entry (name/description/schema) plus the
@@ -181,7 +177,6 @@ fn leaf_entry(path: &str, cmd: &clap::Command) -> CatalogEntry {
             key: key.clone(),
             positional,
             boolean,
-            repeatable,
         });
 
         let mut prop = serde_json::Map::new();
@@ -250,6 +245,383 @@ fn leaf_entry(path: &str, cmd: &clap::Command) -> CatalogEntry {
             .unwrap_or_default(),
         schema: Value::Object(schema),
         args,
+    }
+}
+
+/// THE serve loop (`ign mcp serve`): newline-delimited JSON-RPC 2.0 on
+/// stdio (research Pattern 2). Concurrency shape — ONE reader (this
+/// task), ONE writer (the spawned task below is the sole stdout
+/// owner), and every `tools/call` spawned OFF the reader path with its
+/// response routed through an unbounded channel. Out-of-order
+/// responses are legal (JSON-RPC id matching) and are what make ping
+/// non-starving true by construction.
+pub(crate) async fn serve(args: McpArgs, profile_flag: Option<&str>) -> ExitCode {
+    // clap's value_parser=["serve"] means reaching this seam proves
+    // the positional was exactly "serve" — nothing else parses.
+    let McpArgs { serve } = args;
+    debug_assert_eq!(serve, "serve");
+
+    let catalog = build_catalog();
+    let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(writer_task(resp_rx));
+
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line).await {
+            Ok(0) | Err(_) => break, // stdin closed — the client is gone
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let message: Value = match serde_json::from_str(trimmed) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                // Unparseable line WITHOUT a recoverable id: log to
+                // stderr and keep serving — never std::process::exit,
+                // never a non-message byte on stdout.
+                tracing::warn!("mcp: dropped an unparseable stdin line");
+                continue;
+            }
+        };
+        let id = message.get("id").cloned();
+        let Some(method) = message
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            // A Response (no method) has nothing to answer; ignore.
+            tracing::warn!("mcp: ignored a message without a method");
+            continue;
+        };
+        // Notifications (including lifecycle `notifications/initialized`)
+        // never get a response — MCP/JSON-RPC rule.
+        if method.starts_with("notifications/") {
+            continue;
+        }
+        // A request-shaped message without an id IS a notification;
+        // nothing to answer.
+        let Some(id) = id else {
+            continue;
+        };
+        match method.as_str() {
+            "initialize" => {
+                let requested = message
+                    .pointer("/params/protocolVersion")
+                    .and_then(Value::as_str);
+                let result = json!({
+                    "protocolVersion": negotiate(requested),
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "ign", "version": env!("CARGO_PKG_VERSION") },
+                });
+                let _ = resp_tx.send(response_message(Some(id), Ok(result)));
+            }
+            "ping" => {
+                // INLINE on the reader path — never queued behind a
+                // dispatch (SC-5): the empty response needs no gateway
+                // work, so it is enqueued immediately, ahead of any
+                // still-executing tools/call.
+                let _ = resp_tx.send(response_message(Some(id), Ok(json!({}))));
+            }
+            "tools/list" => {
+                // Full static catalog, no pagination — the cursor
+                // param, if sent, is ignored gracefully (OQ2 pin).
+                let tools: Vec<Value> = catalog.iter().map(tool_to_wire).collect();
+                let _ = resp_tx.send(response_message(Some(id), Ok(json!({ "tools": tools }))));
+            }
+            "tools/call" => {
+                let tx = resp_tx.clone();
+                let catalog = Arc::clone(&catalog);
+                let profile = profile_flag.map(str::to_string);
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                // OFF the reader loop: a slow/dead gateway call must
+                // never block ping (Pitfall 2).
+                tokio::spawn(async move {
+                    let answer = execute(&params, profile.as_deref(), &catalog).await;
+                    let _ = tx.send(response_message(Some(id), answer));
+                });
+            }
+            unknown => {
+                // Unknown method WITH id → JSON-RPC protocol error.
+                let _ = resp_tx.send(response_message(
+                    Some(id),
+                    Err((-32601, format!("Method not found: {unknown}"))),
+                ));
+            }
+        }
+    }
+    // stdin closed: drop the sender so the writer drains and exits.
+    drop(resp_tx);
+    let _ = writer.await;
+    ExitCode::SUCCESS
+}
+
+/// The ONE stdout owner: writes each pre-serialized response as
+/// exactly one newline-terminated line. COMPACT ONLY — the lines
+/// arrive from `serde_json::to_string`; embedded newlines inside JSON
+/// strings are escaped by the serializer, so write+newline is exactly
+/// one protocol frame (pretty-printing would be a protocol death).
+async fn writer_task(mut resp_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use tokio::io::AsyncWriteExt;
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = resp_rx.recv().await {
+        if stdout.write_all(line.as_bytes()).await.is_err()
+            || stdout.write_all(b"\n").await.is_err()
+        {
+            break; // stdout closed — the client is gone
+        }
+        let _ = stdout.flush().await;
+    }
+}
+
+/// Spec negotiation rule (2025-06-18 pin): echo the requested revision
+/// when the server supports it; otherwise answer with the server's
+/// latest — here the single supported revision either way.
+fn negotiate(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some(version) if version == PROTOCOL_VERSION => PROTOCOL_VERSION,
+        _ => PROTOCOL_VERSION,
+    }
+}
+
+/// One wire tool entry (name/title-less/description/inputSchema).
+fn tool_to_wire(entry: &CatalogEntry) -> Value {
+    json!({
+        "name": entry.name,
+        "description": entry.description,
+        "inputSchema": entry.schema,
+    })
+}
+
+/// Serialize one JSON-RPC response — compact, single line, id-matched.
+fn response_message(id: Option<Value>, answer: Result<Value, (i64, String)>) -> String {
+    let mut message = serde_json::Map::new();
+    message.insert("jsonrpc".into(), Value::String("2.0".into()));
+    if let Some(id) = id {
+        message.insert("id".into(), id);
+    }
+    match answer {
+        Ok(result) => {
+            message.insert("result".into(), result);
+        }
+        Err((code, text)) => {
+            message.insert("error".into(), json!({ "code": code, "message": text }));
+        }
+    }
+    serde_json::to_string(&Value::Object(message)).expect("a JSON-RPC response serializes")
+}
+
+/// THE dispatch bridge (research Pattern 3, SC-1 + SC-2's execution
+/// half): a tools/call becomes CLI tokens, parsed by the SAME clap
+/// tree the catalog derives from, and dispatched IN-PROCESS through
+/// the one `dispatch` seam (Session is the only auth path — CORE-09).
+/// Returns the tool-result value: the frozen CLI envelope verbatim as
+/// text content, `isError` true exactly when the envelope says
+/// `ok:false` (business-logic errors ride isError, NOT protocol
+/// errors).
+async fn execute(
+    params: &Value,
+    profile_flag: Option<&str>,
+    catalog: &Catalog,
+) -> Result<Value, (i64, String)> {
+    let tool_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| (-32602, "tools/call requires a string tool name".to_string()))?;
+    let entry = catalog
+        .iter()
+        .find(|entry| entry.name == tool_name)
+        .ok_or_else(|| (-32601, format!("Unknown tool: {tool_name}")))?;
+    let arguments = params.get("arguments").and_then(Value::as_object);
+
+    // Purity guards (Pitfall 3): two dispatch arms print RAW lines to
+    // stdout through in-dispatch sinks — `rig logs` (compose
+    // passthrough in every mode) and `logs -f` (NDJSON). A stray
+    // stdout byte is a protocol death for the MCP client, so the
+    // bridge refuses these before any dispatch work. (The other
+    // stdout exceptions never reach this path: completions is
+    // catalog-excluded; `tags export -o -` carries its payload in the
+    // result and prints only via render_ok, which the protocol path
+    // never calls.)
+    const SINK_STREAMING_TOOLS: &[&str] = &["rig_logs"];
+    if SINK_STREAMING_TOOLS.contains(&tool_name) {
+        return Err((
+            -32602,
+            format!(
+                "tool {tool_name} streams raw lines to stdout and cannot ride the MCP \
+                 protocol stream — run `ign {}` in a terminal instead",
+                entry.path
+            ),
+        ));
+    }
+    let follow = arguments
+        .and_then(|args| args.get("follow"))
+        .and_then(Value::as_bool);
+    if entry.path == "logs" && follow == Some(true) {
+        return Err((
+            -32602,
+            "tool logs --follow streams raw lines to stdout and cannot ride the MCP \
+             protocol stream — run `ign logs -f` in a terminal instead"
+                .to_string(),
+        ));
+    }
+
+    // Fail-closed argument validation: every key must be a known leaf
+    // arg — or the synthetic `confirm` on guarded leaves. The schema
+    // advertises exactly these, so a client that sends more is either
+    // buggy or probing; in particular a hostile `yes` property can
+    // NEVER ride through (SC-2 defense-in-depth — it is not a leaf
+    // arg here because globals are excluded from every schema).
+    let arguments = arguments.cloned().unwrap_or_default();
+    let mut known: HashSet<&str> = entry.args.iter().map(|spec| spec.key.as_str()).collect();
+    if GUARDED_OPS.iter().any(|(path, _)| *path == entry.path) {
+        known.insert("confirm");
+    }
+    let unknown: Vec<&str> = arguments
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !known.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        return Err((
+            -32602,
+            format!(
+                "Unknown argument(s) for {tool_name}: {}",
+                unknown.join(", ")
+            ),
+        ));
+    }
+    let confirm = arguments.get("confirm").and_then(Value::as_bool);
+
+    // argv = ["ign"] + leaf-path segments + flag tokens — property
+    // name IS the clap long name / positional id (1:1, no renaming).
+    let mut argv: Vec<String> = vec!["ign".to_string()];
+    argv.extend(entry.path.split(' ').map(str::to_string));
+    for spec in &entry.args {
+        let Some(value) = arguments.get(&spec.key) else {
+            continue;
+        };
+        if spec.positional {
+            // Positionals ride as raw tokens, in clap definition
+            // order (arrays spread for repeatable positionals).
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(token) = scalar_token(item) {
+                            argv.push(token);
+                        }
+                    }
+                }
+                other => {
+                    if let Some(token) = scalar_token(other) {
+                        argv.push(token);
+                    }
+                }
+            }
+        } else if spec.boolean {
+            // SetTrue flags: only an explicit true emits the flag.
+            if value.as_bool() == Some(true) {
+                argv.push(format!("--{}", spec.key));
+            }
+        } else {
+            // Value flags ride `--long=value` (the = form cannot be
+            // mistaken for a flag even for dash-leading values);
+            // arrays spread into repeated flags (Append args).
+            match value {
+                Value::Null => {}
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(token) = scalar_token(item) {
+                            argv.push(format!("--{}={}", spec.key, token));
+                        }
+                    }
+                }
+                other => {
+                    if let Some(token) = scalar_token(other) {
+                        argv.push(format!("--{}={}", spec.key, token));
+                    }
+                }
+            }
+        }
+    }
+    // THE confirm gate (SC-2): `--yes` is reachable ONLY from the
+    // confirm field. No env merge exists on this path.
+    if confirm == Some(true) {
+        argv.push("--yes".to_string());
+    }
+
+    // NEVER `e.exit()` — clap would print usage to stdout and kill
+    // the process mid-protocol. Parse failures are -32602 invalid
+    // params carrying the message.
+    let mut inner = Cli::try_parse_from(argv)
+        .map_err(|err| (-32602, format!("Invalid arguments for {tool_name}: {err}")))?;
+    // The bridge's fixed mutations (SC-2 + CORE-09): the ambient
+    // profile (IGNITION_PROFILE was folded ONCE in main's
+    // apply_env_defaults) rides in; json/compact are FORCED off (the
+    // protocol path renders its own compact envelope below);
+    // inner.yes stays EXACTLY as parsed — only confirm:true produced
+    // --yes, so IGNITION_YES exported in an agent's shell can never
+    // confirm a write.
+    inner.profile = profile_flag.map(str::to_string);
+    inner.json = false;
+    inner.compact = false;
+
+    // In-process dispatch in compact-json mode.
+    let mode = RenderMode::resolve(true, true);
+    let (profile, result) = crate::dispatch(inner, mode).await;
+    let envelope = match result {
+        Ok(out) => success_envelope(&out, profile.as_deref()),
+        Err(err) => failure_envelope(&err, profile.as_deref()),
+    };
+    let is_error = envelope_reports_failure(&envelope);
+    Ok(json!({
+        "content": [{ "type": "text", "text": envelope }],
+        "isError": is_error,
+    }))
+}
+
+/// The FROZEN success passthrough: EXACTLY the string `render_ok`
+/// writes to stdout in CompactJson mode for the same inputs. The
+/// tool result must never reshape the envelope (byte-equality pinned
+/// by unit test).
+fn success_envelope(out: &crate::ActionOutput, profile: Option<&str>) -> String {
+    out.render_json(profile, true)
+}
+
+/// The FROZEN failure passthrough: EXACTLY the string `render_error`
+/// writes to stderr in CompactJson mode (the compact serialization of
+/// the LOCKED error envelope). Refusals — including the
+/// confirmation_required one when `confirm` is omitted on a guarded
+/// verb — ride this shape verbatim as error tool results (SC-2).
+fn failure_envelope(err: &CoreError, profile: Option<&str>) -> String {
+    serde_json::to_string(&err.envelope(profile)).expect("envelope serialization cannot fail")
+}
+
+/// isError = the envelope says `ok:false`. A payload that is not a
+/// parseable envelope (not produced by the paths above, but defensive)
+/// counts as failure — fail-closed.
+fn envelope_reports_failure(envelope: &str) -> bool {
+    serde_json::from_str::<Value>(envelope)
+        .ok()
+        .and_then(|parsed| parsed.get("ok").and_then(Value::as_bool).map(|ok| !ok))
+        .unwrap_or(true)
+}
+
+/// JSON scalar → CLI token text. Strings pass through; numbers/bools
+/// stringify; null vanishes (the caller skips it); objects serialize
+/// compact (the CLI's own validation refuses nonsense downstream);
+/// arrays never reach here (the caller spreads them).
+fn scalar_token(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Bool(boolean) => Some(boolean.to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) => Some(text.clone()),
+        Value::Array(_) => None,
+        Value::Object(_) => Some(value.to_string()),
     }
 }
 
@@ -401,5 +773,184 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), count, "tool names must be unique");
+    }
+
+    /// The negotiation rule (OQ5 pin): the requested 2025-06-18 is
+    /// echoed EXACTLY; anything else (older, newer, absent, wrong
+    /// type) answers with the server's single supported revision.
+    #[test]
+    fn initialize_negotiation_echoes_the_pinned_revision() {
+        assert_eq!(negotiate(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate(Some("2024-11-05")), "2025-06-18");
+        assert_eq!(negotiate(Some("2030-01-01")), "2025-06-18");
+        assert_eq!(negotiate(None), "2025-06-18");
+    }
+
+    /// Framing: a response is ONE compact line — jsonrpc, id, and
+    /// result/error — never pretty-printed (embedded newlines are a
+    /// spec violation and a protocol death).
+    #[test]
+    fn response_message_is_single_line_json_rpc() {
+        let ok = response_message(Some(json!(1)), Ok(json!({})));
+        assert!(!ok.contains('\n'), "compact only: {ok}");
+        let parsed: Value = serde_json::from_str(&ok).expect("valid JSON");
+        assert_eq!(parsed.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert_eq!(parsed.get("id").and_then(Value::as_i64), Some(1));
+        assert!(parsed.get("result").is_some());
+
+        // String ids ride verbatim (the ping spec example uses "123").
+        let string_id = response_message(Some(json!("123")), Ok(json!({})));
+        let parsed: Value = serde_json::from_str(&string_id).expect("valid JSON");
+        assert_eq!(parsed.get("id").and_then(Value::as_str), Some("123"));
+
+        let err = response_message(Some(json!(7)), Err((-32601, "Method not found".into())));
+        assert!(!err.contains('\n'), "compact only: {err}");
+        let parsed: Value = serde_json::from_str(&err).expect("valid JSON");
+        assert_eq!(
+            parsed.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32601)
+        );
+        assert!(parsed.get("result").is_none());
+    }
+
+    /// THE envelope passthrough pin (SC-2's frozen-shape contract):
+    /// the tool-result envelope strings are BYTE-EQUAL to what the
+    /// chassis renders for the same inputs in CompactJson mode —
+    /// success == render_ok's stdout line; failure == render_error's
+    /// stderr line (the compact serialization of the LOCKED envelope).
+    /// The MCP layer must never reshape an envelope.
+    #[test]
+    fn envelope_serializations_are_chassis_byte_identical() {
+        use ignition_core::actions;
+        use ignition_core::output::render_failure;
+
+        let out = crate::ActionOutput::Version(actions::version::VersionResult {
+            cli_version: env!("CARGO_PKG_VERSION"),
+            gateway: None,
+            warnings: vec![],
+        });
+        let success = success_envelope(&out, Some("dev"));
+        assert_eq!(
+            success,
+            out.render_json(Some("dev"), true),
+            "success envelope == render_ok's CompactJson stdout line"
+        );
+        assert!(!success.contains('\n'), "compact only: {success}");
+        let parsed: Value = serde_json::from_str(&success).expect("valid envelope JSON");
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(parsed.get("profile").and_then(Value::as_str), Some("dev"));
+
+        let err = CoreError::ConfirmationRequired {
+            operation: "project delete".to_string(),
+        };
+        let failure = failure_envelope(&err, Some("dev"));
+        assert_eq!(
+            failure,
+            render_failure(&err.envelope(Some("dev")), true),
+            "failure envelope == render_error's CompactJson stderr line"
+        );
+        assert!(!failure.contains('\n'), "compact only: {failure}");
+        let parsed: Value = serde_json::from_str(&failure).expect("valid envelope JSON");
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            parsed.pointer("/error/code").and_then(Value::as_str),
+            Some("confirmation_required"),
+            "the refusal rides the frozen envelope verbatim"
+        );
+    }
+
+    /// isError semantics: true exactly when the envelope says ok:false;
+    /// a non-envelope payload counts as failure (fail-closed).
+    #[test]
+    fn is_error_follows_the_envelope_ok_field() {
+        assert!(!envelope_reports_failure(
+            r#"{"ok":true,"profile":null,"data":{}}"#
+        ));
+        assert!(envelope_reports_failure(
+            r#"{"ok":false,"profile":null,"error":{"code":"x","message":"m","endpoint":null,"hint":null}}"#
+        ));
+        assert!(envelope_reports_failure("not json at all"));
+        assert!(envelope_reports_failure(r#"{"no_ok_field":1}"#));
+    }
+
+    /// JSON scalar → token rules: strings pass through, numbers/bools
+    /// stringify, null vanishes, objects serialize compact.
+    #[test]
+    fn scalar_tokens_map_1_to_1_to_cli_tokens() {
+        assert_eq!(scalar_token(&json!("hello")), Some("hello".to_string()));
+        assert_eq!(scalar_token(&json!(42)), Some("42".to_string()));
+        assert_eq!(scalar_token(&json!(1.5)), Some("1.5".to_string()));
+        assert_eq!(scalar_token(&json!(true)), Some("true".to_string()));
+        assert_eq!(scalar_token(&Value::Null), None);
+        assert_eq!(
+            scalar_token(&json!({"a":1})),
+            Some(r#"{"a":1}"#.to_string())
+        );
+    }
+
+    /// The bridge's refusals — all BEFORE any dispatch work (zero
+    /// network): unknown tool → -32601; hostile/unknown argument keys
+    /// → -32602 (the SC-2 defense-in-depth probe: a hostile `yes`
+    /// property can never ride through); raw-stdout streaming verbs →
+    /// -32602; missing required arguments → -32602 via clap WITHOUT
+    /// e.exit().
+    #[tokio::test]
+    async fn execute_refuses_before_dispatch() {
+        let catalog = build_catalog();
+
+        // Unknown tool → -32601.
+        let err = execute(&json!({ "name": "nonexistent_verb" }), None, &catalog)
+            .await
+            .expect_err("unknown tool");
+        assert_eq!(err.0, -32601);
+
+        // THE SC-2 probe: `yes` is not a leaf arg on ANY tool — a
+        // hostile client cannot smuggle --yes through the arguments
+        // object (it would bypass the confirm gate).
+        let err = execute(
+            &json!({ "name": "status", "arguments": { "yes": true } }),
+            None,
+            &catalog,
+        )
+        .await
+        .expect_err("hostile yes must refuse");
+        assert_eq!(err.0, -32602, "{err:?}");
+        assert!(err.1.contains("yes"), "names the offending key: {err:?}");
+
+        // Unknown argument (not in the leaf's schema) → -32602.
+        let err = execute(
+            &json!({ "name": "version", "arguments": { "bogus": 1 } }),
+            None,
+            &catalog,
+        )
+        .await
+        .expect_err("unknown argument");
+        assert_eq!(err.0, -32602);
+
+        // Raw-stdout streaming verbs refuse (Pitfall 3): rig_logs in
+        // every mode, logs with follow=true.
+        let err = execute(&json!({ "name": "rig_logs" }), None, &catalog)
+            .await
+            .expect_err("raw-streaming verb");
+        assert_eq!(err.0, -32602);
+        let err = execute(
+            &json!({ "name": "logs", "arguments": { "follow": true } }),
+            None,
+            &catalog,
+        )
+        .await
+        .expect_err("follow streams raw lines");
+        assert_eq!(err.0, -32602);
+
+        // Missing required arguments → clap parse error → -32602
+        // (NEVER e.exit(): the process must survive the protocol).
+        let err = execute(
+            &json!({ "name": "tags_read", "arguments": {} }),
+            None,
+            &catalog,
+        )
+        .await
+        .expect_err("missing required positional");
+        assert_eq!(err.0, -32602);
     }
 }

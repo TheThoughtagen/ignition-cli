@@ -437,6 +437,23 @@ fn main() -> ExitCode {
         let yes = cli.yes;
         return runtime.block_on(dispatch_edit(args, profile_flag.as_deref(), yes, mode));
     }
+    // 14-01: `ign mcp` is the OutOfBand protocol verb — the MCP client
+    // owns stdout with newline-delimited JSON-RPC 2.0 (the protocol
+    // stream IS the product; the routes.rs OutOfBand row landed
+    // atomically with this command, 08-06 contract). No ActionOutput
+    // variant exists BY DESIGN (a success variant would route through
+    // render_ok's stdout — exactly what the OutOfBand declaration
+    // forbids), so mcp dispatches on its own seam HERE, beside edit's:
+    // after the ONE mode decision, still one ExitCode decision point
+    // in main. The ambient profile flag rides in resolved ONCE by
+    // apply_env_defaults (CORE-09); the inner dispatch bridge NEVER
+    // inherits the outer cli.yes — `--yes` is reachable only via the
+    // tools/call confirm field (SC-2: IGNITION_YES cannot reach the
+    // protocol path).
+    if let Commands::Mcp(args) = cli.command {
+        let profile_flag = cli.profile.clone();
+        return runtime.block_on(mcp::serve(args, profile_flag.as_deref()));
+    }
     // dispatch resolves the profile context and returns it alongside the
     // result so BOTH the success and the error envelope echo it (CORE-01).
     let (profile, result) = runtime.block_on(dispatch(cli, mode));
