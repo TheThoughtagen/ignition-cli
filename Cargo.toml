@@ -61,9 +61,13 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 # (rust-lang) owns Content-Length framing + handshake + io threads; lsp-types
 # carries the spec's type surface. Capabilities stay NARROW (completion/hover/
 # full-sync) by design — Python ignition-lsp owns the statics (composition).
-# crossbeam-channel arrives transitively with lsp-server — never a direct dep.
+# 14-04 supersedes the "never a direct dep" rule: the diagnostics loop
+# crossbeam_channel::select!s over connection.receiver + the refresher's
+# version channel, which requires the crate directly (same 0.5 line
+# lsp-server uses, so the Receiver types unify).
 lsp-server = "0.10"
 lsp-types = "0.97"
+crossbeam-channel = "0.5"
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

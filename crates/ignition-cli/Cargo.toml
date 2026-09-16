@@ -33,6 +33,10 @@ tokio = { workspace = true }
 # spec's data model. The phase's ONLY new dependencies (workspace-carried).
 lsp-server = { workspace = true }
 lsp-types = { workspace = true }
+# 14-04: the diagnostics loop select!s over connection.receiver + the
+# refresher's version channel — the crate must be direct for that (0.5 line,
+# shared with lsp-server, so the Receiver types unify).
+crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

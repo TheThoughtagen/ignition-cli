@@ -1531,6 +1531,7 @@ dependencies = [
  "base64",
  "clap",
  "clap_complete",
+ "crossbeam-channel",
  "ignition-core",
  "ignition-tui",
  "lsp-server",
