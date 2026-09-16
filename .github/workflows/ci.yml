@@ -22,7 +22,7 @@ jobs:
       # Phase 12 tokenization-first discipline: Color:: literals live ONLY
       # in the style-tokens module (ui/theme.rs). Also catches the import
       # and alias forms that could smuggle usage past a bare-Color:: grep.
-      - name: style tokens only (Color:: confined to ui/theme.rs)
+      - name: "style tokens only (Color:: confined to ui/theme.rs)"
         run: |
           offenders=$(grep -rn -e 'Color::' -e 'style::Color' -e 'Color as' crates/ \
             --include='*.rs' \
