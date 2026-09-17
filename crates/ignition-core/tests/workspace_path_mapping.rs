@@ -151,7 +151,11 @@ proptest! {
     fn p4_safe_domain_is_idempotent(member in safe_member_path()) {
         let local = local_path_for(&member)
             .unwrap_or_else(|err| panic!("safe path {member:?} must map, got {err}"));
-        prop_assert_eq!(local.to_string_lossy(), member);
+        prop_assert_eq!(
+            ignition_core::client::scripts_codec::tree_relative_string(&local),
+            member,
+            "tree-relative rendering is the bijection's /-form (host separators never leak)"
+        );
     }
 }
 
