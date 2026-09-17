@@ -544,11 +544,11 @@ fn percent_names_round_trip_without_double_decode() {
 /// Control bytes ride as `%XX` — pinned spelling.
 #[test]
 fn control_bytes_escape_to_hex() {
+    let local = local_path_for("a\u{1}b/x").expect("control byte maps");
     assert_eq!(
-        local_path_for("a\u{1}b/x")
-            .expect("control byte maps")
-            .to_string_lossy(),
-        "a%01b/x"
+        ignition_core::client::scripts_codec::tree_relative_string(&local),
+        "a%01b/x",
+        "the /-form is the pinned spelling on every host"
     );
     assert_eq!(
         segment_escape("tab\tsep").expect("tab escapes"),
@@ -560,15 +560,15 @@ fn control_bytes_escape_to_hex() {
 #[test]
 fn safe_names_stay_legible_spaces_escape() {
     assert_eq!(
-        local_path_for("readme.md")
-            .expect("plain name")
-            .to_string_lossy(),
+        ignition_core::client::scripts_codec::tree_relative_string(
+            &local_path_for("readme.md").expect("plain name"),
+        ),
         "readme.md"
     );
     assert_eq!(
-        local_path_for("my notes")
-            .expect("spaced name")
-            .to_string_lossy(),
+        ignition_core::client::scripts_codec::tree_relative_string(
+            &local_path_for("my notes").expect("spaced name"),
+        ),
         "my%20notes"
     );
 }
