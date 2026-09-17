@@ -2,12 +2,15 @@ name: Release
 
 # The one-push release pipeline. Pushing a tag (v1.0, v1.1, ...) triggers:
 #
-#   build            — 4-target release matrix; tarballs + sha256 attached
-#                      to the GitHub release (created if missing)
+#   build            — 5-target release matrix; tarballs + sha256 attached
+#                      to the GitHub release (created if missing). Windows
+#                      ships a .zip (locked no-Windows decision REVERSED
+#                      2026-09-17 — see the matrix below).
 #                      aarch64-apple-darwin       (native on macos-latest)
 #                      x86_64-apple-darwin        (cross on the same mac)
 #                      x86_64-unknown-linux-gnu   (native on ubuntu-latest)
 #                      aarch64-unknown-linux-gnu  (native on ubuntu-24.04-arm)
+#                      x86_64-pc-windows-msvc     (native on windows-latest, zip)
 #   publish-crates   — cargo publish --workspace (core → tui → cli) after the
 #                      binaries prove the tag builds; idempotent: skips when
 #                      the version is already on crates.io
@@ -53,6 +56,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # Windows joins the release matrix — locked no-Windows decision
+          # REVERSED (2026-09-17) alongside the ring TLS flip. The exe is
+          # zipped (not tarred) and the sha256 rides Get-FileHash.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -68,6 +76,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p ignition-cli --target ${{ matrix.target }}
       - name: Package tarball
+        if: runner.os != 'Windows'
         run: |
           ART="ign-${{ env.TAG_NAME }}-${{ matrix.target }}"
           mkdir "$ART"
@@ -75,6 +84,17 @@ jobs:
           cp README.md LICENSE "$ART/"
           tar -czf "$ART.tar.gz" "$ART"
           shasum -a 256 "$ART.tar.gz" > "$ART.tar.gz.sha256"
+      - name: Package zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $art = "ign-${{ env.TAG_NAME }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $art | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ign.exe" "$art/"
+          Copy-Item README.md, LICENSE "$art/"
+          Compress-Archive -Path $art -DestinationPath "$art.zip"
+          (Get-FileHash "$art.zip" -Algorithm SHA256).Hash.ToLower() + "  $art.zip" |
+            Set-Content "$art.zip.sha256"
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
@@ -82,6 +102,8 @@ jobs:
           files: |
             ign-*.tar.gz
             ign-*.tar.gz.sha256
+            ign-*.zip
+            ign-*.zip.sha256
 
   publish-crates:
     needs: build # only publish crates once the tag's binaries prove it builds

@@ -60,6 +60,7 @@ use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
+use ignition_core::client::install_crypto_provider;
 use serde_json::Value;
 
 /// The gathered env contract for one live-gateway run.
@@ -634,6 +635,7 @@ async fn openapi_capture_writes_phase3_extract() {
     };
 
     let url = format!("{}/openapi.json", env.url.trim_end_matches('/'));
+    install_crypto_provider();
     let response = reqwest::Client::new()
         .get(&url)
         .header("X-Ignition-API-Token", &env.token)

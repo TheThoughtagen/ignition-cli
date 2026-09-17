@@ -135,6 +135,7 @@ impl IdpLoginFlow {
     /// Build the flow against a rig's base URL (e.g.
     /// `http://localhost:9088`).
     pub fn new(base_url: &str) -> Result<Self, CoreError> {
+        super::install_crypto_provider();
         let client = reqwest::Client::builder()
             // The locked client's rule, flow-local edition: consume
             // every 302 BY HAND (the flow's steps ARE the redirects).

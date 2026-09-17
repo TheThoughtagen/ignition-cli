@@ -863,7 +863,23 @@ impl ReqwestGatewayApi {
     }
 }
 
+/// Install the process-wide TLS crypto provider (ring). reqwest is built
+/// with `rustls-no-provider` (workspace Cargo.toml) so the provider is the
+/// app's responsibility — this is the single install point for the binary,
+/// and it is `pub` so the e2e tests' raw `reqwest::Client` constructions
+/// can install it too. Safe to call any number of times.
+pub fn install_crypto_provider() {
+    // ring is the process-wide TLS provider (workspace Cargo.toml: reqwest
+    // rides rustls-no-provider). install_default() errors on a second call —
+    // the Once makes every later construction a no-op instead.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn build_client(ssl_verify: bool) -> Result<reqwest::Client, CoreError> {
+    install_crypto_provider();
     let mut builder = reqwest::Client::builder()
         // Never follow redirects: an uncommissioned gateway 302s everything
         // to /welcome and the follow would render the wizard HTML as a 200
