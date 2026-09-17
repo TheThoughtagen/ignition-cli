@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ignition_core::actions::lint::{find_lint_tool, lint_run};
+// Unix-only consumer: CoreError::LintToolAbsent is asserted in the
+// executable-bit test below (mode 0o644 probing has no Windows story).
+#[cfg(unix)]
 use ignition_core::error::CoreError;
 
 /// PATH-mutating tests serialize on ONE mutex, HELD for the guard's
