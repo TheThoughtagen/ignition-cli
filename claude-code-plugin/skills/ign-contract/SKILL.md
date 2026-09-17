@@ -31,15 +31,30 @@ Before any ign task, probe what the task needs and install only what is missing:
 # 1. Probe
 command -v ign >/dev/null 2>&1 && ign --version
 
-# 2a. Preferred: build from source (needs Rust 1.88+ toolchain)
-cargo install ignition-cli
-
-# 2b. Fallback: prebuilt release tarball (no Rust toolchain needed)
-#     https://github.com/TheThoughtagen/ignition-cli/releases
-#     macOS arm64 example:
-TARBALL="ign-aarch64-apple-darwin.tar.gz"   # match host arch/os
-curl -fsSL "https://github.com/TheThoughtagen/ignition-cli/releases/latest/download/${TARBALL}" \
-  | tar xz -C /usr/local/bin
+# 2. Install — exactly ONE path, chosen by probe (never run both)
+if command -v cargo >/dev/null 2>&1; then
+  # 2a. Preferred: build from source (needs Rust 1.88+ toolchain)
+  cargo install ignition-cli
+else
+  # 2b. Fallback: prebuilt release tarball (no Rust toolchain needed)
+  #     Asset format (pinned by .github/workflows/release.yml):
+  #     ign-<tag>-<target>.tar.gz — the unversioned latest/download name 404s
+  DEST="${HOME}/.local/bin"          # user-owned, no sudo — ensure it is on PATH
+  case "$(uname -sm)" in             # CI target triple
+    "Darwin arm64")   T="aarch64-apple-darwin" ;;
+    "Darwin x86_64")  T="x86_64-apple-darwin" ;;
+    "Linux x86_64")   T="x86_64-unknown-linux-gnu" ;;
+    "Linux aarch64")  T="aarch64-unknown-linux-gnu" ;;
+    *) echo "unsupported host: $(uname -sm) (no Windows build)"; exit 1 ;;
+  esac
+  TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        https://github.com/TheThoughtagen/ignition-cli/releases/latest \
+        | grep -o 'tag/[^/]*$' | cut -d/ -f2)   # resolves the release tag, jq-free
+  mkdir -p "$DEST"
+  curl -fsSL "https://github.com/TheThoughtagen/ignition-cli/releases/download/${TAG}/ign-${TAG}-${T}.tar.gz" \
+    | tar xz -C "$DEST" --strip-components=1    # archive wraps the binary in ign-<tag>-<target>/
+  # system-wide instead? /usr/local/bin needs root: sudo install -m755 "$DEST/ign" /usr/local/bin/
+fi
 
 # 3. Verify
 ign --version
@@ -47,7 +62,8 @@ ign --version
 
 Rules:
 
-- Verify the tarball asset name against the actual release assets for the host OS/arch before downloading — asset names may change between releases.
+- The tag resolution + target triple above match the release workflow's naming — if `ign --version` 404s or the download fails, check the actual release assets for a renamed format before improvising.
+- `.sha256` companions are published per tarball; verify with `shasum -a 256 -c` when the integrity matters (rigs handling licensed gateways).
 - If `cargo` is absent and there is no network path to GitHub releases, stop and tell the user; do not improvise alternate install paths.
 - Docker/rig work on Apple Silicon runs linux/amd64 images under Rosetta — set `DOCKER_DEFAULT_PLATFORM=linux/amd64` if compose doesn't pin it (see ign-rigs).
 - If an `ign` binary exists but `ign --version` is older than the WebDev routes on the target gateway, the versioning discipline below (route mismatch) is the guide — never pin an old CLI.
