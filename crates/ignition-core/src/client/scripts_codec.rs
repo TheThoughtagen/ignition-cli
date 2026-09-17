@@ -652,7 +652,7 @@ pub fn encode_member(
 /// `local_path` — all git-shared or gateway-facing). Component-wise
 /// joining preserves a literal `\` inside a POSIX filename, which a
 /// blanket replace would corrupt.
-pub(crate) fn tree_relative_string(path: &Path) -> String {
+pub fn tree_relative_string(path: &Path) -> String {
     path.iter()
         .map(|component| component.to_string_lossy())
         .collect::<Vec<_>>()
