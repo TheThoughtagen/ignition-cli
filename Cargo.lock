@@ -1489,6 +1489,7 @@ dependencies = [
  "csv",
  "directories",
  "futures-util",
+ "getrandom 0.2.17",
  "keyring",
  "percent-encoding",
  "proptest",

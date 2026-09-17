@@ -25,6 +25,7 @@ async-trait = "0.1" # GatewayApi: dyn-compatible today, ubiquitous (research Ope
 toml = "1.1"
 directories = "6.0"
 keyring = "4.1"
+getrandom = "0.2" # CSPRNG for the webdev deploy secret — 0.2 pinned to ring's in-tree version (zero new edges); see webdev.rs generate_secret
 thiserror = "2.0"
 semver = "1.0"
 tracing = "0.1"
