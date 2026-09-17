@@ -9,8 +9,11 @@ jobs:
   check:
     strategy:
       matrix:
-        # No Windows — LOCKED planner decision (macOS/Linux primary targets).
-        os: [ubuntu-latest, macos-latest]
+        # Windows joins the matrix — the locked no-Windows decision is
+        # REVERSED (2026-09-17): the TLS flip to ring (pure Rust) removed the
+        # aws-lc C-toolchain blocker, and the tree type-checks for
+        # x86_64-pc-windows-msvc (verified via cargo-xwin cross-check).
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -23,6 +26,7 @@ jobs:
       # in the style-tokens module (ui/theme.rs). Also catches the import
       # and alias forms that could smuggle usage past a bare-Color:: grep.
       - name: "style tokens only (Color:: confined to ui/theme.rs)"
+        if: matrix.os != 'windows-latest'   # POSIX grep recipe; clippy/fmt/tests below carry the Windows gate
         run: |
           offenders=$(grep -rn -e 'Color::' -e 'style::Color' -e 'Color as' crates/ \
             --include='*.rs' \

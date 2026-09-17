@@ -17,6 +17,7 @@
 //!   first) — asserted as a behavior (the exit code varies by child,
 //!   so no inline golden: the README carries the note).
 
+#[cfg(unix)] // fake_tool-only on Windows; the absent-tool golden needs nothing
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -33,6 +34,7 @@ fn isolated_config() -> (tempfile::TempDir, std::path::PathBuf) {
 /// ABSOLUTE `dir/<tag>-argv.txt` (the child inherits the test's CWD,
 /// so relative paths would land elsewhere), prints `$LINT_STDOUT`,
 /// exits 1.
+#[cfg(unix)] // sh-stub harness — see the test gates above
 fn fake_tool(dir: &Path, tag: &str) {
     let tool = dir.join("ignition-lint");
     let argv_out = dir.join(format!("{tag}-argv.txt"));
@@ -60,6 +62,7 @@ fn ign_lint(path_var: &str, stdout_payload: &str, args: &[&str]) -> std::process
 }
 
 /// stdout minus the single trailing newline `println!` appends.
+#[cfg(unix)] // consumed only by the fake_tool goldens
 fn stdout_for_golden(out: &std::process::Output) -> &str {
     let stdout = std::str::from_utf8(&out.stdout).expect("utf-8 stdout");
     stdout.strip_suffix('\n').unwrap_or(stdout)
@@ -77,6 +80,7 @@ fn stderr_envelope(out: &std::process::Output) -> String {
 /// parsed `report` Value serializes key-SORTED and the raw `stdout`
 /// string goldens under snapbox's backslash→slash normalization, so
 /// the fixture stays minimal by design).
+#[cfg(unix)] // consumed only by the fake_tool goldens
 const REPORT: &str = r#"{"issues":[{"severity":"error"}],"summary":{"errors":1}}"#;
 
 /// THE absent-tool refusal golden: an empty PATH discovers nothing →
@@ -107,6 +111,7 @@ fn lint_tool_absent_refusal_golden() {
 /// → the COMMAND exits 0 (the doctor posture), profile NULL (the
 /// local-delegation contract), data carrying the full shape with
 /// child_exit_code 1 + the parsed issues.
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — same Windows cmd-shim follow-up as contract_edit
 #[test]
 fn lint_findings_ride_as_data_golden() {
     let tool_dir = tempfile::tempdir().expect("tool dir");
@@ -149,6 +154,7 @@ fn lint_findings_ride_as_data_golden() {
 
 /// The HUMAN render: the posture summary line + the report's summary
 /// object + the stderr diagnostics passthrough.
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — same Windows cmd-shim follow-up as contract_edit
 #[test]
 fn lint_human_render() {
     let tool_dir = tempfile::tempdir().expect("tool dir");
@@ -178,6 +184,7 @@ summary: {"errors":1}
 /// `--strict` makes the PROCESS exit 1 with the envelope still
 /// printed on stdout — the one sanctioned success-path exit
 /// exception.
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — same Windows cmd-shim follow-up as contract_edit
 #[test]
 fn lint_strict_passthrough_exits_with_the_child_code() {
     let tool_dir = tempfile::tempdir().expect("tool dir");
@@ -200,6 +207,7 @@ fn lint_strict_passthrough_exits_with_the_child_code() {
 
 /// The `--` passthrough rides verbatim after the mapped args (the
 /// fake tool's recorded argv is the proof).
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — same Windows cmd-shim follow-up as contract_edit
 #[test]
 fn lint_passthrough_args_ride_verbatim() {
     let tool_dir = tempfile::tempdir().expect("tool dir");

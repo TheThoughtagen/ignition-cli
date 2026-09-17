@@ -123,7 +123,11 @@ fn fixture_zip() -> Vec<u8> {
 
 // ---- Scripted-$EDITOR shims (the 13-05 real-process pattern) ---------------
 
-/// Write an executable `#!/bin/sh` editor script; `$1` inside the
+/// Write an executable `#!/bin/sh` editor script
+///
+/// WINDOWS: sh-only by construction — the six editor-launching tests
+/// carry `#[cfg(unix)]` until a cmd-shim harness lands; the
+/// refusal-path tests (editor written but never spawned) run everywhere.; `$1` inside the
 /// body is the target file the pipeline passes (arg vector, path
 /// last — the production shape). Returns the script path (the
 /// double's argv[0]).
@@ -140,15 +144,18 @@ fn editor_script(dir: &Path, name: &str, body: &str) -> String {
 }
 
 /// The no-op editor: opens, touches nothing. The structural NoOp.
+#[cfg(unix)]
 const NOOP_EDITOR: &str = "exit 0";
 
 /// The deterministic edit: set the nested member to value 99 — Ready
 /// against the pristine fixture on EVERY run (the gateway never
 /// changes unless a push lands), so repeated runs stay deterministic.
+#[cfg(unix)]
 const SET99_EDITOR: &str = r#"printf '{"scope":"G","value":99}' > "$1""#;
 
 /// The JSON breaker: corrupt the codec-scanned view member → the
 /// fail-closed encode refusal with the kept tree.
+#[cfg(unix)]
 const BREAKER_EDITOR: &str = r#"printf '{ broken' > "$1""#;
 
 // ---- Wire mocks ------------------------------------------------------------
@@ -201,6 +208,7 @@ fn stderr_envelope(out: &std::process::Output) -> String {
 /// alternation pairs them correctly across any number of sequential
 /// runs inside one test — the fetch-vs-recheck divergence the
 /// staleness gate exists for.
+#[cfg(unix)]
 #[derive(Clone)]
 struct AlternatingResponder {
     hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -208,6 +216,7 @@ struct AlternatingResponder {
     fresh: std::sync::Arc<Vec<u8>>,
 }
 
+#[cfg(unix)]
 impl AlternatingResponder {
     fn new(fetch: Vec<u8>, fresh: Vec<u8>) -> Self {
         use std::sync::atomic::AtomicUsize;
@@ -219,6 +228,7 @@ impl AlternatingResponder {
     }
 }
 
+#[cfg(unix)]
 impl wiremock::Respond for AlternatingResponder {
     fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
         use std::sync::atomic::Ordering;
@@ -239,6 +249,7 @@ impl wiremock::Respond for AlternatingResponder {
 /// when one lingers. `dir` is the spawned binary's TMPDIR — tests
 /// redirect it so the scan is race-free (only THIS command's edit
 /// trees can be present).
+#[cfg(unix)]
 fn lingering_edit_tree(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
@@ -262,6 +273,7 @@ fn lingering_edit_tree(dir: &Path) -> Option<PathBuf> {
 /// terminal. Traffic pins ride along: the no-op fetches once (no
 /// staleness re-check, zero imports); the `--yes` push runs fetch +
 /// re-check and EXACTLY ONE import.
+#[cfg(unix)]
 #[tokio::test]
 async fn edit_stdout_is_byte_pure_under_max_diagnostics() {
     // -- The no-op leg: stdout 0 bytes, the prose on stderr. --
@@ -474,6 +486,7 @@ async fn edit_unknown_resource_path_refuses_naming_valid_members_before_the_edit
 /// the workspace-push preview genre). Traffic pin: the pipeline's
 /// fetch + staleness re-check (2 GETs), ZERO imports — the guard is
 /// the only thing that stopped the push.
+#[cfg(unix)]
 #[tokio::test]
 async fn edit_guard_refusal_golden_without_yes() {
     let (_dir, config) = isolated_config();
@@ -541,6 +554,7 @@ hint: this operation is destructive; re-run with --yes or set IGNITION_YES=1
 /// the REAL binary), and `project.json` survives. EXACTLY ONE import
 /// fires; the temp edit tree is gone afterwards (the recovery path
 /// only exists for failures).
+#[cfg(unix)]
 #[tokio::test]
 async fn edit_happy_path_pushes_the_spliced_member_exactly_once() {
     let (_dir, config) = isolated_config();
@@ -621,6 +635,7 @@ async fn edit_happy_path_pushes_the_spliced_member_exactly_once() {
 /// fires IDENTICALLY WITH `--yes` (the 13-05 planner lock carries
 /// through dispatch: forcing would clobber a concurrent Designer
 /// edit). Traffic: both runs fetch + re-check (4 GETs), ZERO imports.
+#[cfg(unix)]
 #[tokio::test]
 async fn edit_staleness_refusal_fires_with_and_without_yes() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -707,6 +722,7 @@ async fn edit_staleness_refusal_fires_with_and_without_yes() {
 /// `preserved at <path>` tree REALLY EXISTS on disk afterwards (the
 /// user's edit survives the failed run). The test redirects TMPDIR so
 /// the kept tree provably lands where the message says.
+#[cfg(unix)]
 #[tokio::test]
 async fn edit_fail_closed_keeps_the_tree_at_the_printed_path() {
     let (_dir, config) = isolated_config();
@@ -761,6 +777,7 @@ async fn edit_fail_closed_keeps_the_tree_at_the_printed_path() {
 /// traffic (nothing to push, nothing to prompt), stdout empty, and
 /// the private edit tree REMOVED (the recovery path exists only for
 /// failures).
+#[cfg(unix)]
 #[tokio::test]
 async fn edit_noop_is_clean_and_cleans_its_temp_tree() {
     let (_dir, config) = isolated_config();

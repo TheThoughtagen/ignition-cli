@@ -18,6 +18,8 @@ semver = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
+getrandom = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

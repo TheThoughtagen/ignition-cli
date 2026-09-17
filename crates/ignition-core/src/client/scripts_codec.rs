@@ -645,6 +645,20 @@ pub fn encode_member(
 
 // ---- Tree-level wrappers -----------------------------------------------------
 
+/// Render a tree-relative path as a FORWARD-slash string — the
+/// canonical member/manifest-key form. Windows `PathBuf::to_string_lossy`
+/// emits `\`, which would poison the three cross-platform seams (zip
+/// member names, the codec manifest keys, the workspace manifest's
+/// `local_path` — all git-shared or gateway-facing). Component-wise
+/// joining preserves a literal `\` inside a POSIX filename, which a
+/// blanket replace would corrupt.
+pub fn tree_relative_string(path: &Path) -> String {
+    path.iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Count a zip's FILE members (directory entries excluded) — the
 /// export-decode result's member count.
 pub fn count_file_members(zip_bytes: &[u8]) -> Result<usize, CoreError> {
@@ -801,7 +815,7 @@ pub fn encode_export_tree(dir: &Path) -> Result<Vec<u8>, CoreError> {
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = rewrite_options();
     for rel in files {
-        let rel_str = rel.to_string_lossy().into_owned();
+        let rel_str = tree_relative_string(&rel);
         if rel_str == MANIFEST_NAME {
             continue; // consumed + stripped
         }

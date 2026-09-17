@@ -34,13 +34,17 @@
 //! message; an identical fresh export allows `Ready`.
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)] // kept_path_from-only
+use std::path::PathBuf;
+#[cfg(unix)] // EDITOR_ENV_LOCK-only
 use std::sync::Mutex;
+#[cfg(unix)] // SequenceResponder-only
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ignition_core::actions::edit::{
-    EditStatus, Editor, TokioEditor, edit_pipeline, run_editor_argv,
-};
+#[cfg(unix)] // consumed only by the spawn-path tests
+use ignition_core::actions::edit::{EditStatus, TokioEditor};
+use ignition_core::actions::edit::{Editor, edit_pipeline, run_editor_argv};
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::error::CoreError;
 
@@ -110,6 +114,7 @@ fn fixture_zip(nested_value: u32) -> Vec<u8> {
 /// Serves `first` on GET #1 (the fetch) and `rest` on every
 /// subsequent GET (the staleness re-check). Interior mutability via
 /// an atomic — wiremock's `Respond` needs only Send + Sync.
+#[cfg(unix)] // staleness spawn tests only
 #[derive(Clone)]
 struct SequenceResponder {
     hits: std::sync::Arc<AtomicUsize>,
@@ -117,6 +122,7 @@ struct SequenceResponder {
     rest: std::sync::Arc<Vec<u8>>,
 }
 
+#[cfg(unix)]
 impl SequenceResponder {
     fn new(first: Vec<u8>, rest: Vec<u8>) -> Self {
         Self {
@@ -127,6 +133,7 @@ impl SequenceResponder {
     }
 }
 
+#[cfg(unix)]
 impl wiremock::Respond for SequenceResponder {
     fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
         let n = self.hits.fetch_add(1, Ordering::SeqCst);
@@ -154,6 +161,7 @@ async fn mount_export(server: &wiremock::MockServer, zip: Vec<u8>, expected_gets
 
 /// Mount the export GET with a fetch-vs-recheck SEQUENCE (staleness
 /// tests): GET #1 → `first`, GET #2+ → `rest`.
+#[cfg(unix)] // staleness spawn tests only
 async fn mount_export_sequence(server: &wiremock::MockServer, first: Vec<u8>, rest: Vec<u8>) {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(
@@ -204,10 +212,12 @@ fn editor_script(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
 /// The sed edit the archetypes share: flip `"value":42` → 43 in the
 /// (plain, verbatim-copied) nested member. POSIX-portable (no
 /// `sed -i`), so macOS and Linux sh both pass.
+#[cfg(unix)]
 const SED_EDIT: &str = r#"sed 's/"value":42/"value":43/' "$1" > "$1.tmp" && mv "$1.tmp" "$1""#;
 
 /// The kept-path clause of the fail-closed message — extracted and
 /// PROVEN on disk (the tree survives the failed run).
+#[cfg(unix)] // fail-closed spawn tests only
 fn kept_path_from(reason: &str) -> PathBuf {
     let marker = "preserved at ";
     let at = reason.find(marker).expect("kept-path marker present");
@@ -221,6 +231,7 @@ fn kept_path_from(reason: &str) -> PathBuf {
 /// A blocking editor that makes a REAL edit and exits 0 → `Ready`
 /// with exactly the edited member in the blast radius (changed =
 /// what a push would write) and the staged import zip present.
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn blocking_editor_edit_yields_ready_with_blast_radius() {
     let zip = fixture_zip(42);
@@ -257,6 +268,7 @@ async fn blocking_editor_edit_yields_ready_with_blast_radius() {
 /// like `code --wait` holding while the user edits), then exit. The
 /// pipeline WAITS for the editor process, and the eventual exit
 /// stays advisory — `Ready` because the CONTENT changed.
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn deferred_exit_editor_is_waited_and_stays_advisory() {
     let zip = fixture_zip(42);
@@ -287,6 +299,7 @@ async fn deferred_exit_editor_is_waited_and_stays_advisory() {
 /// pipeline decides by content AT ENCODE TIME — the exit code never
 /// enters the decision, and the late write (still in flight when
 /// the verdict lands) cannot flip it. Pinned: `NoOp`.
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn daemon_style_immediate_exit_decides_by_content_at_encode_time() {
     let zip = fixture_zip(42);
@@ -321,6 +334,7 @@ exit 0"#,
 /// exiting), the parent still exits 0 — and the CONTENT decides:
 /// garbage in a script-bearing member fails CLOSED. Exit 0 does not
 /// save a broken edit; the pipeline never trusted the code.
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn daemon_child_write_landing_before_encode_fails_closed() {
     let zip = fixture_zip(42);
@@ -358,6 +372,7 @@ exit 0"#,
 /// caller cannot push and cannot prompt (the plan's spy-push proof,
 /// made structural by the corrected signature that keeps push OUT
 /// of core).
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn no_change_editor_yields_structural_noop() {
     let zip = fixture_zip(42);
@@ -389,6 +404,7 @@ exit 0"#,
 /// refuses via the codec's own `encode_member` `InvalidInput`
 /// (verbatim), and the edit tree is KEPT: the error message carries
 /// its path and the tree is still on disk — the recovery path.
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn json_breaking_editor_fails_closed_and_keeps_the_tree() {
     let zip = fixture_zip(42);
@@ -442,6 +458,7 @@ async fn json_breaking_editor_fails_closed_and_keeps_the_tree() {
 /// `changed on gateway since fetch` message. No flag overrides this
 /// — re-run to fetch fresh (forcing it would clobber a concurrent
 /// Designer edit).
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn staleness_drift_refuses_with_stable_message() {
     let server = wiremock::MockServer::start().await;
@@ -473,6 +490,7 @@ async fn staleness_drift_refuses_with_stable_message() {
 
 /// A fresh export identical (hash-equal) to the fetch → the gate
 /// passes and the edit stages `Ready`.
+#[cfg(unix)] // scripted-$EDITOR shims are sh-only — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn staleness_fresh_export_allows_ready() {
     let server = wiremock::MockServer::start().await;
@@ -546,14 +564,17 @@ async fn unknown_resource_path_refuses_naming_candidates() {
 /// Env is process-global and tests run in parallel threads; edition
 /// 2024 makes `set_var` unsafe for exactly this reason — under this
 /// lock it is sound. VISUAL/EDITOR restore on drop.
+#[cfg(unix)] // consumed only by the real-TokioEditor spawn test
 static EDITOR_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(unix)]
 struct EditorEnvGuard {
     visual: Option<std::ffi::OsString>,
     editor: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
+#[cfg(unix)]
 impl EditorEnvGuard {
     /// Point VISUAL at `script` (and blank EDITOR) for the guard's
     /// lifetime.
@@ -575,6 +596,7 @@ impl EditorEnvGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for EditorEnvGuard {
     fn drop(&mut self) {
         unsafe {
@@ -594,6 +616,7 @@ impl Drop for EditorEnvGuard {
 /// whitespace split, the target appended LAST, the advisory exit —
 /// driving the actual pipeline end to end with a real spawned
 /// script as the editor. `Ready` proves the whole seam wiring.
+#[cfg(unix)] // spawns the sh editor for real — Windows cmd-shim follow-up
 #[tokio::test]
 async fn tokio_editor_env_resolution_drives_the_real_pipeline() {
     let zip = fixture_zip(42);

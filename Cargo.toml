@@ -18,12 +18,14 @@ clap_complete = "4.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "fs", "io-std", "io-util", "process", "sync"] } # fs: streaming export writes (03-02); io-std/io-util: stdin import read; process: docker compose shell-out (04-01); sync: the e2e live-gate serializer mutex (05-06 — the live tests mutate SHARED gateway state)
-reqwest = { version = "0.13", default-features = true, features = ["json", "query", "stream"] } # query: .query() for ListQuery params (02-01); stream: bytes_stream for the export download (03-02)
+reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "system-proxy", "json", "query", "stream", "rustls-no-provider"] } # query: .query() for ListQuery params (02-01); stream: bytes_stream for the export download (03-02); rustls-no-provider: the TLS provider is OURS to install (ring, below) — keeps aws-lc's C toolchain out of the Windows build and future musl targets
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] } # ring crypto provider installed process-wide in ignition-core (client/mod.rs install_crypto_provider) — pure Rust, no NASM/MSVC C dep
 futures-util = { version = "0.3", default-features = false, features = ["std"] } # StreamExt over the export chunk stream (arrives transitively with reqwest's stream feature; declared direct so the import is legal)
 async-trait = "0.1" # GatewayApi: dyn-compatible today, ubiquitous (research Open Question 2, resolved)
 toml = "1.1"
 directories = "6.0"
 keyring = "4.1"
+getrandom = "0.2" # CSPRNG for the webdev deploy secret — 0.2 pinned to ring's in-tree version (zero new edges); see webdev.rs generate_secret
 thiserror = "2.0"
 semver = "1.0"
 tracing = "0.1"

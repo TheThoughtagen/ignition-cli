@@ -248,7 +248,7 @@ async fn unedited_decode_checkout_round_trips_byte_exact() {
     // no normalization, no structural equivalence).
     for (user, local) in expected_mapping(&zip) {
         let expected = read_member(&zip, &user).expect("source member");
-        let name = local.to_string_lossy().into_owned();
+        let name = scripts_codec::tree_relative_string(&local);
         let actual = zip_member_bytes(&mut re, &name);
         assert_eq!(actual, expected, "BYTE-EXACT member {user}");
     }
@@ -302,7 +302,7 @@ async fn decode_tree_shape_vs_plain_checkout() {
         let recorded = &manifest.members[&user];
         assert_eq!(
             recorded.local_path,
-            local.to_string_lossy().into_owned(),
+            scripts_codec::tree_relative_string(&local),
             "the recorded pair matches the mapping output verbatim"
         );
     }
@@ -346,7 +346,7 @@ async fn tree_contains_exactly_the_zip_derived_set() {
     let (target, _) = checkout("demo", zip.clone(), true).await;
     let mut expected: BTreeSet<String> = expected_mapping(&zip)
         .values()
-        .map(|local| local.to_string_lossy().into_owned())
+        .map(|local| scripts_codec::tree_relative_string(local))
         .collect();
     expected.insert("com.example/views/Dashboard/view.json.1.py".to_string());
     expected.insert(scripts_codec::MANIFEST_NAME.to_string());
@@ -362,7 +362,7 @@ async fn tree_contains_exactly_the_zip_derived_set() {
     let (plain, _) = checkout("demo", zip.clone(), false).await;
     let mut expected: BTreeSet<String> = expected_mapping(&zip)
         .values()
-        .map(|local| local.to_string_lossy().into_owned())
+        .map(|local| scripts_codec::tree_relative_string(local))
         .collect();
     expected.insert(".gitignore".to_string());
     expected.insert(WORKSPACE_MANIFEST_NAME.to_string());
@@ -438,10 +438,9 @@ async fn edited_sidecar_ressplices_only_the_edited_member() {
     );
 
     // Every OTHER member is byte-identical to the source.
-    let mapping = expected_mapping(&zip);
     for user in [DESC_USER, NESTED_USER, SCRIPT_USER] {
         let expected = read_member(&zip, user).expect("source member");
-        let actual = zip_member_bytes(&mut re, mapping[user].to_str().expect("utf-8 path"));
+        let actual = zip_member_bytes(&mut re, user);
         assert_eq!(actual, expected, "unedited member {user} rides byte-exact");
     }
 }

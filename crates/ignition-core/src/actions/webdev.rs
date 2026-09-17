@@ -28,7 +28,6 @@
 //! NEVER appears in any action result, log, or JSON envelope — the
 //! redaction test below pins that.
 
-use std::io::Read;
 use std::path::Path;
 
 use serde::Serialize;
@@ -310,19 +309,15 @@ fn absent_row(route: &str, status: RouteStatus) -> RouteStatusRow {
     }
 }
 
-/// 32 bytes from `/dev/urandom`, hex-encoded (64 chars) — zero-dep
-/// generation (no `rand` in the workspace; unix-only is fine, no
-/// Windows CI is locked by Phase 1 decision).
+/// 32 random bytes, hex-encoded (64 chars) — via the `getrandom`
+/// crate (already in the tree via ring; 0.2 pinned to dedupe).
+/// The pre-Windows `/dev/urandom` read is gone with the reversal of
+/// the no-Windows decision: getrandom rides the OS CSPRNG everywhere
+/// (BCryptGenRandom on Windows, getrandom(2)/urandom on unix).
 fn generate_secret() -> Result<String, CoreError> {
     let mut bytes = [0u8; 32];
-    let mut source = std::fs::File::open("/dev/urandom").map_err(|err| {
-        CoreError::Internal(format!(
-            "cannot open /dev/urandom for secret generation: {err}"
-        ))
-    })?;
-    source
-        .read_exact(&mut bytes)
-        .map_err(|err| CoreError::Internal(format!("cannot read /dev/urandom: {err}")))?;
+    getrandom::getrandom(&mut bytes)
+        .map_err(|err| CoreError::Internal(format!("cannot generate the deploy secret: {err}")))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 

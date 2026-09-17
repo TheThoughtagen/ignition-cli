@@ -10,7 +10,7 @@ user-invocable: false
 
 ## Platforms
 
-- **macOS** (Apple Silicon + Intel) and **Linux** (x86_64 + arm64). There is **no Windows build** (locked project decision).
+- **macOS** (Apple Silicon + Intel), **Linux** (x86_64 + arm64, glibc), and **Windows** (x64, MSVC — the locked no-Windows decision was REVERSED 2026-09-17 when the TLS stack went pure-Rust; Windows ships a `.zip` release asset, and the TUI needs Windows Terminal).
 - The binary is self-contained; `jq` is optional and only needed for the filtering examples below. All examples are POSIX shell (bash/zsh).
 
 ## Install & dependencies
@@ -20,8 +20,8 @@ Before any ign task, probe what the task needs and install only what is missing:
 | Dep | Probe | Needed for | Install if missing |
 |-----|-------|-----------|--------------------|
 | `ign` ≥ 1.1 | `command -v ign >/dev/null && ign --version` | everything | see below |
-| `jq` | `command -v jq` | envelope filtering in the examples (optional) | `brew install jq` / `apt-get install -y jq` |
-| docker + compose v2 plugin | `docker compose version` | `ign rig` verbs only | Docker Desktop (macOS) / Docker Engine (Linux) — compose **≥ v2 required**; the legacy `docker-compose` v1 binary is unsupported (rig verbs fail fast, exit 7 + install hint) |
+| `jq` | `command -v jq` | envelope filtering in the examples (optional) | `brew install jq` / `apt-get install -y jq` / `winget install jqlang.jq` |
+| docker + compose v2 plugin | `docker compose version` | `ign rig` verbs only | Docker Desktop (macOS / Windows) / Docker Engine (Linux) — compose **≥ v2 required**; the legacy `docker-compose` v1 binary is unsupported (rig verbs fail fast, exit 7 + install hint) |
 | Rust 1.88+ toolchain | `cargo --version` | building `ign` from source only | rustup — skip entirely if using the tarball path |
 | gateway profile | `ign profile list` | every gateway-touching verb | `ign profile add` (config, not install — see Profiles & auth below) |
 
@@ -38,21 +38,28 @@ if command -v cargo >/dev/null 2>&1; then
 else
   # 2b. Fallback: prebuilt release tarball (no Rust toolchain needed)
   #     Asset format (pinned by .github/workflows/release.yml):
-  #     ign-<tag>-<target>.tar.gz — the unversioned latest/download name 404s
+  #     ign-<tag>-<target>.tar.gz (Windows: .zip) — the unversioned
+  #     latest/download name 404s
   DEST="${HOME}/.local/bin"          # user-owned, no sudo — ensure it is on PATH
   case "$(uname -sm)" in             # CI target triple
     "Darwin arm64")   T="aarch64-apple-darwin" ;;
     "Darwin x86_64")  T="x86_64-apple-darwin" ;;
     "Linux x86_64")   T="x86_64-unknown-linux-gnu" ;;
     "Linux aarch64")  T="aarch64-unknown-linux-gnu" ;;
-    *) echo "unsupported host: $(uname -sm) (no Windows build)"; exit 1 ;;
+    *NT*)             T="x86_64-pc-windows-msvc" ;;  # Git Bash / MSYS: MINGW*_NT-…
+    *) echo "unsupported host: $(uname -sm)"; exit 1 ;;
   esac
   TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
         https://github.com/TheThoughtagen/ignition-cli/releases/latest \
         | grep -o 'tag/[^/]*$' | cut -d/ -f2)   # resolves the release tag, jq-free
   mkdir -p "$DEST"
-  curl -fsSL "https://github.com/TheThoughtagen/ignition-cli/releases/download/${TAG}/ign-${TAG}-${T}.tar.gz" \
-    | tar xz -C "$DEST" --strip-components=1    # archive wraps the binary in ign-<tag>-<target>/
+  if [ "$T" = "x86_64-pc-windows-msvc" ]; then
+    curl -fsSL "https://github.com/TheThoughtagen/ignition-cli/releases/download/${TAG}/ign-${TAG}-${T}.zip" \
+      -o "${TMPDIR:-/tmp}/ign.zip" && unzip -j -o "${TMPDIR:-/tmp}/ign.zip" "*/ign.exe" -d "$DEST"   # zip wraps ign-<tag>-<target>/ign.exe
+  else
+    curl -fsSL "https://github.com/TheThoughtagen/ignition-cli/releases/download/${TAG}/ign-${TAG}-${T}.tar.gz" \
+      | tar xz -C "$DEST" --strip-components=1    # archive wraps the binary in ign-<tag>-<target>/
+  fi
   # system-wide instead? /usr/local/bin needs root: sudo install -m755 "$DEST/ign" /usr/local/bin/
 fi
 

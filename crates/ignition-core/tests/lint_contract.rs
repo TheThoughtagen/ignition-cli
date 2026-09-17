@@ -16,10 +16,15 @@
 //!   delegation proves `--report-format json --target <path>` rides
 //!   EXACTLY (never a shell string).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)] // fake_tool-only
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use ignition_core::actions::lint::{find_lint_tool, lint_run};
+// Unix-only consumer: CoreError::LintToolAbsent is asserted in the
+// executable-bit test below (mode 0o644 probing has no Windows story).
+#[cfg(unix)]
 use ignition_core::error::CoreError;
 
 /// PATH-mutating tests serialize on ONE mutex, HELD for the guard's
@@ -60,6 +65,7 @@ impl Drop for PathGuard {
 /// the test sets under the PATH lock. Behavior: record argv to
 /// `$LINT_ARGV_FILE` (one arg per line), print `$LINT_STDOUT`,
 /// print `$LINT_STDERR` on stderr, exit `code`.
+#[cfg(unix)] // sh-stub harness — see the test gates above
 fn fake_tool(dir: &Path, code: i32) -> PathBuf {
     let tool = dir.join("ignition-lint");
     let script = format!(
@@ -78,8 +84,10 @@ fn fake_tool(dir: &Path, code: i32) -> PathBuf {
 
 /// The env payload triplet under the PATH lock: argv file, stdout
 /// text, stderr text (restored on drop).
+#[cfg(unix)] // consumed only by the fake_tool tests
 struct ToolEnv;
 
+#[cfg(unix)]
 impl ToolEnv {
     fn set(dir: &Path, stdout_text: &str, stderr_text: &str) {
         unsafe {
@@ -91,6 +99,7 @@ impl ToolEnv {
 }
 
 /// A JSON report shaped like ignition-lint's `--report-format json`.
+#[cfg(unix)] // consumed only by the fake_tool tests
 const REPORT: &str = concat!(
     r#"{"issues":[{"severity":"error","code":"P001","message":"bad name","file_path":"views/Dashboard/view.json","line_number":3},"#,
     r#"{"severity":"warning","code":"N010","message":"worse name","file_path":"views/Dashboard/view.json","line_number":9}],"#,
@@ -98,6 +107,7 @@ const REPORT: &str = concat!(
 );
 
 /// The recorded argv (the fake tool wrote one line per arg).
+#[cfg(unix)] // consumed only by the fake_tool tests
 fn recorded_argv(dir: &Path) -> Vec<String> {
     let raw = std::fs::read_to_string(
         std::env::var("LINT_ARGV_FILE")
@@ -114,6 +124,7 @@ fn recorded_argv(dir: &Path) -> Vec<String> {
 /// child_exit_code 1 + the parsed issues count + the report, and the
 /// child saw EXACTLY `--report-format json --target <path>` (+ the
 /// passthrough extras, verbatim, after them).
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn findings_ride_as_data_with_the_exact_arg_vector() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -164,6 +175,7 @@ async fn findings_ride_as_data_with_the_exact_arg_vector() {
 /// (b) `--strict` arms the passthrough: the same child run carries
 /// `strict_exit_code() == Some(1)` (the binary decides the actual
 /// process exit AFTER the envelope renders).
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn strict_mode_carries_the_child_exit_passthrough() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -217,6 +229,7 @@ async fn absent_tool_refuses_with_the_install_hint() {
 /// An unparseable report degrades honestly: `report: null`,
 /// `issues_found: 0`, stdout still verbatim — the child RAN, the
 /// posture holds.
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn unparseable_report_degrades_to_null_report() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -240,6 +253,7 @@ async fn unparseable_report_degrades_to_null_report() {
 
 /// A LONG stderr preview truncates (the cap keeps the result shape
 /// bounded; the truncation marker is honest).
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn stderr_preview_truncates() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -261,6 +275,7 @@ async fn stderr_preview_truncates() {
 /// Discovery order: the FIRST `ignition-lint` on PATH wins (a
 /// decoy later on PATH never runs — the recorded argv proves which
 /// one did).
+#[cfg(unix)] // fake_tool is a #!/bin/sh stub — Windows cmd-shim harness is the follow-up
 #[tokio::test]
 async fn discovery_takes_the_first_tool_on_path() {
     let first = tempfile::tempdir().expect("first");

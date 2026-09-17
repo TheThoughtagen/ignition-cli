@@ -315,7 +315,7 @@ pub async fn workspace_checkout(
             // `encode_export_tree` resolves when it walks the tree.
             codec_manifest
                 .members
-                .insert(local.to_string_lossy().into_owned(), entries);
+                .insert(scripts_codec::tree_relative_string(local), entries);
         }
     }
 
@@ -343,7 +343,7 @@ pub async fn workspace_checkout(
         manifest_members.insert(
             user,
             ManifestMember {
-                local_path: local.to_string_lossy().into_owned(),
+                local_path: scripts_codec::tree_relative_string(local),
                 hash,
             },
         );

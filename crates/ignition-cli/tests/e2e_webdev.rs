@@ -60,6 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use assert_cmd::Command;
+use ignition_core::client::install_crypto_provider;
 use serde_json::Value;
 
 /// The gathered env contract for one live-gateway run (the
@@ -201,6 +202,7 @@ fn stored_secret(config: &Path) -> String {
 /// seam's first wire rule); the function returns `error.code` on a
 /// denial or panics with the body when ok:true.
 async fn raw_scriptexec_probe(env: &LiveEnv, secret: Option<&str>) -> Result<(), String> {
+    install_crypto_provider();
     let client = reqwest::Client::new();
     let url = format!("{}/system/webdev/ign-cli/cli/scriptExec", env.url);
     let mut request = client
@@ -872,6 +874,7 @@ const HISTORIAN_PROVIDER_PATH: &str =
 /// create that comes back non-OK with an "already exists"-flavored
 /// body passes (re-runs against a provisioned rig).
 async fn provision_internal_historian(env: &LiveEnv, name: &str) {
+    install_crypto_provider();
     let client = reqwest::Client::new();
     let url = format!("{}{HISTORIAN_PROVIDER_PATH}", env.url);
     let body = serde_json::json!([{
@@ -911,6 +914,7 @@ async fn provision_internal_historian(env: &LiveEnv, name: &str) {
 /// teardown-clean contract, no more silent no-ops. A 404 on the
 /// first find means it is already gone.
 async fn delete_internal_historian(env: &LiveEnv, name: &str) {
+    install_crypto_provider();
     let client = reqwest::Client::new();
     let find_url = format!(
         "{}/data/api/v1/resources/find/com.inductiveautomation.historian/historian-provider/{name}",
@@ -2014,6 +2018,7 @@ fn structurally_identical(a: &[u8], b: &[u8]) -> bool {
 /// file) in one assertion — a second CLI export would only prove
 /// two in-process decodes agree.
 async fn raw_tagconfig_export_xml(env: &LiveEnv, paths: &[&str]) -> Vec<u8> {
+    install_crypto_provider();
     let client = reqwest::Client::new();
     let url = format!("{}/system/webdev/ign-cli/cli/tagConfig", env.url);
     let response = client
