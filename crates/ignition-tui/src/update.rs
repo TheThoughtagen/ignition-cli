@@ -1732,15 +1732,9 @@ fn projects_enter(state: &mut AppState) {
         refire_resource_get(state);
         return;
     }
-    if state.projects.detail.is_some() {
+    if let Some(detail) = state.projects.detail.as_ref() {
         if let Some(path) = selected_resource_path(state) {
-            let project = state
-                .projects
-                .detail
-                .as_ref()
-                .expect("checked")
-                .name
-                .clone();
+            let project = detail.name.clone();
             open_resource_detail(state, &project, &path);
         }
         return;

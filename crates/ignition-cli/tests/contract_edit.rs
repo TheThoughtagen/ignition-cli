@@ -144,15 +144,18 @@ fn editor_script(dir: &Path, name: &str, body: &str) -> String {
 }
 
 /// The no-op editor: opens, touches nothing. The structural NoOp.
+#[cfg(unix)]
 const NOOP_EDITOR: &str = "exit 0";
 
 /// The deterministic edit: set the nested member to value 99 — Ready
 /// against the pristine fixture on EVERY run (the gateway never
 /// changes unless a push lands), so repeated runs stay deterministic.
+#[cfg(unix)]
 const SET99_EDITOR: &str = r#"printf '{"scope":"G","value":99}' > "$1""#;
 
 /// The JSON breaker: corrupt the codec-scanned view member → the
 /// fail-closed encode refusal with the kept tree.
+#[cfg(unix)]
 const BREAKER_EDITOR: &str = r#"printf '{ broken' > "$1""#;
 
 // ---- Wire mocks ------------------------------------------------------------
@@ -205,6 +208,7 @@ fn stderr_envelope(out: &std::process::Output) -> String {
 /// alternation pairs them correctly across any number of sequential
 /// runs inside one test — the fetch-vs-recheck divergence the
 /// staleness gate exists for.
+#[cfg(unix)]
 #[derive(Clone)]
 struct AlternatingResponder {
     hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -212,6 +216,7 @@ struct AlternatingResponder {
     fresh: std::sync::Arc<Vec<u8>>,
 }
 
+#[cfg(unix)]
 impl AlternatingResponder {
     fn new(fetch: Vec<u8>, fresh: Vec<u8>) -> Self {
         use std::sync::atomic::AtomicUsize;
@@ -223,6 +228,7 @@ impl AlternatingResponder {
     }
 }
 
+#[cfg(unix)]
 impl wiremock::Respond for AlternatingResponder {
     fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
         use std::sync::atomic::Ordering;
@@ -243,6 +249,7 @@ impl wiremock::Respond for AlternatingResponder {
 /// when one lingers. `dir` is the spawned binary's TMPDIR — tests
 /// redirect it so the scan is race-free (only THIS command's edit
 /// trees can be present).
+#[cfg(unix)]
 fn lingering_edit_tree(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
