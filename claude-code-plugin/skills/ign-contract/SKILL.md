@@ -11,8 +11,46 @@ user-invocable: false
 ## Platforms
 
 - **macOS** (Apple Silicon + Intel) and **Linux** (x86_64 + arm64). There is **no Windows build** (locked project decision).
-- Install: `cargo install ignition-cli` (Rust 1.88+ MSRV) or grab a release tarball from <https://github.com/TheThoughtagen/ignition-cli/releases>.
 - The binary is self-contained; `jq` is optional and only needed for the filtering examples below. All examples are POSIX shell (bash/zsh).
+
+## Install & dependencies
+
+Before any ign task, probe what the task needs and install only what is missing:
+
+| Dep | Probe | Needed for | Install if missing |
+|-----|-------|-----------|--------------------|
+| `ign` ≥ 1.1 | `command -v ign >/dev/null && ign --version` | everything | see below |
+| `jq` | `command -v jq` | envelope filtering in the examples (optional) | `brew install jq` / `apt-get install -y jq` |
+| docker + compose v2 plugin | `docker compose version` | `ign rig` verbs only | Docker Desktop (macOS) / Docker Engine (Linux) — compose **≥ v2 required**; the legacy `docker-compose` v1 binary is unsupported (rig verbs fail fast, exit 7 + install hint) |
+| Rust 1.88+ toolchain | `cargo --version` | building `ign` from source only | rustup — skip entirely if using the tarball path |
+| gateway profile | `ign profile list` | every gateway-touching verb | `ign profile add` (config, not install — see Profiles & auth below) |
+
+### Installing `ign`
+
+```bash
+# 1. Probe
+command -v ign >/dev/null 2>&1 && ign --version
+
+# 2a. Preferred: build from source (needs Rust 1.88+ toolchain)
+cargo install ignition-cli
+
+# 2b. Fallback: prebuilt release tarball (no Rust toolchain needed)
+#     https://github.com/TheThoughtagen/ignition-cli/releases
+#     macOS arm64 example:
+TARBALL="ign-aarch64-apple-darwin.tar.gz"   # match host arch/os
+curl -fsSL "https://github.com/TheThoughtagen/ignition-cli/releases/latest/download/${TARBALL}" \
+  | tar xz -C /usr/local/bin
+
+# 3. Verify
+ign --version
+```
+
+Rules:
+
+- Verify the tarball asset name against the actual release assets for the host OS/arch before downloading — asset names may change between releases.
+- If `cargo` is absent and there is no network path to GitHub releases, stop and tell the user; do not improvise alternate install paths.
+- Docker/rig work on Apple Silicon runs linux/amd64 images under Rosetta — set `DOCKER_DEFAULT_PLATFORM=linux/amd64` if compose doesn't pin it (see ign-rigs).
+- If an `ign` binary exists but `ign --version` is older than the WebDev routes on the target gateway, the versioning discipline below (route mismatch) is the guide — never pin an old CLI.
 
 ## Three surfaces, one contract
 
