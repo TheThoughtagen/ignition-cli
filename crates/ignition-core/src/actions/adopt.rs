@@ -79,6 +79,15 @@ pub struct AdoptOptions {
     /// The granted security-level PATH segments, root first —
     /// `["Authenticated", "Roles", "Administrator"]` by CLI default.
     pub level: Vec<String>,
+    /// Deploy the CLI's WebDev routes (scriptExec on) into this
+    /// project after the bootstrap (`--project`).
+    pub project: Option<String>,
+    /// Check out every ENABLED project into `<dir>/<project>`
+    /// (`--checkout`) — scripts decoded, the grep/lint posture.
+    pub checkout: Option<std::path::PathBuf>,
+    /// Download a roaming gwbk to this path after everything else
+    /// landed (`--bake`) — the just-reset keeps key + routes.
+    pub bake: Option<std::path::PathBuf>,
 }
 
 /// The adopt result — step rows + (only when a key was minted AND no
@@ -115,11 +124,15 @@ pub const DEFAULT_LEVEL: &[&str] = &["Authenticated", "Roles", "Administrator"];
 
 /// The adopt walk. `base_url` is the profile's gateway URL; the
 /// config rewrite lands in `config_path`'s file.
+/// `compose_credential` feeds the post-bootstrap steps
+/// (`--project`/`--checkout`/`--bake`) ONLY in the skip path — the
+/// mint path rides the fresh key it just proved.
 pub async fn adopt(
     base_url: &str,
     profile_name: &str,
     config_path: &Path,
     password: &Secret,
+    compose_credential: Option<&Credential>,
     opts: &AdoptOptions,
 ) -> Result<AdoptResult, CoreError> {
     let mut steps: Vec<CheckResult> = Vec::new();
@@ -317,6 +330,120 @@ pub async fn adopt(
             detail: "profile auth untouched (key pre-existed)".into(),
             hint: None,
         }),
+    }
+
+    // 6-8. COMPOSITION (`--project` / `--checkout` / `--bake`): the
+    //     post-bootstrap steps ride a WORKING credential — the fresh
+    //     key in the mint path, the CLI-resolved profile credential
+    //     in the skip path (bootstrap resolved DEGRADED; the mint is
+    //     what makes a credential exist). The verbs themselves are
+    //     the existing actions, composed verbatim.
+    let composing = opts.project.is_some() || opts.checkout.is_some() || opts.bake.is_some();
+    if composing {
+        let credential: Option<Credential> = match &token_for_persist {
+            Some(token) => Some(Credential::Token(Secret::new(token.clone()))),
+            None => compose_credential.cloned(),
+        };
+        let Some(credential) = credential else {
+            // Skip path + no resolvable profile credential + explicit
+            // composition flags: the honest mutating-verb refusal.
+            return Err(CoreError::SecretUnavailable {
+                profile: profile_name.to_string(),
+            });
+        };
+        let url: url::Url = base_url
+            .parse()
+            .map_err(|err| CoreError::Internal(format!("invalid gateway URL: {err}")))?;
+        let session = crate::session::Session::for_url(url, Some(credential), true)?;
+        let api = session.api();
+
+        // 6. ROUTES — the embedded WebDev bundle, scriptExec on, the
+        //    existing secret lifecycle (persist-before-upload).
+        if let Some(project) = &opts.project {
+            let deployed = crate::actions::webdev::webdev_deploy(
+                api,
+                project,
+                true,
+                false,
+                config_path,
+                profile_name,
+            )
+            .await?;
+            steps.push(CheckResult {
+                name: "routes".into(),
+                status: CheckStatus::Ok,
+                detail: format!(
+                    "deployed {} WebDev routes into {project:?} (scriptExec on, secret {})",
+                    deployed.routes.len(),
+                    if deployed.secret_rotated { "generated" } else { "reused" }
+                ),
+                hint: None,
+            });
+        }
+
+        // 7. CHECKOUT — every ENABLED project into <dir>/<project>.
+        //    An existing target SKIPS that project (the re-checkout
+        //    clobber refusal is the checkout's own contract — adopt's
+        //    re-run idempotency means leaving it alone).
+        if let Some(dir) = &opts.checkout {
+            let page = api
+                .projects(&crate::client::query::ListQuery::default())
+                .await?;
+            let mut checked: Vec<String> = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            for record in page.items.iter().filter(|record| record.enabled) {
+                let target = dir.join(&record.name);
+                if target.exists() {
+                    skipped.push(record.name.clone());
+                    continue;
+                }
+                crate::actions::workspace::workspace_checkout(
+                    api,
+                    &record.name,
+                    &target,
+                    profile_name,
+                    true,
+                )
+                .await?;
+                checked.push(record.name.clone());
+            }
+            let mut detail = if checked.is_empty() && skipped.is_empty() {
+                "no enabled projects on the gateway".to_string()
+            } else {
+                format!("{} into {}", checked.len(), dir.display())
+            };
+            if !skipped.is_empty() {
+                detail.push_str(&format!(
+                    ", {} skipped (already checked out)",
+                    skipped.len()
+                ));
+            }
+            steps.push(CheckResult {
+                name: "checkout".into(),
+                status: CheckStatus::Ok,
+                detail,
+                hint: None,
+            });
+        }
+
+        // 8. BAKE — a roaming gwbk AFTER everything landed: a just
+        //    reset restored from this file keeps the key, the wiring,
+        //    and the routes (live-proven, ADOPT-RESEARCH §--bake).
+        if let Some(file) = &opts.bake {
+            crate::actions::backup::backup_download(
+                api,
+                Some(file),
+                profile_name,
+                crate::client::backup::BackupType::Roaming,
+            )
+            .await?;
+            steps.push(CheckResult {
+                name: "bake".into(),
+                status: CheckStatus::Ok,
+                detail: format!("roaming gwbk at {}", file.display()),
+                hint: None,
+            });
+        }
     }
 
     Ok(AdoptResult {

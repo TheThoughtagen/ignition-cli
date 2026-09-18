@@ -299,20 +299,25 @@ pub fn build_security_put_body(singleton: &SecuritySingletonWire, config: &Value
     }])
 }
 
-/// Add one granted level (`level_tree` output) into an AnyOf
-/// permission list INSIDE a singleton `config`, add-if-missing,
-/// NEVER removing (the []-is-Public pitfall — this only grows lists;
-/// an existing `[]` gets the level ADDED, tightening Public down to
-/// the named level, which is what adopt means). Returns true when the
-/// config changed. Missing permissions objects are CREATED as
-/// `{"type":"AnyOf","securityLevels":[level]}`. Pure function.
+/// Ensure a BARE-ROOT entry for the granted level's top segment
+/// exists in an AnyOf permission list inside a singleton `config` —
+/// add-if-missing, never remove, never mutate existing entries.
+/// Returns true when the config changed. Missing permissions objects
+/// are CREATED as `{"type":"AnyOf","securityLevels":[bare-root]}`.
 ///
-/// Presence is judged by ROOT NAME (the tree's top segment, e.g.
-/// `Authenticated`): the gateway's level matching is prefix-based, so
-/// any entry rooted at the incoming tree's root already admits a key
-/// granted anywhere beneath it — a bare `Authenticated` permission
-/// satisfies an `Authenticated/Roles/Administrator` key and vice
-/// versa, and duplicate-root entries would be noise.
+/// WHY THE BARE ROOT and not the granted leaf-path tree
+/// (live-pinned 2026-09-18, ADOPT-RESEARCH pitfall 3): a permission
+/// entry serialized as the NESTED tree
+/// (`Authenticated>Roles>Administrator`, the UI's own spelling, with
+/// or without descriptions) does NOT admit an API token granted that
+/// exact path — 403, live-observed both ways — while a BARE-root
+/// entry (`{name:"Authenticated",children:[]}`) admits every
+/// descendant-granted token (200, live-observed). The bare root is
+/// the ANCESTOR form: strictly broader than the nested grant, so
+/// adding it can only widen admission, never narrow.
+///
+/// The `[]` case (the PUBLIC encoding — pitfall 2) gets the bare
+/// root ADDED, tightening Public down to root-admitted.
 pub fn merge_level_into(config: &mut Value, field: &str, level: &Value) -> bool {
     let Some(incoming_root) = level.get("name").and_then(Value::as_str) else {
         return false;
@@ -332,13 +337,20 @@ pub fn merge_level_into(config: &mut Value, field: &str, level: &Value) -> bool 
     let Some(levels_array) = levels.as_array_mut() else {
         return false;
     };
-    if levels_array
-        .iter()
-        .any(|existing| existing.get("name").and_then(Value::as_str) == Some(incoming_root))
-    {
+    // Present = a BARE-root entry exists (children empty). A nested
+    // same-root entry does NOT count — it does not admit the token
+    // (pitfall 3), so the bare form must land beside it.
+    let has_bare_root = levels_array.iter().any(|existing| {
+        existing.get("name").and_then(Value::as_str) == Some(incoming_root)
+            && existing
+                .get("children")
+                .and_then(Value::as_array)
+                .is_some_and(|children| children.is_empty())
+    });
+    if has_bare_root {
         return false;
     }
-    levels_array.push(level.clone());
+    levels_array.push(json!({ "name": incoming_root, "children": [] }));
     true
 }
 
@@ -602,35 +614,53 @@ mod tests {
         );
     }
 
-    /// merge: add-if-missing by ROOT NAME (prefix semantics — a
-    /// bare-`Authenticated` permission already admits an
-    /// Administrator-level key), idempotent on re-run; `[]` (the
-    /// PUBLIC encoding — ADOPT-RESEARCH pitfall 2) gets the level
-    /// ADDED, never left empty; a missing field is created.
+    /// merge: ensures a BARE-ROOT entry for the granted level's top
+    /// segment — add-if-missing, idempotent; a NESTED same-root entry
+    /// does NOT count (pitfall 3: nested entries do not admit
+    /// equal-path tokens — the bare root lands BESIDE it, the
+    /// fresh-gateway-default fix); `[]` (the PUBLIC encoding —
+    /// pitfall 2) gets the root ADDED; a missing field is created.
     #[test]
     fn merge_adds_missing_and_is_idempotent() {
         let authenticated = level_tree(&["Authenticated"]);
         let administrator = level_tree(&["Authenticated", "Roles", "Administrator"]);
+        let bare = |root: &str| json!({ "name": root, "children": [] });
 
-        // Different root → added; re-run changes nothing.
+        // Different root → the bare root added; re-run changes nothing.
         let mut config = json!({
             "writePermissions": {
                 "type": "AnyOf",
-                "securityLevels": [ { "name": "SecurityZones", "children": [] } ]
+                "securityLevels": [ bare("SecurityZones") ]
             }
         });
         assert!(merge_level_into(&mut config, "writePermissions", &administrator));
         assert!(!merge_level_into(&mut config, "writePermissions", &administrator),
             "idempotent re-run changes nothing");
+        assert_eq!(
+            config["writePermissions"]["securityLevels"][1],
+            bare("Authenticated"),
+            "the BARE root lands (pitfall 3), not the nested tree"
+        );
 
-        // Same root (bare Authenticated) already admits the
-        // Administrator key — skipped, not duplicated.
+        // Bare-root entry already present → skip.
         let mut config = json!({
             "writePermissions": { "type": "AnyOf", "securityLevels": [authenticated.clone()] }
         });
         assert!(!merge_level_into(&mut config, "writePermissions", &administrator));
 
-        // Empty list (Public) → the level lands, tightening it.
+        // NESTED same-root entry (the fresh-gateway default) does not
+        // admit the token — the bare root lands BESIDE it.
+        let mut config = json!({
+            "writePermissions": { "type": "AnyOf", "securityLevels": [administrator.clone()] }
+        });
+        assert!(merge_level_into(&mut config, "writePermissions", &administrator));
+        let levels = config["writePermissions"]["securityLevels"]
+            .as_array()
+            .expect("levels");
+        assert_eq!(levels.len(), 2, "bare root added beside the nested entry");
+        assert_eq!(levels[1], bare("Authenticated"));
+
+        // Empty list (Public) → the bare root lands, tightening it.
         let mut config = json!({
             "writePermissions": { "type": "AnyOf", "securityLevels": [] }
         });
@@ -639,6 +669,7 @@ mod tests {
             .as_array()
             .expect("levels");
         assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0], bare("Authenticated"));
 
         // Missing field entirely → created as AnyOf.
         let mut config = json!({});

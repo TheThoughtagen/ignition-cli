@@ -32,8 +32,9 @@
 //!
 //! ## The sanctioned stdout exceptions
 //!
-//! The OutOfBand row set is exactly `["api call", "completions",
-//! "edit", "mcp", "lsp"]` — the LEAF-REPRESENTABLE sanctioned stdout
+//! The OutOfBand row set is exactly `["adopt", "api call",
+//! "completions", "edit", "lsp", "mcp"]` — the LEAF-REPRESENTABLE
+//! sanctioned stdout
 //! exceptions. The flag-value / stream-form exceptions are NOT
 //! distinct leaves and carry no rows: `logs -f` NDJSON is a FLAG on
 //! the Screen-mapped `logs` leaf; `tags export -o -` is a FLAG VALUE
@@ -124,9 +125,17 @@ fn every_row_requiring_cli_node_is_mapped_and_no_orphans() {
 
 /// Mapping-kind sanity: the OutOfBand row set is pinned to the
 /// leaf-representable sanctioned stdout exceptions — exactly
-/// `["api call", "completions", "edit", "mcp", "lsp"]` (compared as a
+/// `["adopt", "api call", "completions", "edit", "lsp", "mcp"]`
+/// (compared as a
 /// SET: order-free by design, so a routes() re-ordering cannot churn
 /// the pin).
+///
+/// Why `adopt` belongs here (ADOPT-03 justification): the bootstrap
+/// verb's product includes a ONE-TIME plaintext token print (the
+/// env-fallback path) and an env-sourced password — a cockpit screen
+/// persisting either is a redaction violation by construction
+/// (completions/api-call genre: the verb talks to a terminal
+/// consumer, never to a dashboard).
 ///
 /// Why `api call` belongs here (09-03 justification): raw passthrough
 /// to ARBITRARY gateway REST endpoints is not a cockpit verb — there
@@ -173,7 +182,7 @@ fn out_of_band_rows_are_pinned() {
     out_of_band.sort_unstable();
     assert_eq!(
         out_of_band,
-        vec!["api call", "completions", "edit", "lsp", "mcp"],
+        vec!["adopt", "api call", "completions", "edit", "lsp", "mcp"],
         "the OutOfBand set must stay exactly [api call, completions, edit, mcp, lsp] — \
          a new member needs a written justification here AND in routes.rs, \
          landing in the SAME task as its clap command"

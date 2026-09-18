@@ -870,6 +870,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             user,
             key_name,
             level,
+            project,
+            checkout,
+            bake,
         } => match Session::resolve_degraded(cli.profile.as_deref()) {
             Ok(session) => {
                 let name = session.profile_name().to_string();
@@ -881,6 +884,19 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         }),
                         Err(CoreError::SecretUnavailable { profile: name }),
                     );
+                };
+                // Composition credential — resolved ONLY when a
+                // composition flag rides the run (the skip path needs
+                // a working token; the mint path ignores this).
+                let composing =
+                    project.is_some() || checkout.is_some() || bake.is_some();
+                let compose_credential = if composing {
+                    match Session::resolve_credential_opt(cli.profile.as_deref()) {
+                        Ok(credential) => credential,
+                        Err(err) => return (error_profile(&err), Err(err)),
+                    }
+                } else {
+                    None
                 };
                 let opts = actions::adopt::AdoptOptions {
                     username: user.unwrap_or_else(|| "admin".into()),
@@ -897,12 +913,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 .map(|segment| segment.to_string())
                                 .collect()
                         }),
+                    project,
+                    checkout: checkout.map(std::path::PathBuf::from),
+                    bake: bake.map(std::path::PathBuf::from),
                 };
                 let result = actions::adopt::adopt(
                     &url,
                     &name,
                     &ignition_core::config::config_path(),
                     &config::Secret::new(password),
+                    compose_credential.as_ref(),
                     &opts,
                 )
                 .await;

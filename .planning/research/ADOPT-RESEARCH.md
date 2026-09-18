@@ -120,7 +120,7 @@ The UI also sends `gatewayAuditProfile: null` (absent from GET responses) —
 include it or omit it; the server accepted both? (only the with-null variant
 live-observed — keep it).
 
-**PITFALLS (live-discovered, both cost one restore-cycle to confirm):**
+**PITFALLS (live-discovered, all pinned by experiment on the rig):**
 
 1. **The PUT REPLACES the whole config** — `writePermissions` in the body
    overwrites the stored list entirely. Adopt must GET → merge the key's
@@ -130,8 +130,20 @@ live-observed — keep it).
    grants *everyone* write. Checking "Public" in the UI serializes as an
    empty list. Never send `[]` when intending to restrict; conversely, a
    GET-side `[]` means the rig is wide open (this rig was, pre-capture).
-3. Node `description` strings are optional in, echoed out — harmless
-   either way.
+3. **Nested permission entries do NOT admit equal-path tokens** (pinned
+   2026-09-18, the composition live-run): with
+   `writePermissions = [Authenticated>Roles>Administrator]` (the UI's own
+   nested serialization, descriptions present AND absent — both tried), a
+   token granted exactly `Authenticated/Roles/Administrator` gets **403**
+   on writes. With `writePermissions = [{name:"Authenticated",children:[]}]`
+   (the BARE ROOT), the same token gets **200**. Only the ancestor (bare
+   root) form admits descendant-granted tokens. Consequence for adopt:
+   the merge ensures a **bare-root entry** lands (beside any nested
+   entry when present — the fresh-gateway default IS the nested form, so
+   this is the fix that makes a default gateway's writes work for the
+   minted key at all).
+4. Node `description` strings are optional in, echoed out — irrelevant
+   to matching (tried both ways for pitfall 3).
 
 ### Singleton GET response `attributes.lastModification`
 
@@ -197,6 +209,10 @@ research. Every path below live-verified on the 8.3.6 rig:
    Corrected to the singleton route + config-nested parse
    (client/restart.rs + client/mod.rs); live row now shows real wiring.
 
-Not yet in the umbrella (compose on existing verbs, follow-up work):
-`--with-routes` (webdev deploy), the embedded testing bundle (D2),
-`--checkout`, `--bake`.
+Not yet in the umbrella (follow-up work): the embedded testing bundle
+(D2), MCP registration of the adopt tool. Composition (`--project`,
+`--checkout`, `--bake`) LANDED (ADOPT-03): live-verified 2026-09-18 —
+routes (5 deployed, secret lifecycle reused), checkout (3 projects,
+re-run skips existing targets), bake (restore.gwbk 3.7 MB), and the
+pitfall-3 discovery + fix that made the composition path work at all
+(nested-permission 403 → bare-root merge → token writes 200).

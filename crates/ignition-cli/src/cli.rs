@@ -124,7 +124,10 @@ pub enum Commands {
     /// Administrator-level API key (idempotent by name) → wire the
     /// gateway's read/write permissions → live-probe the key →
     /// persist the credential (OS keyring, env-var fallback). Re-run
-    /// on an adopted gateway is an all-skip no-op
+    /// on an adopted gateway is an all-skip no-op. Composition flags
+    /// ride the bootstrap: --project deploys the CLI's WebDev routes,
+    /// --checkout lands every enabled project locally, --bake saves a
+    /// restore-ready gwbk
     Adopt {
         /// Gateway login user for the native OIDC dance
         /// (default: admin)
@@ -139,6 +142,21 @@ pub enum Commands {
         /// (default: Authenticated/Roles/Administrator)
         #[arg(long, value_name = "PATH")]
         level: Option<String>,
+
+        /// Deploy the CLI's WebDev routes (scriptExec on) into this
+        /// project after the bootstrap
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+
+        /// Check out every enabled project into DIR/<project>
+        /// (scripts decoded — grep/lint ready); existing targets skip
+        #[arg(long, value_name = "DIR")]
+        checkout: Option<String>,
+
+        /// Download a roaming gwbk to FILE after everything landed —
+        /// a gateway reset restored from it keeps the key and routes
+        #[arg(long, value_name = "FILE")]
+        bake: Option<String>,
     },
 
     /// Manage gateway projects: list with inheritance info, new, copy,
