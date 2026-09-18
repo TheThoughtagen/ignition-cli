@@ -871,6 +871,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             key_name,
             level,
             project,
+            testing,
             checkout,
             bake,
         } => match Session::resolve_degraded(cli.profile.as_deref()) {
@@ -889,7 +890,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // composition flag rides the run (the skip path needs
                 // a working token; the mint path ignores this).
                 let composing =
-                    project.is_some() || checkout.is_some() || bake.is_some();
+                    project.is_some() || testing || checkout.is_some() || bake.is_some();
                 let compose_credential = if composing {
                     match Session::resolve_credential_opt(cli.profile.as_deref()) {
                         Ok(credential) => credential,
@@ -914,6 +915,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 .collect()
                         }),
                     project,
+                    testing,
                     checkout: checkout.map(std::path::PathBuf::from),
                     bake: bake.map(std::path::PathBuf::from),
                 };
@@ -1490,6 +1492,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             project,
                             with_script_exec,
                             rotate_secret,
+                            with_testing,
                         } => {
                             if mode == RenderMode::Human {
                                 eprintln!("deploying webdev routes to {project} …");
@@ -1501,6 +1504,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 rotate_secret,
                                 &path,
                                 &name,
+                                with_testing,
                             )
                             .await
                             .map(ActionOutput::WebdevDeploy)

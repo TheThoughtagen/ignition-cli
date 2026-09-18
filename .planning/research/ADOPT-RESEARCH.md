@@ -220,27 +220,56 @@ the catalog walk (verified live: tools/list carries it, 87 tools) —
 the env-fallback token riding the JSON result is exactly what agents
 need.
 
-## D2 handoff — the embedded testing bundle (next session)
+## D2 SHIPPED — the 8.3 WebDev reality (live-pinned 2026-09-18/19, same rig)
 
-Source: `/Users/pmannion/whiskeyhouse/agentic-ignition-tooling/scripts/scaffold-testing.sh`
-(1806 lines, heredoc-embedded files; mirrored in ignition-nvim /
-ignition-zed-test plugin copies). The port manifest — 22 of the ~25
-files matter for the embedded bundle (skip the 6 `.ignition-stubs/`
-editor stubs; they stay a plugin concern):
+The testing bundle landed (`webdev/testing/` + `src/webdev/testing.rs`,
+18 members; `webdev deploy --with-testing`; `adopt --project … --testing`
+with the discover-≥1 + green-smoke assertions). The scaffolder's 8.1
+architecture did NOT survive contact with 8.3 — six pitfalls pinned by
+experiment, each a redesign decision:
 
-- 5× `ignition/script-python/testing/<module>/{code.py,resource.json}`
-  for runner, assertions, decorators, helpers, reporter (8.1 layout —
-  the relocation to the 8.3 resource-folder layout is the patch D2
-  retires)
-- WebDev routes `com.inductiveautomation.webdev/resources/testing/run/`
-  (doGet.py genericized project name, doPost.py generic, config.json,
-  resource.json) and `.../testing/tags/` (same four)
+1. **No project-script imports from WebDev.** The route context has NO
+   project-script classloader: bare `import testing.runner`,
+   project-prefixed `__import__("ign-cli.testing.runner")`, and
+   filename imports ALL fail (live ImportError); `sys.path` is pure
+   gateway classpath. `gatewayScriptingProject` (system-properties
+   `config.gatewayScriptingProject`, same singleton PUT shape) does NOT
+   help WebDev routes even after restart. REDESIGN: the route seeds the
+   framework into `sys.modules` by exec'ing the on-disk sources
+   (`ignition/script-python/resources/testing/…` — filesystem access
+   works fine); the runner's `_import_module` gained the same
+   exec-fallback for USER test modules. The Designer/Script-Console
+   path (native imports) is untouched.
+2. **The route file's module namespace is NOT kept — only `doPost`.**
+   Module-level code and helper defs vanish (NameError at call time);
+   a module-level compile failure reads as 501 both-methods-disabled.
+   REDESIGN: every helper nests INSIDE doPost (why the cli routes are
+   giant single functions — now understood as a platform contract).
+3. **Two-method doGet+doPost configs do not register** on live 8.3.6
+   (both methods read disabled → 501); the proven single-method config
+   shape (exactly the cli routes' field set) registers fine. REDESIGN:
+   POST-only routes; discover rides the POST body `{"discover": true}`.
+4. **Jython 2.7 `exec(src, dict)` in a closure with free variables is a
+   SyntaxError** ("unqualified exec is not allowed"); the qualified
+   `exec src in dict` form is required.
+5. **Jython 2.7 source is ASCII by default** — em-dashes in comments
+   break compilation (the repo's cli routes are pure ASCII by
+   accident-or-design; the testing tree now enforces it in tests).
+6. **`[System]Gateway/SystemProperties/DataDirectory` is Bad_NotFound
+   on 8.3** (System tree reorganized). REDESIGN: a data-dir ladder —
+   system tag (8.1) → `./data` (CWD = install root, the docker shape,
+   live-verified `user.dir=/usr/local/bin/ignition`) → CWD-is-data
+   (`./projects` exists) → stock defaults.
+7. **Route-table changes may need a restart** (murky): config.json is
+   hot per request, .py compiles cache across imports, and tonight's
+   broken compiles left the table 501-poisoned until restart. Clean
+   compiles registered immediately on first deploy. The smoke
+   assertions fail loudly if this bites — restart + re-run heals.
 
-Port shape (the webdev bundle precedent): files land under
-`crates/ignition-core/webdev/testing/` (or a sibling), embedded via
-`include_str!`, shipped by `seam::build_deploy_zip` in the 8.3 layout;
-`--testing` on adopt adds the step; the step asserts
-`?discover=true` lists ≥1 module before reporting green (the
-empty-suite trap). The scaffolder's genericized-vs-generic split
-(run/doGet.py carries the project name) becomes a build-time
-substitution on the bundle's deploy path.
+Live-verified end state: `adopt --project ign-cli --testing` →
+`routes OK (7 routes, testing bundle on)` + `testing OK (1 module
+discovered, smoke run 2 passed)`, idempotent re-run green. The
+`testing.__tests__` sentinel ships permanently (the empty-suite trap's
+answer). Note: a testing-only deploy (`--with-testing` WITHOUT
+`--with-script-exec`) OVERWRITES and drops scriptExec — compose both
+flags (adopt's routes step always does).

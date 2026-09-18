@@ -133,6 +133,7 @@ pub async fn webdev_deploy(
     rotate_secret: bool,
     config_path: &Path,
     profile_name: &str,
+    with_testing: bool,
 ) -> Result<WebdevDeployResult, CoreError> {
     // Secret lifecycle first — refuse on an unwritable config store
     // BEFORE touching the gateway.
@@ -165,10 +166,17 @@ pub async fn webdev_deploy(
     // fail-closed guard covers the (true, None) bug case) and import
     // overwrite=true through the 03-02 machinery. NO pre-flight
     // project create (Pitfall 10).
-    let zip = seam::build_deploy_zip(project, with_script_exec, pack_secret.as_deref())?;
+    let zip = seam::build_deploy_zip(project, with_script_exec, pack_secret.as_deref(), with_testing)?;
     let mut routes = seam::always_on_routes();
     if with_script_exec {
         routes.push(SCRIPT_EXEC_ROUTE.to_string());
+    }
+    if with_testing {
+        routes.extend(
+            crate::webdev::testing::TESTING_ROUTES
+                .iter()
+                .map(|route| format!("testing/{route}")),
+        );
     }
     let import = api.project_import(project, zip, true).await?;
 
@@ -733,7 +741,7 @@ mod tests {
                 Ok(ok_import())
             }),
         };
-        let result = webdev_deploy(&rig, "ign-cli", false, false, &config, "dev")
+        let result = webdev_deploy(&rig, "ign-cli", false, false, &config, "dev", false)
             .await
             .expect("plain deploy");
         assert_eq!(
@@ -767,7 +775,7 @@ mod tests {
                 Ok(ok_import())
             }),
         };
-        let result = webdev_deploy(&rig, "ign-cli", true, false, &config, "dev")
+        let result = webdev_deploy(&rig, "ign-cli", true, false, &config, "dev", false)
             .await
             .expect("scriptExec deploy");
         assert_eq!(
@@ -827,7 +835,7 @@ mod tests {
                 Ok(ok_import())
             }),
         };
-        let result = webdev_deploy(&rig, "ign-cli", true, false, &config, "dev")
+        let result = webdev_deploy(&rig, "ign-cli", true, false, &config, "dev", false)
             .await
             .expect("reuse deploy");
         assert!(!result.secret_rotated);
@@ -843,7 +851,7 @@ mod tests {
         );
 
         // --rotate-secret: a fresh 64-char hex replaces it.
-        let result = webdev_deploy(&importing_rig(), "ign-cli", true, true, &config, "dev")
+        let result = webdev_deploy(&importing_rig(), "ign-cli", true, true, &config, "dev", false)
             .await
             .expect("rotate deploy");
         assert!(result.secret_rotated);

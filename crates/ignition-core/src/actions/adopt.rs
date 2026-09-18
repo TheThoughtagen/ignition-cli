@@ -44,6 +44,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::client::GatewayApi;
 use crate::client::adopt::ResourceMutationWire;
@@ -82,6 +83,12 @@ pub struct AdoptOptions {
     /// Deploy the CLI's WebDev routes (scriptExec on) into this
     /// project after the bootstrap (`--project`).
     pub project: Option<String>,
+    /// Ship the embedded TESTING bundle with the routes (`--testing`)
+    /// — the Jython framework + testing/run|tags routes + the smoke
+    /// sentinel; the step ASSERTS discover ≥1 module and a green
+    /// smoke run before reporting (the empty-suite trap). Requires
+    /// `--project`.
+    pub testing: bool,
     /// Check out every ENABLED project into `<dir>/<project>`
     /// (`--checkout`) — scripts decoded, the grep/lint posture.
     pub checkout: Option<std::path::PathBuf>,
@@ -338,7 +345,10 @@ pub async fn adopt(
     //     in the skip path (bootstrap resolved DEGRADED; the mint is
     //     what makes a credential exist). The verbs themselves are
     //     the existing actions, composed verbatim.
-    let composing = opts.project.is_some() || opts.checkout.is_some() || opts.bake.is_some();
+    let composing = opts.project.is_some()
+        || opts.checkout.is_some()
+        || opts.bake.is_some()
+        || opts.testing;
     if composing {
         let credential: Option<Credential> = match &token_for_persist {
             Some(token) => Some(Credential::Token(Secret::new(token.clone()))),
@@ -358,7 +368,8 @@ pub async fn adopt(
         let api = session.api();
 
         // 6. ROUTES — the embedded WebDev bundle, scriptExec on, the
-        //    existing secret lifecycle (persist-before-upload).
+        //    existing secret lifecycle (persist-before-upload); the
+        //    testing bundle rides the SAME import when `--testing`.
         if let Some(project) = &opts.project {
             let deployed = crate::actions::webdev::webdev_deploy(
                 api,
@@ -367,18 +378,74 @@ pub async fn adopt(
                 false,
                 config_path,
                 profile_name,
+                opts.testing,
             )
             .await?;
             steps.push(CheckResult {
                 name: "routes".into(),
                 status: CheckStatus::Ok,
                 detail: format!(
-                    "deployed {} WebDev routes into {project:?} (scriptExec on, secret {})",
+                    "deployed {} WebDev routes into {project:?} (scriptExec on, secret {}{})",
                     deployed.routes.len(),
-                    if deployed.secret_rotated { "generated" } else { "reused" }
+                    if deployed.secret_rotated { "generated" } else { "reused" },
+                    if opts.testing { ", testing bundle on" } else { "" }
                 ),
                 hint: None,
             });
+
+            // 6b. TESTING — the smoke assertions (the empty-suite
+            //     trap): discover must list ≥1 module (the sentinel
+            //     ships with the bundle — zero means the discovery
+            //     walk broke, which is a FAILED deploy, not a green
+            //     one), and the sentinel suite must run green through
+            //     the run route (POST exercises doPost end-to-end).
+            if opts.testing {
+                let discovered = crate::client::webdev::testing_discover(api, project).await?;
+                let count = discovered.get("count").and_then(Value::as_i64).unwrap_or(0);
+                let modules = discovered
+                    .get("discovered_modules")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if count < 1 || modules.is_empty() {
+                    return Err(CoreError::Internal(format!(
+                        "testing deploy is NOT green: ?discover=true listed {} modules \
+                         (expected ≥1 — the testing.__tests__ sentinel ships with the \
+                         bundle; zero means the discovery walk found nothing, the \
+                         empty-suite trap)",
+                        modules.len()
+                    )));
+                }
+                let run = crate::client::webdev::testing_run(
+                    api,
+                    project,
+                    &serde_json::json!({}),
+                )
+                .await?;
+                let passed = run.get("passed").and_then(Value::as_i64).unwrap_or(0);
+                let failed = run.get("failed").and_then(Value::as_i64).unwrap_or(-1);
+                let errors = run.get("errors").and_then(Value::as_i64).unwrap_or(-1);
+                if failed != 0 || errors != 0 || passed < 1 {
+                    return Err(CoreError::Internal(format!(
+                        "testing smoke run is NOT green: passed={passed} failed={failed} \
+                         errors={errors} (the testing.__tests__ sentinel must pass)"
+                    )));
+                }
+                steps.push(CheckResult {
+                    name: "testing".into(),
+                    status: CheckStatus::Ok,
+                    detail: format!(
+                        "framework live: {} module(s) discovered, smoke run {passed} passed",
+                        modules.len()
+                    ),
+                    hint: None,
+                });
+            }
         }
 
         // 7. CHECKOUT — every ENABLED project into <dir>/<project>.

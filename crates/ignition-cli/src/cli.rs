@@ -148,6 +148,13 @@ pub enum Commands {
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
 
+        /// Ship the embedded TESTING bundle with the routes (the
+        /// Jython framework + testing/run|tags routes + the smoke
+        /// sentinel; the step asserts discover ≥1 module and a green
+        /// smoke run — the empty-suite trap)
+        #[arg(long, requires = "project")]
+        testing: bool,
+
         /// Check out every enabled project into DIR/<project>
         /// (scripts decoded — grep/lint ready); existing targets skip
         #[arg(long, value_name = "DIR")]
@@ -650,6 +657,12 @@ pub enum WebdevCommand {
         /// route deployed with the old secret starts refusing)
         #[arg(long, requires = "with_script_exec")]
         rotate_secret: bool,
+        /// Also deploy the embedded TESTING bundle — the Jython test
+        /// framework (testing.runner & co., with the permanent
+        /// testing.__tests__ smoke sentinel) and the testing/run +
+        /// testing/tags WebDev routes
+        #[arg(long)]
+        with_testing: bool,
     },
     /// Probe every route's version handshake — a READ: exit 0
     /// whenever the sweep completes, per-route degradation is data

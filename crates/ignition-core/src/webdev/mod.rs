@@ -20,6 +20,8 @@
 //! before packing it, and keeping it out of the always-on bundle makes an
 //! unsubstituted deploy impossible by construction.
 
+pub mod testing;
+
 /// Version of the embedded route bundle — the `version` handshake action
 /// in every route answers with this value (as `routeVersion`).
 pub const ROUTE_BUNDLE_VERSION: &str = "1.3.0";
