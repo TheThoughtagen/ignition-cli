@@ -210,9 +210,37 @@ research. Every path below live-verified on the 8.3.6 rig:
    (client/restart.rs + client/mod.rs); live row now shows real wiring.
 
 Not yet in the umbrella (follow-up work): the embedded testing bundle
-(D2), MCP registration of the adopt tool. Composition (`--project`,
-`--checkout`, `--bake`) LANDED (ADOPT-03): live-verified 2026-09-18 —
-routes (5 deployed, secret lifecycle reused), checkout (3 projects,
-re-run skips existing targets), bake (restore.gwbk 3.7 MB), and the
-pitfall-3 discovery + fix that made the composition path work at all
-(nested-permission 403 → bare-root merge → token writes 200).
+(D2). Composition (`--project`, `--checkout`, `--bake`) LANDED
+(ADOPT-03): live-verified 2026-09-18 — routes (5 deployed, secret
+lifecycle reused), checkout (3 projects, re-run skips existing
+targets), bake (restore.gwbk 3.7 MB), and the pitfall-3 discovery +
+fix that made the composition path work at all (nested-permission 403
+→ bare-root merge → token writes 200). MCP: adopt auto-registered by
+the catalog walk (verified live: tools/list carries it, 87 tools) —
+the env-fallback token riding the JSON result is exactly what agents
+need.
+
+## D2 handoff — the embedded testing bundle (next session)
+
+Source: `/Users/pmannion/whiskeyhouse/agentic-ignition-tooling/scripts/scaffold-testing.sh`
+(1806 lines, heredoc-embedded files; mirrored in ignition-nvim /
+ignition-zed-test plugin copies). The port manifest — 22 of the ~25
+files matter for the embedded bundle (skip the 6 `.ignition-stubs/`
+editor stubs; they stay a plugin concern):
+
+- 5× `ignition/script-python/testing/<module>/{code.py,resource.json}`
+  for runner, assertions, decorators, helpers, reporter (8.1 layout —
+  the relocation to the 8.3 resource-folder layout is the patch D2
+  retires)
+- WebDev routes `com.inductiveautomation.webdev/resources/testing/run/`
+  (doGet.py genericized project name, doPost.py generic, config.json,
+  resource.json) and `.../testing/tags/` (same four)
+
+Port shape (the webdev bundle precedent): files land under
+`crates/ignition-core/webdev/testing/` (or a sibling), embedded via
+`include_str!`, shipped by `seam::build_deploy_zip` in the 8.3 layout;
+`--testing` on adopt adds the step; the step asserts
+`?discover=true` lists ≥1 module before reporting green (the
+empty-suite trap). The scaffolder's genericized-vs-generic split
+(run/doGet.py carries the project name) becomes a build-time
+substitution on the bundle's deploy path.
