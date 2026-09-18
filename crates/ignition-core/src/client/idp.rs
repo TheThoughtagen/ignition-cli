@@ -546,3 +546,114 @@ fn query_param(path_and_query: &str, name: &str) -> Option<String> {
         (key == name).then(|| value.to_string())
     })
 }
+
+// --- The session-tier generic helpers (ADOPT-01) -----------------------
+//
+// The adopt capability (client/adopt.rs) needs GET/POST/PUT against
+// /data routes on the SAME session+CSRF footing as the trial reset,
+// but lives outside this module (wire models + tests of its own). The
+// three helpers below are the minimal pub(crate) surface: session
+// cookie + X-CSRF-Token + JSON in/out, the trial-reset error
+// classification verbatim (401/403 auth-class; other non-2xx flow
+// failures with the Jetty title sniff; non-JSON shape failures).
+// Response-body verdicts (success:false and friends) belong to the
+// CALLER — these helpers only move JSON.
+
+impl IdpLoginFlow {
+    /// GET `path?pairs` on the session tier → JSON.
+    pub(crate) async fn session_get_json(
+        &self,
+        session: &GatewaySession,
+        path: &str,
+        pairs: &[(&str, &str)],
+    ) -> Result<serde_json::Value, CoreError> {
+        let mut url = self.url_for(path);
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        let request = self
+            .client
+            .get(url.clone())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::COOKIE, session.cookie_header());
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        self.session_finish(url.as_str(), response).await
+    }
+
+    /// POST `path` with a JSON body on the session tier → JSON.
+    pub(crate) async fn session_post_json(
+        &self,
+        session: &GatewaySession,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.session_send(reqwest::Method::POST, session, path, Some(body))
+            .await
+    }
+
+    /// PUT `path` with a JSON body on the session tier → JSON.
+    pub(crate) async fn session_put_json(
+        &self,
+        session: &GatewaySession,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.session_send(reqwest::Method::PUT, session, path, Some(body))
+            .await
+    }
+
+    async fn session_send(
+        &self,
+        method: reqwest::Method,
+        session: &GatewaySession,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, CoreError> {
+        let url = self.url_for(path);
+        let mut request = self
+            .client
+            .request(method, url.clone())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::COOKIE, session.cookie_header())
+            .header("X-CSRF-Token", &session.csrf_token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        self.session_finish(url.as_str(), response).await
+    }
+
+    /// The shared verdict: 401/403 auth-class; other non-2xx flow
+    /// failure (title sniff); 2xx must be JSON.
+    async fn session_finish(
+        &self,
+        path: &str,
+        response: reqwest::Response,
+    ) -> Result<serde_json::Value, CoreError> {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        if status == 401 || status == 403 {
+            return Err(CoreError::Auth {
+                status,
+                endpoint: Some(path.to_string()),
+            });
+        }
+        if !(200..300).contains(&status) {
+            return Err(IdpLoginFlow::flow_error(
+                "session request",
+                format!("HTTP {status} ({})", IdpLoginFlow::html_title_or_excerpt(&text)),
+            ));
+        }
+        serde_json::from_str(&text).map_err(|err| {
+            CoreError::Internal(format!(
+                "session response from {path} was not JSON ({err})"
+            ))
+        })
+    }
+}

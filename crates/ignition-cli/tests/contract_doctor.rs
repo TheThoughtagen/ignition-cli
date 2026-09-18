@@ -62,9 +62,16 @@ fn healthy_gateway_info() -> serde_json::Value {
 /// The default security-properties singleton (the research's verified
 /// default wiring: only the Administrator role level).
 fn security_properties_body() -> serde_json::Value {
+    // The LIVE 8.3.6 singleton shape (ADOPT-RESEARCH §2): a resource
+    // record wrapping the config — permissions nested under `config`.
     serde_json::json!({
-        "readPermissions": {"anyOf": ["Authenticated/Roles/Administrator"]},
-        "writePermissions": {"anyOf": ["Authenticated/Roles/Administrator"]}
+        "type": "ignition/security-properties",
+        "signature": "dee8c946",
+        "collection": "core",
+        "config": {
+            "readPermissions": {"anyOf": ["Authenticated/Roles/Administrator"]},
+            "writePermissions": {"anyOf": ["Authenticated/Roles/Administrator"]}
+        }
     })
 }
 
@@ -112,7 +119,7 @@ async fn doctor_healthy_gateway_golden() {
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(
-            "/data/api/v1/resources/ignition/security-properties",
+            "/data/api/v1/resources/singleton/ignition/security-properties",
         ))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(security_properties_body()),
@@ -224,10 +231,10 @@ async fn doctor_403_three_part_hint_and_permissions_golden() {
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(
-            "/data/api/v1/resources/ignition/security-properties",
+            "/data/api/v1/resources/singleton/ignition/security-properties",
         ))
         .respond_with(wiremock::ResponseTemplate::new(403).set_body_raw(
-            jetty_error_html(403, "/data/api/v1/resources/ignition/security-properties"),
+            jetty_error_html(403, "/data/api/v1/resources/singleton/ignition/security-properties"),
             "text/html;charset=iso-8859-1",
         ))
         .expect(1..)
@@ -329,7 +336,7 @@ async fn doctor_json_shape_and_flags() {
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(
-            "/data/api/v1/resources/ignition/security-properties",
+            "/data/api/v1/resources/singleton/ignition/security-properties",
         ))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(security_properties_body()),
@@ -458,7 +465,7 @@ async fn doctor_healthy_json_golden() {
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(
-            "/data/api/v1/resources/ignition/security-properties",
+            "/data/api/v1/resources/singleton/ignition/security-properties",
         ))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(security_properties_body()),

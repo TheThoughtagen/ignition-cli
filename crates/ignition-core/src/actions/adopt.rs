@@ -1,0 +1,405 @@
+//! The adopt action (ADOPT-02) — one idempotent verb that walks a
+//! commissioned-but-unadopted gateway to a fully working profile:
+//! native login → API-key mint (idempotent by name) → permissions
+//! wiring → live probe → credential persistence.
+//!
+//! POSTURE (the proposal's contract, doctor-flavored): each step
+//! reports as a data row — `{name, status, detail, hint}` on the
+//! doctor's `CheckResult` shape, so rendering comes free — but unlike
+//! doctor this verb MUTATES: a step that fails is a hard error
+//! (the taxonomy's exit codes), never a skipped-ahead table. Steps
+//! already satisfied report `skip`; adopt re-run on an adopted
+//! gateway is a four-row all-green no-op.
+//!
+//! THE BOOTSTRAP ORDER (why session-tier): adopt runs BEFORE any API
+//! token exists, so every gateway call rides the native OIDC login
+//! (`client::idp` — the trial-reset machinery) — the only credential
+//! path that can mint the first key. Wire shapes + pitfalls:
+//! `client/adopt.rs` + `.planning/research/ADOPT-RESEARCH.md`.
+//!
+//! STEP MAP (ADOPT-01's capture):
+//!
+//! 1. `login` — the OIDC dance → `GatewaySession` (cookie + CSRF).
+//! 2. `key` — find-by-name in the api-token resource list; mint when
+//!    absent (`generate` → `create`), skip when present and sane,
+//!    refuse honestly when present but misconfigured (a secure-only
+//!    key on an http gateway cannot be repaired — the plaintext is
+//!    unrecoverable by construction).
+//! 3. `permissions` — read-modify-write the security-properties
+//!    singleton: ADD the key's level root to read+write AnyOf lists
+//!    (never remove — the replace-semantics + []-is-Public pitfalls),
+//!    signature riding verbatim.
+//! 4. `probe` — gateway-info with the freshly minted name:key; the
+//!    live end-to-end proof (mint-to-200 same second, live-observed).
+//! 5. `persist` — keyring first (`auth = { keyring = "profile:…" }`,
+//!    zero exposure — better than webdev's 0600 config slot), env-var
+//!    fallback (`IGNITION_TOKEN_<PROFILE>` + the one-time `token`
+//!    exposure in the result — the ONLY place the plaintext ever
+//!    prints, and only when no keyring exists to hold it).
+//!
+//! Steps 3–5 only run in the mint path; a found key means the
+//! profile's existing credential already works (that's how the find
+//! got there) — adopt never touches a satisfied profile's auth.
+
+use std::path::Path;
+
+use serde::Serialize;
+
+use crate::client::GatewayApi;
+use crate::client::adopt::ResourceMutationWire;
+use crate::client::adopt::build_security_put_body;
+use crate::client::adopt::build_token_create_body;
+use crate::client::adopt::create_api_token_via_session;
+use crate::client::adopt::generate_api_key_via_session;
+use crate::client::adopt::level_tree;
+use crate::client::adopt::merge_level_into;
+use crate::client::adopt::put_security_properties_via_session;
+use crate::client::adopt::security_properties_via_session;
+use crate::client::adopt::api_tokens_via_session;
+use crate::client::idp;
+use crate::client::idp::GatewaySession;
+use crate::client::idp::IdpLoginFlow;
+use crate::config;
+use crate::config::AuthRef;
+use crate::config::Credential;
+use crate::config::KeyringStore;
+use crate::config::Secret;
+use crate::error::CoreError;
+use crate::actions::doctor::CheckResult;
+use crate::actions::doctor::CheckStatus;
+
+/// Adopt options — the CLI seam's defaults land here.
+#[derive(Debug, Clone)]
+pub struct AdoptOptions {
+    /// The gateway login user (the OIDC dance's `username`).
+    pub username: String,
+    /// The API-key name — the idempotency key AND half of the auth
+    /// header value (`<name>:<key>`).
+    pub key_name: String,
+    /// The granted security-level PATH segments, root first —
+    /// `["Authenticated", "Roles", "Administrator"]` by CLI default.
+    pub level: Vec<String>,
+}
+
+/// The adopt result — step rows + (only when a key was minted AND no
+/// keyring exists) the one-time token exposure.
+#[derive(Debug, Serialize)]
+pub struct AdoptResult {
+    /// The API-key name adopted under.
+    pub key_name: String,
+    /// `"name:key"` — THE one-time plaintext exposure, present ONLY
+    /// when a key was minted and no keyring could hold it (headless
+    /// hosts). The deliberate, single-site exception to the Secret
+    /// discipline: the env-var fallback route requires the user to
+    /// learn the string exactly once, here. Never logged, never
+    /// persisted by the CLI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// How the profile authenticates after adopt: `"keyring"` or
+    /// `"token_env:IGNITION_TOKEN_<PROFILE>"` (the fallback the
+    /// result's token feeds). `None` when nothing was changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored: Option<String>,
+    /// The step rows, execution order (login, key, permissions,
+    /// probe, persist).
+    pub steps: Vec<CheckResult>,
+}
+
+/// The default API-key name — the CLI's key, clear ownership on any
+/// gateway it lands on.
+pub const DEFAULT_KEY_NAME: &str = "ign-cli";
+
+/// The default granted level path — Administrator (the proposal's
+/// posture; gateway-default read/write permissions include it).
+pub const DEFAULT_LEVEL: &[&str] = &["Authenticated", "Roles", "Administrator"];
+
+/// The adopt walk. `base_url` is the profile's gateway URL; the
+/// config rewrite lands in `config_path`'s file.
+pub async fn adopt(
+    base_url: &str,
+    profile_name: &str,
+    config_path: &Path,
+    password: &Secret,
+    opts: &AdoptOptions,
+) -> Result<AdoptResult, CoreError> {
+    let mut steps: Vec<CheckResult> = Vec::new();
+    let level_path: Vec<&str> = opts.level.iter().map(String::as_str).collect();
+
+    // 1. LOGIN — the OIDC dance. Hard error on failure (adopt cannot
+    //    proceed without the bootstrap credential).
+    let flow = IdpLoginFlow::new(base_url)?;
+    let (flow, session) = idp::login(flow, &opts.username, password).await?;
+    steps.push(CheckResult {
+        name: "login".into(),
+        status: CheckStatus::Ok,
+        detail: format!("native OIDC session as {}", opts.username),
+        hint: None,
+    });
+
+    // 2. KEY — find-by-name, mint when absent.
+    let tokens = api_tokens_via_session(&flow, &session).await?;
+    let existing = tokens.iter().find(|record| record.name == opts.key_name);
+    let minted: Option<String> = match existing {
+        Some(record) => {
+            // Present: the honest idempotent path refuses a key we
+            // cannot verify usable — its plaintext is unrecoverable
+            // by construction, so a secure-only or disabled key is a
+            // delete-and-rerun, never a silent skip.
+            if !record.enabled {
+                return Err(CoreError::Internal(format!(
+                    "API key {:?} exists but is disabled — delete it in the gateway UI \
+                     (Platform → Security → API Keys) and re-run adopt",
+                    opts.key_name
+                )));
+            }
+            if record.config.profile.secure_channel_required {
+                return Err(CoreError::Internal(format!(
+                    "API key {:?} exists but requires secure connections — it cannot \
+                     authenticate over http; delete it in the gateway UI and re-run adopt",
+                    opts.key_name
+                )));
+            }
+            let level_names: Vec<String> = record
+                .config
+                .profile
+                .security_levels
+                .iter()
+                .map(crate::client::adopt::level_path_string)
+                .collect();
+            steps.push(CheckResult {
+                name: "key".into(),
+                status: CheckStatus::Skip,
+                detail: format!(
+                    "API key {:?} already present (level {:?}, secure off) — nothing minted",
+                    opts.key_name, level_names
+                ),
+                hint: None,
+            });
+            None
+        }
+        None => {
+            let token = mint(&flow, &session, &opts.key_name, &level_path).await?;
+            steps.push(CheckResult {
+                name: "key".into(),
+                status: CheckStatus::Ok,
+                detail: format!(
+                    "minted API key {:?} at {} (secure connections off)",
+                    opts.key_name,
+                    opts.level.join("/")
+                ),
+                hint: None,
+            });
+            Some(token)
+        }
+    };
+
+    // 3. PERMISSIONS — add-if-missing in read+write (merge-only; the
+    //    PUT replaces the whole singleton, the signature rides
+    //    verbatim). Runs in BOTH paths: a found key can still be
+    //    locked out by permissions (doctor's part-2 finding).
+    let singleton = security_properties_via_session(&flow, &session).await?;
+    let mut config = singleton.config.clone();
+    let level = level_tree(&level_path);
+    let changed_read = merge_level_into(&mut config, "readPermissions", &level);
+    let changed_write = merge_level_into(&mut config, "writePermissions", &level);
+    if changed_read || changed_write {
+        let body = build_security_put_body(&singleton, &config);
+        let answer = put_security_properties_via_session(&flow, &session, &body).await?;
+        if !answer.success {
+            return Err(CoreError::Internal(format!(
+                "security-properties write refused: {:?}",
+                answer.problem
+            )));
+        }
+        steps.push(CheckResult {
+            name: "permissions".into(),
+            status: CheckStatus::Ok,
+            detail: format!(
+                "wired {} into gateway read/write permissions ({}added)",
+                opts.level.join("/"),
+                if changed_read && changed_write {
+                    "both "
+                } else {
+                    ""
+                }
+            ),
+            hint: None,
+        });
+    } else {
+        steps.push(CheckResult {
+            name: "permissions".into(),
+            status: CheckStatus::Skip,
+            detail: format!(
+                "gateway permissions already admit {} — nothing written",
+                opts.level.join("/")
+            ),
+            hint: None,
+        });
+    }
+
+    // 4. PROBE — only provable with a plaintext in hand (the mint
+    //    path); a pre-existing key is probed by the profile's own
+    //    credential elsewhere (`ign doctor`).
+    let mut token_for_persist: Option<String> = None;
+    match minted {
+        Some(token) => {
+            let url: url::Url = base_url
+                .parse()
+                .map_err(|err| CoreError::Internal(format!("invalid gateway URL: {err}")))?;
+            let probe = crate::session::Session::for_url(
+                url,
+                Some(Credential::Token(Secret::new(token.clone()))),
+                true,
+            )?;
+            probe.api().gateway_info().await?;
+            steps.push(CheckResult {
+                name: "probe".into(),
+                status: CheckStatus::Ok,
+                detail: "gateway-info answered 200 with the fresh name:key — the key works"
+                    .into(),
+                hint: None,
+            });
+            token_for_persist = Some(token);
+        }
+        None => steps.push(CheckResult {
+            name: "probe".into(),
+            status: CheckStatus::Skip,
+            detail: "key pre-existed — probe with `ign doctor` on this profile".into(),
+            hint: None,
+        }),
+    }
+
+    // 5. PERSIST — keyring first; env fallback prints the token ONCE.
+    let (stored, exposed): (Option<String>, Option<String>) = match &token_for_persist {
+        None => (None, None),
+        Some(token) => {
+            let keyring = KeyringStore;
+            match keyring.set(profile_name, &Secret::new(token.clone())) {
+                Ok(()) => {
+                    rewrite_profile_auth(config_path, profile_name, AuthRef::Keyring {
+                        keyring: format!("profile:{profile_name}"),
+                    })?;
+                    (Some("keyring".into()), None)
+                }
+                Err(err) => {
+                    // Headless hosts (no D-Bus keyring) are EXPECTED —
+                    // the documented fallback: env var + one print.
+                    tracing::debug!(error = %err, "keyring unavailable; env fallback");
+                    let var = format!(
+                        "IGNITION_TOKEN_{}",
+                        super_profile_env_suffix(profile_name)
+                    );
+                    rewrite_profile_auth(config_path, profile_name, AuthRef::TokenEnv {
+                        token_env: var.clone(),
+                    })?;
+                    (Some(format!("token_env:{var}")), Some(token.clone()))
+                }
+            }
+        }
+    };
+    match &stored {
+        Some(how) if token_for_persist.is_some() => steps.push(CheckResult {
+            name: "persist".into(),
+            status: CheckStatus::Ok,
+            detail: match exposed {
+                Some(_) => format!(
+                    "profile now expects {} (no keyring on this host) — export it \
+                     with the token from this run's output",
+                    how
+                ),
+                None => format!("credential stored in the OS keyring — profile {how:?} wired"),
+            },
+            hint: exposed.as_ref().map(|_| "export the token now; it is never shown again".into()),
+        }),
+        _ => steps.push(CheckResult {
+            name: "persist".into(),
+            status: CheckStatus::Skip,
+            detail: "profile auth untouched (key pre-existed)".into(),
+            hint: None,
+        }),
+    }
+
+    Ok(AdoptResult {
+        key_name: opts.key_name.clone(),
+        token: exposed,
+        stored,
+        steps,
+    })
+}
+
+/// Steps 2's mint: generate the key material, create the resource,
+/// verify the gateway's own verdict. The plaintext rides the return
+/// value to the ONE exposure site (persist / result).
+async fn mint(
+    flow: &IdpLoginFlow,
+    session: &GatewaySession,
+    key_name: &str,
+    level_path: &[&str],
+) -> Result<String, CoreError> {
+    let generated = generate_api_key_via_session(flow, session).await?;
+    if generated.key.is_empty() || generated.hash.is_empty() {
+        return Err(CoreError::Internal(
+            "api-token generate answered an empty key or hash".into(),
+        ));
+    }
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_millis() as i64;
+    let body = build_token_create_body(
+        key_name,
+        &level_tree(level_path),
+        &generated.hash,
+        timestamp_ms,
+    );
+    let answer: ResourceMutationWire = create_api_token_via_session(flow, session, &body).await?;
+    if !answer.success
+        || !answer
+            .changes
+            .iter()
+            .any(|change| change.name == key_name && change.kind == crate::client::adopt::API_TOKEN_TYPE)
+    {
+        return Err(CoreError::Internal(format!(
+            "api-token create refused: success={} problem={:?}",
+            answer.success, answer.problem
+        )));
+    }
+    Ok(format!("{key_name}:{}", generated.key))
+}
+
+/// Rewrite one profile's `auth` in the config file (0600 re-asserted
+/// by the save path — the webdev-secret precedent).
+fn rewrite_profile_auth(
+    config_path: &Path,
+    profile_name: &str,
+    auth: AuthRef,
+) -> Result<(), CoreError> {
+    let mut config = config::load(config_path)?;
+    let profile = config
+        .profiles
+        .get_mut(profile_name)
+        .ok_or_else(|| CoreError::Internal(format!(
+            "profile {profile_name:?} vanished from the config mid-adopt"
+        )))?;
+    profile.auth = auth;
+    config::save(config_path, &config)
+}
+
+/// The env-suffix rule (config::secret's mapping, verbatim import —
+/// one home, never restated): profile uppercased, non-alphanumeric
+/// → `_`.
+fn super_profile_env_suffix(profile: &str) -> String {
+    config::secret::profile_env_suffix(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_KEY_NAME, DEFAULT_LEVEL};
+
+    /// The locked defaults — Administrator, the CLI-owned key name.
+    #[test]
+    fn defaults_are_the_administrator_posture() {
+        assert_eq!(DEFAULT_KEY_NAME, "ign-cli");
+        assert_eq!(DEFAULT_LEVEL, &["Authenticated", "Roles", "Administrator"]);
+    }
+}

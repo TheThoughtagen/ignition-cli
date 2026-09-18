@@ -30,9 +30,13 @@ pub(crate) const SCAN_PROJECTS_PATH: &str = "/data/api/v1/scan/projects";
 /// GET path of the security-properties config singleton — the doctor's
 /// permissions deep-dive (02-RESEARCH §Doctor inputs 5b; the resource
 /// singleton read, same family 02-03 verified for the connection
-/// lists).
+/// lists). LIVE-CORRECTED 2026-09-18 (ADOPT-RESEARCH §2): the
+/// previously used non-singleton spelling
+/// `/resources/ignition/security-properties` is the PUT target and
+/// 404s as a GET on live 8.3.6 — the read is the SINGLETON route with
+/// `?defaultIfUndefined=true`.
 pub(crate) const SECURITY_PROPERTIES_PATH: &str =
-    "/data/api/v1/resources/ignition/security-properties";
+    "/data/api/v1/resources/singleton/ignition/security-properties";
 
 /// Root of the WebDev route surface — doctor probes
 /// `/system/webdev/<route>` for presence (404 = absent).
@@ -82,12 +86,40 @@ mod tests {
     fn doctor_probe_paths_pinned() {
         assert_eq!(
             super::SECURITY_PROPERTIES_PATH,
-            "/data/api/v1/resources/ignition/security-properties"
+            "/data/api/v1/resources/singleton/ignition/security-properties"
         );
         assert_eq!(super::WEBDEV_ROOT, "/system/webdev/");
         assert_eq!(super::SCAN_PROJECTS_PATH, "/data/api/v1/scan/projects");
         assert_eq!(super::RESTART_PATH, "/data/api/v1/restart-tasks/restart");
         assert_eq!(webdev_route_path("stacked"), "/system/webdev/stacked");
+    }
+
+    /// THE live-capture regression (ADOPT-RESEARCH §2, 8.3.6 rig):
+    /// the singleton record nests the permissions under `config` —
+    /// the client impl deserializes from there.
+    #[test]
+    fn security_properties_parses_the_live_singleton_capture() {
+        let record: serde_json::Value = serde_json::json!({
+            "type": "ignition/security-properties",
+            "signature": "dee8c946",
+            "config": {
+                "forceIdpAuth": true,
+                "readPermissions": {
+                    "type": "AnyOf",
+                    "securityLevels": [ { "name": "Authenticated", "children": [] } ]
+                },
+                "writePermissions": {
+                    "type": "AnyOf",
+                    "securityLevels": [ { "name": "Authenticated", "children": [] } ]
+                }
+            }
+        });
+        let config = record.get("config").cloned().unwrap_or(record);
+        let props: SecurityProperties = serde_json::from_value(config)
+            .expect("the live singleton config must parse");
+        assert!(props.read_permissions.is_some());
+        assert!(props.write_permissions.is_some());
+        assert!(props.extra.contains_key("forceIdpAuth"));
     }
 
     /// The singleton parses with both permission blocks surfaced under

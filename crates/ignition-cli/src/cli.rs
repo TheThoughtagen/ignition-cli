@@ -120,6 +120,27 @@ pub enum Commands {
         webdev_route: Option<String>,
     },
 
+    /// Adopt this profile's gateway: native login → mint an
+    /// Administrator-level API key (idempotent by name) → wire the
+    /// gateway's read/write permissions → live-probe the key →
+    /// persist the credential (OS keyring, env-var fallback). Re-run
+    /// on an adopted gateway is an all-skip no-op
+    Adopt {
+        /// Gateway login user for the native OIDC dance
+        /// (default: admin)
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+
+        /// The API-key name — the idempotency key (default: ign-cli)
+        #[arg(long, value_name = "NAME")]
+        key_name: Option<String>,
+
+        /// The granted security level as a slash path
+        /// (default: Authenticated/Roles/Administrator)
+        #[arg(long, value_name = "PATH")]
+        level: Option<String>,
+    },
+
     /// Manage gateway projects: list with inheritance info, new, copy,
     /// rename, set (reparent), delete, export/import (ZIP)
     #[command(arg_required_else_help = true)]

@@ -92,8 +92,10 @@ impl SecretStore for EnvStore {
 }
 
 /// Profile name → env-var-safe uppercase suffix: non-alphanumeric
-/// characters become `_` (`my-rig` → `MY_RIG`).
-fn profile_env_suffix(profile: &str) -> String {
+/// characters become `_` (`my-rig` → `MY_RIG`). `pub(crate)` since
+/// ADOPT-02: the adopt action names the fallback env var with the
+/// SAME rule (one home — never restated).
+pub(crate) fn profile_env_suffix(profile: &str) -> String {
     profile
         .chars()
         .map(|c| {

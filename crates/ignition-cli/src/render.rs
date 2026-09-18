@@ -213,6 +213,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::RestartWait(result) => render_restart_wait_human(result),
         ActionOutput::Wait(result) => render_wait_human(result),
         ActionOutput::Doctor(result) => render_doctor_human(result),
+        ActionOutput::Adopt(result) => render_adopt_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -758,6 +759,38 @@ fn render_doctor_human(result: &ignition_core::actions::doctor::DoctorResult) {
         summary.push_str(&format!(", {skip} skip"));
     }
     println!("{summary}");
+}
+
+/// `ign adopt` human table: the doctor's step-row format (name
+/// STATUS detail, hints under), then the credential outcome — and,
+/// ONLY on the env-var fallback (no keyring), the one-time
+/// `name:key` print: the plaintext appears here and nowhere else,
+/// ever (the deliberate exposure site; ADOPT-02).
+fn render_adopt_human(result: &ignition_core::actions::adopt::AdoptResult) {
+    use ignition_core::actions::doctor::CheckStatus;
+    for step in &result.steps {
+        let status = match step.status {
+            CheckStatus::Ok => "OK",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+            CheckStatus::Skip => "SKIP",
+        };
+        println!("{:<12}  {:<4}  {}", step.name, status, step.detail);
+        if let Some(hint) = &step.hint {
+            println!("  hint: {hint}");
+        }
+    }
+    match (&result.stored, &result.token) {
+        (Some(how), _) => println!("credential: {how}"),
+        (None, _) => println!("credential: unchanged (key pre-existed)"),
+    }
+    if let Some(token) = &result.token {
+        // THE one-time exposure (env-fallback only): boxed loudly so
+        // it is impossible to miss, and never repeated anywhere.
+        println!();
+        println!("API token (shown ONCE — store it now):");
+        println!("  {token}");
+    }
 }
 
 /// `ign project list` human rows: `name  title  enabled  parent

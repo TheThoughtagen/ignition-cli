@@ -32,6 +32,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+pub mod adopt;
 pub mod apicall;
 pub mod backup;
 mod classify;
@@ -1099,8 +1100,23 @@ impl GatewayApi for ReqwestGatewayApi {
     }
 
     async fn security_properties(&self) -> Result<SecurityProperties, CoreError> {
-        self.get_json(restart::SECURITY_PROPERTIES_PATH, None, true)
-            .await
+        // The singleton READ (ADOPT-RESEARCH §2, live-corrected): the
+        // record nests the permissions under `config` — deserialize
+        // from there, tolerating a legacy flat record (config absent
+        // → the record itself parses).
+        let record: serde_json::Value = self
+            .get_json(
+                restart::SECURITY_PROPERTIES_PATH,
+                Some(&[("defaultIfUndefined".to_string(), "true".to_string())]),
+                true,
+            )
+            .await?;
+        let config = record.get("config").cloned().unwrap_or(record);
+        serde_json::from_value(config).map_err(|err| {
+            CoreError::Internal(format!(
+                "security-properties did not match the expected shape: {err}"
+            ))
+        })
     }
 
     async fn webdev_route_status(&self, route: &str) -> Result<u16, CoreError> {
