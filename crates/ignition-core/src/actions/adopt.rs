@@ -400,7 +400,21 @@ pub async fn adopt(
             //     one), and the sentinel suite must run green through
             //     the run route (POST exercises doPost end-to-end).
             if opts.testing {
-                let discovered = crate::client::webdev::testing_discover(api, project).await?;
+                // First-touch warmup (live-pinned, both on the reset
+                // rig and the fresh-gateway run): a freshly deployed
+                // route can answer 500 on its FIRST request while
+                // WebDev lazily compiles the module — the second hit
+                // answers. One bounded retry, then the error is real.
+                let discover = |() | {
+                    crate::client::webdev::testing_discover(api, project)
+                };
+                let discovered = match discover(()).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        discover(()).await?
+                    }
+                };
                 let count = discovered.get("count").and_then(Value::as_i64).unwrap_or(0);
                 let modules = discovered
                     .get("discovered_modules")

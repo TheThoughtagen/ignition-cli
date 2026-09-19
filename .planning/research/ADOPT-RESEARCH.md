@@ -265,6 +265,25 @@ experiment, each a redesign decision:
    broken compiles left the table 501-poisoned until restart. Clean
    compiles registered immediately on first deploy. The smoke
    assertions fail loudly if this bites — restart + re-run heals.
+   **RESOLVED 2026-09-19 (the fresh-gateway proof)**: `rig reset` →
+   auto-commissioned fresh volume (the compose env vars commission
+   automatically on 8.3.6 — no wizard needed) → ONE `adopt --project
+   … --testing --checkout --bake` → ALL rows OK on first execution:
+   mint, permissions (the bare-root merge fired against true factory
+   defaults — both read+write), probe, keyring persist, 7 routes on a
+   nonexistent project, testing green, checkout, bake. **No restart
+   needed.** The one first-touch artifact: the freshly deployed
+   testing route can 500 its FIRST request while WebDev lazily
+   compiles (second hit answers — live-pinned twice); the testing
+   step now retries once after 3 s (ADOPT-04 fix).
+
+**Operational trap (user-space, bit this session twice)**: a stale
+`IGNITION_TOKEN` exported in the shell SHADOWS the keyring (env-first
+chain, by design) — after any gateway reset the old token 401s
+confusingly while the keyring holds a working key. `unset
+IGNITION_TOKEN` or re-adopt heals. A doctor enhancement candidate:
+when the chain resolved an env token AND it 401s, name the env var
+specifically in the hint.
 
 Live-verified end state: `adopt --project ign-cli --testing` →
 `routes OK (7 routes, testing bundle on)` + `testing OK (1 module
