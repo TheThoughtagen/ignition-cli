@@ -177,6 +177,21 @@ impl Session {
         })
     }
 
+    /// Resolve ONLY a credential for a selection — the adopt
+    /// composition path (ADOPT-03): the bootstrap resolves DEGRADED
+    /// (the OIDC dance needs no token), while the post-bootstrap
+    /// steps (`--project`/`--checkout`/`--bake`) need a working token
+    /// when the key step SKIPPED (the mint path already holds the
+    /// fresh key). Same overlay → selection → LOCKED chain as
+    /// [`Self::resolve_degraded`], no client construction.
+    pub fn resolve_credential_opt(
+        profile_flag: Option<&str>,
+    ) -> Result<Option<Credential>, CoreError> {
+        let mut config = config::load(&config::config_path())?;
+        let (name, profile) = resolve_selected(&mut config, profile_flag)?;
+        resolve_secret_opt(&name, &profile.auth)
+    }
+
     /// Headerless-BY-CONSTRUCTION client for the rig family: a caller-
     /// derived gateway URL (never a profile's), an explicit optional
     /// credential, and the caller's `ssl_verify` (rig probes use

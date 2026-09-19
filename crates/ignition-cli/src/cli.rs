@@ -120,6 +120,52 @@ pub enum Commands {
         webdev_route: Option<String>,
     },
 
+    /// Adopt this profile's gateway: native login → mint an
+    /// Administrator-level API key (idempotent by name) → wire the
+    /// gateway's read/write permissions → live-probe the key →
+    /// persist the credential (OS keyring, env-var fallback). Re-run
+    /// on an adopted gateway is an all-skip no-op. Composition flags
+    /// ride the bootstrap: --project deploys the CLI's WebDev routes,
+    /// --checkout lands every enabled project locally, --bake saves a
+    /// restore-ready gwbk
+    Adopt {
+        /// Gateway login user for the native OIDC dance
+        /// (default: admin)
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+
+        /// The API-key name — the idempotency key (default: ign-cli)
+        #[arg(long, value_name = "NAME")]
+        key_name: Option<String>,
+
+        /// The granted security level as a slash path
+        /// (default: Authenticated/Roles/Administrator)
+        #[arg(long, value_name = "PATH")]
+        level: Option<String>,
+
+        /// Deploy the CLI's WebDev routes (scriptExec on) into this
+        /// project after the bootstrap
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+
+        /// Ship the embedded TESTING bundle with the routes (the
+        /// Jython framework + testing/run|tags routes + the smoke
+        /// sentinel; the step asserts discover ≥1 module and a green
+        /// smoke run — the empty-suite trap)
+        #[arg(long, requires = "project")]
+        testing: bool,
+
+        /// Check out every enabled project into DIR/<project>
+        /// (scripts decoded — grep/lint ready); existing targets skip
+        #[arg(long, value_name = "DIR")]
+        checkout: Option<String>,
+
+        /// Download a roaming gwbk to FILE after everything landed —
+        /// a gateway reset restored from it keeps the key and routes
+        #[arg(long, value_name = "FILE")]
+        bake: Option<String>,
+    },
+
     /// Manage gateway projects: list with inheritance info, new, copy,
     /// rename, set (reparent), delete, export/import (ZIP)
     #[command(arg_required_else_help = true)]
@@ -611,6 +657,12 @@ pub enum WebdevCommand {
         /// route deployed with the old secret starts refusing)
         #[arg(long, requires = "with_script_exec")]
         rotate_secret: bool,
+        /// Also deploy the embedded TESTING bundle — the Jython test
+        /// framework (testing.runner & co., with the permanent
+        /// testing.__tests__ smoke sentinel) and the testing/run +
+        /// testing/tags WebDev routes
+        #[arg(long)]
+        with_testing: bool,
     },
     /// Probe every route's version handshake — a READ: exit 0
     /// whenever the sweep completes, per-route degradation is data

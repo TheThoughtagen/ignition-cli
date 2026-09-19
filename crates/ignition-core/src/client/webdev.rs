@@ -80,6 +80,57 @@ pub(crate) fn route_url(project: &str, route: &str) -> String {
     format!("/system/webdev/{project}/cli/{route}")
 }
 
+/// The testing bundle's URL space — `/system/webdev/{project}/testing/
+/// {route}` (the `run`/`tags` folders live BESIDE `cli/`, not under
+/// it; ADOPT-04).
+pub(crate) fn testing_route_url(project: &str, route: &str) -> String {
+    format!("/system/webdev/{project}/testing/{route}")
+}
+
+/// `POST …/testing/run` with `{"discover": true}` — the module list
+/// (the route is POST-ONLY: the two-method doGet+doPost config does
+/// not register on live 8.3.6 — both methods read disabled → 501;
+/// live-pinned, so discover rides the POST body). Answers
+/// `{"discovered_modules": [...], "count": N}`.
+pub async fn testing_discover(
+    api: &super::ReqwestGatewayApi,
+    project: &str,
+) -> Result<serde_json::Value, CoreError> {
+    api.post_json(
+        &testing_route_url(project, "run"),
+        &serde_json::json!({ "discover": true }),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await
+    .map_err(|err| {
+        CoreError::Internal(format!(
+            "testing discover response did not match the expected shape: {err}"
+        ))
+    })
+}
+
+/// `POST …/testing/run` — execute tests (`{"module"|"package"|"format"}`
+/// body; empty body = run_all). The doPost sets HTTP 207 on
+/// failures/errors and 200 on green — BOTH are classified-success
+/// shapes here; the pass/fail verdict rides the BODY
+/// (`passed/failed/errors/total`), never the status line (the
+/// module's own Pitfall-2 rule).
+pub async fn testing_run(
+    api: &super::ReqwestGatewayApi,
+    project: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, CoreError> {
+    let response = api
+        .post_json(&testing_route_url(project, "run"), body)
+        .await?;
+    response.json::<serde_json::Value>().await.map_err(|err| {
+        CoreError::Internal(format!(
+            "testing run response did not match the expected shape: {err}"
+        ))
+    })
+}
+
 /// The presence/version discrimination — the probe enum. The status
 /// code IS the answer (deliberately NOT run through classify, the
 /// [`super::GatewayApi::webdev_route_status`] precedent); only
@@ -237,6 +288,12 @@ pub(crate) fn denial_to_error(
 /// tolerated and ignored — a stored profile secret never forces a
 /// scriptExec deploy.
 ///
+/// `with_testing` appends the embedded TESTING bundle
+/// ([`bundle::testing::TESTING_FILES`]) after the always-on routes —
+/// the Jython framework + `testing/run`/`testing/tags` WebDev routes,
+/// with every `__IGN_CLI_PROJECT__` marker substituted for
+/// `project_title` (the scriptExec marker pattern, count-pinned).
+///
 /// Members ride fixed `SimpleFileOptions` + deflate (the 05-02
 /// deterministic-zip convention) so identical inputs pack
 /// identically.
@@ -244,6 +301,7 @@ pub fn build_deploy_zip(
     project_title: &str,
     with_script_exec: bool,
     secret: Option<&str>,
+    with_testing: bool,
 ) -> Result<Vec<u8>, CoreError> {
     let script_exec_py = match (with_script_exec, secret) {
         (false, _) => None,
@@ -293,6 +351,30 @@ pub fn build_deploy_zip(
             writer
                 .start_file(name.as_str(), options)
                 .map_err(zip_write_err)?;
+            writer.write_all(body.as_bytes()).map_err(|err| {
+                CoreError::Internal(format!("cannot build the webdev deploy zip: {err}"))
+            })?;
+        }
+    }
+
+    // The testing bundle (ADOPT-04): every member's marker substituted
+    // with the deploy project — an unsubstituted marker on a gateway
+    // is the bug the count-pin exists to catch before it ships.
+    if with_testing {
+        let marker_total: usize = bundle::testing::TESTING_FILES
+            .iter()
+            .map(|(_, contents)| contents.matches(bundle::testing::PROJECT_MARKER).count())
+            .sum();
+        if marker_total != bundle::testing::PROJECT_MARKER_COUNT {
+            return Err(CoreError::Internal(format!(
+                "testing bundle marker count drifted: found {marker_total}, pinned {} — \
+                 a template edit changed the substitution contract",
+                bundle::testing::PROJECT_MARKER_COUNT
+            )));
+        }
+        for (name, contents) in bundle::testing::TESTING_FILES {
+            let body = contents.replace(bundle::testing::PROJECT_MARKER, project_title);
+            writer.start_file(*name, options).map_err(zip_write_err)?;
             writer.write_all(body.as_bytes()).map_err(|err| {
                 CoreError::Internal(format!("cannot build the webdev deploy zip: {err}"))
             })?;
@@ -483,7 +565,7 @@ mod tests {
     /// `None` + `with_script_exec` refuses BEFORE any zip is built.
     #[test]
     fn deploy_zip_fails_closed_without_a_script_exec_secret() {
-        let err = build_deploy_zip(DEFAULT_PROJECT, true, None).expect_err("must refuse");
+        let err = build_deploy_zip(DEFAULT_PROJECT, true, None, false).expect_err("must refuse");
         assert!(matches!(err, CoreError::Internal(_)), "{err}");
         assert_eq!(err.exit_code(), 1);
     }

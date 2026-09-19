@@ -108,6 +108,22 @@ pub fn routes() -> &'static [CliRoute] {
             path: "mcp",
             mapping: Mapping::OutOfBand,
         },
+        // ADOPT-03: `ign adopt` — OutOfBand with written
+        // justification: the bootstrap verb's product includes a
+        // ONE-TIME plaintext token print (the env-fallback path) and
+        // a password sourced from the caller's environment — a
+        // cockpit screen persisting either is a redaction violation
+        // by construction, and there is no dashboard surface for a
+        // five-step bootstrap walk whose secret must never be
+        // re-rendered (completions/api-call/edit/mcp genre: the verb
+        // talks to a terminal consumer, not to a dashboard). The
+        // pinned OutOfBand test in tui_coverage.rs was extended to
+        // include `adopt` in the SAME task — row + clap command land
+        // together (Pitfall 5).
+        CliRoute {
+            path: "adopt",
+            mapping: Mapping::OutOfBand,
+        },
         // 14-03: `ign lsp` (the 08-06 pre-declared reservation
         // FULFILLED) — OutOfBand with written justification: the LSP
         // server's stdout stream IS the product — Content-Length-

@@ -319,7 +319,7 @@ fn member(zip_bytes: &[u8], name: &str) -> Vec<u8> {
 /// member, ROUTE_FILES order, no scriptExec.
 #[test]
 fn deploy_zip_plain_members_are_the_manifest() {
-    let zip = build_deploy_zip("ign-cli", false, None).expect("plain deploy packs");
+    let zip = build_deploy_zip("ign-cli", false, None, false).expect("plain deploy packs");
     let expected: Vec<&str> = ROUTE_FILES.iter().map(|(name, _)| *name).collect();
     assert_eq!(member_names(&zip), expected);
     assert!(
@@ -338,8 +338,8 @@ fn deploy_zip_plain_members_are_the_manifest() {
 /// substituted secret rides doPost.py — the placeholder NEVER ships.
 #[test]
 fn deploy_zip_script_exec_substitutes_the_secret() {
-    let zip =
-        build_deploy_zip("ign-cli", true, Some("cafebabe1234")).expect("scriptExec deploy packs");
+    let zip = build_deploy_zip("ign-cli", true, Some("cafebabe1234"), false)
+        .expect("scriptExec deploy packs");
     let names = member_names(&zip);
     assert_eq!(names.len(), ROUTE_FILES.len() + 3, "manifest + 3 members");
     for suffix in ["resource.json", "config.json", "doPost.py"] {
@@ -373,7 +373,7 @@ fn deploy_zip_script_exec_substitutes_the_secret() {
 /// the default title rides the manifest untouched.
 #[test]
 fn deploy_zip_retitles_only_on_project_override() {
-    let zip = build_deploy_zip("plant-floor-cli", false, None).expect("override packs");
+    let zip = build_deploy_zip("plant-floor-cli", false, None, false).expect("override packs");
     let manifest: serde_json::Value =
         serde_json::from_slice(&member(&zip, "project.json")).expect("manifest parses");
     assert_eq!(manifest["title"], "plant-floor-cli");
@@ -432,6 +432,7 @@ async fn deploy_action_posts_the_zip_through_the_import_machinery() {
         false,
         &config_path,
         "dev",
+        false,
     )
     .await
     .expect("deploy imports");
