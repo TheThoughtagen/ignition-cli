@@ -469,7 +469,7 @@ mod tests {
     fn generate_parses_the_live_capture() {
         let wire: GeneratedKeyWire = serde_json::from_value(json!({
             "key": "AAAAexample-redacted-key-43-chars-urlsafe-0",
-            "hash": "BBBBexample_redacted_hash_43_chars_urlsafe_0"
+            "hash": "BBBBexample_redacted_hash_43_chars_urlsafe0"
         }))
         .expect("the live generate shape must parse");
         assert_eq!(wire.key.len(), 43, "urlsafe plaintext, 43 chars");
@@ -498,7 +498,7 @@ mod tests {
                     ],
                     "timestamp": 1789760514446i64
                 },
-                "settings": { "tokenHash": "BBBBexample_redacted_hash_43_chars_urlsafe_0" }
+                "settings": { "tokenHash": "BBBBexample_redacted_hash_43_chars_urlsafe0" }
             },
             "attributes": { "uuid": "…", "enabled": true }
         }))
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(record.config.profile.kind, "basic-token");
         assert_eq!(
             record.config.settings.token_hash,
-            "BBBBexample_redacted_hash_43_chars_urlsafe_0"
+            "BBBBexample_redacted_hash_43_chars_urlsafe0"
         );
         assert!(record.extra.contains_key("signature"), "passthrough rides");
     }
@@ -520,8 +520,12 @@ mod tests {
     #[test]
     fn create_body_matches_the_live_capture() {
         let level = level_tree(&["Authenticated"]);
-        let body =
-            build_token_create_body("ign-adopt-capture", &level, "BBBBexample", 1789760514446);
+        let body = build_token_create_body(
+            "ign-adopt-capture",
+            &level,
+            "BBBBexample_redacted_hash_43_chars_urlsafe0",
+            1789760514446,
+        );
         let captured: Value = json!([{
             "name": "ign-adopt-capture",
             "collection": "core",
@@ -538,7 +542,7 @@ mod tests {
                     "type": "basic-token",
                     "timestamp": 1789760514446i64
                 },
-                "settings": { "tokenHash": "BBBBexample_redacted_hash_43_chars_urlsafe_0" }
+                "settings": { "tokenHash": "BBBBexample_redacted_hash_43_chars_urlsafe0" }
             }
         }]);
         // descriptions are optional-in (the gateway echoes them out);
