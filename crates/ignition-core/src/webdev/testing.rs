@@ -199,9 +199,19 @@ mod tests {
                 .iter()
                 .filter(|(name, _)| name.starts_with(&prefix))
                 .count();
-            assert_eq!(files, 3, "route {route} carries its 3 files (POST-only - the two-method config does not register on 8.3)");
+            assert_eq!(
+                files, 3,
+                "route {route} carries its 3 files (POST-only - the two-method config does not register on 8.3)"
+            );
         }
-        for module in ["runner", "assertions", "decorators", "helpers", "reporter", "__tests__"] {
+        for module in [
+            "runner",
+            "assertions",
+            "decorators",
+            "helpers",
+            "reporter",
+            "__tests__",
+        ] {
             let path = format!("ignition/script-python/resources/testing/{module}/code.py");
             assert!(
                 TESTING_FILES.iter().any(|(name, _)| *name == path),
@@ -220,6 +230,8 @@ mod tests {
             .map(|(_, contents)| *contents)
             .expect("runner present");
         assert!(runner.contains("resources_path = File(script_path, \"resources\")"));
-        assert!(runner.contains("base = resources_path if resources_path.exists() else script_path"));
+        assert!(
+            runner.contains("base = resources_path if resources_path.exists() else script_path")
+        );
     }
 }

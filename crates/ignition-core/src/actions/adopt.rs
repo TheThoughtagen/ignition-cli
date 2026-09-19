@@ -46,8 +46,11 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::actions::doctor::CheckResult;
+use crate::actions::doctor::CheckStatus;
 use crate::client::GatewayApi;
 use crate::client::adopt::ResourceMutationWire;
+use crate::client::adopt::api_tokens_via_session;
 use crate::client::adopt::build_security_put_body;
 use crate::client::adopt::build_token_create_body;
 use crate::client::adopt::create_api_token_via_session;
@@ -56,7 +59,6 @@ use crate::client::adopt::level_tree;
 use crate::client::adopt::merge_level_into;
 use crate::client::adopt::put_security_properties_via_session;
 use crate::client::adopt::security_properties_via_session;
-use crate::client::adopt::api_tokens_via_session;
 use crate::client::idp;
 use crate::client::idp::GatewaySession;
 use crate::client::idp::IdpLoginFlow;
@@ -66,8 +68,6 @@ use crate::config::Credential;
 use crate::config::KeyringStore;
 use crate::config::Secret;
 use crate::error::CoreError;
-use crate::actions::doctor::CheckResult;
-use crate::actions::doctor::CheckStatus;
 
 /// Adopt options — the CLI seam's defaults land here.
 #[derive(Debug, Clone)]
@@ -275,8 +275,7 @@ pub async fn adopt(
             steps.push(CheckResult {
                 name: "probe".into(),
                 status: CheckStatus::Ok,
-                detail: "gateway-info answered 200 with the fresh name:key — the key works"
-                    .into(),
+                detail: "gateway-info answered 200 with the fresh name:key — the key works".into(),
                 hint: None,
             });
             token_for_persist = Some(token);
@@ -296,22 +295,27 @@ pub async fn adopt(
             let keyring = KeyringStore;
             match keyring.set(profile_name, &Secret::new(token.clone())) {
                 Ok(()) => {
-                    rewrite_profile_auth(config_path, profile_name, AuthRef::Keyring {
-                        keyring: format!("profile:{profile_name}"),
-                    })?;
+                    rewrite_profile_auth(
+                        config_path,
+                        profile_name,
+                        AuthRef::Keyring {
+                            keyring: format!("profile:{profile_name}"),
+                        },
+                    )?;
                     (Some("keyring".into()), None)
                 }
                 Err(err) => {
                     // Headless hosts (no D-Bus keyring) are EXPECTED —
                     // the documented fallback: env var + one print.
                     tracing::debug!(error = %err, "keyring unavailable; env fallback");
-                    let var = format!(
-                        "IGNITION_TOKEN_{}",
-                        super_profile_env_suffix(profile_name)
-                    );
-                    rewrite_profile_auth(config_path, profile_name, AuthRef::TokenEnv {
-                        token_env: var.clone(),
-                    })?;
+                    let var = format!("IGNITION_TOKEN_{}", super_profile_env_suffix(profile_name));
+                    rewrite_profile_auth(
+                        config_path,
+                        profile_name,
+                        AuthRef::TokenEnv {
+                            token_env: var.clone(),
+                        },
+                    )?;
                     (Some(format!("token_env:{var}")), Some(token.clone()))
                 }
             }
@@ -329,7 +333,9 @@ pub async fn adopt(
                 ),
                 None => format!("credential stored in the OS keyring — profile {how:?} wired"),
             },
-            hint: exposed.as_ref().map(|_| "export the token now; it is never shown again".into()),
+            hint: exposed
+                .as_ref()
+                .map(|_| "export the token now; it is never shown again".into()),
         }),
         _ => steps.push(CheckResult {
             name: "persist".into(),
@@ -345,10 +351,8 @@ pub async fn adopt(
     //     in the skip path (bootstrap resolved DEGRADED; the mint is
     //     what makes a credential exist). The verbs themselves are
     //     the existing actions, composed verbatim.
-    let composing = opts.project.is_some()
-        || opts.checkout.is_some()
-        || opts.bake.is_some()
-        || opts.testing;
+    let composing =
+        opts.project.is_some() || opts.checkout.is_some() || opts.bake.is_some() || opts.testing;
     if composing {
         let credential: Option<Credential> = match &token_for_persist {
             Some(token) => Some(Credential::Token(Secret::new(token.clone()))),
@@ -387,8 +391,16 @@ pub async fn adopt(
                 detail: format!(
                     "deployed {} WebDev routes into {project:?} (scriptExec on, secret {}{})",
                     deployed.routes.len(),
-                    if deployed.secret_rotated { "generated" } else { "reused" },
-                    if opts.testing { ", testing bundle on" } else { "" }
+                    if deployed.secret_rotated {
+                        "generated"
+                    } else {
+                        "reused"
+                    },
+                    if opts.testing {
+                        ", testing bundle on"
+                    } else {
+                        ""
+                    }
                 ),
                 hint: None,
             });
@@ -405,9 +417,7 @@ pub async fn adopt(
                 // route can answer 500 on its FIRST request while
                 // WebDev lazily compiles the module — the second hit
                 // answers. One bounded retry, then the error is real.
-                let discover = |() | {
-                    crate::client::webdev::testing_discover(api, project)
-                };
+                let discover = |()| crate::client::webdev::testing_discover(api, project);
                 let discovered = match discover(()).await {
                     Ok(value) => value,
                     Err(_) => {
@@ -435,12 +445,8 @@ pub async fn adopt(
                         modules.len()
                     )));
                 }
-                let run = crate::client::webdev::testing_run(
-                    api,
-                    project,
-                    &serde_json::json!({}),
-                )
-                .await?;
+                let run = crate::client::webdev::testing_run(api, project, &serde_json::json!({}))
+                    .await?;
                 let passed = run.get("passed").and_then(Value::as_i64).unwrap_or(0);
                 let failed = run.get("failed").and_then(Value::as_i64).unwrap_or(-1);
                 let errors = run.get("errors").and_then(Value::as_i64).unwrap_or(-1);
@@ -562,10 +568,9 @@ async fn mint(
     );
     let answer: ResourceMutationWire = create_api_token_via_session(flow, session, &body).await?;
     if !answer.success
-        || !answer
-            .changes
-            .iter()
-            .any(|change| change.name == key_name && change.kind == crate::client::adopt::API_TOKEN_TYPE)
+        || !answer.changes.iter().any(|change| {
+            change.name == key_name && change.kind == crate::client::adopt::API_TOKEN_TYPE
+        })
     {
         return Err(CoreError::Internal(format!(
             "api-token create refused: success={} problem={:?}",
@@ -583,12 +588,11 @@ fn rewrite_profile_auth(
     auth: AuthRef,
 ) -> Result<(), CoreError> {
     let mut config = config::load(config_path)?;
-    let profile = config
-        .profiles
-        .get_mut(profile_name)
-        .ok_or_else(|| CoreError::Internal(format!(
+    let profile = config.profiles.get_mut(profile_name).ok_or_else(|| {
+        CoreError::Internal(format!(
             "profile {profile_name:?} vanished from the config mid-adopt"
-        )))?;
+        ))
+    })?;
     profile.auth = auth;
     config::save(config_path, &config)
 }

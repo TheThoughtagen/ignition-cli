@@ -338,8 +338,8 @@ fn deploy_zip_plain_members_are_the_manifest() {
 /// substituted secret rides doPost.py — the placeholder NEVER ships.
 #[test]
 fn deploy_zip_script_exec_substitutes_the_secret() {
-    let zip =
-        build_deploy_zip("ign-cli", true, Some("cafebabe1234"), false).expect("scriptExec deploy packs");
+    let zip = build_deploy_zip("ign-cli", true, Some("cafebabe1234"), false)
+        .expect("scriptExec deploy packs");
     let names = member_names(&zip);
     assert_eq!(names.len(), ROUTE_FILES.len() + 3, "manifest + 3 members");
     for suffix in ["resource.json", "config.json", "doPost.py"] {

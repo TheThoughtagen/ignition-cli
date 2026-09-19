@@ -166,7 +166,12 @@ pub async fn webdev_deploy(
     // fail-closed guard covers the (true, None) bug case) and import
     // overwrite=true through the 03-02 machinery. NO pre-flight
     // project create (Pitfall 10).
-    let zip = seam::build_deploy_zip(project, with_script_exec, pack_secret.as_deref(), with_testing)?;
+    let zip = seam::build_deploy_zip(
+        project,
+        with_script_exec,
+        pack_secret.as_deref(),
+        with_testing,
+    )?;
     let mut routes = seam::always_on_routes();
     if with_script_exec {
         routes.push(SCRIPT_EXEC_ROUTE.to_string());
@@ -851,9 +856,17 @@ mod tests {
         );
 
         // --rotate-secret: a fresh 64-char hex replaces it.
-        let result = webdev_deploy(&importing_rig(), "ign-cli", true, true, &config, "dev", false)
-            .await
-            .expect("rotate deploy");
+        let result = webdev_deploy(
+            &importing_rig(),
+            "ign-cli",
+            true,
+            true,
+            &config,
+            "dev",
+            false,
+        )
+        .await
+        .expect("rotate deploy");
         assert!(result.secret_rotated);
         let rotated = stored_secret(&config).expect("rotated secret stored");
         assert_eq!(rotated.len(), 64);

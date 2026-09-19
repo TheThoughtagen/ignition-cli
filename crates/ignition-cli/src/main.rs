@@ -901,13 +901,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 };
                 let opts = actions::adopt::AdoptOptions {
                     username: user.unwrap_or_else(|| "admin".into()),
-                    key_name: key_name.unwrap_or_else(|| {
-                        actions::adopt::DEFAULT_KEY_NAME.to_string()
-                    }),
+                    key_name: key_name
+                        .unwrap_or_else(|| actions::adopt::DEFAULT_KEY_NAME.to_string()),
                     level: level
-                        .map(|path| {
-                            path.split('/').map(str::to_string).collect::<Vec<_>>()
-                        })
+                        .map(|path| path.split('/').map(str::to_string).collect::<Vec<_>>())
                         .unwrap_or_else(|| {
                             actions::adopt::DEFAULT_LEVEL
                                 .iter()

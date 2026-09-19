@@ -46,8 +46,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 use crate::client::idp::GatewaySession;
 use crate::client::idp::IdpLoginFlow;
@@ -370,7 +370,9 @@ pub async fn api_tokens_via_session(
         .cloned()
         .ok_or_else(|| CoreError::Internal("api-token list carried no items array".into()))?;
     let records: Vec<ApiTokenRecord> = serde_json::from_value(items).map_err(|err| {
-        CoreError::Internal(format!("api-token list item did not match the record shape: {err}"))
+        CoreError::Internal(format!(
+            "api-token list item did not match the record shape: {err}"
+        ))
     })?;
     Ok(records)
 }
@@ -384,9 +386,8 @@ pub async fn generate_api_key_via_session(
     let value = flow
         .session_post_json(session, GENERATE_PATH, &json!({}))
         .await?;
-    serde_json::from_value(value).map_err(|err| {
-        CoreError::Internal(format!("api-token generate answer shape: {err}"))
-    })
+    serde_json::from_value(value)
+        .map_err(|err| CoreError::Internal(format!("api-token generate answer shape: {err}")))
 }
 
 /// `POST …/resources/ignition/api-token` on the session tier — the
@@ -396,7 +397,9 @@ pub async fn create_api_token_via_session(
     session: &GatewaySession,
     body: &Value,
 ) -> Result<ResourceMutationWire, CoreError> {
-    let value = flow.session_post_json(session, API_TOKEN_CREATE_PATH, body).await?;
+    let value = flow
+        .session_post_json(session, API_TOKEN_CREATE_PATH, body)
+        .await?;
     serde_json::from_value(value)
         .map_err(|err| CoreError::Internal(format!("api-token create answer shape: {err}")))
 }
@@ -414,9 +417,8 @@ pub async fn security_properties_via_session(
             &[("defaultIfUndefined", "true")],
         )
         .await?;
-    serde_json::from_value(value).map_err(|err| {
-        CoreError::Internal(format!("security-properties singleton shape: {err}"))
-    })
+    serde_json::from_value(value)
+        .map_err(|err| CoreError::Internal(format!("security-properties singleton shape: {err}")))
 }
 
 /// `PUT …/resources/ignition/security-properties` on the session
@@ -428,15 +430,17 @@ pub async fn put_security_properties_via_session(
     session: &GatewaySession,
     body: &Value,
 ) -> Result<ResourceMutationWire, CoreError> {
-    let value = flow.session_put_json(session, SECURITY_PUT_PATH, body).await?;
+    let value = flow
+        .session_put_json(session, SECURITY_PUT_PATH, body)
+        .await?;
     serde_json::from_value(value)
         .map_err(|err| CoreError::Internal(format!("security-properties put answer shape: {err}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
 
     use super::{
         ApiTokenRecord, GeneratedKeyWire, ResourceMutationWire, SecuritySingletonWire,
@@ -633,9 +637,15 @@ mod tests {
                 "securityLevels": [ bare("SecurityZones") ]
             }
         });
-        assert!(merge_level_into(&mut config, "writePermissions", &administrator));
-        assert!(!merge_level_into(&mut config, "writePermissions", &administrator),
-            "idempotent re-run changes nothing");
+        assert!(merge_level_into(
+            &mut config,
+            "writePermissions",
+            &administrator
+        ));
+        assert!(
+            !merge_level_into(&mut config, "writePermissions", &administrator),
+            "idempotent re-run changes nothing"
+        );
         assert_eq!(
             config["writePermissions"]["securityLevels"][1],
             bare("Authenticated"),
@@ -646,14 +656,22 @@ mod tests {
         let mut config = json!({
             "writePermissions": { "type": "AnyOf", "securityLevels": [authenticated.clone()] }
         });
-        assert!(!merge_level_into(&mut config, "writePermissions", &administrator));
+        assert!(!merge_level_into(
+            &mut config,
+            "writePermissions",
+            &administrator
+        ));
 
         // NESTED same-root entry (the fresh-gateway default) does not
         // admit the token — the bare root lands BESIDE it.
         let mut config = json!({
             "writePermissions": { "type": "AnyOf", "securityLevels": [administrator.clone()] }
         });
-        assert!(merge_level_into(&mut config, "writePermissions", &administrator));
+        assert!(merge_level_into(
+            &mut config,
+            "writePermissions",
+            &administrator
+        ));
         let levels = config["writePermissions"]["securityLevels"]
             .as_array()
             .expect("levels");
@@ -664,7 +682,11 @@ mod tests {
         let mut config = json!({
             "writePermissions": { "type": "AnyOf", "securityLevels": [] }
         });
-        assert!(merge_level_into(&mut config, "writePermissions", &authenticated));
+        assert!(merge_level_into(
+            &mut config,
+            "writePermissions",
+            &authenticated
+        ));
         let levels = config["writePermissions"]["securityLevels"]
             .as_array()
             .expect("levels");
@@ -673,7 +695,11 @@ mod tests {
 
         // Missing field entirely → created as AnyOf.
         let mut config = json!({});
-        assert!(merge_level_into(&mut config, "readPermissions", &authenticated));
+        assert!(merge_level_into(
+            &mut config,
+            "readPermissions",
+            &authenticated
+        ));
         assert_eq!(config["readPermissions"]["type"], "AnyOf");
     }
 
@@ -688,14 +714,21 @@ mod tests {
         }))
         .expect("parses");
         let mut config = singleton.config.clone();
-        merge_level_into(&mut config, "writePermissions", &level_tree(&["Authenticated"]));
+        merge_level_into(
+            &mut config,
+            "writePermissions",
+            &level_tree(&["Authenticated"]),
+        );
         let body = build_security_put_body(&singleton, &config);
         assert_eq!(body[0]["signature"], "dee8c94600032841");
         assert_eq!(body[0]["collection"], "core");
         assert_eq!(body[0]["config"]["forceIdpAuth"], true);
-        assert!(body[0]["config"]["writePermissions"]["securityLevels"]
-            .as_array()
-            .expect("levels")
-            .len() == 1);
+        assert!(
+            body[0]["config"]["writePermissions"]["securityLevels"]
+                .as_array()
+                .expect("levels")
+                .len()
+                == 1
+        );
     }
 }

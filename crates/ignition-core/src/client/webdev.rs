@@ -121,7 +121,9 @@ pub async fn testing_run(
     project: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, CoreError> {
-    let response = api.post_json(&testing_route_url(project, "run"), body).await?;
+    let response = api
+        .post_json(&testing_route_url(project, "run"), body)
+        .await?;
     response.json::<serde_json::Value>().await.map_err(|err| {
         CoreError::Internal(format!(
             "testing run response did not match the expected shape: {err}"

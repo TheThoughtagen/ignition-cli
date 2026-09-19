@@ -234,7 +234,10 @@ async fn doctor_403_three_part_hint_and_permissions_golden() {
             "/data/api/v1/resources/singleton/ignition/security-properties",
         ))
         .respond_with(wiremock::ResponseTemplate::new(403).set_body_raw(
-            jetty_error_html(403, "/data/api/v1/resources/singleton/ignition/security-properties"),
+            jetty_error_html(
+                403,
+                "/data/api/v1/resources/singleton/ignition/security-properties",
+            ),
             "text/html;charset=iso-8859-1",
         ))
         .expect(1..)

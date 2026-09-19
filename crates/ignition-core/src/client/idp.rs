@@ -647,13 +647,14 @@ impl IdpLoginFlow {
         if !(200..300).contains(&status) {
             return Err(IdpLoginFlow::flow_error(
                 "session request",
-                format!("HTTP {status} ({})", IdpLoginFlow::html_title_or_excerpt(&text)),
+                format!(
+                    "HTTP {status} ({})",
+                    IdpLoginFlow::html_title_or_excerpt(&text)
+                ),
             ));
         }
         serde_json::from_str(&text).map_err(|err| {
-            CoreError::Internal(format!(
-                "session response from {path} was not JSON ({err})"
-            ))
+            CoreError::Internal(format!("session response from {path} was not JSON ({err})"))
         })
     }
 }

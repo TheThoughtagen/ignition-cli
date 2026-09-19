@@ -115,8 +115,8 @@ mod tests {
             }
         });
         let config = record.get("config").cloned().unwrap_or(record);
-        let props: SecurityProperties = serde_json::from_value(config)
-            .expect("the live singleton config must parse");
+        let props: SecurityProperties =
+            serde_json::from_value(config).expect("the live singleton config must parse");
         assert!(props.read_permissions.is_some());
         assert!(props.write_permissions.is_some());
         assert!(props.extra.contains_key("forceIdpAuth"));
