@@ -29,7 +29,8 @@ def write_dataset_tag(tag_path, columns, types, rows):
 		# Coerce row values to match declared types
 		def parse_boolean(value):
 			# Review round: bool("false") is True in Python -- DataSet
-			# test rows must parse Boolean strings explicitly.
+			# test rows must parse Boolean strings explicitly, and an
+			# unrecognized string must FAIL, not silently become True.
 			if isinstance(value, bool):
 				return value
 			text = str(value).strip().lower()
@@ -37,7 +38,9 @@ def write_dataset_tag(tag_path, columns, types, rows):
 				return True
 			if text in ("false", "0", "no", "off", ""):
 				return False
-			return bool(value)
+			raise ValueError(
+				"not a Boolean literal: %r (expected true/false/1/0/yes/no/on/off)"
+				% (value,))
 
 		type_coerce = {
 			"String": str,

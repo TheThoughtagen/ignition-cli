@@ -890,19 +890,17 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         Err(CoreError::PasswordUnavailable { profile: name }),
                     );
                 };
-                // Composition credential — resolved ONLY when a
-                // composition flag rides the run (the skip path needs
-                // a working token; the mint path ignores this).
-                let composing =
-                    project.is_some() || testing || checkout.is_some() || bake.is_some();
-                let compose_credential = if composing {
+                // Profile credential — resolved on EVERY run now
+                // (review round): the skip path's probe needs it, and
+                // its absence is the minted-then-failed trap the
+                // action must surface (resolution DEGRADES — a
+                // missing secret is the None the action turns into
+                // the actionable error, not a CLI refusal).
+                let compose_credential =
                     match Session::resolve_credential_opt(cli.profile.as_deref()) {
                         Ok(credential) => credential,
                         Err(err) => return (error_profile(&err), Err(err)),
-                    }
-                } else {
-                    None
-                };
+                    };
                 let opts = actions::adopt::AdoptOptions {
                     username: user.unwrap_or_else(|| "admin".into()),
                     key_name: key_name

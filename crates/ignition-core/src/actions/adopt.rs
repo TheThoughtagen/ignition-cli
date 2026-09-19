@@ -145,6 +145,19 @@ pub async fn adopt(
     let mut steps: Vec<CheckResult> = Vec::new();
     let level_path: Vec<&str> = opts.level.iter().map(String::as_str).collect();
 
+    // 0. INPUT — the level path must be non-empty segments BEFORE any
+    //    login or gateway I/O (review round: `path.split('/')` keeps
+    //    empties, so `--level ""`/`/Authenticated`/`A//B` would mint a
+    //    token tree with blank names). InvalidInput (exit 2), the
+    //    pre-resolution refusal class.
+    if level_path.is_empty() || level_path.iter().any(|segment| segment.trim().is_empty()) {
+        return Err(CoreError::InvalidInput {
+            reason: "--level must be a slash path of non-empty segments, e.g. \
+                     Authenticated/Roles/Administrator"
+                .into(),
+        });
+    }
+
     // 1. LOGIN — the OIDC dance. Hard error on failure (adopt cannot
     //    proceed without the bootstrap credential).
     let flow = IdpLoginFlow::new(base_url)?;
@@ -274,12 +287,17 @@ pub async fn adopt(
     //    round: "key pre-existed" must not skip the liveness check
     //    when a credential IS in hand; only a credential-less skip
     //    defers to `ign doctor`).
-    let mut token_for_persist: Option<String> = None;
+    // Only TOKEN credentials can pass /data auth (Basic never does on
+    // 8.3) — a Basic-only resolution is not a probeable credential.
     let probe_credential: Option<Credential> = minted
         .as_ref()
         .map(|token| Credential::Token(Secret::new(token.clone())))
-        .or_else(|| compose_credential.cloned());
-    match probe_credential {
+        .or_else(|| {
+            compose_credential
+                .cloned()
+                .filter(|credential| matches!(credential, Credential::Token(_)))
+        });
+    let token_for_persist: Option<String> = match probe_credential {
         Some(credential) => {
             let url: url::Url = base_url
                 .parse()
@@ -297,16 +315,19 @@ pub async fn adopt(
                 detail: format!("gateway-info answered 200 with {via} — the key works"),
                 hint: None,
             });
-            token_for_persist = minted;
+            minted
         }
-        None => steps.push(CheckResult {
-            name: "probe".into(),
-            status: CheckStatus::Skip,
-            detail: "key pre-existed and no credential resolved — probe with `ign doctor` on this profile"
-                .into(),
-            hint: None,
-        }),
-    }
+        None => {
+            // Review round: a pre-existing key with NO usable
+            // credential is the minted-then-failed re-run trap (run 1
+            // minted, persistence failed — e.g. a denied keychain;
+            // run 2 "succeeds" all-skip while the profile is
+            // unusable). That state must NOT report success.
+            return Err(CoreError::SecretUnavailable {
+                profile: profile_name.to_string(),
+            });
+        }
+    };
 
     // 5. PERSIST — keyring first; env fallback prints the token ONCE.
     let (stored, exposed): (Option<String>, Option<String>) = match &token_for_persist {
