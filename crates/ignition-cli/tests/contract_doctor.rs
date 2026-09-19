@@ -69,8 +69,8 @@ fn security_properties_body() -> serde_json::Value {
         "signature": "dee8c946",
         "collection": "core",
         "config": {
-            "readPermissions": {"anyOf": ["Authenticated/Roles/Administrator"]},
-            "writePermissions": {"anyOf": ["Authenticated/Roles/Administrator"]}
+            "readPermissions": {"type": "AnyOf", "securityLevels": [{"name": "Authenticated", "children": [{"name": "Roles", "children": [{"name": "Administrator", "children": []}]}]}]},
+            "writePermissions": {"type": "AnyOf", "securityLevels": [{"name": "Authenticated", "children": [{"name": "Roles", "children": [{"name": "Administrator", "children": []}]}]}]}
         }
     })
 }
@@ -145,7 +145,7 @@ url           OK    TCP connect to 127.0.0.1:[..] succeeded
 liveness      OK    gateway RUNNING (unauthenticated /StatusPing)
 commissioned  OK    no /welcome redirect on /data routes
 auth          OK    gateway-info read succeeded (HTTP 200, gateway 8.3.6 (b2026042713))
-permissions   OK    readPermissions: {"anyOf":["Authenticated/Roles/Administrator"]}; writePermissions: {"anyOf":["Authenticated/Roles/Administrator"]}
+permissions   OK    readPermissions: {"securityLevels":[{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}],"type":"AnyOf"}; writePermissions: {"securityLevels":[{"children":[{"children":[{"children":[],"name":"Administrator"}],"name":"Roles"}],"name":"Authenticated"}],"type":"AnyOf"}
 write         SKIP  not requested (--check-write)
 webdev        SKIP  not requested (--webdev-route NAME)
 rig           [..]
@@ -517,7 +517,7 @@ async fn doctor_healthy_json_golden() {
       {
         "name": "permissions",
         "status": "ok",
-        "detail": "readPermissions: {/"anyOf/":[/"Authenticated/Roles/Administrator/"]}; writePermissions: {/"anyOf/":[/"Authenticated/Roles/Administrator/"]}",
+        "detail": "readPermissions: {/"securityLevels/":[{/"children/":[{/"children/":[{/"children/":[],/"name/":/"Administrator/"}],/"name/":/"Roles/"}],/"name/":/"Authenticated/"}],/"type/":/"AnyOf/"}; writePermissions: {/"securityLevels/":[{/"children/":[{/"children/":[{/"children/":[],/"name/":/"Administrator/"}],/"name/":/"Roles/"}],/"name/":/"Authenticated/"}],/"type/":/"AnyOf/"}",
         "hint": null
       },
       {

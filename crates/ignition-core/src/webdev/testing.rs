@@ -30,8 +30,8 @@
 //! ## Markers (substituted at pack time, the scriptExec pattern)
 //!
 //! - `__IGN_CLI_PROJECT__` — the deploy project name (the runner's
-//!   fallback constant). Exactly 1 site — the pack substitution
-//!   replaces it; a marker-count test pins the total.
+//!   fallback constant + the run route's scoped-seeding lookup).
+//!   Exactly 2 sites; a marker-count test pins the total.
 //!
 //! Source of truth for the port: `.planning/research/ADOPT-RESEARCH.md`
 //! §D2 handoff (the manifest) + the extracted originals under
@@ -164,7 +164,7 @@ pub(crate) const PROJECT_MARKER: &str = "__IGN_CLI_PROJECT__";
 /// replaces every one; this pin makes an accidental template edit
 /// (adding or removing a marker) a test failure, not a runtime
 /// `PLACEHOLDER` on a gateway.
-pub(crate) const PROJECT_MARKER_COUNT: usize = 1;
+pub(crate) const PROJECT_MARKER_COUNT: usize = 2;
 
 /// The testing bundle's route folder names (URL space:
 /// `/system/webdev/<project>/testing/<route>`).

@@ -23,8 +23,8 @@ Request: empty JSON body, session cookie + `X-CSRF-Token` header.
 Response `200` (live-captured):
 
 ```json
-{ "key": "OEVWuytN-pOzWum_eDS6gAXEwZS9YlgBZ8-a43a2Y6M",
-  "hash": "01fQ4KjcPq2VzxU7eYGvEgKuTH6rlnFJLWtUQhQndtU" }
+{ "key": "AAAA…43-char urlsafe key (REDACTED — same shape)",
+  "hash": "BBBB…43-char urlsafe hash (REDACTED — same shape)" }
 ```
 
 - `key` = the plaintext token, **returned here and nowhere else** (the
@@ -52,7 +52,7 @@ Request body — an **array** of resource records (live-captured verbatim):
       "type": "basic-token",
       "timestamp": 1789760514446
     },
-    "settings": { "tokenHash": "01fQ4KjcPq2VzxU7eYGvEgKuTH6rlnFJLWtUQhQndtU" }
+    "settings": { "tokenHash": "BBBB…43-char urlsafe hash (REDACTED — same shape)" }
   }
 }]
 ```

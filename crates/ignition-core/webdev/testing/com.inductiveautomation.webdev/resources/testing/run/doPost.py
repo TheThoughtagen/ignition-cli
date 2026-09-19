@@ -27,6 +27,10 @@ def doPost(request, session):
 	import traceback
 	from java.io import File
 
+	# Deploy-time marker: this route's own project (substituted by
+	# `ign webdev deploy --with-testing` / adopt --testing).
+	PROJECT_NAME = "__IGN_CLI_PROJECT__"
+
 	def data_dirs():
 		# Candidate gateway DATA directories, best first. The 8.1
 		# [System]Gateway/SystemProperties/DataDirectory tag is
@@ -54,24 +58,36 @@ def doPost(request, session):
 
 	def seed_testing():
 		# Build the `testing` package in sys.modules from the on-disk
-		# framework sources (exec'd into real module objects).
+		# framework sources (exec'd into real module objects). Scoped
+		# to THIS route's project first (the deploy-time marker --
+		# review round: an unscoped scan could load another project's
+		# framework and execute ITS tests); the scan remains only as
+		# a fallback for hand-copied bundles without the marker.
 		if "testing.runner" in sys.modules:
 			return
 		root = None
 		for data_dir in data_dirs():
-			projects_root = File(data_dir, "projects")
-			if not projects_root.isDirectory():
-				continue
-			for project_dir in (projects_root.listFiles() or []):
-				if not project_dir.isDirectory():
-					continue
-				candidate = File(
-					project_dir, "ignition/script-python/resources/testing")
-				if candidate.isDirectory():
-					root = candidate
-					break
-			if root is not None:
+			scoped = File(
+				File(File(data_dir, "projects"), PROJECT_NAME),
+				"ignition/script-python/resources/testing")
+			if scoped.isDirectory():
+				root = scoped
 				break
+		if root is None:
+			for data_dir in data_dirs():
+				projects_root = File(data_dir, "projects")
+				if not projects_root.isDirectory():
+					continue
+				for project_dir in (projects_root.listFiles() or []):
+					if not project_dir.isDirectory():
+						continue
+					candidate = File(
+						project_dir, "ignition/script-python/resources/testing")
+					if candidate.isDirectory():
+						root = candidate
+						break
+				if root is not None:
+					break
 		if root is None:
 			raise ImportError(
 				"testing framework not found on the gateway filesystem - "
@@ -181,6 +197,13 @@ def doPost(request, session):
 		return {"json": results}
 
 	except Exception as e:
+		# Review round: an exception BEFORE the normal status update
+		# must not ride the default 200 (status-based clients would
+		# read a runner blowup as success).
+		try:
+			request['servletResponse'].setStatus(500)
+		except Exception:
+			pass
 		return {"json": {
 			"error": str(e),
 			"traceback": traceback.format_exc(),

@@ -186,6 +186,18 @@ pub async fn adopt(
                 .iter()
                 .map(crate::client::adopt::level_path_string)
                 .collect();
+            // Review round: a same-name key at a DIFFERENT level than
+            // requested must refuse, not silently ride — the caller
+            // asked for one posture and would get another.
+            let requested = opts.level.join("/");
+            if !level_names.iter().any(|granted| granted == &requested) {
+                return Err(CoreError::Internal(format!(
+                    "API key {:?} exists at level {:?} but {:?} was requested — \
+                     pass --level to match, or delete the key and re-run to mint \
+                     the requested level",
+                    opts.key_name, level_names, requested
+                )));
+            }
             steps.push(CheckResult {
                 name: "key".into(),
                 status: CheckStatus::Skip,
@@ -257,33 +269,41 @@ pub async fn adopt(
         });
     }
 
-    // 4. PROBE — only provable with a plaintext in hand (the mint
-    //    path); a pre-existing key is probed by the profile's own
-    //    credential elsewhere (`ign doctor`).
+    // 4. PROBE — with the minted token (the mint path), or with the
+    //    CLI-resolved profile credential (the skip path — the review
+    //    round: "key pre-existed" must not skip the liveness check
+    //    when a credential IS in hand; only a credential-less skip
+    //    defers to `ign doctor`).
     let mut token_for_persist: Option<String> = None;
-    match minted {
-        Some(token) => {
+    let probe_credential: Option<Credential> = minted
+        .as_ref()
+        .map(|token| Credential::Token(Secret::new(token.clone())))
+        .or_else(|| compose_credential.cloned());
+    match probe_credential {
+        Some(credential) => {
             let url: url::Url = base_url
                 .parse()
                 .map_err(|err| CoreError::Internal(format!("invalid gateway URL: {err}")))?;
-            let probe = crate::session::Session::for_url(
-                url,
-                Some(Credential::Token(Secret::new(token.clone()))),
-                true,
-            )?;
+            let probe = crate::session::Session::for_url(url, Some(credential), true)?;
             probe.api().gateway_info().await?;
+            let via = if minted.is_some() {
+                "the fresh name:key"
+            } else {
+                "the profile's resolved credential"
+            };
             steps.push(CheckResult {
                 name: "probe".into(),
                 status: CheckStatus::Ok,
-                detail: "gateway-info answered 200 with the fresh name:key — the key works".into(),
+                detail: format!("gateway-info answered 200 with {via} — the key works"),
                 hint: None,
             });
-            token_for_persist = Some(token);
+            token_for_persist = minted;
         }
         None => steps.push(CheckResult {
             name: "probe".into(),
             status: CheckStatus::Skip,
-            detail: "key pre-existed — probe with `ign doctor` on this profile".into(),
+            detail: "key pre-existed and no credential resolved — probe with `ign doctor` on this profile"
+                .into(),
             hint: None,
         }),
     }

@@ -879,11 +879,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let name = session.profile_name().to_string();
                 let url = session.profile_url().to_string();
                 let Some(password) = env_non_empty("IGNITION_PASSWORD") else {
+                    // The PASSWORD gate, not the token gate — its own
+                    // slug + hint name IGNITION_PASSWORD (the review
+                    // round: the generic secret hint points at token
+                    // paths, exactly wrong here).
                     return (
-                        error_profile(&CoreError::SecretUnavailable {
+                        error_profile(&CoreError::PasswordUnavailable {
                             profile: name.clone(),
                         }),
-                        Err(CoreError::SecretUnavailable { profile: name }),
+                        Err(CoreError::PasswordUnavailable { profile: name }),
                     );
                 };
                 // Composition credential — resolved ONLY when a

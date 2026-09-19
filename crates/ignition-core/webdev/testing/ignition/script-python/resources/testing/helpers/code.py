@@ -27,13 +27,25 @@ def write_dataset_tag(tag_path, columns, types, rows):
 	"""
 	try:
 		# Coerce row values to match declared types
+		def parse_boolean(value):
+			# Review round: bool("false") is True in Python -- DataSet
+			# test rows must parse Boolean strings explicitly.
+			if isinstance(value, bool):
+				return value
+			text = str(value).strip().lower()
+			if text in ("true", "1", "yes", "on"):
+				return True
+			if text in ("false", "0", "no", "off", ""):
+				return False
+			return bool(value)
+
 		type_coerce = {
 			"String": str,
 			"Float8": float,
 			"Float4": float,
 			"Int4": int,
 			"Int8": int,
-			"Boolean": bool,
+			"Boolean": parse_boolean,
 		}
 		coerced_rows = []
 		for row in rows:

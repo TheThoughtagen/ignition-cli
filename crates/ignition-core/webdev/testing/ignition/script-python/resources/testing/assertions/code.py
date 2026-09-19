@@ -73,6 +73,10 @@ def assert_close(actual, expected, tolerance=0.001, msg=None):
 		msg: Optional failure message
 	"""
 	diff = abs(actual - expected)
+	if diff != diff:  # NaN (x != x is the only NaN test in Jython 2.7)
+		raise TestAssertionError(
+			msg or ("assert_close: NaN in comparison (actual=%r, expected=%r)"
+					% (actual, expected)))
 	if diff > tolerance:
 		text = msg or "Expected %r within %s of %r (diff=%s)" % (
 			actual, tolerance, expected, diff

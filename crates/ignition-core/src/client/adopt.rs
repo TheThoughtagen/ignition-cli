@@ -84,8 +84,8 @@ pub(crate) const BASIC_TOKEN_TYPE: &str = "basic-token";
 /// resource record stores. Live-captured 8.3.6:
 ///
 /// ```json
-/// { "key":  "OEVWuytN-pOzWum_eDS6gAXEwZS9YlgBZ8-a43a2Y6M",
-///   "hash": "01fQ4KjcPq2VzxU7eYGvEgKuTH6rlnFJLWtUQhQndtU" }
+/// { "key":  "<43-char urlsafe plaintext — REDACTED, same shape>",
+///   "hash": "<43-char urlsafe stored hash — REDACTED, same shape>" }
 /// ```
 ///
 /// Redaction discipline: this struct carries the plaintext between the
@@ -355,9 +355,11 @@ pub fn merge_level_into(config: &mut Value, field: &str, level: &Value) -> bool 
 }
 
 /// `GET …/resources/list/ignition/api-token` on the session tier —
-/// the pre-token idempotent find. One page at `limit=100` (a gateway
-/// with more API keys than that is far outside adopt's posture; the
-/// total rides the envelope and a truncated read is an honest error).
+/// the pre-token idempotent find. One page at `limit=100`; a gateway
+/// holding MORE tokens than that REFUSES rather than guessing (the
+/// review round's truncation trap: a key beyond the page would read
+/// as absent and the mint would collide — an honest error beats an
+/// ambiguous duplicate).
 pub async fn api_tokens_via_session(
     flow: &IdpLoginFlow,
     session: &GatewaySession,
@@ -365,10 +367,22 @@ pub async fn api_tokens_via_session(
     let value = flow
         .session_get_json(session, API_TOKEN_LIST_PATH, &[("limit", "100")])
         .await?;
+    let total = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("total"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let items = value
         .get("items")
         .cloned()
         .ok_or_else(|| CoreError::Internal("api-token list carried no items array".into()))?;
+    let count = items.as_array().map_or(0, Vec::len) as i64;
+    if total > count {
+        return Err(CoreError::Internal(format!(
+            "this gateway holds {total} API keys — more than adopt's one-page \
+             lookup ({count} returned); delete unused keys and re-run"
+        )));
+    }
     let records: Vec<ApiTokenRecord> = serde_json::from_value(items).map_err(|err| {
         CoreError::Internal(format!(
             "api-token list item did not match the record shape: {err}"
@@ -447,17 +461,19 @@ mod tests {
         build_security_put_body, build_token_create_body, level_tree, merge_level_into,
     };
 
-    /// THE live-capture regression — the generate answer, verbatim
-    /// from the 8.3.6 rig (ADOPT-RESEARCH §1a).
+    /// THE live-capture regression — the generate answer's SHAPE,
+    /// from the 8.3.6 rig capture (ADOPT-RESEARCH §1a). The VALUES
+    /// are redacted same-shape synthetics: real key material never
+    /// lands in source, even disposable-rig keys (review round).
     #[test]
     fn generate_parses_the_live_capture() {
         let wire: GeneratedKeyWire = serde_json::from_value(json!({
-            "key": "OEVWuytN-pOzWum_eDS6gAXEwZS9YlgBZ8-a43a2Y6M",
-            "hash": "01fQ4KjcPq2VzxU7eYGvEgKuTH6rlnFJLWtUQhQndtU"
+            "key": "AAAAexample-redacted-key-43-chars-urlsafe-0",
+            "hash": "BBBBexample_redacted_hash_43_chars_urlsafe_0"
         }))
         .expect("the live generate shape must parse");
-        assert_eq!(wire.key.len(), 43);
-        assert_eq!(wire.hash.len(), 43);
+        assert_eq!(wire.key.len(), 43, "urlsafe plaintext, 43 chars");
+        assert_eq!(wire.hash.len(), 43, "stored hash, 43 chars");
     }
 
     /// The live-captured list item (trimmed to the typed fields +
@@ -482,7 +498,7 @@ mod tests {
                     ],
                     "timestamp": 1789760514446i64
                 },
-                "settings": { "tokenHash": "01fQ4Kjc" }
+                "settings": { "tokenHash": "BBBBexample_redacted_hash_43_chars_urlsafe_0" }
             },
             "attributes": { "uuid": "…", "enabled": true }
         }))
@@ -491,7 +507,10 @@ mod tests {
         assert!(record.enabled);
         assert!(!record.config.profile.secure_channel_required);
         assert_eq!(record.config.profile.kind, "basic-token");
-        assert_eq!(record.config.settings.token_hash, "01fQ4Kjc");
+        assert_eq!(
+            record.config.settings.token_hash,
+            "BBBBexample_redacted_hash_43_chars_urlsafe_0"
+        );
         assert!(record.extra.contains_key("signature"), "passthrough rides");
     }
 
@@ -501,7 +520,8 @@ mod tests {
     #[test]
     fn create_body_matches_the_live_capture() {
         let level = level_tree(&["Authenticated"]);
-        let body = build_token_create_body("ign-adopt-capture", &level, "01fQ4Kjc", 1789760514446);
+        let body =
+            build_token_create_body("ign-adopt-capture", &level, "BBBBexample", 1789760514446);
         let captured: Value = json!([{
             "name": "ign-adopt-capture",
             "collection": "core",
@@ -518,7 +538,7 @@ mod tests {
                     "type": "basic-token",
                     "timestamp": 1789760514446i64
                 },
-                "settings": { "tokenHash": "01fQ4Kjc" }
+                "settings": { "tokenHash": "BBBBexample_redacted_hash_43_chars_urlsafe_0" }
             }
         }]);
         // descriptions are optional-in (the gateway echoes them out);

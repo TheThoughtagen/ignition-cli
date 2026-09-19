@@ -161,6 +161,12 @@ def _escape_xml(text):
 	if text is None:
 		return ""
 	text = str(text)
+	# Review round: XML 1.0 forbids most control characters (only
+	# \t \n \r are legal below 0x20) -- strip the rest or the
+	# document is malformed, not just escaped.
+	text = "".join(
+		ch for ch in text
+		if ch in "\t\n\r" or ord(ch) >= 0x20)
 	text = text.replace("&", "&amp;")
 	text = text.replace("<", "&lt;")
 	text = text.replace(">", "&gt;")

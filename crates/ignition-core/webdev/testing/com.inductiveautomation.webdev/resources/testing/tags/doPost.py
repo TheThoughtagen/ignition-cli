@@ -143,9 +143,20 @@ def doPost(request, session):
 					'quality': str(qc)
 				})
 			else:
-				# Tag probably doesn't exist - queue for creation
-				needCreate.append(i)
-				results.append(None)  # placeholder
+				# Review round: auto-create ONLY on a not-found quality -
+				# a read-only, OPC-owned, permission-denied, or unhealthy
+				# tag must surface its real quality, not silently gain a
+				# shadow memory twin.
+				code = str(getattr(qc, 'code', '') or qc)
+				if 'NotFound' in code or 'BadTag' in code:
+					needCreate.append(i)
+					results.append(None)  # placeholder
+				else:
+					results.append({
+						'path': paths[i],
+						'success': False,
+						'quality': str(qc)
+					})
 
 		# Create missing tags and retry writes
 		if needCreate:

@@ -132,6 +132,14 @@ pub enum CoreError {
     #[error("secret unavailable for profile {profile:?}")]
     SecretUnavailable { profile: String },
 
+    /// The adopt bootstrap's login rung needs `IGNITION_PASSWORD` and it
+    /// was absent/empty (ADOPT-05 review round: the generic
+    /// [`Self::SecretUnavailable`] hint names the TOKEN paths, which is
+    /// exactly wrong for the PASSWORD gate — same exit class, own slug,
+    /// never a new exit code; the PollIntervalTooSmall precedent).
+    #[error("login password unavailable for profile {profile:?}")]
+    PasswordUnavailable { profile: String },
+
     /// Config file unreadable or wrong shape. Exit 3.
     #[error("invalid configuration: {reason}")]
     ConfigInvalid { reason: String },
@@ -561,6 +569,7 @@ impl CoreError {
             Self::ProfileNotFound { .. } => "profile_not_found",
             Self::NoActiveProfile => "no_active_profile",
             Self::SecretUnavailable { .. } => "secret_unavailable",
+            Self::PasswordUnavailable { .. } => "password_unavailable",
             Self::ConfigInvalid { .. } => "config_invalid",
             Self::PollIntervalTooSmall { .. } => "poll_interval_too_small",
             Self::Network { .. } => "network_error",
@@ -603,6 +612,7 @@ impl CoreError {
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
+            | Self::PasswordUnavailable { .. }
             | Self::ConfigInvalid { .. }
             | Self::PollIntervalTooSmall { .. } => 3,
             Self::Network { .. } => 4,
@@ -697,6 +707,11 @@ impl CoreError {
                 "set IGNITION_TOKEN (or token_env in the profile), or store a \
                  keyring entry: service 'ignition-cli', user 'profile:{profile}'"
             )),
+            Self::PasswordUnavailable { .. } => Some(
+                "ign adopt logs in with the gateway admin password — export \
+                 IGNITION_PASSWORD (env-only, never a flag)"
+                    .to_string(),
+            ),
             Self::ConfigInvalid { .. } => Some(
                 "verify the config file is valid TOML with [profiles.NAME] \
                  tables; `ign profile add` writes a known-good one"
@@ -1044,6 +1059,13 @@ mod tests {
                 "secret_unavailable",
             ),
             (
+                CoreError::PasswordUnavailable {
+                    profile: "dev".into(),
+                },
+                3,
+                "password_unavailable",
+            ),
+            (
                 CoreError::ConfigInvalid {
                     reason: "bad toml".into(),
                 },
@@ -1278,6 +1300,7 @@ mod tests {
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
+        (3, "password_unavailable"),
         (3, "config_invalid"),
         (3, "poll_interval_too_small"),
         (4, "network_error"),

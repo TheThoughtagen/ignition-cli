@@ -343,6 +343,14 @@ def _import_module(module_path):
 			if code_file.exists():
 				source = open(code_file.getAbsolutePath()).read()
 				module = types.ModuleType(module_path)
+				try:
+					exec(source, module.__dict__)
+				except Exception:
+					# Never cache a partial module (review round): a
+					# half-executed module in sys.modules would satisfy
+					# later runs WITHOUT executing its source.
+					sys.modules.pop(module_path, None)
+					raise
 				sys.modules[module_path] = module
 				# Attach to the parent package so `from pkg import mod`
 				# resolves for later imports too.
@@ -350,7 +358,6 @@ def _import_module(module_path):
 					parent = sys.modules.get(".".join(parts[:-1]))
 					if parent is not None:
 						setattr(parent, parts[-1], module)
-				exec(source, module.__dict__)
 				return module
 		raise
 
