@@ -276,6 +276,7 @@ pub fn fire_webdev_deploy(state: &mut AppState) {
             false, // --rotate-secret ditto
             &ignition_core::config::config_path(),
             &profile,
+            false, // --with-testing stays a CLI-form flag (ADOPT-04)
         )
         .await
     });

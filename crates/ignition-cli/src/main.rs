@@ -89,6 +89,9 @@ enum ActionOutput {
     Wait(actions::restart::WaitResult),
     /// `ign doctor` — the structured checks[] report.
     Doctor(actions::doctor::DoctorResult),
+    /// `ign adopt` — the step rows + (env-fallback only) the
+    /// one-time token exposure.
+    Adopt(actions::adopt::AdoptResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -320,6 +323,7 @@ impl ActionOutput {
             ActionOutput::RestartWait(result) => render_success(profile, result, compact),
             ActionOutput::Wait(result) => render_success(profile, result, compact),
             ActionOutput::Doctor(result) => render_success(profile, result, compact),
+            ActionOutput::Adopt(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -853,6 +857,77 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 )
                 .await;
                 (Some(name), Ok(ActionOutput::Doctor(result)))
+            }
+            Err(err) => (error_profile(&err), Err(err)),
+        },
+        // Adopt (ADOPT-02): the bootstrap verb — profile-scoped URL +
+        // name, credential = the login rung's env-only password rule
+        // (IGNITION_PASSWORD, NEVER a flag — the rig family's
+        // precedent) + --user (default admin). The session resolves
+        // DEGRADED: adopt's whole job is running BEFORE a working API
+        // token exists.
+        Commands::Adopt {
+            user,
+            key_name,
+            level,
+            project,
+            testing,
+            checkout,
+            bake,
+        } => match Session::resolve_degraded(cli.profile.as_deref()) {
+            Ok(session) => {
+                let name = session.profile_name().to_string();
+                let url = session.profile_url().to_string();
+                let Some(password) = env_non_empty("IGNITION_PASSWORD") else {
+                    // The PASSWORD gate, not the token gate — its own
+                    // slug + hint name IGNITION_PASSWORD (the review
+                    // round: the generic secret hint points at token
+                    // paths, exactly wrong here).
+                    return (
+                        error_profile(&CoreError::PasswordUnavailable {
+                            profile: name.clone(),
+                        }),
+                        Err(CoreError::PasswordUnavailable { profile: name }),
+                    );
+                };
+                // Profile credential — resolved on EVERY run now
+                // (review round): the skip path's probe needs it, and
+                // its absence is the minted-then-failed trap the
+                // action must surface (resolution DEGRADES — a
+                // missing secret is the None the action turns into
+                // the actionable error, not a CLI refusal).
+                let compose_credential =
+                    match Session::resolve_credential_opt(cli.profile.as_deref()) {
+                        Ok(credential) => credential,
+                        Err(err) => return (error_profile(&err), Err(err)),
+                    };
+                let opts = actions::adopt::AdoptOptions {
+                    username: user.unwrap_or_else(|| "admin".into()),
+                    key_name: key_name
+                        .unwrap_or_else(|| actions::adopt::DEFAULT_KEY_NAME.to_string()),
+                    level: level
+                        .map(|path| path.split('/').map(str::to_string).collect::<Vec<_>>())
+                        .unwrap_or_else(|| {
+                            actions::adopt::DEFAULT_LEVEL
+                                .iter()
+                                .map(|segment| segment.to_string())
+                                .collect()
+                        }),
+                    project,
+                    testing,
+                    checkout: checkout.map(std::path::PathBuf::from),
+                    bake: bake.map(std::path::PathBuf::from),
+                };
+                let result = actions::adopt::adopt(
+                    &url,
+                    &name,
+                    &ignition_core::config::config_path(),
+                    &config::Secret::new(password),
+                    compose_credential.as_ref(),
+                    &opts,
+                )
+                .await;
+                (Some(name), result.map(ActionOutput::Adopt))
             }
             Err(err) => (error_profile(&err), Err(err)),
         },
@@ -1416,6 +1491,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             project,
                             with_script_exec,
                             rotate_secret,
+                            with_testing,
                         } => {
                             if mode == RenderMode::Human {
                                 eprintln!("deploying webdev routes to {project} …");
@@ -1427,6 +1503,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                 rotate_secret,
                                 &path,
                                 &name,
+                                with_testing,
                             )
                             .await
                             .map(ActionOutput::WebdevDeploy)

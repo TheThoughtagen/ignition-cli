@@ -90,7 +90,7 @@ guarded verbs: schema-required would invite agents to auto-fill
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
 | 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, an invalid import file, an unreadable command input, or a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim) | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9)
-| 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small`
+| 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
 | 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `provider_root_unsupported`, `bundle_not_available` |
@@ -169,6 +169,55 @@ permission, WebDev-route presence, and Docker presence — and exits 0
 whenever the diagnosis completes so agents can parse `checks[]` from a
 broken setup without a nonzero exit getting in the way.
 
+### Gateway adoption (`ign adopt`)
+
+Doctor diagnoses the three-part token setup; **adopt fixes it**. One
+idempotent, profile-scoped verb walks a commissioned-but-unadopted
+gateway to a fully working profile:
+
+```bash
+export IGNITION_PASSWORD='<gateway admin password>'
+ign adopt --profile se-slot5-backend --project Flux --testing \
+  --checkout ~/gateways/slot5 --bake ~/rigs/slot5/restore.gwbk
+```
+
+Five bootstrap steps, each reported as a doctor-shaped row, each
+skippable when already satisfied — **re-running on an adopted gateway
+is an all-skip no-op**:
+
+| Step | What it does |
+|------|--------------|
+| `login` | The native OIDC dance (session cookie + CSRF) — the same machinery as `ign rig trial reset`, the only credential path that can mint the first key |
+| `key` | Mints an Administrator-level API key named `ign-cli` with "Require secure connections" **off** — idempotent by name over the `ignition/api-token` resource list |
+| `permissions` | Adds the key's level root to the gateway's read/write permission lists (merge-only, never removes) |
+| `probe` | `gateway-info` with the fresh `name:key` — the live end-to-end proof |
+| `persist` | Stores the credential in the **OS keyring** and rewrites the profile to `auth = { keyring = … }`; on headless hosts falls back to `IGNITION_TOKEN_<PROFILE>` and prints the token **exactly once** |
+
+Composition flags ride the bootstrap after the key is proven working:
+`--project NAME` deploys the CLI's WebDev routes (scriptExec on, the
+existing secret lifecycle), `--project … --testing` additionally ships
+the embedded Jython test framework + `testing/run`/`testing/tags`
+routes and **asserts the suite is live** before reporting green
+(discover ≥1 module + a passing smoke run — the empty-suite trap;
+a freshly deployed route's first-touch lazy-compile 500 is retried
+once), `--checkout DIR` lands every enabled project at
+`DIR/<project>` (scripts decoded, existing targets skip), and
+`--bake FILE` saves a roaming gwbk **after** everything landed — a
+gateway reset restored from it keeps the key, the wiring, and the
+routes (live-proven on 8.3.6).
+
+Flags: `--user NAME` (default `admin`), `--key-name NAME` (default
+`ign-cli`), `--level PATH` (default `Authenticated/Roles/Administrator`).
+The password comes from `IGNITION_PASSWORD` env-only (missing → exit
+3, rejected → exit 5). Unlike doctor, adopt **mutates**: a failed
+step is a hard error through the normal exit-code taxonomy, never a
+skip-ahead table. A same-name key that is disabled or
+secure-connections-only is a hard error (its plaintext is
+unrecoverable — delete it and re-run).
+
+Wire shapes, pitfalls, and the fresh-gateway verification log live in
+[`.planning/research/ADOPT-RESEARCH.md`](.planning/research/ADOPT-RESEARCH.md).
+
 ### Live-gateway verification (opt-in)
 
 An `#[ignore]`-gated suite (`crates/ignition-core/tests/live_gateway.rs`)
@@ -222,7 +271,8 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign wait restart [--interval S --timeout S]` | Wait for a restart to complete | shares `restart --wait`'s semantics: a non-RUNNING state observed once → RUNNING completes immediately (witnessed restart, no floor wait); an all-RUNNING wait reports success only after the same 5 s floor — no false positive when run right after `ign restart` |
 | `ign wait module <ID> [--interval S --timeout S]` | Wait until a module reports ACTIVE | polls `modules/healthy?search=<id>` (authed); timeout names the id + last observed state |
 | `ign doctor [--check-write] [--webdev-route NAME]` | Diagnose the setup: url (parse + TCP dial), liveness (unauth `/StatusPing`), commissioning (302→`/welcome`), auth (401 vs 403), the permissions deep-dive (`security-properties`), write permission, WebDev-route presence, Docker/rig presence | **exits 0 whenever the diagnosis completes** — failing checks are data, not CLI errors (agents parse `checks[]`; humans read the table); `--check-write` fires the harmless `scan/projects` rescan (2xx = write OK, 403 = read-only token); `--webdev-route NAME` probes that route's version action in the CLI's `ign-cli` WebDev project — **405 = absent** (the live-proven 8.3 marker; the earlier 404 assumption was wrong), 402 = module unlicensed, 200 = present (+ handshake version); config errors (no profile) still exit 3 |
-| `ign webdev deploy [--project NAME] [--with-script-exec] [--rotate-secret]` | Install the CLI's own WebDev route bundle into the dedicated `ign-cli` project (default) — `tags`, `tagConfig`, `alarms`, `tagHistory` (+ `scriptExec` only with `--with-script-exec`) | **not `--yes`-guarded by design**: the dedicated project is CLI-OWNED — born from the first deploy zip, overwrite-REPLACED on every deploy (replace-not-merge is the contract here; user projects are never touched); every WebDev-dependent tag command (Phase 5) refuses exit 6 `routes_not_deployed` naming `ign webdev deploy` until this runs; `--with-script-exec` generates a fresh hex secret (stored in the profile config at 0600) when none exists, `--rotate-secret` regenerates unconditionally (requires `--with-script-exec`); the secret NEVER appears in any output, envelope, or log (it lives in exactly one place: the baked route zip member); JSON data `{project, routes, script_exec, secret_rotated, import}` |
+| `ign adopt [--user NAME] [--key-name NAME] [--level PATH] [--project NAME] [--testing] [--checkout DIR] [--bake FILE]` | Bootstrap a commissioned gateway to a working profile: native OIDC login → mint an Administrator-level API key (`ign-cli`, secure-connections off, idempotent by name) → merge the level root into gateway read/write permissions → live-probe the fresh `name:key` → persist (OS keyring + profile rewrite; env-var fallback prints the token exactly once) | password from `IGNITION_PASSWORD` env-only (missing → exit 3, rejected → exit 5); **mutating-verb exits** — a failed step is a hard error (doctor-shaped `steps[]` rows, SKIP = already satisfied; re-run on an adopted gateway is an all-skip no-op); a same-name key that is disabled or secure-only is a hard error (delete it and re-run); composition flags run after the key is proven: `--project` deploys the WebDev routes, `--testing` (requires `--project`) ships the Jython test framework + testing routes and asserts discover ≥1 module + a green smoke run, `--checkout DIR` lands every enabled project (scripts decoded), `--bake FILE` saves a restore-ready roaming gwbk; see the [Gateway adoption section](#gateway-adoption-ign-adopt) |
+| `ign webdev deploy [--project NAME] [--with-script-exec] [--rotate-secret] [--with-testing]` | Install the CLI's own WebDev route bundle into the dedicated `ign-cli` project (default) — `tags`, `tagConfig`, `alarms`, `tagHistory` (+ `scriptExec` only with `--with-script-exec`, + the testing bundle only with `--with-testing`) | **not `--yes`-guarded by design**: the dedicated project is CLI-OWNED — born from the first deploy zip, overwrite-REPLACED on every deploy (replace-not-merge is the contract here; user projects are never touched); every WebDev-dependent tag command (Phase 5) refuses exit 6 `routes_not_deployed` naming `ign webdev deploy` until this runs; `--with-script-exec` generates a fresh hex secret (stored in the profile config at 0600) when none exists, `--rotate-secret` regenerates unconditionally (requires `--with-script-exec`); the secret NEVER appears in any output, envelope, or log (it lives in exactly one place: the baked route zip member); `--with-testing` appends the embedded TESTING bundle (the Jython framework, the permanent `testing.__tests__` smoke sentinel, and the POST-only `testing/run`/`testing/tags` routes) — NOTE: a testing-only deploy OVERWRITES and drops `scriptExec`; compose both flags (or let `ign adopt --project … --testing` do it); JSON data `{project, routes, script_exec, secret_rotated, import}` |
 | `ign webdev status [--project NAME]` | The version-handshake sweep: probe every route's version action — per-route `{route, status, deployed_version, expected_version}` | **a read — exits 0 whenever the sweep completes** (per-route degradation is DATA, the doctor precedent): `present`/`absent`/`unlicensed`/`auth_gated`/`secret_mismatch`/`version_mismatch` per route; the `ok` flag (data, not exit code) is true only when every always-on route is present with a matching version; scriptExec is probed ONLY when a secret is configured for the profile and never gates `ok` |
 | `ign tags provider list` | The gateway's tag providers: `name  enabled  tags  health` (+ `(managed)` marker) | NATIVE config-resource REST (no deployed routes needed) — the healthy seam: `metrics.tagCount` + `healthchecks.status` ride as the gateway reports them; the built-in `System` provider (and any MANAGED-type) is flagged; JSON rows carry `{name, enabled, tag_count, health, managed}` (all keys always) |
 | `ign tags provider create <NAME>` | Create a STANDARD tag provider | MVP creates the fixed STANDARD shape only (`{profile:{type:"STANDARD"}, settings:{}}` — the live-proven array-body POST); DB-backed providers are out of scope; audit-logged server-side |
@@ -1039,11 +1089,11 @@ decode to counter-named `<member>.<n>.py` sidecars keyed by
 `scripts-manifest.json` (also gitignored); the UNEDITED tree
 re-encodes through the codec BYTE-EXACTLY per member — proven at tree
 scale by the checkout contract suite. See
-[Script decode/encode](#script-decodeencode---decode-scripts--encode-scripts)
+[Script decode/encode](#script-decodeencode---decode-scripts----encode-scripts)
 for the codec contract.
 
 Editing ONE resource without checking out the whole tree is
-[`ign edit`](#edit---the-kubectl-edit-loop-over-one-resource-ign-edit)'s
+[`ign edit`](#edit--the-kubectl-edit-loop-over-one-resource-ign-edit)'s
 job — the workspace is for whole-tree authoring.
 
 ### Edit — the kubectl-edit loop over one resource (`ign edit`)
@@ -1124,7 +1174,7 @@ stderr-only for the same reason.
 stdout in ANY mode — the child `$EDITOR` owns the terminal and all
 prose renders to stderr — so it never participates in the envelope
 system at all (see the
-[edit section](#edit---the-kubectl-edit-loop-over-one-resource-ign-edit)).
+[edit section](#edit--the-kubectl-edit-loop-over-one-resource-ign-edit)).
 
 ### Destructive operations
 
