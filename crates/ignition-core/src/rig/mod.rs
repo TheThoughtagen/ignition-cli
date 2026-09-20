@@ -20,10 +20,14 @@
 //!    error, never a silent scan)
 //! 4. cwd candidates: `./docker/compose.yml`, `./docker/docker-compose.yml`,
 //!    `./compose.yml`, `./compose.yaml`, `./docker-compose.yml`
-//! 5. WHK conventions — the git-module repo, then the WHK-Global
-//!    orchestration repo, each probed under BOTH home roots
-//!    (plan-checker: machine layouts differ; never pin one root):
-//!    `~/Documents/whiskeyhouse/` first, `~/whiskeyhouse/` second.
+//! 5. WHK conventions — the git-module repo's TEST rig, then its
+//!    repo-root rig, then the WHK-Global orchestration repo, each probed
+//!    under BOTH home roots (plan-checker: machine layouts differ; never
+//!    pin one root): `~/Documents/whiskeyhouse/` first, `~/whiskeyhouse/`
+//!    second. Test rig leads because it's the only git-module rig whose
+//!    gateway can load the module — the repo-root rig's stock image has
+//!    neither `ACCEPT_MODULE_CERTS` nor `ACCEPT_MODULE_LICENSES`, so 8.3
+//!    quarantines the unsigned modl on boot.
 //!
 //! Nothing found → [`CoreError::Rig`] carrying the full search trail
 //! (agents self-diagnose). Convention roots live in ONE const array;
@@ -87,8 +91,21 @@ pub enum RigSelection {
 /// per machine, so BOTH roots are probed for BOTH convention repos).
 pub const WHK_HOME_ROOTS: &[&str] = &["~/Documents/whiskeyhouse", "~/whiskeyhouse"];
 
-/// Relative compose-file locations of the two WHK convention repos.
-const GIT_MODULE_RELPATH: &str = "ignition-git-module/docker/docker-compose.yml";
+/// The git-module repo ships TWO rigs; both are probed, test rig FIRST.
+/// The test rig is a BUILT gateway image with developer mode baked in
+/// before the first module scan and both `ACCEPT_MODULE_CERTS` /
+/// `ACCEPT_MODULE_LICENSES` set — it can actually load the module. The
+/// repo-root rig mounts the unsigned `Git-unsigned.modl` into a stock
+/// `inductiveautomation/ignition` image with neither accept var set, so
+/// 8.3 quarantines it on boot (and it separately wants a live
+/// `GATEWAY_GIT_USER_SECRET` plus real remote repos). Repo-root is kept
+/// as the SECOND entry, not dropped — checkouts that predate the test
+/// rig must still discover something.
+const GIT_MODULE_RELPATHS: &[&str] = &[
+    "ignition-git-module/docker/test-rig/docker-compose.yml",
+    "ignition-git-module/docker/docker-compose.yml",
+];
+/// Relative compose-file location of the WHK-Global orchestration repo.
 const WHK_GLOBAL_RELPATH: &str = "whk-environment-orchestration/docker-compose.yml";
 
 /// cwd compose candidates, in order (discovery level 4).
@@ -221,9 +238,14 @@ pub(crate) async fn resolve_plan_with(
         trail.push(candidate.to_string());
     }
 
-    // Level 5: WHK conventions — git-module first, then WHK-Global,
-    // each under BOTH home roots (first hit wins).
-    for relpath in [GIT_MODULE_RELPATH, WHK_GLOBAL_RELPATH] {
+    // Level 5: WHK conventions — git-module test-rig, then git-module
+    // repo-root, then WHK-Global, each under BOTH home roots (first hit
+    // wins).
+    for relpath in GIT_MODULE_RELPATHS
+        .iter()
+        .copied()
+        .chain(std::iter::once(WHK_GLOBAL_RELPATH))
+    {
         for root in &env.roots {
             let path = root.join(relpath);
             if path.is_file() {
@@ -818,6 +840,40 @@ mod tests {
         .await
         .expect("resolves");
         assert_eq!(plan.compose_file, in_root1, "first root wins");
+    }
+
+    /// The git-module repo ships two rigs under the SAME root: the test
+    /// rig (built image, developer mode baked in, both ACCEPT_MODULE_*
+    /// vars set) and the repo-root rig (stock image, unsigned modl,
+    /// neither accept var — 8.3 quarantines the module on boot). The
+    /// test rig must win; it's the only one whose gateway can load it.
+    #[tokio::test]
+    async fn git_module_test_rig_beats_the_repo_root_rig() {
+        let root = tempfile::tempdir().expect("root");
+        let test_rig = root
+            .path()
+            .join("ignition-git-module/docker/test-rig/docker-compose.yml");
+        std::fs::create_dir_all(test_rig.parent().unwrap()).expect("mkdir");
+        std::fs::write(&test_rig, MINIMAL_COMPOSE).expect("write");
+        let repo_root = root
+            .path()
+            .join("ignition-git-module/docker/docker-compose.yml");
+        std::fs::create_dir_all(repo_root.parent().unwrap()).expect("mkdir");
+        std::fs::write(&repo_root, MINIMAL_COMPOSE).expect("write");
+
+        let plan = resolve_plan_with(
+            &FakeRunner::with(vec![resolve_output()]),
+            RigSelection::Auto,
+            &Config::default(),
+            &discovery_env(Path::new("/empty-cwd"), &[root.path().into()]),
+        )
+        .await
+        .expect("test-rig resolves");
+        assert_eq!(
+            plan.compose_file, test_rig,
+            "test rig outranks the repo-root rig — it's the only one \
+             whose gateway can load the unsigned module"
+        );
     }
 
     // ----- resolve failures propagate as Rig ------------------------------
