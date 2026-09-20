@@ -795,3 +795,258 @@ async fn mismatch_error_is_not_downgradable() {
     }
     assert_cache_empty(cache_root.path(), "git");
 }
+
+// ---------------------------------------------------------------------
+// 15-02 Task 2: upstream digest drift (D-02) — refuse by default on
+// Refresh, name both digests, keep the cached artifact; the explicit
+// AcceptUpstreamChange override downloads and verifies the new bytes,
+// persisting them ALONGSIDE (never over) the existing entry.
+// ---------------------------------------------------------------------
+
+/// SC-3 regression guard: `CacheFirst` makes ZERO requests for a cached
+/// version even though upstream would (hypothetically) answer with a
+/// different digest — proven by never mounting ANY route at all.
+#[tokio::test]
+async fn cache_first_never_consults_the_feed_after_a_rerelease() {
+    let mock = FeedMock::start().await;
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    let cached_body = payload();
+    let digest_a = sha256_hex(&cached_body);
+    let cached_path = module_dir.join(format!("2.3.4-{digest_a}.modl"));
+    std::fs::write(&cached_path, &cached_body).expect("seed cache entry A");
+
+    let no_requests = wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let fetched = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect("CacheFirst must serve the cache without any request");
+
+    assert_eq!(fetched.source, ArtifactSource::Cache);
+    assert_eq!(fetched.digest_sha256, digest_a);
+    assert_eq!(fetched.path, cached_path);
+    drop(no_requests);
+}
+
+/// `Refresh` with an UNCHANGED upstream digest reuses the cache: the
+/// release endpoint is consulted (exactly once) but the download
+/// endpoint is never hit — bytes already proven are not re-fetched.
+#[tokio::test]
+async fn refresh_with_unchanged_digest_reuses_cache_without_redownloading() {
+    let mock = FeedMock::start().await;
+    let release_guard = mock.mount_release(1).await;
+    let download_no_hit = wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/download/Git-2.3.4-signed.modl"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    let cached_path = module_dir.join(format!("2.3.4-{}.modl", mock.digest));
+    std::fs::write(&cached_path, &mock.payload)
+        .expect("seed cache entry matching upstream's current digest");
+
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let fetched = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::Refresh)
+        .await
+        .expect("an unchanged digest under Refresh must reuse the cache");
+
+    assert_eq!(fetched.source, ArtifactSource::Cache);
+    assert_eq!(fetched.digest_sha256, mock.digest);
+    drop(release_guard);
+    drop(download_no_hit);
+}
+
+/// D-02 default: a CHANGED upstream digest under `Refresh` is REFUSED,
+/// naming both full digests, with the cached artifact left
+/// byte-identical and no file written for the refused new digest.
+#[tokio::test]
+async fn refresh_with_changed_digest_refuses_and_keeps_the_cached_artifact() {
+    let mock = FeedMock::start().await; // upstream now publishes digest B = mock.digest
+    let release_guard = mock.mount_release(1).await;
+    let download_no_hit = wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/download/Git-2.3.4-signed.modl"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    let old_body = b"an entirely different, previously-cached artifact - digest A".to_vec();
+    let digest_a = sha256_hex(&old_body);
+    assert_ne!(digest_a, mock.digest, "test fixture must diverge from upstream's digest");
+    let cached_path = module_dir.join(format!("2.3.4-{digest_a}.modl"));
+    std::fs::write(&cached_path, &old_body).expect("seed stale cache entry");
+
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::Refresh)
+        .await
+        .expect_err("a changed upstream digest must refuse under Refresh");
+
+    assert_eq!(err.code(), "module_digest_changed");
+    assert_eq!(err.exit_code(), 6);
+    let message = err.to_string();
+    assert!(
+        message.contains(&digest_a),
+        "message must name the cached digest: {message}"
+    );
+    assert!(
+        message.contains(&mock.digest),
+        "message must name the upstream digest: {message}"
+    );
+
+    // The cached artifact is left EXACTLY as it was.
+    assert_eq!(
+        std::fs::read(&cached_path).expect("cached file still present"),
+        old_body
+    );
+    let new_path = module_dir.join(format!("2.3.4-{}.modl", mock.digest));
+    assert!(
+        !new_path.exists(),
+        "no file for the refused upstream digest may be created"
+    );
+
+    drop(release_guard);
+    drop(download_no_hit);
+}
+
+/// D-02's explicit override: `AcceptUpstreamChange` downloads the new
+/// bytes, verifies them against the NEWLY published digest, and keeps
+/// BOTH the old and the new cache entries.
+#[tokio::test]
+async fn accept_upstream_change_downloads_verifies_and_keeps_both() {
+    let mock = FeedMock::start().await; // upstream now publishes digest B = mock.digest
+    let release_guard = mock.mount_release(1).await;
+    let (redirect_guard, cdn_guard) = mock.mount_download(1).await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    let old_body = b"the old artifact under digest A, cached before the upstream re-release".to_vec();
+    let digest_a = sha256_hex(&old_body);
+    assert_ne!(digest_a, mock.digest);
+    let old_path = module_dir.join(format!("2.3.4-{digest_a}.modl"));
+    std::fs::write(&old_path, &old_body).expect("seed old cache entry");
+
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let fetched = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::AcceptUpstreamChange,
+        )
+        .await
+        .expect("AcceptUpstreamChange must download and verify the new bytes");
+
+    assert_eq!(fetched.source, ArtifactSource::Download);
+    assert_eq!(fetched.digest_sha256, mock.digest);
+    let new_path = module_dir.join(format!("2.3.4-{}.modl", mock.digest));
+    assert_eq!(fetched.path, new_path);
+    assert!(new_path.exists(), "the newly accepted digest's file must exist");
+    assert!(old_path.exists(), "the old cached entry must remain untouched");
+    assert_eq!(
+        std::fs::read(&old_path).expect("old file still readable"),
+        old_body
+    );
+
+    drop(release_guard);
+    drop(redirect_guard);
+    drop(cdn_guard);
+}
+
+/// D-02/D-09: the override accepts a changed DIGEST, never unverified
+/// bytes — if the CDN serves something that doesn't match what upstream
+/// NOW publishes, `AcceptUpstreamChange` still refuses.
+#[tokio::test]
+async fn accept_upstream_change_still_verifies_the_new_bytes() {
+    let server = wiremock::MockServer::start().await;
+    let published_payload = payload();
+    let digest_b = sha256_hex(&published_payload);
+    let served_payload =
+        b"bytes that do not match digest B at all - a corrupted or hostile CDN".to_vec();
+    let digest_c = sha256_hex(&served_payload);
+    assert_ne!(digest_b, digest_c);
+
+    mount_release_and_download(
+        &server,
+        &digest_b,
+        served_payload.len() as u64,
+        served_payload,
+    )
+    .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    let old_body = b"digest A's old cached bytes".to_vec();
+    let digest_a = sha256_hex(&old_body);
+    std::fs::write(module_dir.join(format!("2.3.4-{digest_a}.modl")), &old_body)
+        .expect("seed old cache entry");
+
+    let feed =
+        ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
+    let err = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::AcceptUpstreamChange,
+        )
+        .await
+        .expect_err("bytes not matching the newly published digest must still refuse");
+
+    assert_eq!(err.code(), "module_digest_mismatch");
+    let leftover = module_dir.join(format!("2.3.4-{digest_c}.modl"));
+    assert!(
+        !leftover.exists(),
+        "unverified bytes must never reach the cache under any digest name"
+    );
+}
+
+/// D-08: once a version legitimately owns two cache entries (the
+/// override's doing), selection stays DETERMINISTIC across repeated
+/// calls — the newest by modified time, never a directory-iteration
+/// coin flip.
+#[test]
+fn cached_entry_picks_the_newest_deterministically() {
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    let digest_a = sha256_hex(b"artifact A bytes");
+    let digest_b = sha256_hex(b"artifact B bytes");
+    let path_a = module_dir.join(format!("2.3.4-{digest_a}.modl"));
+    let path_b = module_dir.join(format!("2.3.4-{digest_b}.modl"));
+    std::fs::write(&path_a, b"artifact A bytes").expect("write A");
+    // Ensure B's mtime is observably newer than A's — coarse mtime
+    // granularity on some filesystems otherwise makes this flaky.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&path_b, b"artifact B bytes").expect("write B");
+
+    for _ in 0..5 {
+        let entry = ignition_core::module::cached_entry(cache_root.path(), "git", "2.3.4")
+            .expect("a cache hit must exist");
+        assert_eq!(
+            entry.digest_sha256, digest_b,
+            "the newest-by-mtime entry must always win"
+        );
+    }
+}
