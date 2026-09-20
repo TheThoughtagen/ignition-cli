@@ -348,14 +348,14 @@ fn cache_entry_rejects_malformed_filenames() {
 /// fails HERE rather than passing on an incomplete ad-hoc check.
 fn assert_cache_empty(cache_root: &std::path::Path, module_id: &str) {
     let dir = cache_root.join("modules").join(module_id);
-    match std::fs::read_dir(&dir) {
-        Ok(mut entries) => assert!(
+    // A missing directory counts as empty.
+    if let Ok(mut entries) = std::fs::read_dir(&dir) {
+        assert!(
             entries.next().is_none(),
             "cache dir {} must be empty after a refusal — a refusal that leaves debris \
              is a failure even when the error itself is right",
             dir.display()
-        ),
-        Err(_) => {} // a missing directory counts as empty
+        );
     }
 }
 

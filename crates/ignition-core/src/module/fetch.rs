@@ -92,10 +92,11 @@ struct Asset {
     /// `"sha256:<64-hex>"` on GitHub's modern API — `None`/malformed is
     /// refused (`ign` never caches bytes it cannot verify).
     digest: Option<String>,
-    /// The release's published size in bytes. Unused in this plan;
-    /// 15-02 uses it to cap the download stream against a DoS body
-    /// (T-15-04) — kept here now so that plan needs no signature churn.
-    #[allow(dead_code)]
+    /// The release's published size in bytes — caps the download
+    /// stream against an oversized/endless body (T-15-10, 15-02).
+    /// `Content-Length` is deliberately NOT trusted in its place: a
+    /// hostile or broken origin controls that header too, while this
+    /// value arrived over the separate release-metadata request.
     size: u64,
 }
 
@@ -340,19 +341,37 @@ impl ModuleFeed {
                 url: download_url.to_string(),
                 source: Some(err),
             })?;
+            bytes += chunk.len() as u64;
+            // Size cap (T-15-10): compare the running total against the
+            // release's PUBLISHED size — never Content-Length, which a
+            // hostile or broken origin controls just as easily.
+            // Returning here stops polling `stream` immediately (the
+            // remaining body is never drained) and drops `temp`, whose
+            // Drop discards whatever partial bytes were written so far.
+            if bytes > asset.size {
+                return Err(CoreError::ModuleFeedUnusable {
+                    url: download_url.to_string(),
+                    detail: format!(
+                        "asset body exceeded the published size ({} bytes) — aborted mid-stream",
+                        asset.size
+                    ),
+                });
+            }
             hasher.update(&chunk);
             async_file.write_all(&chunk).await.map_err(|err| {
                 CoreError::Internal(format!("cannot write temp file: {err}"))
             })?;
-            bytes += chunk.len() as u64;
         }
         async_file
             .flush()
             .await
             .map_err(|err| CoreError::Internal(format!("cannot flush temp file: {err}")))?;
 
-        // (g) Verify. A mismatch returns before `.persist()` — the
-        // NamedTempFile's Drop discards the bytes structurally.
+        // (g) Verify. This comparison runs unconditionally, ahead of
+        // any policy branch, and takes no policy parameter — there is
+        // no FetchPolicy value that changes what happens here. A
+        // mismatch returns before `.persist()` — the NamedTempFile's
+        // Drop discards the bytes structurally.
         let actual_digest = format!("{:x}", hasher.finalize());
         if actual_digest != expected_digest {
             return Err(CoreError::ModuleDigestMismatch {
