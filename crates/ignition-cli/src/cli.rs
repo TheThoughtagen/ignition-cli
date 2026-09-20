@@ -250,6 +250,14 @@ pub enum Commands {
     /// through for CI
     Lint(LintArgs),
 
+    /// Browser end-to-end testing: diagnose the host + gateway a
+    /// Playwright suite needs (`doctor`), and scaffold one that logs
+    /// in through `ign session login` and talks to the gateway's
+    /// testing routes (`init`). There is no `e2e run` — the
+    /// scaffold's own `npm test` is the runner
+    #[command(arg_required_else_help = true)]
+    E2e(E2eArgs),
+
     /// Raw passthrough to any gateway REST endpoint — the escape
     /// hatch for the uncurated routes (the envelope's `data` is left
     /// gateway-verbatim; see README's documented contract exception)
@@ -1420,6 +1428,33 @@ pub struct ScriptArgs {
 pub struct TestingArgs {
     #[command(subcommand)]
     pub command: TestingCommand,
+}
+
+/// `ign e2e` args (QUICK-tg4) — the browser-E2E pair.
+#[derive(Debug, clap::Args)]
+pub struct E2eArgs {
+    #[command(subcommand)]
+    pub command: E2eCmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum E2eCmd {
+    /// Diagnose the browser-E2E setup: node (≥20), npm,
+    /// @playwright/test in the scaffold, a downloaded chromium, the
+    /// gateway's testing bundle, and the gateway's trial state.
+    /// Read-only and offline-safe — **exits 0 whenever the diagnosis
+    /// completes**, so every finding is a `checks[]` row rather than
+    /// an exit code. The two gateway rows report `skip` when no
+    /// profile resolves or no --project is given
+    Doctor {
+        /// The scaffold directory to inspect (default: ./e2e)
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// The gateway project whose testing bundle is probed. No
+        /// default — without it the bundle row honestly skips
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+    },
 }
 
 /// `ign session` args (QUICK-tg4) — the SINGULAR verb family: one

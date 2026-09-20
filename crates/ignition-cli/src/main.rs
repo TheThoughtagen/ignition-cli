@@ -96,6 +96,8 @@ enum ActionOutput {
     /// `storageState`. The session material rides the JSON envelope
     /// ONLY; the human render deliberately withholds it.
     SessionLogin(actions::login::SessionLoginResult),
+    /// `ign e2e doctor` — the six-row browser-E2E diagnosis.
+    E2eDoctor(actions::e2e::E2eDoctorResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -334,6 +336,7 @@ impl ActionOutput {
             ActionOutput::Doctor(result) => render_success(profile, result, compact),
             ActionOutput::Adopt(result) => render_success(profile, result, compact),
             ActionOutput::SessionLogin(result) => render_success(profile, result, compact),
+            ActionOutput::E2eDoctor(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -2620,6 +2623,32 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // The strict-mode exit passthrough is decided in `main` AFTER
         // the envelope renders — the one sanctioned success-path EXIT
         // exception (README "Linting").
+        // `ign e2e` (QUICK-tg4): the browser-E2E pair. The doctor's
+        // profile resolution is OPTIONAL — a failure to resolve yields
+        // `None` and a null profile rather than a refusal, because the
+        // verb's whole job is diagnosing a host that may not be
+        // configured yet (the `ign lint` shape, where the dispatch
+        // tuple's first element is None).
+        Commands::E2e(cli::E2eArgs { command }) => match command {
+            cli::E2eCmd::Doctor { dir, project } => {
+                let env = actions::e2e::E2eEnv::from_process();
+                let opts = actions::e2e::E2eDoctorOptions {
+                    dir: dir.unwrap_or_else(|| std::path::PathBuf::from("./e2e")),
+                    project,
+                };
+                match Session::resolve_degraded(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::e2e::e2e_doctor(Some(&session), &env, &opts).await;
+                        (Some(name), result.map(ActionOutput::E2eDoctor))
+                    }
+                    Err(_) => {
+                        let result = actions::e2e::e2e_doctor(None, &env, &opts).await;
+                        (None, result.map(ActionOutput::E2eDoctor))
+                    }
+                }
+            }
+        },
         Commands::Lint(LintArgs {
             paths,
             strict,

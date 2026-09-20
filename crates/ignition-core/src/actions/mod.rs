@@ -10,6 +10,7 @@ pub mod backup;
 pub mod connections;
 pub mod diagnostics;
 pub mod doctor;
+pub mod e2e;
 pub mod eam;
 pub mod edit;
 pub mod gan;

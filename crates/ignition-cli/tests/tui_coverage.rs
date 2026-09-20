@@ -320,7 +320,7 @@ fn dashboard_actions_menu_matches_registry() {
     // (extend the exclusion comments). The pinned test IS the
     // pre-declaration (the 08-06 OutOfBand pattern).
     //
-    // Current exclusions (38 Dashboard rows − 27 menu verbs = 11):
+    // Current exclusions (39 Dashboard rows − 27 menu verbs = 12):
     //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
     //     the TUI's menu can host).
     //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
@@ -343,6 +343,10 @@ fn dashboard_actions_menu_matches_registry() {
     //     terminal frame hands it to scrollback, screen recordings,
     //     and tmux capture. The verb exists to feed JSON to a machine
     //     (a Playwright globalSetup), so --json is its whole surface.
+    //   - `e2e doctor` (QUICK-tg4) — the same exclusion as `testing
+    //     run`: its product is a multi-row diagnosis DOCUMENT (six
+    //     rows, each with a detail and a hint), not a modal round
+    //     trip. It belongs in a doctor pane, not the actions menu.
     let dashboard_rows: Vec<&str> = routes()
         .iter()
         .filter(|route| matches!(route.mapping, Mapping::Screen(Screen::Dashboard)))
@@ -350,7 +354,7 @@ fn dashboard_actions_menu_matches_registry() {
         .collect();
     assert_eq!(
         dashboard_rows.len(),
-        38,
+        39,
         "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
          + the update.rs executor arms in the same change, or justify the \
          exclusion in this test's comment block: {dashboard_rows:#?}"

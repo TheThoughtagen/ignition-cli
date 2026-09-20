@@ -618,6 +618,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "testing run",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // QUICK-tg4: `ign e2e doctor` — the browser-E2E diagnosis. The
+        // row lands FRESH in this change. Deliberately NOT a dashboard
+        // menu action, for the same reason `testing run` is excluded:
+        // its product is a multi-row diagnosis DOCUMENT (six rows,
+        // each with a detail and a hint), and a one-line result modal
+        // would discard exactly the part a user came for. The
+        // dashboard's own doctor pane is where this belongs when a
+        // pane exists to host it.
+        CliRoute {
+            path: "e2e doctor",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // QUICK-tg4: `ign session login` — the live gateway session.
         // The row lands FRESH in this change. Deliberately NOT a
         // dashboard menu action: the verb's product IS a live

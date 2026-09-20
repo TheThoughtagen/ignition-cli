@@ -216,6 +216,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Doctor(result) => render_doctor_human(result),
         ActionOutput::Adopt(result) => render_adopt_human(result),
         ActionOutput::SessionLogin(result) => render_session_login_human(result),
+        ActionOutput::E2eDoctor(result) => render_e2e_doctor_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -793,6 +794,31 @@ fn render_adopt_human(result: &ignition_core::actions::adopt::AdoptResult) {
         println!();
         println!("API token (shown ONCE — store it now):");
         println!("  {token}");
+    }
+}
+
+/// `ign e2e doctor` rows — the SAME column treatment as
+/// `render_doctor_human`, deliberately: two doctors in one CLI that
+/// print differently teach a user that the rows mean different things.
+/// The one divergence is that every non-ok row shows its hint (the
+/// gateway doctor shows hints on `fail` only), because four of the six
+/// rows here can be `warn` with an actionable next step.
+fn render_e2e_doctor_human(result: &ignition_core::actions::e2e::E2eDoctorResult) {
+    use ignition_core::actions::doctor::CheckStatus;
+    println!("scaffold    {}", result.dir);
+    for check in &result.checks {
+        let status = match check.status {
+            CheckStatus::Ok => "OK",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+            CheckStatus::Skip => "SKIP",
+        };
+        println!("{:<14}  {:<4}  {}", check.name, status, check.detail);
+        if check.status != CheckStatus::Ok
+            && let Some(hint) = &check.hint
+        {
+            println!("  hint: {hint}");
+        }
     }
 }
 
