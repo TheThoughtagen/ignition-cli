@@ -11,7 +11,7 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 
 **Milestone:** v1.1 COMPLETE — archived to `.planning/milestones/` (v1.1-ROADMAP.md, v1.1-REQUIREMENTS.md), tagged `v1.1`
 **Status:** Awaiting next milestone definition
-**Last Activity:** 2026-09-16
+**Last Activity:** 2026-09-19 - Completed quick task 260919-p0g: Add ign testing run verb wrapping testing_discover/testing_run client functions
 
 **Progress:** Milestone boundary — no phase in progress
 
@@ -37,6 +37,12 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 ### Blockers
 
 (None — clean milestone boundary.)
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260919-p0g | Add ign testing run verb wrapping testing_discover/testing_run client functions | 2026-09-19 | d5938dd | [260919-p0g-add-ign-testing-run-verb-wrapping-testin](./quick/260919-p0g-add-ign-testing-run-verb-wrapping-testin/) |
 
 ## Session Continuity
 
