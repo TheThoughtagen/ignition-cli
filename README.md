@@ -432,7 +432,7 @@ is the identity truth, and every later op passes it as an explicit
 | 2 | `IGNITION_RIG` env | same lookup (folded into the flag — one env→flag home) |
 | 3 | `[rig].default` | the config's explicit preference — BEATS the cwd scan; a stale default is a loud exit 7 |
 | 4 | cwd compose files | `./docker/compose.yml`, `./docker/docker-compose.yml`, `./compose.yml`, `./compose.yaml`, `./docker-compose.yml` |
-| 5 | WHK conventions | `ignition-git-module/docker/docker-compose.yml`, then `whk-environment-orchestration/docker-compose.yml` — each probed under BOTH `~/Documents/whiskeyhouse/` and `~/whiskeyhouse/` (first hit wins) |
+| 5 | WHK conventions | `ignition-git-module/docker/test-rig/docker-compose.yml`, then `ignition-git-module/docker/docker-compose.yml`, then `whk-environment-orchestration/docker-compose.yml` — each probed under BOTH `~/Documents/whiskeyhouse/` and `~/whiskeyhouse/` (first hit wins); the test rig leads because it's the only git-module rig whose gateway loads the module |
 
 Config surface:
 
@@ -441,7 +441,7 @@ Config surface:
 default = "git-module"
 
 [rigs.git-module]
-compose_file = "~/Documents/whiskeyhouse/ignition-git-module/docker/docker-compose.yml"
+compose_file = "~/Documents/whiskeyhouse/ignition-git-module/docker/test-rig/docker-compose.yml"
 # project_name optional — omit to honor the rig's own .env
 ```
 
