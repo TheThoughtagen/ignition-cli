@@ -606,6 +606,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "script run",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // QUICK-p0g: `ign testing run` — the gateway test-suite verb.
+        // The row lands FRESH in this change. Deliberately NOT a
+        // dashboard menu action: it is an agent/CI verb whose product
+        // is a results DOCUMENT (counts, per-module results, an
+        // optional rendered report), not a modal round trip — a
+        // one-line result modal would lose exactly what the verb is
+        // for. Wiring it into ACTIONS behind a dedicated results pane
+        // is a clean follow-up.
+        CliRoute {
+            path: "testing run",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // 07-04: `ign lint` — the local delegation (no gateway: the
         // worker needs NO client). Ungated, unstrict (the doctor
         // posture IS the TUI display contract — findings land in the

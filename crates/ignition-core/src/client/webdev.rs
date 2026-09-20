@@ -131,6 +131,88 @@ pub async fn testing_run(
     })
 }
 
+/// The TESTING bundle's presence discrimination (QUICK-p0g) — the
+/// [`RouteProbe`] twin for the `testing/` URL space. A SEPARATE enum
+/// on purpose: `RouteProbe`'s variant set is pinned by the webdev
+/// tests and the two route families answer different shapes (the
+/// testing routes have no `{ok, data|error}` envelope and no
+/// `routeVersion` handshake).
+///
+/// WHY a raw-status path exists at all: [`super::classify::classify`]
+/// maps 404 → `NotFound` and collapses **405, 500 and 501** into
+/// `Internal` (exit 1, no status preserved). Running the presence
+/// check through it would make "the testing bundle was never
+/// deployed" (a target-state refusal, exit 6) indistinguishable from
+/// a CLI bug — so the status code IS the answer here, the
+/// [`super::GatewayApi::webdev_route_probe`] precedent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestingProbe {
+    /// 2xx — the bundle answers; the parsed discover body rides along
+    /// so the probe doubles as the discover round trip.
+    Present {
+        /// The `{"discovered_modules": [...], "count": N}` answer.
+        discovered: serde_json::Value,
+    },
+    /// 404 | 405 | 501 — the bundle is not deployed in this project.
+    /// All three are absent markers: 405 is the live-proven 8.3
+    /// WebDev marker for a missing route folder, 404 appears when the
+    /// project itself is absent on some paths, and 501 is what a
+    /// route whose methods failed to register answers.
+    Absent,
+    /// 402 — the WebDev module is installed but unlicensed.
+    Unlicensed,
+    /// 401 | 403 — something answers but rejects the credential.
+    AuthGated {
+        /// The rejecting status, preserved for the error.
+        status: u16,
+    },
+    /// 500 — the first-touch lazy-compile blowup (a freshly deployed
+    /// route can answer 500 on its FIRST request while WebDev
+    /// compiles the module; live-pinned in `actions::adopt`). The
+    /// body rides along so a SECOND 500 can be reported honestly.
+    LazyCompile {
+        /// The route's 500 body, verbatim.
+        body: String,
+    },
+}
+
+/// `POST …/testing/run` with `{"discover": true}` through the RAW
+/// transport — the presence probe. Only transport failures are
+/// errors; every status the gateway answered maps onto a
+/// [`TestingProbe`] variant (or an `Internal` naming the status when
+/// the enum has no variant for it).
+pub async fn testing_probe(
+    api: &super::ReqwestGatewayApi,
+    project: &str,
+) -> Result<TestingProbe, CoreError> {
+    let (url, response) = api
+        .testing_post_raw(project, "run", &serde_json::json!({"discover": true}))
+        .await?;
+    let status = response.status();
+    if status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let discovered = serde_json::from_str::<Value>(&text).map_err(|err| {
+            CoreError::Internal(format!(
+                "testing discover response did not match the expected shape: {err}"
+            ))
+        })?;
+        return Ok(TestingProbe::Present { discovered });
+    }
+    match status.as_u16() {
+        401 | 403 => Ok(TestingProbe::AuthGated {
+            status: status.as_u16(),
+        }),
+        402 => Ok(TestingProbe::Unlicensed),
+        404 | 405 | 501 => Ok(TestingProbe::Absent),
+        500 => Ok(TestingProbe::LazyCompile {
+            body: response.text().await.unwrap_or_default(),
+        }),
+        other => Err(CoreError::Internal(format!(
+            "unexpected HTTP {other} from the testing route probe at {url}"
+        ))),
+    }
+}
+
 /// The presence/version discrimination — the probe enum. The status
 /// code IS the answer (deliberately NOT run through classify, the
 /// [`super::GatewayApi::webdev_route_status`] precedent); only

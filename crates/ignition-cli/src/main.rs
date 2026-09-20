@@ -44,8 +44,8 @@ use ignition_cli::cli::{
     ProfileCmd, ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs,
     ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs,
     SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
-    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
-    WorkspaceArgs, WorkspaceCommand,
+    TagsProviderCommand, TagsUdtCommand, TestingArgs, TestingCommand, WaitArgs, WaitCmd,
+    WebdevArgs, WebdevCommand, WorkspaceArgs, WorkspaceCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -194,6 +194,11 @@ enum ActionOutput {
     /// keys {stdout, result, elapsedMs} (ALL keys always; the
     /// secret never rides any output path).
     ScriptRun(actions::script::ScriptRunResult),
+    /// `ign testing run` — the gateway suite's discover list or run
+    /// verdict (ALL keys always). A red run renders THIS success
+    /// envelope and exits 6 afterwards (the `ign lint --strict`
+    /// precedent, decided in `main` after the envelope renders).
+    TestingRun(actions::testing::TestingRunResult),
     /// `ign lint` — the doctor-posture delegation result; exit 0
     /// whenever the child ran, findings + child_exit_code + the
     /// parsed report as data (`--strict`'s passthrough is decided
@@ -366,6 +371,7 @@ impl ActionOutput {
             ActionOutput::EamTaskModify(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskDelete(result) => render_success(profile, result, compact),
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
+            ActionOutput::TestingRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
@@ -488,6 +494,22 @@ fn main() -> ExitCode {
             // findings at/above the tool's --fail-on threshold).
             if let ActionOutput::Lint(lint) = &out
                 && let Some(code) = lint.strict_exit_code()
+            {
+                return ExitCode::from(code);
+            }
+            // The SECOND sanctioned success-path EXIT exception
+            // (QUICK-p0g), same shape as the `ign lint --strict` one
+            // directly above: a RED `ign testing run` exits 6 while
+            // the envelope rendered above still carries every result
+            // field. `ErrorEnvelope` has no `data` field (LOCKED), so
+            // the error path physically cannot carry the results —
+            // and this is how every test runner behaves: the full
+            // report on stdout, the verdict in the exit code. The
+            // slug rides the payload as `data.slug = "tests_failed"`;
+            // it is NOT a CoreError variant and never belongs in the
+            // exit-code tables.
+            if let ActionOutput::TestingRun(testing) = &out
+                && let Some(code) = testing.failure_exit_code()
             {
                 return ExitCode::from(code);
             }
@@ -2508,6 +2530,29 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         )
                         .await
                         .map(ActionOutput::ScriptRun);
+                        (Some(name), result)
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
+        },
+        // `ign testing run` (QUICK-p0g): the standalone wrapper over
+        // the deployed testing bundle. `--project` is REQUIRED (clap
+        // enforces it) — running a suite executes that project's
+        // gateway-side code, so there is no silent default. The
+        // action probes the route's presence BEFORE running (an
+        // undeployed bundle is `routes_not_deployed`, exit 6, not a
+        // bug), and a RED run's exit 6 is decided in `main` AFTER the
+        // envelope renders — the `ign lint --strict` seam.
+        Commands::Testing(TestingArgs { command }) => match command {
+            TestingCommand::Run { project, discover } => {
+                let opts = actions::testing::TestingRunOptions { discover };
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::testing::testing_run(&session, &project, &opts)
+                            .await
+                            .map(ActionOutput::TestingRun);
                         (Some(name), result)
                     }
                     Err(err) => (error_profile(&err), Err(err)),

@@ -49,6 +49,7 @@ use ignition_core::actions::tags::{
     TagsExportResult, TagsHistoryQueryResult, TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
     history_summary,
 };
+use ignition_core::actions::testing::TestingRunResult;
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::actions::workspace::{
     CheckoutOutcome, PushOutcome, StatusKind, WorkspaceStatus,
@@ -271,6 +272,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskModify(result) => render_eam_task_modify_human(result),
         ActionOutput::EamTaskDelete(result) => render_eam_task_delete_human(result),
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
+        ActionOutput::TestingRun(result) => render_testing_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
@@ -1287,6 +1289,33 @@ fn render_script_run_human(result: &ScriptRunResult) {
     }
     println!("result: {}", result.result);
     println!("elapsed: {} ms", result.elapsed_ms);
+}
+
+/// `ign testing run` human shape (QUICK-p0g): discover prints one
+/// module per line plus a count; a run prints the counts summary and
+/// the verdict. The verdict line is explicit because the exit code
+/// alone is invisible to someone reading a terminal.
+fn render_testing_run_human(result: &TestingRunResult) {
+    if result.mode == "discover" {
+        for module in &result.modules {
+            println!("{module}");
+        }
+        println!("{} module(s) discovered", result.count);
+        return;
+    }
+    println!(
+        "passed: {}  failed: {}  skipped: {}  errors: {}  (total {}, {} ms)",
+        result.passed,
+        result.failed,
+        result.skipped,
+        result.errors,
+        result.total,
+        result.duration_ms
+    );
+    println!(
+        "verdict: {}",
+        result.verdict.as_deref().unwrap_or("unknown")
+    );
 }
 
 /// `ign api call` human shape: one verdict line, then the body — the

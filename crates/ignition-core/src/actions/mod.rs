@@ -27,6 +27,7 @@ pub mod script;
 pub mod sessions;
 pub mod tag_loss;
 pub mod tags;
+pub mod testing;
 pub mod version;
 pub mod webdev;
 pub mod workspace;

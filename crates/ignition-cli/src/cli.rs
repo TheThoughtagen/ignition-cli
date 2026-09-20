@@ -228,6 +228,13 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Script(ScriptArgs),
 
+    /// Run the gateway's own Jython test suite through the deployed
+    /// testing bundle — the agent/CI verb: a machine verdict without
+    /// the Designer (`ign webdev deploy --with-testing` or
+    /// `ign adopt --project NAME --testing` installs the bundle)
+    #[command(arg_required_else_help = true)]
+    Testing(TestingArgs),
+
     /// Lint local project files by delegating to ignition-lint (PATH
     /// discovery) — doctor posture: findings are DATA, exit 0
     /// whenever the tool ran; --strict passes the tool's exit code
@@ -1393,6 +1400,36 @@ impl ScheduleMode {
 pub struct ScriptArgs {
     #[command(subcommand)]
     pub command: ScriptCommand,
+}
+
+/// Testing subcommands (QUICK-p0g) — the standalone wrapper over the
+/// gateway testing bundle's `testing/run` route. `testing` requires a
+/// subcommand (the `script` shape — no bare row); there is no `--yes`
+/// guard: running a test suite is a read-shaped operation from the
+/// CLI's side and agents need the verb non-interactive.
+#[derive(Debug, clap::Args)]
+pub struct TestingArgs {
+    #[command(subcommand)]
+    pub command: TestingCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TestingCommand {
+    /// Run the gateway-side Jython test suite and return the machine
+    /// verdict (exit 0 green, exit 6 red with the FULL results still
+    /// in the envelope)
+    Run {
+        /// The project whose testing bundle runs. REQUIRED — the
+        /// bundle deploys per project and running a suite executes
+        /// that project's gateway-side code, so there is
+        /// deliberately no `ign-cli` default here
+        #[arg(long, value_name = "NAME", required = true)]
+        project: String,
+        /// List the gateway's discovered test modules instead of
+        /// running them
+        #[arg(long)]
+        discover: bool,
+    },
 }
 
 /// `ign lint` args (07-04, INTR-02) — the ignition-lint delegation:

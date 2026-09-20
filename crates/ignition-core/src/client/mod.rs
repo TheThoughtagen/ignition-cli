@@ -810,6 +810,37 @@ impl ReqwestGatewayApi {
         Ok((url.to_string(), response))
     }
 
+    /// POST the JSON body to a TESTING-bundle route
+    /// (`/system/webdev/{project}/testing/{route}`) RAW — the
+    /// `webdev_post_raw` twin for the sibling URL space (QUICK-p0g).
+    ///
+    /// NO classify, deliberately (the `webdev_route_probe`
+    /// precedent): the testing bundle's presence discrimination
+    /// needs the raw status, because [`classify`] collapses
+    /// 405/500/501 into `Internal` (exit 1) and would make an
+    /// undeployed bundle indistinguishable from a CLI bug. Transport
+    /// failures map to `Network` like every pipeline.
+    ///
+    /// The classified siblings ([`webdev::testing_discover`],
+    /// [`webdev::testing_run`]) are untouched — `ign adopt --testing`
+    /// keeps its exact behavior.
+    pub(crate) async fn testing_post_raw(
+        &self,
+        project: &str,
+        route: &str,
+        body: &serde_json::Value,
+    ) -> Result<(String, reqwest::Response), CoreError> {
+        let path = webdev::testing_route_url(project, route);
+        let url = self.url_for(&path);
+        let request = self.apply_auth(self.client.post(url.clone()).json(body));
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        Ok((url.to_string(), response))
+    }
+
     /// PUT `path` with a JSON body → classify → `Ok(())` (modify/
     /// reparent; resource puts in 03-03). Token-auth PUTs need NO
     /// CSRF. The classify-first rule holds: nothing consumes a body
