@@ -208,6 +208,18 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 | `exitcode` crate unmaintained (2017) | crates.io `updated_at` | 2026-08-21 |
 <!-- GSD:stack-end -->
 
+## Worktrees and cargo builds
+
+Do NOT create git worktrees under `.claude/worktrees/` (or anywhere else) that share this checkout's cargo target directory. This machine sets a global `CARGO_TARGET_DIR`, and cargo assigns a worktree's `ignition-core` the same artifact hash as the main checkout, so the two overwrite each other's rlib and dep-info. The symptoms look like code defects and are not: committed tests vanish from `--list`, `compile_error!` does not fail the build, `unresolved import ignition_core::actions::<new module>` against code that compiles everywhere else, and rust-analyzer shows phantom E0432/E0282 errors in new test files.
+
+Rules:
+
+- Prefer no worktree. Agents and GSD quick tasks run sequentially on the main checkout (`workflow.use_worktrees=false`).
+- If a worktree is unavoidable, give it its own target dir before any cargo command: `export CARGO_TARGET_DIR=/path/unique/to/that/worktree`. Never let two checkouts of this repo build into one target dir.
+- Remove any worktree under `.claude/worktrees/` when its branch lands. A leftover one silently corrupts the main checkout's builds.
+- If the symptoms above appear, do not debug the code. Rebuild in an isolated `CARGO_TARGET_DIR` first; if that is green, the shared target dir is the cause. `cargo clean -p` is not enough; the `.fingerprint/` and `deps/` artifacts for `ignition_core` must be removed with `/bin/rm` (the shell `rm` is wrapped and rejects `-rf`).
+- `ign` on PATH is the installed binary, not the repo build. Run `cargo install --path crates/ignition-cli --force` before any manual smoke check of a changed verb.
+
 <!-- GSD:conventions-start source:CONVENTIONS.md -->
 
 ## Conventions
