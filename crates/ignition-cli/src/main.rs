@@ -2545,8 +2545,19 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // bug), and a RED run's exit 6 is decided in `main` AFTER the
         // envelope renders — the `ign lint --strict` seam.
         Commands::Testing(TestingArgs { command }) => match command {
-            TestingCommand::Run { project, discover } => {
-                let opts = actions::testing::TestingRunOptions { discover };
+            TestingCommand::Run {
+                project,
+                discover,
+                module,
+                package,
+                format,
+            } => {
+                let opts = actions::testing::TestingRunOptions {
+                    discover,
+                    module,
+                    package,
+                    format: format.into(),
+                };
                 match Session::resolve(cli.profile.as_deref()) {
                     Ok(session) => {
                         let name = session.profile_name().to_string();

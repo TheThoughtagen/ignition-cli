@@ -1413,6 +1413,38 @@ pub struct TestingArgs {
     pub command: TestingCommand,
 }
 
+/// The CLI-side `--format` enum (QUICK-p0g) — the clap `ValueEnum`
+/// mirror of core's plain `TestingFormat`, the `TransferFormat`
+/// precedent (core keeps framework-free enums; the `From` impl lives
+/// beside this one). `get_possible_values()` is what feeds the MCP
+/// tool schema a real enum instead of a free string.
+///
+/// EVERY value produces the SAME verdict and exit code: the route is
+/// always asked for json and the junit/text reports are rendered
+/// client-side, because the route's own junit/text answers stay HTTP
+/// 200 and carry no counts — a passthrough would exit 0 on a red
+/// suite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum TestingFormatArg {
+    /// Structured results only (default) — `data.report` stays empty
+    #[default]
+    Json,
+    /// JUnit XML in `data.report`, for a CI test reporter
+    Junit,
+    /// Console-style text in `data.report`, for a human reading logs
+    Text,
+}
+
+impl From<TestingFormatArg> for ignition_core::actions::testing::TestingFormat {
+    fn from(value: TestingFormatArg) -> Self {
+        match value {
+            TestingFormatArg::Json => Self::Json,
+            TestingFormatArg::Junit => Self::Junit,
+            TestingFormatArg::Text => Self::Text,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TestingCommand {
     /// Run the gateway-side Jython test suite and return the machine
@@ -1427,8 +1459,21 @@ pub enum TestingCommand {
         project: String,
         /// List the gateway's discovered test modules instead of
         /// running them
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["module", "package"])]
         discover: bool,
+        /// Run ONE dotted module (`proj.foo_test`); mutually
+        /// exclusive with --package and --discover
+        #[arg(long, value_name = "DOTTED", conflicts_with = "package")]
+        module: Option<String>,
+        /// Run every module under a package prefix (`proj.`);
+        /// mutually exclusive with --module and --discover
+        #[arg(long, value_name = "PREFIX")]
+        package: Option<String>,
+        /// Report rendered into `data.report`. The verdict and exit
+        /// code are IDENTICAL in every format — the structured
+        /// results always ride under `data.results`
+        #[arg(long, value_name = "FORMAT", default_value = "json")]
+        format: TestingFormatArg,
     },
 }
 

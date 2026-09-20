@@ -1316,6 +1316,12 @@ fn render_testing_run_human(result: &TestingRunResult) {
         "verdict: {}",
         result.verdict.as_deref().unwrap_or("unknown")
     );
+    // The rendered report (--format junit|text) follows the summary:
+    // the counts line is the verdict at a glance, the report is the
+    // detail a CI reporter or a human wants after it.
+    if !result.report.is_empty() {
+        println!("{}", result.report);
+    }
 }
 
 /// `ign api call` human shape: one verdict line, then the body — the
