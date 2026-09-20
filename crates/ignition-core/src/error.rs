@@ -10,9 +10,9 @@
 //! | 1    | internal       | `internal`
 //! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01)
-//! | 4    | network        | `network_error`
+//! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -581,6 +581,81 @@ pub enum CoreError {
         /// vocabulary, e.g. `Invalid`).
         state: String,
     },
+
+    /// Transport failure reaching a third-party module release feed or
+    /// its asset CDN — DNS/connect/timeout/TLS (Phase 15, D-06). Exit 4:
+    /// same network class as [`Self::Network`], but a SEPARATE slug and
+    /// wording — `Network`'s Display hard-codes "gateway unreachable",
+    /// which is actively wrong here (`api.github.com` is not a gateway,
+    /// and the user's own gateway may be perfectly reachable). This is
+    /// the offline signal `fetch_and_verify` returns when the cache is
+    /// empty (SC-4's negative half).
+    #[error(
+        "module release feed at {url} is unreachable{source_note}",
+        source_note = source.as_ref().map(|source| format!(": {source}")).unwrap_or_default()
+    )]
+    ModuleFeedUnreachable {
+        /// The feed or CDN URL that could not be reached.
+        url: String,
+        #[source]
+        source: Option<reqwest::Error>,
+    },
+
+    /// No release exists for the pinned tag, or the release carries no
+    /// asset of the expected name (Phase 15, SC-1's "unknown version"
+    /// refusal). Exit 6 — target state: names BOTH the requested version
+    /// and the resolved URL, and (for a missing asset) both the expected
+    /// asset name and the names actually present, so the caller never
+    /// has to guess which lookup failed or falls back to "latest".
+    #[error("module {module:?} version {version:?} not found at {url}: {detail}")]
+    ModuleReleaseNotFound {
+        /// The [`crate::module::ModuleSpec::id`] being fetched.
+        module: String,
+        /// The requested version string.
+        version: String,
+        /// The tag-pinned releases URL that was queried.
+        url: String,
+        /// What specifically was missing (no release for the tag, or no
+        /// matching asset — names the asset actually present).
+        detail: String,
+    },
+
+    /// Downloaded bytes hash to something other than the release's
+    /// published digest — SC-2's hard refusal (Phase 15; this variant is
+    /// defined in 15-01, the branch is exercised starting 15-02). Exit 6
+    /// — target state: the feed answered and served bytes, but what it
+    /// served cannot be trusted. The bytes are discarded (never
+    /// persisted to the cache) and BOTH digests are named.
+    #[error(
+        "module {module:?} version {version:?} digest mismatch at {url}: expected {expected}, got {actual}"
+    )]
+    ModuleDigestMismatch {
+        /// The [`crate::module::ModuleSpec::id`] being fetched.
+        module: String,
+        /// The requested version string.
+        version: String,
+        /// The asset URL the mismatched bytes were downloaded from.
+        url: String,
+        /// The release's published sha256 digest.
+        expected: String,
+        /// The sha256 digest of the bytes actually downloaded.
+        actual: String,
+    },
+
+    /// The module release feed ANSWERED but not usably — rate-limited,
+    /// unauthenticated 401/403, 5xx, an unparseable body, an asset with
+    /// no published digest, or an insecure downgrade of the asset URL
+    /// (Phase 15). Exit 6 — target state: distinct from
+    /// [`Self::ModuleFeedUnreachable`] (exit 4 — transport never reached
+    /// the feed at all); here the feed DID answer, just not with
+    /// something `ign` can safely act on.
+    #[error("module release feed at {url} is unusable: {detail}")]
+    ModuleFeedUnusable {
+        /// The feed or asset URL that answered unusably.
+        url: String,
+        /// What specifically made the answer unusable.
+        detail: String,
+    },
 }
 
 impl CoreError {
@@ -625,6 +700,10 @@ impl CoreError {
             Self::NodeToolAbsent { .. } => "node_tool_absent",
             Self::GatewayClientError { .. } => "gateway_client_error",
             Self::BundleNotAvailable { .. } => "bundle_not_available",
+            Self::ModuleFeedUnreachable { .. } => "module_feed_unreachable",
+            Self::ModuleReleaseNotFound { .. } => "module_release_not_found",
+            Self::ModuleDigestMismatch { .. } => "module_digest_mismatch",
+            Self::ModuleFeedUnusable { .. } => "module_feed_unusable",
         }
     }
 
@@ -642,7 +721,7 @@ impl CoreError {
             | Self::PasswordUnavailable { .. }
             | Self::ConfigInvalid { .. }
             | Self::PollIntervalTooSmall { .. } => 3,
-            Self::Network { .. } => 4,
+            Self::Network { .. } | Self::ModuleFeedUnreachable { .. } => 4,
             Self::Auth { .. } => 5,
             Self::GatewayTooOld { .. }
             | Self::GatewayNotCommissioned { .. }
@@ -667,7 +746,10 @@ impl CoreError {
             | Self::ScriptExecNotConfigured { .. }
             | Self::LintToolAbsent
             | Self::NodeToolAbsent { .. }
-            | Self::BundleNotAvailable { .. } => 6,
+            | Self::BundleNotAvailable { .. }
+            | Self::ModuleReleaseNotFound { .. }
+            | Self::ModuleDigestMismatch { .. }
+            | Self::ModuleFeedUnusable { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -944,6 +1026,30 @@ impl CoreError {
                  polling cannot produce one"
                     .to_string(),
             ),
+            Self::ModuleFeedUnreachable { .. } => Some(
+                "check network reachability to the module release feed — an \
+                 already-cached version works fully offline, so this only \
+                 blocks a first-time fetch of a new version"
+                    .to_string(),
+            ),
+            Self::ModuleReleaseNotFound {
+                module, version, ..
+            } => Some(format!(
+                "check that {module} version {version} exists as a release upstream \
+                 (the tag and asset name must match exactly) — this CLI never falls \
+                 back to \"latest\""
+            )),
+            Self::ModuleDigestMismatch { module, version, .. } => Some(format!(
+                "the downloaded bytes for {module} version {version} do not match \
+                 the feed's published digest — do not trust this artifact; nothing \
+                 was cached, so re-running the fetch tries again from scratch"
+            )),
+            Self::ModuleFeedUnusable { .. } => Some(
+                "the module release feed answered but was not usable — if the \
+                 detail names a rate limit, wait and retry; otherwise the feed's \
+                 response itself needs investigation"
+                    .to_string(),
+            ),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -977,6 +1083,10 @@ impl CoreError {
             | Self::EamNotController { endpoint }
             | Self::ProviderRootUnsupported { endpoint }
             | Self::EamTaskInFlight { endpoint, .. } => endpoint.clone(),
+            Self::ModuleFeedUnreachable { url, .. }
+            | Self::ModuleReleaseNotFound { url, .. }
+            | Self::ModuleDigestMismatch { url, .. }
+            | Self::ModuleFeedUnusable { url, .. } => Some(url.clone()),
             _ => None,
         }
     }
@@ -1066,6 +1176,25 @@ mod tests {
             url: url.to_string(),
             source: Some(source),
             observation: None,
+        }
+    }
+
+    /// The [`CoreError::ModuleFeedUnreachable`] twin of [`network_error`]
+    /// — a real `reqwest::Error` from an unroutable loopback port, for
+    /// the offline-module-feed exit-4 case.
+    fn module_feed_unreachable_error() -> CoreError {
+        crate::client::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let url = "http://127.0.0.1:1";
+        let source = rt
+            .block_on(reqwest::get(url))
+            .expect_err("request to an unroutable port must fail");
+        CoreError::ModuleFeedUnreachable {
+            url: url.to_string(),
+            source: Some(source),
         }
     }
 
@@ -1338,6 +1467,40 @@ mod tests {
                 "gateway_client_error",
             ),
             (CoreError::Rig("compose up failed".into()), 7, "rig_error"),
+            (
+                module_feed_unreachable_error(),
+                4,
+                "module_feed_unreachable",
+            ),
+            (
+                CoreError::ModuleReleaseNotFound {
+                    module: "git".into(),
+                    version: "99.99.99".into(),
+                    url: "https://api.github.com/repos/WhiskeyHouse/ignition-git-module/releases/tags/v99.99.99".into(),
+                    detail: "no release exists for tag \"v99.99.99\"".into(),
+                },
+                6,
+                "module_release_not_found",
+            ),
+            (
+                CoreError::ModuleDigestMismatch {
+                    module: "git".into(),
+                    version: "2.3.4".into(),
+                    url: "https://release-assets.githubusercontent.com/Git-2.3.4-signed.modl".into(),
+                    expected: "b".repeat(64),
+                    actual: "c".repeat(64),
+                },
+                6,
+                "module_digest_mismatch",
+            ),
+            (
+                CoreError::ModuleFeedUnusable {
+                    url: "https://api.github.com/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4".into(),
+                    detail: "rate limit exceeded".into(),
+                },
+                6,
+                "module_feed_unusable",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1391,6 +1554,10 @@ mod tests {
         (6, "node_tool_absent"),
         (6, "provider_root_unsupported"),
         (6, "bundle_not_available"),
+        (4, "module_feed_unreachable"),
+        (6, "module_release_not_found"),
+        (6, "module_digest_mismatch"),
+        (6, "module_feed_unusable"),
         (7, "rig_error"),
     ];
 

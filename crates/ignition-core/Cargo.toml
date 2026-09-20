@@ -29,6 +29,7 @@ tempfile = { workspace = true } # promoted from dev (05-02): the resource-surger
 quick-xml = { workspace = true } # 11-03 TAGS-12: Event-loop loss scan (no serde feature — see workspace deps rationale)
 csv = { workspace = true } # 11-03 TAGS-12: legacy CSV loss scan + 11-04 generator
 base64 = { workspace = true } # 11-04: byte-faithful envelope carrier (payload_b64 decode / file_b64 encode — the ONLY transfer transformation)
+sha2 = { workspace = true } # promoted from ignition-cli's dev-dependencies (15-01): the module artifact fetch's streaming sha256 verification — already workspace-pinned at 0.10, NOT a new dependency
 
 [dev-dependencies]
 wiremock = { workspace = true }
