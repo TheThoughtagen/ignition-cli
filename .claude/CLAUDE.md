@@ -59,7 +59,7 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 
 - Derive-API subcommands map 1:1 onto the domain (`gateway status`, `project list`, `tag read`, `rig up`, `tui`), generate help/completions for free, and `#[command(propagate_version = true)]` gives every subcommand `--version`.
 - Global args (`#[arg(global = true)]`) are exactly what `--json`, `--profile`, `--verbose` need — available on every subcommand without repetition.
-- clap's default exit code for usage errors is `2`, distinct from runtime failures (`1`+) — the exit-code contract (below) builds on this.
+- clap's default exit code for usage errors is `2`, distinct from runtime failures; the full exit-code contract lives in the README, not here.
 - It is *the* Rust CLI standard (docs.rs/clap sustainably ~10M+ downloads/mo; maintained under clap-rs org with active 2026 releases — 4.6.6 released 2026-08-06).
 - `argh`, `argh_derive` — Google-internal conventions, thinner ecosystem, no completion generation story to match clap_complete.
 - `bpaf` — clever combinators, smaller community; nothing here needs it.
@@ -134,17 +134,9 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 - Plaintext secrets file with `0600` — works, but prod gateway tokens in dotfiles is exactly what leaks; keyring is one small crate.
 - `secrecy` crate wrapping — useful hygiene (`SecretString`) but can be added when the config layer lands; not a v1 blocker. (Mention: consider `zeroize`-backed `secrecy` for in-memory token strings — optional polish.)
 
-### 10. Error Handling & Exit Codes — thiserror + std::process::ExitCode
+### 10. Error Handling — thiserror + std::process::ExitCode
 
-| Code | Meaning | Examples |
-|------|---------|----------|
-| 0 | success | — |
-| 1 | general runtime failure | unexpected internal error |
-| 2 | usage error (clap default) | bad flags, missing args |
-| 3 | connection failure | gateway unreachable, timeout |
-| 4 | auth failure | 401/403, bad token |
-| 5 | gateway state error | project not found, rig not running |
-| 6 | docker/rig failure | `docker compose` nonzero, docker missing |
+The exit-code table is NOT documented here. The source of truth is the README's exit-code table and `crates/ignition-core/src/error.rs`, both pinned by `readme_exit_table_agreement` and `exit_code_mapping_enumerated`. Read those before specifying any exit code.
 
 - `thiserror` (2.0.20, Aug 2026) gives typed variants that carry structured details for the JSON error envelope (`code` slug + message + optional details), and `#[from]` conversions from reqwest/serde/io.
 - `std::process::ExitCode` (stable since Rust 1.61) makes `main` return codes cleanly; the mapping lives in one `impl From<&CliError> for ExitCode`.
@@ -207,6 +199,18 @@ A Rust CLI and ratatui TUI cockpit for Ignition by Inductive Automation gateways
 | clap derive/subcommand/global-arg patterns | Context7 `/websites/rs_clap` (docs.rs cookbook/derive tutorial) | 2026-08-21 |
 | `exitcode` crate unmaintained (2017) | crates.io `updated_at` | 2026-08-21 |
 <!-- GSD:stack-end -->
+
+## Worktrees and cargo builds
+
+Do NOT create git worktrees under `.claude/worktrees/` (or anywhere else) that share this checkout's cargo target directory. This machine sets a global `CARGO_TARGET_DIR`, and cargo assigns a worktree's `ignition-core` the same artifact hash as the main checkout, so the two overwrite each other's rlib and dep-info. The symptoms look like code defects and are not: committed tests vanish from `--list`, `compile_error!` does not fail the build, `unresolved import ignition_core::actions::<new module>` against code that compiles everywhere else, and rust-analyzer shows phantom E0432/E0282 errors in new test files.
+
+Rules:
+
+- Prefer no worktree. Agents and GSD quick tasks run sequentially on the main checkout (`workflow.use_worktrees=false`).
+- If a worktree is unavoidable, give it its own target dir before any cargo command: `export CARGO_TARGET_DIR=/path/unique/to/that/worktree`. Never let two checkouts of this repo build into one target dir.
+- Remove any worktree under `.claude/worktrees/` when its branch lands. A leftover one silently corrupts the main checkout's builds.
+- If the symptoms above appear, do not debug the code. Rebuild in an isolated `CARGO_TARGET_DIR` first; if that is green, the shared target dir is the cause. `cargo clean -p` is not enough; the `.fingerprint/` and `deps/` artifacts for `ignition_core` must be removed with `/bin/rm` (the shell `rm` is wrapped and rejects `-rf`).
+- `ign` on PATH is the installed binary, not the repo build. Run `cargo install --path crates/ignition-cli --force` before any manual smoke check of a changed verb.
 
 <!-- GSD:conventions-start source:CONVENTIONS.md -->
 

@@ -320,7 +320,7 @@ fn dashboard_actions_menu_matches_registry() {
     // (extend the exclusion comments). The pinned test IS the
     // pre-declaration (the 08-06 OutOfBand pattern).
     //
-    // Current exclusions (36 Dashboard rows − 27 menu verbs = 9):
+    // Current exclusions (40 Dashboard rows − 27 menu verbs = 13):
     //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
     //     the TUI's menu can host).
     //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
@@ -331,6 +331,27 @@ fn dashboard_actions_menu_matches_registry() {
     //   - `profile use`, `profile list`, `profile add` — the profile
     //     switcher modal (the global `p` key, 06-02 Task 3), not the
     //     actions menu.
+    //   - `testing run` (QUICK-p0g) — an agent/CI verb whose product
+    //     is a results DOCUMENT (counts, per-module results, an
+    //     optional rendered report), not a modal round trip; a
+    //     one-line result modal would lose exactly what the verb is
+    //     for. Wiring it into ACTIONS behind a dedicated results pane
+    //     is a clean follow-up.
+    //   - `session login` (QUICK-tg4) — the verb's product IS a live
+    //     credential (session cookie value + CSRF token). A TUI modal
+    //     has nowhere safe to put one: rendering a secret into a
+    //     terminal frame hands it to scrollback, screen recordings,
+    //     and tmux capture. The verb exists to feed JSON to a machine
+    //     (a Playwright globalSetup), so --json is its whole surface.
+    //   - `e2e doctor` (QUICK-tg4) — the same exclusion as `testing
+    //     run`: its product is a multi-row diagnosis DOCUMENT (six
+    //     rows, each with a detail and a hint), not a modal round
+    //     trip. It belongs in a doctor pane, not the actions menu.
+    //   - `e2e init` (QUICK-tg4) — it writes files into an
+    //     operator-named directory and spawns package installers. The
+    //     CLI gate is the global --yes, whose refusal previews every
+    //     member and both command lines; a TUI modal that shrank that
+    //     to "OK?" would be a worse gate than no gate.
     let dashboard_rows: Vec<&str> = routes()
         .iter()
         .filter(|route| matches!(route.mapping, Mapping::Screen(Screen::Dashboard)))
@@ -338,7 +359,7 @@ fn dashboard_actions_menu_matches_registry() {
         .collect();
     assert_eq!(
         dashboard_rows.len(),
-        36,
+        40,
         "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
          + the update.rs executor arms in the same change, or justify the \
          exclusion in this test's comment block: {dashboard_rows:#?}"

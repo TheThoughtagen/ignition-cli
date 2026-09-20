@@ -29,7 +29,7 @@ const STDERR_PREVIEW_CAP: usize = 4000;
 
 /// An executable regular file (unix checks any execute bit).
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.is_file()
         && std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
@@ -37,17 +37,49 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// An executable regular file (non-unix falls back to file-ness).
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Split `PATH` and return the first `ignition-lint` that is an
-/// executable regular file — std fs + env, no `which` dependency.
-pub fn find_lint_tool() -> Option<PathBuf> {
+/// The candidate name suffixes probed on a non-unix host, in order.
+///
+/// `npm` and `npx` ship as `.cmd` shims on Windows, so a bare-name-only
+/// probe would report a perfectly working Node install as absent. The
+/// empty suffix stays FIRST so a real `.exe` or extensionless binary
+/// still wins when both exist.
+#[cfg(not(unix))]
+const EXEC_SUFFIXES: &[&str] = &["", ".cmd", ".exe", ".bat"];
+
+/// Unix has no name-suffix convention — one candidate, the bare name.
+#[cfg(unix)]
+const EXEC_SUFFIXES: &[&str] = &[""];
+
+/// Split a caller-supplied `PATH` value and return the first `tool`
+/// that is an executable regular file — std fs only, no `which`
+/// dependency.
+///
+/// The injected form (QUICK-tg4): tests hand this a temp-dir stub PATH
+/// instead of mutating the process environment, which is `unsafe` in
+/// edition 2024 and races under the workspace's parallel test runs.
+pub fn find_on_path_in(path_var: &std::ffi::OsStr, tool: &str) -> Option<PathBuf> {
+    std::env::split_paths(path_var).find_map(|dir| {
+        EXEC_SUFFIXES.iter().find_map(|suffix| {
+            let candidate = dir.join(format!("{tool}{suffix}"));
+            is_executable_file(&candidate).then_some(candidate)
+        })
+    })
+}
+
+/// [`find_on_path_in`] over the process `PATH`.
+pub fn find_on_path(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(TOOL_NAME))
-        .find(|candidate| is_executable_file(candidate))
+    find_on_path_in(&path, tool)
+}
+
+/// Discover `ignition-lint` on PATH. One implementation now serves
+/// both this verb and `ign e2e`'s node/npm rows.
+pub fn find_lint_tool() -> Option<PathBuf> {
+    find_on_path(TOOL_NAME)
 }
 
 /// `ign lint` output model — the doctor-posture shape, ALL keys

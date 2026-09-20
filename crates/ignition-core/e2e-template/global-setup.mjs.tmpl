@@ -1,0 +1,98 @@
+// Playwright globalSetup — scaffolded by `ign e2e init`.
+//
+// Two steps, both delegating to the `ign` CLI so this file never
+// reimplements the gateway's login dance or its test protocol:
+//
+//   1. `ign session login --json` → write `.auth/state.json`, the
+//      Playwright storageState every browser context starts from. This
+//      is why no test has to drive the login form.
+//   2. `ign testing run --json` → run the gateway's OWN Jython suite
+//      FIRST and abort the browser run if it is red. A browser failure
+//      caused by broken gateway-side code is an expensive way to learn
+//      something one HTTP call already knew.
+
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+
+const IGN = process.env.IGN_BIN || 'ign';
+const AUTH_STATE = resolve('.auth/state.json');
+const PROJECT = '__IGN_PROJECT__';
+
+function runIgn(args, what) {
+  try {
+    return execFileSync(IGN, args, {
+      encoding: 'utf8',
+      // The current environment passes through so IGNITION_PASSWORD,
+      // IGNITION_URL, IGNITION_TOKEN and friends reach the CLI.
+      env: process.env,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  } catch (err) {
+    const code = err.status;
+    const stderr = (err.stderr || '').toString().trim();
+    // The CLI's exit codes ARE the contract — name them, because
+    // "command failed" sends a reader to the wrong place.
+    const meaning =
+      code === 3
+        ? 'exit 3 — no password available; set IGNITION_PASSWORD'
+        : code === 4 || code === 5
+          ? `exit ${code} — the gateway rejected the credentials`
+          : code === 6
+            ? 'exit 6 — the gateway suite is RED or a required tool/route is missing'
+            : `exit ${code}`;
+    throw new Error(`${what} failed (${meaning})\n${stderr}`);
+  }
+}
+
+function parseEnvelope(stdout, what) {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`${what} did not return JSON:\n${stdout.slice(0, 800)}`);
+  }
+}
+
+export default async function globalSetup() {
+  // --- 1. The gateway session -------------------------------------
+  const loginOut = runIgn(['session', 'login', '--json'], 'ign session login');
+  const login = parseEnvelope(loginOut, 'ign session login');
+  if (!login.ok || !login.data || !login.data.storage_state) {
+    throw new Error(
+      `ign session login returned no storage_state:\n${loginOut.slice(0, 800)}`,
+    );
+  }
+  mkdirSync(dirname(AUTH_STATE), { recursive: true });
+  writeFileSync(AUTH_STATE, JSON.stringify(login.data.storage_state, null, 2));
+  process.stdout.write(`[ign e2e] session established → ${AUTH_STATE}\n`);
+
+  // --- 2. The gateway's own suite ---------------------------------
+  if (process.env.IGN_E2E_SKIP_GATEWAY_TESTS === '1') {
+    process.stdout.write('[ign e2e] gateway suite skipped (IGN_E2E_SKIP_GATEWAY_TESTS=1)\n');
+    return;
+  }
+  const testOut = runIgn(
+    ['testing', 'run', '--project', PROJECT, '--json'],
+    'ign testing run',
+  );
+  const suite = parseEnvelope(testOut, 'ign testing run');
+  const data = suite.data || {};
+  if (data.verdict !== 'passed') {
+    // `data.results` is the route's run_all object verbatim; the
+    // per-module rows live under its `modules` array.
+    const broken = ((data.results && data.results.modules) || [])
+      .filter((r) => (r.failed || 0) > 0 || (r.errors || 0) > 0)
+      .map((r) => r.module || r.name)
+      .filter(Boolean);
+    throw new Error(
+      `the gateway's own test suite is RED (verdict: ${data.verdict}) — ` +
+        `aborting before the browser run.\n` +
+        `Failing modules: ${broken.length ? broken.join(', ') : '(see the full report)'}\n` +
+        `Re-run it directly: ign testing run --project ${PROJECT}\n` +
+        `Skip this gate with IGN_E2E_SKIP_GATEWAY_TESTS=1.`,
+    );
+  }
+  process.stdout.write(
+    `[ign e2e] gateway suite green (${data.passed || 0} passed)\n`,
+  );
+}

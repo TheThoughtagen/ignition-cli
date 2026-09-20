@@ -41,6 +41,17 @@ pub const TUI_TTY_REFUSAL_REASON: &str = "ign tui requires a terminal (stdout is
 /// hint silently regresses to the generic default and those pins fail.
 pub const LOSS_GATE_REFUSAL_REASON_PREFIX: &str = "loss report (";
 
+/// The TESTING bundle's route prefix (QUICK-p0g). The
+/// [`CoreError::RoutesNotDeployed`] hint is content-addressed off it
+/// — same third instance of the 06-07 pattern: the frozen taxonomy
+/// keeps ONE absent-routes variant and one slug
+/// (`routes_not_deployed`, exit 6), but the testing bundle installs
+/// through a DIFFERENT command (`ign webdev deploy --with-testing` /
+/// `ign adopt --project NAME --testing`), so the generic
+/// `ign webdev deploy` hint would name a command that does not fix
+/// it. Raise sites pass `route: "testing/run"`.
+pub const TESTING_ROUTE_PREFIX: &str = "testing/";
+
 /// The api-call catch-all's body cap (09-01): a gateway 4xx body rides
 /// [`CoreError::GatewayClientError`] VERBATIM up to this many bytes; a
 /// larger body is truncated at [`truncate_api_body`] with the explicit
@@ -515,6 +526,21 @@ pub enum CoreError {
     #[error("ignition-lint is not installed (no executable found on PATH)")]
     LintToolAbsent,
 
+    /// `ign e2e init` found no `node` executable on PATH — the scaffold
+    /// it would write is unusable without one (QUICK-tg4).
+    ///
+    /// Exit 6, mirroring [`Self::LintToolAbsent`] line for line: this
+    /// is the SAME shape — a local external tool a verb delegates to is
+    /// absent, with an install hint. It deliberately does NOT join
+    /// exit 7, whose sole slug is `rig_error` for docker/compose rig
+    /// failures; putting a missing Node there would force a relabel of
+    /// a locked exit class.
+    #[error("{tool} is not installed (no executable found on PATH)")]
+    NodeToolAbsent {
+        /// The tool that was looked for (`node`).
+        tool: String,
+    },
+
     /// The gateway answered the api call with a 4xx this CLI does not
     /// curate — the caller's request is the problem, and the body is
     /// theirs to read. Exit 2 (usage class; additive slug — the
@@ -596,6 +622,7 @@ impl CoreError {
             Self::EamTaskInFlight { .. } => "eam_task_in_flight",
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
             Self::LintToolAbsent => "lint_tool_absent",
+            Self::NodeToolAbsent { .. } => "node_tool_absent",
             Self::GatewayClientError { .. } => "gateway_client_error",
             Self::BundleNotAvailable { .. } => "bundle_not_available",
         }
@@ -639,6 +666,7 @@ impl CoreError {
             | Self::EamTaskInFlight { .. }
             | Self::ScriptExecNotConfigured { .. }
             | Self::LintToolAbsent
+            | Self::NodeToolAbsent { .. }
             | Self::BundleNotAvailable { .. } => 6,
             Self::Rig(_) => 7,
         }
@@ -781,10 +809,23 @@ impl CoreError {
                   run `ign rig reset --yes` for a completely fresh trial volume"
                     .to_string(),
             ),
-            Self::RoutesNotDeployed { .. } => Some(
-                "run `ign webdev deploy` to install the CLI's WebDev routes into \
-                  the gateway, then retry"
-                    .to_string(),
+            Self::RoutesNotDeployed { route, .. } => Some(
+                // CONTENT-ADDRESSED off the route (the
+                // TUI_TTY_REFUSAL_REASON / loss-gate prose-prefix
+                // pattern, same file): the testing bundle is a
+                // SEPARATE deploy with its own flag, so the generic
+                // `ign webdev deploy` hint would send the caller to a
+                // command that does not install it. No new variant,
+                // no new slug — the exit tables are untouched.
+                if route.starts_with(TESTING_ROUTE_PREFIX) {
+                    "run `ign webdev deploy --with-testing` to install the gateway \
+                      testing bundle into the project (or bootstrap it in one shot \
+                      with `ign adopt --project NAME --testing`), then retry"
+                } else {
+                    "run `ign webdev deploy` to install the CLI's WebDev routes into \
+                      the gateway, then retry"
+                }
+                .to_string(),
             ),
             Self::WebdevUnlicensed { .. } => Some(
                 "license the gateway — the WebDev module answers 402 while \
@@ -885,6 +926,12 @@ impl CoreError {
                  ignition-lint on PATH"
                     .to_string(),
             ),
+            // The SAME string `ign e2e doctor`'s node row hands out —
+            // a user who hits this refusal and then runs the doctor
+            // must not be given two wordings of one instruction.
+            Self::NodeToolAbsent { .. } => {
+                Some(crate::actions::e2e::NODE_INSTALL_HINT.to_string())
+            }
             Self::GatewayClientError { .. } => Some(
                 "the gateway rejected this request — the body above is the \
                  gateway's own answer; fix the path/method/body, or use a \
@@ -992,13 +1039,21 @@ pub struct ErrorBody {
 mod tests {
     use super::{
         CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
-        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX, truncate_api_body,
+        GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
+        TESTING_ROUTE_PREFIX, truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
     /// an unroutable loopback port fails at connect time (instant refusal —
     /// `reqwest::Error` has no public constructor).
     fn network_error() -> CoreError {
+        // reqwest is built with `rustls-no-provider`, so a raw
+        // `reqwest::get` panics unless the process-wide provider is
+        // installed. In a full lib-test run some other test happens to
+        // install it first; running the error tests ALONE (which the
+        // exit-table verify command does) hit the panic. The install is
+        // idempotent and documented for exactly this use.
+        crate::client::install_crypto_provider();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1260,6 +1315,13 @@ mod tests {
             ),
             (CoreError::LintToolAbsent, 6, "lint_tool_absent"),
             (
+                CoreError::NodeToolAbsent {
+                    tool: "node".into(),
+                },
+                6,
+                "node_tool_absent",
+            ),
+            (
                 CoreError::BundleNotAvailable {
                     state: "Invalid".into(),
                 },
@@ -1326,6 +1388,7 @@ mod tests {
         (6, "eam_task_in_flight"),
         (6, "script_exec_not_configured"),
         (6, "lint_tool_absent"),
+        (6, "node_tool_absent"),
         (6, "provider_root_unsupported"),
         (6, "bundle_not_available"),
         (7, "rig_error"),
@@ -1793,6 +1856,47 @@ mod tests {
         assert!(
             !hint.contains("--yes"),
             "the --yes hint must not leak onto the TTY path: {hint}"
+        );
+    }
+
+    /// The testing-scoped `routes_not_deployed` hint (QUICK-p0g): a
+    /// `testing/`-prefixed route names the TESTING install commands,
+    /// while every other route keeps the generic `ign webdev deploy`
+    /// text BYTE-identically. Both branches are pinned so a future
+    /// edit cannot silently merge them — sending a caller to
+    /// `ign webdev deploy` for an absent testing bundle is a hint
+    /// that does not fix the error.
+    #[test]
+    fn routes_not_deployed_hint_is_testing_scoped() {
+        let testing = CoreError::RoutesNotDeployed {
+            project: "Flux".into(),
+            route: format!("{TESTING_ROUTE_PREFIX}run"),
+            endpoint: None,
+        };
+        assert_eq!(testing.code(), "routes_not_deployed", "slug unchanged");
+        assert_eq!(testing.exit_code(), 6, "target-state class unchanged");
+        let hint = testing.hint().expect("hint required");
+        assert!(
+            hint.contains("ign webdev deploy --with-testing"),
+            "testing hint must name the deploy flag: {hint}"
+        );
+        assert!(
+            hint.contains("ign adopt") && hint.contains("--testing"),
+            "testing hint must name the adopt path: {hint}"
+        );
+
+        // Every non-testing route: the generic hint, unchanged.
+        let generic = CoreError::RoutesNotDeployed {
+            project: "ign-cli".into(),
+            route: "tags".into(),
+            endpoint: None,
+        };
+        let hint = generic.hint().expect("hint required");
+        assert_eq!(
+            hint,
+            "run `ign webdev deploy` to install the CLI's WebDev routes into \
+             the gateway, then retry",
+            "the generic branch is byte-identical to its pre-QUICK-p0g text"
         );
     }
 }

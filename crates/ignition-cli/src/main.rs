@@ -44,8 +44,8 @@ use ignition_cli::cli::{
     ProfileCmd, ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs,
     ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs,
     SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
-    TagsProviderCommand, TagsUdtCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand,
-    WorkspaceArgs, WorkspaceCommand,
+    TagsProviderCommand, TagsUdtCommand, TestingArgs, TestingCommand, WaitArgs, WaitCmd,
+    WebdevArgs, WebdevCommand, WorkspaceArgs, WorkspaceCommand,
 };
 
 /// What a dispatched subcommand produced. One variant per command; grows in
@@ -92,6 +92,14 @@ enum ActionOutput {
     /// `ign adopt` — the step rows + (env-fallback only) the
     /// one-time token exposure.
     Adopt(actions::adopt::AdoptResult),
+    /// `ign session login` — the live gateway session + its Playwright
+    /// `storageState`. The session material rides the JSON envelope
+    /// ONLY; the human render deliberately withholds it.
+    SessionLogin(actions::login::SessionLoginResult),
+    /// `ign e2e doctor` — the six-row browser-E2E diagnosis.
+    E2eDoctor(actions::e2e::E2eDoctorResult),
+    /// `ign e2e init` — the scaffold write + the installer legs.
+    E2eInit(actions::e2e::E2eInitResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -194,6 +202,11 @@ enum ActionOutput {
     /// keys {stdout, result, elapsedMs} (ALL keys always; the
     /// secret never rides any output path).
     ScriptRun(actions::script::ScriptRunResult),
+    /// `ign testing run` — the gateway suite's discover list or run
+    /// verdict (ALL keys always). A red run renders THIS success
+    /// envelope and exits 6 afterwards (the `ign lint --strict`
+    /// precedent, decided in `main` after the envelope renders).
+    TestingRun(actions::testing::TestingRunResult),
     /// `ign lint` — the doctor-posture delegation result; exit 0
     /// whenever the child ran, findings + child_exit_code + the
     /// parsed report as data (`--strict`'s passthrough is decided
@@ -324,6 +337,9 @@ impl ActionOutput {
             ActionOutput::Wait(result) => render_success(profile, result, compact),
             ActionOutput::Doctor(result) => render_success(profile, result, compact),
             ActionOutput::Adopt(result) => render_success(profile, result, compact),
+            ActionOutput::SessionLogin(result) => render_success(profile, result, compact),
+            ActionOutput::E2eDoctor(result) => render_success(profile, result, compact),
+            ActionOutput::E2eInit(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -366,6 +382,7 @@ impl ActionOutput {
             ActionOutput::EamTaskModify(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskDelete(result) => render_success(profile, result, compact),
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
+            ActionOutput::TestingRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
@@ -488,6 +505,22 @@ fn main() -> ExitCode {
             // findings at/above the tool's --fail-on threshold).
             if let ActionOutput::Lint(lint) = &out
                 && let Some(code) = lint.strict_exit_code()
+            {
+                return ExitCode::from(code);
+            }
+            // The SECOND sanctioned success-path EXIT exception
+            // (QUICK-p0g), same shape as the `ign lint --strict` one
+            // directly above: a RED `ign testing run` exits 6 while
+            // the envelope rendered above still carries every result
+            // field. `ErrorEnvelope` has no `data` field (LOCKED), so
+            // the error path physically cannot carry the results —
+            // and this is how every test runner behaves: the full
+            // report on stdout, the verdict in the exit code. The
+            // slug rides the payload as `data.slug = "tests_failed"`;
+            // it is NOT a CoreError variant and never belongs in the
+            // exit-code tables.
+            if let ActionOutput::TestingRun(testing) = &out
+                && let Some(code) = testing.failure_exit_code()
             {
                 return ExitCode::from(code);
             }
@@ -930,6 +963,45 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (Some(name), result.map(ActionOutput::Adopt))
             }
             Err(err) => (error_profile(&err), Err(err)),
+        },
+        // Session login (QUICK-tg4): the second env-only-password
+        // verb, placed directly beside adopt so the two read together.
+        // Same rationale VERBATIM: the session resolves DEGRADED
+        // because logging in is what happens BEFORE a token exists,
+        // and the password gate is the PASSWORD one (IGNITION_PASSWORD,
+        // never a flag) whose slug and hint name that variable rather
+        // than a token path.
+        Commands::Session(cli::SessionArgs { command }) => match command {
+            cli::SessionCmd::Login { user } => {
+                match Session::resolve_degraded(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let url = session.profile_url().to_string();
+                        let Some(password) = env_non_empty("IGNITION_PASSWORD") else {
+                            return (
+                                error_profile(&CoreError::PasswordUnavailable {
+                                    profile: name.clone(),
+                                }),
+                                Err(CoreError::PasswordUnavailable { profile: name }),
+                            );
+                        };
+                        // D6: flag → IGNITION_USER → admin (the union of
+                        // adopt's and `rig trial reset`'s orders).
+                        let username = user
+                            .or_else(|| env_non_empty("IGNITION_USER"))
+                            .unwrap_or_else(|| "admin".into());
+                        let opts = actions::login::SessionLoginOptions { username };
+                        let result = actions::login::session_login(
+                            &url,
+                            &opts,
+                            &config::Secret::new(password),
+                        )
+                        .await;
+                        (Some(name), result.map(ActionOutput::SessionLogin))
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
         },
         // Projects (03-01, PROJ-01/02): the first project-family
         // commands. All arms are authed (inspection-command rule: exit
@@ -2514,12 +2586,114 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
             }
         },
+        // `ign testing run` (QUICK-p0g): the standalone wrapper over
+        // the deployed testing bundle. `--project` is REQUIRED (clap
+        // enforces it) — running a suite executes that project's
+        // gateway-side code, so there is no silent default. The
+        // action probes the route's presence BEFORE running (an
+        // undeployed bundle is `routes_not_deployed`, exit 6, not a
+        // bug), and a RED run's exit 6 is decided in `main` AFTER the
+        // envelope renders — the `ign lint --strict` seam.
+        Commands::Testing(TestingArgs { command }) => match command {
+            TestingCommand::Run {
+                project,
+                discover,
+                module,
+                package,
+                format,
+            } => {
+                let opts = actions::testing::TestingRunOptions {
+                    discover,
+                    module,
+                    package,
+                    format: format.into(),
+                };
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::testing::testing_run(&session, &project, &opts)
+                            .await
+                            .map(ActionOutput::TestingRun);
+                        (Some(name), result)
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
+        },
         // `ign lint` (07-04, INTR-02): LOCAL delegation — no gateway,
         // no credential, no profile resolution at all (the docker-verb
         // precedent for non-gateway commands; envelope profile null).
         // The strict-mode exit passthrough is decided in `main` AFTER
         // the envelope renders — the one sanctioned success-path EXIT
         // exception (README "Linting").
+        // `ign e2e` (QUICK-tg4): the browser-E2E pair. The doctor's
+        // profile resolution is OPTIONAL — a failure to resolve yields
+        // `None` and a null profile rather than a refusal, because the
+        // verb's whole job is diagnosing a host that may not be
+        // configured yet (the `ign lint` shape, where the dispatch
+        // tuple's first element is None).
+        Commands::E2e(cli::E2eArgs { command }) => match command {
+            cli::E2eCmd::Doctor { dir, project } => {
+                let env = actions::e2e::E2eEnv::from_process();
+                let opts = actions::e2e::E2eDoctorOptions {
+                    dir: dir.unwrap_or_else(|| std::path::PathBuf::from("./e2e")),
+                    project,
+                };
+                match Session::resolve_degraded(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::e2e::e2e_doctor(Some(&session), &env, &opts).await;
+                        (Some(name), result.map(ActionOutput::E2eDoctor))
+                    }
+                    Err(_) => {
+                        let result = actions::e2e::e2e_doctor(None, &env, &opts).await;
+                        (None, result.map(ActionOutput::E2eDoctor))
+                    }
+                }
+            }
+            // `ign e2e init` — the guarded scaffold write. Order is
+            // load-bearing: the PREVIEW runs first (it re-runs the
+            // foreign-directory and node gates, so those refusals win
+            // over the confirmation refusal and the previewed statuses
+            // are accurate), then the confirmation guard consumes the
+            // preview as its prose, then the action.
+            cli::E2eCmd::Init {
+                dir,
+                project,
+                run_project,
+                browsers,
+            } => {
+                let env = actions::e2e::E2eEnv::from_process();
+                // `e2e init` must work BEFORE a profile is configured —
+                // scaffolding is something you do on a fresh machine.
+                let (profile, gateway_url) = match Session::resolve_degraded(cli.profile.as_deref())
+                {
+                    Ok(session) => (
+                        Some(session.profile_name().to_string()),
+                        session.profile_url().to_string(),
+                    ),
+                    Err(_) => (None, actions::e2e::DEFAULT_GATEWAY_URL.to_string()),
+                };
+                let project = project.unwrap_or_else(|| "ign-cli".to_string());
+                let opts = actions::e2e::E2eInitOptions {
+                    dir: dir.unwrap_or_else(|| std::path::PathBuf::from("./e2e")),
+                    run_project: run_project.unwrap_or_else(|| project.clone()),
+                    project,
+                    gateway_url,
+                    browsers,
+                };
+                let preview = match actions::e2e::e2e_init_preview(&env, &opts) {
+                    Ok(preview) => preview,
+                    Err(err) => return (profile, Err(err)),
+                };
+                // guarded:e2e init
+                if let Err(err) = require_confirmation(cli.yes, &preview) {
+                    return (profile, Err(err));
+                }
+                let result = actions::e2e::e2e_init(&env, &opts).await;
+                (profile, result.map(ActionOutput::E2eInit))
+            }
+        },
         Commands::Lint(LintArgs {
             paths,
             strict,
@@ -3223,6 +3397,15 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     // 13-08: the kubectl-edit loop's push gate (dynamic prose: the
     // staged-changed summary IS the refusal message).
     ("edit", "edit would write <N> member(s) to <project>"),
+    // QUICK-tg4: the scaffold write + the spawned installers. A
+    // DYNAMIC-prose site — the refusal message IS `e2e_init_preview`'s
+    // output (the target, every member with its would-be status, and
+    // both command lines verbatim), so the preview doubles as the dry
+    // run and no separate --dry-run flag exists.
+    (
+        "e2e init",
+        "e2e init <target, member list with statuses, and the npm/npx command lines>",
+    ),
 ];
 
 /// The guarded lifecycle verbs' Tier-2 gate (10-04): the blast-radius
@@ -3709,7 +3892,16 @@ mod tests {
                 continue;
             };
             let path = rest.trim();
-            if !path.is_empty() && path.bytes().all(|b| b.is_ascii_lowercase() || b == b' ') {
+            // Lowercase, DIGITS, and spaces: a clap leaf path may carry
+            // a digit (`e2e init` — QUICK-tg4). A digit-rejecting
+            // filter silently dropped that marker and reported the
+            // registered op as unmarked, which is the one failure mode
+            // this scan exists to prevent.
+            if !path.is_empty()
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b' ')
+            {
                 out.push(path.to_string());
             }
         }

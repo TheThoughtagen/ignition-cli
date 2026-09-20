@@ -166,6 +166,15 @@ pub enum Commands {
         bake: Option<String>,
     },
 
+    /// Obtain a live gateway login session (the native OIDC dance) —
+    /// returns the session cookie name/value, the CSRF token, the
+    /// gateway URL, and a ready-to-use Playwright `storageState`
+    /// document. The session material is emitted ONLY under the
+    /// global --json flag; the human render prints the cookie name
+    /// and the gateway URL and withholds the rest
+    #[command(arg_required_else_help = true)]
+    Session(SessionArgs),
+
     /// Manage gateway projects: list with inheritance info, new, copy,
     /// rename, set (reparent), delete, export/import (ZIP)
     #[command(arg_required_else_help = true)]
@@ -228,11 +237,26 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Script(ScriptArgs),
 
+    /// Run the gateway's own Jython test suite through the deployed
+    /// testing bundle — the agent/CI verb: a machine verdict without
+    /// the Designer (`ign webdev deploy --with-testing` or
+    /// `ign adopt --project NAME --testing` installs the bundle)
+    #[command(arg_required_else_help = true)]
+    Testing(TestingArgs),
+
     /// Lint local project files by delegating to ignition-lint (PATH
     /// discovery) — doctor posture: findings are DATA, exit 0
     /// whenever the tool ran; --strict passes the tool's exit code
     /// through for CI
     Lint(LintArgs),
+
+    /// Browser end-to-end testing: diagnose the host + gateway a
+    /// Playwright suite needs (`doctor`), and scaffold one that logs
+    /// in through `ign session login` and talks to the gateway's
+    /// testing routes (`init`). There is no `e2e run` — the
+    /// scaffold's own `npm test` is the runner
+    #[command(arg_required_else_help = true)]
+    E2e(E2eArgs),
 
     /// Raw passthrough to any gateway REST endpoint — the escape
     /// hatch for the uncurated routes (the envelope's `data` is left
@@ -1393,6 +1417,163 @@ impl ScheduleMode {
 pub struct ScriptArgs {
     #[command(subcommand)]
     pub command: ScriptCommand,
+}
+
+/// Testing subcommands (QUICK-p0g) — the standalone wrapper over the
+/// gateway testing bundle's `testing/run` route. `testing` requires a
+/// subcommand (the `script` shape — no bare row); there is no `--yes`
+/// guard: running a test suite is a read-shaped operation from the
+/// CLI's side and agents need the verb non-interactive.
+#[derive(Debug, clap::Args)]
+pub struct TestingArgs {
+    #[command(subcommand)]
+    pub command: TestingCommand,
+}
+
+/// `ign e2e` args (QUICK-tg4) — the browser-E2E pair.
+#[derive(Debug, clap::Args)]
+pub struct E2eArgs {
+    #[command(subcommand)]
+    pub command: E2eCmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum E2eCmd {
+    /// Diagnose the browser-E2E setup: node (≥20), npm,
+    /// @playwright/test in the scaffold, a downloaded chromium, the
+    /// gateway's testing bundle, and the gateway's trial state.
+    /// Read-only and offline-safe — **exits 0 whenever the diagnosis
+    /// completes**, so every finding is a `checks[]` row rather than
+    /// an exit code. The two gateway rows report `skip` when no
+    /// profile resolves or no --project is given
+    Doctor {
+        /// The scaffold directory to inspect (default: ./e2e)
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// The gateway project whose testing bundle is probed. No
+        /// default — without it the bundle row honestly skips
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+    },
+
+    /// Scaffold a Playwright E2E suite into DIR (default ./e2e): a
+    /// runner config, a global setup that logs in through `ign
+    /// session login` and gates on `ign testing run`, gateway tag/
+    /// script helpers, an example suite, a .gitignore, and a README —
+    /// then `npm install`. **Idempotent**: an existing file is
+    /// reported `skipped` and never overwritten. Requires the global
+    /// --yes; without it the verb writes nothing, spawns nothing, and
+    /// refuses exit 2 after previewing every file and both commands
+    Init {
+        /// Where the scaffold lands (default: ./e2e)
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// The project whose WebDev testing routes the helpers call
+        /// (default: ign-cli)
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        /// The Perspective project the browser test navigates to
+        /// (default: the effective --project)
+        #[arg(long, value_name = "NAME")]
+        run_project: Option<String>,
+        /// Also download the Chromium build after installing
+        #[arg(long)]
+        browsers: bool,
+    },
+}
+
+/// `ign session` args (QUICK-tg4) — the SINGULAR verb family: one
+/// gateway login session for this CLI to hand to a browser harness.
+///
+/// The plural `ign sessions` family (`SessionsArgs` / `SessionsCommand`)
+/// is a different thing entirely: it LISTS the gateway's connected
+/// designer/Perspective/Vision sessions. The names are deliberately
+/// kept apart here so a future reader never merges them.
+#[derive(Debug, clap::Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCmd {
+    /// Log in to the gateway and return the live session: the
+    /// `webui-sid-*` cookie name and value, the CSRF token for
+    /// `X-CSRF-Token`, the gateway URL, and `storage_state` — a
+    /// Playwright `storageState` document ready to write straight to
+    /// disk and point `use.storageState` at. The password is env-only
+    /// (`IGNITION_PASSWORD`; missing exits 3, rejected exits 5). The
+    /// cookie value and CSRF token are exposed ONLY under the global
+    /// --json flag
+    Login {
+        /// Gateway login user (default: $IGNITION_USER, else admin)
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+    },
+}
+
+/// The CLI-side `--format` enum (QUICK-p0g) — the clap `ValueEnum`
+/// mirror of core's plain `TestingFormat`, the `TransferFormat`
+/// precedent (core keeps framework-free enums; the `From` impl lives
+/// beside this one). `get_possible_values()` is what feeds the MCP
+/// tool schema a real enum instead of a free string.
+///
+/// EVERY value produces the SAME verdict and exit code: the route is
+/// always asked for json and the junit/text reports are rendered
+/// client-side, because the route's own junit/text answers stay HTTP
+/// 200 and carry no counts — a passthrough would exit 0 on a red
+/// suite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum TestingFormatArg {
+    /// Structured results only (default) — `data.report` stays empty
+    #[default]
+    Json,
+    /// JUnit XML in `data.report`, for a CI test reporter
+    Junit,
+    /// Console-style text in `data.report`, for a human reading logs
+    Text,
+}
+
+impl From<TestingFormatArg> for ignition_core::actions::testing::TestingFormat {
+    fn from(value: TestingFormatArg) -> Self {
+        match value {
+            TestingFormatArg::Json => Self::Json,
+            TestingFormatArg::Junit => Self::Junit,
+            TestingFormatArg::Text => Self::Text,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TestingCommand {
+    /// Run the gateway-side Jython test suite and return the machine
+    /// verdict (exit 0 green, exit 6 red with the FULL results still
+    /// in the envelope)
+    Run {
+        /// The project whose testing bundle runs. REQUIRED — the
+        /// bundle deploys per project and running a suite executes
+        /// that project's gateway-side code, so there is
+        /// deliberately no `ign-cli` default here
+        #[arg(long, value_name = "NAME", required = true)]
+        project: String,
+        /// List the gateway's discovered test modules instead of
+        /// running them
+        #[arg(long, conflicts_with_all = ["module", "package"])]
+        discover: bool,
+        /// Run ONE dotted module (`proj.foo_test`); mutually
+        /// exclusive with --package and --discover
+        #[arg(long, value_name = "DOTTED", conflicts_with = "package")]
+        module: Option<String>,
+        /// Run every module under a package prefix (`proj.`);
+        /// mutually exclusive with --module and --discover
+        #[arg(long, value_name = "PREFIX")]
+        package: Option<String>,
+        /// Report rendered into `data.report`. The verdict and exit
+        /// code are IDENTICAL in every format — the structured
+        /// results always ride under `data.results`
+        #[arg(long, value_name = "FORMAT", default_value = "json")]
+        format: TestingFormatArg,
+    },
 }
 
 /// `ign lint` args (07-04, INTR-02) — the ignition-lint delegation:

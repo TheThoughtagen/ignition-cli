@@ -49,6 +49,7 @@ use ignition_core::actions::tags::{
     TagsExportResult, TagsHistoryQueryResult, TagsReadResult, TagsUdtDefResult, TagsUdtTypesResult,
     history_summary,
 };
+use ignition_core::actions::testing::TestingRunResult;
 use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::actions::workspace::{
     CheckoutOutcome, PushOutcome, StatusKind, WorkspaceStatus,
@@ -214,6 +215,9 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Wait(result) => render_wait_human(result),
         ActionOutput::Doctor(result) => render_doctor_human(result),
         ActionOutput::Adopt(result) => render_adopt_human(result),
+        ActionOutput::SessionLogin(result) => render_session_login_human(result),
+        ActionOutput::E2eDoctor(result) => render_e2e_doctor_human(result),
+        ActionOutput::E2eInit(result) => render_e2e_init_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -271,6 +275,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskModify(result) => render_eam_task_modify_human(result),
         ActionOutput::EamTaskDelete(result) => render_eam_task_delete_human(result),
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
+        ActionOutput::TestingRun(result) => render_testing_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
@@ -793,6 +798,97 @@ fn render_adopt_human(result: &ignition_core::actions::adopt::AdoptResult) {
     }
 }
 
+/// `ign e2e doctor` rows — the SAME column treatment as
+/// `render_doctor_human`, deliberately: two doctors in one CLI that
+/// print differently teach a user that the rows mean different things.
+/// The one divergence is that every non-ok row shows its hint (the
+/// gateway doctor shows hints on `fail` only), because four of the six
+/// rows here can be `warn` with an actionable next step.
+fn render_e2e_doctor_human(result: &ignition_core::actions::e2e::E2eDoctorResult) {
+    use ignition_core::actions::doctor::CheckStatus;
+    println!("scaffold    {}", result.dir);
+    for check in &result.checks {
+        let status = match check.status {
+            CheckStatus::Ok => "OK",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+            CheckStatus::Skip => "SKIP",
+        };
+        println!("{:<14}  {:<4}  {}", check.name, status, check.detail);
+        if check.status != CheckStatus::Ok
+            && let Some(hint) = &check.hint
+        {
+            println!("  hint: {hint}");
+        }
+    }
+}
+
+/// `ign e2e init` — one line per member with its status, then one per
+/// installer leg with its exit code.
+fn render_e2e_init_human(result: &ignition_core::actions::e2e::E2eInitResult) {
+    use ignition_core::actions::e2e::E2eFileStatus;
+    println!("scaffold    {}", result.dir);
+    for file in &result.files {
+        let status = match file.status {
+            E2eFileStatus::Written => "written",
+            E2eFileStatus::Skipped => "skipped",
+        };
+        println!("{status:<10}  {}", file.path);
+    }
+    let leg = |name: &str, run: &Option<ignition_core::actions::e2e::E2eCommandRun>| {
+        if let Some(run) = run {
+            if run.ran {
+                match run.exit_code {
+                    Some(0) => println!("{name:<10}  ok"),
+                    // A non-zero installer is DATA, not a failed verb:
+                    // the scaffold is on disk and usable once the user
+                    // fixes the network (or runs the command again).
+                    Some(code) => {
+                        println!("{name:<10}  exit {code} (the scaffold is still on disk)")
+                    }
+                    None => println!("{name:<10}  killed by a signal"),
+                }
+            } else {
+                println!("{name:<10}  not run");
+            }
+        }
+    };
+    leg("npm", &result.npm_install);
+    leg("browsers", &result.browsers);
+    println!();
+    println!("next: cd {} && npm test", result.dir);
+}
+
+/// The `ign session login` human lines (QUICK-tg4, D5).
+///
+/// A PURE function, not a pile of `println!`s, for exactly one reason:
+/// this render is a security boundary (threat T-tg4-01). The verb's
+/// product is a live gateway credential, and the human path must carry
+/// the cookie NAME and the gateway URL while carrying neither the
+/// cookie VALUE nor the CSRF token. `println!` output is unreadable to
+/// a unit test; these lines are not — so the withholding is asserted
+/// in CI rather than hoped for. (The `to_junit_xml`/`to_console`
+/// precedent in `actions::testing`.)
+pub(crate) fn session_login_human_lines(
+    result: &ignition_core::actions::login::SessionLoginResult,
+) -> Vec<String> {
+    vec![
+        format!("gateway     {}", result.gateway_url),
+        format!("cookie      {}", result.cookie_name),
+        "session     established (cookie value + CSRF token withheld)".to_string(),
+        "".to_string(),
+        "The session material — cookie value, CSRF token, and the Playwright".to_string(),
+        "storageState document — is emitted only under --json:".to_string(),
+        "  ign session login --json".to_string(),
+    ]
+}
+
+fn render_session_login_human(result: &ignition_core::actions::login::SessionLoginResult) {
+    for line in session_login_human_lines(result) {
+        println!("{line}");
+    }
+}
+
 /// `ign project list` human rows: `name  title  enabled  parent
 /// inheritable` (absent title/parent/inheritable render as `-`) — the
 /// webpage's project list as terminal rows.
@@ -1287,6 +1383,39 @@ fn render_script_run_human(result: &ScriptRunResult) {
     }
     println!("result: {}", result.result);
     println!("elapsed: {} ms", result.elapsed_ms);
+}
+
+/// `ign testing run` human shape (QUICK-p0g): discover prints one
+/// module per line plus a count; a run prints the counts summary and
+/// the verdict. The verdict line is explicit because the exit code
+/// alone is invisible to someone reading a terminal.
+fn render_testing_run_human(result: &TestingRunResult) {
+    if result.mode == "discover" {
+        for module in &result.modules {
+            println!("{module}");
+        }
+        println!("{} module(s) discovered", result.count);
+        return;
+    }
+    println!(
+        "passed: {}  failed: {}  skipped: {}  errors: {}  (total {}, {} ms)",
+        result.passed,
+        result.failed,
+        result.skipped,
+        result.errors,
+        result.total,
+        result.duration_ms
+    );
+    println!(
+        "verdict: {}",
+        result.verdict.as_deref().unwrap_or("unknown")
+    );
+    // The rendered report (--format junit|text) follows the summary:
+    // the counts line is the verdict at a glance, the report is the
+    // detail a CI reporter or a human wants after it.
+    if !result.report.is_empty() {
+        println!("{}", result.report);
+    }
 }
 
 /// `ign api call` human shape: one verdict line, then the body — the
@@ -1987,5 +2116,55 @@ mod tests {
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    /// THE withholding pin (QUICK-tg4, threat T-tg4-01). `ign session
+    /// login`'s human path renders a LIVE credential's metadata; a
+    /// future edit that "helpfully" prints the cookie value or the CSRF
+    /// token must fail CI rather than ship. This is the whole reason
+    /// the render is a pure function (D5) — `println!` cannot be read
+    /// by a test, so the discipline would otherwise be unenforceable.
+    #[test]
+    fn session_login_human_lines_withhold_the_session_material() {
+        use ignition_core::actions::login::{SessionLoginResult, storage_state_for};
+        use ignition_core::client::idp::GatewaySession;
+
+        const SECRET_COOKIE: &str = "SESSION-VALUE-MUST-NOT-APPEAR";
+        const SECRET_CSRF: &str = "CSRF-TOKEN-MUST-NOT-APPEAR";
+        let session = GatewaySession {
+            cookie_name: "webui-sid-1766878194".into(),
+            cookie_value: SECRET_COOKIE.into(),
+            csrf_token: SECRET_CSRF.into(),
+        };
+        let result = SessionLoginResult {
+            cookie_name: session.cookie_name.clone(),
+            cookie_value: session.cookie_value.clone(),
+            csrf_token: session.csrf_token.clone(),
+            gateway_url: "http://localhost:9088".into(),
+            storage_state: storage_state_for(&session, "http://localhost:9088").unwrap(),
+        };
+
+        let rendered = super::session_login_human_lines(&result).join("\n");
+
+        assert!(
+            rendered.contains("webui-sid-1766878194"),
+            "the cookie NAME is shown: {rendered}"
+        );
+        assert!(
+            rendered.contains("http://localhost:9088"),
+            "the gateway URL is shown: {rendered}"
+        );
+        assert!(
+            !rendered.contains(SECRET_COOKIE),
+            "the cookie VALUE leaked into the human render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(SECRET_CSRF),
+            "the CSRF token leaked into the human render: {rendered}"
+        );
+        assert!(
+            rendered.contains("--json"),
+            "the render points at where the material lives: {rendered}"
+        );
     }
 }

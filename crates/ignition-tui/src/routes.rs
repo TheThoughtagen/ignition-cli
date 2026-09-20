@@ -606,6 +606,55 @@ pub fn routes() -> &'static [CliRoute] {
             path: "script run",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // QUICK-p0g: `ign testing run` — the gateway test-suite verb.
+        // The row lands FRESH in this change. Deliberately NOT a
+        // dashboard menu action: it is an agent/CI verb whose product
+        // is a results DOCUMENT (counts, per-module results, an
+        // optional rendered report), not a modal round trip — a
+        // one-line result modal would lose exactly what the verb is
+        // for. Wiring it into ACTIONS behind a dedicated results pane
+        // is a clean follow-up.
+        CliRoute {
+            path: "testing run",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        // QUICK-tg4: `ign e2e doctor` — the browser-E2E diagnosis. The
+        // row lands FRESH in this change. Deliberately NOT a dashboard
+        // menu action, for the same reason `testing run` is excluded:
+        // its product is a multi-row diagnosis DOCUMENT (six rows,
+        // each with a detail and a hint), and a one-line result modal
+        // would discard exactly the part a user came for. The
+        // dashboard's own doctor pane is where this belongs when a
+        // pane exists to host it.
+        CliRoute {
+            path: "e2e doctor",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        // QUICK-tg4: `ign e2e init` — the scaffold write. The row lands
+        // FRESH in this change. Deliberately NOT a dashboard menu
+        // action: it writes files into an operator-named directory and
+        // spawns package installers, and the TUI has no safe
+        // confirmation surface for that — the CLI-side gate is the
+        // global --yes, whose refusal PREVIEWS every member and both
+        // command lines. A modal that shrank that preview to "OK?"
+        // would be a worse gate than no gate.
+        CliRoute {
+            path: "e2e init",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
+        // QUICK-tg4: `ign session login` — the live gateway session.
+        // The row lands FRESH in this change. Deliberately NOT a
+        // dashboard menu action: the verb's product IS a live
+        // credential (session cookie value + CSRF token), and a TUI
+        // modal has nowhere safe to put one — it would render the
+        // secret into a terminal frame that scrollback, screen
+        // recordings, and tmux capture all keep. The verb exists to
+        // hand JSON to a machine (a Playwright `globalSetup`), so the
+        // CLI's --json path is its whole surface.
+        CliRoute {
+            path: "session login",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // 07-04: `ign lint` — the local delegation (no gateway: the
         // worker needs NO client). Ungated, unstrict (the doctor
         // posture IS the TUI display contract — findings land in the

@@ -1,0 +1,58 @@
+// Playwright configuration — scaffolded by `ign e2e init`.
+//
+// The gateway URL resolves from IGNITION_URL, falling back to the
+// gateway this scaffold was generated against.
+
+import { defineConfig, devices } from '@playwright/test';
+
+const GATEWAY_URL = process.env.IGNITION_URL || '__IGN_GATEWAY_URL__';
+
+/**
+ * THE localhost guard — duplicated verbatim in lib/gateway.mjs.
+ *
+ * Do not "fix" that duplication by importing one from the other: this
+ * module is loaded by the Playwright runner and the helper is loaded by
+ * the tests, and a cross-import between them is a load-order hazard.
+ * The two copies are kept honest by a Rust test that renders both
+ * bodies and asserts they name the same three hosts and the same
+ * opt-in variable.
+ *
+ * Relaxing TLS is gated to loopback because a self-signed certificate
+ * on YOUR machine is a papercut, while the same relaxation against a
+ * remote gateway silently disables the check that makes HTTPS mean
+ * anything. For a remote gateway behind a private CA, set
+ * NODE_EXTRA_CA_CERTS to the CA bundle instead.
+ */
+function isLocalGateway(url) {
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  return loopback || process.env.IGNITION_ALLOW_INSECURE_LOCAL === 'true';
+}
+
+export default defineConfig({
+  testDir: './tests',
+  timeout: 180000,
+  retries: 0,
+  fullyParallel: false,
+  reporter: [['list'], ['html', { open: 'never' }]],
+  globalSetup: './global-setup.mjs',
+  use: {
+    baseURL: GATEWAY_URL,
+    ignoreHTTPSErrors: isLocalGateway(GATEWAY_URL),
+    screenshot: 'only-on-failure',
+    trace: 'retain-on-failure',
+    // Written by global-setup.mjs from `ign session login --json`.
+    storageState: '.auth/state.json',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
+});
