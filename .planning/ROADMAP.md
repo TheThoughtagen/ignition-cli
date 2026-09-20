@@ -60,6 +60,53 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 **Dependencies:** 16 depends on 15 (nothing to inject without a verified artifact). 17 depends on 16 (the override carries the generated `git.yaml` mount). 18 is independent of 15-17 and may run in parallel or slip.
 
+## Phase Details
+
+### Phase 15: 15-module-artifact-fetch-verify
+**Goal**: `ign` can obtain a specific, signed Ignition module artifact and prove it is the right bytes before anything else in the milestone is allowed to depend on it — the only phase that touches a third-party feed, isolated so its failure modes are visible rather than buried inside a Docker flow.
+**Depends on**: Nothing (first phase of v1.3)
+**Requirements**: RMOD-02, RMOD-03
+**Success Criteria** (what must be TRUE):
+  1. Given a pinned module version, `ign` resolves that release's signed `.modl` asset and downloads it; an unknown version fails loudly naming the version and the resolved URL, never falling back to "latest"
+  2. A downloaded artifact whose sha256 does not match the release's published digest is REFUSED — the bytes are discarded, nothing is cached, and the error names both expected and actual digests. This is a hard failure, never a warning
+  3. A verified artifact is cached keyed by version+digest; a second fetch of the same version reuses the cache and makes no network request (provable by a test that fails if a request is issued)
+  4. With a populated cache and no network, provisioning proceeds to completion — offline is a supported state, not a degraded one
+**Research/Planning flags**: GitHub release asset resolution is new ground for this codebase (first third-party artifact feed). Worth a short research pass on: unauthenticated vs. token-authenticated release-asset fetch against a private/public repo boundary, and whether `reqwest`'s redirect handling needs configuration for GitHub's asset CDN redirect. Streaming-to-disk with incremental hashing (avoid buffering 7.7 MB in memory) is the expected shape.
+
+### Phase 16: 16-compose-override-module-injection
+**Goal**: A module the user asked for is actually loaded by the rig's gateway, durably across recreates, without `ign` ever editing a file the user owns — and the mechanism is a module registry rather than a Git-module special case.
+**Depends on**: Phase 15 (nothing to inject without a verified artifact)
+**Requirements**: RMOD-01, RMOD-04, RMOD-05, RMOD-06, RMOD-07
+**Success Criteria** (what must be TRUE):
+  1. A rig with no module declaration behaves byte-identically to today — no override generated, no env vars added, no behavior change (regression-proven against existing rig tests)
+  2. A rig with a declared module comes up with that module LOADED and running on a stock `inductiveautomation/ignition` image — no custom image, no developer mode, verified on a live rig
+  3. The module survives `ign rig down` followed by `ign rig up` — the mount is declared in the override, not copied into a container (the recreate is the test)
+  4. `ign` never writes to the user's compose file; the override is a separate `ign`-owned file carrying a generated-by header, and deleting it fully reverts provisioning
+  5. A second, different module registers and provisions through the same seam with no Git-module-specific code path — the registry abstraction is proven, not asserted
+**Research/Planning flags**: Compose multi-file merge semantics (`-f base -f override`) need confirming for the service-level keys used here — env vars merge, but volume lists append, and an override that accidentally replaces the base's volumes would break the rig. Worth verifying against the real compose CLI before the plan locks the override shape. Second module for SC-5 is an open choice — flag for user input during planning rather than guessing.
+
+### Phase 17: 17-git-module-commissioning
+**Goal**: The Git module arrives configured, not just installed — `ign` generates its commissioning file from declared config, keeps every credential out of that file, and refuses configurations that are known to corrupt a gateway.
+**Depends on**: Phase 16 (the override carries the generated `git.yaml` mount)
+**Requirements**: GITM-01, GITM-02, GITM-03, GITM-04
+**Success Criteria** (what must be TRUE):
+  1. From declared config, `ign` emits a valid `git.yaml` the module accepts — proven by a rig that commissions its declared projects end-to-end, not merely by schema match
+  2. No generated file on disk ever contains a credential; the git secret reaches the gateway only via `GATEWAY_GIT_USER_SECRET` or `GATEWAY_GIT_USER_SECRET_FILE`, resolved from keyring with env fallback. A test asserts `user_password` is never emitted under any input
+  3. A configuration where zero or two-plus projects claim `gateway_exportResources` is REFUSED before anything is written, naming the offending projects — the failure mode this prevents (competing projects each exporting their own copy of the same gateway-scoped resources) is the upstream bug the test rig was built to reproduce
+  4. After provisioning, `ign` reports the human-owned remaining steps (repo access, credential provisioning, first Designer connection) explicitly rather than implying completion
+**Research/Planning flags**: The `git.yaml` schema is source-verified against `ProjectConfig.java` and both existing rig configs; low unknowns. The secret-precedence behavior (`GATEWAY_GIT_USER_SECRET` before `_FILE`) is read from `GitCommissioningUtils.java:437` and should be confirmed live once. Skip a full research pass.
+
+### Phase 18: 18-declared-rig-discovery
+**Goal**: Rig selection becomes something the user declared rather than something the binary guesses — the hardcoded WhiskeyHouse directory layout leaves the shipped artifact without stranding anyone who relied on it.
+**Depends on**: Nothing (independent of 15-17; may run in parallel or slip without blocking module work)
+**Requirements**: RDISC-01, RDISC-02, LEDG-01
+**Success Criteria** (what must be TRUE):
+  1. No hardcoded home paths or convention repo names remain in the shipped binary — `WHK_HOME_ROOTS` and the repo relpath consts are gone, grep-proven, and the WHK reference count in `crates/` drops accordingly
+  2. Roots declared in `[rig]` config produce the same discovery outcome the hardcoded consts did — a user who declares their two roots once loses no convenience
+  3. A user with no declared roots and no other rig configuration gets a clear exit-7 error naming every way to configure a rig — never a silent scan and never a scan of a directory they did not name
+  4. `MILESTONES.md` records v1.2's shipped work with its requirements archived, so the ledger is continuous from v1.0 through v1.3
+**Research/Planning flags**: None — the discovery code is fully source-verified (`crates/ignition-core/src/rig/mod.rs`, five-level chain, `IGNITION_RIG_ROOTS` override already exists as the seam). Pure refactor plus config schema addition. Skip research. Note the existing `IGNITION_RIG_ROOTS` env var already does most of SC-2's job and may simply be promoted to config rather than replaced.
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
