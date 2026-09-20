@@ -651,6 +651,16 @@ pub fn e2e_init_preview(env: &E2eEnv, opts: &E2eInitOptions) -> Result<String, C
     for command in command_lines(&opts.dir, opts.browsers) {
         lines.push(format!("  {command}"));
     }
+    // `require_confirmation` renders "<operation> is destructive; rerun
+    // with --yes to confirm", concatenating its suffix directly onto
+    // this string. Every other guarded site passes a short noun phrase,
+    // so the suffix reads fine; a multi-line preview ending in a
+    // command line does NOT — it produces
+    // "npm install is destructive; rerun with --yes to confirm",
+    // which reads as a claim about npm. The closing noun phrase gives
+    // the suffix something sensible to attach to.
+    lines.push(String::new());
+    lines.push("this scaffold write".to_string());
     Ok(lines.join("\n"))
 }
 

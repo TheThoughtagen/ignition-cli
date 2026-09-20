@@ -617,6 +617,18 @@ async fn preview_lists_every_member_and_both_commands_and_writes_nothing() {
     );
     assert!(preview.contains("ign-cli") && preview.contains("Flux"));
 
+    // `require_confirmation` concatenates " is destructive; rerun with
+    // --yes to confirm" straight onto this string, so the preview must
+    // END on a noun phrase. Ending on a command line produced
+    // "npm install is destructive; rerun with --yes to confirm" — a
+    // sentence about npm rather than about the scaffold write.
+    assert!(
+        preview.ends_with("this scaffold write"),
+        "the preview must end on a noun phrase the confirmation suffix can \
+         attach to; it ends with: {:?}",
+        &preview[preview.len().saturating_sub(60)..]
+    );
+
     // The preview is a DRY RUN: nothing on disk, nothing spawned.
     assert!(!dir.exists(), "the preview created no directory");
     assert!(
