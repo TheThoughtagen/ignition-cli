@@ -299,10 +299,14 @@ async fn run_with_warmup(
 ) -> Result<serde_json::Value, CoreError> {
     match crate::client::webdev::testing_run(api, project, body).await {
         Ok(results) => Ok(results),
-        Err(_) => {
+        // ONLY the classified 5xx (`Internal`) is the lazy-compile
+        // story; an auth, connection, or usage error must surface
+        // immediately rather than sleep and re-execute the suite.
+        Err(CoreError::Internal(_)) => {
             tokio::time::sleep(LAZY_COMPILE_WARMUP).await;
             crate::client::webdev::testing_run(api, project, body).await
         }
+        Err(err) => Err(err),
     }
 }
 

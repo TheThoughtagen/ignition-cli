@@ -78,7 +78,9 @@ export default async function globalSetup() {
   const suite = parseEnvelope(testOut, 'ign testing run');
   const data = suite.data || {};
   if (data.verdict !== 'passed') {
-    const broken = (data.results || [])
+    // `data.results` is the route's run_all object verbatim; the
+    // per-module rows live under its `modules` array.
+    const broken = ((data.results && data.results.modules) || [])
       .filter((r) => (r.failed || 0) > 0 || (r.errors || 0) > 0)
       .map((r) => r.module || r.name)
       .filter(Boolean);
