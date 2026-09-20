@@ -342,14 +342,20 @@ fn cache_entry_rejects_malformed_filenames() {
 // leave the cache untouched.
 // ---------------------------------------------------------------------
 
-/// `true` when the `git` module's cache directory holds no `.modl`
-/// entries — asserted after every refusal test: a refusal that leaves
-/// debris is a failure even when the error itself is right.
-fn cache_is_empty(cache_root: &std::path::Path) -> bool {
-    let dir = cache_root.join("modules").join("git");
+/// Shared refusal-hygiene helper (Task 1, 15-02): asserts `module_id`'s
+/// cache directory either does not exist or holds ZERO entries — every
+/// refusal test in this file calls this, so a refusal that leaves debris
+/// fails HERE rather than passing on an incomplete ad-hoc check.
+fn assert_cache_empty(cache_root: &std::path::Path, module_id: &str) {
+    let dir = cache_root.join("modules").join(module_id);
     match std::fs::read_dir(&dir) {
-        Ok(mut entries) => entries.next().is_none(),
-        Err(_) => true,
+        Ok(mut entries) => assert!(
+            entries.next().is_none(),
+            "cache dir {} must be empty after a refusal — a refusal that leaves debris \
+             is a failure even when the error itself is right",
+            dir.display()
+        ),
+        Err(_) => {} // a missing directory counts as empty
     }
 }
 
@@ -392,7 +398,7 @@ async fn unknown_version_names_version_and_url() {
         Some(expected_url.as_str()),
         "endpoint must name the resolved URL"
     );
-    assert!(cache_is_empty(cache_root.path()), "no debris on refusal");
+    assert_cache_empty(cache_root.path(), "git");
 }
 
 /// SC-1: a release with no matching asset fails loudly naming BOTH the
@@ -435,7 +441,7 @@ async fn missing_asset_names_expected_and_present() {
         message.contains("Git-2.3.4-signed.modl") && message.contains("Other-2.3.4-signed.modl"),
         "message must name both expected and present asset names: {message}"
     );
-    assert!(cache_is_empty(cache_root.path()), "no debris on refusal");
+    assert_cache_empty(cache_root.path(), "git");
 }
 
 /// SC-2's precondition: `ign` never caches bytes it cannot verify — an
@@ -474,7 +480,7 @@ async fn asset_without_digest_is_refused() {
 
     assert_eq!(err.code(), "module_feed_unusable");
     assert_eq!(err.exit_code(), 6);
-    assert!(cache_is_empty(cache_root.path()), "no debris on refusal");
+    assert_cache_empty(cache_root.path(), "git");
 }
 
 /// Pitfall 5: a rate-limited 403 is NEVER reported as an auth failure —
@@ -580,4 +586,212 @@ async fn unsafe_version_is_refused_before_any_request() {
     assert_eq!(err.exit_code(), 2);
 
     drop(no_requests);
+}
+
+// ---------------------------------------------------------------------
+// 15-02 Task 1: digest mismatch is a hard refusal that caches nothing
+// (SC-2), and an oversized body is aborted mid-stream. Three of the four
+// tests below exercise the mismatch arm 15-01 already wrote; only
+// `oversized_body_is_aborted_and_refused` drives genuinely new behavior
+// (the streaming size cap) — see the plan's Task 1 action note.
+// ---------------------------------------------------------------------
+
+/// Mount a full happy-shaped release+download flow where the CALLER
+/// controls the declared digest/size independently of what bytes are
+/// actually served — the refusal tests below deliberately make these
+/// disagree.
+async fn mount_release_and_download(
+    server: &wiremock::MockServer,
+    declared_digest: &str,
+    declared_size: u64,
+    served_body: Vec<u8>,
+) {
+    let release_json = serde_json::json!({
+        "tag_name": "v2.3.4",
+        "assets": [{
+            "name": "Git-2.3.4-signed.modl",
+            "url": format!("{}/assets/1", server.uri()),
+            "browser_download_url": format!("{}/download/Git-2.3.4-signed.modl", server.uri()),
+            "digest": format!("sha256:{declared_digest}"),
+            "content_type": "application/octet-stream",
+            "size": declared_size,
+            "state": "uploaded",
+        }],
+    });
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(release_json))
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/download/Git-2.3.4-signed.modl"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(302)
+                .insert_header("Location", "/cdn/Git-2.3.4-signed.modl"),
+        )
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/cdn/Git-2.3.4-signed.modl"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(served_body))
+        .mount(server)
+        .await;
+}
+
+/// SC-2: the release publishes digest A, the CDN serves bytes hashing to
+/// B. Refused, both full 64-char digests named, cache left empty.
+#[tokio::test]
+async fn digest_mismatch_refuses_and_caches_nothing() {
+    let server = wiremock::MockServer::start().await;
+    let good_payload = payload();
+    let expected_digest = sha256_hex(&good_payload);
+    let served_payload =
+        b"entirely different bytes than what the release claims to publish here".to_vec();
+    let actual_digest = sha256_hex(&served_payload);
+    assert_ne!(expected_digest, actual_digest);
+
+    mount_release_and_download(
+        &server,
+        &expected_digest,
+        served_payload.len() as u64,
+        served_payload.clone(),
+    )
+    .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("digest mismatch must refuse");
+
+    assert_eq!(err.code(), "module_digest_mismatch");
+    assert_eq!(err.exit_code(), 6);
+    let message = err.to_string();
+    assert!(
+        message.contains(&expected_digest),
+        "message must name the expected digest in full: {message}"
+    );
+    assert!(
+        message.contains(&actual_digest),
+        "message must name the actual digest in full: {message}"
+    );
+    assert_cache_empty(cache_root.path(), "git");
+}
+
+/// A PREFIX of the correct payload (the interrupted-download shape) is
+/// the same mismatch refusal, not a partial cache entry.
+#[tokio::test]
+async fn truncated_body_is_a_mismatch_not_a_cache_entry() {
+    let server = wiremock::MockServer::start().await;
+    let full_payload = payload();
+    let expected_digest = sha256_hex(&full_payload);
+    let truncated = full_payload[..full_payload.len() / 2].to_vec();
+
+    mount_release_and_download(
+        &server,
+        &expected_digest,
+        full_payload.len() as u64,
+        truncated,
+    )
+    .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("a truncated body must refuse as a mismatch");
+
+    assert_eq!(err.code(), "module_digest_mismatch");
+    assert_eq!(err.exit_code(), 6);
+    assert_cache_empty(cache_root.path(), "git");
+}
+
+/// T-15-10: a body exceeding the release's published `size` is aborted
+/// mid-stream and refused `module_feed_unusable`, never trusting
+/// `Content-Length` in the published size's place. The declared digest
+/// here IS the hash of the oversized bytes — isolating the size check
+/// from the digest check: if the size cap did not fire first, the bytes
+/// would otherwise verify cleanly and get cached.
+#[tokio::test]
+async fn oversized_body_is_aborted_and_refused() {
+    let server = wiremock::MockServer::start().await;
+    let base_payload = payload();
+    let mut oversized = base_payload.clone();
+    oversized
+        .extend_from_slice(b"extra bytes the CDN should never have served past the published size");
+    let digest_of_oversized = sha256_hex(&oversized);
+
+    mount_release_and_download(
+        &server,
+        &digest_of_oversized,
+        base_payload.len() as u64,
+        oversized,
+    )
+    .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("an oversized body must be aborted and refused");
+
+    assert_eq!(err.code(), "module_feed_unusable");
+    assert_eq!(err.exit_code(), 6);
+    let message = err.to_string();
+    assert!(
+        message.contains(&base_payload.len().to_string()),
+        "message must name the published size: {message}"
+    );
+    assert_cache_empty(cache_root.path(), "git");
+}
+
+/// D-02/D-09: there is no policy, flag, or parameter that turns a
+/// digest mismatch into a success — exercised under all three
+/// `FetchPolicy` variants against the same mismatching mock.
+#[tokio::test]
+async fn mismatch_error_is_not_downgradable() {
+    let server = wiremock::MockServer::start().await;
+    let good_payload = payload();
+    let expected_digest = sha256_hex(&good_payload);
+    let served_payload = b"still the wrong bytes no matter which policy asks for them".to_vec();
+
+    mount_release_and_download(
+        &server,
+        &expected_digest,
+        served_payload.len() as u64,
+        served_payload,
+    )
+    .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
+
+    for policy in [
+        FetchPolicy::CacheFirst,
+        FetchPolicy::Refresh,
+        FetchPolicy::AcceptUpstreamChange,
+    ] {
+        let err = feed
+            .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), policy)
+            .await
+            .expect_err("a digest mismatch must refuse under every FetchPolicy");
+        assert_eq!(
+            err.code(),
+            "module_digest_mismatch",
+            "policy {policy:?} must still refuse"
+        );
+    }
+    assert_cache_empty(cache_root.path(), "git");
 }
