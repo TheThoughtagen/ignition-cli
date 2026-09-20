@@ -320,7 +320,7 @@ fn dashboard_actions_menu_matches_registry() {
     // (extend the exclusion comments). The pinned test IS the
     // pre-declaration (the 08-06 OutOfBand pattern).
     //
-    // Current exclusions (37 Dashboard rows − 27 menu verbs = 10):
+    // Current exclusions (38 Dashboard rows − 27 menu verbs = 11):
     //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
     //     the TUI's menu can host).
     //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
@@ -337,6 +337,12 @@ fn dashboard_actions_menu_matches_registry() {
     //     one-line result modal would lose exactly what the verb is
     //     for. Wiring it into ACTIONS behind a dedicated results pane
     //     is a clean follow-up.
+    //   - `session login` (QUICK-tg4) — the verb's product IS a live
+    //     credential (session cookie value + CSRF token). A TUI modal
+    //     has nowhere safe to put one: rendering a secret into a
+    //     terminal frame hands it to scrollback, screen recordings,
+    //     and tmux capture. The verb exists to feed JSON to a machine
+    //     (a Playwright globalSetup), so --json is its whole surface.
     let dashboard_rows: Vec<&str> = routes()
         .iter()
         .filter(|route| matches!(route.mapping, Mapping::Screen(Screen::Dashboard)))
@@ -344,7 +350,7 @@ fn dashboard_actions_menu_matches_registry() {
         .collect();
     assert_eq!(
         dashboard_rows.len(),
-        37,
+        38,
         "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
          + the update.rs executor arms in the same change, or justify the \
          exclusion in this test's comment block: {dashboard_rows:#?}"

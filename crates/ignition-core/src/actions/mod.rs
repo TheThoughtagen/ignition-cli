@@ -16,6 +16,7 @@ pub mod gan;
 pub mod inspect;
 pub mod license;
 pub mod lint;
+pub mod login;
 pub mod logs;
 pub mod profile;
 pub mod projects;

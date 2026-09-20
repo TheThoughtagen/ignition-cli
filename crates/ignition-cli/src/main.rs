@@ -92,6 +92,10 @@ enum ActionOutput {
     /// `ign adopt` — the step rows + (env-fallback only) the
     /// one-time token exposure.
     Adopt(actions::adopt::AdoptResult),
+    /// `ign session login` — the live gateway session + its Playwright
+    /// `storageState`. The session material rides the JSON envelope
+    /// ONLY; the human render deliberately withholds it.
+    SessionLogin(actions::login::SessionLoginResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -329,6 +333,7 @@ impl ActionOutput {
             ActionOutput::Wait(result) => render_success(profile, result, compact),
             ActionOutput::Doctor(result) => render_success(profile, result, compact),
             ActionOutput::Adopt(result) => render_success(profile, result, compact),
+            ActionOutput::SessionLogin(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -952,6 +957,45 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 (Some(name), result.map(ActionOutput::Adopt))
             }
             Err(err) => (error_profile(&err), Err(err)),
+        },
+        // Session login (QUICK-tg4): the second env-only-password
+        // verb, placed directly beside adopt so the two read together.
+        // Same rationale VERBATIM: the session resolves DEGRADED
+        // because logging in is what happens BEFORE a token exists,
+        // and the password gate is the PASSWORD one (IGNITION_PASSWORD,
+        // never a flag) whose slug and hint name that variable rather
+        // than a token path.
+        Commands::Session(cli::SessionArgs { command }) => match command {
+            cli::SessionCmd::Login { user } => {
+                match Session::resolve_degraded(cli.profile.as_deref()) {
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let url = session.profile_url().to_string();
+                        let Some(password) = env_non_empty("IGNITION_PASSWORD") else {
+                            return (
+                                error_profile(&CoreError::PasswordUnavailable {
+                                    profile: name.clone(),
+                                }),
+                                Err(CoreError::PasswordUnavailable { profile: name }),
+                            );
+                        };
+                        // D6: flag → IGNITION_USER → admin (the union of
+                        // adopt's and `rig trial reset`'s orders).
+                        let username = user
+                            .or_else(|| env_non_empty("IGNITION_USER"))
+                            .unwrap_or_else(|| "admin".into());
+                        let opts = actions::login::SessionLoginOptions { username };
+                        let result = actions::login::session_login(
+                            &url,
+                            &opts,
+                            &config::Secret::new(password),
+                        )
+                        .await;
+                        (Some(name), result.map(ActionOutput::SessionLogin))
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
         },
         // Projects (03-01, PROJ-01/02): the first project-family
         // commands. All arms are authed (inspection-command rule: exit

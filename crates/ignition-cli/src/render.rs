@@ -215,6 +215,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Wait(result) => render_wait_human(result),
         ActionOutput::Doctor(result) => render_doctor_human(result),
         ActionOutput::Adopt(result) => render_adopt_human(result),
+        ActionOutput::SessionLogin(result) => render_session_login_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -792,6 +793,36 @@ fn render_adopt_human(result: &ignition_core::actions::adopt::AdoptResult) {
         println!();
         println!("API token (shown ONCE — store it now):");
         println!("  {token}");
+    }
+}
+
+/// The `ign session login` human lines (QUICK-tg4, D5).
+///
+/// A PURE function, not a pile of `println!`s, for exactly one reason:
+/// this render is a security boundary (threat T-tg4-01). The verb's
+/// product is a live gateway credential, and the human path must carry
+/// the cookie NAME and the gateway URL while carrying neither the
+/// cookie VALUE nor the CSRF token. `println!` output is unreadable to
+/// a unit test; these lines are not — so the withholding is asserted
+/// in CI rather than hoped for. (The `to_junit_xml`/`to_console`
+/// precedent in `actions::testing`.)
+pub(crate) fn session_login_human_lines(
+    result: &ignition_core::actions::login::SessionLoginResult,
+) -> Vec<String> {
+    vec![
+        format!("gateway     {}", result.gateway_url),
+        format!("cookie      {}", result.cookie_name),
+        "session     established (cookie value + CSRF token withheld)".to_string(),
+        "".to_string(),
+        "The session material — cookie value, CSRF token, and the Playwright".to_string(),
+        "storageState document — is emitted only under --json:".to_string(),
+        "  ign session login --json".to_string(),
+    ]
+}
+
+fn render_session_login_human(result: &ignition_core::actions::login::SessionLoginResult) {
+    for line in session_login_human_lines(result) {
+        println!("{line}");
     }
 }
 
@@ -2022,5 +2053,55 @@ mod tests {
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    /// THE withholding pin (QUICK-tg4, threat T-tg4-01). `ign session
+    /// login`'s human path renders a LIVE credential's metadata; a
+    /// future edit that "helpfully" prints the cookie value or the CSRF
+    /// token must fail CI rather than ship. This is the whole reason
+    /// the render is a pure function (D5) — `println!` cannot be read
+    /// by a test, so the discipline would otherwise be unenforceable.
+    #[test]
+    fn session_login_human_lines_withhold_the_session_material() {
+        use ignition_core::actions::login::{SessionLoginResult, storage_state_for};
+        use ignition_core::client::idp::GatewaySession;
+
+        const SECRET_COOKIE: &str = "SESSION-VALUE-MUST-NOT-APPEAR";
+        const SECRET_CSRF: &str = "CSRF-TOKEN-MUST-NOT-APPEAR";
+        let session = GatewaySession {
+            cookie_name: "webui-sid-1766878194".into(),
+            cookie_value: SECRET_COOKIE.into(),
+            csrf_token: SECRET_CSRF.into(),
+        };
+        let result = SessionLoginResult {
+            cookie_name: session.cookie_name.clone(),
+            cookie_value: session.cookie_value.clone(),
+            csrf_token: session.csrf_token.clone(),
+            gateway_url: "http://localhost:9088".into(),
+            storage_state: storage_state_for(&session, "http://localhost:9088").unwrap(),
+        };
+
+        let rendered = super::session_login_human_lines(&result).join("\n");
+
+        assert!(
+            rendered.contains("webui-sid-1766878194"),
+            "the cookie NAME is shown: {rendered}"
+        );
+        assert!(
+            rendered.contains("http://localhost:9088"),
+            "the gateway URL is shown: {rendered}"
+        );
+        assert!(
+            !rendered.contains(SECRET_COOKIE),
+            "the cookie VALUE leaked into the human render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(SECRET_CSRF),
+            "the CSRF token leaked into the human render: {rendered}"
+        );
+        assert!(
+            rendered.contains("--json"),
+            "the render points at where the material lives: {rendered}"
+        );
     }
 }

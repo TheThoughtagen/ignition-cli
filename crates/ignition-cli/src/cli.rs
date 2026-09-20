@@ -166,6 +166,15 @@ pub enum Commands {
         bake: Option<String>,
     },
 
+    /// Obtain a live gateway login session (the native OIDC dance) —
+    /// returns the session cookie name/value, the CSRF token, the
+    /// gateway URL, and a ready-to-use Playwright `storageState`
+    /// document. The session material is emitted ONLY under the
+    /// global --json flag; the human render prints the cookie name
+    /// and the gateway URL and withholds the rest
+    #[command(arg_required_else_help = true)]
+    Session(SessionArgs),
+
     /// Manage gateway projects: list with inheritance info, new, copy,
     /// rename, set (reparent), delete, export/import (ZIP)
     #[command(arg_required_else_help = true)]
@@ -1411,6 +1420,36 @@ pub struct ScriptArgs {
 pub struct TestingArgs {
     #[command(subcommand)]
     pub command: TestingCommand,
+}
+
+/// `ign session` args (QUICK-tg4) — the SINGULAR verb family: one
+/// gateway login session for this CLI to hand to a browser harness.
+///
+/// The plural `ign sessions` family (`SessionsArgs` / `SessionsCommand`)
+/// is a different thing entirely: it LISTS the gateway's connected
+/// designer/Perspective/Vision sessions. The names are deliberately
+/// kept apart here so a future reader never merges them.
+#[derive(Debug, clap::Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCmd {
+    /// Log in to the gateway and return the live session: the
+    /// `webui-sid-*` cookie name and value, the CSRF token for
+    /// `X-CSRF-Token`, the gateway URL, and `storage_state` — a
+    /// Playwright `storageState` document ready to write straight to
+    /// disk and point `use.storageState` at. The password is env-only
+    /// (`IGNITION_PASSWORD`; missing exits 3, rejected exits 5). The
+    /// cookie value and CSRF token are exposed ONLY under the global
+    /// --json flag
+    Login {
+        /// Gateway login user (default: $IGNITION_USER, else admin)
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+    },
 }
 
 /// The CLI-side `--format` enum (QUICK-p0g) — the clap `ValueEnum`

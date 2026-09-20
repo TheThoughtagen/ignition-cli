@@ -618,6 +618,19 @@ pub fn routes() -> &'static [CliRoute] {
             path: "testing run",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // QUICK-tg4: `ign session login` — the live gateway session.
+        // The row lands FRESH in this change. Deliberately NOT a
+        // dashboard menu action: the verb's product IS a live
+        // credential (session cookie value + CSRF token), and a TUI
+        // modal has nowhere safe to put one — it would render the
+        // secret into a terminal frame that scrollback, screen
+        // recordings, and tmux capture all keep. The verb exists to
+        // hand JSON to a machine (a Playwright `globalSetup`), so the
+        // CLI's --json path is its whole surface.
+        CliRoute {
+            path: "session login",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // 07-04: `ign lint` — the local delegation (no gateway: the
         // worker needs NO client). Ungated, unstrict (the doctor
         // posture IS the TUI display contract — findings land in the
