@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -656,6 +656,33 @@ pub enum CoreError {
         /// What specifically made the answer unusable.
         detail: String,
     },
+
+    /// A pinned version's upstream digest differs from what's already
+    /// cached — D-02's default refusal on `FetchPolicy::Refresh` /
+    /// `AcceptUpstreamChange` (Phase 15, 15-02): the feed answered
+    /// fine, but what it currently publishes for this version no
+    /// longer matches what was verified and cached before. Exit 6 —
+    /// target state: names BOTH full digests and the path of the
+    /// cached artifact, which is left on disk UNTOUCHED (no path in
+    /// `module/` deletes, truncates, or overwrites a cache entry).
+    /// `FetchPolicy::AcceptUpstreamChange` is the explicit, documented
+    /// override.
+    #[error(
+        "module {module:?} version {version:?} digest changed upstream: cached {cached_digest}, \
+         upstream now reports {upstream_digest} (cached artifact kept at {cached_path})"
+    )]
+    ModuleDigestChanged {
+        /// The [`crate::module::ModuleSpec::id`] being fetched.
+        module: String,
+        /// The requested version string.
+        version: String,
+        /// The digest of the artifact already cached for this version.
+        cached_digest: String,
+        /// The digest the feed currently publishes for this version.
+        upstream_digest: String,
+        /// Path of the untouched, still-usable cached artifact.
+        cached_path: String,
+    },
 }
 
 impl CoreError {
@@ -704,6 +731,7 @@ impl CoreError {
             Self::ModuleReleaseNotFound { .. } => "module_release_not_found",
             Self::ModuleDigestMismatch { .. } => "module_digest_mismatch",
             Self::ModuleFeedUnusable { .. } => "module_feed_unusable",
+            Self::ModuleDigestChanged { .. } => "module_digest_changed",
         }
     }
 
@@ -749,7 +777,8 @@ impl CoreError {
             | Self::BundleNotAvailable { .. }
             | Self::ModuleReleaseNotFound { .. }
             | Self::ModuleDigestMismatch { .. }
-            | Self::ModuleFeedUnusable { .. } => 6,
+            | Self::ModuleFeedUnusable { .. }
+            | Self::ModuleDigestChanged { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1050,6 +1079,12 @@ impl CoreError {
                  response itself needs investigation"
                     .to_string(),
             ),
+            Self::ModuleDigestChanged { cached_path, .. } => Some(format!(
+                "upstream re-released this version with different bytes — the cached \
+                 artifact at {cached_path} is still there and usable offline; re-run with \
+                 FetchPolicy::AcceptUpstreamChange to deliberately accept and verify the \
+                 new bytes"
+            )),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
                  (docker ps)"
@@ -1501,6 +1536,17 @@ mod tests {
                 6,
                 "module_feed_unusable",
             ),
+            (
+                CoreError::ModuleDigestChanged {
+                    module: "git".into(),
+                    version: "2.3.4".into(),
+                    cached_digest: "a".repeat(64),
+                    upstream_digest: "b".repeat(64),
+                    cached_path: "/cache/modules/git/2.3.4-aaaa.modl".into(),
+                },
+                6,
+                "module_digest_changed",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1558,6 +1604,7 @@ mod tests {
         (6, "module_release_not_found"),
         (6, "module_digest_mismatch"),
         (6, "module_feed_unusable"),
+        (6, "module_digest_changed"),
         (7, "rig_error"),
     ];
 

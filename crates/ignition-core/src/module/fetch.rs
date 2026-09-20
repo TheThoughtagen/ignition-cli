@@ -28,11 +28,18 @@ use crate::error::CoreError;
 use crate::module::{ModuleSpec, cached_entry, module_cache_dir, validate_module_id, validate_version};
 
 /// How a fetch treats an existing cache hit (D-02, D-09). All three
-/// behave IDENTICALLY on a cache MISS — this plan (15-01) implements the
-/// miss path once; plan 15-02 differentiates the HIT path (a pinned
-/// version re-released upstream with a different digest) without
-/// changing this signature. Phase 16 wires `Refresh` and
-/// `AcceptUpstreamChange` to CLI flags.
+/// behave IDENTICALLY on a cache MISS — the miss path (resolve,
+/// download, verify, persist) is implemented exactly once and is
+/// reached by every policy alike.
+///
+/// On a cache HIT, a re-released version upstream is refused BY
+/// DEFAULT: if the digest the feed publishes today differs from what's
+/// cached for this version, the fetch refuses naming both digests and
+/// leaves the cached artifact usable and untouched.
+/// `AcceptUpstreamChange` is the deliberate, explicit way to accept
+/// that change — it downloads the new bytes and verifies them against
+/// the NEWLY published digest before caching them ALONGSIDE (never
+/// over) the old entry. Phase 16 wires these to a CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FetchPolicy {
     /// Trust an existing cache hit outright — never re-contact the feed
@@ -40,10 +47,15 @@ pub enum FetchPolicy {
     #[default]
     CacheFirst,
     /// Re-verify a cache hit against the feed's current digest before
-    /// trusting it (15-02).
+    /// trusting it: an unchanged digest reuses the cache (no
+    /// re-download); a changed digest is REFUSED
+    /// (`module_digest_changed`, exit 6), naming both digests, with
+    /// the cached artifact left exactly as it was (15-02).
     Refresh,
     /// Accept a digest change the feed now reports for an already-cached
-    /// version, re-downloading and re-caching under the new digest
+    /// version: downloads the new bytes and verifies them against the
+    /// NEWLY published digest — never trusts them unverified — then
+    /// persists them alongside (not over) the existing cache entry
     /// (15-02, D-02's explicit override).
     AcceptUpstreamChange,
 }
@@ -140,7 +152,7 @@ impl ModuleFeed {
         spec: &ModuleSpec,
         version: &str,
         cache_root: &Path,
-        _policy: FetchPolicy,
+        policy: FetchPolicy,
     ) -> Result<FetchedModule, CoreError> {
         // Refuse a hostile module id / version BEFORE it reaches a
         // PathBuf::join or a URL (T-15-03) — before even the cache
@@ -148,20 +160,31 @@ impl ModuleFeed {
         validate_module_id(spec.id)?;
         validate_version(version)?;
 
-        // (a) Cache lookup — keyed by version alone, no feed contact.
-        if let Some(cached) = cached_entry(cache_root, spec.id, version) {
+        // (a) Cache lookup — keyed by version alone. `CacheFirst` (the
+        // default) short-circuits HERE with ZERO requests of any kind
+        // — that's the whole SC-3/SC-4 mechanism, and adding drift
+        // detection below must never weaken it.
+        // `Refresh`/`AcceptUpstreamChange` fall through to resolve the
+        // release below and compare digests before deciding (D-02/D-09).
+        let cached = cached_entry(cache_root, spec.id, version);
+        if let Some(cached) = &cached
+            && policy == FetchPolicy::CacheFirst
+        {
             return Ok(FetchedModule {
                 module_id: spec.id.to_string(),
                 version: version.to_string(),
-                digest_sha256: cached.digest_sha256,
-                path: cached.path,
+                digest_sha256: cached.digest_sha256.clone(),
+                path: cached.path.clone(),
                 bytes: cached.bytes,
                 source: ArtifactSource::Cache,
             });
         }
 
         // (b) Resolve ONLY through the tag-pinned releases endpoint —
-        // the floating `releases/latest` endpoint is never called.
+        // the floating `releases/latest` endpoint is never called. Runs
+        // for a cache MISS (any policy) AND for a cache HIT under
+        // Refresh/AcceptUpstreamChange (the drift check needs the
+        // feed's CURRENT digest).
         let tag = spec.tag(version);
         let release_url = self
             .api_base
@@ -269,6 +292,44 @@ impl ModuleFeed {
                 });
             }
         };
+
+        // (a-continued) A cache HIT under Refresh/AcceptUpstreamChange:
+        // decide from the digest comparison BEFORE touching the
+        // network again for bytes — D-02's two separate questions
+        // (see the module doc: this is the "did upstream change?"
+        // question, never the "do the bytes match?" one below, which
+        // has no override).
+        if let Some(cached) = cached {
+            if expected_digest == cached.digest_sha256 {
+                // Upstream still publishes the digest already cached —
+                // bytes already proven are not re-fetched.
+                return Ok(FetchedModule {
+                    module_id: spec.id.to_string(),
+                    version: version.to_string(),
+                    digest_sha256: cached.digest_sha256,
+                    path: cached.path,
+                    bytes: cached.bytes,
+                    source: ArtifactSource::Cache,
+                });
+            }
+            if policy == FetchPolicy::Refresh {
+                // D-02 default: refuse, name both digests, leave the
+                // cached artifact exactly as it was — no write, no
+                // delete, no overwrite.
+                return Err(CoreError::ModuleDigestChanged {
+                    module: spec.id.to_string(),
+                    version: version.to_string(),
+                    cached_digest: cached.digest_sha256,
+                    upstream_digest: expected_digest.clone(),
+                    cached_path: cached.path.display().to_string(),
+                });
+            }
+            // AcceptUpstreamChange: fall through to the SHARED
+            // download-verify-persist path below, which verifies the
+            // NEW bytes against `expected_digest` exactly as a cache
+            // miss would — the override never skips verification
+            // (D-02/D-09).
+        }
 
         // (e) Download through the redirect (D-03: default policy).
         let download_url = url::Url::parse(&asset.browser_download_url).map_err(|err| {
