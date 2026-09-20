@@ -1,0 +1,77 @@
+# Ignition browser E2E
+
+Scaffolded by `ign e2e init` against `__IGN_GATEWAY_URL__`.
+
+Playwright drives a real browser against the gateway. The login form is
+never touched: `global-setup.mjs` asks the CLI for a session and hands
+Playwright the resulting `storageState`.
+
+## Run it
+
+```sh
+npm test              # headless
+npm run test:headed   # watch the browser
+npm run test:ui       # Playwright's UI mode
+npm run report        # open the last HTML report
+```
+
+Diagnose the setup at any time:
+
+```sh
+ign e2e doctor --project __IGN_PROJECT__
+```
+
+## What global setup does
+
+1. **`ign session login --json`** — runs the gateway's native OIDC
+   login and writes `data.storage_state` to `.auth/state.json`.
+   `playwright.config.mjs` points `use.storageState` at that file, so
+   every browser context starts already authenticated.
+2. **`ign testing run --project __IGN_PROJECT__ --json`** — runs the
+   gateway's own Jython suite FIRST and throws if the verdict is not
+   `passed`, aborting before a single page is opened. A browser failure
+   caused by broken gateway-side code is an expensive way to learn
+   something one HTTP call already knew. Set
+   `IGN_E2E_SKIP_GATEWAY_TESTS=1` to skip this gate.
+
+Both steps surface the CLI's own stderr and name its exit code: **3** a
+missing password, **5** rejected credentials, **6** a red suite.
+
+## Environment
+
+| Variable | Purpose |
+|---|---|
+| `IGNITION_URL` | Gateway base URL. Overrides the baked-in `__IGN_GATEWAY_URL__`. |
+| `IGNITION_PASSWORD` | **Required.** The gateway password, read by `ign session login`. Never a flag, never in a file here. |
+| `IGNITION_USER` | Gateway username. Defaults to `admin`. |
+| `IGNITION_TOKEN` | API token for the `lib/gateway.mjs` helpers (`X-Ignition-API-Token`). |
+| `IGN_BIN` | Path to the `ign` binary. Defaults to `ign` on `PATH`. |
+| `IGN_E2E_SKIP_GATEWAY_TESTS` | Set to `1` to skip the gateway-suite gate in global setup. |
+| `IGNITION_ALLOW_INSECURE_LOCAL` | Set to `true` to apply the loopback TLS relaxation to a non-loopback host. See below. |
+
+## TLS
+
+`lib/gateway.mjs` disables certificate verification **only** when the
+gateway host is `localhost`, `127.0.0.1`, or `::1` — and prints one
+warning to stderr when it does. A self-signed certificate on your own
+machine is a papercut; the same relaxation pointed at a remote gateway
+silently removes the guarantee HTTPS exists to provide.
+
+For a remote gateway behind a private CA, do **not** set
+`IGNITION_ALLOW_INSECURE_LOCAL`. Point Node at the CA instead:
+
+```sh
+export NODE_EXTRA_CA_CERTS=/path/to/company-ca.pem
+```
+
+## Files
+
+| File | What it is |
+|---|---|
+| `playwright.config.mjs` | Runner config: `baseURL`, the 180 s timeout, `globalSetup`, `use.storageState`. |
+| `global-setup.mjs` | The two-step bootstrap described above. |
+| `lib/gateway.mjs` | `readTags`, `writeTags`, `runScript`, `waitForTag` over the gateway's testing routes. |
+| `tests/example.spec.mjs` | A tag round trip and a Perspective shell check. |
+| `.auth/state.json` | **Generated, gitignored.** Holds a live session cookie. |
+
+Edit `tests/example.spec.mjs` or add your own `tests/*.spec.mjs`.

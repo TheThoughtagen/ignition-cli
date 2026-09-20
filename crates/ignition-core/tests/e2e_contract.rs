@@ -412,3 +412,247 @@ fn find_on_path_in_walks_the_injected_path_in_order() {
         "a non-executable file is not a tool"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Init — the scaffold write.
+// ---------------------------------------------------------------------------
+
+use ignition_core::actions::e2e::{E2eFileStatus, E2eInitOptions, e2e_init, e2e_init_preview};
+
+fn init_opts(dir: &Path) -> E2eInitOptions {
+    E2eInitOptions {
+        dir: dir.to_path_buf(),
+        project: "ign-cli".into(),
+        run_project: "Flux".into(),
+        gateway_url: "http://localhost:9088".into(),
+        browsers: false,
+    }
+}
+
+/// A fresh directory gets every member, on disk, with the expected
+/// relative layout and no surviving markers.
+#[cfg(unix)]
+#[tokio::test]
+async fn init_writes_the_full_scaffold() {
+    let tools = tempfile::tempdir().unwrap();
+    stub_tool(tools.path(), "node", "v22.11.0");
+    stub_tool(tools.path(), "npm", "10.9.0");
+    let target = tempfile::tempdir().unwrap();
+    let dir = target.path().join("e2e");
+
+    let env = env_with(tools.path(), None);
+    let result = e2e_init(&env, &init_opts(&dir)).await.expect("init lands");
+
+    assert_eq!(result.files.len(), 7, "seven members");
+    assert!(
+        result
+            .files
+            .iter()
+            .all(|file| file.status == E2eFileStatus::Written),
+        "a fresh directory writes every member: {:?}",
+        result.files
+    );
+
+    for member in [
+        "package.json",
+        "playwright.config.mjs",
+        "global-setup.mjs",
+        "lib/gateway.mjs",
+        "tests/example.spec.mjs",
+        ".gitignore",
+        "README.md",
+    ] {
+        let path = dir.join(member);
+        assert!(path.is_file(), "{member} is on disk at {}", path.display());
+        let body = std::fs::read_to_string(&path).unwrap();
+        for marker in [
+            "__IGN_PROJECT__",
+            "__IGN_RUN_PROJECT__",
+            "__IGN_GATEWAY_URL__",
+        ] {
+            assert!(
+                !body.contains(marker),
+                "{member} shipped with an unsubstituted {marker}"
+            );
+        }
+    }
+
+    // No member reached disk with the template suffix.
+    assert!(
+        !dir.join("package.json.tmpl").exists() && !dir.join("gitignore.tmpl").exists(),
+        "a .tmpl suffix reached disk"
+    );
+    // The substituted values actually landed.
+    let helper = std::fs::read_to_string(dir.join("lib/gateway.mjs")).unwrap();
+    assert!(helper.contains("/system/webdev/ign-cli/testing/tags"));
+    let spec = std::fs::read_to_string(dir.join("tests/example.spec.mjs")).unwrap();
+    assert!(spec.contains("Flux"), "the run project landed in the spec");
+
+    // The npm leg ran with an arg vector.
+    let argv = recorded_argv(tools.path(), "npm");
+    assert_eq!(argv, vec!["install"], "npm install ran in the target");
+    assert!(result.npm_install.as_ref().unwrap().ran);
+    assert!(result.browsers.is_none(), "no --browsers, null field");
+}
+
+/// Idempotence: a second init reports every member skipped and leaves
+/// every byte alone. This is what makes re-running safe over a suite
+/// someone has edited.
+#[cfg(unix)]
+#[tokio::test]
+async fn second_init_skips_every_member() {
+    let tools = tempfile::tempdir().unwrap();
+    stub_tool(tools.path(), "node", "v22.11.0");
+    stub_tool(tools.path(), "npm", "10.9.0");
+    let target = tempfile::tempdir().unwrap();
+    let dir = target.path().join("e2e");
+    let env = env_with(tools.path(), None);
+
+    e2e_init(&env, &init_opts(&dir)).await.expect("first init");
+
+    // A user edit that must survive.
+    let spec = dir.join("tests/example.spec.mjs");
+    std::fs::write(&spec, "// MY OWN TESTS\n").unwrap();
+    let before: Vec<(String, String)> = ["package.json", "README.md", "tests/example.spec.mjs"]
+        .iter()
+        .map(|m| {
+            (
+                (*m).to_string(),
+                std::fs::read_to_string(dir.join(m)).unwrap(),
+            )
+        })
+        .collect();
+
+    let second = e2e_init(&env, &init_opts(&dir)).await.expect("second init");
+
+    assert!(
+        second
+            .files
+            .iter()
+            .all(|file| file.status == E2eFileStatus::Skipped),
+        "every member skips on a re-init: {:?}",
+        second.files
+    );
+    for (member, body) in before {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&member)).unwrap(),
+            body,
+            "{member} was modified by the second init"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&spec).unwrap(),
+        "// MY OWN TESTS\n",
+        "the user's own test file survived"
+    );
+}
+
+/// A non-empty directory that is not a scaffold is refused BEFORE any
+/// write, and the refusal names something it found.
+#[cfg(unix)]
+#[tokio::test]
+async fn foreign_directory_refuses_before_any_write() {
+    let tools = tempfile::tempdir().unwrap();
+    stub_tool(tools.path(), "node", "v22.11.0");
+    stub_tool(tools.path(), "npm", "10.9.0");
+    let target = tempfile::tempdir().unwrap();
+    std::fs::write(target.path().join("important-notes.txt"), "do not delete").unwrap();
+    std::fs::write(target.path().join("budget.xlsx"), "x").unwrap();
+
+    let env = env_with(tools.path(), None);
+    let err = e2e_init(&env, &init_opts(target.path()))
+        .await
+        .expect_err("a foreign directory refuses");
+
+    assert_eq!(err.exit_code(), 2, "usage class");
+    assert_eq!(err.code(), "invalid_input");
+    let message = err.to_string();
+    assert!(
+        message.contains("budget.xlsx") || message.contains("important-notes.txt"),
+        "the refusal names what it found: {message}"
+    );
+
+    // NOTHING was written and NOTHING was spawned.
+    assert!(!target.path().join("package.json").exists());
+    assert!(!target.path().join("playwright.config.mjs").exists());
+    assert!(
+        recorded_argv(tools.path(), "npm").is_empty(),
+        "no installer was spawned"
+    );
+}
+
+/// The preview lists every member and both command lines, and writes
+/// nothing. (The confirmation refusal itself is `require_confirmation`'s
+/// and is already pinned by the CLI suite.)
+#[cfg(unix)]
+#[tokio::test]
+async fn preview_lists_every_member_and_both_commands_and_writes_nothing() {
+    let tools = tempfile::tempdir().unwrap();
+    stub_tool(tools.path(), "node", "v22.11.0");
+    stub_tool(tools.path(), "npm", "10.9.0");
+    let target = tempfile::tempdir().unwrap();
+    let dir = target.path().join("e2e");
+
+    let env = env_with(tools.path(), None);
+    let mut opts = init_opts(&dir);
+    opts.browsers = true;
+
+    let preview = e2e_init_preview(&env, &opts).expect("the preview computes");
+
+    for member in [
+        "package.json",
+        "playwright.config.mjs",
+        "global-setup.mjs",
+        "lib/gateway.mjs",
+        "tests/example.spec.mjs",
+        ".gitignore",
+        "README.md",
+    ] {
+        assert!(preview.contains(member), "the preview lists {member}");
+    }
+    assert!(preview.contains("npm install"), "the npm command line");
+    assert!(
+        preview.contains("playwright install") && preview.contains("chromium"),
+        "the browser command line: {preview}"
+    );
+    assert!(preview.contains("ign-cli") && preview.contains("Flux"));
+
+    // The preview is a DRY RUN: nothing on disk, nothing spawned.
+    assert!(!dir.exists(), "the preview created no directory");
+    assert!(
+        recorded_argv(tools.path(), "npm").is_empty(),
+        "the preview spawned nothing"
+    );
+}
+
+/// A host with no node refuses exit 6 with the doctor's install hint —
+/// the same string, byte for byte.
+#[tokio::test]
+async fn absent_node_refuses_with_the_install_hint() {
+    let empty = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let dir = target.path().join("e2e");
+    let env = env_with(empty.path(), None);
+
+    let err = e2e_init(&env, &init_opts(&dir))
+        .await
+        .expect_err("no node refuses");
+
+    assert_eq!(
+        err.exit_code(),
+        6,
+        "target-state class, NOT the rig class 7"
+    );
+    assert_eq!(err.code(), "node_tool_absent");
+    assert_eq!(
+        err.hint().expect("a hint"),
+        ignition_core::actions::e2e::NODE_INSTALL_HINT,
+        "the refusal reuses the doctor's node hint byte-identically"
+    );
+    assert!(!dir.exists(), "nothing was written");
+
+    // The preview refuses identically (the gate order is the same).
+    let preview_err =
+        e2e_init_preview(&env, &init_opts(&dir)).expect_err("the preview refuses too");
+    assert_eq!(preview_err.code(), "node_tool_absent");
+}

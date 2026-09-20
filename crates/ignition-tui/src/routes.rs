@@ -630,6 +630,18 @@ pub fn routes() -> &'static [CliRoute] {
             path: "e2e doctor",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // QUICK-tg4: `ign e2e init` — the scaffold write. The row lands
+        // FRESH in this change. Deliberately NOT a dashboard menu
+        // action: it writes files into an operator-named directory and
+        // spawns package installers, and the TUI has no safe
+        // confirmation surface for that — the CLI-side gate is the
+        // global --yes, whose refusal PREVIEWS every member and both
+        // command lines. A modal that shrank that preview to "OK?"
+        // would be a worse gate than no gate.
+        CliRoute {
+            path: "e2e init",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         // QUICK-tg4: `ign session login` — the live gateway session.
         // The row lands FRESH in this change. Deliberately NOT a
         // dashboard menu action: the verb's product IS a live

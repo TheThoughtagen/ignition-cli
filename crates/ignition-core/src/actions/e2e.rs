@@ -453,6 +453,326 @@ pub async fn e2e_doctor(
     })
 }
 
+// ---------------------------------------------------------------------------
+// `ign e2e init` — the scaffold write.
+// ---------------------------------------------------------------------------
+
+/// The marker file that identifies a directory as an e2e scaffold (and
+/// therefore safe to re-init over).
+const SCAFFOLD_MARKER: &str = "playwright.config.mjs";
+
+/// The gateway URL baked into a scaffold generated with NO profile.
+///
+/// `ign e2e init` must work before a profile is configured — scaffolding
+/// is something you do on a fresh machine — so the URL falls back to
+/// Ignition's stock HTTP port. The scaffold reads `IGNITION_URL` first
+/// in every place it uses this, so a wrong guess here costs one env var,
+/// never a re-scaffold.
+pub const DEFAULT_GATEWAY_URL: &str = "http://localhost:8088";
+
+/// `ign e2e init` options.
+///
+/// There is deliberately NO `yes` field: `--yes`/`-y` is a GLOBAL clap
+/// arg, and the confirmation guard lives at the dispatch site so the
+/// `GUARDED_OPS` registry and the MCP catalog's synthetic `confirm`
+/// property both see it (D3).
+#[derive(Debug, Clone)]
+pub struct E2eInitOptions {
+    /// Where the scaffold lands.
+    pub dir: PathBuf,
+    /// The project whose testing routes the helpers call.
+    pub project: String,
+    /// The Perspective project the browser test navigates to.
+    pub run_project: String,
+    /// Baked in as the `IGNITION_URL` fallback.
+    pub gateway_url: String,
+    /// Also download the Chromium build.
+    pub browsers: bool,
+}
+
+/// What happened to one scaffold member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum E2eFileStatus {
+    /// The member was written.
+    Written,
+    /// The destination already existed and was left untouched.
+    Skipped,
+}
+
+/// One scaffold member's outcome.
+#[derive(Debug, Serialize)]
+pub struct E2eFile {
+    /// The member path, relative to the target directory.
+    pub path: String,
+    /// Written or skipped.
+    pub status: E2eFileStatus,
+}
+
+/// A spawned installer's outcome. A non-zero exit is DATA, not an
+/// error: a network-less host must still be left with a usable
+/// scaffold on disk (the lint doctor posture).
+#[derive(Debug, Serialize)]
+pub struct E2eCommandRun {
+    /// Whether the command was spawned at all.
+    pub ran: bool,
+    /// The child's exit code (`null` when a signal killed it).
+    pub exit_code: Option<i32>,
+}
+
+/// `ign e2e init` output — ALL keys always present.
+#[derive(Debug, Serialize)]
+pub struct E2eInitResult {
+    /// The target directory.
+    pub dir: String,
+    /// Every member with its status, in write order.
+    pub files: Vec<E2eFile>,
+    /// The `npm install` leg.
+    pub npm_install: Option<E2eCommandRun>,
+    /// The browser-download leg (`null` without `--browsers`).
+    pub browsers: Option<E2eCommandRun>,
+}
+
+/// The `npm install` argv.
+fn npm_install_argv() -> Vec<&'static str> {
+    vec!["install"]
+}
+
+/// The Playwright browser-download argv.
+fn browsers_argv() -> Vec<&'static str> {
+    vec!["playwright", "install", "--with-deps", "chromium"]
+}
+
+/// Human-readable renderings of the two commands, for the preview.
+fn command_lines(dir: &std::path::Path, browsers: bool) -> Vec<String> {
+    let mut lines = vec![format!(
+        "(in {}) npm {}",
+        dir.display(),
+        npm_install_argv().join(" ")
+    )];
+    if browsers {
+        lines.push(format!(
+            "(in {}) npx {}",
+            dir.display(),
+            browsers_argv().join(" ")
+        ));
+    }
+    lines
+}
+
+/// GATE 1 — the foreign-directory refusal.
+///
+/// A non-empty target that is not already a scaffold is refused BEFORE
+/// any write, naming a file it found. The `ensure_checkout_target`
+/// message shape: a refusal that does not say what it saw leaves the
+/// user guessing which directory they actually typed.
+fn refuse_foreign_directory(dir: &std::path::Path) -> Result<(), CoreError> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(()); // absent (or unreadable) — the write step owns it
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    if names.is_empty() {
+        return Ok(()); // empty dir — init owns it from here
+    }
+    if names.iter().any(|name| name == SCAFFOLD_MARKER) {
+        return Ok(()); // an existing scaffold: re-init is idempotent
+    }
+    let mut found = names.clone();
+    found.sort();
+    Err(CoreError::InvalidInput {
+        reason: format!(
+            "target directory {} is not empty and is not an e2e scaffold (no {}) — \
+             refusing to clobber it; it contains {}",
+            dir.display(),
+            SCAFFOLD_MARKER,
+            found
+                .iter()
+                .take(5)
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
+/// GATE 2 — the node refusal.
+fn refuse_without_node(env: &E2eEnv) -> Result<(), CoreError> {
+    let found = env
+        .path
+        .as_ref()
+        .and_then(|path| find_on_path_in(path, "node"));
+    if found.is_none() {
+        return Err(CoreError::NodeToolAbsent {
+            tool: "node".into(),
+        });
+    }
+    Ok(())
+}
+
+/// The confirmation preview (D3) — the refusal IS the dry run.
+///
+/// Runs gates 1 and 2 first so the foreign-directory and node refusals
+/// WIN over the confirmation refusal (being told to pass `--yes` for a
+/// write that would have been refused anyway is a wasted round trip),
+/// and so the previewed statuses are accurate.
+///
+/// Pure apart from filesystem reads: it writes nothing and spawns
+/// nothing.
+pub fn e2e_init_preview(env: &E2eEnv, opts: &E2eInitOptions) -> Result<String, CoreError> {
+    refuse_foreign_directory(&opts.dir)?;
+    refuse_without_node(env)?;
+
+    let mut lines = vec![
+        format!(
+            "scaffold a Playwright E2E suite into {}",
+            opts.dir.display()
+        ),
+        String::new(),
+        format!(
+            "project: {}   run-project: {}   gateway: {}",
+            opts.project, opts.run_project, opts.gateway_url
+        ),
+        String::new(),
+        "files:".to_string(),
+    ];
+    for path in crate::e2e::member_paths() {
+        let status = if opts.dir.join(path).exists() {
+            "skip (exists)"
+        } else {
+            "write"
+        };
+        lines.push(format!("  {status:<14} {path}"));
+    }
+    lines.push(String::new());
+    lines.push("commands:".to_string());
+    for command in command_lines(&opts.dir, opts.browsers) {
+        lines.push(format!("  {command}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Spawn an installer in the target directory, streaming its output.
+///
+/// An ARG VECTOR, never a shell string (the compose seam precedent):
+/// the target directory is operator-named and must never be able to
+/// become shell syntax. stdout/stderr are inherited so the child
+/// streams through live — the `rig logs` passthrough posture.
+async fn run_installer(
+    env: &E2eEnv,
+    dir: &std::path::Path,
+    tool: &str,
+    args: &[&str],
+) -> E2eCommandRun {
+    let Some(binary) = env
+        .path
+        .as_ref()
+        .and_then(|path| find_on_path_in(path, tool))
+    else {
+        eprintln!(
+            "[ign e2e init] {tool} is not on PATH — skipping `{tool} {}`",
+            args.join(" ")
+        );
+        return E2eCommandRun {
+            ran: false,
+            exit_code: None,
+        };
+    };
+    eprintln!(
+        "[ign e2e init] running: (in {}) {tool} {}",
+        dir.display(),
+        args.join(" ")
+    );
+    match tokio::process::Command::new(&binary)
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+    {
+        Ok(status) => E2eCommandRun {
+            ran: true,
+            exit_code: status.code(),
+        },
+        Err(err) => {
+            eprintln!("[ign e2e init] {tool} could not run: {err}");
+            E2eCommandRun {
+                ran: false,
+                exit_code: None,
+            }
+        }
+    }
+}
+
+/// THE scaffold write. Gates run in a fixed order and NONE may be
+/// reordered.
+///
+/// Gates 1 and 2 are RE-RUN here even though `e2e_init_preview` already
+/// ran them at the CLI seam: the action's own re-check is what keeps
+/// in-process TUI and MCP callers honest (the `api call` convention),
+/// because those callers do not pass through the dispatch arm.
+pub async fn e2e_init(env: &E2eEnv, opts: &E2eInitOptions) -> Result<E2eInitResult, CoreError> {
+    // 1. Foreign directory — before any write.
+    refuse_foreign_directory(&opts.dir)?;
+    // 2. Node — before any write.
+    refuse_without_node(env)?;
+    // A bad template edit must not write outside the target.
+    crate::e2e::validate_member_paths()?;
+
+    // 3. Write. NEVER overwrite: an existing member is recorded
+    //    `skipped` and left byte-for-byte alone, which is what makes a
+    //    second init safe to run over a suite someone has edited.
+    std::fs::create_dir_all(&opts.dir).map_err(|err| {
+        CoreError::Internal(format!("cannot create {}: {err}", opts.dir.display()))
+    })?;
+    let mut files = Vec::with_capacity(crate::e2e::E2E_TEMPLATE_FILES.len());
+    for (member, body) in crate::e2e::E2E_TEMPLATE_FILES {
+        let destination = opts.dir.join(member);
+        if destination.exists() {
+            files.push(E2eFile {
+                path: (*member).to_string(),
+                status: E2eFileStatus::Skipped,
+            });
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                CoreError::Internal(format!("cannot create {}: {err}", parent.display()))
+            })?;
+        }
+        let rendered =
+            crate::e2e::render_template(body, &opts.project, &opts.run_project, &opts.gateway_url);
+        std::fs::write(&destination, rendered).map_err(|err| {
+            CoreError::Internal(format!("cannot write {}: {err}", destination.display()))
+        })?;
+        files.push(E2eFile {
+            path: (*member).to_string(),
+            status: E2eFileStatus::Written,
+        });
+    }
+
+    // 4. Install. A non-zero child is DATA — a host with no network
+    //    still ends up with a scaffold it can install later.
+    let npm_install = Some(run_installer(env, &opts.dir, "npm", &npm_install_argv()).await);
+
+    // 5. Browsers, only on request.
+    let browsers = if opts.browsers {
+        Some(run_installer(env, &opts.dir, "npx", &browsers_argv()).await)
+    } else {
+        None
+    };
+
+    Ok(E2eInitResult {
+        dir: opts.dir.display().to_string(),
+        files,
+        npm_install,
+        browsers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

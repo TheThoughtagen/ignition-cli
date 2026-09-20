@@ -1,0 +1,62 @@
+// Example suite — scaffolded by `ign e2e init`.
+//
+// Two tests that are meant to be GREEN on a fresh rig:
+//
+//   1. A tag round trip through the gateway's testing routes. No
+//      browser, no custom project content — it passes on any gateway
+//      with the testing bundle deployed.
+//   2. A Perspective shell check. It navigates to the run project's
+//      Perspective entry point and, when that answers 404, SKIPS with a
+//      message naming --run-project rather than failing. A fresh
+//      gateway with no views of your own must not produce a red run.
+
+import { expect, test } from '@playwright/test';
+import { readTags, waitForTag, writeTags } from '../lib/gateway.mjs';
+
+/** Where the Perspective shell for the run project lives. */
+const RUN_PROJECT_PATH = '/data/perspective/client/__IGN_RUN_PROJECT__';
+
+/** A memory tag the testing bundle ships for exactly this purpose. */
+const SCRATCH_TAG = '[default]_ign_e2e_scratch';
+
+test.describe('gateway round trip', () => {
+  test('writes a tag and reads the value back', async () => {
+    const written = `ign-e2e-${Date.now()}`;
+
+    await writeTags([{ path: SCRATCH_TAG, value: written }]);
+
+    // waitForTag rather than an immediate read: a tag write is
+    // asynchronous on the gateway, and an immediate read is the
+    // classic flake in every Ignition test suite ever written.
+    const settled = await waitForTag(SCRATCH_TAG, (value) => value === written, 10000, 250);
+    expect(settled).toBe(written);
+
+    const answer = await readTags([SCRATCH_TAG]);
+    expect(answer).toBeTruthy();
+  });
+});
+
+test.describe('perspective shell', () => {
+  test('the run project loads', async ({ page }) => {
+    const response = await page.goto(RUN_PROJECT_PATH, { waitUntil: 'domcontentloaded' });
+
+    if (response && response.status() === 404) {
+      test.skip(
+        true,
+        `no Perspective project at ${RUN_PROJECT_PATH} — scaffold with ` +
+          `--run-project <NAME> to point this test at a project that has views`,
+      );
+      return;
+    }
+
+    expect(response, 'the gateway answered the navigation').toBeTruthy();
+    expect(
+      response.status(),
+      `the Perspective shell answered HTTP ${response && response.status()}`,
+    ).toBeLessThan(500);
+
+    await expect
+      .poll(async () => (await page.title()).length, { timeout: 30000 })
+      .toBeGreaterThan(0);
+  });
+});

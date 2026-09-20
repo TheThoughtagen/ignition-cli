@@ -320,7 +320,7 @@ fn dashboard_actions_menu_matches_registry() {
     // (extend the exclusion comments). The pinned test IS the
     // pre-declaration (the 08-06 OutOfBand pattern).
     //
-    // Current exclusions (39 Dashboard rows − 27 menu verbs = 12):
+    // Current exclusions (40 Dashboard rows − 27 menu verbs = 13):
     //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
     //     the TUI's menu can host).
     //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
@@ -347,6 +347,11 @@ fn dashboard_actions_menu_matches_registry() {
     //     run`: its product is a multi-row diagnosis DOCUMENT (six
     //     rows, each with a detail and a hint), not a modal round
     //     trip. It belongs in a doctor pane, not the actions menu.
+    //   - `e2e init` (QUICK-tg4) — it writes files into an
+    //     operator-named directory and spawns package installers. The
+    //     CLI gate is the global --yes, whose refusal previews every
+    //     member and both command lines; a TUI modal that shrank that
+    //     to "OK?" would be a worse gate than no gate.
     let dashboard_rows: Vec<&str> = routes()
         .iter()
         .filter(|route| matches!(route.mapping, Mapping::Screen(Screen::Dashboard)))
@@ -354,7 +359,7 @@ fn dashboard_actions_menu_matches_registry() {
         .collect();
     assert_eq!(
         dashboard_rows.len(),
-        39,
+        40,
         "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
          + the update.rs executor arms in the same change, or justify the \
          exclusion in this test's comment block: {dashboard_rows:#?}"

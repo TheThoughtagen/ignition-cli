@@ -526,6 +526,21 @@ pub enum CoreError {
     #[error("ignition-lint is not installed (no executable found on PATH)")]
     LintToolAbsent,
 
+    /// `ign e2e init` found no `node` executable on PATH — the scaffold
+    /// it would write is unusable without one (QUICK-tg4).
+    ///
+    /// Exit 6, mirroring [`Self::LintToolAbsent`] line for line: this
+    /// is the SAME shape — a local external tool a verb delegates to is
+    /// absent, with an install hint. It deliberately does NOT join
+    /// exit 7, whose sole slug is `rig_error` for docker/compose rig
+    /// failures; putting a missing Node there would force a relabel of
+    /// a locked exit class.
+    #[error("{tool} is not installed (no executable found on PATH)")]
+    NodeToolAbsent {
+        /// The tool that was looked for (`node`).
+        tool: String,
+    },
+
     /// The gateway answered the api call with a 4xx this CLI does not
     /// curate — the caller's request is the problem, and the body is
     /// theirs to read. Exit 2 (usage class; additive slug — the
@@ -607,6 +622,7 @@ impl CoreError {
             Self::EamTaskInFlight { .. } => "eam_task_in_flight",
             Self::ScriptExecNotConfigured { .. } => "script_exec_not_configured",
             Self::LintToolAbsent => "lint_tool_absent",
+            Self::NodeToolAbsent { .. } => "node_tool_absent",
             Self::GatewayClientError { .. } => "gateway_client_error",
             Self::BundleNotAvailable { .. } => "bundle_not_available",
         }
@@ -650,6 +666,7 @@ impl CoreError {
             | Self::EamTaskInFlight { .. }
             | Self::ScriptExecNotConfigured { .. }
             | Self::LintToolAbsent
+            | Self::NodeToolAbsent { .. }
             | Self::BundleNotAvailable { .. } => 6,
             Self::Rig(_) => 7,
         }
@@ -909,6 +926,12 @@ impl CoreError {
                  ignition-lint on PATH"
                     .to_string(),
             ),
+            // The SAME string `ign e2e doctor`'s node row hands out —
+            // a user who hits this refusal and then runs the doctor
+            // must not be given two wordings of one instruction.
+            Self::NodeToolAbsent { .. } => {
+                Some(crate::actions::e2e::NODE_INSTALL_HINT.to_string())
+            }
             Self::GatewayClientError { .. } => Some(
                 "the gateway rejected this request — the body above is the \
                  gateway's own answer; fix the path/method/body, or use a \
@@ -1024,6 +1047,13 @@ mod tests {
     /// an unroutable loopback port fails at connect time (instant refusal —
     /// `reqwest::Error` has no public constructor).
     fn network_error() -> CoreError {
+        // reqwest is built with `rustls-no-provider`, so a raw
+        // `reqwest::get` panics unless the process-wide provider is
+        // installed. In a full lib-test run some other test happens to
+        // install it first; running the error tests ALONE (which the
+        // exit-table verify command does) hit the panic. The install is
+        // idempotent and documented for exactly this use.
+        crate::client::install_crypto_provider();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1285,6 +1315,13 @@ mod tests {
             ),
             (CoreError::LintToolAbsent, 6, "lint_tool_absent"),
             (
+                CoreError::NodeToolAbsent {
+                    tool: "node".into(),
+                },
+                6,
+                "node_tool_absent",
+            ),
+            (
                 CoreError::BundleNotAvailable {
                     state: "Invalid".into(),
                 },
@@ -1351,6 +1388,7 @@ mod tests {
         (6, "eam_task_in_flight"),
         (6, "script_exec_not_configured"),
         (6, "lint_tool_absent"),
+        (6, "node_tool_absent"),
         (6, "provider_root_unsupported"),
         (6, "bundle_not_available"),
         (7, "rig_error"),

@@ -23,6 +23,7 @@
 pub mod actions;
 pub mod client;
 pub mod config;
+pub mod e2e;
 pub mod error;
 pub mod output;
 pub mod poll;

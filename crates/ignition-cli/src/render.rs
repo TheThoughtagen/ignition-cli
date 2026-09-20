@@ -217,6 +217,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Adopt(result) => render_adopt_human(result),
         ActionOutput::SessionLogin(result) => render_session_login_human(result),
         ActionOutput::E2eDoctor(result) => render_e2e_doctor_human(result),
+        ActionOutput::E2eInit(result) => render_e2e_init_human(result),
         // Unreachable: render_ok intercepts Completions before mode
         // dispatch (the sanctioned stdout exception).
         ActionOutput::Completions { shell } => {
@@ -820,6 +821,42 @@ fn render_e2e_doctor_human(result: &ignition_core::actions::e2e::E2eDoctorResult
             println!("  hint: {hint}");
         }
     }
+}
+
+/// `ign e2e init` — one line per member with its status, then one per
+/// installer leg with its exit code.
+fn render_e2e_init_human(result: &ignition_core::actions::e2e::E2eInitResult) {
+    use ignition_core::actions::e2e::E2eFileStatus;
+    println!("scaffold    {}", result.dir);
+    for file in &result.files {
+        let status = match file.status {
+            E2eFileStatus::Written => "written",
+            E2eFileStatus::Skipped => "skipped",
+        };
+        println!("{status:<10}  {}", file.path);
+    }
+    let leg = |name: &str, run: &Option<ignition_core::actions::e2e::E2eCommandRun>| {
+        if let Some(run) = run {
+            if run.ran {
+                match run.exit_code {
+                    Some(0) => println!("{name:<10}  ok"),
+                    // A non-zero installer is DATA, not a failed verb:
+                    // the scaffold is on disk and usable once the user
+                    // fixes the network (or runs the command again).
+                    Some(code) => {
+                        println!("{name:<10}  exit {code} (the scaffold is still on disk)")
+                    }
+                    None => println!("{name:<10}  killed by a signal"),
+                }
+            } else {
+                println!("{name:<10}  not run");
+            }
+        }
+    };
+    leg("npm", &result.npm_install);
+    leg("browsers", &result.browsers);
+    println!();
+    println!("next: cd {} && npm test", result.dir);
 }
 
 /// The `ign session login` human lines (QUICK-tg4, D5).

@@ -1455,6 +1455,31 @@ pub enum E2eCmd {
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
     },
+
+    /// Scaffold a Playwright E2E suite into DIR (default ./e2e): a
+    /// runner config, a global setup that logs in through `ign
+    /// session login` and gates on `ign testing run`, gateway tag/
+    /// script helpers, an example suite, a .gitignore, and a README —
+    /// then `npm install`. **Idempotent**: an existing file is
+    /// reported `skipped` and never overwritten. Requires the global
+    /// --yes; without it the verb writes nothing, spawns nothing, and
+    /// refuses exit 2 after previewing every file and both commands
+    Init {
+        /// Where the scaffold lands (default: ./e2e)
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// The project whose WebDev testing routes the helpers call
+        /// (default: ign-cli)
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        /// The Perspective project the browser test navigates to
+        /// (default: the effective --project)
+        #[arg(long, value_name = "NAME")]
+        run_project: Option<String>,
+        /// Also download the Chromium build after installing
+        #[arg(long)]
+        browsers: bool,
+    },
 }
 
 /// `ign session` args (QUICK-tg4) — the SINGULAR verb family: one

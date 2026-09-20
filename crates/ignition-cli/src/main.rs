@@ -98,6 +98,8 @@ enum ActionOutput {
     SessionLogin(actions::login::SessionLoginResult),
     /// `ign e2e doctor` — the six-row browser-E2E diagnosis.
     E2eDoctor(actions::e2e::E2eDoctorResult),
+    /// `ign e2e init` — the scaffold write + the installer legs.
+    E2eInit(actions::e2e::E2eInitResult),
     /// `ign completions <SHELL>` — raw script text on stdout, the ONE
     /// sanctioned exception: printed verbatim regardless of `--json`
     /// (shells source stdout; see `render_ok`).
@@ -337,6 +339,7 @@ impl ActionOutput {
             ActionOutput::Adopt(result) => render_success(profile, result, compact),
             ActionOutput::SessionLogin(result) => render_success(profile, result, compact),
             ActionOutput::E2eDoctor(result) => render_success(profile, result, compact),
+            ActionOutput::E2eInit(result) => render_success(profile, result, compact),
             // Unreachable in practice (render_ok intercepts Completions
             // before mode dispatch) — but degrades to the correct raw
             // script rather than panicking if that bypass ever moves.
@@ -2648,6 +2651,48 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     }
                 }
             }
+            // `ign e2e init` — the guarded scaffold write. Order is
+            // load-bearing: the PREVIEW runs first (it re-runs the
+            // foreign-directory and node gates, so those refusals win
+            // over the confirmation refusal and the previewed statuses
+            // are accurate), then the confirmation guard consumes the
+            // preview as its prose, then the action.
+            cli::E2eCmd::Init {
+                dir,
+                project,
+                run_project,
+                browsers,
+            } => {
+                let env = actions::e2e::E2eEnv::from_process();
+                // `e2e init` must work BEFORE a profile is configured —
+                // scaffolding is something you do on a fresh machine.
+                let (profile, gateway_url) = match Session::resolve_degraded(cli.profile.as_deref())
+                {
+                    Ok(session) => (
+                        Some(session.profile_name().to_string()),
+                        session.profile_url().to_string(),
+                    ),
+                    Err(_) => (None, actions::e2e::DEFAULT_GATEWAY_URL.to_string()),
+                };
+                let project = project.unwrap_or_else(|| "ign-cli".to_string());
+                let opts = actions::e2e::E2eInitOptions {
+                    dir: dir.unwrap_or_else(|| std::path::PathBuf::from("./e2e")),
+                    run_project: run_project.unwrap_or_else(|| project.clone()),
+                    project,
+                    gateway_url,
+                    browsers,
+                };
+                let preview = match actions::e2e::e2e_init_preview(&env, &opts) {
+                    Ok(preview) => preview,
+                    Err(err) => return (profile, Err(err)),
+                };
+                // guarded:e2e init
+                if let Err(err) = require_confirmation(cli.yes, &preview) {
+                    return (profile, Err(err));
+                }
+                let result = actions::e2e::e2e_init(&env, &opts).await;
+                (profile, result.map(ActionOutput::E2eInit))
+            }
         },
         Commands::Lint(LintArgs {
             paths,
@@ -3352,6 +3397,15 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     // 13-08: the kubectl-edit loop's push gate (dynamic prose: the
     // staged-changed summary IS the refusal message).
     ("edit", "edit would write <N> member(s) to <project>"),
+    // QUICK-tg4: the scaffold write + the spawned installers. A
+    // DYNAMIC-prose site — the refusal message IS `e2e_init_preview`'s
+    // output (the target, every member with its would-be status, and
+    // both command lines verbatim), so the preview doubles as the dry
+    // run and no separate --dry-run flag exists.
+    (
+        "e2e init",
+        "e2e init <target, member list with statuses, and the npm/npx command lines>",
+    ),
 ];
 
 /// The guarded lifecycle verbs' Tier-2 gate (10-04): the blast-radius
@@ -3838,7 +3892,16 @@ mod tests {
                 continue;
             };
             let path = rest.trim();
-            if !path.is_empty() && path.bytes().all(|b| b.is_ascii_lowercase() || b == b' ') {
+            // Lowercase, DIGITS, and spaces: a clap leaf path may carry
+            // a digit (`e2e init` — QUICK-tg4). A digit-rejecting
+            // filter silently dropped that marker and reported the
+            // registered op as unmarked, which is the one failure mode
+            // this scan exists to prevent.
+            if !path.is_empty()
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b' ')
+            {
                 out.push(path.to_string());
             }
         }

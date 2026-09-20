@@ -93,7 +93,7 @@ guarded verbs: schema-required would invite agents to auto-fill
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`
 | 4    | network       | gateway unreachable / timeout / TLS                | `network_error`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `provider_root_unsupported`, `bundle_not_available` |
+| 6    | target_state  | command invalid for the gateway's current state    | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -326,6 +326,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign testing run --project NAME [--discover] [--module DOTTED\|--package PREFIX] [--format json\|junit\|text]` | Run the gateway's own Jython test suite through the deployed testing bundle and return a machine verdict — the agent/CI verb (no Designer, no `ign adopt`) | `--project` is **required** (the bundle deploys per project and a run executes THAT project's gateway-side code — there is deliberately no `ign-cli` default); `--discover` lists the discovered test modules; `--discover`/`--module`/`--package` are mutually exclusive (exit 2 `invalid_input` naming both flags, with ZERO HTTP requests); **the verdict rides the BODY, never the status line** — the route answers 200 on green and **207** on failures/errors and both are success transport shapes, so `failed + errors > 0` is the only oracle; a green run exits 0; a RED run renders the FULL results in the **success** envelope and exits **6** with `data.slug = "tests_failed"` (the `ign lint --strict` precedent — the error envelope has no `data` field to carry results, and every test runner puts the report on stdout and the verdict in the exit code; `tests_failed` is NOT a `CoreError` slug and never appears in the exit-code table); an undeployed bundle exits 6 `routes_not_deployed` with a hint naming `ign webdev deploy --with-testing` / `ign adopt --project NAME --testing` (404/405/501 are all absent markers — a raw-status probe runs BEFORE the run POST so an absent bundle can never read as a passing suite); a first-touch lazy-compile 500 is retried exactly once (3 s) on each leg; `--format` renders **client-side** — the route is ALWAYS asked for json, so the verdict and exit code are identical in every format (the route's own junit/text answers stay HTTP 200 and carry no counts), with the rendered document in `data.report` and the structured truth in `data.results`; JSON data `{mode, project, modules, count, verdict, slug, passed, failed, skipped, errors, total, durationMs, report, results}` — ALL keys always; NO server-side execution timeout exists — a long-running suite holds the HTTP connection (the client's per-request timeout class applies) |
 | `ign lint PATH... [--strict] [-- ARGS...]` | Lint local project files by delegating to `ignition-lint` (PATH-discovered; no gateway, `profile: null`) | **doctor posture**: exit 0 whenever the tool RAN — findings, `child_exit_code`, and the parsed JSON report ride as data (ALL keys always; `report` null + `stdout` verbatim when unparseable; `stderr_preview` capped at 4000 chars); `--strict` exits with the tool's own code for CI (envelope prints first — the one sanctioned success-path exit exception; 1 = findings at the `--fail-on` threshold); PATHS map to `--target <path>` pairs + `--report-format json` on an ARG VECTOR (never a shell string); anything after `--` passes through verbatim; no tool on PATH → exit 6 `lint_tool_absent` with the install hint (`uv tool install ignition-lint-toolkit`); pair with `project export --decode-scripts` to lint the decoded sidecars |
 | `ign e2e doctor [DIR] [--project NAME]` | Diagnose the browser-E2E setup before (or instead of) scaffolding one: `node` (≥20, version-probed), `npm`, `@playwright/test` inside `DIR` (default `./e2e`), a downloaded chromium in the Playwright browsers cache, the gateway's **testing bundle**, and the gateway's **trial** state | **doctor posture — exits 0 whenever the diagnosis COMPLETES**: every finding is a `checks[]` row, never an exit code, so a toolless host, an unreachable gateway, and an undeployed bundle all still return the full report (agents parse `checks[]`; humans read the table). Six rows in a fixed order — `node`, `npm`, `playwright`, `chromium`, `testing-bundle`, `trial` — each in the standard `{name, status, detail, hint}` shape with `status` one of `ok`/`warn`/`fail`/`skip`. Read-only and **offline-safe**: chromium presence is a pure filesystem scan of `PLAYWRIGHT_BROWSERS_PATH` (else the per-OS default — `~/Library/Caches/ms-playwright` on macOS, `~/.cache/ms-playwright` on Linux) for a `chromium-*` or `chromium_headless_shell-*` entry, deliberately **not** `npx playwright install --dry-run`, which would reach for the npm registry. A missing browser or an uninstalled runner is `warn` (one command away), an absent or too-old node is `fail` with the install hint. The two gateway rows report **`skip`** when no profile resolves or no `--project` is given — `--project` has no default, and a profile that will not resolve is not an error for this verb (envelope `profile` is null); an absent bundle is `fail` hinting at `ign webdev deploy --with-testing`, an expired trial is `warn` hinting at `ign rig trial reset` |
+| `ign e2e init [DIR] [--project NAME] [--run-project NAME] [--browsers] [--yes]` | Scaffold a Playwright browser-E2E suite into `DIR` (default `./e2e`) and `npm install` it: `playwright.config.mjs`, a `global-setup.mjs` that logs in via `ign session login` and gates on `ign testing run`, `lib/gateway.mjs` (tag/script helpers over the testing routes), `tests/example.spec.mjs`, `.gitignore`, `README.md` — seven members, all embedded in the binary | **requires the global `--yes`**; without it the verb writes NOTHING and spawns NOTHING and refuses exit 2 `confirmation_required` after previewing the target, every member with its would-be status, and both command lines verbatim — **the refusal IS the dry run**, which is why no separate `--dry-run` flag exists. **Idempotent**: an existing file is reported `skipped` and never overwritten, so a re-init over a suite you have edited is safe. A non-empty target that is not already a scaffold (no `playwright.config.mjs`) refuses exit 2 `invalid_input` **naming files it found**, before any write. A host with no `node` on PATH refuses exit 6 `node_tool_absent` with the same install hint `ign e2e doctor`'s node row carries. Both gates run before any write AND are re-run inside the action, so in-process TUI/MCP callers get the same refusals. `npm install` (and, with `--browsers`, the Chromium download) run with ARG VECTORS, never shell strings, streaming their output through; a **non-zero installer is DATA, not an error** — a network-less host is still left with a usable scaffold on disk. `--project` defaults to `ign-cli` (the CLI's own WebDev project), `--run-project` defaults to the effective `--project`; the gateway URL comes from the profile, falling back to `http://localhost:8088` when none resolves (scaffolding must work before a profile exists). JSON data `{dir, files[{path, status}], npm_install, browsers}` — ALL keys always | 
 | `ign api call --method M --path /P [--data TEXT] [--header "Name: Value"]... [--query k=v]...` | Raw passthrough to any gateway REST endpoint — the escape hatch for the uncurated endpoint families (any HTTP verb accepted) | the envelope's `data.result.data` IS the gateway's JSON **verbatim** (no field dropped, no value coerced, key order preserved — the documented contract exception above); a non-JSON 2xx body exits 1 `internal` with the explanation (binary endpoints: use logs/backup downloads); auth-pattern headers (`Authorization`, `X-Ignition-API-Token`, `Cookie` — case-insensitive) refuse exit 2 pre-resolve with ZERO gateway requests (credentials come from the profile); `--path` must start with `/`, refuses host-shaped URLs and embedded `?` (use repeatable `--query k=v` — the ONE query mechanism); `--header` splits on the FIRST `:` (repeatable), `--data` is raw text on ANY method (GET/DELETE bodies allowed — curl parity); exit partition: 401/403→5, 404→6, 503→6, 500→1, every other 4xx→2 `gateway_client_error` with the body verbatim (4 KiB cap + `... [truncated]` marker) |
 | `ign license status` | The license morning-check in ONE command: license mode + countdown, then per-hardware-key item rows (`name  title  version`) | merges TWO reads — `/data/api/v1/licenses` (the inventory) + `/data/api/v1/trial` (the trial companion); the license MODE lives on the trial wire, not the licenses payload (live-capture fact — fresh-rig `/licenses` carries no mode/edition keys); models are version-tolerant: unknown keys ride the JSON passthrough, license-array ELEMENT shapes were not capturable on fresh rigs (no activations) and stay lenient; JSON data `{license, trial}` — trial carries `license_mode`, `trial_seconds_left`, `expired`; authed read (exit 3 without a credential, exit 5 on bad auth) |
 | `ign redundancy status` | The redundancy morning-check: role, project state, activity, peer connection, config access, sync/failover pending, uptime, last-sync | units AS CAPTURED on 8.3.3 + 8.3.6: `uptime` = **ms since gateway start** (wall-clock proven twice); `lastSyncTimestamp` = `-1` = **never synced** (the unit is NOT capture-proven — non-negative values read epoch-ms flagged as inference; human mode says so, JSON rides the raw value); `role` is a String (`Independent`/`Primary`/`Backup` seen — unknown future roles ride, never refuse); peer-connected shapes were not capturable on a single fresh rig (peer fields lenient); JSON data `{status}` with the gateway's own camelCase keys; authed read |
@@ -1672,6 +1673,65 @@ tool's own flags (`--profile perspective`, `--checks naming`,
 `--fail-on warning`, …). Spawning is an arg VECTOR — never a shell
 string. Pair it with `project export --decode-scripts`: lint the
 decoded `.py` sidecars, then re-import with `--encode-scripts`.
+
+## Browser E2E (`ign e2e`)
+
+Two verbs. `ign e2e doctor` diagnoses; `ign e2e init` scaffolds. There is
+deliberately **no `ign e2e run`** — the scaffold's own `npm test` is the
+runner, and wrapping it would put this CLI in the business of proxying
+Playwright's reporter, flags, and exit codes.
+
+```sh
+ign e2e doctor                      # what's missing?
+ign e2e init ./e2e --yes            # scaffold + npm install
+cd e2e && IGNITION_PASSWORD=… npm test
+```
+
+**What the scaffold ships.** Seven members, embedded in the binary:
+`package.json` (one dev dependency — `@playwright/test`),
+`playwright.config.mjs`, `global-setup.mjs`, `lib/gateway.mjs`,
+`tests/example.spec.mjs`, `.gitignore`, and a `README.md` documenting
+every environment variable it reads.
+
+**What global setup does.** Two steps, both delegating to this CLI so the
+scaffold never reimplements the gateway's login dance or its test
+protocol:
+
+1. **`ign session login --json`** → writes `data.storage_state` to
+   `.auth/state.json`, which `playwright.config.mjs` points
+   `use.storageState` at. Every browser context therefore starts already
+   authenticated, and no test ever drives the login form.
+2. **`ign testing run --project NAME --json`** → runs the gateway's own
+   Jython suite FIRST and throws if the verdict is not `passed`, aborting
+   before a single page opens. A browser failure caused by broken
+   gateway-side code is an expensive way to learn something one HTTP call
+   already knew. Skip it with `IGN_E2E_SKIP_GATEWAY_TESTS=1`.
+
+Both steps surface the CLI's own stderr and name its exit code: **3** a
+missing password, **5** rejected credentials, **6** a red suite.
+
+**The example suite is green on a fresh rig.** It ships two tests: a tag
+round trip through the testing routes (passes on any gateway with the
+bundle deployed), and a Perspective shell check that `test.skip()`s —
+naming `--run-project` — when the navigation answers 404. A gateway with
+no views of your own must not produce a red run.
+
+**TLS.** `lib/gateway.mjs` disables certificate verification **only**
+when the gateway host is `localhost`, `127.0.0.1`, or `::1`, and prints
+one warning to stderr when it does. A self-signed cert on your own
+machine is a papercut; the same relaxation pointed at a remote gateway
+silently removes the guarantee HTTPS exists to provide. The identical
+guard is duplicated in `playwright.config.mjs` (for `ignoreHTTPSErrors`)
+rather than imported — a cross-import between the runner config and a
+test helper is a load-order hazard — and a Rust test renders both bodies
+and asserts they name the same hosts and the same opt-in variable, so
+the two copies cannot drift. For a remote gateway behind a private CA,
+do **not** set `IGNITION_ALLOW_INSECURE_LOCAL`; point Node at the CA
+with `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` instead.
+
+**`.auth/state.json` holds a live session cookie.** The scaffold's own
+`.gitignore` lists the `.auth/` directory, and its README names the file
+and what it contains.
 
 ## Agent transports — MCP (`ign mcp serve`) and LSP (`ign lsp`)
 
