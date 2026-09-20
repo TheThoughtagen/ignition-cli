@@ -17,6 +17,8 @@ pub mod fetch;
 
 use std::path::{Path, PathBuf};
 
+use crate::error::CoreError;
+
 /// One third-party module's release-feed coordinates: where its releases
 /// live (`repo`) and how a version string becomes a release tag / asset
 /// filename (`tag_template` / `asset_template`, both substituting the
@@ -64,6 +66,49 @@ pub const MODULES: &[ModuleSpec] = &[GIT_MODULE];
 /// Look up a registered module by [`ModuleSpec::id`].
 pub fn spec_for(id: &str) -> Option<&'static ModuleSpec> {
     MODULES.iter().find(|spec| spec.id == id)
+}
+
+/// Validate a module version string BEFORE it becomes a filesystem path
+/// segment or URL component (ASVS V5, T-15-03): 1–64 characters from
+/// `[A-Za-z0-9._+-]`, with no `..` window anywhere (path-traversal
+/// refusal — this also catches a lone `..`). Exit 2 `invalid_input` —
+/// a caller-supplied bad value is the usage class, so no new slug is
+/// warranted (the frozen taxonomy's existing precedent).
+pub fn validate_version(version: &str) -> Result<(), CoreError> {
+    let len_ok = (1..=64).contains(&version.len());
+    let chars_ok = version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    let no_traversal = !version.as_bytes().windows(2).any(|pair| pair == b"..");
+    if len_ok && chars_ok && no_traversal {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidInput {
+            reason: format!(
+                "module version {version:?} is not a safe version string (expected \
+                 1-64 characters of [A-Za-z0-9._+-], no \"..\")"
+            ),
+        })
+    }
+}
+
+/// Validate a module id string the same way (T-15-03): 1–32 characters
+/// from `[a-z0-9-]`. Exit 2 `invalid_input`.
+pub fn validate_module_id(id: &str) -> Result<(), CoreError> {
+    let len_ok = (1..=32).contains(&id.len());
+    let chars_ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if len_ok && chars_ok {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidInput {
+            reason: format!(
+                "module id {id:?} is not a safe identifier (expected 1-32 \
+                 characters of [a-z0-9-])"
+            ),
+        })
+    }
 }
 
 /// The module artifact cache root: `IGNITION_CLI_CACHE` env override
@@ -168,7 +213,10 @@ pub fn cached_entry(root: &Path, module_id: &str, version: &str) -> Option<Cache
 
 #[cfg(test)]
 mod tests {
-    use super::{GIT_MODULE, MODULES, cached_entry, module_cache_dir, spec_for};
+    use super::{
+        GIT_MODULE, MODULES, cached_entry, module_cache_dir, spec_for, validate_module_id,
+        validate_version,
+    };
 
     #[test]
     fn module_spec_substitutes_version() {
@@ -201,5 +249,44 @@ mod tests {
             module_cache_dir(root, "git"),
             std::path::PathBuf::from("/tmp/cache-root/modules/git")
         );
+    }
+
+    #[test]
+    fn validate_version_accepts_well_formed() {
+        assert!(validate_version("2.3.4").is_ok());
+        assert!(validate_version("2.3.4-rc1+build.1").is_ok());
+    }
+
+    #[test]
+    fn validate_version_rejects_hostile_input() {
+        for bad in [
+            "../escape",
+            "a/b",
+            "with\0null",
+            "back\\slash",
+            "2..3",
+            "",
+            &"x".repeat(65),
+        ] {
+            let err = validate_version(bad).expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(err.code(), "invalid_input");
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn validate_module_id_accepts_registry_entries() {
+        for spec in MODULES {
+            assert!(validate_module_id(spec.id).is_ok(), "{} must validate", spec.id);
+        }
+    }
+
+    #[test]
+    fn validate_module_id_rejects_hostile_input() {
+        for bad in ["../nope", "a/b", "UPPER", "", &"x".repeat(33)] {
+            let err = validate_module_id(bad).expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(err.code(), "invalid_input");
+            assert_eq!(err.exit_code(), 2);
+        }
     }
 }

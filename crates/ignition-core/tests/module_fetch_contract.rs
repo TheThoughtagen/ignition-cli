@@ -334,3 +334,250 @@ fn cache_entry_rejects_malformed_filenames() {
         "no malformed filename may be treated as a cache hit"
     );
 }
+
+// ---------------------------------------------------------------------
+// Task 3: loud refusals on input (SC-1's negative half) — an unknown
+// version, a missing asset, a rate-limited feed, and a hostile version/
+// module-id string all fail loudly, name what the caller must fix, and
+// leave the cache untouched.
+// ---------------------------------------------------------------------
+
+/// `true` when the `git` module's cache directory holds no `.modl`
+/// entries — asserted after every refusal test: a refusal that leaves
+/// debris is a failure even when the error itself is right.
+fn cache_is_empty(cache_root: &std::path::Path) -> bool {
+    let dir = cache_root.join("modules").join("git");
+    match std::fs::read_dir(&dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
+    }
+}
+
+/// SC-1: an unknown version fails loudly naming BOTH the requested
+/// version and the resolved tags URL — never a silent fallback to
+/// "latest". Nothing is written to the cache root.
+#[tokio::test]
+async fn unknown_version_names_version_and_url() {
+    let mock = FeedMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"message": "Not Found"})),
+        )
+        .mount(&mock.server)
+        .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("unknown version must fail loudly");
+
+    assert_eq!(err.code(), "module_release_not_found");
+    assert_eq!(err.exit_code(), 6);
+    let message = err.to_string();
+    assert!(message.contains("2.3.4"), "message must name the version: {message}");
+    let expected_url = format!(
+        "{}/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        mock.uri()
+    );
+    assert_eq!(
+        err.endpoint().as_deref(),
+        Some(expected_url.as_str()),
+        "endpoint must name the resolved URL"
+    );
+    assert!(cache_is_empty(cache_root.path()), "no debris on refusal");
+}
+
+/// SC-1: a release with no matching asset fails loudly naming BOTH the
+/// expected asset name and the names actually present.
+#[tokio::test]
+async fn missing_asset_names_expected_and_present() {
+    let mock = FeedMock::start().await;
+    let release_json = serde_json::json!({
+        "tag_name": "v2.3.4",
+        "assets": [{
+            "name": "Other-2.3.4-signed.modl",
+            "url": format!("{}/assets/1", mock.uri()),
+            "browser_download_url": format!("{}/download/other.modl", mock.uri()),
+            "digest": format!("sha256:{}", mock.digest),
+            "content_type": "application/octet-stream",
+            "size": mock.payload.len(),
+            "state": "uploaded",
+        }],
+    });
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(release_json))
+        .mount(&mock.server)
+        .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("missing asset must fail loudly");
+
+    assert_eq!(err.code(), "module_release_not_found");
+    let message = err.to_string();
+    assert!(
+        message.contains("Git-2.3.4-signed.modl") && message.contains("Other-2.3.4-signed.modl"),
+        "message must name both expected and present asset names: {message}"
+    );
+    assert!(cache_is_empty(cache_root.path()), "no debris on refusal");
+}
+
+/// SC-2's precondition: `ign` never caches bytes it cannot verify — an
+/// asset published with `digest: null` is refused before any download.
+#[tokio::test]
+async fn asset_without_digest_is_refused() {
+    let mock = FeedMock::start().await;
+    let release_json = serde_json::json!({
+        "tag_name": "v2.3.4",
+        "assets": [{
+            "name": "Git-2.3.4-signed.modl",
+            "url": format!("{}/assets/1", mock.uri()),
+            "browser_download_url": format!("{}/download/Git-2.3.4-signed.modl", mock.uri()),
+            "digest": serde_json::Value::Null,
+            "content_type": "application/octet-stream",
+            "size": mock.payload.len(),
+            "state": "uploaded",
+        }],
+    });
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(release_json))
+        .mount(&mock.server)
+        .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("digest-less asset must be refused");
+
+    assert_eq!(err.code(), "module_feed_unusable");
+    assert_eq!(err.exit_code(), 6);
+    assert!(cache_is_empty(cache_root.path()), "no debris on refusal");
+}
+
+/// Pitfall 5: a rate-limited 403 is NEVER reported as an auth failure —
+/// distinguished by the `x-ratelimit-remaining` header, not status code
+/// alone. A 403 WITHOUT the header is still `module_feed_unusable`, with
+/// a detail that does not claim a rate limit.
+#[tokio::test]
+async fn rate_limited_feed_is_not_reported_as_auth() {
+    let limited = FeedMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(403)
+                .insert_header("x-ratelimit-remaining", "0")
+                .insert_header("x-ratelimit-reset", "1234567890")
+                .set_body_json(serde_json::json!({"message": "API rate limit exceeded"})),
+        )
+        .mount(&limited.server)
+        .await;
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(limited.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("rate-limited feed must be refused");
+    assert_eq!(err.code(), "module_feed_unusable");
+    assert_eq!(err.exit_code(), 6);
+    let message = err.to_string().to_lowercase();
+    assert!(message.contains("rate limit"), "message must name the rate limit: {message}");
+    assert!(
+        !message.contains("credential"),
+        "message must not claim a credential problem: {message}"
+    );
+
+    let forbidden = FeedMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(403)
+                .set_body_json(serde_json::json!({"message": "Forbidden"})),
+        )
+        .mount(&forbidden.server)
+        .await;
+    let cache_root2 = tempfile::tempdir().expect("tempdir");
+    let feed2 =
+        ModuleFeed::for_base(forbidden.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err2 = feed2
+        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root2.path(), FetchPolicy::CacheFirst)
+        .await
+        .expect_err("plain 403 must still be refused as unusable, not auth");
+    assert_eq!(err2.code(), "module_feed_unusable");
+    let message2 = err2.to_string().to_lowercase();
+    assert!(
+        !message2.contains("rate limit"),
+        "message must not claim a rate limit when the header is absent: {message2}"
+    );
+}
+
+/// T-15-03: a hostile version or module id is refused BEFORE any HTTP
+/// request is issued or any path is joined — asserted with a
+/// `.expect(0)`-scoped mock over the whole server.
+#[tokio::test]
+async fn unsafe_version_is_refused_before_any_request() {
+    let mock = FeedMock::start().await;
+    let no_requests = wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount_as_scoped(&mock.server)
+        .await;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let long_version = "x".repeat(65);
+    for unsafe_version in ["../escape", "a/b", "with\0null", "back\\slash", long_version.as_str()] {
+        let err = feed
+            .fetch_and_verify(&GIT_MODULE, unsafe_version, cache_root.path(), FetchPolicy::CacheFirst)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_input", "version {unsafe_version:?} must be refused");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    let unsafe_module = ignition_core::module::ModuleSpec {
+        id: "../nope",
+        repo: "WhiskeyHouse/ignition-git-module",
+        tag_template: "v{version}",
+        asset_template: "Git-{version}-signed.modl",
+    };
+    let err = feed
+        .fetch_and_verify(&unsafe_module, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_input", "unsafe module id must be refused");
+    assert_eq!(err.exit_code(), 2);
+
+    drop(no_requests);
+}

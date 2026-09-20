@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::error::CoreError;
-use crate::module::{ModuleSpec, cached_entry, module_cache_dir};
+use crate::module::{ModuleSpec, cached_entry, module_cache_dir, validate_module_id, validate_version};
 
 /// How a fetch treats an existing cache hit (D-02, D-09). All three
 /// behave IDENTICALLY on a cache MISS — this plan (15-01) implements the
@@ -141,6 +141,12 @@ impl ModuleFeed {
         cache_root: &Path,
         _policy: FetchPolicy,
     ) -> Result<FetchedModule, CoreError> {
+        // Refuse a hostile module id / version BEFORE it reaches a
+        // PathBuf::join or a URL (T-15-03) — before even the cache
+        // lookup, so a traversal attempt never touches the filesystem.
+        validate_module_id(spec.id)?;
+        validate_version(version)?;
+
         // (a) Cache lookup — keyed by version alone, no feed contact.
         if let Some(cached) = cached_entry(cache_root, spec.id, version) {
             return Ok(FetchedModule {
@@ -183,9 +189,39 @@ impl ModuleFeed {
             });
         }
         if !response.status().is_success() {
+            let status = response.status();
+            // Rate-limit detail BEFORE anything else (15-RESEARCH
+            // Pitfall 5): GitHub's unauthenticated API answers an
+            // exhausted rate limit as a bare 403, which the gateway
+            // classifier's convention would misreport as a credential
+            // rejection. Distinguish by header, not status code alone —
+            // a 403 WITHOUT the header is a plain unusable answer, never
+            // presumed to be a rate limit.
+            let rate_limit_remaining = response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let rate_limit_reset = response
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response.text().await.unwrap_or_default();
+            let capped_body: String = body.chars().take(200).collect();
+            let detail = if rate_limit_remaining.as_deref() == Some("0") {
+                match rate_limit_reset {
+                    Some(reset) => format!(
+                        "feed rate limit exhausted (x-ratelimit-remaining: 0, resets at {reset})"
+                    ),
+                    None => "feed rate limit exhausted (x-ratelimit-remaining: 0)".to_string(),
+                }
+            } else {
+                format!("release lookup answered HTTP {status}: {capped_body}")
+            };
             return Err(CoreError::ModuleFeedUnusable {
                 url: release_url.to_string(),
-                detail: format!("release lookup answered HTTP {}", response.status()),
+                detail,
             });
         }
         let release: Release = response.json().await.map_err(|err| {
@@ -243,6 +279,22 @@ impl ModuleFeed {
                 ),
             }
         })?;
+
+        // Asset-URL scheme guard (T-15-05): an `https` feed may only
+        // hand back an `https` asset URL — refuse BEFORE attempting the
+        // download, never silently follow a downgrade. Keeps the
+        // mock-server (http base -> http asset) path working while
+        // making a production downgrade impossible.
+        if is_insecure_downgrade(self.api_base.scheme(), download_url.scheme()) {
+            return Err(CoreError::ModuleFeedUnusable {
+                url: download_url.to_string(),
+                detail: format!(
+                    "asset download URL uses {} while the feed itself is https — \
+                     refusing the insecure downgrade",
+                    download_url.scheme()
+                ),
+            });
+        }
 
         let response = self
             .client
@@ -329,5 +381,39 @@ impl ModuleFeed {
             bytes,
             source: ArtifactSource::Download,
         })
+    }
+}
+
+/// `true` when handing back `asset_scheme` would downgrade below the
+/// feed's own `feed_scheme` — an `https` feed serving a non-`https`
+/// asset URL (T-15-05). Pure and network-free by design: this workspace
+/// has no TLS-serving wiremock (the same limitation
+/// `tests/session_contract.rs`'s module doc already documents for the
+/// `ssl_verify` builder behavior — "the WIRE-level https-skip proof
+/// needs wiremock's optional `tls` feature, which this workspace does
+/// not enable"), so the guard's logic is pinned here directly rather
+/// than through a live round trip.
+fn is_insecure_downgrade(feed_scheme: &str, asset_scheme: &str) -> bool {
+    feed_scheme == "https" && asset_scheme != "https"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_insecure_downgrade;
+
+    #[test]
+    fn https_feed_refuses_non_https_asset() {
+        assert!(is_insecure_downgrade("https", "http"));
+    }
+
+    #[test]
+    fn https_feed_allows_https_asset() {
+        assert!(!is_insecure_downgrade("https", "https"));
+    }
+
+    #[test]
+    fn http_feed_allows_any_asset_scheme() {
+        assert!(!is_insecure_downgrade("http", "http"));
+        assert!(!is_insecure_downgrade("http", "https"));
     }
 }
