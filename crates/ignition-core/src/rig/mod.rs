@@ -733,6 +733,10 @@ mod tests {
             message.contains("/tmp/no-such-root"),
             "convention roots named in the trail: {message}"
         );
+        assert!(
+            message.contains("test-rig/docker-compose.yml"),
+            "git-module test-rig probe path named in the trail: {message}"
+        );
     }
 
     // ----- level 5: WHK conventions (both roots, first hit wins) ----------
@@ -741,7 +745,11 @@ mod tests {
     async fn git_module_convention_probes_both_roots_first_hit_wins() {
         let root1 = tempfile::tempdir().expect("root1");
         let root2 = tempfile::tempdir().expect("root2");
-        // Only root2 has the git-module repo.
+        // Only root2 has the git-module repo, and only its repo-root
+        // compose (not the test rig). This proves the full relpath-by-
+        // root grid: the test-rig relpath misses under BOTH roots before
+        // the repo-root relpath is even tried, and it only hits once it
+        // reaches root2.
         let path = root2
             .path()
             .join("ignition-git-module/docker/docker-compose.yml");
@@ -765,7 +773,9 @@ mod tests {
     #[tokio::test]
     async fn whk_global_convention_tried_after_git_module() {
         let root = tempfile::tempdir().expect("root");
-        // No git-module repo; WHK-Global present.
+        // Neither git-module relpath present (test-rig nor repo-root);
+        // WHK-Global present. Both git-module probes must miss before
+        // WHK-Global is even tried.
         let path = root
             .path()
             .join("whk-environment-orchestration/docker-compose.yml");
@@ -807,7 +817,9 @@ mod tests {
         .expect("conventions resolve");
         assert_eq!(
             plan.compose_file, git_module,
-            "git-module outranks WHK-Global (discovery order)"
+            "git-module repo-root rig outranks WHK-Global (discovery order); \
+             see git_module_test_rig_beats_the_repo_root_rig for the \
+             test-rig-vs-repo-root precedence"
         );
     }
 
