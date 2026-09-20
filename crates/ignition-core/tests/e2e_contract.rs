@@ -417,7 +417,11 @@ fn find_on_path_in_walks_the_injected_path_in_order() {
 // Init — the scaffold write.
 // ---------------------------------------------------------------------------
 
-use ignition_core::actions::e2e::{E2eFileStatus, E2eInitOptions, e2e_init, e2e_init_preview};
+// `E2eFileStatus` is only asserted on by the unix-gated stub-PATH tests;
+// an unconditional import is a dead import on Windows under `-D warnings`.
+#[cfg(unix)]
+use ignition_core::actions::e2e::E2eFileStatus;
+use ignition_core::actions::e2e::{E2eInitOptions, e2e_init, e2e_init_preview};
 
 fn init_opts(dir: &Path) -> E2eInitOptions {
     E2eInitOptions {
