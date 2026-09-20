@@ -1,3 +1,18 @@
+---
+gsd_state_version: 1.0
+milestone: v1.3
+milestone_name: Rig Modules & Declared Discovery
+status: planning
+last_updated: "2026-09-20T15:16:39.958Z"
+last_activity: 2026-09-20
+progress:
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
+---
+
 # Project State
 
 ## Project Reference
@@ -9,11 +24,10 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 
 ## Current Position
 
-**Milestone:** v1.1 COMPLETE — archived to `.planning/milestones/` (v1.1-ROADMAP.md, v1.1-REQUIREMENTS.md), tagged `v1.1`
-**Status:** Awaiting next milestone definition
-**Last Activity:** 2026-09-20 - Completed quick task 260919-tg4: ign session login + ign e2e doctor/init (browser-E2E scaffold pair)
-
-**Progress:** Milestone boundary — no phase in progress
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-09-20 — Milestone v1.3 started
 
 ## Performance Metrics
 
