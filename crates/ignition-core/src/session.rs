@@ -19,8 +19,11 @@
 //!    (flag > active; unknown name → `ProfileNotFound` with the known
 //!    profiles in the hint; nothing resolvable → `NoActiveProfile`,
 //!    exactly what main.rs's `Ok(None)` consumers do today).
-//! 3. THEN the LOCKED secret chain (env tokens → keyring → basic pair)
-//!    — `config::resolve_secret` over the one chain built below.
+//! 3. THEN the secret chain (env tokens → keyring → basic pair) —
+//!    `config::resolve_secret` over the one chain built below. The
+//!    SEQUENCE is unchanged, but the two generic (profile-less) env
+//!    rungs are auth-shape-conditional as of quick/260920-iti — see
+//!    `config::secret`'s module header for the full statement.
 //!
 //! The client is built from the POST-OVERLAY profile — the research-
 //! locked precedence (flag > `IGNITION_URL` env > profile value) must
@@ -277,9 +280,12 @@ impl Deref for Session {
     }
 }
 
-/// THE LOCKED secret chain (env tokens → keyring → basic pair), built
-/// in exactly one place — the chain, not the structs, encodes the
-/// order (main.rs's private `secret_chain`, now shared).
+/// THE secret chain (env tokens → keyring → basic pair), built in
+/// exactly one place — the chain, not the structs, encodes the
+/// SEQUENCE (main.rs's private `secret_chain`, now shared). The two
+/// generic (profile-less) env rungs within it are auth-shape-conditional
+/// as of quick/260920-iti; `config::secret`'s module header states the
+/// full rule this chain enforces.
 fn locked_secret_chain() -> Vec<Box<dyn SecretStore>> {
     vec![
         Box::new(config::EnvStore),

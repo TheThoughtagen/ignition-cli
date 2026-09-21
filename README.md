@@ -157,6 +157,44 @@ The two rejection codes carry distinct diagnoses:
 | 401 | token not recognized | the header must be the full `name:key` string — no `name:` prefix or wrong key → 401; Basic never works on `/data` |
 | 403 | token recognized but under-permitted | three-part setup: (1) token holds an adequate security level, (2) gateway read/write permissions include that level, (3) "Require secure connections" unchecked for http — `ign doctor` diagnoses all three |
 
+### Credential resolution order
+
+Which env var or store answers for a profile depends on that profile's
+declared `auth` shape — the generic, profile-less env vars no longer win
+for every profile:
+
+| Step | Source | Applies to |
+|------|--------|-----------|
+| 1 | `IGNITION_TOKEN_<PROFILE_UP>` | EVERY auth shape — the universal explicit override |
+| 2 | the profile's own `token_env` var | `TokenEnv` profiles |
+| 3 | bare `IGNITION_TOKEN` | ONLY a profile whose auth equals the default — i.e. no `auth` key in the TOML |
+| 4 | keyring entry `ignition-cli` / `profile:<name>` | every profile (unconditional — the lookup is already profile-named) |
+| 5 | the profile's own `user_env`/`password_env` | `Basic` profiles |
+| 6 | bare `IGNITION_USER` + `IGNITION_PASSWORD` | a default-auth profile, or a `Basic` profile whose own named vars are unset |
+
+The generic `IGNITION_TOKEN` and `IGNITION_USER`/`IGNITION_PASSWORD` vars
+(steps 3 and 6) apply ONLY to a profile with no `auth` block. A profile
+that declares `auth = { keyring = ... }` or `auth = { token_env = ... }`
+/ `auth = { user_env = ..., password_env = ... }` authenticates as
+itself — it never falls through to an unrelated shell credential meant
+for a different gateway.
+
+`IGNITION_TOKEN_<PROFILE_UP>` (step 1) is the universal escape hatch: it
+still overrides every auth shape, including keyring profiles. The
+profile name maps to the var name by uppercasing and turning every
+non-alphanumeric character into `_` — profile `my-rig` reads
+`IGNITION_TOKEN_MY_RIG`.
+
+This matters most right after `ign adopt`, which rewrites the adopted
+profile to `auth = { keyring = ... }`. Before this order existed, a
+leftover `IGNITION_TOKEN` for some OTHER gateway in the developer's
+shell would shadow the freshly-stored keyring credential, and
+`ign --profile <name> status` would answer `auth_rejected` (exit 5)
+immediately after a successful adopt. Now a keyring profile with an
+empty keyring entry and a foreign `IGNITION_TOKEN` in the shell refuses
+loudly with `secret_unavailable` (exit 3) instead of silently sending
+the wrong token — a diagnosable refusal beats a misleading rejection.
+
 ### Token-setup troubleshooting (the three-part failure, `ign doctor`'s bread and butter)
 
 A 403 means the gateway RECOGNIZED your token but its security level
@@ -965,11 +1003,15 @@ ign --profile dev tags export [default]P5 -o - | ign --profile prod tags import 
 ```
 
 **Two-sided secrets.** Each side resolves its own credential through
-the same locked chain (env tokens → keyring → basic env pair), which
-means `IGNITION_TOKEN` (and the basic env pair) applies to BOTH sides
-unless per-profile keyring entries exist. For real two-gateway use,
-store per-profile tokens in the keyring (`ign profile add --keyring`)
-so each side authenticates as itself.
+the same chain (env tokens → keyring → basic env pair), and that chain
+is auth-shape-conditional (see [Credential resolution
+order](#credential-resolution-order)): the generic `IGNITION_TOKEN` and
+basic env pair reach a side only when THAT side's profile declares no
+`auth` block. A side declaring keyring or named-env auth resolves its
+own credential and never picks up the other side's — or the shell's —
+generic token. For real two-gateway use, store per-profile tokens in
+the keyring (`ign profile add --keyring`) so each side authenticates as
+itself.
 
 **Envelope.** The output envelope keeps its single `profile` field —
 the ACTIVE profile, exactly as every other command resolves it —
