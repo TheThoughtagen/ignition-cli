@@ -2,13 +2,36 @@
 //! seam, and env-first resolution (research Pattern 3 — the STATE.md keyring
 //! blocker resolution).
 //!
-//! LOCKED resolution order (CORE-02 must-have):
-//! `IGNITION_TOKEN_<PROFILE>` → profile `token_env` name → `IGNITION_TOKEN`
-//! → keyring entry → `IGNITION_USER`+`IGNITION_PASSWORD`.
+//! Resolution order (auth-shape-conditional as of quick/260920-iti —
+//! supersedes the old unconditional "LOCKED (CORE-02 must-have)" fallback):
+//!
+//! 1. `IGNITION_TOKEN_<PROFILE_UP>` — the universal explicit override,
+//!    EVERY auth shape.
+//! 2. the profile's own `token_env` var — `TokenEnv` profiles only.
+//! 3. bare `IGNITION_TOKEN` — ONLY a profile whose `auth` equals
+//!    `AuthRef::default()`, i.e. no `auth` key in the TOML at all.
+//! 4. keyring entry `ignition-cli` / `profile:<name>` — every profile,
+//!    UNCONDITIONALLY.
+//! 5. the profile's own `user_env`/`password_env` — `Basic` profiles only.
+//! 6. bare `IGNITION_USER` + `IGNITION_PASSWORD` — a default-auth profile,
+//!    or a `Basic` profile whose own named vars are unset.
+//!
+//! The SEQUENCE above is unchanged from the original design; what changed
+//! is that steps 3 and 6 — the two rungs naming NO profile — became
+//! conditional on the profile's declared auth shape, gated by
+//! [`is_generic_default`]. A `Keyring` or `Basic` profile (or a `TokenEnv`
+//! profile naming some OTHER var) no longer falls through to a foreign
+//! generic credential; it resolves `Ok(None)` from these two rungs and
+//! lets the next store answer. `KeyringStore` stays UNCONDITIONAL: its
+//! lookup is already profile-named (`profile:<name>`), so it cannot serve
+//! one profile's credential to another, and a token-env profile simply has
+//! no entry there (`Ok(None)`) — gating it would break the headless/adopt
+//! interplay for no safety gain.
+//!
 //! The order lives in the STORE CHAIN (see the unit tests and, from 01-04,
 //! the dispatch construction site) — which is why the basic env pair is a
 //! separate [`BasicEnvStore`] placed AFTER [`KeyringStore`]: env tokens
-//! first, keyring second, basic env last, exactly as locked.
+//! first, keyring second, basic env last.
 //!
 //! The env-first order means default CI and tests never need a secret
 //! service at all; `KeyringStore` fails soft (warn + skip) wherever no OS
@@ -68,9 +91,21 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// True when a profile declared no `auth` block at all — the ONLY shape
+/// entitled to the two generic (profile-less) env rungs. An equality test
+/// against `AuthRef::default()`, not a restated `"IGNITION_TOKEN"` literal:
+/// `profile.rs`'s `Default` impl keeps that string's single home.
+fn is_generic_default(auth: &AuthRef) -> bool {
+    *auth == AuthRef::default()
+}
+
 /// Token env lookups: `IGNITION_TOKEN_<PROFILE_UP>` (profile uppercased,
-/// non-alphanumeric → `_`) → the profile's `token_env` var name → generic
-/// `IGNITION_TOKEN`.
+/// non-alphanumeric → `_`, EVERY auth shape) → the profile's own
+/// `token_env` var (`TokenEnv` profiles only) → bare `IGNITION_TOKEN`
+/// (ONLY a profile whose `auth` is `AuthRef::default()` — see
+/// [`is_generic_default`]). A `Keyring` or `Basic` profile, or a
+/// `TokenEnv` profile naming any other variable, falls through to
+/// `Ok(None)` here and lets the next store in the chain answer.
 pub struct EnvStore;
 
 impl SecretStore for EnvStore {
@@ -84,7 +119,9 @@ impl SecretStore for EnvStore {
         {
             return Ok(Some(Credential::Token(Secret::new(token))));
         }
-        if let Some(token) = env_var("IGNITION_TOKEN") {
+        if is_generic_default(auth)
+            && let Some(token) = env_var("IGNITION_TOKEN")
+        {
             return Ok(Some(Credential::Token(Secret::new(token))));
         }
         Ok(None)
@@ -108,20 +145,45 @@ pub(crate) fn profile_env_suffix(profile: &str) -> String {
         .collect()
 }
 
-/// `IGNITION_USER` + `IGNITION_PASSWORD` basic pair — LAST in the LOCKED
-/// order (after keyring), which is why it is a separate store from
-/// [`EnvStore`]: the chain, not the struct, encodes the order.
+/// Reads a two-var credential pair (user, password); `None` unless BOTH
+/// are set and non-empty — a lone user is never a credential. Shared by
+/// both the named-pair and generic-pair reads in [`BasicEnvStore`].
+fn env_pair_credential(user_var: &str, password_var: &str) -> Option<Credential> {
+    match (env_var(user_var), env_var(password_var)) {
+        (Some(user), Some(password)) => {
+            Some(Credential::Basic(Secret::new(user), Secret::new(password)))
+        }
+        _ => None,
+    }
+}
+
+/// `IGNITION_USER` + `IGNITION_PASSWORD` basic pair — LAST in the
+/// resolution order (after keyring), which is why it is a separate store
+/// from [`EnvStore`]: the chain, not the struct, encodes the order. The
+/// generic pair is auth-shape-conditional too: a `Basic` profile's own
+/// `user_env`/`password_env` are read first, falling back to the generic
+/// pair only when those named vars are unset; a default-auth profile
+/// (no `auth` block) reads the generic pair directly; any other shape
+/// (`Keyring`, or `TokenEnv` naming its own var) resolves `Ok(None)`
+/// without touching the environment at all.
 pub struct BasicEnvStore;
 
 impl SecretStore for BasicEnvStore {
-    fn resolve(&self, _profile: &str, _auth: &AuthRef) -> Result<Option<Credential>, CoreError> {
-        match (env_var("IGNITION_USER"), env_var("IGNITION_PASSWORD")) {
-            (Some(user), Some(password)) => Ok(Some(Credential::Basic(
-                Secret::new(user),
-                Secret::new(password),
-            ))),
-            _ => Ok(None),
+    fn resolve(&self, _profile: &str, auth: &AuthRef) -> Result<Option<Credential>, CoreError> {
+        if let AuthRef::Basic {
+            user_env,
+            password_env,
+        } = auth
+        {
+            if let Some(credential) = env_pair_credential(user_env, password_env) {
+                return Ok(Some(credential));
+            }
+            return Ok(env_pair_credential("IGNITION_USER", "IGNITION_PASSWORD"));
         }
+        if is_generic_default(auth) {
+            return Ok(env_pair_credential("IGNITION_USER", "IGNITION_PASSWORD"));
+        }
+        Ok(None)
     }
 }
 
