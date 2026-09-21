@@ -74,8 +74,8 @@ async fn tracer_fetches_verifies_and_caches() {
         .await;
 
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed =
-        ModuleFeed::for_base(server.uri().parse().expect("server uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(server.uri().parse().expect("server uri parses"))
+        .expect("feed builds");
 
     let fetched = feed
         .fetch_and_verify(
@@ -207,8 +207,7 @@ async fn second_fetch_makes_no_network_request() {
     let (redirect_guard, cdn_guard) = mock.mount_download(1).await;
 
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
 
     let first = feed
         .fetch_and_verify(
@@ -262,13 +261,17 @@ async fn offline_with_populated_cache_succeeds() {
     std::fs::write(module_dir.join(format!("2.3.4-{digest}.modl")), &body)
         .expect("seed cache entry");
 
-    let feed = ModuleFeed::for_base(
-        url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"),
-    )
-    .expect("feed builds");
+    let feed =
+        ModuleFeed::for_base(url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"))
+            .expect("feed builds");
 
     let fetched = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect("offline cache hit succeeds with nothing listening");
 
@@ -282,13 +285,17 @@ async fn offline_with_populated_cache_succeeds() {
 #[tokio::test]
 async fn offline_with_empty_cache_names_the_feed() {
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed = ModuleFeed::for_base(
-        url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"),
-    )
-    .expect("feed builds");
+    let feed =
+        ModuleFeed::for_base(url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"))
+            .expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("empty cache + unreachable feed must fail");
 
@@ -377,18 +384,25 @@ async fn unknown_version_names_version_and_url() {
         .await;
 
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("unknown version must fail loudly");
 
     assert_eq!(err.code(), "module_release_not_found");
     assert_eq!(err.exit_code(), 6);
     let message = err.to_string();
-    assert!(message.contains("2.3.4"), "message must name the version: {message}");
+    assert!(
+        message.contains("2.3.4"),
+        "message must name the version: {message}"
+    );
     let expected_url = format!(
         "{}/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
         mock.uri()
@@ -427,11 +441,15 @@ async fn missing_asset_names_expected_and_present() {
         .await;
 
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("missing asset must fail loudly");
 
@@ -470,11 +488,15 @@ async fn asset_without_digest_is_refused() {
         .await;
 
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("digest-less asset must be refused");
 
@@ -507,13 +529,21 @@ async fn rate_limited_feed_is_not_reported_as_auth() {
         ModuleFeed::for_base(limited.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("rate-limited feed must be refused");
     assert_eq!(err.code(), "module_feed_unusable");
     assert_eq!(err.exit_code(), 6);
     let message = err.to_string().to_lowercase();
-    assert!(message.contains("rate limit"), "message must name the rate limit: {message}");
+    assert!(
+        message.contains("rate limit"),
+        "message must name the rate limit: {message}"
+    );
     assert!(
         !message.contains("credential"),
         "message must not claim a credential problem: {message}"
@@ -535,7 +565,12 @@ async fn rate_limited_feed_is_not_reported_as_auth() {
         ModuleFeed::for_base(forbidden.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err2 = feed2
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root2.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root2.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("plain 403 must still be refused as unusable, not auth");
     assert_eq!(err2.code(), "module_feed_unusable");
@@ -559,16 +594,30 @@ async fn unsafe_version_is_refused_before_any_request() {
         .await;
 
     let cache_root = tempfile::tempdir().expect("tempdir");
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
 
     let long_version = "x".repeat(65);
-    for unsafe_version in ["../escape", "a/b", "with\0null", "back\\slash", long_version.as_str()] {
+    for unsafe_version in [
+        "../escape",
+        "a/b",
+        "with\0null",
+        "back\\slash",
+        long_version.as_str(),
+    ] {
         let err = feed
-            .fetch_and_verify(&GIT_MODULE, unsafe_version, cache_root.path(), FetchPolicy::CacheFirst)
+            .fetch_and_verify(
+                &GIT_MODULE,
+                unsafe_version,
+                cache_root.path(),
+                FetchPolicy::CacheFirst,
+            )
             .await
             .unwrap_err();
-        assert_eq!(err.code(), "invalid_input", "version {unsafe_version:?} must be refused");
+        assert_eq!(
+            err.code(),
+            "invalid_input",
+            "version {unsafe_version:?} must be refused"
+        );
         assert_eq!(err.exit_code(), 2);
     }
 
@@ -579,10 +628,19 @@ async fn unsafe_version_is_refused_before_any_request() {
         asset_template: "Git-{version}-signed.modl",
     };
     let err = feed
-        .fetch_and_verify(&unsafe_module, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &unsafe_module,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "invalid_input", "unsafe module id must be refused");
+    assert_eq!(
+        err.code(),
+        "invalid_input",
+        "unsafe module id must be refused"
+    );
     assert_eq!(err.exit_code(), 2);
 
     drop(no_requests);
@@ -665,7 +723,12 @@ async fn digest_mismatch_refuses_and_caches_nothing() {
         ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("digest mismatch must refuse");
 
@@ -705,7 +768,12 @@ async fn truncated_body_is_a_mismatch_not_a_cache_entry() {
         ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("a truncated body must refuse as a mismatch");
 
@@ -742,7 +810,12 @@ async fn oversized_body_is_aborted_and_refused() {
         ModuleFeed::for_base(server.uri().parse().expect("uri parses")).expect("feed builds");
 
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect_err("an oversized body must be aborted and refused");
 
@@ -823,10 +896,14 @@ async fn cache_first_never_consults_the_feed_after_a_rerelease() {
         .mount_as_scoped(&mock.server)
         .await;
 
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
     let fetched = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect("CacheFirst must serve the cache without any request");
 
@@ -857,10 +934,14 @@ async fn refresh_with_unchanged_digest_reuses_cache_without_redownloading() {
     std::fs::write(&cached_path, &mock.payload)
         .expect("seed cache entry matching upstream's current digest");
 
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
     let fetched = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::Refresh)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::Refresh,
+        )
         .await
         .expect("an unchanged digest under Refresh must reuse the cache");
 
@@ -889,14 +970,21 @@ async fn refresh_with_changed_digest_refuses_and_keeps_the_cached_artifact() {
     std::fs::create_dir_all(&module_dir).expect("create module cache dir");
     let old_body = b"an entirely different, previously-cached artifact - digest A".to_vec();
     let digest_a = sha256_hex(&old_body);
-    assert_ne!(digest_a, mock.digest, "test fixture must diverge from upstream's digest");
+    assert_ne!(
+        digest_a, mock.digest,
+        "test fixture must diverge from upstream's digest"
+    );
     let cached_path = module_dir.join(format!("2.3.4-{digest_a}.modl"));
     std::fs::write(&cached_path, &old_body).expect("seed stale cache entry");
 
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
     let err = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::Refresh)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::Refresh,
+        )
         .await
         .expect_err("a changed upstream digest must refuse under Refresh");
 
@@ -939,14 +1027,14 @@ async fn accept_upstream_change_downloads_verifies_and_keeps_both() {
     let cache_root = tempfile::tempdir().expect("tempdir");
     let module_dir = cache_root.path().join("modules").join("git");
     std::fs::create_dir_all(&module_dir).expect("create module cache dir");
-    let old_body = b"the old artifact under digest A, cached before the upstream re-release".to_vec();
+    let old_body =
+        b"the old artifact under digest A, cached before the upstream re-release".to_vec();
     let digest_a = sha256_hex(&old_body);
     assert_ne!(digest_a, mock.digest);
     let old_path = module_dir.join(format!("2.3.4-{digest_a}.modl"));
     std::fs::write(&old_path, &old_body).expect("seed old cache entry");
 
-    let feed =
-        ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
     let fetched = feed
         .fetch_and_verify(
             &GIT_MODULE,
@@ -961,8 +1049,14 @@ async fn accept_upstream_change_downloads_verifies_and_keeps_both() {
     assert_eq!(fetched.digest_sha256, mock.digest);
     let new_path = module_dir.join(format!("2.3.4-{}.modl", mock.digest));
     assert_eq!(fetched.path, new_path);
-    assert!(new_path.exists(), "the newly accepted digest's file must exist");
-    assert!(old_path.exists(), "the old cached entry must remain untouched");
+    assert!(
+        new_path.exists(),
+        "the newly accepted digest's file must exist"
+    );
+    assert!(
+        old_path.exists(),
+        "the old cached entry must remain untouched"
+    );
     assert_eq!(
         std::fs::read(&old_path).expect("old file still readable"),
         old_body

@@ -147,7 +147,9 @@ pub struct CachedArtifact {
 /// `true` when `s` is exactly 64 lowercase hex characters — the full
 /// digest, never a truncated prefix or an uppercase rendering (D-08).
 fn is_full_lowercase_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// Look up a cached, verified artifact for `module_id`/`version` — keyed
@@ -197,18 +199,21 @@ pub fn cached_entry(root: &Path, module_id: &str, version: &str) -> Option<Cache
     // directory-iteration order, which is unspecified.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
-    candidates.into_iter().next().map(|(_, file_name, path, bytes)| {
-        let digest = file_name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".modl"))
-            .expect("candidate matched the prefix/suffix check above")
-            .to_string();
-        CachedArtifact {
-            path,
-            digest_sha256: digest,
-            bytes,
-        }
-    })
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, file_name, path, bytes)| {
+            let digest = file_name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".modl"))
+                .expect("candidate matched the prefix/suffix check above")
+                .to_string();
+            CachedArtifact {
+                path,
+                digest_sha256: digest,
+                bytes,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -277,7 +282,11 @@ mod tests {
     #[test]
     fn validate_module_id_accepts_registry_entries() {
         for spec in MODULES {
-            assert!(validate_module_id(spec.id).is_ok(), "{} must validate", spec.id);
+            assert!(
+                validate_module_id(spec.id).is_ok(),
+                "{} must validate",
+                spec.id
+            );
         }
     }
 

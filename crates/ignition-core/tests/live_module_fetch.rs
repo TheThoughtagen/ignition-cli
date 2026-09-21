@@ -53,7 +53,12 @@ async fn live_fetches_and_verifies_git_module() {
     let feed = ModuleFeed::github().expect("feed builds");
 
     let fetched = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect("live fetch of the real Git-2.3.4-signed.modl must succeed");
 
@@ -80,7 +85,12 @@ async fn live_fetches_and_verifies_git_module() {
     // A second call against the SAME temp cache root proves the
     // offline guarantee against the REAL artifact, not just a mock.
     let second = feed
-        .fetch_and_verify(&GIT_MODULE, "2.3.4", cache_root.path(), FetchPolicy::CacheFirst)
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
         .await
         .expect("second fetch must serve from cache");
     assert_eq!(second.source, ArtifactSource::Cache);

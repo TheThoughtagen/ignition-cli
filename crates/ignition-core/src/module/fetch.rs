@@ -25,7 +25,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::error::CoreError;
-use crate::module::{ModuleSpec, cached_entry, module_cache_dir, validate_module_id, validate_version};
+use crate::module::{
+    ModuleSpec, cached_entry, module_cache_dir, validate_module_id, validate_version,
+};
 
 /// How a fetch treats an existing cache hit (D-02, D-09). All three
 /// behave IDENTICALLY on a cache MISS — the miss path (resolve,
@@ -248,12 +250,14 @@ impl ModuleFeed {
                 detail,
             });
         }
-        let release: Release = response.json().await.map_err(|err| {
-            CoreError::ModuleFeedUnusable {
-                url: release_url.to_string(),
-                detail: format!("release body did not match the expected shape: {err}"),
-            }
-        })?;
+        let release: Release =
+            response
+                .json()
+                .await
+                .map_err(|err| CoreError::ModuleFeedUnusable {
+                    url: release_url.to_string(),
+                    detail: format!("release body did not match the expected shape: {err}"),
+                })?;
 
         // (d) Select the asset; verify it carries a usable digest.
         let expected_asset_name = spec.asset_name(version);
@@ -421,9 +425,10 @@ impl ModuleFeed {
                 });
             }
             hasher.update(&chunk);
-            async_file.write_all(&chunk).await.map_err(|err| {
-                CoreError::Internal(format!("cannot write temp file: {err}"))
-            })?;
+            async_file
+                .write_all(&chunk)
+                .await
+                .map_err(|err| CoreError::Internal(format!("cannot write temp file: {err}")))?;
         }
         async_file
             .flush()
