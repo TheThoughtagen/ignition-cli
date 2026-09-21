@@ -626,21 +626,14 @@ pub enum CoreError {
     /// — target state: the feed answered and served bytes, but what it
     /// served cannot be trusted. The bytes are discarded (never
     /// persisted to the cache) and BOTH digests are named.
-    #[error(
-        "module {module:?} version {version:?} digest mismatch at {url}: expected {expected}, got {actual}"
-    )]
-    ModuleDigestMismatch {
-        /// The [`crate::module::ModuleSpec::id`] being fetched.
-        module: String,
-        /// The requested version string.
-        version: String,
-        /// The asset URL the mismatched bytes were downloaded from.
-        url: String,
-        /// The release's published sha256 digest.
-        expected: String,
-        /// The sha256 digest of the bytes actually downloaded.
-        actual: String,
-    },
+    ///
+    /// Payload is BOXED: five inline `String`s put `CoreError` at
+    /// exactly clippy's 128-byte `result_large_err` threshold, which
+    /// fails `-D warnings` in every crate returning `Result<_,
+    /// CoreError>` — `ignition-tui` first. Error paths are cold, so one
+    /// allocation on construction is the cheap side of that trade.
+    #[error("{0}")]
+    ModuleDigestMismatch(Box<ModuleDigestMismatchDetails>),
 
     /// The module release feed ANSWERED but not usably — rate-limited,
     /// unauthenticated 401/403, 5xx, an unparseable body, an asset with
@@ -667,22 +660,64 @@ pub enum CoreError {
     /// `module/` deletes, truncates, or overwrites a cache entry).
     /// `FetchPolicy::AcceptUpstreamChange` is the explicit, documented
     /// override.
-    #[error(
-        "module {module:?} version {version:?} digest changed upstream: cached {cached_digest}, \
-         upstream now reports {upstream_digest} (cached artifact kept at {cached_path})"
-    )]
-    ModuleDigestChanged {
-        /// The [`crate::module::ModuleSpec::id`] being fetched.
-        module: String,
-        /// The requested version string.
-        version: String,
-        /// The digest of the artifact already cached for this version.
-        cached_digest: String,
-        /// The digest the feed currently publishes for this version.
-        upstream_digest: String,
-        /// Path of the untouched, still-usable cached artifact.
-        cached_path: String,
-    },
+    ///
+    /// Payload is BOXED for the same reason as
+    /// [`Self::ModuleDigestMismatch`] — see that variant.
+    #[error("{0}")]
+    ModuleDigestChanged(Box<ModuleDigestChangedDetails>),
+}
+
+/// Payload of [`CoreError::ModuleDigestMismatch`], boxed to keep
+/// `CoreError` under clippy's `result_large_err` threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDigestMismatchDetails {
+    /// The [`crate::module::ModuleSpec::id`] being fetched.
+    pub module: String,
+    /// The requested version string.
+    pub version: String,
+    /// The asset URL the mismatched bytes were downloaded from.
+    pub url: String,
+    /// The release's published sha256 digest.
+    pub expected: String,
+    /// The sha256 digest of the bytes actually downloaded.
+    pub actual: String,
+}
+
+/// Payload of [`CoreError::ModuleDigestChanged`], boxed to keep
+/// `CoreError` under clippy's `result_large_err` threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDigestChangedDetails {
+    /// The [`crate::module::ModuleSpec::id`] being fetched.
+    pub module: String,
+    /// The requested version string.
+    pub version: String,
+    /// The digest of the artifact already cached for this version.
+    pub cached_digest: String,
+    /// The digest the feed currently publishes for this version.
+    pub upstream_digest: String,
+    /// Path of the untouched, still-usable cached artifact.
+    pub cached_path: String,
+}
+
+impl std::fmt::Display for ModuleDigestMismatchDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "module {:?} version {:?} digest mismatch at {}: expected {}, got {}",
+            self.module, self.version, self.url, self.expected, self.actual
+        )
+    }
+}
+
+impl std::fmt::Display for ModuleDigestChangedDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "module {:?} version {:?} digest changed upstream: cached {}, \
+             upstream now reports {} (cached artifact kept at {})",
+            self.module, self.version, self.cached_digest, self.upstream_digest, self.cached_path
+        )
+    }
 }
 
 impl CoreError {
@@ -729,9 +764,9 @@ impl CoreError {
             Self::BundleNotAvailable { .. } => "bundle_not_available",
             Self::ModuleFeedUnreachable { .. } => "module_feed_unreachable",
             Self::ModuleReleaseNotFound { .. } => "module_release_not_found",
-            Self::ModuleDigestMismatch { .. } => "module_digest_mismatch",
+            Self::ModuleDigestMismatch(..) => "module_digest_mismatch",
             Self::ModuleFeedUnusable { .. } => "module_feed_unusable",
-            Self::ModuleDigestChanged { .. } => "module_digest_changed",
+            Self::ModuleDigestChanged(..) => "module_digest_changed",
         }
     }
 
@@ -776,9 +811,9 @@ impl CoreError {
             | Self::NodeToolAbsent { .. }
             | Self::BundleNotAvailable { .. }
             | Self::ModuleReleaseNotFound { .. }
-            | Self::ModuleDigestMismatch { .. }
+            | Self::ModuleDigestMismatch(..)
             | Self::ModuleFeedUnusable { .. }
-            | Self::ModuleDigestChanged { .. } => 6,
+            | Self::ModuleDigestChanged(..) => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1068,10 +1103,12 @@ impl CoreError {
                  (the tag and asset name must match exactly) — this CLI never falls \
                  back to \"latest\""
             )),
-            Self::ModuleDigestMismatch { module, version, .. } => Some(format!(
-                "the downloaded bytes for {module} version {version} do not match \
+            Self::ModuleDigestMismatch(d) => Some(format!(
+                "the downloaded bytes for {} version {} do not match \
                  the feed's published digest — do not trust this artifact; nothing \
-                 was cached, so re-running the fetch tries again from scratch"
+                 was cached, so re-running the fetch tries again from scratch",
+                d.module,
+                d.version
             )),
             Self::ModuleFeedUnusable { .. } => Some(
                 "the module release feed answered but was not usable — if the \
@@ -1079,11 +1116,12 @@ impl CoreError {
                  response itself needs investigation"
                     .to_string(),
             ),
-            Self::ModuleDigestChanged { cached_path, .. } => Some(format!(
+            Self::ModuleDigestChanged(d) => Some(format!(
                 "upstream re-released this version with different bytes — the cached \
-                 artifact at {cached_path} is still there and usable offline; re-run with \
+                 artifact at {} is still there and usable offline; re-run with \
                  FetchPolicy::AcceptUpstreamChange to deliberately accept and verify the \
-                 new bytes"
+                 new bytes",
+                d.cached_path
             )),
             Self::Rig(_) => Some(
                 "check Docker is running and inspect the rig containers \
@@ -1120,8 +1158,9 @@ impl CoreError {
             | Self::EamTaskInFlight { endpoint, .. } => endpoint.clone(),
             Self::ModuleFeedUnreachable { url, .. }
             | Self::ModuleReleaseNotFound { url, .. }
-            | Self::ModuleDigestMismatch { url, .. }
             | Self::ModuleFeedUnusable { url, .. } => Some(url.clone()),
+            // Boxed payload, so it cannot share the or-pattern above.
+            Self::ModuleDigestMismatch(d) => Some(d.url.clone()),
             _ => None,
         }
     }
@@ -1185,7 +1224,8 @@ mod tests {
     use super::{
         CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
-        TESTING_ROUTE_PREFIX, truncate_api_body,
+        ModuleDigestChangedDetails, ModuleDigestMismatchDetails, TESTING_ROUTE_PREFIX,
+        truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -1518,13 +1558,13 @@ mod tests {
                 "module_release_not_found",
             ),
             (
-                CoreError::ModuleDigestMismatch {
+                CoreError::ModuleDigestMismatch(Box::new(ModuleDigestMismatchDetails {
                     module: "git".into(),
                     version: "2.3.4".into(),
                     url: "https://release-assets.githubusercontent.com/Git-2.3.4-signed.modl".into(),
                     expected: "b".repeat(64),
                     actual: "c".repeat(64),
-                },
+                })),
                 6,
                 "module_digest_mismatch",
             ),
@@ -1537,13 +1577,13 @@ mod tests {
                 "module_feed_unusable",
             ),
             (
-                CoreError::ModuleDigestChanged {
+                CoreError::ModuleDigestChanged(Box::new(ModuleDigestChangedDetails {
                     module: "git".into(),
                     version: "2.3.4".into(),
                     cached_digest: "a".repeat(64),
                     upstream_digest: "b".repeat(64),
                     cached_path: "/cache/modules/git/2.3.4-aaaa.modl".into(),
-                },
+                })),
                 6,
                 "module_digest_changed",
             ),

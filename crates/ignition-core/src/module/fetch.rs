@@ -316,13 +316,15 @@ impl ModuleFeed {
                 // D-02 default: refuse, name both digests, leave the
                 // cached artifact exactly as it was — no write, no
                 // delete, no overwrite.
-                return Err(CoreError::ModuleDigestChanged {
-                    module: spec.id.to_string(),
-                    version: version.to_string(),
-                    cached_digest: cached.digest_sha256,
-                    upstream_digest: expected_digest.clone(),
-                    cached_path: cached.path.display().to_string(),
-                });
+                return Err(CoreError::ModuleDigestChanged(Box::new(
+                    crate::error::ModuleDigestChangedDetails {
+                        module: spec.id.to_string(),
+                        version: version.to_string(),
+                        cached_digest: cached.digest_sha256,
+                        upstream_digest: expected_digest.clone(),
+                        cached_path: cached.path.display().to_string(),
+                    },
+                )));
             }
             // AcceptUpstreamChange: fall through to the SHARED
             // download-verify-persist path below, which verifies the
@@ -435,13 +437,15 @@ impl ModuleFeed {
         // Drop discards the bytes structurally.
         let actual_digest = format!("{:x}", hasher.finalize());
         if actual_digest != expected_digest {
-            return Err(CoreError::ModuleDigestMismatch {
-                module: spec.id.to_string(),
-                version: version.to_string(),
-                url: download_url.to_string(),
-                expected: expected_digest,
-                actual: actual_digest,
-            });
+            return Err(CoreError::ModuleDigestMismatch(Box::new(
+                crate::error::ModuleDigestMismatchDetails {
+                    module: spec.id.to_string(),
+                    version: version.to_string(),
+                    url: download_url.to_string(),
+                    expected: expected_digest,
+                    actual: actual_digest,
+                },
+            )));
         }
 
         // (h) Persist — the ONLY way bytes reach the final cache path.
