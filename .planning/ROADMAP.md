@@ -53,7 +53,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 **Structure rationale:** The artifact path is the risky, external-facing half and everything else depends on it, so fetch-and-verify lands first and alone — it is the only phase touching a third-party feed, and it is provable without Docker. Injection (the override) comes next because it is what makes a fetched artifact actually load, and it closes RMOD-01 end-to-end for a single module. Commissioning config is separable from injection: `git.yaml` generation and the credential/validation rules are pure generation logic over a schema, testable by golden file with no gateway. Discovery is independent of all three — it is the one phase that can slip without blocking module work — so it goes last and carries the small ledger backfill with it.
 
-- [ ] **Phase 15: 15-module-artifact-fetch-verify** — Pinned signed-release resolution, sha256 verification, version+digest cache, offline-from-cache *(RMOD-02, RMOD-03)*
+- [x] **Phase 15: 15-module-artifact-fetch-verify** — Pinned signed-release resolution, sha256 verification, version+digest cache, offline-from-cache *(RMOD-02, RMOD-03)* *(complete 2026-09-20; 2/2 plans, all 4 SCs tested; live fetch confirmed the real Git-2.3.4-signed.modl byte-for-byte)*
 - [ ] **Phase 16: 16-compose-override-module-injection** — Generated `compose.ign-modules.yml`, acceptance variables, recreate-durable mount, `ign`-owned regeneration, module registry with a second module proving the seam *(RMOD-01, RMOD-04, RMOD-05, RMOD-06, RMOD-07)*
 - [ ] **Phase 17: 17-git-module-commissioning** — `git.yaml` generation, credential kept out via `GATEWAY_GIT_USER_SECRET`/`_FILE`, exactly-one `gateway_exportResources` validation, human-next-steps reporting *(GITM-01, GITM-02, GITM-03, GITM-04)*
 - [ ] **Phase 18: 18-declared-rig-discovery** — Convention roots move from binary consts to `[rig]` config; clear error when nothing is declared; v1.2 ledger backfill *(RDISC-01, RDISC-02, LEDG-01)*
@@ -71,7 +71,12 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
   2. A downloaded artifact whose sha256 does not match the release's published digest is REFUSED — the bytes are discarded, nothing is cached, and the error names both expected and actual digests. This is a hard failure, never a warning
   3. A verified artifact is cached keyed by version+digest; a second fetch of the same version reuses the cache and makes no network request (provable by a test that fails if a request is issued)
   4. With a populated cache and no network, provisioning proceeds to completion — offline is a supported state, not a degraded one
-**Research/Planning flags**: GitHub release asset resolution is new ground for this codebase (first third-party artifact feed). Worth a short research pass on: unauthenticated vs. token-authenticated release-asset fetch against a private/public repo boundary, and whether `reqwest`'s redirect handling needs configuration for GitHub's asset CDN redirect. Streaming-to-disk with incremental hashing (avoid buffering 7.7 MB in memory) is the expected shape.
+**Research/Planning flags**: GitHub release asset resolution is new ground for this codebase (first third-party artifact feed). Worth a short research pass on: unauthenticated vs. token-authenticated release-asset fetch against a private/public repo boundary, and whether `reqwest`'s redirect handling needs configuration for GitHub's asset CDN redirect. Streaming-to-disk with incremental hashing (avoid buffering 7.7 MB in memory) is the expected shape. *(Research done 2026-09-20 → `15-RESEARCH.md`, HIGH confidence, repo/asset/redirect/digest facts verified live.)*
+**Planner locks** (user decisions + planner calls, binding on plans): LIBRARY-ONLY — no clap surface, no CLI verb (that is Phase 16/RMOD-01); deliverable is an `ignition-core` API proven by `cargo test`. A pinned version re-released upstream with different bytes is REFUSED by default naming both cached and upstream digests with the cached artifact left intact, overridable only by an explicit documented policy value. A SEPARATE `reqwest::Client` from `ReqwestGatewayApi` (whose redirect suppression would swallow the mandatory release-CDN 302). NO new crates — `sha2` is promoted from `ignition-cli` dev-deps into `ignition-core` `[dependencies]`, the `tempfile` 05-02 precedent. Five new `CoreError` slugs, every one at an EXISTING exit code: `module_feed_unreachable` (4), `module_feed_unusable` (6), `module_release_not_found` (6), `module_digest_mismatch` (6), `module_digest_changed` (6). Cache = `<cache_dir>/modules/<id>/<version>-<sha256hex>.modl`, `IGNITION_CLI_CACHE` override, lookup keyed by version alone so a hit never needs the network.
+**Plans:** 2 plans
+Plans:
+- [ ] 15-01-PLAN.md — Tracer slice (resolve → 302 → stream+hash → verify → atomic persist) + module registry seam + cache authority (SC-3/SC-4) + loud input refusals (SC-1)
+- [ ] 15-02-PLAN.md — Digest-mismatch hard refusal that caches nothing + published-size cap (SC-2), upstream digest-drift refusal with its explicit override, opt-in live fetch of the real `Git-2.3.4-signed.modl`
 
 ### Phase 16: 16-compose-override-module-injection
 **Goal**: A module the user asked for is actually loaded by the rig's gateway, durably across recreates, without `ign` ever editing a file the user owns — and the mechanism is a module registry rather than a Git-module special case.
@@ -125,7 +130,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 | 12. TUI Theming & Degradation | v1.1 | 4/4 | Complete | 2026-09-14 |
 | 13. Composite Engine — Workspace/Historian/Edit | v1.1 | 8/8 | Complete | 2026-09-15 |
 | 14. Transports — MCP/LSP | v1.1 | 6/6 | Complete | 2026-09-16 |
-| 15. Module Artifact — Fetch & Verify | v1.3 | 0/? | Not started | — |
+| 15. Module Artifact — Fetch & Verify | v1.3 | 2/2 | Complete | 2026-09-20 |
 | 16. Compose Override — Module Injection | v1.3 | 0/? | Not started | — |
 | 17. Git Module Commissioning | v1.3 | 0/? | Not started | — |
 | 18. Declared Rig Discovery | v1.3 | 0/? | Not started | — |
