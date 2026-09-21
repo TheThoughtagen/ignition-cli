@@ -48,9 +48,12 @@ csv = "1"
 # in the transfer path, and it is byte-exact by construction (research
 # Pattern 1; the Jython side already used stdlib base64 in 11-02).
 base64 = "0.22"
-# Phase 11 (11-06): sha2 records the live fidelity oracle's sha256 evidence
-# (11-LIVE-GATE.md). Already in the tree transitively (via zbus) — this only
-# names it for ignition-cli's dev-dependencies.
+# sha2: originally named here only for ignition-cli's dev-dependencies
+# (Phase 11, 11-06 — the live fidelity oracle's sha256(A/B) evidence,
+# 11-LIVE-GATE.md; already in the tree transitively via zbus). Phase 15
+# (15-01) promotes it into ignition-core's [dependencies] for the module
+# artifact fetch's streaming sha256 verification — still not a new
+# dependency, just a second, production-side consumer of the same pin.
 sha2 = "0.10"
 # Phase 6 (TUI): ratatui floor-pinned at 0.30.2 — 0.30.1 bumped MSRV 1.86→1.88
 # in a PATCH release, so patch drift can move MSRV; the floor rides the
