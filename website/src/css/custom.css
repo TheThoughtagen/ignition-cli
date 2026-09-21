@@ -30,3 +30,8 @@
 .kpi-pill { position:fixed; right:1.2rem; bottom:1.2rem; z-index:900; display:inline-flex; align-items:center; gap:.45rem; border:1px solid var(--ifm-color-emphasis-300); background:var(--ifm-background-surface-color); color:var(--ifm-color-emphasis-800); border-radius:999px; padding:.35rem .8rem; font-size:.8rem; cursor:pointer; }
 .kpi-pill kbd { background:var(--ifm-color-emphasis-200); border:none; padding:.05rem .4rem; border-radius:5px; font-size:.78rem; }
 .kpi-pill:hover { border-color:var(--ifm-color-primary); color:var(--ifm-color-primary); }
+
+.launch-demos { max-width:1120px; margin:0 auto 4rem; padding:0 1.5rem; }
+.launch-demos h3 { margin-top:2rem; }
+.terminal-demo { position:relative; width:100%; padding-top:calc(64% + 40px); margin:1rem 0; }
+.terminal-demo-frame { position:absolute; inset:0; display:block; width:100%; height:100%; border:1px solid var(--ifm-color-emphasis-300); border-radius:8px; background:#111510; }

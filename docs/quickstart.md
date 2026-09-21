@@ -3,6 +3,8 @@ sidebar_position: 2
 ---
 # Inspect a gateway
 
+[Watch the recorded walkthroughs](demos.md) to see the tools in use.
+
 Start with a commissioned development gateway running Ignition 8.3+ and an API token authorized to read its configuration.
 
 Set `IGNITION_TOKEN` in your shell or secret manager to the full `name:key` token issued by the gateway. Avoid putting the token itself into a profile command or committing it to a repository.
