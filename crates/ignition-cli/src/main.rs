@@ -1407,6 +1407,13 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 match Session::resolve(cli.profile.as_deref()) {
                     Ok(session) => {
                         let name = session.profile_name().to_string();
+                        // guarded:workspace push
+                        // The gate itself lives inside ignition-core's
+                        // workspace_push action (require_confirmation on
+                        // the render_push_preview text) — this CLI arm
+                        // only forwards cli.yes as `yes`, so this marker
+                        // is not orphaned even though no require_confirmation
+                        // call sits at this dispatch site.
                         let result = actions::workspace::workspace_push(
                             &path,
                             &*session,
@@ -3397,6 +3404,20 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     // 13-08: the kubectl-edit loop's push gate (dynamic prose: the
     // staged-changed summary IS the refusal message).
     ("edit", "edit would write <N> member(s) to <project>"),
+    // QUICK-96c: the gate lives in ignition-core's
+    // `actions::workspace::workspace_push` (it calls its own
+    // `require_confirmation(yes, &preview)`, not main.rs's) — there is
+    // no main.rs `require_confirmation` literal for this verb, so this
+    // is a DYNAMIC-prose site pinned by its dispatch-site marker alone,
+    // not by a byte-matched literal. The prose below is a representative
+    // rendering of `render_push_preview`'s first line. The conflict
+    // refusal inside `workspace_push` (a plain `InvalidInput` fired
+    // BEFORE the gate) is a SEPARATE, never-confirmable path — this
+    // entry does not and must not cover it.
+    (
+        "workspace push",
+        "workspace push would write <N> member(s) and delete <M> member(s)",
+    ),
     // QUICK-tg4: the scaffold write + the spawned installers. A
     // DYNAMIC-prose site — the refusal message IS `e2e_init_preview`'s
     // output (the target, every member with its would-be status, and
