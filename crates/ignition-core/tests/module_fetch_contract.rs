@@ -1144,3 +1144,51 @@ fn cached_entry_picks_the_newest_deterministically() {
         );
     }
 }
+
+/// CodeRabbit PR #9: the non-success diagnostic path used
+/// `Response::text()`, which buffers the WHOLE remote body before
+/// truncating it to 200 characters. The request timeout bounds duration,
+/// not size, so a hostile feed could answer an error with an arbitrarily
+/// large payload. The artifact path already streams under a cap; this
+/// proves the diagnostic path does too.
+///
+/// A 10 MiB error body must not appear in the message: the detail stays
+/// small and carries the truncation marker.
+#[tokio::test]
+async fn oversized_feed_error_body_is_bounded_before_buffering() {
+    let huge = "A".repeat(10 * 1024 * 1024);
+    let limited = FeedMock::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/repos/WhiskeyHouse/ignition-git-module/releases/tags/v2.3.4",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_string(huge))
+        .mount(&limited.server)
+        .await;
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed =
+        ModuleFeed::for_base(limited.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let err = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect_err("a 500 must be refused");
+    assert_eq!(err.code(), "module_feed_unusable");
+
+    let message = err.to_string();
+    assert!(
+        message.len() < 1024,
+        "the 10 MiB body must not reach the message (len {}): {message}",
+        message.len()
+    );
+    assert!(
+        message.contains("truncated"),
+        "a cut-short diagnostic body must say so: {message}"
+    );
+    assert_cache_empty(cache_root.path(), "git");
+}

@@ -29,6 +29,14 @@ use crate::module::{
     ModuleSpec, cached_entry, module_cache_dir, validate_module_id, validate_version,
 };
 
+/// Hard byte budget read from a non-success feed response before it is
+/// used in an error message — see [`bounded_diagnostic_body`].
+const DIAGNOSTIC_BODY_CAP_BYTES: usize = 8 * 1024;
+/// Characters of that budget actually kept in the error message.
+const DIAGNOSTIC_BODY_CHARS: usize = 200;
+/// Appended when the diagnostic body was cut short.
+const DIAGNOSTIC_TRUNCATION_MARKER: &str = "… (truncated)";
+
 /// How a fetch treats an existing cache hit (D-02, D-09). All three
 /// behave IDENTICALLY on a cache MISS — the miss path (resolve,
 /// download, verify, persist) is implemented exactly once and is
@@ -233,8 +241,7 @@ impl ModuleFeed {
                 .get("x-ratelimit-reset")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let body = response.text().await.unwrap_or_default();
-            let capped_body: String = body.chars().take(200).collect();
+            let capped_body = bounded_diagnostic_body(response).await;
             let detail = if rate_limit_remaining.as_deref() == Some("0") {
                 match rate_limit_reset {
                     Some(reset) => format!(
@@ -484,6 +491,42 @@ impl ModuleFeed {
 /// than through a live round trip.
 fn is_insecure_downgrade(feed_scheme: &str, asset_scheme: &str) -> bool {
     feed_scheme == "https" && asset_scheme != "https"
+}
+
+/// Read at most [`DIAGNOSTIC_BODY_CAP_BYTES`] from a non-success feed
+/// response for use in an error message.
+///
+/// `Response::text()` buffers the WHOLE remote body before any
+/// truncation, so a hostile or compromised feed could answer an error
+/// with an arbitrarily large payload and push `ign` into memory
+/// pressure — the request timeout bounds duration, not size. The
+/// artifact path already streams under a published-size cap; this is
+/// the same discipline applied to the diagnostic path, which is the
+/// one place a feed's bytes are read without one.
+///
+/// Whatever is read is decoded lossily (an error body is diagnostic
+/// text, never trusted structured data) and truncated to
+/// [`DIAGNOSTIC_BODY_CHARS`], with a marker when anything was dropped.
+async fn bounded_diagnostic_body(response: reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = DIAGNOSTIC_BODY_CAP_BYTES.saturating_sub(buf.len());
+        if chunk.len() >= remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut capped: String = text.chars().take(DIAGNOSTIC_BODY_CHARS).collect();
+    if truncated || capped.chars().count() < text.chars().count() {
+        capped.push_str(DIAGNOSTIC_TRUNCATION_MARKER);
+    }
+    capped
 }
 
 #[cfg(test)]
