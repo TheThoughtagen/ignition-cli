@@ -13,6 +13,22 @@ transfer, a workspace checkout / `ign edit` round-trip, and protocol
 transports — MCP (`ign mcp serve`) and LSP (`ign lsp`) — so agents and
 editors drive the same binary humans do.
 
+## Watch it in use
+
+### Ignition CLI
+
+Gateway inspection, project discovery, and batch tag reads.
+
+[![Ignition CLI recorded terminal walkthrough](website/static/demos/cli.gif?raw=true)](https://thethoughtagen.github.io/ignition-cli/docs/demos/)
+
+### Ignition CLI TUI
+
+Explore gateway health, browse tags, and inspect projects from the keyboard.
+
+[![Ignition CLI TUI recorded terminal walkthrough](website/static/demos/tui.gif?raw=true)](https://thethoughtagen.github.io/ignition-cli/docs/demos/)
+
+[Open the recordings with playback controls and written summaries](https://thethoughtagen.github.io/ignition-cli/docs/demos/). Recorded against a fictional batch process; playback runs at 1.2×.
+
 ## Install
 
 ```
