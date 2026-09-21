@@ -433,4 +433,225 @@ mod tests {
     fn keyring_store_is_constructible_without_side_effects() {
         let _store = KeyringStore;
     }
+
+    /// T-iti-01 pin: the live bug, reproduced at the store level. A profile
+    /// whose auth is `Keyring` must not receive a foreign bare
+    /// `IGNITION_TOKEN` — the `ign adopt` → `ign --profile e2e status` →
+    /// `auth_rejected` failure this plan closes.
+    #[test]
+    fn env_store_keyring_profile_skips_bare_generic_token() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("IGNITION_TOKEN", "foreign");
+            std::env::remove_var("IGNITION_TOKEN_E2E");
+        }
+        let auth = AuthRef::Keyring {
+            keyring: "profile:e2e".into(),
+        };
+        let result = EnvStore.resolve("e2e", &auth).expect("resolve");
+        assert!(
+            result.is_none(),
+            "a keyring profile must skip the bare generic token"
+        );
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_TOKEN");
+        }
+    }
+
+    /// Step 1 stays universal: `IGNITION_TOKEN_<PROFILE_UP>` still overrides
+    /// even a keyring-shaped profile.
+    #[test]
+    fn env_store_profile_specific_token_overrides_keyring_profile() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("IGNITION_TOKEN", "foreign");
+            std::env::set_var("IGNITION_TOKEN_E2E", "specific");
+        }
+        let auth = AuthRef::Keyring {
+            keyring: "profile:e2e".into(),
+        };
+        let credential = EnvStore
+            .resolve("e2e", &auth)
+            .expect("resolve")
+            .expect("some");
+        let Credential::Token(token) = credential else {
+            panic!("expected token credential");
+        };
+        assert_eq!(token.expose(), "specific");
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_TOKEN");
+            std::env::remove_var("IGNITION_TOKEN_E2E");
+        }
+    }
+
+    /// The no-`auth`-block / `IGNITION_URL`-overlay path is pinned
+    /// unchanged: a default-auth profile still resolves the bare generic
+    /// token.
+    #[test]
+    fn env_store_default_auth_still_uses_bare_generic_token() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("IGNITION_TOKEN", "generic");
+            std::env::remove_var("IGNITION_TOKEN_DEV");
+        }
+        let credential = EnvStore
+            .resolve("dev", &AuthRef::default())
+            .expect("resolve")
+            .expect("some");
+        let Credential::Token(token) = credential else {
+            panic!("expected token credential");
+        };
+        assert_eq!(token.expose(), "generic");
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_TOKEN");
+        }
+    }
+
+    /// A `TokenEnv` profile naming its OWN var must not fall back to the
+    /// unrelated bare `IGNITION_TOKEN` when that named var is absent.
+    #[test]
+    fn env_store_named_token_env_skips_bare_generic() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::remove_var("MY_TOKEN");
+            std::env::set_var("IGNITION_TOKEN", "generic");
+            std::env::remove_var("IGNITION_TOKEN_DEV");
+        }
+        let auth = AuthRef::TokenEnv {
+            token_env: "MY_TOKEN".into(),
+        };
+        let result = EnvStore.resolve("dev", &auth).expect("resolve");
+        assert!(
+            result.is_none(),
+            "a named token_env profile must not fall back to the bare generic token"
+        );
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_TOKEN");
+        }
+    }
+
+    /// T-iti-02 pin: a keyring-shaped profile must not receive the generic
+    /// basic pair either.
+    #[test]
+    fn basic_env_store_skips_keyring_profile() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("IGNITION_USER", "admin");
+            std::env::set_var("IGNITION_PASSWORD", "pw");
+        }
+        let auth = AuthRef::Keyring {
+            keyring: "profile:e2e".into(),
+        };
+        let result = BasicEnvStore.resolve("e2e", &auth).expect("resolve");
+        assert!(
+            result.is_none(),
+            "a keyring profile must skip the generic basic pair"
+        );
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_USER");
+            std::env::remove_var("IGNITION_PASSWORD");
+        }
+    }
+
+    /// A `Basic` profile reads its OWN named vars first, falling back to
+    /// the generic pair only when those named vars are unset.
+    #[test]
+    fn basic_env_store_prefers_profile_named_vars_then_generic_pair() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let auth = AuthRef::Basic {
+            user_env: "GW_USER".into(),
+            password_env: "GW_PASS".into(),
+        };
+
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("GW_USER", "named-user");
+            std::env::set_var("GW_PASS", "named-pass");
+            std::env::remove_var("IGNITION_USER");
+            std::env::remove_var("IGNITION_PASSWORD");
+        }
+        let credential = BasicEnvStore
+            .resolve("dev", &auth)
+            .expect("resolve")
+            .expect("some via named vars");
+        let Credential::Basic(user, password) = credential else {
+            panic!("expected basic credential");
+        };
+        assert_eq!(user.expose(), "named-user");
+        assert_eq!(password.expose(), "named-pass");
+
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::remove_var("GW_USER");
+            std::env::remove_var("GW_PASS");
+            std::env::set_var("IGNITION_USER", "generic-user");
+            std::env::set_var("IGNITION_PASSWORD", "generic-pass");
+        }
+        let credential = BasicEnvStore
+            .resolve("dev", &auth)
+            .expect("resolve")
+            .expect("some via generic fallback");
+        let Credential::Basic(user, password) = credential else {
+            panic!("expected basic credential");
+        };
+        assert_eq!(user.expose(), "generic-user");
+        assert_eq!(password.expose(), "generic-pass");
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_USER");
+            std::env::remove_var("IGNITION_PASSWORD");
+        }
+    }
+
+    /// The chain-level pin — the end-to-end shape of the live bug: a
+    /// keyring profile with a populated keyring wins over a foreign
+    /// generic env token AND a foreign generic basic pair.
+    #[test]
+    fn resolve_secret_keyring_profile_beats_foreign_generic_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: single-threaded under ENV_LOCK; removed before return.
+        unsafe {
+            std::env::set_var("IGNITION_TOKEN", "foreign-token");
+            std::env::set_var("IGNITION_USER", "foreign-user");
+            std::env::set_var("IGNITION_PASSWORD", "foreign-pass");
+            std::env::remove_var("IGNITION_TOKEN_E2E");
+        }
+        let auth = AuthRef::Keyring {
+            keyring: "profile:e2e".into(),
+        };
+        let keyring_like = FixedStore(Ok(Some(Credential::Token(Secret::new("keyring-token")))));
+        let chain: Vec<Box<dyn SecretStore>> = vec![
+            Box::new(EnvStore),
+            Box::new(keyring_like),
+            Box::new(BasicEnvStore),
+        ];
+        let credential = resolve_secret("e2e", &auth, &chain).expect("resolve");
+        let Credential::Token(token) = credential else {
+            panic!("expected token credential");
+        };
+        assert_eq!(token.expose(), "keyring-token");
+
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe {
+            std::env::remove_var("IGNITION_TOKEN");
+            std::env::remove_var("IGNITION_USER");
+            std::env::remove_var("IGNITION_PASSWORD");
+        }
+    }
 }
