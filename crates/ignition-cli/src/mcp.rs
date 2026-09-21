@@ -792,6 +792,36 @@ mod tests {
             "the read-only status verb carries no confirm property"
         );
 
+        // QUICK-96c: workspace_push's explicit pin. The GUARDED_OPS
+        // loop below only checks leaves that ARE in the registry —
+        // removing the workspace_push entry would make the loop
+        // silently stop checking this verb. This explicit block is
+        // the regression pin for the live gap QUICK-96c closed
+        // (workspace_push shipped with no confirm property at all).
+        let push = catalog
+            .iter()
+            .find(|e| e.name == "workspace_push")
+            .expect("workspace_push derives from the clap tree");
+        let push_props = push.schema.get("properties").expect("schema object");
+        let push_confirm = push_props
+            .get("confirm")
+            .expect("workspace_push carries confirm (QUICK-96c)");
+        assert_eq!(
+            push_confirm.get("type").and_then(Value::as_str),
+            Some("boolean"),
+            "confirm is a boolean property on workspace_push"
+        );
+        let push_required = push
+            .schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required array");
+        assert!(
+            !push_required.iter().any(|v| v == "confirm"),
+            "confirm must be OPTIONAL on workspace_push \
+             (schema-required invites reflexive auto-fill): {push_required:?}"
+        );
+
         // And EVERY guarded leaf that is CATALOG-ELIGIBLE advertises
         // it (the registry → catalog direction; the drift test in
         // main.rs pins the dispatch-site → registry direction). One
@@ -1103,5 +1133,73 @@ mod tests {
         .await
         .expect_err("missing required positional");
         assert_eq!(err.0, -32602);
+    }
+
+    /// QUICK-96c's per-leaf pin on `workspace_push`. This proves
+    /// `confirm` is a KNOWN argument for this leaf — only GUARDED_OPS
+    /// membership puts it in `execute`'s `known` set, so a -32602
+    /// here would mean the registry entry (or its dispatch-site
+    /// marker) regressed — and that the assembled argv parses and
+    /// dispatch actually runs with `--yes` appended: `read_manifest`
+    /// executes BEFORE `Session::resolve` in the dispatch arm, so
+    /// pointing `path` at a directory with no `.ign-workspace.json`
+    /// refuses `invalid_input` with zero network, zero credentials,
+    /// deterministically (never `confirmation_required` — that would
+    /// mean confirm:true failed to reach `cli.yes`).
+    ///
+    /// This does NOT exercise the `confirm:true` -> `--yes` ->
+    /// `cli.yes` hop itself — that bridge code is leaf-agnostic and is
+    /// already pinned generically by
+    /// `catalog_sample_round_trips_through_clap_parse` (contract_mcp.rs,
+    /// which now samples `workspace_push` too) and by the SC-2
+    /// execution-half test on `project_delete`
+    /// (`confirm_true_executes_the_guarded_verb_on_the_wire`). A
+    /// gateway-reaching MCP-level push (workspace fixture + export-zip
+    /// mock) is deliberately out of scope for this quick task.
+    #[tokio::test]
+    async fn workspace_push_accepts_confirm_and_refuses_smuggled_yes() {
+        let catalog = build_catalog();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let no_manifest = dir.path().join("not-a-workspace");
+
+        let result = execute(
+            &json!({
+                "name": "workspace_push",
+                "arguments": {
+                    "path": no_manifest.to_string_lossy(),
+                    "confirm": true,
+                }
+            }),
+            None,
+            &catalog,
+        )
+        .await
+        .expect("confirm is a known argument for workspace_push");
+        let text = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .expect("one text content item");
+        let envelope: Value = serde_json::from_str(text).expect("valid envelope JSON");
+        assert_eq!(
+            envelope.get("ok"),
+            Some(&json!(false)),
+            "no manifest at the path: {envelope}"
+        );
+        assert_eq!(
+            envelope.pointer("/error/code").and_then(Value::as_str),
+            Some("invalid_input"),
+            "not-an-ign-workspace refuses invalid_input, proving the argv \
+             parsed and dispatch ran: {envelope}"
+        );
+
+        let err = execute(
+            &json!({ "name": "workspace_push", "arguments": { "yes": true } }),
+            None,
+            &catalog,
+        )
+        .await
+        .expect_err("hostile yes must refuse on workspace_push too");
+        assert_eq!(err.0, -32602, "{err:?}");
+        assert!(err.1.contains("yes"), "names the offending key: {err:?}");
     }
 }
