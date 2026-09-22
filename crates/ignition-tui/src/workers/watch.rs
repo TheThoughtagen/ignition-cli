@@ -47,16 +47,21 @@ pub async fn alarms_worker(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let result = actions::tags::tags_alarms_active(
+                // Race the poll against shutdown so a slow or hung
+                // request cannot pin the worker past its stop signal.
+                let read = actions::tags::tags_alarms_active(
                     &*api,
                     ALARMS_PROJECT,
                     None,
                     None,
                     None,
-                )
-                .await
-                .map(|result| result.alarms)
-                .map_err(|err| err.to_string());
+                );
+                let result = tokio::select! {
+                    read = read => read
+                        .map(|result| result.alarms)
+                        .map_err(|err| err.to_string()),
+                    _ = shutdown.changed() => return,
+                };
                 if tx
                     .send(AppEvent::Alarms { era, result })
                     .is_err()
@@ -244,10 +249,15 @@ pub async fn tag_watch_worker(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let result = actions::tags::tags_read(&*api, TAGS_PROJECT, &paths)
-                    .await
-                    .map(|result| result.results)
-                    .map_err(|err| err.to_string());
+                // Race the poll against shutdown so a slow or hung
+                // request cannot pin the worker past its stop signal.
+                let read = actions::tags::tags_read(&*api, TAGS_PROJECT, &paths);
+                let result = tokio::select! {
+                    read = read => read
+                        .map(|result| result.results)
+                        .map_err(|err| err.to_string()),
+                    _ = shutdown.changed() => return,
+                };
                 if tx
                     .send(AppEvent::TagWatch { era, generation, result })
                     .is_err()
@@ -507,6 +517,65 @@ mod tests {
             .await
             .expect("worker exits on shutdown")
             .expect("worker task not cancelled");
+    }
+
+    /// Shutdown must interrupt an in-flight poll, not wait for it. This
+    /// is the Windows CI flake: a slow connect failure on 127.0.0.1:1 left
+    /// the request un-cancellable and the 5s join budget expired
+    /// (`watch_worker_reports_and_terminates_on_shutdown`, runs
+    /// 35509849994 and 35725876888). A 10s-delayed endpoint makes the
+    /// hazard deterministic on every OS.
+    #[tokio::test]
+    async fn watch_worker_shutdown_interrupts_an_in_flight_poll() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(10))
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+        let api = std::sync::Arc::new(ignition_core::client::ReqwestGatewayApi::for_tests(
+            &format!("{}/", server.uri()),
+            None,
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let worker = tokio::spawn(tag_watch_worker(
+            api,
+            tx,
+            shutdown_rx,
+            1,
+            1,
+            vec!["[default]T1".to_string()],
+            WATCH_PERIOD,
+        ));
+
+        // Let the first tick fire and the request reach the (stalling) server.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0),
+            1,
+            "one poll is in flight"
+        );
+
+        let started = std::time::Instant::now();
+        shutdown_tx.send(true).expect("worker holds the receiver");
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("shutdown interrupts the in-flight poll within 1s")
+            .expect("worker task not cancelled");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "joined in {:?}",
+            started.elapsed()
+        );
     }
 
     /// The spawn rail: a non-empty set arms the worker under a bumped

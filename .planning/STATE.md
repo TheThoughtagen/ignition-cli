@@ -2,15 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Rig Modules & Declared Discovery
+current_phase: 15
+current_phase_name: 2/2 plans
 status: planning
-last_updated: "2026-09-20T15:16:39.958Z"
-last_activity: 2026-09-20
+stopped_at: "Completed quick/260919-tg4 (3 commits: 063f389, a1863ea, 7859247); next: `/gsd-new-milestone`"
+last_updated: "2026-09-22T12:29:45.761Z"
+last_activity: 2026-09-21
+last_activity_desc: "Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch"
 progress:
-  total_phases: 0
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  total_phases: 4
+  completed_phases: 1
+  total_plans: 2
+  completed_plans: 2
+  percent: 25
 ---
 
 # Project State
@@ -27,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 Phase: 15-module-artifact-fetch-verify — COMPLETE (2/2 plans)
 Plan: — (next: Phase 16, 16-compose-override-module-injection)
 Status: Phase 15 complete; v1.3 in progress
-Last activity: 2026-09-20 - Phase 15 complete: pinned signed-release fetch, sha256 verification, version-keyed cache, offline-from-cache. All 4 SCs tested; live fetch confirmed Git-2.3.4-signed.modl byte-for-byte. Workspace clippy gate restored (d0e92f7 boxed CoreError's digest payloads).
+Last activity: 2026-09-21 - Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch
 
 ## Performance Metrics
 
@@ -60,6 +64,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 260919-p0g | Add ign testing run verb wrapping testing_discover/testing_run client functions | 2026-09-19 | d5938dd | [260919-p0g-add-ign-testing-run-verb-wrapping-testin](./quick/260919-p0g-add-ign-testing-run-verb-wrapping-testin/) |
 | 260919-tg4 | `ign session login` + `ign e2e doctor`/`init` — the IdP session as a Playwright storageState, the six-row E2E diagnosis, and the embedded scaffold | 2026-09-20 | 123a3db | [260919-tg4-add-ign-session-login-plus-ign-e2e-docto](./quick/260919-tg4-add-ign-session-login-plus-ign-e2e-docto/) |
 | 260920-iti | Fix credential precedence: profile auth (keyring / named token_env / basic) wins over bare IGNITION_TOKEN and IGNITION_USER/PASSWORD | 2026-09-20 | 3df005a | [260920-iti-fix-credential-precedence-a-profile-with](./quick/260920-iti-fix-credential-precedence-a-profile-with/) |
+| 260921-96c | Register workspace push in GUARDED_OPS so it is confirmable over MCP (confirm: true → --yes; rig down stays unguarded by design) | 2026-09-21 | 7800ba6 | [260921-96c-register-workspace-push-in-guarded-ops-s](./quick/260921-96c-register-workspace-push-in-guarded-ops-s/) |
+| 5 | fix(tui): watch/alarm workers race in-flight polls against shutdown (Windows CI flake root cause) | 2026-09-22 | d64280c | — |
 
 ## Session Continuity
 
