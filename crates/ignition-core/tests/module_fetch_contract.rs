@@ -1192,3 +1192,108 @@ async fn oversized_feed_error_body_is_bounded_before_buffering() {
     );
     assert_cache_empty(cache_root.path(), "git");
 }
+
+/// A cache entry is an artifact to be MOUNTED, not a secret.
+///
+/// `NamedTempFile` creates at 0600 and `persist` preserves that mode, so
+/// before this was widened the cached `.modl` was owner-only. The stock
+/// `inductiveautomation/ignition` image runs as `2003:2003`, so bind-mounting
+/// a 0600 file into `user-lib/modules` leaves the gateway unable to read it
+/// and the module silently absent — no error, nothing in the logs to chase.
+///
+/// Phase 15's own tests never mounted the file, which is why this survived to
+/// Phase 16's research. Asserts the world-readable bit specifically: that is
+/// the one that decides whether a different uid can read it.
+#[cfg(unix)]
+#[tokio::test]
+async fn cached_artifact_is_readable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock = FeedMock::start().await;
+    let _release = mock.mount_release(1).await;
+    let _download = mock.mount_download(1).await;
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let fetched = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("fetch succeeds");
+
+    let mode = std::fs::metadata(&fetched.path)
+        .expect("cache entry exists")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o044,
+        0o044,
+        "cache entry must be group+world readable so a gateway running as \
+         another uid can load it (mode {mode:o})"
+    );
+}
+
+/// CodeRabbit PR #13: readability must be repaired on a cache HIT, not only
+/// after a download.
+///
+/// Anyone who ran the fetcher before readability was enforced has 0600
+/// entries on disk. Those are returned through the `CacheFirst` branch
+/// without a download, so a download-only fix would leave every
+/// already-cached module permanently unreadable by the gateway — the exact
+/// failure this is meant to prevent, made permanent for existing users.
+///
+/// Seeds a 0600 entry by hand, fetches with `CacheFirst` (no mocks mounted,
+/// so any HTTP request fails the test), and asserts the entry came back
+/// readable.
+#[cfg(unix)]
+#[tokio::test]
+async fn preexisting_unreadable_cache_entry_is_repaired_on_hit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("mkdir");
+
+    let body = b"seeded cache entry".to_vec();
+    let digest = sha256_hex(&body);
+    let seeded = module_dir.join(format!("2.3.4-{digest}.modl"));
+    std::fs::write(&seeded, &body).expect("seed entry");
+    std::fs::set_permissions(&seeded, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    assert_eq!(
+        std::fs::metadata(&seeded)
+            .expect("seeded")
+            .permissions()
+            .mode()
+            & 0o044,
+        0,
+        "precondition: the seeded entry must start unreadable"
+    );
+
+    // No mocks mounted: an unroutable base proves this never reaches the feed.
+    let feed = ModuleFeed::for_base("http://127.0.0.1:1/".parse().expect("uri parses"))
+        .expect("feed builds");
+    let fetched = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("a cache hit must succeed offline");
+
+    assert_eq!(fetched.path, seeded);
+    let mode = std::fs::metadata(&fetched.path)
+        .expect("entry exists")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o044,
+        0o044,
+        "a cache hit must repair a pre-existing 0600 entry (mode {mode:o})"
+    );
+}
