@@ -5,7 +5,7 @@ members = ["crates/ignition-cli", "crates/ignition-core", "crates/ignition-tui"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.88" # CORRECTED: keyring 4.1.x floor (was 1.85 in STACK.md)
-version = "1.2.0"
+version = "1.3.0"
 license = "MIT"
 repository = "https://github.com/TheThoughtagen/ignition-cli"
 
