@@ -180,6 +180,10 @@ impl ModuleFeed {
         if let Some(cached) = &cached
             && policy == FetchPolicy::CacheFirst
         {
+            // An entry cached before readability was enforced is still
+            // 0600 on disk; a hit must repair it, not hand back an
+            // artifact the gateway cannot read.
+            ensure_readable(&cached.path)?;
             return Ok(FetchedModule {
                 module_id: spec.id.to_string(),
                 version: version.to_string(),
@@ -314,6 +318,7 @@ impl ModuleFeed {
             if expected_digest == cached.digest_sha256 {
                 // Upstream still publishes the digest already cached —
                 // bytes already proven are not re-fetched.
+                ensure_readable(&cached.path)?;
                 return Ok(FetchedModule {
                     module_id: spec.id.to_string(),
                     version: version.to_string(),
@@ -461,6 +466,13 @@ impl ModuleFeed {
         }
 
         // (h) Persist — the ONLY way bytes reach the final cache path.
+        //
+        // Readability is set on the TEMP file, before publication. Doing it
+        // after `persist` would expose the final path at the temp mode for a
+        // window, and a failure there would leave an unreadable artifact
+        // already published; failing here instead lets the NamedTempFile's
+        // Drop discard it, exactly as a digest mismatch does.
+        ensure_readable(temp.path())?;
         let final_path = cache_dir.join(format!("{version}-{actual_digest}.modl"));
         temp.persist(&final_path).map_err(|err| {
             CoreError::Internal(format!(
@@ -468,31 +480,6 @@ impl ModuleFeed {
                 final_path.display()
             ))
         })?;
-
-        // A cache entry is an artifact to be MOUNTED, not a secret.
-        //
-        // `NamedTempFile` creates at 0600 by design, and `persist` keeps that
-        // mode. The stock `inductiveautomation/ignition` image runs as
-        // 2003:2003, so a 0600 file bind-mounted into `user-lib/modules` is
-        // unreadable by the gateway and the module silently fails to load —
-        // no error, just an absent module. Widen to 0644 at the moment the
-        // entry becomes a cache entry, so every consumer inherits a readable
-        // file rather than repeating this guard.
-        //
-        // Unix-only: Windows has no equivalent mode bit, and its default ACL
-        // on a user-owned file is already readable.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o644)).map_err(
-                |err| {
-                    CoreError::Internal(format!(
-                        "cannot set readable permissions on cache entry at {}: {err}",
-                        final_path.display()
-                    ))
-                },
-            )?;
-        }
 
         Ok(FetchedModule {
             module_id: spec.id.to_string(),
@@ -552,6 +539,51 @@ async fn bounded_diagnostic_body(response: reqwest::Response) -> String {
         capped.push_str(DIAGNOSTIC_TRUNCATION_MARKER);
     }
     capped
+}
+
+/// Make a cache entry readable by any uid — the gateway runs as its own
+/// user, not ours.
+///
+/// A cache entry is an artifact to be MOUNTED, not a secret.
+/// `NamedTempFile` creates at 0600 and `persist` preserves that mode, so
+/// without this the stock `inductiveautomation/ignition` image (uid
+/// 2003:2003) cannot read a bind-mounted `.modl` and the module is
+/// silently absent — no error, nothing in the gateway log.
+///
+/// Idempotent, and applied on cache HITS as well as fresh downloads:
+/// entries written before this existed are still 0600 on disk, and a hit
+/// must repair one rather than hand back an unreadable artifact.
+///
+/// Unix-only. Windows has no equivalent mode bit and its default ACL on a
+/// user-owned file is already readable.
+fn ensure_readable(path: &Path) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let current = std::fs::metadata(path)
+            .map_err(|err| {
+                CoreError::Internal(format!(
+                    "cannot read permissions of cache entry at {}: {err}",
+                    path.display()
+                ))
+            })?
+            .permissions()
+            .mode();
+        if current & 0o044 == 0o044 {
+            return Ok(());
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(current | 0o044)).map_err(
+            |err| {
+                CoreError::Internal(format!(
+                    "cannot make cache entry readable at {}: {err}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]

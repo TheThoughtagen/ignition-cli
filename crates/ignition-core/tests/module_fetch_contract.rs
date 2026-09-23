@@ -1236,3 +1236,64 @@ async fn cached_artifact_is_readable_by_other_users() {
          another uid can load it (mode {mode:o})"
     );
 }
+
+/// CodeRabbit PR #13: readability must be repaired on a cache HIT, not only
+/// after a download.
+///
+/// Anyone who ran the fetcher before readability was enforced has 0600
+/// entries on disk. Those are returned through the `CacheFirst` branch
+/// without a download, so a download-only fix would leave every
+/// already-cached module permanently unreadable by the gateway — the exact
+/// failure this is meant to prevent, made permanent for existing users.
+///
+/// Seeds a 0600 entry by hand, fetches with `CacheFirst` (no mocks mounted,
+/// so any HTTP request fails the test), and asserts the entry came back
+/// readable.
+#[cfg(unix)]
+#[tokio::test]
+async fn preexisting_unreadable_cache_entry_is_repaired_on_hit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("mkdir");
+
+    let body = b"seeded cache entry".to_vec();
+    let digest = sha256_hex(&body);
+    let seeded = module_dir.join(format!("2.3.4-{digest}.modl"));
+    std::fs::write(&seeded, &body).expect("seed entry");
+    std::fs::set_permissions(&seeded, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    assert_eq!(
+        std::fs::metadata(&seeded)
+            .expect("seeded")
+            .permissions()
+            .mode()
+            & 0o044,
+        0,
+        "precondition: the seeded entry must start unreadable"
+    );
+
+    // No mocks mounted: an unroutable base proves this never reaches the feed.
+    let feed = ModuleFeed::for_base("http://127.0.0.1:1/".parse().expect("uri parses"))
+        .expect("feed builds");
+    let fetched = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("a cache hit must succeed offline");
+
+    assert_eq!(fetched.path, seeded);
+    let mode = std::fs::metadata(&fetched.path)
+        .expect("entry exists")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o044,
+        0o044,
+        "a cache hit must repair a pre-existing 0600 entry (mode {mode:o})"
+    );
+}
