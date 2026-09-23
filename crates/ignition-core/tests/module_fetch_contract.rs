@@ -1192,3 +1192,47 @@ async fn oversized_feed_error_body_is_bounded_before_buffering() {
     );
     assert_cache_empty(cache_root.path(), "git");
 }
+
+/// A cache entry is an artifact to be MOUNTED, not a secret.
+///
+/// `NamedTempFile` creates at 0600 and `persist` preserves that mode, so
+/// before this was widened the cached `.modl` was owner-only. The stock
+/// `inductiveautomation/ignition` image runs as `2003:2003`, so bind-mounting
+/// a 0600 file into `user-lib/modules` leaves the gateway unable to read it
+/// and the module silently absent — no error, nothing in the logs to chase.
+///
+/// Phase 15's own tests never mounted the file, which is why this survived to
+/// Phase 16's research. Asserts the world-readable bit specifically: that is
+/// the one that decides whether a different uid can read it.
+#[cfg(unix)]
+#[tokio::test]
+async fn cached_artifact_is_readable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock = FeedMock::start().await;
+    let _release = mock.mount_release(1).await;
+    let _download = mock.mount_download(1).await;
+    let cache_root = tempfile::tempdir().expect("tempdir");
+    let feed = ModuleFeed::for_base(mock.uri().parse().expect("uri parses")).expect("feed builds");
+
+    let fetched = feed
+        .fetch_and_verify(
+            &GIT_MODULE,
+            "2.3.4",
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("fetch succeeds");
+
+    let mode = std::fs::metadata(&fetched.path)
+        .expect("cache entry exists")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o044,
+        0o044,
+        "cache entry must be group+world readable so a gateway running as \
+         another uid can load it (mode {mode:o})"
+    );
+}

@@ -469,6 +469,31 @@ impl ModuleFeed {
             ))
         })?;
 
+        // A cache entry is an artifact to be MOUNTED, not a secret.
+        //
+        // `NamedTempFile` creates at 0600 by design, and `persist` keeps that
+        // mode. The stock `inductiveautomation/ignition` image runs as
+        // 2003:2003, so a 0600 file bind-mounted into `user-lib/modules` is
+        // unreadable by the gateway and the module silently fails to load —
+        // no error, just an absent module. Widen to 0644 at the moment the
+        // entry becomes a cache entry, so every consumer inherits a readable
+        // file rather than repeating this guard.
+        //
+        // Unix-only: Windows has no equivalent mode bit, and its default ACL
+        // on a user-owned file is already readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o644)).map_err(
+                |err| {
+                    CoreError::Internal(format!(
+                        "cannot set readable permissions on cache entry at {}: {err}",
+                        final_path.display()
+                    ))
+                },
+            )?;
+        }
+
         Ok(FetchedModule {
             module_id: spec.id.to_string(),
             version: version.to_string(),
