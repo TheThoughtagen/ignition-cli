@@ -105,6 +105,11 @@ pub struct RigResetResult {
     pub state: String,
     /// Data-level warnings (uncommissioned wizard hint, skipped-wait).
     pub warnings: Vec<String>,
+    /// Modules provisioned this call (Phase 16, Task 2) — the SAME
+    /// always-present convention as [`RigUpResult::provisioned_modules`]:
+    /// empty for a rig with no `[rigs.NAME.modules.*]` declared and no
+    /// `--with-module` flag (SC-1).
+    pub provisioned_modules: Vec<ProvisionedModule>,
 }
 
 /// One published-port row in status output (allowlist only).
@@ -419,6 +424,7 @@ pub async fn rig_reset(
         removed_volumes,
         state,
         warnings,
+        provisioned_modules: provisioning.modules.clone(),
     })
 }
 
@@ -3115,9 +3121,17 @@ mod tests {
             removed_volumes: vec![],
             state: "running".into(),
             warnings: vec![],
+            provisioned_modules: vec![],
         };
         let json = serde_json::to_value(&reset).unwrap();
-        for key in ["rig", "project", "removed_volumes", "state", "warnings"] {
+        for key in [
+            "rig",
+            "project",
+            "removed_volumes",
+            "state",
+            "warnings",
+            "provisioned_modules",
+        ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let status_keys = [

@@ -26,6 +26,97 @@ use crate::module::fetch::{ArtifactSource, FetchPolicy, ModuleFeed};
 
 use super::RigPlan;
 
+/// The `ID@VERSION` separator for `--with-module` (D-15): unambiguous
+/// because neither [`crate::module::validate_module_id`]'s charset
+/// (`[a-z0-9-]`) nor [`crate::module::validate_version`]'s
+/// (`[A-Za-z0-9._+-]`) includes `@`.
+const WITH_MODULE_SEPARATOR: char = '@';
+
+/// Split one `--with-module` flag value into a validated
+/// `(id, ModuleDeclaration)` pair (D-15): one `split_once` on
+/// [`WITH_MODULE_SEPARATOR`], then BOTH halves through the EXISTING
+/// validators — no third validator is written here. A value with no
+/// separator, or with either half empty (which also catches a bare
+/// `@`), is `CoreError::InvalidInput` naming the value received and the
+/// expected shape.
+fn parse_with_module_flag(raw: &str) -> Result<(String, ModuleDeclaration), CoreError> {
+    let Some((id, version)) = raw.split_once(WITH_MODULE_SEPARATOR) else {
+        return Err(CoreError::InvalidInput {
+            reason: format!(
+                "--with-module value {raw:?} is missing the '@' separator \
+                 (expected ID@VERSION, e.g. git@2.3.4)"
+            ),
+        });
+    };
+    crate::module::validate_module_id(id)?;
+    crate::module::validate_version(version)?;
+    Ok((
+        id.to_string(),
+        ModuleDeclaration {
+            version: version.to_string(),
+        },
+    ))
+}
+
+/// Overlay `--with-module ID@VERSION` flags onto `config`'s declared
+/// modules (D-15/D-16), PURE — no filesystem or network access. A flag
+/// entry replaces `config`'s entry for the same id (the flag wins,
+/// D-16's "additive to config for this invocation only, no subtractive
+/// form" contract) — `config` is never mutated in place, only cloned.
+/// `flags` order never affects the result: the returned map is a
+/// `BTreeMap`, so repeated flags land in `ModuleSpec::id` order
+/// regardless of which order they were passed on the command line.
+///
+/// Every refusal is [`CoreError::InvalidInput`] (exit 2) naming the
+/// offending value and the expected `ID@VERSION` shape — a REGISTRY
+/// check (is the id actually registered?) is deliberately NOT performed
+/// here; that stays [`provision_modules`]'s job (`CoreError::
+/// ModuleNotRegistered`, exit 3), which applies identically to a
+/// config-declared id and a flag-declared one.
+pub fn merge_declarations(
+    config: &BTreeMap<String, ModuleDeclaration>,
+    flags: &[String],
+) -> Result<BTreeMap<String, ModuleDeclaration>, CoreError> {
+    let mut merged = config.clone();
+    for raw in flags {
+        let (id, declaration) = parse_with_module_flag(raw)?;
+        merged.insert(id, declaration);
+    }
+    Ok(merged)
+}
+
+/// Pre-flight JUST the `--with-module` flag values — BEFORE
+/// [`crate::rig::resolve_plan`] ever runs, so a malformed or
+/// unregistered flag value refuses at exit 2/3 with ZERO Docker
+/// invocation (Task 2, D-15/D-13). Runs [`merge_declarations`] against
+/// an EMPTY config map purely to reuse its syntax validation (the
+/// config half is irrelevant here — only the flags' own well-
+/// formedness and registration matter), then checks every resulting id
+/// against the registry the same way [`provision_modules`] does.
+///
+/// This is a pre-check, not a replacement: [`provision_modules`]
+/// performs the AUTHORITATIVE registry check once the plan (and its
+/// config-declared modules) exist — a config-declared unregistered id
+/// is still caught there. This function only shortens the path for the
+/// flag's own mistakes, which is what lets those two refusals be
+/// proven without ever touching Docker.
+pub fn preflight_with_module_flags(flags: &[String]) -> Result<(), CoreError> {
+    let parsed = merge_declarations(&BTreeMap::new(), flags)?;
+    for id in parsed.keys() {
+        crate::module::spec_for(id).ok_or_else(|| {
+            let known: Vec<String> = crate::module::MODULES
+                .iter()
+                .map(|spec| spec.id.to_string())
+                .collect();
+            CoreError::ModuleNotRegistered {
+                id: id.clone(),
+                known,
+            }
+        })?;
+    }
+    Ok(())
+}
+
 /// The override's filename — always at `std::path::absolute(plan.
 /// project_dir.join(OVERRIDE_FILENAME))` (D-10). `std::path::absolute`
 /// (stable 1.79), never `canonicalize`: the latter resolves symlinks and
@@ -722,5 +813,560 @@ mod tests {
             after, compose_bytes,
             "and must equal exactly the bytes this test seeded"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // merge_declarations / preflight_with_module_flags (16-02 Task 2,
+    // D-15/D-16)
+    // -------------------------------------------------------------------
+
+    /// D-16: a flag naming a NEW id adds to config's declarations; a
+    /// flag naming the SAME id as config OVERRIDES that id's version
+    /// for this invocation — the entry appears once, flag version wins.
+    #[test]
+    fn merge_declarations_overlays_flag_onto_config() {
+        let mut config = BTreeMap::new();
+        config.insert(
+            "git".to_string(),
+            ModuleDeclaration {
+                version: "2.3.4".to_string(),
+            },
+        );
+
+        // A flag naming a second id: both present afterward.
+        let merged = merge_declarations(&config, &["project-scan-endpoint@1.0.0".to_string()])
+            .expect("well-formed flag merges");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["git"].version, "2.3.4", "config entry untouched");
+        assert_eq!(merged["project-scan-endpoint"].version, "1.0.0");
+
+        // A flag naming the SAME id as config: the flag's version wins,
+        // the entry appears exactly once.
+        let merged =
+            merge_declarations(&config, &["git@9.9.9".to_string()]).expect("same-id flag merges");
+        assert_eq!(merged.len(), 1, "one entry, not two, for the same id");
+        assert_eq!(
+            merged["git"].version, "9.9.9",
+            "the FLAG's version wins over config's"
+        );
+
+        // Untouched config is never mutated by the merge.
+        assert_eq!(config["git"].version, "2.3.4");
+    }
+
+    /// Every malformed shape refuses `invalid_input` / exit 2: no
+    /// separator, an empty id half, an empty version half (a bare `@`
+    /// hits this same branch) — these three are refused directly by
+    /// `parse_with_module_flag`, so the message names the FULL raw
+    /// value received. An id failing `validate_module_id` and a
+    /// version failing `validate_version` are refused by those
+    /// EXISTING validators instead (no third validator is written, per
+    /// D-15) — their messages name only the offending half, which the
+    /// second half of this table checks for.
+    #[test]
+    fn merge_declarations_refuses_malformed_values() {
+        let config = BTreeMap::new();
+
+        // Refused by parse_with_module_flag ITSELF — only the
+        // missing-separator case, which is the one failure the parser
+        // detects before either validator runs, so it is the only one
+        // whose message can name the whole raw value. A value that DOES
+        // split (even into an empty half) reaches a validator, and those
+        // belong in the table below.
+        let bad = "git-no-separator";
+        let err = merge_declarations(&config, &[bad.to_string()])
+            .expect_err("a value with no '@' must be refused");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains(bad),
+            "message names the received value {bad:?}: {err}"
+        );
+
+        // Refused by the EXISTING validate_module_id/validate_version
+        // (D-15: no third validator) — the message names the offending
+        // half, not necessarily the whole ID@VERSION value.
+        for (bad, expected_fragment) in [
+            ("UPPER@2.3.4", "UPPER"),
+            ("git@../escape", "../escape"),
+            // These DO split on '@' into an empty half, so they are
+            // refused by the validators, not by the parser — the message
+            // names which half was empty. Asserting the validator's own
+            // wording keeps the empty-string fragment from matching
+            // everything vacuously.
+            ("@2.3.4", "module id \"\" is not a safe identifier"),
+            ("@", "module id \"\" is not a safe identifier"),
+            ("git@", "module version \"\" is not a safe version string"),
+        ] {
+            let err = merge_declarations(&config, &[bad.to_string()])
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(err.code(), "invalid_input", "{bad:?}");
+            assert_eq!(err.exit_code(), 2, "{bad:?}");
+            assert!(
+                err.to_string().contains(expected_fragment),
+                "message names the offending half {expected_fragment:?}: {err}"
+            );
+        }
+    }
+
+    /// D-15: repeated `--with-module` flags produce a map ordered by
+    /// id (BTreeMap's natural order), never by the order flags were
+    /// passed on the command line.
+    #[test]
+    fn merge_declarations_is_order_independent() {
+        let config = BTreeMap::new();
+        let forward = merge_declarations(
+            &config,
+            &[
+                "project-scan-endpoint@1.0.0".to_string(),
+                "git@2.3.4".to_string(),
+            ],
+        )
+        .expect("forward order merges");
+        let reverse = merge_declarations(
+            &config,
+            &[
+                "git@2.3.4".to_string(),
+                "project-scan-endpoint@1.0.0".to_string(),
+            ],
+        )
+        .expect("reverse order merges");
+        assert_eq!(forward, reverse, "flag order must not affect the result");
+        assert_eq!(
+            forward.keys().collect::<Vec<_>>(),
+            vec!["git", "project-scan-endpoint"],
+            "iteration order is id order, not flag order"
+        );
+    }
+
+    /// The dispatch-level guard (Task 2): a malformed flag value
+    /// refuses via the SAME `invalid_input` path as
+    /// `merge_declarations` — `preflight_with_module_flags` is a
+    /// thin wrapper, not a second implementation.
+    #[test]
+    fn preflight_with_module_flags_refuses_malformed_value() {
+        let err = preflight_with_module_flags(&["not-a-flag-value".to_string()])
+            .expect_err("malformed value refused");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// The dispatch-level guard's other half: a well-formed but
+    /// UNREGISTERED id refuses `module_not_registered` / exit 3,
+    /// naming the unregistered id and every currently registered one —
+    /// reachable with ZERO plan/Docker context, which is what lets the
+    /// CLI catch it before `resolve_plan` ever runs.
+    #[test]
+    fn preflight_with_module_flags_refuses_unregistered_id() {
+        let err = preflight_with_module_flags(&["nope@1.0.0".to_string()])
+            .expect_err("unregistered id refused");
+        assert_eq!(err.code(), "module_not_registered");
+        assert_eq!(err.exit_code(), 3);
+        let message = err.to_string();
+        assert!(message.contains("nope"), "{message}");
+        assert!(message.contains("git"), "known ids listed: {message}");
+        assert!(
+            message.contains("project-scan-endpoint"),
+            "known ids listed: {message}"
+        );
+    }
+
+    /// The guard's happy path: every currently registered id, and a
+    /// well-formed unregistered-nowhere-near-registry id is refused —
+    /// proven together so a future registry change can't silently
+    /// widen or narrow acceptance.
+    #[test]
+    fn preflight_with_module_flags_accepts_every_registered_id() {
+        for spec in crate::module::MODULES {
+            let flag = format!("{}@1.0.0", spec.id);
+            preflight_with_module_flags(std::slice::from_ref(&flag))
+                .unwrap_or_else(|err| panic!("{} must preflight cleanly: {err}", spec.id));
+        }
+    }
+
+    /// RMOD-01 / plan Task 2 item 4: `--with-module` against a rig with
+    /// NO config-declared module — `merge_declarations` then
+    /// `provision_modules` end to end — writes an override and reports
+    /// the module in `ModuleProvisioning::modules` (the shape
+    /// `RigUpResult.provisioned_modules` clones verbatim); the SAME rig
+    /// with NO flag (`merge_declarations` against an empty flag slice)
+    /// writes nothing and reports an empty list (SC-1, re-proven at
+    /// this seam).
+    #[tokio::test]
+    async fn with_module_flag_alone_provisions_and_empty_flags_stay_sc1() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let plan = RigPlan {
+            name: "fixture-rig".to_string(),
+            compose_file: project_dir.path().join("docker-compose.yml"),
+            project_dir: project_dir.path().to_path_buf(),
+            services: vec!["ignition".to_string()],
+            host_ports: Vec::new(),
+            port_mappings: Vec::new(),
+            volumes: Vec::new(),
+            gateway_service: Some("ignition".to_string()),
+            modules: BTreeMap::new(),
+        };
+
+        // Pre-seed the cache so this is a pure cache hit — the flag
+        // merge/provisioning path is what's under test, not the feed.
+        let cache_root = tempfile::tempdir().expect("cache tempdir");
+        let payload = b"synthetic .modl payload for with_module_flag_alone_provisions".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let digest = format!("{:x}", hasher.finalize());
+        let module_dir = cache_root.path().join("modules").join("git");
+        std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+        std::fs::write(module_dir.join(format!("2.3.4-{digest}.modl")), &payload)
+            .expect("seed cached artifact");
+
+        let feed = ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"),
+        )
+        .expect("feed builds");
+
+        // No config declaration, no flag: SC-1 stays intact at this seam.
+        let empty_declared = merge_declarations(&plan.modules, &[]).expect("empty merge");
+        assert!(empty_declared.is_empty());
+        let empty_provisioning = provision_modules(
+            &feed,
+            &plan,
+            &empty_declared,
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("no-declaration provisioning succeeds");
+        assert!(empty_provisioning.modules.is_empty());
+        assert!(empty_provisioning.override_file.is_none());
+        assert!(
+            !override_path(&plan)
+                .expect("override path computes")
+                .exists(),
+            "no override file written when nothing is declared"
+        );
+
+        // The flag alone, no config declaration: provisions and reports.
+        let flagged =
+            merge_declarations(&plan.modules, &["git@2.3.4".to_string()]).expect("flag-only merge");
+        assert_eq!(flagged.len(), 1);
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &flagged,
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("flag-only provisioning succeeds with a cache hit");
+        assert_eq!(provisioning.modules.len(), 1);
+        assert_eq!(provisioning.modules[0].id, "git");
+        assert_eq!(provisioning.modules[0].version, "2.3.4");
+        assert_eq!(provisioning.modules[0].source, ArtifactSource::Cache);
+        assert!(provisioning.override_file.is_some());
+        assert!(
+            override_path(&plan)
+                .expect("override path computes")
+                .exists(),
+            "override file written once a module is provisioned via the flag"
+        );
+    }
+
+    /// THE actual SC-1 mechanism (not just its OBSERVABLE effect): a
+    /// rig with NO derivable gateway service (`gateway_service: None`
+    /// — no port targeting 8088/443, no `module_service` override) and
+    /// NO declared module (config empty, no `--with-module` flag) must
+    /// still provision cleanly. `provision_modules` resolves the
+    /// service ONLY when something is declared (`declared.is_empty()`
+    /// short-circuits BEFORE that resolution) — a rig this bare would
+    /// otherwise hit `CoreError::Rig` ("cannot derive a gateway service
+    /// to mount modules into") for a rig that never asked to mount
+    /// anything. This is what "prove the short-circuit, don't assert
+    /// it" means: the two sibling tests above always seed
+    /// `gateway_service: Some(..)`, which would mask exactly this
+    /// regression.
+    #[tokio::test]
+    async fn no_declaration_provisions_cleanly_even_with_no_derivable_gateway_service() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let plan = RigPlan {
+            name: "bare-rig".to_string(),
+            compose_file: project_dir.path().join("docker-compose.yml"),
+            project_dir: project_dir.path().to_path_buf(),
+            services: vec!["sidecar".to_string()],
+            host_ports: Vec::new(),
+            port_mappings: Vec::new(),
+            volumes: Vec::new(),
+            gateway_service: None,
+            modules: BTreeMap::new(),
+        };
+
+        let feed = ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"),
+        )
+        .expect("feed builds");
+        let cache_root = tempfile::tempdir().expect("cache tempdir");
+
+        let declared = merge_declarations(&plan.modules, &[]).expect("empty merge");
+        assert!(declared.is_empty());
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &declared,
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect(
+            "a rig with no declared module must provision cleanly even when it has \
+             NO derivable gateway service — service resolution must never run for it",
+        );
+        assert!(provisioning.modules.is_empty());
+        assert!(provisioning.override_file.is_none());
+    }
+
+    /// Test-matrix rule (mandatory): a rig whose override was written
+    /// by a PREVIOUS run declaring one module in CONFIG, now invoked
+    /// with an ADDITIONAL `--with-module` flag naming a SECOND, already
+    /// pre-seeded in the cache — ends with an override naming BOTH.
+    /// (Task 1's `adding_a_second_module_to_a_pre_existing_override_
+    /// regenerates_whole` proves this at `write_override`'s layer; this
+    /// test proves it through the FULL `merge_declarations` →
+    /// `provision_modules` seam a real `--with-module` invocation
+    /// drives.)
+    #[tokio::test]
+    async fn pre_existing_override_plus_a_flag_module_regenerates() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let mut config_modules = BTreeMap::new();
+        config_modules.insert(
+            "git".to_string(),
+            ModuleDeclaration {
+                version: "2.3.4".to_string(),
+            },
+        );
+        let plan = RigPlan {
+            name: "fixture-rig".to_string(),
+            compose_file: project_dir.path().join("docker-compose.yml"),
+            project_dir: project_dir.path().to_path_buf(),
+            services: vec!["ignition".to_string()],
+            host_ports: Vec::new(),
+            port_mappings: Vec::new(),
+            volumes: Vec::new(),
+            gateway_service: Some("ignition".to_string()),
+            modules: config_modules,
+        };
+
+        let cache_root = tempfile::tempdir().expect("cache tempdir");
+        let seed = |module_id: &str, version: &str, payload: &[u8]| {
+            let mut hasher = Sha256::new();
+            hasher.update(payload);
+            let digest = format!("{:x}", hasher.finalize());
+            let dir = cache_root.path().join("modules").join(module_id);
+            std::fs::create_dir_all(&dir).expect("create module cache dir");
+            std::fs::write(dir.join(format!("{version}-{digest}.modl")), payload)
+                .expect("seed cached artifact");
+        };
+        seed("git", "2.3.4", b"synthetic git payload for regenerate test");
+        seed(
+            "project-scan-endpoint",
+            "1.0.0",
+            b"synthetic project-scan-endpoint payload for regenerate test",
+        );
+
+        let feed = ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("unroutable url parses"),
+        )
+        .expect("feed builds");
+
+        // Run 1: config alone (as a prior `rig up` with no flag would).
+        let declared = merge_declarations(&plan.modules, &[]).expect("config-only merge");
+        let first = provision_modules(
+            &feed,
+            &plan,
+            &declared,
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("config-only provisioning succeeds");
+        assert_eq!(first.modules.len(), 1);
+        let override_file = first.override_file.clone().expect("override written");
+        let one_module_contents =
+            std::fs::read_to_string(&override_file).expect("read one-module override");
+        assert!(
+            one_module_contents.contains("git.modl")
+                && !one_module_contents.contains("project-scan-endpoint"),
+            "precondition: the seeded override must name only git"
+        );
+
+        // Run 2: the SAME rig, now with an additional --with-module flag.
+        let declared =
+            merge_declarations(&plan.modules, &["project-scan-endpoint@1.0.0".to_string()])
+                .expect("config-plus-flag merge");
+        assert_eq!(declared.len(), 2);
+        let second = provision_modules(
+            &feed,
+            &plan,
+            &declared,
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("config-plus-flag provisioning succeeds");
+        assert_eq!(second.modules.len(), 2);
+
+        let two_module_contents =
+            std::fs::read_to_string(&override_file).expect("read regenerated override");
+        assert!(
+            two_module_contents.contains("git.modl"),
+            "the config-declared module survives: {two_module_contents}"
+        );
+        assert!(
+            two_module_contents.contains("project-scan-endpoint.modl"),
+            "the flag-added module is present: {two_module_contents}"
+        );
+        assert_eq!(
+            two_module_contents.matches("git.modl").count(),
+            1,
+            "git must appear exactly once, not duplicated"
+        );
+        assert_eq!(
+            two_module_contents
+                .matches("project-scan-endpoint.modl")
+                .count(),
+            1,
+            "the flag-added module must appear exactly once"
+        );
+    }
+
+    /// The test-matrix rule's cache-mix half: a cache that already
+    /// holds ONE of two modules while the OTHER must be fetched over
+    /// the network — a wiremock server stands in for the second
+    /// module's feed, and its mock is asserted hit EXACTLY once, which
+    /// is the falsifiable proof the cached entry was never re-fetched.
+    #[tokio::test]
+    async fn provisioning_fetches_only_the_missing_artifact_when_one_is_cached() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let plan = RigPlan {
+            name: "fixture-rig".to_string(),
+            compose_file: project_dir.path().join("docker-compose.yml"),
+            project_dir: project_dir.path().to_path_buf(),
+            services: vec!["ignition".to_string()],
+            host_ports: Vec::new(),
+            port_mappings: Vec::new(),
+            volumes: Vec::new(),
+            gateway_service: Some("ignition".to_string()),
+            modules: BTreeMap::new(),
+        };
+
+        let cache_root = tempfile::tempdir().expect("cache tempdir");
+        let cached_payload = b"synthetic git payload already cached".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&cached_payload);
+        let cached_digest = format!("{:x}", hasher.finalize());
+        let git_dir = cache_root.path().join("modules").join("git");
+        std::fs::create_dir_all(&git_dir).expect("create git cache dir");
+        std::fs::write(
+            git_dir.join(format!("2.3.4-{cached_digest}.modl")),
+            &cached_payload,
+        )
+        .expect("seed cached git artifact");
+
+        // The second module's release feed — a real wiremock server,
+        // asserted hit exactly once (`.expect(1)` on the mount).
+        let server = wiremock::MockServer::start().await;
+        let scan_payload = b"synthetic project-scan-endpoint payload, freshly fetched".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&scan_payload);
+        let scan_digest = format!("{:x}", hasher.finalize());
+        let release_json = serde_json::json!({
+            "tag_name": "v1.0.0",
+            "assets": [{
+                "name": "Project-Scan-Endpoint.modl",
+                "url": format!("{}/assets/1", server.uri()),
+                "browser_download_url": format!("{}/download/Project-Scan-Endpoint.modl", server.uri()),
+                "digest": format!("sha256:{scan_digest}"),
+                "content_type": "application/octet-stream",
+                "size": scan_payload.len(),
+                "state": "uploaded",
+            }],
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/bw-design-group/ignition-project-scan-endpoint/releases/tags/v1.0.0",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(release_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/download/Project-Scan-Endpoint.modl",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(scan_payload.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // If `git` were ever re-fetched, THIS path would be hit — it
+        // isn't mounted at all, so any request to it 404s and the test
+        // would fail loudly rather than silently re-downloading.
+
+        let feed = ModuleFeed::for_base(server.uri().parse().expect("server uri parses"))
+            .expect("feed builds");
+
+        let mut declared = BTreeMap::new();
+        declared.insert(
+            "git".to_string(),
+            ModuleDeclaration {
+                version: "2.3.4".to_string(),
+            },
+        );
+        declared.insert(
+            "project-scan-endpoint".to_string(),
+            ModuleDeclaration {
+                version: "1.0.0".to_string(),
+            },
+        );
+
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &declared,
+            cache_root.path(),
+            FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("mixed cache/fetch provisioning succeeds");
+
+        assert_eq!(provisioning.modules.len(), 2);
+        let git_outcome = provisioning
+            .modules
+            .iter()
+            .find(|m| m.id == "git")
+            .expect("git provisioned");
+        assert_eq!(
+            git_outcome.source,
+            ArtifactSource::Cache,
+            "the pre-seeded module must be a cache hit, never re-fetched"
+        );
+        let scan_outcome = provisioning
+            .modules
+            .iter()
+            .find(|m| m.id == "project-scan-endpoint")
+            .expect("project-scan-endpoint provisioned");
+        assert_eq!(
+            scan_outcome.source,
+            ArtifactSource::Download,
+            "the missing module must be freshly downloaded"
+        );
+
+        let contents = std::fs::read_to_string(
+            provisioning
+                .override_file
+                .as_ref()
+                .expect("override written"),
+        )
+        .expect("read override");
+        assert!(contents.contains("git.modl") && contents.contains("project-scan-endpoint.modl"));
+        // wiremock's `.expect(1)` mounts assert on drop (server teardown
+        // at end of scope) — an unmet or exceeded expectation panics.
     }
 }
