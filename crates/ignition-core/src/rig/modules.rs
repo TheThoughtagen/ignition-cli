@@ -153,6 +153,27 @@ fn override_path(plan: &RigPlan) -> Result<PathBuf, CoreError> {
     })
 }
 
+/// The pre-existing override on disk for `plan` (D-10), for verbs that
+/// NEVER provision — `rig down`, `rig status`, `rig logs` (Task 3). These
+/// verbs never fetch and never write, so the file's presence on disk IS
+/// the whole truth about what the last `up` used. Returns the absolute
+/// path ONLY when it exists AND is a regular file; any other state
+/// (absent, a directory, or a path-computation failure) is `None` —
+/// never a refusal, because these verbs must keep working on a rig that
+/// has never provisioned a module at all.
+///
+/// A stale override surviving into a `down` is harmless: it only adds a
+/// read-only mount to a service that is about to be removed. The next
+/// `up` (through [`provision_modules`]) deletes it per D-08's tri-state
+/// if nothing is declared, or regenerates it whole if something still
+/// is — so a file this function finds never accumulates stale state
+/// across cycles.
+pub fn existing_override(plan: &RigPlan) -> Option<PathBuf> {
+    let path = override_path(plan).ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if metadata.is_file() { Some(path) } else { None }
+}
+
 /// Write, overwrite whole, or remove the override for `plan` — D-08's
 /// tri-state, completed in Task 2 (RMOD-06):
 ///

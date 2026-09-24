@@ -41,7 +41,7 @@ use crate::rig::compose::{
     parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
     up_args, volume_ls_args,
 };
-use crate::rig::modules::{ModuleProvisioning, ProvisionedModule};
+use crate::rig::modules::{ModuleProvisioning, ProvisionedModule, existing_override};
 use crate::rig::{RigPlan, port_preflight};
 
 /// Default wait budget for BOTH `up --wait-timeout` and the
@@ -310,12 +310,19 @@ async fn commissioned_wait(
 
 /// `ign rig down`: version gate → `down --remove-orphans` (volumes
 /// KEPT — the `-v` teardown half belongs to `rig reset`, 04-02).
+///
+/// `rig down` never provisions (Phase 16, Task 3) — it derives its
+/// override from what [`existing_override`] finds on disk, which is the
+/// whole truth about what the last `up` used. An undeclared rig (or one
+/// whose override was already deleted) finds nothing and reproduces the
+/// pre-Phase-16 vector exactly (SC-1).
 pub async fn rig_down(
     runner: &dyn ComposeRunner,
     plan: &RigPlan,
 ) -> Result<RigDownResult, CoreError> {
     compose_version(runner).await?;
-    let output = runner.run(&down_args(plan, false)).await;
+    let override_files: Vec<PathBuf> = existing_override(plan).into_iter().collect();
+    let output = runner.run(&down_args(plan, false, &override_files)).await;
     check_output(&output, "docker compose down")?;
     Ok(RigDownResult {
         rig: plan.name.clone(),
@@ -362,8 +369,12 @@ pub async fn rig_reset(
     // 2. Fail fast on a missing/too-old compose.
     compose_version(runner).await?;
 
-    // 3. Teardown: down -v --remove-orphans (volumes die here).
-    let output = runner.run(&down_args(plan, true)).await;
+    // 3. Teardown: down -v --remove-orphans (volumes die here). The SAME
+    //    override file set as the up half below — resolved once by the
+    //    caller before this cycle started (SC-3's mechanism half).
+    let output = runner
+        .run(&down_args(plan, true, provisioning.override_files()))
+        .await;
     check_output(&output, "docker compose down")?;
 
     // 4. Port pre-flight with fresh eyes — between the halves.
@@ -672,7 +683,10 @@ pub async fn rig_logs(
     service: Option<&str>,
     sink: &mut (dyn FnMut(String) + Send),
 ) -> Result<RigLogsResult, CoreError> {
-    let args = logs_args(plan, tail, follow, service);
+    // `rig logs` never provisions (Phase 16, Task 3) — same disk-derived
+    // override discipline as `rig_down`/`rig_status`.
+    let override_files: Vec<PathBuf> = existing_override(plan).into_iter().collect();
+    let args = logs_args(plan, tail, follow, service, &override_files);
     let mut streamed = 0usize;
     let output = if follow {
         // Follow: streamed through the runner's piped-stdout shape;
@@ -984,7 +998,10 @@ pub async fn rig_status(
 ) -> Result<RigStatusResult, CoreError> {
     compose_version(runner).await?;
 
-    let ps = runner.run(&ps_args(plan)).await;
+    // `rig status` never provisions (Phase 16, Task 3) — the override
+    // it passes (if any) is whatever `existing_override` finds on disk.
+    let override_files: Vec<PathBuf> = existing_override(plan).into_iter().collect();
+    let ps = runner.run(&ps_args(plan, &override_files)).await;
     let rows = parse_ps_ldjson(check_output(&ps, "docker compose ps")?);
 
     let volume_ls = runner.run_docker(&volume_ls_args(&plan.name)).await;
@@ -1504,7 +1521,10 @@ mod tests {
             "RigDownResult shape (all keys always)"
         );
         let calls = runner.calls();
-        assert_eq!(calls[1], ("docker compose", down_args(&gw_plan(), false)));
+        assert_eq!(
+            calls[1],
+            ("docker compose", down_args(&gw_plan(), false, &[]))
+        );
     }
 
     #[tokio::test]
@@ -1739,7 +1759,10 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(
             calls,
-            vec![("docker compose", logs_args(&gw_plan(), 200, false, None))]
+            vec![(
+                "docker compose",
+                logs_args(&gw_plan(), 200, false, None, &[])
+            )]
         );
     }
 
@@ -1766,7 +1789,7 @@ mod tests {
             calls,
             vec![(
                 "docker compose",
-                logs_args(&gw_plan(), 50, true, Some("ignition"))
+                logs_args(&gw_plan(), 50, true, Some("ignition"), &[])
             )]
         );
     }

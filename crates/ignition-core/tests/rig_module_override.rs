@@ -10,13 +10,17 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use async_trait::async_trait;
+use ignition_core::actions::rig::{rig_down, rig_up};
 use ignition_core::config::ModuleDeclaration;
 use ignition_core::module::GIT_MODULE;
 use ignition_core::module::fetch::{ArtifactSource, FetchPolicy, ModuleFeed};
 use ignition_core::rig::modules::preflight_mount_source;
 use ignition_core::rig::{
-    MountedModule, OVERRIDE_FILENAME, RigPlan, generate_override, provision_modules, write_override,
+    ComposeOutput, ComposeRunner, ModuleProvisioning, MountedModule, OVERRIDE_FILENAME, RigPlan,
+    existing_override, generate_override, provision_modules, write_override,
 };
 
 use sha2::{Digest, Sha256};
@@ -501,4 +505,226 @@ async fn provisioned_artifact_is_readable_by_a_non_root_container_user() {
         "provisioning through the normal cache-hit path must leave the artifact \
          group+world readable (mode {mode:o})"
     );
+}
+
+// ---------------------------------------------------------------------
+// Task 3: one `-f` helper for all four builders, and the down-then-up
+// durability proof (SC-1, SC-3 mechanism half).
+// ---------------------------------------------------------------------
+
+/// Records every `(program, args)` call, in order; every call succeeds
+/// with an empty (or, for `version`, parseable) stdout — sufficient for
+/// the durability test below, where only the ARGUMENT VECTORS
+/// `rig_up`/`rig_down` build matter, never response parsing.
+#[derive(Default)]
+struct RecordingRunner {
+    calls: Mutex<Vec<(&'static str, Vec<String>)>>,
+}
+
+impl RecordingRunner {
+    fn calls(&self) -> Vec<(&'static str, Vec<String>)> {
+        self.calls.lock().expect("call log lock").clone()
+    }
+}
+
+fn version_output() -> ComposeOutput {
+    ComposeOutput {
+        stdout: "Docker Compose version v2.24.0\n".to_string(),
+        stderr: String::new(),
+        code: 0,
+    }
+}
+
+fn ok_output() -> ComposeOutput {
+    ComposeOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        code: 0,
+    }
+}
+
+#[async_trait]
+impl ComposeRunner for RecordingRunner {
+    async fn run(&self, args: &[String]) -> ComposeOutput {
+        let is_version = args.first().map(String::as_str) == Some("version");
+        self.calls
+            .lock()
+            .expect("call log lock")
+            .push(("docker compose", args.to_vec()));
+        if is_version {
+            version_output()
+        } else {
+            ok_output()
+        }
+    }
+
+    async fn run_docker(&self, args: &[String]) -> ComposeOutput {
+        self.calls
+            .lock()
+            .expect("call log lock")
+            .push(("docker", args.to_vec()));
+        ok_output()
+    }
+
+    async fn run_streaming(
+        &self,
+        args: &[String],
+        _line_sink: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> ComposeOutput {
+        self.calls
+            .lock()
+            .expect("call log lock")
+            .push(("docker compose", args.to_vec()));
+        ok_output()
+    }
+}
+
+/// `rig_down`/`rig_status`/`rig_logs` never provision — they derive
+/// their override purely from [`existing_override`]'s read of the
+/// project directory (Task 3). Exercised directly against the function
+/// itself: absent → `None`; a PRE-EXISTING file left by a run this test
+/// process never made → found; a DIRECTORY occupying the override's
+/// path (the same on-disk shape Pitfall 1 describes on the write side)
+/// → never mistaken for a real override.
+#[test]
+fn down_uses_the_override_found_on_disk() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+
+    assert_eq!(
+        existing_override(&plan),
+        None,
+        "no override file on disk → None"
+    );
+
+    // A PRE-EXISTING override — `write_override` here stands in for a
+    // PRIOR run's `up` that this test process never itself drove
+    // through `rig_up` (the Phase-15-inherited test-matrix rule:
+    // pre-existing on-disk state, not only freshly created state).
+    let mount = MountedModule {
+        spec: &GIT_MODULE,
+        version: "2.3.4".to_string(),
+        source: PathBuf::from("/cache/modules/git/2.3.4-deadbeef.modl"),
+        source_kind: ArtifactSource::Cache,
+    };
+    let written = write_override(&plan, "ignition", std::slice::from_ref(&mount))
+        .expect("seed a pre-existing override")
+        .expect("mounts were non-empty");
+
+    assert_eq!(
+        existing_override(&plan),
+        Some(written.clone()),
+        "a pre-existing override on disk must be found"
+    );
+
+    // A directory at the override's path must never be mistaken for a
+    // real override — the same is_file discipline `write_override`'s
+    // own pre-write guard already uses, applied here to the read side.
+    std::fs::remove_file(&written).expect("remove the file override");
+    std::fs::create_dir_all(&written).expect("seed a directory at the override's path");
+    assert_eq!(
+        existing_override(&plan),
+        None,
+        "a directory occupying the override's path must never be mistaken for a real override"
+    );
+}
+
+/// SC-3's mechanism half: a `rig_up` / `rig_down` / `rig_up` sequence
+/// records the SAME override path in all three compose invocations, and
+/// the override file is still on disk BETWEEN them — provable without
+/// Docker. `rig_up` threads the override through the `ModuleProvisioning`
+/// the caller already resolved; `rig_down` never provisions and instead
+/// derives it from what [`existing_override`] finds on disk — which is
+/// exactly the override `write_override` seeds BEFORE this test's first
+/// `rig_up` even runs (a PRE-EXISTING file, never one freshly written
+/// mid-sequence by this test).
+///
+/// The assertion after the `down` call is the one that would fail if
+/// anything ever deleted the override as a side effect of teardown —
+/// `rig_down` only reads the file's presence; it must never write or
+/// remove it.
+#[tokio::test]
+async fn down_then_up_passes_the_same_override_file() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+
+    let mount = MountedModule {
+        spec: &GIT_MODULE,
+        version: "2.3.4".to_string(),
+        source: PathBuf::from("/cache/modules/git/2.3.4-deadbeef.modl"),
+        source_kind: ArtifactSource::Cache,
+    };
+    let override_path = write_override(&plan, "ignition", std::slice::from_ref(&mount))
+        .expect("seed a pre-existing override, as if a prior `up` provisioned it")
+        .expect("mounts were non-empty, so a path must come back");
+    assert!(
+        override_path.exists(),
+        "precondition: the override must exist before the sequence starts"
+    );
+
+    let provisioning = ModuleProvisioning {
+        override_file: Some(override_path.clone()),
+        modules: Vec::new(),
+    };
+
+    let runner = RecordingRunner::default();
+
+    rig_up(&runner, &plan, 300, None, &provisioning)
+        .await
+        .expect("first up succeeds");
+    assert!(
+        override_path.exists(),
+        "the override must still be on disk immediately after the first up"
+    );
+
+    rig_down(&runner, &plan).await.expect("down succeeds");
+    assert!(
+        override_path.exists(),
+        "the override must survive `rig_down` — teardown must never delete it \
+         (this is the assertion that would fail if teardown ever deleted it \
+         as a side effect)"
+    );
+
+    rig_up(&runner, &plan, 300, None, &provisioning)
+        .await
+        .expect("second up succeeds");
+    assert!(
+        override_path.exists(),
+        "the override must still be on disk after the second up"
+    );
+
+    let calls = runner.calls();
+    // version, up, version, down, version, up — base_plan's fixture
+    // declares no host_ports, so port_preflight makes zero calls on
+    // either side of the cycle.
+    assert_eq!(calls.len(), 6, "exactly the six scripted calls: {calls:?}");
+
+    let override_str = override_path.display().to_string();
+    let base_str = plan.compose_file.display().to_string();
+
+    for (label, args) in [
+        ("first up", &calls[1].1),
+        ("down", &calls[3].1),
+        ("second up", &calls[5].1),
+    ] {
+        let override_index = args
+            .iter()
+            .position(|arg| arg == &override_str)
+            .unwrap_or_else(|| panic!("{label} call is missing the override -f arg: {args:?}"));
+        let base_index = args
+            .iter()
+            .position(|arg| arg == &base_str)
+            .unwrap_or_else(|| panic!("{label} call is missing the base -f arg: {args:?}"));
+        assert!(
+            override_index > base_index,
+            "{label}: the override's -f must come AFTER the base file's -f \
+             (D-11 — an override landing first would invert compose's merge \
+             precedence): {args:?}"
+        );
+        assert_eq!(
+            args[override_index - 1],
+            "-f",
+            "{label}: the override path must be immediately preceded by its own -f flag: {args:?}"
+        );
+    }
 }
