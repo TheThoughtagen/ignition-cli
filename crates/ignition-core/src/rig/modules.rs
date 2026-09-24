@@ -153,22 +153,53 @@ fn override_path(plan: &RigPlan) -> Result<PathBuf, CoreError> {
     })
 }
 
-/// Write (or, once Task 2 lands, remove) the override for `plan`.
+/// Write, overwrite whole, or remove the override for `plan` — D-08's
+/// tri-state, completed in Task 2 (RMOD-06):
 ///
-/// With a non-empty `mounts`, computes the absolute override path (D-10)
-/// and writes [`generate_override`]'s output, returning `Some(path)`. The
-/// empty-mounts tri-state (deleting a pre-existing override, tolerating
-/// `NotFound`) is Task 2's addition (D-08) — for now the empty case is a
-/// no-op returning `Ok(None)`.
+/// - `mounts` non-empty: computes the absolute override path (D-10),
+///   refuses BEFORE writing if something other than a regular file
+///   already occupies it (never a swallowed write error), then writes
+///   [`generate_override`]'s output WHOLE — replacing anything a
+///   previous run left behind, never merged or appended — and returns
+///   `Some(path)`.
+/// - `mounts` empty: removes a pre-existing override, tolerating
+///   `NotFound` (a second run against an already-absent file is still
+///   `Ok`), and returns `None`. This is the delete half of RMOD-06: an
+///   undeclared rig must never leave a stale mount behind (research
+///   Pitfall 4).
+///
+/// After this call returns, the override's `-f` is only ever passed for
+/// a path this run either wrote or found (D-08) — never an empty-but-
+/// present file.
 pub fn write_override(
     plan: &RigPlan,
     service: &str,
     mounts: &[MountedModule],
 ) -> Result<Option<PathBuf>, CoreError> {
-    if mounts.is_empty() {
-        return Ok(None);
-    }
     let path = override_path(plan)?;
+
+    if mounts.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(CoreError::Rig(format!(
+                "cannot remove stale module override at {}: {err}",
+                path.display()
+            ))),
+        };
+    }
+
+    if let Ok(metadata) = std::fs::metadata(&path)
+        && !metadata.is_file()
+    {
+        return Err(CoreError::Rig(format!(
+            "cannot write module override at {} — something other than a \
+             regular file already occupies that path; remove it by hand \
+             and re-run `ign rig up`",
+            path.display()
+        )));
+    }
+
     let contents = generate_override(service, mounts);
     std::fs::write(&path, contents).map_err(|err| {
         CoreError::Rig(format!(
@@ -177,6 +208,50 @@ pub fn write_override(
         ))
     })?;
     Ok(Some(path))
+}
+
+/// Pre-flight a declared module's mount source BEFORE it becomes a
+/// [`MountedModule`] and before generation or the runner ever sees it
+/// (Task 2; Pitfalls 1 and 7; T-16-02). Checked in THIS order — a
+/// relative path that happens to resolve under the current directory
+/// must be refused for BEING relative, not accepted because it
+/// resolved:
+///
+/// 1. `source` is absolute.
+/// 2. `std::fs::metadata(source)` succeeds (the path is accessible).
+/// 3. the metadata reports a regular file, not a directory — a missing
+///    bind-mount source silently becomes an empty DIRECTORY on both
+///    host and container (reproduced live in 16-RESEARCH.md), leaving a
+///    rig that boots healthy with no module ever loaded.
+///
+/// Every failure is [`CoreError::Rig`] (exit 7, D-13) naming the module
+/// id and the offending path, with an actionable next step.
+pub fn preflight_mount_source(id: &str, source: &Path) -> Result<(), CoreError> {
+    if !source.is_absolute() {
+        return Err(CoreError::Rig(format!(
+            "module {id:?} artifact path {} is not absolute — ign refuses \
+             to mount a relative path (it would resolve against compose's \
+             own working directory, not this cached artifact)",
+            source.display()
+        )));
+    }
+    let metadata = std::fs::metadata(source).map_err(|err| {
+        CoreError::Rig(format!(
+            "module {id:?} artifact at {} is not accessible: {err} — the \
+             cache entry is missing; re-run `ign rig up` to re-fetch it",
+            source.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(CoreError::Rig(format!(
+            "module {id:?} artifact path {} is not a regular file (found a \
+             directory) — a missing or corrupted bind-mount source \
+             silently becomes an empty directory on both host and \
+             container; remove it and re-run `ign rig up` to re-fetch",
+            source.display()
+        )));
+    }
+    Ok(())
 }
 
 /// One provisioned module — the `ign rig up`/`reset` result-data shape
@@ -223,16 +298,27 @@ impl ModuleProvisioning {
 }
 
 /// Resolve, fetch, pre-flight, generate, and write the override for every
-/// module `declared` on `plan` (D-14): the happy path only — registry
-/// lookups, pre-flight refusals, and the service-underivable refusal are
-/// Task 2. Iterates `declared` in `BTreeMap` (sorted-by-id) order, which
-/// is what keeps [`generate_override`]'s `ModuleSpec::id` ordering
-/// deterministic end to end without an extra sort at this layer.
+/// module `declared` on `plan` (D-14). Iterates `declared` in
+/// `BTreeMap` (sorted-by-id) order, which is what keeps
+/// [`generate_override`]'s `ModuleSpec::id` ordering deterministic end
+/// to end without an extra sort at this layer.
 ///
-/// `feed`/`cache_root`/`policy` thread straight into
-/// [`crate::module::fetch::ModuleFeed::fetch_and_verify`] — this function
-/// never re-chmods, re-hashes, or re-verifies anything Phase 15 already
-/// owns (D-04).
+/// The no-declaration case (`declared.is_empty()`) returns
+/// [`ModuleProvisioning::default`] WITHOUT touching service resolution
+/// at all — a rig that publishes no gateway port and declares no module
+/// must still provision cleanly (SC-1). With at least one module
+/// declared, the service is resolved FIRST (before any fetch): `plan.
+/// gateway_service` already carries `RigEntry::module_service`'s
+/// precedence over the derived value, folded in by `resolve_entry`
+/// (Task 1, D-12) — `None` here is refused (Task 2), naming the rig's
+/// services and the config key that fixes it. Each declared id is then
+/// looked up ([`CoreError::ModuleNotRegistered`], Task 2, D-13, exit 3
+/// — a well-formed id that simply isn't registered is a config problem,
+/// never a silent skip), fetched through Phase 15's
+/// [`crate::module::fetch::ModuleFeed::fetch_and_verify`] (never
+/// re-chmodded, re-hashed, or re-verified here — D-04), and
+/// pre-flighted ([`preflight_mount_source`], Task 2) before it ever
+/// becomes a [`MountedModule`].
 pub async fn provision_modules(
     feed: &ModuleFeed,
     plan: &RigPlan,
@@ -257,14 +343,19 @@ pub async fn provision_modules(
     let mut provisioned: Vec<ProvisionedModule> = Vec::new();
     for (id, declaration) in declared {
         let spec = crate::module::spec_for(id).ok_or_else(|| {
-            let known: Vec<&str> = crate::module::MODULES.iter().map(|s| s.id).collect();
-            CoreError::Rig(format!(
-                "declared module {id:?} is not registered (known modules: {known:?})"
-            ))
+            let known: Vec<String> = crate::module::MODULES
+                .iter()
+                .map(|s| s.id.to_string())
+                .collect();
+            CoreError::ModuleNotRegistered {
+                id: id.clone(),
+                known,
+            }
         })?;
         let fetched = feed
             .fetch_and_verify(spec, &declaration.version, cache_root, policy)
             .await?;
+        preflight_mount_source(spec.id, &fetched.path)?;
         mounts.push(MountedModule {
             spec,
             version: declaration.version.clone(),
