@@ -34,6 +34,16 @@ pub struct ModuleSpec {
     pub tag_template: &'static str,
     /// The release asset filename shape, e.g. `Git-{version}-signed.modl`.
     pub asset_template: &'static str,
+    /// The value the GATEWAY's own acceptance variables
+    /// (`ACCEPT_MODULE_CERTS`/`ACCEPT_MODULE_LICENSES`) must name — read
+    /// from the artifact's own `module.xml`, NOT derivable from
+    /// [`Self::id`] (Phase 16, D-03). The two ids are different SHAPES:
+    /// `id` is a short cache-dir/mount-basename slug (`[a-z0-9-]{1,32}`,
+    /// `validate_module_id`-constrained), while `gateway_module_id` may be
+    /// reverse-DNS (`com.axone_io.ignition.git`) or a bare slug
+    /// (`project-scan-endpoint`) depending on the module — never
+    /// interchanged.
+    pub gateway_module_id: &'static str,
 }
 
 impl ModuleSpec {
@@ -57,6 +67,9 @@ pub const GIT_MODULE: ModuleSpec = ModuleSpec {
     repo: "WhiskeyHouse/ignition-git-module",
     tag_template: "v{version}",
     asset_template: "Git-{version}-signed.modl",
+    // Verified from the artifact's own module.xml (Phase 16, D-03):
+    // reverse-DNS, requires Ignition 8.3.1.
+    gateway_module_id: "com.axone_io.ignition.git",
 };
 
 /// The module registry — one entry today. Phase 16's second module
@@ -227,6 +240,15 @@ mod tests {
     fn module_spec_substitutes_version() {
         assert_eq!(GIT_MODULE.tag("2.3.4"), "v2.3.4");
         assert_eq!(GIT_MODULE.asset_name("2.3.4"), "Git-2.3.4-signed.modl");
+    }
+
+    /// Standing guard (D-03): `id` (the cache-dir/mount-basename slug)
+    /// and `gateway_module_id` (the gateway's acceptance-variable value)
+    /// are DIFFERENT SHAPES and must never collapse into one field.
+    #[test]
+    fn git_module_id_and_gateway_module_id_are_not_equal() {
+        assert_ne!(GIT_MODULE.id, GIT_MODULE.gateway_module_id);
+        assert_eq!(GIT_MODULE.gateway_module_id, "com.axone_io.ignition.git");
     }
 
     #[test]

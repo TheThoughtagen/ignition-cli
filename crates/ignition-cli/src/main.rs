@@ -2060,17 +2060,30 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> = probe
                             .as_ref()
                             .map(|session| session.api() as &dyn ignition_core::client::GatewayApi);
+                        // Phase 16 module provisioning is not yet wired
+                        // through the CLI (plan 16-02 owns the verb) —
+                        // the default carries no override, reproducing
+                        // today's behavior byte-for-byte (SC-1).
+                        let provisioning = ignition_core::rig::ModuleProvisioning::default();
                         match command {
-                            RigCommand::Up { timeout } => {
-                                actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
-                                    .await
-                                    .map(ActionOutput::RigUp)
-                            }
-                            RigCommand::Reset { timeout } => {
-                                actions::rig::rig_reset(&runner, &plan, timeout, probe_dyn)
-                                    .await
-                                    .map(ActionOutput::RigReset)
-                            }
+                            RigCommand::Up { timeout } => actions::rig::rig_up(
+                                &runner,
+                                &plan,
+                                timeout,
+                                probe_dyn,
+                                &provisioning,
+                            )
+                            .await
+                            .map(ActionOutput::RigUp),
+                            RigCommand::Reset { timeout } => actions::rig::rig_reset(
+                                &runner,
+                                &plan,
+                                timeout,
+                                probe_dyn,
+                                &provisioning,
+                            )
+                            .await
+                            .map(ActionOutput::RigReset),
                             _ => unreachable!("guarded by the outer match arm"),
                         }
                     }
