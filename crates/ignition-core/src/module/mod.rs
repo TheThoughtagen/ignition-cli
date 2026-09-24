@@ -72,9 +72,44 @@ pub const GIT_MODULE: ModuleSpec = ModuleSpec {
     gateway_module_id: "com.axone_io.ignition.git",
 };
 
-/// The module registry — one entry today. Phase 16's second module
-/// registers through this seam; nothing else grows here in Phase 15.
-pub const MODULES: &[ModuleSpec] = &[GIT_MODULE];
+/// The `ignition-project-scan-endpoint` release feed (Phase 16,
+/// 16-02-PLAN.md — verified live this session, not re-derived):
+/// `bw-design-group/ignition-project-scan-endpoint`, release `v1.0.0`,
+/// asset `Project-Scan-Endpoint.modl` (30,150 bytes, sha256
+/// `f0ffb9cf90f0dfb55647080399c4699a32d6ded0387e0142b7c1cb6212806722`),
+/// signed (the release archive carries `certificates.p7b` and
+/// `signatures.properties`).
+///
+/// Deliberately the phase's falsification target for SC-5: a DIFFERENT
+/// GitHub org than [`GIT_MODULE`], an asset filename that carries NO
+/// version token (the same filename is published on every release, so
+/// [`ModuleSpec::asset_name`]'s `{version}` substitution is a harmless
+/// no-op here — no special-casing was needed to support it), and a
+/// BARE-SLUG `gateway_module_id` rather than reverse-DNS.
+///
+/// `id`/`gateway_module_id` are verified from the artifact's own
+/// `module.xml` (`<id>project-scan-endpoint</id>`), NOT derived from
+/// GitHub release metadata — release metadata only tells you the
+/// tag/asset shape, never what the gateway's own acceptance variables
+/// must name. Requires Ignition **8.3.0** (`module.xml`'s
+/// `requiredIgnitionVersion`) — one minor version LOWER than
+/// [`GIT_MODULE`]'s 8.3.1 floor; a rig combining both modules needs the
+/// higher of the two.
+pub const PROJECT_SCAN_ENDPOINT: ModuleSpec = ModuleSpec {
+    id: "project-scan-endpoint",
+    repo: "bw-design-group/ignition-project-scan-endpoint",
+    tag_template: "v{version}",
+    asset_template: "Project-Scan-Endpoint.modl",
+    gateway_module_id: "project-scan-endpoint",
+};
+
+/// The module registry — TWO entries as of Phase 16, Plan 02:
+/// [`GIT_MODULE`] (Phase 15) and [`PROJECT_SCAN_ENDPOINT`], registered
+/// through the identical seam to prove the registry abstraction holds
+/// (SC-5) rather than merely asserting it. A third module registers
+/// here the same way; nothing else in the provisioning path should ever
+/// need to change for it.
+pub const MODULES: &[ModuleSpec] = &[GIT_MODULE, PROJECT_SCAN_ENDPOINT];
 
 /// Look up a registered module by [`ModuleSpec::id`].
 pub fn spec_for(id: &str) -> Option<&'static ModuleSpec> {
@@ -232,8 +267,8 @@ pub fn cached_entry(root: &Path, module_id: &str, version: &str) -> Option<Cache
 #[cfg(test)]
 mod tests {
     use super::{
-        GIT_MODULE, MODULES, cached_entry, module_cache_dir, spec_for, validate_module_id,
-        validate_version,
+        GIT_MODULE, MODULES, PROJECT_SCAN_ENDPOINT, cached_entry, module_cache_dir, spec_for,
+        validate_module_id, validate_version,
     };
 
     #[test]
@@ -242,20 +277,79 @@ mod tests {
         assert_eq!(GIT_MODULE.asset_name("2.3.4"), "Git-2.3.4-signed.modl");
     }
 
-    /// Standing guard (D-03): `id` (the cache-dir/mount-basename slug)
-    /// and `gateway_module_id` (the gateway's acceptance-variable value)
-    /// are DIFFERENT SHAPES and must never collapse into one field.
+    /// D-03 (16-01 plan lock): the Git module's registry slug and
+    /// gateway id are DIFFERENT (reverse-DNS), while the second
+    /// module's slug and gateway id happen to COINCIDE (both bare
+    /// slugs). Asserted for BOTH entries — deliberately by name, the
+    /// ONE place in the registry tests an entry is singled out rather
+    /// than iterated — so a future refactor that collapses `id` and
+    /// `gateway_module_id` into one field fails on the Git module
+    /// rather than silently passing on the one where they look alike
+    /// (16-RESEARCH.md Pitfall 5).
     #[test]
-    fn git_module_id_and_gateway_module_id_are_not_equal() {
+    fn git_module_ids_differ_and_second_module_ids_coincide() {
         assert_ne!(GIT_MODULE.id, GIT_MODULE.gateway_module_id);
         assert_eq!(GIT_MODULE.gateway_module_id, "com.axone_io.ignition.git");
+
+        assert_eq!(
+            PROJECT_SCAN_ENDPOINT.id,
+            PROJECT_SCAN_ENDPOINT.gateway_module_id
+        );
+        assert_eq!(
+            PROJECT_SCAN_ENDPOINT.gateway_module_id,
+            "project-scan-endpoint"
+        );
     }
 
+    /// SC-5: the registry is generic, not Git-module-shaped — proven by
+    /// iterating [`MODULES`] itself rather than naming either entry, so
+    /// a third registered module is covered by this test the day it is
+    /// added.
     #[test]
-    fn registry_finds_git_module() {
+    fn registry_holds_both_modules() {
+        assert_eq!(MODULES.len(), 2, "exactly two modules registered so far");
         assert!(MODULES.contains(&GIT_MODULE));
-        assert_eq!(spec_for("git").map(|spec| spec.id), Some("git"));
+        assert!(MODULES.contains(&PROJECT_SCAN_ENDPOINT));
+
+        for spec in MODULES {
+            assert_eq!(
+                spec_for(spec.id).map(|found| found.id),
+                Some(spec.id),
+                "{} must resolve via spec_for",
+                spec.id
+            );
+            assert!(
+                validate_module_id(spec.id).is_ok(),
+                "{} must pass validate_module_id",
+                spec.id
+            );
+            assert!(
+                !spec.gateway_module_id.is_empty(),
+                "{}'s gateway_module_id must be non-empty",
+                spec.id
+            );
+        }
+
         assert!(spec_for("nope").is_none());
+    }
+
+    /// SC-5, plan Task 1 item 2: the second module's asset filename
+    /// carries NO version token — the falsifiable proof that
+    /// [`super::ModuleSpec::asset_name`]'s `{version}` substitution is a
+    /// harmless no-op for it, rather than something that needed a
+    /// special case to support.
+    #[test]
+    fn second_module_asset_template_carries_no_version() {
+        assert_eq!(
+            PROJECT_SCAN_ENDPOINT.asset_name("1.0.0"),
+            PROJECT_SCAN_ENDPOINT.asset_name("2.0.0"),
+            "a version-less asset template must substitute to the identical \
+             filename regardless of which version is requested"
+        );
+        assert_eq!(
+            PROJECT_SCAN_ENDPOINT.asset_name("1.0.0"),
+            "Project-Scan-Endpoint.modl"
+        );
     }
 
     // cache_root()'s IGNITION_CLI_CACHE env-override seam is exercised by

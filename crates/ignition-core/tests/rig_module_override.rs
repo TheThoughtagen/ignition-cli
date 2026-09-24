@@ -15,8 +15,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use ignition_core::actions::rig::{rig_down, rig_up};
 use ignition_core::config::ModuleDeclaration;
-use ignition_core::module::GIT_MODULE;
 use ignition_core::module::fetch::{ArtifactSource, FetchPolicy, ModuleFeed};
+use ignition_core::module::{GIT_MODULE, MODULES};
 use ignition_core::rig::modules::preflight_mount_source;
 use ignition_core::rig::{
     ComposeOutput, ComposeRunner, ModuleProvisioning, MountedModule, OVERRIDE_FILENAME, RigPlan,
@@ -284,6 +284,79 @@ async fn unknown_module_id_lists_known_ids() {
     );
 
     assert!(!project_dir.path().join(OVERRIDE_FILENAME).exists());
+}
+
+/// SC-5, 16-02 plan Task 1 item 7: the SAME `provision_modules` call,
+/// with a pre-seeded cache, produces a correct `ProvisionedModule` for
+/// EVERY entry in the registry — proven by iterating [`MODULES`]
+/// itself rather than naming either module by hand, so a third
+/// registry entry is covered by this test the day it is added. No
+/// per-module branch exists anywhere in `provision_modules`'s own
+/// source (the SC-5 structural grep gate proves that statically); this
+/// test proves the same claim dynamically, for real inputs.
+#[tokio::test]
+async fn provisioning_is_registry_driven_for_both_modules() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let cache_root = tempfile::tempdir().expect("cache tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+
+    let mut declared: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    let mut expected_versions: BTreeMap<&str, String> = BTreeMap::new();
+    for (index, spec) in MODULES.iter().enumerate() {
+        let version = format!("1.{index}.0");
+        let payload = format!("synthetic payload for {}", spec.id).into_bytes();
+        seed_cache_file(cache_root.path(), spec.id, &version, &payload);
+        declared.insert(
+            spec.id.to_string(),
+            ModuleDeclaration {
+                version: version.clone(),
+            },
+        );
+        expected_versions.insert(spec.id, version);
+    }
+
+    let provisioning = provision_modules(
+        &unroutable_feed(),
+        &plan,
+        &declared,
+        cache_root.path(),
+        FetchPolicy::CacheFirst,
+    )
+    .await
+    .expect("every registered module must provision from a pure cache hit");
+
+    assert_eq!(
+        provisioning.modules.len(),
+        MODULES.len(),
+        "every registry entry must have produced exactly one ProvisionedModule"
+    );
+    for spec in MODULES {
+        let found = provisioning
+            .modules
+            .iter()
+            .find(|module| module.id == spec.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} is missing from the provisioned list — this is the \
+                     registry-genericity proof failing",
+                    spec.id
+                )
+            });
+        assert_eq!(
+            &found.version,
+            expected_versions.get(spec.id).expect("seeded above")
+        );
+        assert_eq!(found.gateway_module_id, spec.gateway_module_id);
+        assert_eq!(
+            found.mount_target,
+            format!("/usr/local/bin/ignition/user-lib/modules/{}.modl", spec.id)
+        );
+    }
+
+    assert!(
+        project_dir.path().join(OVERRIDE_FILENAME).exists(),
+        "a successful multi-module provisioning run must write the override"
+    );
 }
 
 /// D-12: `None` is only fatal when service resolution is actually
