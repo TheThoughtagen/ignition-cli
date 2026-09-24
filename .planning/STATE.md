@@ -28,9 +28,9 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 
 ## Current Position
 
-Phase: 15-module-artifact-fetch-verify — COMPLETE (2/2 plans)
-Plan: — (next: Phase 16, 16-compose-override-module-injection)
-Status: Phase 15 complete; v1.3 in progress
+Phase: 16-compose-override-module-injection — IN PROGRESS (1/3 plans)
+Plan: 16-01 complete; next 16-02 (registry second module + CLI verb), then 16-03 (live gate)
+Status: Phase 16 mechanism proven Docker-free; SC-2 (a module actually loading) still unproven
 Last activity: 2026-09-21 - Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch
 
 ## Performance Metrics
