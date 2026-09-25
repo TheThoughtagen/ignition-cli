@@ -186,7 +186,7 @@ fn discovery_precedence_config_default_beats_cwd() {
     std::fs::write(
         &config,
         format!(
-            "[rig]\ndefault = \"remote\"\n\n[rigs.remote]\ncompose_file = \"{}\"\n",
+            "[rig]\ndefault = \"remote\"\n\n[rigs.remote]\ncompose_file = '{}'\n",
             remote_compose.display()
         ),
     )
@@ -600,7 +600,7 @@ fn rig_config_with_real_compose_file() -> (tempfile::TempDir, PathBuf, tempfile:
     std::fs::write(
         &config,
         format!(
-            "[rigs.fixture]\ncompose_file = \"{}\"\n",
+            "[rigs.fixture]\ncompose_file = '{}'\n",
             compose_file.display()
         ),
     )
@@ -873,7 +873,7 @@ fn rig_up_with_module_json_reports_provisioned_modules() {
     std::fs::write(
         &config,
         format!(
-            "[rigs.fixture]\ncompose_file = \"{}\"\nproject_name = \"{}\"\nmodule_service = \"app\"\n",
+            "[rigs.fixture]\ncompose_file = '{}'\nproject_name = '{}'\nmodule_service = \"app\"\n",
             compose_file.display(),
             project_name
         ),
