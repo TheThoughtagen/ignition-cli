@@ -549,6 +549,69 @@ still STARTING is a real exit-7 failure.
  "warnings": ["gateway uncommissioned — open http://localhost:9088/welcome in a browser and complete the commissioning wizard (no headless commissioning exists)"]}}
 ```
 
+### Rig modules — opt-in, signed, never automatic
+
+A rig can declare modules to provision. Nothing is installed unless you
+ask for it: a rig with no `modules` table behaves exactly as it always
+has.
+
+```toml
+[rigs.dev]
+compose_file = "docker/compose.yml"
+# Optional: only needed when the gateway service cannot be derived from
+# the compose file (ign picks the first service publishing a port
+# targeting 8088, then 443).
+# module_service = "gateway"
+
+[rigs.dev.modules.git]
+version = "2.3.4"
+
+[rigs.dev.modules.project-scan-endpoint]
+version = "1.0.0"
+```
+
+Registered modules:
+
+| Registry id | Source repository | Gateway module id | Min gateway |
+|---|---|---|---|
+| `git` | `WhiskeyHouse/ignition-git-module` | `com.axone_io.ignition.git` | 8.3.1 |
+| `project-scan-endpoint` | `bw-design-group/ignition-project-scan-endpoint` | `project-scan-endpoint` | 8.3.0 |
+
+The two rows differ in every column — including the gateway module id's
+shape (reverse-DNS vs bare slug), which is why it is a separate field
+rather than derived from the registry id. Only **signed** release
+artifacts are ever installed; `ign` will not build, sign, or fetch an
+unsigned module.
+
+**Trying one without editing config.** `--with-module ID@VERSION` on
+`rig up` and `rig reset` is repeatable and additive for that invocation
+only. A flag wins over a config declaration for the same id. There is
+deliberately no subtractive form — you cannot run *without* a
+config-declared module; remove it from config instead.
+
+```bash
+ign rig up --with-module project-scan-endpoint@1.0.0
+```
+
+**Fetch policy.** A verified artifact is cached by version, and a cache
+hit makes no network request. Two flags change that:
+
+| Flag | Effect |
+|---|---|
+| `--refresh` | Re-checks the feed for the pinned version. If upstream now publishes a different digest than the one cached, this REFUSES (exit 6) and names both digests; the cached artifact is left untouched. |
+| `--accept-upstream-change` | Accepts a changed upstream digest and caches the new bytes — which are still verified against the newly published digest. Never implied by `--refresh`: accepting a re-released artifact is a deliberate act. |
+
+**The override file.** `ign` writes `compose.ign-modules.yml` next to
+the rig's compose file and passes it as a second `-f`. That file is
+`ign`'s: it is regenerated whole on every provisioning run, never
+hand-merged. **`ign` never writes to the compose file you wrote.**
+Deleting `compose.ign-modules.yml` fully reverts module provisioning for
+that rig; the next `rig up` with nothing declared removes it for you.
+
+Provisioning **mounts** a module; it does not commission one. No
+repository, credential, or module configuration is supplied — a
+provisioned module is present and accepted by the gateway, not set up.
+
 ### `rig status` is an allowlist
 
 Status NEVER passes through `docker compose config`/`inspect` output —
