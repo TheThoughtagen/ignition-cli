@@ -605,8 +605,15 @@ hit makes no network request. Two flags change that:
 the rig's compose file and passes it as a second `-f`. That file is
 `ign`'s: it is regenerated whole on every provisioning run, never
 hand-merged. **`ign` never writes to the compose file you wrote.**
-Deleting `compose.ign-modules.yml` fully reverts module provisioning for
-that rig; the next `rig up` with nothing declared removes it for you.
+Deleting `compose.ign-modules.yml` stops the module being mounted, and the
+next `rig up` with nothing declared removes the file for you.
+
+**It does not uninstall the module from the gateway.** Ignition installs an
+accepted module into its own data directory, which lives in the rig's volume
+and outlives the mount — so a gateway that already loaded a module keeps
+reporting it after the override is gone (verified live, not inferred). To
+clear it today, `ign rig reset` removes the volume along with everything else
+in it.
 
 Provisioning **mounts** a module; it does not commission one. No
 repository, credential, or module configuration is supplied — a
