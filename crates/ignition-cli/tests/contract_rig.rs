@@ -833,7 +833,21 @@ fn refresh_and_accept_upstream_change_together_is_a_usage_error() {
 /// accept `up -d`/`down`, so the cheaper probe is enough and avoids a
 /// redundant `compose version` round-trip.
 fn docker_daemon_available() -> bool {
-    docker_compose_available()
+    if !docker_compose_available() {
+        return false;
+    }
+    // A reachable daemon is NOT enough: this test's fixture runs an
+    // `alpine` image, and a Windows-container daemon answers every probe
+    // happily and then fails the pull with "no matching manifest for
+    // windows(...)/amd64" (observed on CI's windows-latest). Ask what the
+    // daemon can actually RUN, not merely whether it is there.
+    std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Os}}"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "linux")
+        .unwrap_or(false)
 }
 
 /// RMOD-01 / the must_haves artifact table's "--json provisioning key"
