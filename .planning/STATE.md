@@ -28,9 +28,9 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 
 ## Current Position
 
-Phase: 16-compose-override-module-injection — IN PROGRESS (1/3 plans)
-Plan: 16-01 complete; next 16-02 (registry second module + CLI verb), then 16-03 (live gate)
-Status: Phase 16 mechanism proven Docker-free; SC-2 (a module actually loading) still unproven
+Phase: 16-compose-override-module-injection — IN PROGRESS (2/3 plans)
+Plan: 16-01 and 16-02 complete; next 16-03 (live gate, needs Docker, human checkpoint on evidence)
+Status: mechanism and CLI proven Docker-free. SC-2 (a module actually loading) still unproven, and three details are stable-but-unverified: the comma-joined ACCEPT_MODULE_* separator, the gateway_service heuristic, and SC-3's mount-survives-recreate half
 Last activity: 2026-09-21 - Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch
 
 ## Performance Metrics
