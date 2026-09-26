@@ -120,6 +120,31 @@ pub struct RigEntry {
     /// research Pattern 1); set only to override it deliberately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+    /// Declared third-party modules to inject via the generated compose
+    /// override (`[rigs.NAME.modules.*]`, Phase 16, D-01): a MAP, so a
+    /// rig can declare any number of modules, each pinned to its own
+    /// version. Empty by construction on every discovery path except
+    /// [`super::super::rig::resolve_entry`] — the structural reason
+    /// SC-1 (an undeclared rig behaves byte-identically to today) holds.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, ModuleDeclaration>,
+    /// Escape hatch (D-12) overriding the derived gateway service when
+    /// modules are declared: the DERIVED value (the first service
+    /// publishing a port targeting 8088/443) is used when this is
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_service: Option<String>,
+}
+
+/// One declared module under `[rigs.NAME.modules.ID]` (Phase 16, D-01):
+/// today just the pinned version, but its own table (not a bare string)
+/// so a future key never forces a shape migration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModuleDeclaration {
+    /// The pinned version string (validated by
+    /// [`crate::module::validate_version`] before use — this struct
+    /// carries it verbatim, unvalidated, exactly like `compose_file`).
+    pub version: String,
 }
 
 /// One gateway profile.
@@ -374,6 +399,52 @@ url = "http://localhost:9088/"
 "#;
         let config: Config = toml::from_str(toml).expect("parse");
         assert_eq!(config.ui.theme.as_deref(), Some("dark"));
+    }
+
+    /// SC-1's config-layer half (D-01/D-12): a `[rigs.NAME]` table with
+    /// no `[rigs.NAME.modules.*]` sub-table round-trips byte-identically
+    /// — `modules`/`module_service` never appear in the re-serialized
+    /// TOML when unset.
+    #[test]
+    fn rig_entry_without_modules_round_trips_byte_identically() {
+        let toml = "[rigs.dev]\ncompose_file = \"docker/compose.yml\"\n";
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(config.rigs["dev"].modules.is_empty());
+        assert_eq!(config.rigs["dev"].module_service, None);
+        // Compared against the FULL serialized config, not the input
+        // fragment: `toml::to_string` of a `Config` always emits the
+        // `[profiles]` table, so a fragment compare fails regardless of
+        // anything this phase changed. The exact-output form is the
+        // stronger assertion anyway — it fails the moment `modules`,
+        // `module_service`, or any other new key appears.
+        let reserialized = toml::to_string(&config).expect("serialize");
+        assert_eq!(
+            reserialized, "[profiles]\n\n[rigs.dev]\ncompose_file = \"docker/compose.yml\"\n",
+            "a rig with no modules table must serialize byte-identically"
+        );
+    }
+
+    /// The documented `[rigs.NAME.modules.ID]` shape parses (D-01): a
+    /// `[rigs.dev]` table carrying `compose_file`, followed by a
+    /// `[rigs.dev.modules.git]` table carrying `version`.
+    #[test]
+    fn rig_entry_modules_table_parses() {
+        let toml = r#"
+[rigs.dev]
+compose_file = "docker/compose.yml"
+
+[rigs.dev.modules.git]
+version = "2.3.4"
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        let dev = &config.rigs["dev"];
+        assert_eq!(dev.modules.len(), 1);
+        assert_eq!(dev.modules["git"].version, "2.3.4");
+        assert_eq!(dev.module_service, None);
+
+        let reserialized = toml::to_string(&config).expect("serialize");
+        let back: Config = toml::from_str(&reserialized).expect("re-parse");
+        assert_eq!(back, config, "round trip must be lossless");
     }
 
     /// The clamp's floor belongs to validation, not serde: 0 parses fine

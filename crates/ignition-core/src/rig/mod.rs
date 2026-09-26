@@ -31,19 +31,25 @@
 //! so binary tests can isolate the machine's real home and agents with
 //! rigs elsewhere can redirect the convention scan.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 pub mod compose;
+pub mod modules;
 
 pub use compose::{
     ComposeOutput, ComposeRunner, DockerCompose, DockerPsEntry, PortMapping, Publisher,
     ServiceStatus, VolumeEntry, compose_version, config_args, docker_ps_publish_args, parse_config,
     parse_docker_ps_ldjson, reset_preview,
 };
+pub use modules::{
+    ModuleProvisioning, MountedModule, OVERRIDE_FILENAME, ProvisionedModule, clear_override,
+    existing_override, generate_override, provision_modules, write_override,
+};
 
-use crate::config::Config;
+use crate::config::{Config, ModuleDeclaration};
 use crate::error::CoreError;
 
 /// The resolved rig — research Pattern 1's model, plus the target→
@@ -67,6 +73,20 @@ pub struct RigPlan {
     pub port_mappings: Vec<PortMapping>,
     /// Named volumes declared by the compose file.
     pub volumes: Vec<String>,
+    /// The derived gateway service (D-12): the first service publishing
+    /// a port targeting 8088, else the first targeting 443, else
+    /// `None`. `resolve_entry` overrides this with
+    /// `RigEntry::module_service` when set. Populated by every
+    /// discovery path; only consumed when modules are declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_service: Option<String>,
+    /// Declared third-party modules (D-01): copied from
+    /// `RigEntry::modules` by `resolve_entry` ONLY — every other
+    /// discovery path leaves this empty, which is the structural
+    /// reason SC-1 (an undeclared rig behaves byte-identically to
+    /// today) holds.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, ModuleDeclaration>,
 }
 
 /// What the caller wants resolved: an explicit name (the `--rig` flag,
@@ -264,6 +284,13 @@ async fn resolve_entry(
     if let Some(project_name) = &entry.project_name {
         plan.name.clone_from(project_name);
     }
+    // D-01/D-12: modules + the service escape hatch are copied ONLY
+    // here — every other discovery path leaves `plan.modules` empty,
+    // which is the structural reason SC-1 holds.
+    plan.modules.clone_from(&entry.modules);
+    if entry.module_service.is_some() {
+        plan.gateway_service.clone_from(&entry.module_service);
+    }
     Ok(plan)
 }
 
@@ -455,6 +482,8 @@ mod tests {
         RigEntry {
             compose_file: path.display().to_string(),
             project_name: None,
+            modules: std::collections::BTreeMap::new(),
+            module_service: None,
         }
     }
 
@@ -592,6 +621,8 @@ mod tests {
             RigEntry {
                 compose_file: compose.display().to_string(),
                 project_name: Some("explicit-name".into()),
+                modules: std::collections::BTreeMap::new(),
+                module_service: None,
             },
         );
 

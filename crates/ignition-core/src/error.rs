@@ -9,7 +9,7 @@
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
 //! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01) (clap renders its own usage errors — never hook clap)
-//! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01)
+//! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
 //! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02)
@@ -665,6 +665,23 @@ pub enum CoreError {
     /// [`Self::ModuleDigestMismatch`] — see that variant.
     #[error("{0}")]
     ModuleDigestChanged(Box<ModuleDigestChangedDetails>),
+
+    /// A declared module id has no matching registry entry (Phase 16,
+    /// D-13). A well-formed id that simply isn't registered is a CONFIG
+    /// problem, not malformed input (exit 2 belongs to
+    /// `validate_module_id`/`validate_version`) and not a Docker
+    /// failure (exit 7 is [`Self::Rig`]) — every OTHER module
+    /// provisioning refusal (missing artifact, non-file artifact,
+    /// relative path, underivable service) stays `CoreError::Rig`.
+    /// Exit 3, structurally the [`Self::ProfileNotFound`] shape: names
+    /// both the bad id and every id that IS registered.
+    #[error("module {id:?} is not registered (known modules: {known:?})")]
+    ModuleNotRegistered {
+        /// The declared id with no matching [`crate::module::ModuleSpec`].
+        id: String,
+        /// Every currently registered [`crate::module::ModuleSpec::id`].
+        known: Vec<String>,
+    },
 }
 
 /// Payload of [`CoreError::ModuleDigestMismatch`], boxed to keep
@@ -767,6 +784,7 @@ impl CoreError {
             Self::ModuleDigestMismatch(..) => "module_digest_mismatch",
             Self::ModuleFeedUnusable { .. } => "module_feed_unusable",
             Self::ModuleDigestChanged(..) => "module_digest_changed",
+            Self::ModuleNotRegistered { .. } => "module_not_registered",
         }
     }
 
@@ -783,7 +801,8 @@ impl CoreError {
             | Self::SecretUnavailable { .. }
             | Self::PasswordUnavailable { .. }
             | Self::ConfigInvalid { .. }
-            | Self::PollIntervalTooSmall { .. } => 3,
+            | Self::PollIntervalTooSmall { .. }
+            | Self::ModuleNotRegistered { .. } => 3,
             Self::Network { .. } | Self::ModuleFeedUnreachable { .. } => 4,
             Self::Auth { .. } => 5,
             Self::GatewayTooOld { .. }
@@ -1128,6 +1147,15 @@ impl CoreError {
                  (docker ps)"
                     .to_string(),
             ),
+            Self::ModuleNotRegistered { known, .. } => Some(if known.is_empty() {
+                "no modules are registered in this build of ign".to_string()
+            } else {
+                format!(
+                    "known module ids: {} — check the id under \
+                     [rigs.NAME.modules.*] in your config",
+                    known.join(", ")
+                )
+            }),
         }
     }
 
@@ -1587,6 +1615,14 @@ mod tests {
                 6,
                 "module_digest_changed",
             ),
+            (
+                CoreError::ModuleNotRegistered {
+                    id: "bogus".into(),
+                    known: vec!["git".into()],
+                },
+                3,
+                "module_not_registered",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1614,6 +1650,7 @@ mod tests {
         (3, "password_unavailable"),
         (3, "config_invalid"),
         (3, "poll_interval_too_small"),
+        (3, "module_not_registered"),
         (4, "network_error"),
         (5, "auth_rejected"),
         (6, "gateway_too_old"),

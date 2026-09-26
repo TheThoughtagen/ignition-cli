@@ -623,6 +623,7 @@ async fn unsafe_version_is_refused_before_any_request() {
 
     let unsafe_module = ignition_core::module::ModuleSpec {
         id: "../nope",
+        gateway_module_id: "com.axone_io.ignition.git",
         repo: "WhiskeyHouse/ignition-git-module",
         tag_template: "v{version}",
         asset_template: "Git-{version}-signed.modl",

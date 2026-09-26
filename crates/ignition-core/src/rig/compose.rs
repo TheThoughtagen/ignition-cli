@@ -42,6 +42,14 @@ use crate::error::CoreError;
 
 use super::RigPlan;
 
+/// Gateway target ports (D-12) — the SAME documented heuristic
+/// [`crate::actions::rig::gateway_url_from`] uses, one layer down:
+/// services arrive in sorted key order (`serde_json` is built without
+/// `preserve_order`), so the first service publishing a port targeting
+/// 8088 (else 443) is deterministic.
+const GATEWAY_HTTP_TARGET: u16 = 8088;
+const GATEWAY_HTTPS_TARGET: u16 = 443;
+
 /// How many stderr lines ride a failed invocation's error message
 /// (research Pitfall 3: compose's tail is the diagnosis).
 const STDERR_TAIL_LINES: usize = 5;
@@ -292,37 +300,68 @@ pub fn config_args(file: &Path, project_dir: &Path) -> Vec<String> {
     ]
 }
 
-/// `up` (research LOCKED shape): explicit `-p <name>` (never an
-/// implicit directory-name project), detached + `--wait` with an
-/// EXPLICIT timeout (Pitfall 3: `--wait` blocks on healthchecks and
-/// image pulls), `--remove-orphans`.
-pub fn up_args(plan: &RigPlan, wait_timeout_s: u64) -> Vec<String> {
-    vec![
+/// The shared `-f` file-flags helper (D-11): `-p <name>` then `-f
+/// <base>` then one `-f <override>` per entry in `override_files`, IN
+/// ORDER. This is the ONE code path every project-scoped builder
+/// (`up_args`, `down_args`, `ps_args`, `logs_args`) routes through, so
+/// an override can never land before the base file — inverting merge
+/// precedence and shifting `--project-directory`/`.env` inference
+/// (research Pitfall 3) — and the four builders cannot drift from each
+/// other. Empty `override_files` reproduces the pre-Phase-16 vector
+/// exactly (SC-1: the structural reason an undeclared rig is
+/// byte-identical).
+fn project_and_file_args(plan: &RigPlan, override_files: &[std::path::PathBuf]) -> Vec<String> {
+    let mut args = vec![
         "-p".into(),
         plan.name.clone(),
         "-f".into(),
         plan.compose_file.display().to_string(),
+    ];
+    for override_file in override_files {
+        args.push("-f".into());
+        args.push(override_file.display().to_string());
+    }
+    args
+}
+
+/// `up` (research LOCKED shape): explicit `-p <name>` (never an
+/// implicit directory-name project), detached + `--wait` with an
+/// EXPLICIT timeout (Pitfall 3: `--wait` blocks on healthchecks and
+/// image pulls), `--remove-orphans`. `override_files` (Phase 16, D-11)
+/// appends after the base `-f`, before the `up` subcommand token —
+/// empty for an undeclared rig, which reproduces the pre-Phase-16
+/// vector exactly (SC-1).
+pub fn up_args(
+    plan: &RigPlan,
+    wait_timeout_s: u64,
+    override_files: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut args = project_and_file_args(plan, override_files);
+    args.extend([
         "up".into(),
         "-d".into(),
         "--wait".into(),
         "--wait-timeout".into(),
         wait_timeout_s.to_string(),
         "--remove-orphans".into(),
-    ]
+    ]);
+    args
 }
 
 /// `down`: stop + remove containers/networks; `--remove-orphans` always
 /// (Pitfall 4); `-v` (named+anonymous volume deletion) only for the
-/// reset teardown half (04-02).
-pub fn down_args(plan: &RigPlan, volumes: bool) -> Vec<String> {
-    let mut args = vec![
-        "-p".into(),
-        plan.name.clone(),
-        "-f".into(),
-        plan.compose_file.display().to_string(),
-        "down".into(),
-        "--remove-orphans".into(),
-    ];
+/// reset teardown half (04-02). `override_files` (Phase 16, D-11) routes
+/// through the same shared helper [`up_args`] uses — empty for an
+/// undeclared rig or a rig `rig_down` found no on-disk override for,
+/// which reproduces the pre-Phase-16 vector exactly (SC-1).
+pub fn down_args(
+    plan: &RigPlan,
+    volumes: bool,
+    override_files: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut args = project_and_file_args(plan, override_files);
+    args.push("down".into());
+    args.push("--remove-orphans".into());
     if volumes {
         args.push("-v".into());
     }
@@ -330,31 +369,34 @@ pub fn down_args(plan: &RigPlan, volumes: bool) -> Vec<String> {
 }
 
 /// `ps` as LDJSON (research Pitfall 1): one object per service.
-pub fn ps_args(plan: &RigPlan) -> Vec<String> {
-    vec![
-        "-p".into(),
-        plan.name.clone(),
-        "-f".into(),
-        plan.compose_file.display().to_string(),
-        "ps".into(),
-        "--format".into(),
-        "json".into(),
-    ]
+/// `override_files` (Phase 16, D-11) routes through the same shared
+/// helper [`up_args`] uses — empty when `rig_status` found no on-disk
+/// override, which reproduces the pre-Phase-16 vector exactly (SC-1).
+pub fn ps_args(plan: &RigPlan, override_files: &[std::path::PathBuf]) -> Vec<String> {
+    let mut args = project_and_file_args(plan, override_files);
+    args.push("ps".into());
+    args.push("--format".into());
+    args.push("json".into());
+    args
 }
 
 /// `logs` (human-form passthrough by design — the streaming exception
 /// when `--follow`; wired by 04-02's `rig_logs` via `run` one-shot /
 /// `run_streaming` follow). Invocation shape LOCKED from day one.
-pub fn logs_args(plan: &RigPlan, tail: u32, follow: bool, service: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        "-p".into(),
-        plan.name.clone(),
-        "-f".into(),
-        plan.compose_file.display().to_string(),
-        "logs".into(),
-        "--tail".into(),
-        tail.to_string(),
-    ];
+/// `override_files` (Phase 16, D-11) routes through the same shared
+/// helper [`up_args`] uses — empty when `rig_logs` found no on-disk
+/// override, which reproduces the pre-Phase-16 vector exactly (SC-1).
+pub fn logs_args(
+    plan: &RigPlan,
+    tail: u32,
+    follow: bool,
+    service: Option<&str>,
+    override_files: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut args = project_and_file_args(plan, override_files);
+    args.push("logs".into());
+    args.push("--tail".into());
+    args.push(tail.to_string());
     if follow {
         args.push("-f".into());
     }
@@ -453,10 +495,29 @@ pub fn parse_config(
         .unwrap_or_default();
 
     let mut port_mappings: Vec<PortMapping> = Vec::new();
+    // The gateway-service derivation (D-12): the first service (sorted
+    // key order) publishing a port targeting 8088, else the first
+    // targeting 443, else `None`. One pass over the same services map.
+    let mut gateway_service: Option<String> = None;
+    let mut gateway_service_https: Option<String> = None;
     if let Some(services) = root.get("services").and_then(Value::as_object) {
-        for service in services.values() {
+        for (service_name, service) in services {
             let ports = service.get("ports").and_then(Value::as_array);
             for port in ports.into_iter().flatten() {
+                if gateway_service.is_none() {
+                    let target = port
+                        .get("target")
+                        .and_then(|value| value.as_u64().and_then(|n| u16::try_from(n).ok()));
+                    match target {
+                        Some(GATEWAY_HTTP_TARGET) => {
+                            gateway_service = Some(service_name.clone());
+                        }
+                        Some(GATEWAY_HTTPS_TARGET) if gateway_service_https.is_none() => {
+                            gateway_service_https = Some(service_name.clone());
+                        }
+                        _ => {}
+                    }
+                }
                 // `published` is a STRING on current compose ("9088"),
                 // a number on some builds — tolerate both; entries
                 // without a published port (random host ports) don't
@@ -484,6 +545,7 @@ pub fn parse_config(
         .iter()
         .map(|mapping| mapping.published)
         .collect();
+    let gateway_service = gateway_service.or(gateway_service_https);
 
     let volumes: Vec<String> = root
         .get("volumes")
@@ -499,6 +561,8 @@ pub fn parse_config(
         host_ports,
         port_mappings,
         volumes,
+        gateway_service,
+        modules: std::collections::BTreeMap::new(),
     })
 }
 
@@ -689,6 +753,8 @@ mod tests {
                 },
             ],
             volumes: vec!["gw-data".into()],
+            gateway_service: Some("ignition".into()),
+            modules: std::collections::BTreeMap::new(),
         }
     }
 
@@ -720,7 +786,7 @@ mod tests {
     #[test]
     fn up_args_pinned() {
         assert_eq!(
-            up_args(&sample_plan(), 300),
+            up_args(&sample_plan(), 300, &[]),
             s(&[
                 "-p",
                 "ignition-devops",
@@ -736,10 +802,36 @@ mod tests {
         );
     }
 
+    /// D-11: a declared override's `-f` is the SECOND `-f`, never the
+    /// first — an override landing first would invert merge precedence
+    /// and shift `--project-directory`/`.env` inference.
+    #[test]
+    fn up_args_appends_override_after_base_file() {
+        let override_path =
+            std::path::PathBuf::from("/rigs/git-module/docker/compose.ign-modules.yml");
+        assert_eq!(
+            up_args(&sample_plan(), 300, std::slice::from_ref(&override_path)),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules.yml",
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "300",
+                "--remove-orphans"
+            ]),
+        );
+    }
+
     #[test]
     fn down_args_pinned_with_and_without_volumes() {
         assert_eq!(
-            down_args(&sample_plan(), false),
+            down_args(&sample_plan(), false, &[]),
             s(&[
                 "-p",
                 "ignition-devops",
@@ -751,7 +843,7 @@ mod tests {
             "plain down keeps volumes (reset's -v arrives in 04-02)"
         );
         assert_eq!(
-            down_args(&sample_plan(), true),
+            down_args(&sample_plan(), true, &[]),
             s(&[
                 "-p",
                 "ignition-devops",
@@ -767,7 +859,7 @@ mod tests {
     #[test]
     fn ps_args_pinned() {
         assert_eq!(
-            ps_args(&sample_plan()),
+            ps_args(&sample_plan(), &[]),
             s(&[
                 "-p",
                 "ignition-devops",
@@ -783,7 +875,7 @@ mod tests {
     #[test]
     fn logs_args_pinned() {
         assert_eq!(
-            logs_args(&sample_plan(), 200, false, None),
+            logs_args(&sample_plan(), 200, false, None, &[]),
             s(&[
                 "-p",
                 "ignition-devops",
@@ -795,7 +887,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            logs_args(&sample_plan(), 50, true, Some("ignition")),
+            logs_args(&sample_plan(), 50, true, Some("ignition"), &[]),
             s(&[
                 "-p",
                 "ignition-devops",
@@ -807,6 +899,162 @@ mod tests {
                 "-f",
                 "ignition"
             ]),
+        );
+    }
+
+    /// D-11: every one of the four project-scoped builders puts the
+    /// override's `-f` AFTER the base file's `-f`, and the subcommand
+    /// token follows both — proven for all four, not just `up_args`
+    /// (Task 1 already pinned that one in
+    /// `up_args_appends_override_after_base_file`).
+    #[test]
+    fn every_builder_puts_the_override_after_the_base_file() {
+        let override_path =
+            std::path::PathBuf::from("/rigs/git-module/docker/compose.ign-modules.yml");
+        let overrides = std::slice::from_ref(&override_path);
+
+        assert_eq!(
+            down_args(&sample_plan(), false, overrides),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules.yml",
+                "down",
+                "--remove-orphans"
+            ]),
+        );
+        assert_eq!(
+            ps_args(&sample_plan(), overrides),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules.yml",
+                "ps",
+                "--format",
+                "json"
+            ]),
+        );
+        assert_eq!(
+            logs_args(&sample_plan(), 200, false, None, overrides),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules.yml",
+                "logs",
+                "--tail",
+                "200"
+            ]),
+        );
+        assert_eq!(
+            up_args(&sample_plan(), 300, overrides),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules.yml",
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "300",
+                "--remove-orphans"
+            ]),
+        );
+    }
+
+    /// With TWO overrides, the relative order is stable and deterministic
+    /// — driven purely by `override_files`' own order (the caller's
+    /// responsibility, e.g. `ModuleSpec::id` sort order upstream), never
+    /// by map iteration inside the builder itself.
+    #[test]
+    fn override_order_is_stable_across_two_modules() {
+        let first = std::path::PathBuf::from("/rigs/git-module/docker/compose.ign-modules-a.yml");
+        let second = std::path::PathBuf::from("/rigs/git-module/docker/compose.ign-modules-b.yml");
+        let overrides = [first.clone(), second.clone()];
+
+        assert_eq!(
+            up_args(&sample_plan(), 300, &overrides),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules-a.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules-b.yml",
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "300",
+                "--remove-orphans"
+            ]),
+            "the two overrides keep the exact order they were passed in"
+        );
+
+        // Reversed input order produces the reversed output order — the
+        // builder is not silently re-sorting.
+        let reversed = [second, first];
+        assert_eq!(
+            up_args(&sample_plan(), 300, &reversed),
+            s(&[
+                "-p",
+                "ignition-devops",
+                "-f",
+                "/rigs/git-module/docker/docker-compose.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules-b.yml",
+                "-f",
+                "/rigs/git-module/docker/compose.ign-modules-a.yml",
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "300",
+                "--remove-orphans"
+            ]),
+        );
+    }
+
+    /// D-09: `config_args` — the resolve step — must NEVER receive an
+    /// override. It carries exactly one `-f` flag (the base file), no
+    /// matter what. There is no `override_files` parameter to even pass
+    /// one through, which is what this test guards against a later
+    /// well-meaning refactor threading one in.
+    #[test]
+    fn config_args_never_receives_an_override() {
+        let args = config_args(
+            Path::new("/rigs/docker/compose.yml"),
+            Path::new("/rigs/docker"),
+        );
+        assert_eq!(
+            args,
+            s(&[
+                "-f",
+                "/rigs/docker/compose.yml",
+                "--project-directory",
+                "/rigs/docker",
+                "config",
+                "--format",
+                "json"
+            ]),
+        );
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "-f").count(),
+            1,
+            "config_args must carry exactly one -f flag — the base file, never an override"
         );
     }
 
@@ -1063,7 +1311,7 @@ mod tests {
         let mut streamed = 0usize;
         let mut sink = |_: &str| streamed += 1;
         let output = runner
-            .run_streaming(&logs_args(&plan, 5, false, None), &mut sink)
+            .run_streaming(&logs_args(&plan, 5, false, None, &[]), &mut sink)
             .await;
         assert_eq!(
             output.code, 0,
