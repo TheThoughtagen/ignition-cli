@@ -2099,6 +2099,15 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             Err(err) => return (None, Err(err)),
                         };
                         let provisioning = if merged_modules.is_empty() {
+                            // SC-1 holds — no ModuleFeed, no cache root, no
+                            // network client — but a previous run's override
+                            // must still be cleared, which is why this is
+                            // clear_override and not a bare default().
+                            // Returning default() alone left D-08's delete
+                            // branch unreachable in production.
+                            if let Err(err) = ignition_core::rig::clear_override(&plan) {
+                                return (None, Err(err));
+                            }
                             ignition_core::rig::ModuleProvisioning::default()
                         } else {
                             let feed = match ignition_core::module::fetch::ModuleFeed::github() {

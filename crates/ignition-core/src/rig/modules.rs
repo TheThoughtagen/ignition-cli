@@ -444,6 +444,28 @@ impl ModuleProvisioning {
 /// re-chmodded, re-hashed, or re-verified here — D-04), and
 /// pre-flighted ([`preflight_mount_source`], Task 2) before it ever
 /// becomes a [`MountedModule`].
+/// Clear a previous run's override for a rig that now declares NOTHING —
+/// D-08's delete half, reachable WITHOUT a [`ModuleFeed`].
+///
+/// This exists because the obvious shape was wrong. `provision_modules`
+/// returns early on an empty `declared`, and `main.rs`'s dispatch
+/// short-circuits before building a feed at all (SC-1: an undeclared rig
+/// constructs no network client). Between them, [`write_override`]'s
+/// delete branch was UNREACHABLE in production — verified live: the
+/// stale `compose.ign-modules.yml` orphaned on disk across two full
+/// undeclare cycles.
+///
+/// That matters beyond tidiness: [`existing_override`] is what
+/// `rig_down`/`rig_status`/`rig_logs` consult, so a stale file kept
+/// passing a mount for a module the user had removed — the exact hazard
+/// Phase 16's threat row T-16-06 claimed D-08 mitigated.
+///
+/// Idempotent: a missing file is `Ok(())`, so a second undeclared `up` is
+/// not an error.
+pub fn clear_override(plan: &RigPlan) -> Result<(), CoreError> {
+    write_override(plan, "", &[]).map(|_| ())
+}
+
 pub async fn provision_modules(
     feed: &ModuleFeed,
     plan: &RigPlan,
@@ -452,6 +474,10 @@ pub async fn provision_modules(
     policy: FetchPolicy,
 ) -> Result<ModuleProvisioning, CoreError> {
     if declared.is_empty() {
+        // Not just an early return: a previous run's override must GO.
+        // See `clear_override` for why returning default() alone left
+        // D-08's delete branch unreachable.
+        clear_override(plan)?;
         return Ok(ModuleProvisioning::default());
     }
 

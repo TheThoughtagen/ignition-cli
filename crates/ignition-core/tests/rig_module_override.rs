@@ -801,3 +801,62 @@ async fn down_then_up_passes_the_same_override_file() {
         );
     }
 }
+
+/// The regression for a bug that shipped: `write_override`'s delete branch
+/// was correct and UNREACHABLE.
+///
+/// `undeclaring_the_last_module_deletes_a_pre_existing_override` calls
+/// `write_override` directly, so it proved the function deletes — while
+/// `provision_modules` returned early on an empty `declared` and never
+/// called it. Verified live: the stale `compose.ign-modules.yml` orphaned
+/// on disk across two full undeclare cycles. `rig_down`/`rig_status`/
+/// `rig_logs` consult `existing_override`, so that file kept passing a
+/// mount for a module the user had removed — the hazard threat row T-16-06
+/// claimed D-08 mitigated.
+///
+/// This drives the REAL entry point instead. A test that exercises a
+/// function in isolation cannot tell you the function is reached.
+#[tokio::test]
+async fn provision_modules_clears_a_stale_override_when_nothing_is_declared() {
+    let project_dir = tempfile::tempdir().expect("tempdir");
+    let plan = base_plan(project_dir.path(), Some("gateway"), &["gateway"]);
+
+    // A previous run's override, as it would be found on disk.
+    let stale = project_dir.path().join(OVERRIDE_FILENAME);
+    std::fs::write(&stale, "# left by a previous run\n").expect("seed stale override");
+    assert!(stale.is_file(), "precondition: the stale override exists");
+
+    // The REAL call, with nothing declared — no feed is contacted because
+    // the empty-declared path returns before any fetch.
+    let feed = unroutable_feed();
+    let provisioning = provision_modules(
+        &feed,
+        &plan,
+        &BTreeMap::new(),
+        project_dir.path(),
+        FetchPolicy::CacheFirst,
+    )
+    .await
+    .expect("an undeclared rig provisions successfully");
+
+    assert!(
+        provisioning.override_file.is_none(),
+        "an undeclared rig reports no override"
+    );
+    assert!(
+        !stale.exists(),
+        "the stale override must be DELETED by the real path, not merely by \
+         write_override when called directly"
+    );
+
+    // Idempotent: a second undeclared run with the file already gone is Ok.
+    provision_modules(
+        &feed,
+        &plan,
+        &BTreeMap::new(),
+        project_dir.path(),
+        FetchPolicy::CacheFirst,
+    )
+    .await
+    .expect("a second undeclared run is not an error");
+}
