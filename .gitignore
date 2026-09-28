@@ -11,3 +11,23 @@
 /docs/reference.md
 /docs/reference/
 /website/static/search-index.json
+
+# Agent/tool scratch state. `.omc/skills/` is the deliberate exception —
+# project-scoped skills are meant to be committed, and git will not descend
+# into a wholly-ignored directory, so `.omc/*` + a negation is the only
+# spelling that keeps that door open.
+/.omc/*
+!/.omc/skills/
+/.playwright-mcp/
+
+# Gateway backups. Never source: a .gwbk is a full gateway image, routinely
+# hundreds of MB, and `ign backup download` drops them in the cwd.
+*.gwbk
+
+# Live/UAT probe output written into the repo root by hand-run commands
+# (`ign tags export`, `project export`, pterm captures). Root-scoped on
+# purpose so a legitimately named file deeper in the tree is not swallowed.
+/uat-*
+/Uat*
+/uattest*
+/pterm_*.zip

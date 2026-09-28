@@ -67,7 +67,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          # `target`, NOT `targets` — the action rejects the plural and warned
+          # "Unexpected input(s) 'targets'" on every release build, silently
+          # installing no cross target at all. The explicit rustup step below
+          # is what actually made cross builds work; it stays as belt and
+          # braces now that the input is spelled correctly.
+          target: ${{ matrix.target }}
       - name: Ensure target std is installed
         run: rustup target add --toolchain stable ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
@@ -96,7 +101,10 @@ jobs:
           (Get-FileHash "$art.zip" -Algorithm SHA256).Hash.ToLower() + "  $art.zip" |
             Set-Content "$art.zip.sha256"
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        # v3 = the same action on the Node 24 runtime (no input changes).
+        # v2 targets Node 20, which GitHub now force-runs on Node 24 and
+        # warns about on every release build.
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG_NAME }}
           files: |
