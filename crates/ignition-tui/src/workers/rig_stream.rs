@@ -336,6 +336,34 @@ pub fn fire_rig_restore(state: &mut AppState, file: String) {
     });
 }
 
+/// `ign rig module uninstall <ID> --rig <NAME> --yes` — the cockpit's
+/// only IRREVERSIBLE gateway write in the rig family, fired ONLY from
+/// update's execute_pending (the Confirm gate IS the `--yes`).
+///
+/// `declared` comes from the resolved plan, so the CLI's third refusal
+/// (uninstalling a module the rig still declares, which the next
+/// `rig up` would simply re-mount) holds identically here — the TUI
+/// drives the same action, never its own copy of the rule.
+pub fn fire_rig_module_uninstall(state: &mut AppState, id: String) {
+    super::spawn_action(state, "rig module uninstall", async move {
+        let spec = ignition_core::module::spec_for(&id)
+            .ok_or_else(|| CoreError::Rig(format!("{id:?} is not a registered module")))?;
+        let plan = resolve_auto_plan().await?;
+        let url = rig_url(&plan)?;
+        let token = context::rig_token_only()?;
+        let api = context::rig_client_token(&url, &token)
+            .ok_or_else(|| CoreError::Rig(format!("cannot build client for {url}")))?;
+        // `config_name` is what `--rig` takes; `name` is the compose
+        // project, which `.env` can rename. Error messages must name
+        // the selector the user could actually retype.
+        let rig = plan
+            .config_name
+            .clone()
+            .unwrap_or_else(|| plan.name.clone());
+        actions::rig::rig_module_uninstall(&*api, &rig, spec, &plan.modules).await
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{spawn_rig_logs, spawn_rig_status, stop_rig_logs};

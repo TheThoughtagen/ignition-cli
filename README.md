@@ -646,6 +646,11 @@ The id is a **registry id** — the same one `--with-module` and the config tabl
 take, not the gateway's own module id. The verb needs `IGNITION_TOKEN`, the same
 credential contract as `rig snapshot` and `rig restore`.
 
+In the TUI it is the Rig screen's actions menu (`a` → `module uninstall`): a
+form takes the registry id, an unknown id is refused locally against the same
+registry, and a Confirm gate — the cockpit's `--yes` — states the
+irreversibility before the write goes out.
+
 **The order matters, and the gateway enforces it.** Undeclare the module, run
 `ign rig up` so the mount goes, *then* uninstall. The gateway refuses to
 uninstall a module whose `.modl` is still mounted. Once it succeeds the effect

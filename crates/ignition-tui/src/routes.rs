@@ -534,14 +534,14 @@ pub fn routes() -> &'static [CliRoute] {
             mapping: Mapping::Screen(Screen::Rig),
         },
         // 19-01: the module-uninstall guarded write joins the Rig
-        // family for structural completeness (the clap-walk coverage
-        // test requires every row-requiring leaf to map somewhere).
-        // Registered on the Rig screen like its siblings; NOT yet
-        // wired into the `RigActions` modal (`a` on the Rig screen) —
-        // unlike every other rig verb, this one takes a REQUIRED
-        // module-id argument, so a bare menu entry would need its own
-        // id-selection step first. That TUI wiring is future work,
-        // out of this CLI-only phase's scope.
+        // family. 19-04 made this mapping TRUE rather than merely
+        // structural — it is now reachable through the `RigActions`
+        // modal (`a` on the Rig screen), which was the one rig verb
+        // the menu could not carry: unlike its siblings it takes a
+        // REQUIRED module-id argument, so it needed a form. It has
+        // one (`RigForm::ModuleUninstallId`, validated against the
+        // module registry at accept) and a Confirm gate for the
+        // irreversible write, matching the `restore` precedent.
         CliRoute {
             path: "rig module uninstall",
             mapping: Mapping::Screen(Screen::Rig),
