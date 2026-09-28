@@ -10,9 +10,12 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::IgnitionMock;
+use ignition_core::actions::rig::rig_module_uninstall;
 use ignition_core::client::{GatewayApi, ReqwestGatewayApi};
-use ignition_core::config::{Credential, Secret};
+use ignition_core::config::{Credential, ModuleDeclaration, Secret};
 use ignition_core::error::CoreError;
 
 const UNINSTALL_PATH: &str = "/data/api/v1/modules/uninstall";
@@ -231,6 +234,114 @@ async fn authenticated_call_carries_auth_header() {
         headers.contains("x-ignition-api-token"),
         "uninstall must send the token header: {headers}"
     );
+}
+
+/// SC-4's structural half (D-19-05): an id the registry does not know
+/// has no `&'static ModuleSpec` to name — [`rig_module_uninstall`]
+/// takes the spec, never a raw id, so an unregistered id is
+/// UNREPRESENTABLE at this call boundary, not merely refused at
+/// runtime. The `.expect(0)` catch-all is mounted anyway (the
+/// `unsafe_version_is_refused_before_any_request` pattern): if a
+/// future refactor ever widened this function to accept a raw id and
+/// forgot to re-check the registry, this is the belt that would catch
+/// the regression the moment such a caller tried to reach the wire.
+#[tokio::test]
+async fn unregistered_id_has_no_representable_spec() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    assert!(
+        ignition_core::module::spec_for("not-a-real-module").is_none(),
+        "an unregistered id must never resolve to a spec"
+    );
+
+    let requests = guard.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        0,
+        "zero HTTP requests — there was never a spec to send"
+    );
+}
+
+/// The still-declared refusal (Task 2): a registry id the rig's
+/// `[rigs.NAME.modules]` table STILL names refuses via
+/// [`ignition_core::actions::rig::module_still_declared_error`] BEFORE
+/// [`rig_module_uninstall`] ever calls `api.uninstall_module` — proven
+/// with a REAL [`ReqwestGatewayApi`] pointed at a live mock server
+/// carrying a whole-server `.expect(0)` catch-all: if the guard were
+/// missing, this exact call would reach the wire and the mock's
+/// drop-time assertion would fail the test.
+#[tokio::test]
+async fn still_declared_id_refuses_before_any_http_request() {
+    let server = wiremock::MockServer::start().await;
+    let guard = wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(
+        &server.uri(),
+        Some(Credential::Token(Secret::new("name:key"))),
+    );
+    let spec = ignition_core::module::spec_for(GIT_REGISTRY_ID).expect("git is registered");
+    let mut declared = BTreeMap::new();
+    declared.insert(
+        GIT_REGISTRY_ID.to_string(),
+        ModuleDeclaration {
+            version: "2.3.4".to_string(),
+        },
+    );
+
+    let err = rig_module_uninstall(&api, "myrig", spec, &declared)
+        .await
+        .expect_err("a still-declared module must refuse, never reach the gateway");
+    assert_eq!(err.code(), "rig_error");
+    assert_eq!(err.exit_code(), 7);
+    let message = err.to_string();
+    assert!(message.contains(GIT_REGISTRY_ID), "names the id: {message}");
+    assert!(message.contains("myrig"), "names the rig: {message}");
+    assert!(
+        message.contains("[rigs.myrig.modules.git]"),
+        "names the config table to edit: {message}"
+    );
+    assert!(message.contains("ign rig up"), "names the fix: {message}");
+
+    let requests = guard.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        0,
+        "the still-declared guard fired before any HTTP request"
+    );
+}
+
+/// The same refusal when the module is UNDECLARED (the normal case)
+/// does NOT fire — the guard is scoped to `declared`, not every call.
+#[tokio::test]
+async fn undeclared_id_proceeds_past_the_still_declared_guard() {
+    let mock = IgnitionMock::start().await;
+    mock.list_json(
+        "DELETE",
+        UNINSTALL_PATH,
+        serde_json::json!({
+            "success": true,
+            "failedUninstalls": {"uninstall": []}
+        }),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let spec = ignition_core::module::spec_for(GIT_REGISTRY_ID).expect("git is registered");
+    let declared = BTreeMap::new();
+
+    let result = rig_module_uninstall(&api, "myrig", spec, &declared)
+        .await
+        .expect("an undeclared module must proceed to the gateway call");
+    assert!(result.uninstalled);
 }
 
 /// The denial names BOTH the registry id and the gateway id — D-19-05's

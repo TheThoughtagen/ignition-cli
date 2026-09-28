@@ -27,6 +27,7 @@
 //! aborts); Network/GatewayRestarting propagate for poll's native
 //! retry; Auth can't fire (the probe is header-less).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -34,6 +35,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::client::GatewayApi;
+use crate::config::ModuleDeclaration;
 use crate::error::CoreError;
 use crate::module::ModuleSpec;
 use crate::poll::{self, PollConfig, PollState};
@@ -796,17 +798,52 @@ pub struct ModuleUninstallResult {
     pub uninstalled: bool,
 }
 
+/// The still-declared refusal (Task 2): a registry id the rig's
+/// `[rigs.NAME.modules]` table STILL names would be undone by the very
+/// next `ign rig up` — the gateway itself already refuses this case
+/// live (fact 2: it answers `success:false` while the `.modl` is still
+/// bind-mounted), so this turns that confusing gateway denial into an
+/// actionable LOCAL one, exit 7 (`CoreError::Rig`), naming the rig, the
+/// module, the config table to edit, and `ign rig up` as the fix.
+///
+/// Shared by the CLI's pre-check (main.rs, run BEFORE any gateway
+/// client is built — the sessions-terminate/`preflight_with_module_
+/// flags` ordering precedent) and [`rig_module_uninstall`]'s own
+/// authoritative re-check below, so the two call sites can never drift
+/// apart on wording (the `preflight_with_module_flags`/
+/// `provision_modules` precedent).
+pub fn module_still_declared_error(id: &str, rig: &str) -> CoreError {
+    CoreError::Rig(format!(
+        "module {id:?} is still declared in [rigs.{rig}.modules.{id}] — \
+         uninstalling it now would be undone by the very next `ign rig up` \
+         (the gateway refuses to forget a module whose `.modl` is still \
+         mounted); remove that table entry, run `ign rig up` so the mount \
+         is dropped, then retry `ign rig module uninstall {id} --yes`"
+    ))
+}
+
 /// `ign rig module uninstall <ID> --yes` (Phase 19, D-19-01/D-19-02/
 /// D-19-04): the ONE gateway write this phase adds. ONE call, ONE id —
 /// `spec.gateway_module_id` is what rides the wire; `spec.id` (the
 /// registry slug) names the error without a reverse lookup. Success is
 /// the gateway's own `success:true` — never a bare HTTP 200 ([`crate::client::GatewayApi::uninstall_module`]'s
 /// denial-rides-200 contract).
+///
+/// `declared` is the rig's `[rigs.NAME.modules]` table (`RigPlan::
+/// modules`) — the AUTHORITATIVE re-check of the still-declared refusal
+/// (Task 2), a second belt behind the CLI's own pre-check: even a
+/// caller that reaches this function directly (bypassing main.rs'
+/// dispatch arm, as this crate's own tests do) can never issue the
+/// gateway write for a module the config still names.
 pub async fn rig_module_uninstall(
     api: &dyn GatewayApi,
     rig: &str,
     spec: &'static ModuleSpec,
+    declared: &BTreeMap<String, ModuleDeclaration>,
 ) -> Result<ModuleUninstallResult, CoreError> {
+    if declared.contains_key(spec.id) {
+        return Err(module_still_declared_error(spec.id, rig));
+    }
     api.uninstall_module(spec.gateway_module_id, spec.id)
         .await?;
     Ok(ModuleUninstallResult {

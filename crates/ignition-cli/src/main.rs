@@ -2337,6 +2337,21 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                     );
                                 }
                             };
+                            // Task 2's second pre-HTTP local refusal —
+                            // still BEFORE any credential is sourced or
+                            // any client is built, matching the
+                            // registry check above: a module the rig's
+                            // own config still declares would be
+                            // remounted by the very next `rig up`, so
+                            // refuse locally rather than let the
+                            // gateway's confusing `success:false` be
+                            // the only signal.
+                            if plan.modules.contains_key(&id) {
+                                return (
+                                    gateway_verb_echo,
+                                    Err(actions::rig::module_still_declared_error(&id, &plan.name)),
+                                );
+                            }
                             let Some(token) = env_non_empty("IGNITION_TOKEN") else {
                                 return (
                                     gateway_verb_echo,
@@ -2347,11 +2362,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             };
                             let credential = Some(Credential::Token(config::Secret::new(token)));
                             match rig_gateway_client(&plan, credential) {
-                                Some(api) => {
-                                    actions::rig::rig_module_uninstall(&*api, &plan.name, spec)
-                                        .await
-                                        .map(ActionOutput::RigModuleUninstall)
-                                }
+                                Some(api) => actions::rig::rig_module_uninstall(
+                                    &*api,
+                                    &plan.name,
+                                    spec,
+                                    &plan.modules,
+                                )
+                                .await
+                                .map(ActionOutput::RigModuleUninstall),
                                 None => Err(trial_no_gateway(&plan)),
                             }
                         }

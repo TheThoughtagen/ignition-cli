@@ -412,6 +412,191 @@ fn rig_trial_reset_refuses_without_yes_before_any_discovery() {
     );
 }
 
+/// THE destructive-guard pin for `rig module uninstall` (Phase 19,
+/// SC-2, D-19-02): no `--yes` refuses exit 2 (`confirmation_required`),
+/// profile null — the ZERO WORK proof rides the same no-rig environment
+/// as `rig reset` (the cwd has NO compose file; un-guarded execution
+/// would exit 7 at discovery). Sixth destructive-verb instance
+/// (sessions terminate -> project delete -> rig reset -> rig trial
+/// reset -> rig restore -> rig module uninstall).
+#[test]
+fn rig_module_uninstall_refuses_without_yes_before_any_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &["rig", "module", "uninstall", "git", "--compact"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "guard exit 2 — NOT the exit 7 a discovery run would produce"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("confirmation_required".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("rig module uninstall"),
+        "names the operation: {message}"
+    );
+    let hint = body["error"]["hint"].as_str().expect("hint required");
+    assert!(
+        hint.contains("--yes") && hint.contains("IGNITION_YES"),
+        "hint names the flag and the env escape hatch: {hint}"
+    );
+}
+
+/// The unregistered-id refusal for `rig module uninstall` (Phase 19,
+/// D-19-05, SC-4's CLI-surface half): exit 3, `module_not_registered`,
+/// the message lists the known registry ids. Proven to fire BEFORE any
+/// credential is sourced by the environment itself: `IGNITION_TOKEN` is
+/// unset (`ign_rig`'s default `env_remove`), so if this check ran AFTER
+/// the token step the run would instead surface `secret_unavailable` —
+/// the distinct slug IS the ordering proof (the same technique as the
+/// `--yes`-guard goldens' exit-code distinction). Requires docker:
+/// `resolve_plan` parses the fixture's compose file via `docker compose
+/// config` before the `Module` arm is ever reached — skips when docker
+/// is unavailable (this file's established convention), never runs a
+/// container.
+#[test]
+fn module_uninstall_unregistered_id_is_exit_3_before_credential_step() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_compose_available() {
+        eprintln!(
+            "skipping: docker unavailable (or skip forced) — resolve_plan needs \
+             `docker compose config`"
+        );
+        return;
+    }
+
+    let (_config_dir, config, _project_dir) = rig_config_with_real_compose_file();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "module",
+            "uninstall",
+            "not-a-real-module",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "unregistered id refuses at exit 3, never reaching the credential step"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("module_not_registered".into()),
+        "stable slug — NOT secret_unavailable, which is what an out-of-order \
+         check would produce with no IGNITION_TOKEN set"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("not-a-real-module"),
+        "names the bad id: {message}"
+    );
+    assert!(message.contains("git"), "lists a known id: {message}");
+}
+
+/// The still-declared refusal for `rig module uninstall`: a registry id
+/// the rig's own `[rigs.NAME.modules]` table still names refuses exit 7
+/// (`rig_error`), naming the config table to edit and `ign rig up` —
+/// never reaching the credential step (same ordering proof as the
+/// unregistered-id golden above: `IGNITION_TOKEN` is unset, so an
+/// out-of-order check would surface `secret_unavailable` instead).
+/// Requires docker for the same reason as the unregistered-id golden.
+#[test]
+fn module_uninstall_still_declared_id_is_exit_7_before_credential_step() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_compose_available() {
+        eprintln!(
+            "skipping: docker unavailable (or skip forced) — resolve_plan needs \
+             `docker compose config`"
+        );
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let compose_file = project_dir.path().join("docker-compose.yml");
+    std::fs::write(
+        &compose_file,
+        "services:\n  app:\n    image: alpine:latest\n",
+    )
+    .expect("write compose file");
+
+    let (_config_dir, config) = isolated_config();
+    std::fs::write(
+        &config,
+        format!(
+            "[rigs.fixture]\ncompose_file = '{}'\nproject_name = \"fixture\"\n\n\
+             [rigs.fixture.modules.git]\nversion = \"2.3.4\"\n",
+            compose_file.display()
+        ),
+    )
+    .expect("write config");
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "module",
+            "uninstall",
+            "git",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "still-declared id refuses at exit 7, never reaching the credential step"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("rig_error".into()),
+        "stable slug — NOT secret_unavailable, which is what an out-of-order \
+         check would produce with no IGNITION_TOKEN set"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("git"), "names the module: {message}");
+    assert!(message.contains("fixture"), "names the rig: {message}");
+    assert!(
+        message.contains("[rigs.fixture.modules.git]"),
+        "names the config table to edit: {message}"
+    );
+    assert!(message.contains("ign rig up"), "names the fix: {message}");
+}
+
 /// The `rig trial` help surface: both verbs + `--user`; a PASSWORD
 /// flag must NOT exist (env-only redaction discipline — pinned by
 /// this absence in the same golden as the presence checks).
