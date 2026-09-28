@@ -288,8 +288,27 @@ async fn resolve_entry(
     // here — every other discovery path leaves `plan.modules` empty,
     // which is the structural reason SC-1 holds.
     plan.modules.clone_from(&entry.modules);
-    if entry.module_service.is_some() {
-        plan.gateway_service.clone_from(&entry.module_service);
+    if let Some(service) = &entry.module_service {
+        // VALIDATED, not merely escaped. `module_service` is free-form
+        // TOML that lands verbatim in the generated override's YAML, so a
+        // value like "x:\n    privileged: true\n  y" would inject compose
+        // keys — `privileged: true` on a container is a privilege
+        // escalation from a config string. Threat row T-16-01 claimed
+        // every interpolated value was charset-validated or quoted; this
+        // one was neither.
+        //
+        // Requiring the service to EXIST in the resolved compose project
+        // makes the injection unreachable rather than escaped, and catches
+        // the likelier mistake — a typo — with a message that lists the
+        // real service names.
+        if !plan.services.iter().any(|known| known == service) {
+            return Err(CoreError::Rig(format!(
+                "rig {name:?} sets module_service = {service:?}, which is not a service                  in {} (services: {:?}) — module_service must name a service the                  compose project actually defines",
+                plan.compose_file.display(),
+                plan.services
+            )));
+        }
+        plan.gateway_service = Some(service.clone());
     }
     Ok(plan)
 }
@@ -745,6 +764,50 @@ mod tests {
     }
 
     // ----- level 5: WHK conventions (both roots, first hit wins) ----------
+
+    /// CodeRabbit PR #14: `module_service` is free-form TOML that landed
+    /// verbatim in the generated override's YAML, unquoted and
+    /// unvalidated.
+    ///
+    /// A value carrying a newline and further keys injected them into the
+    /// compose service — `privileged: true` on a container is a privilege
+    /// escalation from a config string. Threat row T-16-01 claimed every
+    /// interpolated value was charset-validated or quoted; this one was
+    /// neither, so the threat model asserted a property the code lacked.
+    ///
+    /// Refusing a `module_service` that names no service in the resolved
+    /// project makes the injection unreachable rather than merely escaped.
+    #[tokio::test]
+    async fn module_service_that_names_no_real_service_is_refused() {
+        let compose = tempfile::tempdir().expect("tempdir");
+        let path = compose.path().join("compose.yml");
+        std::fs::write(&path, "services:\n  sidecar:\n    image: alpine\n").expect("write");
+
+        let mut config = Config::default();
+        let mut bad = entry(&path);
+        bad.module_service = Some("sidecar:\n    privileged: true\n  evil".to_string());
+        config.rigs.insert("injected".into(), bad);
+
+        let err = resolve_plan_with(
+            &FakeRunner::with(vec![resolve_output()]),
+            RigSelection::Named("injected".into()),
+            &config,
+            &discovery_env(Path::new("/empty-cwd"), &[]),
+        )
+        .await
+        .expect_err("a module_service naming no real service must be refused");
+
+        assert_eq!(err.code(), "rig_error");
+        let message = err.to_string();
+        assert!(
+            message.contains("module_service"),
+            "the refusal names the offending key: {message}"
+        );
+        assert!(
+            message.contains("sidecar"),
+            "the refusal lists the real services so a typo is diagnosable: {message}"
+        );
+    }
 
     #[tokio::test]
     async fn git_module_convention_probes_both_roots_first_hit_wins() {
