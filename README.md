@@ -106,7 +106,7 @@ guarded verbs: schema-required would invite agents to auto-fill
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
 | 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, an invalid import file, an unreadable command input, or a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim) | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9)
-| 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`
+| 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS | `network_error`, `module_feed_unreachable`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
 | 6    | target_state  | command invalid for the gateway's current state, or a module artifact the feed refused to serve or verify | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed` |
@@ -548,6 +548,76 @@ still STARTING is a real exit-7 failure.
  "state": "uncommissioned", "gateway_url": "http://localhost:9088",
  "warnings": ["gateway uncommissioned — open http://localhost:9088/welcome in a browser and complete the commissioning wizard (no headless commissioning exists)"]}}
 ```
+
+### Rig modules — opt-in, signed, never automatic
+
+A rig can declare modules to provision. Nothing is installed unless you
+ask for it: a rig with no `modules` table behaves exactly as it always
+has.
+
+```toml
+[rigs.dev]
+compose_file = "docker/compose.yml"
+# Optional: only needed when the gateway service cannot be derived from
+# the compose file (ign picks the first service publishing a port
+# targeting 8088, then 443).
+# module_service = "gateway"
+
+[rigs.dev.modules.git]
+version = "2.3.4"
+
+[rigs.dev.modules.project-scan-endpoint]
+version = "1.0.0"
+```
+
+Registered modules:
+
+| Registry id | Source repository | Gateway module id | Min gateway |
+|---|---|---|---|
+| `git` | `WhiskeyHouse/ignition-git-module` | `com.axone_io.ignition.git` | 8.3.1 |
+| `project-scan-endpoint` | `bw-design-group/ignition-project-scan-endpoint` | `project-scan-endpoint` | 8.3.0 |
+
+The two rows differ in every column — including the gateway module id's
+shape (reverse-DNS vs bare slug), which is why it is a separate field
+rather than derived from the registry id. Only **signed** release
+artifacts are ever installed; `ign` will not build, sign, or fetch an
+unsigned module.
+
+**Trying one without editing config.** `--with-module ID@VERSION` on
+`rig up` and `rig reset` is repeatable and additive for that invocation
+only. A flag wins over a config declaration for the same id. There is
+deliberately no subtractive form — you cannot run *without* a
+config-declared module; remove it from config instead.
+
+```bash
+ign rig up --with-module project-scan-endpoint@1.0.0
+```
+
+**Fetch policy.** A verified artifact is cached by version, and a cache
+hit makes no network request. Two flags change that:
+
+| Flag | Effect |
+|---|---|
+| `--refresh` | Re-checks the feed for the pinned version. If upstream now publishes a different digest than the one cached, this REFUSES (exit 6) and names both digests; the cached artifact is left untouched. |
+| `--accept-upstream-change` | Accepts a changed upstream digest and caches the new bytes — which are still verified against the newly published digest. Never implied by `--refresh`: accepting a re-released artifact is a deliberate act. |
+
+**The override file.** `ign` writes `compose.ign-modules.yml` next to
+the rig's compose file and passes it as a second `-f`. That file is
+`ign`'s: it is regenerated whole on every provisioning run, never
+hand-merged. **`ign` never writes to the compose file you wrote.**
+Deleting `compose.ign-modules.yml` stops the module being mounted, and the
+next `rig up` with nothing declared removes the file for you.
+
+**It does not uninstall the module from the gateway.** Ignition installs an
+accepted module into its own data directory, which lives in the rig's volume
+and outlives the mount — so a gateway that already loaded a module keeps
+reporting it after the override is gone (verified live, not inferred). To
+clear it today, `ign rig reset` removes the volume along with everything else
+in it.
+
+Provisioning **mounts** a module; it does not commission one. No
+repository, credential, or module configuration is supplied — a
+provisioned module is present and accepted by the gateway, not set up.
 
 ### `rig status` is an allowlist
 

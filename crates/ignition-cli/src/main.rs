@@ -2031,6 +2031,28 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             {
                 return (None, Err(err));
             }
+            // Phase 16 (D-15/D-18): `--with-module` is NOT a guarded
+            // operation — pre-flight its values here, BEFORE
+            // resolve_plan (and therefore before Docker is ever
+            // invoked), so a malformed or unregistered flag value
+            // refuses at exit 2/3 with zero Docker work. `merge_
+            // declarations` runs again below once `plan.modules`
+            // exists — this is a pre-check, not a replacement: the
+            // real merge (and provision_modules' authoritative
+            // registry check, which also covers config-declared ids)
+            // still happens after the plan resolves.
+            let with_module_flags: &[String] = match &command {
+                RigCommand::Up { with_module, .. } | RigCommand::Reset { with_module, .. } => {
+                    with_module
+                }
+                _ => &[],
+            };
+            if !with_module_flags.is_empty()
+                && let Err(err) =
+                    ignition_core::rig::modules::preflight_with_module_flags(with_module_flags)
+            {
+                return (None, Err(err));
+            }
             let runner = ignition_core::rig::DockerCompose;
             let selection = match rig {
                 Some(name) => ignition_core::rig::RigSelection::Named(name),
@@ -2060,17 +2082,85 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let probe_dyn: Option<&dyn ignition_core::client::GatewayApi> = probe
                             .as_ref()
                             .map(|session| session.api() as &dyn ignition_core::client::GatewayApi);
+
+                        // Phase 16 (D-15/D-16/D-17): merge --with-module
+                        // onto the plan's config-declared modules, flag
+                        // winning per id. SC-1's dispatch-level
+                        // short-circuit is the ONE early branch below —
+                        // an EMPTY merged map builds NO ModuleFeed,
+                        // touches NO cache root, and constructs NO
+                        // network client, reproducing today's behavior
+                        // byte-for-byte.
+                        let merged_modules = match ignition_core::rig::modules::merge_declarations(
+                            &plan.modules,
+                            with_module_flags,
+                        ) {
+                            Ok(merged) => merged,
+                            Err(err) => return (None, Err(err)),
+                        };
+                        let provisioning = if merged_modules.is_empty() {
+                            // SC-1 holds — no ModuleFeed, no cache root, no
+                            // network client — but a previous run's override
+                            // must still be cleared, which is why this is
+                            // clear_override and not a bare default().
+                            // Returning default() alone left D-08's delete
+                            // branch unreachable in production.
+                            if let Err(err) = ignition_core::rig::clear_override(&plan) {
+                                return (None, Err(err));
+                            }
+                            ignition_core::rig::ModuleProvisioning::default()
+                        } else {
+                            let feed = match ignition_core::module::fetch::ModuleFeed::github() {
+                                Ok(feed) => feed,
+                                Err(err) => return (None, Err(err)),
+                            };
+                            let cache_root = ignition_core::module::cache_root();
+                            let (refresh, accept_upstream_change) = match &command {
+                                RigCommand::Up {
+                                    refresh,
+                                    accept_upstream_change,
+                                    ..
+                                }
+                                | RigCommand::Reset {
+                                    refresh,
+                                    accept_upstream_change,
+                                    ..
+                                } => (*refresh, *accept_upstream_change),
+                                _ => unreachable!("guarded by the outer match arm"),
+                            };
+                            let policy = module_fetch_policy(refresh, accept_upstream_change);
+                            match ignition_core::rig::modules::provision_modules(
+                                &feed,
+                                &plan,
+                                &merged_modules,
+                                &cache_root,
+                                policy,
+                            )
+                            .await
+                            {
+                                Ok(provisioning) => provisioning,
+                                Err(err) => return (None, Err(err)),
+                            }
+                        };
                         match command {
-                            RigCommand::Up { timeout } => {
-                                actions::rig::rig_up(&runner, &plan, timeout, probe_dyn)
-                                    .await
-                                    .map(ActionOutput::RigUp)
-                            }
-                            RigCommand::Reset { timeout } => {
-                                actions::rig::rig_reset(&runner, &plan, timeout, probe_dyn)
-                                    .await
-                                    .map(ActionOutput::RigReset)
-                            }
+                            RigCommand::Up { timeout, .. } => actions::rig::rig_up(
+                                &runner,
+                                &plan,
+                                timeout,
+                                probe_dyn,
+                                &provisioning,
+                            )
+                            .await
+                            .map(ActionOutput::RigUp),
+                            RigCommand::Reset { timeout, .. } => actions::rig::rig_reset(
+                                &runner,
+                                &plan,
+                                timeout,
+                                probe_dyn,
+                                &provisioning,
+                            )
+                            .await
+                            .map(ActionOutput::RigReset),
                             _ => unreachable!("guarded by the outer match arm"),
                         }
                     }
@@ -3191,6 +3281,26 @@ fn commissioned_probe(plan: &ignition_core::rig::RigPlan) -> Option<Session> {
     rig_gateway_client(plan, None)
 }
 
+/// Map `rig up`/`rig reset`'s two fetch-policy flags (D-17) to
+/// [`ignition_core::module::fetch::FetchPolicy`] — `--refresh` and
+/// `--accept-upstream-change` are mutually exclusive at the clap level
+/// (`conflicts_with` on both flags in `cli.rs`), so at most one is ever
+/// `true` here; neither flag is ever IMPLIED by the other (D-17's
+/// explicit-accept requirement) — absent both, the default
+/// (`CacheFirst`) stands.
+fn module_fetch_policy(
+    refresh: bool,
+    accept_upstream_change: bool,
+) -> ignition_core::module::fetch::FetchPolicy {
+    if accept_upstream_change {
+        ignition_core::module::fetch::FetchPolicy::AcceptUpstreamChange
+    } else if refresh {
+        ignition_core::module::fetch::FetchPolicy::Refresh
+    } else {
+        ignition_core::module::fetch::FetchPolicy::default()
+    }
+}
+
 /// A client pointed at the rig's OWN derived gateway URL (the
 /// `commissioned_probe` generalized for the trial verbs: an optional
 /// credential rides along — tier 0's token when `IGNITION_TOKEN` is
@@ -3760,7 +3870,7 @@ fn init_tracing(verbosity: u8) {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{GUARDED_OPS, require_confirmation};
+    use super::{GUARDED_OPS, module_fetch_policy, require_confirmation};
 
     /// CORE-06 guard proof: without `--yes` → usage-class error (exit 2,
     /// `confirmation_required` slug) with a hint naming BOTH the flag and
@@ -3784,6 +3894,33 @@ mod tests {
         );
 
         require_confirmation(true, "project delete").expect("--yes confirms");
+    }
+
+    /// D-17: the two fetch-policy flags map to `FetchPolicy::Refresh`
+    /// and `FetchPolicy::AcceptUpstreamChange` independently — neither
+    /// is ever IMPLIED by the other, and absent both the policy is the
+    /// default (`CacheFirst`). clap's `conflicts_with` on both flags
+    /// (`cli.rs`) makes the both-true case unreachable from a real
+    /// invocation, so this only exercises the three reachable
+    /// combinations — that IS the falsifiable proof `--refresh` alone
+    /// can never produce `AcceptUpstreamChange` behavior.
+    #[test]
+    fn module_fetch_policy_flags_map_independently() {
+        assert_eq!(
+            module_fetch_policy(false, false),
+            ignition_core::module::fetch::FetchPolicy::default(),
+            "neither flag: the default policy"
+        );
+        assert_eq!(
+            module_fetch_policy(true, false),
+            ignition_core::module::fetch::FetchPolicy::Refresh,
+            "--refresh alone must map to Refresh, never Accept"
+        );
+        assert_eq!(
+            module_fetch_policy(false, true),
+            ignition_core::module::fetch::FetchPolicy::AcceptUpstreamChange,
+            "--accept-upstream-change alone must map to AcceptUpstreamChange"
+        );
     }
 
     /// Extract the SECOND top-level argument text of every

@@ -1,0 +1,38 @@
+---
+# Fixture rig for the Phase 16 live gate (16-03). One stock gateway, nothing else.
+#
+# DELIBERATELY sets NO ACCEPT_MODULE_CERTS / ACCEPT_MODULE_LICENSES (D-21).
+# That absence is the control: if a declared module reaches the gateway's
+# HEALTHY module list, the acceptance variables can only have come from the
+# override `ign` generated. Adding them here would destroy the experiment and
+# make the test prove nothing — do not "fix" this file by adding them.
+#
+# The image tag is pinned rather than `latest`, so this evidence stays
+# reproducible after upstream publishes a new image.
+services:
+  gateway:
+    image: inductiveautomation/ignition:8.3.3
+    hostname: gateway
+    ports:
+      # Host port is free to change — the test derives the URL from the
+      # resolved rig plan, never a hardcoded port.
+      - "9288:8088"
+    environment:
+      - ACCEPT_IGNITION_EULA=Y
+      - GATEWAY_ADMIN_USERNAME=admin
+      - GATEWAY_ADMIN_PASSWORD=password
+      - IGNITION_EDITION=standard
+    command: >
+      -n Ignition-Phase16-LiveGate
+    volumes:
+      # A NAMED volume, not the container's writable layer. Without it the
+      # gateway's data directory dies with the container on `down`, so the
+      # recreated gateway is brand new — the adopted API token is gone (401)
+      # and §B cannot test what it claims: a mount surviving a RECREATE, not
+      # a fresh gateway that happens to load the module again.
+      #
+      # Teardown uses `down -v`, so this volume does not outlive the test.
+      - gateway_data:/usr/local/bin/ignition/data
+
+volumes:
+  gateway_data:

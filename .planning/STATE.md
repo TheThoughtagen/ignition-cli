@@ -28,9 +28,9 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 
 ## Current Position
 
-Phase: 15-module-artifact-fetch-verify — COMPLETE (2/2 plans)
-Plan: — (next: Phase 16, 16-compose-override-module-injection)
-Status: Phase 15 complete; v1.3 in progress
+Phase: 16-compose-override-module-injection — COMPLETE (3/3 plans, SC-4 amended)
+Plan: — (next: 16-04 module uninstall, opened by 16-03's falsification; then Phase 17)
+Status: `ign rig up --with-module git@2.3.4` works end to end and is PROVEN LIVE — both modules healthy on a stock gateway given no acceptance variables of its own, surviving a container recreate. The comma-separated ACCEPT_MODULE_* format is confirmed correct and the gateway_service heuristic works on a real compose file. SC-4 was FALSIFIED live: deleting the override reverts the mount, not the gateway's install, because Ignition installs an accepted module into its data directory. README, SC-4 and RMOD-06 corrected; uninstall is 16-04.
 Last activity: 2026-09-21 - Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch
 
 ## Performance Metrics

@@ -1078,6 +1078,32 @@ pub enum RigCommand {
         /// the commissioned probe deadline (default 300)
         #[arg(long, default_value_t = 300, value_name = "SECS")]
         timeout: u64,
+
+        /// Provision a third-party module for THIS invocation only
+        /// (repeatable): `ID@VERSION`, e.g. `git@2.3.4`. ADDITIVE to
+        /// any `[rigs.NAME.modules.*]` declared in config — a flag
+        /// naming an id config already declares OVERRIDES that id's
+        /// version for this run; there is NO subtractive form (a
+        /// config-declared module cannot be omitted via this flag —
+        /// remove it from config instead)
+        #[arg(long, value_name = "ID@VERSION")]
+        with_module: Vec<String>,
+
+        /// Re-verify every already-cached module version against its
+        /// release feed before trusting it: an unchanged digest reuses
+        /// the cache, a changed one REFUSES (exit 6) naming both
+        /// digests — never silently accepted. Mutually exclusive with
+        /// --accept-upstream-change (never implied by it)
+        #[arg(long, conflicts_with = "accept_upstream_change")]
+        refresh: bool,
+
+        /// Accept a changed digest the feed now reports for an
+        /// already-cached module version — the deliberate, explicit
+        /// way to accept a re-released artifact (downloads and
+        /// verifies the NEW bytes, cached alongside the old entry,
+        /// never over it). Mutually exclusive with --refresh
+        #[arg(long, conflicts_with = "refresh")]
+        accept_upstream_change: bool,
     },
     /// Stop the rig (compose down --remove-orphans; volumes KEPT —
     /// `reset` owns the teardown half)
@@ -1090,6 +1116,25 @@ pub enum RigCommand {
         /// the commissioned probe deadline (default 300)
         #[arg(long, default_value_t = 300, value_name = "SECS")]
         timeout: u64,
+
+        /// Provision a third-party module for THIS invocation only
+        /// (repeatable): `ID@VERSION`, e.g. `git@2.3.4`. Same
+        /// additive/flag-wins/no-subtractive-form contract as `rig up
+        /// --with-module` (`reset` runs the same up-half internally)
+        #[arg(long, value_name = "ID@VERSION")]
+        with_module: Vec<String>,
+
+        /// Re-verify every already-cached module version against its
+        /// release feed before trusting it (see `rig up --refresh`).
+        /// Mutually exclusive with --accept-upstream-change
+        #[arg(long, conflicts_with = "accept_upstream_change")]
+        refresh: bool,
+
+        /// Accept a changed digest the feed now reports for an
+        /// already-cached module version (see `rig up
+        /// --accept-upstream-change`). Mutually exclusive with --refresh
+        #[arg(long, conflicts_with = "refresh")]
+        accept_upstream_change: bool,
     },
     /// Structured status: services, ports, volumes (allowlist JSON;
     /// a down rig is exit-0 data)

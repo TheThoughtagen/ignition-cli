@@ -41,6 +41,7 @@ use crate::rig::compose::{
     parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
     up_args, volume_ls_args,
 };
+use crate::rig::modules::{ModuleProvisioning, ProvisionedModule, existing_override};
 use crate::rig::{RigPlan, port_preflight};
 
 /// Default wait budget for BOTH `up --wait-timeout` and the
@@ -71,6 +72,11 @@ pub struct RigUpResult {
     /// Data-level warnings (uncommissioned wizard hint, skipped-wait
     /// note) — exit 0 carries them here, never on stderr.
     pub warnings: Vec<String>,
+    /// Modules provisioned this call (Phase 16) — ALWAYS present, empty
+    /// for a rig with no `[rigs.NAME.modules.*]` declared (SC-1: an
+    /// unprovisioned rig's result shape gains only this always-empty
+    /// field, never a behavior change).
+    pub provisioned_modules: Vec<ProvisionedModule>,
 }
 
 /// `ign rig down` output model.
@@ -99,6 +105,11 @@ pub struct RigResetResult {
     pub state: String,
     /// Data-level warnings (uncommissioned wizard hint, skipped-wait).
     pub warnings: Vec<String>,
+    /// Modules provisioned this call (Phase 16, Task 2) — the SAME
+    /// always-present convention as [`RigUpResult::provisioned_modules`]:
+    /// empty for a rig with no `[rigs.NAME.modules.*]` declared and no
+    /// `--with-module` flag (SC-1).
+    pub provisioned_modules: Vec<ProvisionedModule>,
 }
 
 /// One published-port row in status output (allowlist only).
@@ -178,11 +189,19 @@ pub fn gateway_url_from(plan: &RigPlan) -> Option<String> {
 /// [`gateway_url_from`] — when absent (or when no gateway port is
 /// derivable) the wait is skipped with a data-level warning and the
 /// compose `--wait` result stands on its own.
+///
+/// `provisioning` (Phase 16) carries the override file (if any) and the
+/// per-module outcome the caller already resolved via
+/// [`crate::rig::modules::provision_modules`] — `rig_up` never fetches;
+/// it only threads `provisioning.override_files()` into [`up_args`]. A
+/// `&ModuleProvisioning::default()` (no override, no modules) reproduces
+/// today's behavior byte-for-byte (SC-1).
 pub async fn rig_up(
     runner: &dyn ComposeRunner,
     plan: &RigPlan,
     wait_timeout_s: u64,
     gateway: Option<&dyn GatewayApi>,
+    provisioning: &ModuleProvisioning,
 ) -> Result<RigUpResult, CoreError> {
     // 1. Fail fast on a missing/too-old compose (exit 7 + install hint).
     compose_version(runner).await?;
@@ -197,8 +216,14 @@ pub async fn rig_up(
         )));
     }
 
-    // 3. The up itself.
-    let output = runner.run(&up_args(plan, wait_timeout_s)).await;
+    // 3. The up itself — the override (if any) rides as the SECOND -f.
+    let output = runner
+        .run(&up_args(
+            plan,
+            wait_timeout_s,
+            provisioning.override_files(),
+        ))
+        .await;
     check_output(&output, "docker compose up")?;
 
     let gateway_url = gateway_url_from(plan);
@@ -223,6 +248,7 @@ pub async fn rig_up(
         state,
         gateway_url,
         warnings,
+        provisioned_modules: provisioning.modules.clone(),
     })
 }
 
@@ -289,12 +315,19 @@ async fn commissioned_wait(
 
 /// `ign rig down`: version gate → `down --remove-orphans` (volumes
 /// KEPT — the `-v` teardown half belongs to `rig reset`, 04-02).
+///
+/// `rig down` never provisions (Phase 16, Task 3) — it derives its
+/// override from what [`existing_override`] finds on disk, which is the
+/// whole truth about what the last `up` used. An undeclared rig (or one
+/// whose override was already deleted) finds nothing and reproduces the
+/// pre-Phase-16 vector exactly (SC-1).
 pub async fn rig_down(
     runner: &dyn ComposeRunner,
     plan: &RigPlan,
 ) -> Result<RigDownResult, CoreError> {
     compose_version(runner).await?;
-    let output = runner.run(&down_args(plan, false)).await;
+    let override_files: Vec<PathBuf> = existing_override(plan).into_iter().collect();
+    let output = runner.run(&down_args(plan, false, &override_files)).await;
     check_output(&output, "docker compose down")?;
     Ok(RigDownResult {
         rig: plan.name.clone(),
@@ -322,11 +355,18 @@ pub async fn rig_down(
 /// 5. `up -d --wait` (the [`rig_up`] invocation verbatim);
 /// 6. commissioned wait — [`commissioned_wait`], the ONE shared fn
 ///    (the 04-01 probe reused verbatim; `poll.rs` untouched).
+///
+/// `provisioning` (Phase 16) is resolved ONCE by the caller, before the
+/// teardown, so the down and up halves of the cycle see one consistent
+/// override file set (SC-3's mechanism half — a stale override never
+/// changes mid-cycle). A `&ModuleProvisioning::default()` reproduces
+/// today's behavior byte-for-byte (SC-1).
 pub async fn rig_reset(
     runner: &dyn ComposeRunner,
     plan: &RigPlan,
     wait_timeout_s: u64,
     gateway: Option<&dyn GatewayApi>,
+    provisioning: &ModuleProvisioning,
 ) -> Result<RigResetResult, CoreError> {
     // 1. The preview — data for the result, reported as it acts.
     let removed_volumes = reset_preview(runner, plan).await?;
@@ -334,8 +374,12 @@ pub async fn rig_reset(
     // 2. Fail fast on a missing/too-old compose.
     compose_version(runner).await?;
 
-    // 3. Teardown: down -v --remove-orphans (volumes die here).
-    let output = runner.run(&down_args(plan, true)).await;
+    // 3. Teardown: down -v --remove-orphans (volumes die here). The SAME
+    //    override file set as the up half below — resolved once by the
+    //    caller before this cycle started (SC-3's mechanism half).
+    let output = runner
+        .run(&down_args(plan, true, provisioning.override_files()))
+        .await;
     check_output(&output, "docker compose down")?;
 
     // 4. Port pre-flight with fresh eyes — between the halves.
@@ -347,8 +391,14 @@ pub async fn rig_reset(
         )));
     }
 
-    // 5. The up half.
-    let output = runner.run(&up_args(plan, wait_timeout_s)).await;
+    // 5. The up half — the SAME override file set as the teardown.
+    let output = runner
+        .run(&up_args(
+            plan,
+            wait_timeout_s,
+            provisioning.override_files(),
+        ))
+        .await;
     check_output(&output, "docker compose up")?;
 
     // 6. Commissioned wait — the shared fn (uncommissioned-as-data).
@@ -374,6 +424,7 @@ pub async fn rig_reset(
         removed_volumes,
         state,
         warnings,
+        provisioned_modules: provisioning.modules.clone(),
     })
 }
 
@@ -638,7 +689,10 @@ pub async fn rig_logs(
     service: Option<&str>,
     sink: &mut (dyn FnMut(String) + Send),
 ) -> Result<RigLogsResult, CoreError> {
-    let args = logs_args(plan, tail, follow, service);
+    // `rig logs` never provisions (Phase 16, Task 3) — same disk-derived
+    // override discipline as `rig_down`/`rig_status`.
+    let override_files: Vec<PathBuf> = existing_override(plan).into_iter().collect();
+    let args = logs_args(plan, tail, follow, service, &override_files);
     let mut streamed = 0usize;
     let output = if follow {
         // Follow: streamed through the runner's piped-stdout shape;
@@ -950,7 +1004,10 @@ pub async fn rig_status(
 ) -> Result<RigStatusResult, CoreError> {
     compose_version(runner).await?;
 
-    let ps = runner.run(&ps_args(plan)).await;
+    // `rig status` never provisions (Phase 16, Task 3) — the override
+    // it passes (if any) is whatever `existing_override` finds on disk.
+    let override_files: Vec<PathBuf> = existing_override(plan).into_iter().collect();
+    let ps = runner.run(&ps_args(plan, &override_files)).await;
     let rows = parse_ps_ldjson(check_output(&ps, "docker compose ps")?);
 
     let volume_ls = runner.run_docker(&volume_ls_args(&plan.name)).await;
@@ -1020,6 +1077,7 @@ mod tests {
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
     };
+    use crate::rig::modules::ModuleProvisioning;
 
     // ---------------------------------------------------------------------
     // Test doubles
@@ -1155,6 +1213,8 @@ mod tests {
                 },
             ],
             volumes: vec!["gw-data".into()],
+            gateway_service: Some("ignition".into()),
+            modules: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1240,9 +1300,15 @@ mod tests {
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
         let runner = FakeRunner::with(up_cycle_outputs());
-        let result = rig_up(&runner, &gw_plan(), 300, Some(&api))
-            .await
-            .expect("up succeeds");
+        let result = rig_up(
+            &runner,
+            &gw_plan(),
+            300,
+            Some(&api),
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect("up succeeds");
         assert_eq!(result.rig, "fixture-rig");
         assert_eq!(result.state, "running");
         assert!(result.warnings.is_empty());
@@ -1255,8 +1321,55 @@ mod tests {
         assert_eq!(calls[2].0, "docker");
         assert_eq!(
             calls[3],
-            ("docker compose", up_args(&gw_plan(), 300)),
+            ("docker compose", up_args(&gw_plan(), 300, &[])),
             "up rides the LOCKED arg shape"
+        );
+    }
+
+    /// D-11 / plan Task 1 item 3: with a declared module already
+    /// provisioned (an override file `ign` wrote or found this run),
+    /// `rig_up` must issue exactly `-p <name> -f <base> -f <override>`
+    /// then the UNCHANGED `up` tail — override SECOND, never first. The
+    /// vector is hardcoded here (not re-derived by calling `up_args`)
+    /// so this is an independent proof that `rig_up` actually threads
+    /// `provisioning.override_files()` through, not merely that
+    /// `up_args` itself is correct (that's `up_args_appends_override_
+    /// after_base_file` in `rig/compose.rs`).
+    #[tokio::test]
+    async fn up_wires_override_file_as_second_f_argument() {
+        let override_path = PathBuf::from("/rigs/docker/compose.ign-modules.yml");
+        let provisioning = ModuleProvisioning {
+            override_file: Some(override_path.clone()),
+            modules: Vec::new(),
+        };
+
+        let runner = FakeRunner::with(up_cycle_outputs());
+        let result = rig_up(&runner, &gw_plan(), 300, None, &provisioning)
+            .await
+            .expect("up succeeds with a provisioned override");
+        assert!(result.provisioned_modules.is_empty());
+
+        let calls = runner.calls();
+        assert_eq!(
+            calls[3],
+            (
+                "docker compose",
+                vec![
+                    "-p".to_string(),
+                    "fixture-rig".to_string(),
+                    "-f".to_string(),
+                    "/rigs/docker/compose.yml".to_string(),
+                    "-f".to_string(),
+                    "/rigs/docker/compose.ign-modules.yml".to_string(),
+                    "up".to_string(),
+                    "-d".to_string(),
+                    "--wait".to_string(),
+                    "--wait-timeout".to_string(),
+                    "300".to_string(),
+                    "--remove-orphans".to_string(),
+                ]
+            ),
+            "override is the SECOND -f, base file first, up tail unchanged"
         );
     }
 
@@ -1269,9 +1382,15 @@ mod tests {
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
         let runner = FakeRunner::with(up_cycle_outputs());
-        let result = rig_up(&runner, &gw_plan(), 1, Some(&api))
-            .await
-            .expect("uncommissioned is exit-0 data");
+        let result = rig_up(
+            &runner,
+            &gw_plan(),
+            1,
+            Some(&api),
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect("uncommissioned is exit-0 data");
         assert_eq!(result.state, "uncommissioned");
         assert_eq!(result.gateway_url.as_deref(), Some("http://localhost:9088"));
         assert!(
@@ -1291,9 +1410,15 @@ mod tests {
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
         let runner = FakeRunner::with(up_cycle_outputs());
-        let err = rig_up(&runner, &gw_plan(), 1, Some(&api))
-            .await
-            .expect_err("still-STARTING deadline errors");
+        let err = rig_up(
+            &runner,
+            &gw_plan(),
+            1,
+            Some(&api),
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect_err("still-STARTING deadline errors");
         assert!(matches!(err, CoreError::Rig(_)));
         assert_eq!(err.exit_code(), 7);
         let message = err.to_string();
@@ -1310,9 +1435,15 @@ mod tests {
         let occupant = r#"{"Names":"other-gw-1","Labels":"com.docker.compose.project=other"}"#;
         let runner = FakeRunner::with(vec![version_ok(), ok(occupant), ok(occupant)]);
 
-        let err = rig_up(&runner, &gw_plan(), 300, None)
-            .await
-            .expect_err("cross-project occupant aborts");
+        let err = rig_up(
+            &runner,
+            &gw_plan(),
+            300,
+            None,
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect_err("cross-project occupant aborts");
         let message = err.to_string();
         assert!(
             message.contains("port 9088 in use by container other-gw-1 (rig other)"),
@@ -1332,9 +1463,15 @@ mod tests {
     #[tokio::test]
     async fn up_without_probe_skips_wait_with_warning() {
         let runner = FakeRunner::with(up_cycle_outputs());
-        let result = rig_up(&runner, &gw_plan(), 300, None)
-            .await
-            .expect("up succeeds without a probe");
+        let result = rig_up(
+            &runner,
+            &gw_plan(),
+            300,
+            None,
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect("up succeeds without a probe");
         assert_eq!(result.state, "running");
         assert!(
             result
@@ -1355,9 +1492,15 @@ mod tests {
             code: 127,
         };
         let runner = FakeRunner::with(vec![missing]);
-        let err = rig_up(&runner, &gw_plan(), 300, None)
-            .await
-            .expect_err("no docker errors");
+        let err = rig_up(
+            &runner,
+            &gw_plan(),
+            300,
+            None,
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect_err("no docker errors");
         let message = err.to_string();
         assert!(
             message.contains("docker compose is unavailable"),
@@ -1384,7 +1527,10 @@ mod tests {
             "RigDownResult shape (all keys always)"
         );
         let calls = runner.calls();
-        assert_eq!(calls[1], ("docker compose", down_args(&gw_plan(), false)));
+        assert_eq!(
+            calls[1],
+            ("docker compose", down_args(&gw_plan(), false, &[]))
+        );
     }
 
     #[tokio::test]
@@ -1442,9 +1588,15 @@ mod tests {
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
         let runner = FakeRunner::with(reset_cycle_outputs());
-        let result = rig_reset(&runner, &gw_plan(), 300, Some(&api))
-            .await
-            .expect("reset succeeds");
+        let result = rig_reset(
+            &runner,
+            &gw_plan(),
+            300,
+            Some(&api),
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect("reset succeeds");
         assert_eq!(result.rig, "fixture-rig");
         assert_eq!(result.removed_volumes, vec!["fixture-rig_gw-data"]);
         assert_eq!(result.state, "running");
@@ -1480,7 +1632,7 @@ mod tests {
         // Pre-flight AFTER the teardown, BEFORE the up (fresh eyes).
         assert_eq!(calls[3].0, "docker");
         assert_eq!(calls[4].0, "docker");
-        assert_eq!(calls[5], ("docker compose", up_args(&gw_plan(), 300)));
+        assert_eq!(calls[5], ("docker compose", up_args(&gw_plan(), 300, &[])));
     }
 
     /// A fresh volume terminally reports the wizard redirect →
@@ -1491,9 +1643,15 @@ mod tests {
         let api = crate::client::ReqwestGatewayApi::for_tests(&server.uri(), None);
 
         let runner = FakeRunner::with(reset_cycle_outputs());
-        let result = rig_reset(&runner, &gw_plan(), 1, Some(&api))
-            .await
-            .expect("uncommissioned reset is exit-0 data");
+        let result = rig_reset(
+            &runner,
+            &gw_plan(),
+            1,
+            Some(&api),
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect("uncommissioned reset is exit-0 data");
         assert_eq!(result.state, "uncommissioned");
         assert_eq!(result.removed_volumes, vec!["fixture-rig_gw-data"]);
         assert!(
@@ -1518,9 +1676,15 @@ mod tests {
             ok(occupant),     // preflight 9088: re-grabbed mid-cycle
             ok(OWN_OCCUPANT), // preflight 9443: own project
         ]);
-        let err = rig_reset(&runner, &gw_plan(), 300, None)
-            .await
-            .expect_err("mid-cycle port grab aborts before the up half");
+        let err = rig_reset(
+            &runner,
+            &gw_plan(),
+            300,
+            None,
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect_err("mid-cycle port grab aborts before the up half");
         assert!(matches!(err, CoreError::Rig(_)));
         assert_eq!(err.exit_code(), 7);
         let message = err.to_string();
@@ -1550,9 +1714,15 @@ mod tests {
                 code: 1,
             },
         ]);
-        let err = rig_reset(&runner, &gw_plan(), 300, None)
-            .await
-            .expect_err("down -v failure errors");
+        let err = rig_reset(
+            &runner,
+            &gw_plan(),
+            300,
+            None,
+            &ModuleProvisioning::default(),
+        )
+        .await
+        .expect_err("down -v failure errors");
         let message = err.to_string();
         assert!(
             message.contains("docker compose down failed (exit 1)"),
@@ -1595,7 +1765,10 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(
             calls,
-            vec![("docker compose", logs_args(&gw_plan(), 200, false, None))]
+            vec![(
+                "docker compose",
+                logs_args(&gw_plan(), 200, false, None, &[])
+            )]
         );
     }
 
@@ -1622,7 +1795,7 @@ mod tests {
             calls,
             vec![(
                 "docker compose",
-                logs_args(&gw_plan(), 50, true, Some("ignition"))
+                logs_args(&gw_plan(), 50, true, Some("ignition"), &[])
             )]
         );
     }
@@ -2920,9 +3093,17 @@ mod tests {
             state: "uncommissioned".into(),
             gateway_url: None,
             warnings: vec![],
+            provisioned_modules: vec![],
         };
         let json = serde_json::to_value(&up).unwrap();
-        for key in ["rig", "project", "state", "gateway_url", "warnings"] {
+        for key in [
+            "rig",
+            "project",
+            "state",
+            "gateway_url",
+            "warnings",
+            "provisioned_modules",
+        ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let down = RigDownResult {
@@ -2940,9 +3121,17 @@ mod tests {
             removed_volumes: vec![],
             state: "running".into(),
             warnings: vec![],
+            provisioned_modules: vec![],
         };
         let json = serde_json::to_value(&reset).unwrap();
-        for key in ["rig", "project", "removed_volumes", "state", "warnings"] {
+        for key in [
+            "rig",
+            "project",
+            "removed_volumes",
+            "state",
+            "warnings",
+            "provisioned_modules",
+        ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let status_keys = [

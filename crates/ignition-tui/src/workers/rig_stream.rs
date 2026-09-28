@@ -186,7 +186,17 @@ pub fn fire_rig_up(state: &mut AppState) {
         let probe_dyn = probe
             .as_deref()
             .map(|api| api as &dyn ignition_core::client::GatewayApi);
-        actions::rig::rig_up(&DockerCompose, &plan, WAIT_TIMEOUT_S, probe_dyn).await
+        // Phase 16 module provisioning is not yet wired through the TUI
+        // (plan 16-02 owns the verb) — the default carries no override.
+        let provisioning = ignition_core::rig::ModuleProvisioning::default();
+        actions::rig::rig_up(
+            &DockerCompose,
+            &plan,
+            WAIT_TIMEOUT_S,
+            probe_dyn,
+            &provisioning,
+        )
+        .await
     });
 }
 
@@ -208,7 +218,17 @@ pub fn fire_rig_reset(state: &mut AppState) {
         let probe_dyn = probe
             .as_deref()
             .map(|api| api as &dyn ignition_core::client::GatewayApi);
-        actions::rig::rig_reset(&DockerCompose, &plan, WAIT_TIMEOUT_S, probe_dyn).await
+        // Phase 16 module provisioning is not yet wired through the TUI
+        // (plan 16-02 owns the verb) — the default carries no override.
+        let provisioning = ignition_core::rig::ModuleProvisioning::default();
+        actions::rig::rig_reset(
+            &DockerCompose,
+            &plan,
+            WAIT_TIMEOUT_S,
+            probe_dyn,
+            &provisioning,
+        )
+        .await
     });
 }
 
@@ -373,6 +393,8 @@ mod tests {
             host_ports: vec![9088],
             port_mappings: vec![],
             volumes: vec!["gw-data".into()],
+            gateway_service: Some("ignition".into()),
+            modules: std::collections::BTreeMap::new(),
         };
         let runner = OneShotRunner(ComposeOutput {
             stdout: "gw line one\ngw line two\n".to_string(),

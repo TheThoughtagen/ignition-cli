@@ -21,7 +21,7 @@ requirements archive. LEDG-01 reconciles that.
 - [ ] **RMOD-03**: Provisioning works offline when the pinned artifact is already cached and verified — no network access required on subsequent `rig up`
 - [ ] **RMOD-04**: `ign` injects the module through a **generated compose override** (`compose.ign-modules.yml`), never by mutating the user's compose file and never by copying into a running container; the mount survives `rig up` recreates
 - [ ] **RMOD-05**: The override sets the gateway's acceptance variables (`ACCEPT_IGNITION_EULA`, `ACCEPT_MODULE_CERTS`, `ACCEPT_MODULE_LICENSES`) so EULA, certificate, and licence gates clear without a human in the commissioning UI
-- [ ] **RMOD-06**: The override is `ign`-owned output — regenerated rather than merged, carrying a header saying so, and removable without touching anything the user wrote
+- [ ] **RMOD-06**: The override is `ign`-owned output — regenerated rather than merged, carrying a header saying so, and removable without touching anything the user wrote. *Amended 2026-09-25:* removing it reverts the mount, NOT the gateway's install — Ignition installs an accepted module into its data directory, which survives. Proven live in 16-03; uninstall is 16-04.
 - [ ] **RMOD-07**: The mechanism is a **module registry**, not Git-module-specific — a second module is registered and provisioned through the same seam to prove the abstraction holds
 
 ### Git Module Commissioning

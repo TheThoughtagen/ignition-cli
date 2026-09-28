@@ -15,7 +15,7 @@
 pub mod profile;
 pub mod secret;
 
-pub use profile::{AuthRef, Config, Profile, RigConfig, RigEntry, UiConfig};
+pub use profile::{AuthRef, Config, ModuleDeclaration, Profile, RigConfig, RigEntry, UiConfig};
 pub use secret::{
     BasicEnvStore, Credential, EnvStore, KeyringStore, Secret, SecretStore, resolve_secret,
 };

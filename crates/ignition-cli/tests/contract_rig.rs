@@ -186,7 +186,7 @@ fn discovery_precedence_config_default_beats_cwd() {
     std::fs::write(
         &config,
         format!(
-            "[rig]\ndefault = \"remote\"\n\n[rigs.remote]\ncompose_file = \"{}\"\n",
+            "[rig]\ndefault = \"remote\"\n\n[rigs.remote]\ncompose_file = '{}'\n",
             remote_compose.display()
         ),
     )
@@ -573,4 +573,434 @@ fn rig_snapshot_restore_help_surfaces() {
         stdout.contains("--yes"),
         "the destructive guard is documented in the verb's help: {stdout}"
     );
+}
+
+// ---------------------------------------------------------------------
+// --with-module / fetch-policy flags (16-02 Task 2, D-15 through D-17)
+// ---------------------------------------------------------------------
+
+/// A config carrying one named rig whose compose file genuinely exists
+/// on disk (a minimal, valid compose document — never resolved through
+/// Docker by the tests that use this fixture, since their refusal
+/// fires before `resolve_plan` ever runs). Returns the rig's PROJECT
+/// DIRECTORY guard (kept alive by the CALLER — dropping it deletes the
+/// directory, which is why this returns the `TempDir` itself and not
+/// just its `.path()`) so a test can assert nothing new was written
+/// there.
+fn rig_config_with_real_compose_file() -> (tempfile::TempDir, PathBuf, tempfile::TempDir) {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let compose_file = project_dir.path().join("docker-compose.yml");
+    std::fs::write(
+        &compose_file,
+        "services:\n  app:\n    image: alpine:latest\n",
+    )
+    .expect("write compose file");
+
+    let (config_dir, config) = isolated_config();
+    std::fs::write(
+        &config,
+        format!(
+            "[rigs.fixture]\ncompose_file = '{}'\n",
+            compose_file.display()
+        ),
+    )
+    .expect("write config");
+
+    (config_dir, config, project_dir)
+}
+
+/// THE malformed-flag refusal (Task 2, D-15): `--with-module` with no
+/// `@` separator refuses exit 2 (`invalid_input`) with ZERO Docker
+/// invocation — `preflight_with_module_flags` runs BEFORE
+/// `resolve_plan`, so a REAL, resolvable rig config is used here
+/// specifically to prove nothing was written to its project directory
+/// (the directory holds ONLY the compose file this test seeded, never
+/// an `ign`-generated override).
+#[test]
+fn malformed_with_module_value_is_exit_2() {
+    let (_config_dir, config, project_dir_guard) = rig_config_with_real_compose_file();
+    let project_dir = project_dir_guard.path();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "up",
+            "--with-module",
+            "git-no-separator",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "malformed --with-module refuses at exit 2, never reaching a docker/resolve failure"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("invalid_input".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("git-no-separator"),
+        "message names the received value: {message}"
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(project_dir)
+        .expect("read project dir")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("docker-compose.yml")],
+        "nothing was written to the rig's project directory — the refusal fired \
+         before resolve_plan (and therefore before Docker) ever ran"
+    );
+}
+
+/// THE unregistered-id refusal (Task 2, D-13): a well-formed
+/// `--with-module` value naming an id with no registry entry refuses
+/// exit 3 (`module_not_registered`), naming both the offending id and
+/// every currently registered one — with ZERO Docker invocation, the
+/// same `preflight_with_module_flags` guard as the malformed case.
+#[test]
+fn unknown_module_id_via_flag_lists_knowns() {
+    let (_config_dir, config, project_dir_guard) = rig_config_with_real_compose_file();
+    let project_dir = project_dir_guard.path();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "up",
+            "--with-module",
+            "nope@1.0.0",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "unregistered module id refuses at exit 3, never reaching a docker/resolve failure"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("module_not_registered".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("nope"), "names the bad id: {message}");
+    assert!(message.contains("git"), "lists a known id: {message}");
+    assert!(
+        message.contains("project-scan-endpoint"),
+        "lists the OTHER known id too: {message}"
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(project_dir)
+        .expect("read project dir")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("docker-compose.yml")],
+        "nothing was written to the rig's project directory"
+    );
+}
+
+/// `rig reset` gets the SAME two refusals as `rig up` (D-15: `reset`
+/// runs the same up-half internally) — proven once here rather than
+/// duplicating both golden-message assertions above.
+#[test]
+fn rig_reset_with_module_refusals_match_rig_up() {
+    let (_config_dir, config, _project_dir) = rig_config_with_real_compose_file();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "reset",
+            "--yes",
+            "--with-module",
+            "nope@1.0.0",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "same exit-3 refusal as `rig up`"
+    );
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("module_not_registered".into())
+    );
+}
+
+/// The `--with-module` / `--refresh` / `--accept-upstream-change` help
+/// surface on BOTH `up` and `reset` (contains-assertions — clap's help
+/// rendering churns across versions by design).
+#[test]
+fn rig_up_reset_help_shows_with_module_and_fetch_policy_flags() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    for verb in ["up", "reset"] {
+        let out = ign_rig(&config, &roots, cwd.path(), &["rig", verb, "--help"]);
+        assert!(out.status.success(), "{verb} help exits 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("--with-module <ID@VERSION>"),
+            "{verb}: --with-module visible: {stdout}"
+        );
+        assert!(
+            stdout.contains("--refresh"),
+            "{verb}: --refresh visible: {stdout}"
+        );
+        assert!(
+            stdout.contains("--accept-upstream-change"),
+            "{verb}: --accept-upstream-change visible: {stdout}"
+        );
+        assert!(
+            stdout.to_lowercase().contains("no subtractive form")
+                || stdout.to_lowercase().contains("additive"),
+            "{verb}: D-16's no-subtractive-form contract is discoverable in help: {stdout}"
+        );
+    }
+}
+
+/// D-17: `--refresh` and `--accept-upstream-change` together is a
+/// usage-class refusal (clap's `conflicts_with`, exit 2) — BEFORE any
+/// of this crate's own dispatch code runs, which is the strongest form
+/// of "neither flag implies the other": the combination is not even a
+/// reachable runtime state.
+#[test]
+fn refresh_and_accept_upstream_change_together_is_a_usage_error() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "up",
+            "--refresh",
+            "--accept-upstream-change",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "clap's conflicts_with refuses the combination as a usage error"
+    );
+}
+
+/// True when `docker` itself can be spawned and answers to a bare
+/// invocation — distinct from [`docker_compose_available`] (which also
+/// requires the compose plugin): this gate only needs the daemon to
+/// accept `up -d`/`down`, so the cheaper probe is enough and avoids a
+/// redundant `compose version` round-trip.
+fn docker_daemon_available() -> bool {
+    if !docker_compose_available() {
+        return false;
+    }
+    // A reachable daemon is NOT enough: this test's fixture runs an
+    // `alpine` image, and a Windows-container daemon answers every probe
+    // happily and then fails the pull with "no matching manifest for
+    // windows(...)/amd64" (observed on CI's windows-latest). Ask what the
+    // daemon can actually RUN, not merely whether it is there.
+    std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Os}}"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "linux")
+        .unwrap_or(false)
+}
+
+/// RMOD-01 / the must_haves artifact table's "--json provisioning key"
+/// half: `rig up --with-module git@VERSION` against a real (lightweight
+/// alpine, no gateway port) rig — cache-seeded so the fetch is a pure
+/// cache hit and no network request is ever made — succeeds and the
+/// `--json` envelope's `data.provisioned_modules` carries exactly the
+/// provisioned module's id/version/gateway_module_id/digest/source/
+/// mount_target. Skips when Docker is unavailable or
+/// `IGNITION_SKIP_RIG_DOCKER_TESTS` forces the skip (the file's
+/// established convention) — teardown runs via a scope guard so a
+/// mid-test panic never leaks the container.
+#[test]
+fn rig_up_with_module_json_reports_provisioned_modules() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_daemon_available() {
+        eprintln!("skipping: docker unavailable (or skip forced) — this test drives a real rig");
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let compose_file = project_dir.path().join("docker-compose.yml");
+    std::fs::write(
+        &compose_file,
+        "services:\n  app:\n    image: alpine:latest\n    command: [\"sleep\", \"infinity\"]\n",
+    )
+    .expect("write compose file");
+
+    let project_name = format!(
+        "ign-cli-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+
+    let (_config_dir, config) = isolated_config();
+    std::fs::write(
+        &config,
+        format!(
+            "[rigs.fixture]\ncompose_file = '{}'\nproject_name = '{}'\nmodule_service = \"app\"\n",
+            compose_file.display(),
+            project_name
+        ),
+    )
+    .expect("write config");
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    // Pre-seed the module cache — CacheFirst (the default policy) is a
+    // pure cache hit, so this test never contacts GitHub.
+    let payload =
+        b"synthetic .modl payload for rig_up_with_module_json_reports_provisioned_modules".to_vec();
+    let digest = sha256_hex(&payload);
+    let cache_root = tempfile::tempdir().expect("cache tempdir");
+    let module_dir = cache_root.path().join("modules").join("git");
+    std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+    std::fs::write(module_dir.join(format!("2.3.4-{digest}.modl")), &payload)
+        .expect("seed cached artifact");
+
+    // Teardown guard: `docker compose -p <name> -f <file> down -v
+    // --remove-orphans` runs on drop (success, failure, or panic
+    // alike) — best-effort, errors ignored.
+    struct Teardown {
+        compose_file: PathBuf,
+        project_name: String,
+    }
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args([
+                    "compose",
+                    "-p",
+                    &self.project_name,
+                    "-f",
+                    self.compose_file.to_str().expect("utf8 path"),
+                    "down",
+                    "-v",
+                    "--remove-orphans",
+                ])
+                .output();
+        }
+    }
+    let _teardown = Teardown {
+        compose_file: compose_file.clone(),
+        project_name: project_name.clone(),
+    };
+
+    let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    command
+        .env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_RIG_ROOTS", &roots)
+        .env("IGNITION_CLI_CACHE", cache_root.path())
+        .env_remove("IGNITION_RIG")
+        .env_remove("IGNITION_TOKEN")
+        .current_dir(cwd.path())
+        .args([
+            "rig",
+            "--rig",
+            "fixture",
+            "up",
+            "--with-module",
+            "git@2.3.4",
+            "--timeout",
+            "60",
+            "--json",
+            "--compact",
+        ]);
+    let out = command.output().expect("spawn ign");
+    assert!(
+        out.status.success(),
+        "rig up succeeds: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let body: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("stdout envelope parses");
+    assert_eq!(body["ok"], Value::Bool(true));
+    let modules = body["data"]["provisioned_modules"]
+        .as_array()
+        .expect("provisioned_modules is always an array");
+    assert_eq!(modules.len(), 1, "exactly the one --with-module module");
+    let module = &modules[0];
+    assert_eq!(module["id"], Value::String("git".into()));
+    assert_eq!(module["version"], Value::String("2.3.4".into()));
+    assert_eq!(
+        module["gateway_module_id"],
+        Value::String("com.axone_io.ignition.git".into())
+    );
+    assert_eq!(module["digest_sha256"], Value::String(digest.clone()));
+    assert_eq!(module["source"], Value::String("cache".into()));
+    assert_eq!(
+        module["mount_target"],
+        Value::String("/usr/local/bin/ignition/user-lib/modules/git.modl".into())
+    );
+
+    let override_file = project_dir.path().join("compose.ign-modules.yml");
+    assert!(
+        override_file.exists(),
+        "the override file was written to the rig's project directory"
+    );
+    let contents = std::fs::read_to_string(&override_file).expect("read override");
+    assert!(contents.contains("git.modl"), "{contents}");
+    assert!(contents.contains("com.axone_io.ignition.git"), "{contents}");
+}
+
+/// sha256 hex digest — local helper (no dependency added: `sha2` is
+/// already a workspace dependency of `ignition-core`, but this binary
+/// crate's test target keeps its own copy rather than reaching into
+/// core's private surface for one hash).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
