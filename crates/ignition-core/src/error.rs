@@ -1151,8 +1151,8 @@ impl CoreError {
                 "no modules are registered in this build of ign".to_string()
             } else {
                 format!(
-                    "known module ids: {} — check the id under \
-                     [rigs.NAME.modules.*] in your config",
+                    "known module ids: {} — check the id passed to --with-module \
+                     or declared under [rigs.NAME.modules.*]",
                     known.join(", ")
                 )
             }),

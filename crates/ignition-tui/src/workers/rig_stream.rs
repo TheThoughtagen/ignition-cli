@@ -42,6 +42,42 @@ const WAIT_TIMEOUT_S: u64 = actions::rig::DEFAULT_WAIT_TIMEOUT_S;
 /// config load → AUTO discovery → the [`ignition_core::rig::RigPlan`]
 /// every rig action takes. Docker/discovery failures flow the
 /// family's own error shapes (exit 7 + the search trail).
+/// Provision a rig's declared modules for the TUI, mirroring `main.rs`'s
+/// dispatch.
+///
+/// The TUI previously passed `ModuleProvisioning::default()` at both call
+/// sites with a comment saying provisioning was "not yet wired through the
+/// TUI (plan 16-02 owns the verb)". Plan 16-02 shipped the verb and never
+/// wired it, so the comment stopped being a deferral and became false: a
+/// rig whose config declared modules came up from the TUI WITHOUT them,
+/// silently. The project's own constraint is that every CLI action is
+/// available in the TUI.
+///
+/// SC-1 is preserved exactly as in the CLI: an undeclared rig builds NO
+/// `ModuleFeed`, resolves NO cache root and constructs NO network client —
+/// it only clears a stale override. There is no flag surface here, so the
+/// policy is the default `CacheFirst`; a TUI user who needs `--refresh` or
+/// `--accept-upstream-change` uses the CLI, which is where a deliberate
+/// digest decision belongs.
+async fn provision_for(
+    plan: &ignition_core::rig::RigPlan,
+) -> Result<ignition_core::rig::ModuleProvisioning, CoreError> {
+    if plan.modules.is_empty() {
+        ignition_core::rig::clear_override(plan)?;
+        return Ok(ignition_core::rig::ModuleProvisioning::default());
+    }
+    let feed = ignition_core::module::fetch::ModuleFeed::github()?;
+    let cache_root = ignition_core::module::cache_root();
+    ignition_core::rig::provision_modules(
+        &feed,
+        plan,
+        &plan.modules,
+        &cache_root,
+        ignition_core::module::fetch::FetchPolicy::CacheFirst,
+    )
+    .await
+}
+
 async fn resolve_auto_plan() -> Result<ignition_core::rig::RigPlan, CoreError> {
     let config = config::load(&config::config_path())?;
     let runner = DockerCompose;
@@ -186,9 +222,7 @@ pub fn fire_rig_up(state: &mut AppState) {
         let probe_dyn = probe
             .as_deref()
             .map(|api| api as &dyn ignition_core::client::GatewayApi);
-        // Phase 16 module provisioning is not yet wired through the TUI
-        // (plan 16-02 owns the verb) — the default carries no override.
-        let provisioning = ignition_core::rig::ModuleProvisioning::default();
+        let provisioning = provision_for(&plan).await?;
         actions::rig::rig_up(
             &DockerCompose,
             &plan,
@@ -218,9 +252,7 @@ pub fn fire_rig_reset(state: &mut AppState) {
         let probe_dyn = probe
             .as_deref()
             .map(|api| api as &dyn ignition_core::client::GatewayApi);
-        // Phase 16 module provisioning is not yet wired through the TUI
-        // (plan 16-02 owns the verb) — the default carries no override.
-        let provisioning = ignition_core::rig::ModuleProvisioning::default();
+        let provisioning = provision_for(&plan).await?;
         actions::rig::rig_reset(
             &DockerCompose,
             &plan,
