@@ -74,13 +74,28 @@ exercise.
 
 ## The three LOW-confidence questions the research left open
 
-**Q: did the contract hold on a second version?** Yes. 8.3.9 behaved
-identically to 8.3.3 in every observable: same 31-module healthy list, same
-ghost-entry uninstall, same immediacy, no restart required.
+**Q: did the contract hold on a second version?** Yes, for everything the gate
+observes: 8.3.9 matched 8.3.3 on the 31-module healthy list, the ghost-entry
+uninstall, the immediacy and the untouched 29-module seed. What the gate does
+NOT observe is listed in the next answer.
 
-**Q: did anything contradict the four live facts?** No. The 200-always status,
-the refusal while mounted, the ghost-entry success and the no-restart
-immediacy all held on both tags.
+**Q: did anything contradict the four live facts?** Nothing contradicted them,
+but the gate only EXERCISES two of the four, and the original wording of this
+answer claimed all four — corrected here rather than left standing.
+
+| Live fact | Exercised by the gate? |
+|---|---|
+| ghost-entry uninstall succeeds | **yes** — §D, both tags |
+| no restart required | **yes** — §D asserts absence immediately, no restart between |
+| uninstall REFUSES while the `.modl` is still mounted | **no** — §C unmounts before §D, so this path never runs |
+| the denial rides a 200 | **no** — the gate never inspects a raw HTTP status |
+
+The last two rest on the 19-RESEARCH probe against 8.3.3 alone. They are
+covered by contract tests at the `GatewayApi` seam (`module_uninstall_contract.rs`),
+which pin `ign`'s HANDLING of a `success:false`-on-200 body — not the gateway's
+choice to send one. Claiming cross-version confirmation for them would be a
+claim derived from a requirement rather than from behavior, which is the exact
+failure this phase exists to correct.
 
 **Q: was `data/jar-cache/<gateway-module-id>/` residue still present?**
 **Not observed.** Teardown runs `down -v` unconditionally and destroys the

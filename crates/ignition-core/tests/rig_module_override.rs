@@ -1163,6 +1163,56 @@ fn orphaned_module_carries_registry_id_gateway_id_and_removal_command() {
     );
 }
 
+/// `remove_with` is advice the user PASTES INTO A SHELL, and the command
+/// it names is the irreversible one. A `[rigs.NAME]` key is an
+/// unrestricted TOML table name, so a key with a space would split into
+/// two arguments and a key with shell syntax would change what the
+/// pasted line does.
+///
+/// Bare-safe keys stay unquoted so the common case reads naturally;
+/// everything else is POSIX single-quoted, with an embedded apostrophe
+/// closed-escaped-reopened (`'\''`) rather than YAML-doubled.
+#[test]
+fn remove_with_shell_quotes_a_rig_key_that_is_not_a_bare_token() {
+    let empty: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    let command = |name: &str| {
+        orphaned_modules(&[&GIT_MODULE], &empty, Some(name))[0]
+            .remove_with
+            .clone()
+    };
+
+    assert_eq!(
+        command("live-rig.2"),
+        "ign rig module uninstall git --rig live-rig.2 --yes",
+        "an alphanumeric/._- key is already a safe bare token and must not grow quotes"
+    );
+
+    assert_eq!(
+        command("my rig"),
+        "ign rig module uninstall git --rig 'my rig' --yes",
+        "a space would otherwise split the selector into two arguments"
+    );
+
+    assert_eq!(
+        command("prod; rm -rf /"),
+        "ign rig module uninstall git --rig 'prod; rm -rf /' --yes",
+        "shell syntax must be inert inside the quotes, not a second command"
+    );
+
+    assert_eq!(
+        command("$(whoami)"),
+        "ign rig module uninstall git --rig '$(whoami)' --yes",
+        "single quotes suppress command substitution; double quotes would not have"
+    );
+
+    assert_eq!(
+        command("it's"),
+        "ign rig module uninstall git --rig 'it'\\''s' --yes",
+        "an embedded apostrophe is closed, escaped and reopened — the POSIX rule, \
+         NOT the YAML apostrophe-doubling generate_override uses"
+    );
+}
+
 /// The real-path pair (test-matrix rule): a real two-mount override on
 /// disk, nothing declared — `undeclared_provisioning` reports BOTH as
 /// orphans AND the file is gone afterward, asserted in the SAME test so

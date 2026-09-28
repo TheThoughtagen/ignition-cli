@@ -161,7 +161,7 @@ Plans:
 | 16. Compose Override — Module Injection | v1.3 | 3/3 | Complete (SC-4 amended) | 2026-09-25 |
 | 17. Git Module Commissioning | v1.3 | 0/? | Not started | — |
 | 18. Declared Rig Discovery | v1.3 | 0/? | Not started | — |
-| 19. Module Uninstall on Undeclare | v1.3 | 0/3 | Planned | — |
+| 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 
 ---
 *Roadmap created: 2026-09-04 — milestone v1.1; v1.1 completed 2026-09-16 (25/25 requirements shipped)*

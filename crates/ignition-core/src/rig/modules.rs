@@ -377,6 +377,34 @@ pub fn previously_provisioned(plan: &RigPlan) -> Vec<&'static ModuleSpec> {
     specs
 }
 
+/// POSIX-shell-quote a `[rigs.NAME]` key for the copy-paste command in
+/// [`OrphanedModule::remove_with`].
+///
+/// A rig key is an unrestricted TOML table name and `--rig` accepts the
+/// same unrestricted string, so the key reaches a generated command line
+/// as raw text. A key with a space splits into two arguments; a key with
+/// shell syntax (`;`, `$(...)`, backticks) changes what the pasted line
+/// DOES. `remove_with` is advice a user pastes into a shell, and the
+/// command it names is the irreversible one — this is the same defect
+/// shape as the unquoted `module_service` YAML interpolation, in a
+/// different output language.
+///
+/// Safe bare tokens are returned unchanged so the common case stays
+/// readable (`--rig live`, not `--rig 'live'`). Everything else is
+/// single-quoted, with an embedded `'` closed, escaped and reopened
+/// (`'\''`) — the POSIX rule, NOT the YAML apostrophe-doubling used by
+/// [`generate_override`].
+fn shell_quote_rig(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if bare {
+        return name.to_string();
+    }
+    format!("'{}'", name.replace('\'', "'\\''"))
+}
+
 /// The pure set difference behind the orphan report: every `previous`
 /// spec whose id is absent from `declared` — no I/O, sorted by id. A
 /// module `declared` newly adds is never reported (only ABSENCE from
@@ -400,7 +428,11 @@ pub fn orphaned_modules(
             // cwd/convention rig has no key to select by, so it gets the
             // bare form — that rig is not addressable by `--rig` either.
             remove_with: match config_name {
-                Some(rig) => format!("ign rig module uninstall {} --rig {rig} --yes", spec.id),
+                Some(rig) => format!(
+                    "ign rig module uninstall {} --rig {} --yes",
+                    spec.id,
+                    shell_quote_rig(rig)
+                ),
                 None => format!("ign rig module uninstall {} --yes", spec.id),
             },
         })
