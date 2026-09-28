@@ -16,11 +16,12 @@ use async_trait::async_trait;
 use ignition_core::actions::rig::{rig_down, rig_up};
 use ignition_core::config::ModuleDeclaration;
 use ignition_core::module::fetch::{ArtifactSource, FetchPolicy, ModuleFeed};
-use ignition_core::module::{GIT_MODULE, MODULES};
+use ignition_core::module::{GIT_MODULE, MODULES, PROJECT_SCAN_ENDPOINT};
 use ignition_core::rig::modules::preflight_mount_source;
 use ignition_core::rig::{
-    ComposeOutput, ComposeRunner, ModuleProvisioning, MountedModule, OVERRIDE_FILENAME, RigPlan,
-    existing_override, generate_override, provision_modules, write_override,
+    ComposeOutput, ComposeRunner, ModuleProvisioning, MountedModule, OVERRIDE_FILENAME,
+    OrphanedModule, RigPlan, existing_override, generate_override, orphaned_modules,
+    previously_provisioned, provision_modules, undeclared_provisioning, write_override,
 };
 
 use sha2::{Digest, Sha256};
@@ -738,6 +739,7 @@ async fn down_then_up_passes_the_same_override_file() {
     let provisioning = ModuleProvisioning {
         override_file: Some(override_path.clone()),
         modules: Vec::new(),
+        orphaned_modules: Vec::new(),
     };
 
     let runner = RecordingRunner::default();
@@ -859,4 +861,439 @@ async fn provision_modules_clears_a_stale_override_when_nothing_is_declared() {
     )
     .await
     .expect("a second undeclared run is not an error");
+}
+
+// ---------------------------------------------------------------------
+// 19-02 Task 1: the orphan diff — previously_provisioned, orphaned_
+// modules, undeclared_provisioning (D-19-06/D-19-07).
+// ---------------------------------------------------------------------
+
+/// Seed a REAL generated two-mount override (`git` + `project-scan-
+/// endpoint`) via [`write_override`] — never a hand-written stub, per
+/// the plan's own trap warning about
+/// `provision_modules_clears_a_stale_override_when_nothing_is_declared`'s
+/// literal seed. Every test below that needs a two-mount fixture starts
+/// from this real generated file and, where a specific malformed shape
+/// is under test, mutates ONE real `target:` line in place rather than
+/// authoring new content from scratch.
+fn seed_two_mount_override(plan: &RigPlan) -> PathBuf {
+    let git_mount = MountedModule {
+        spec: &GIT_MODULE,
+        version: "2.3.4".to_string(),
+        source: PathBuf::from("/cache/modules/git/2.3.4-deadbeef.modl"),
+        source_kind: ArtifactSource::Cache,
+    };
+    let scan_mount = MountedModule {
+        spec: &PROJECT_SCAN_ENDPOINT,
+        version: "1.0.0".to_string(),
+        source: PathBuf::from("/cache/modules/project-scan-endpoint/1.0.0-cafebabe.modl"),
+        source_kind: ArtifactSource::Cache,
+    };
+    write_override(plan, "ignition", &[git_mount, scan_mount])
+        .expect("seed a real two-mount override")
+        .expect("mounts were non-empty")
+}
+
+/// No override on disk at all: empty, never a refusal.
+#[test]
+fn previously_provisioned_with_no_override_is_empty() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    assert!(
+        previously_provisioned(&plan).is_empty(),
+        "no override on disk must yield an empty result"
+    );
+}
+
+/// A real two-mount override recovers BOTH registry specs, in
+/// `ModuleSpec::id` order — the happy path the diff exists for.
+#[test]
+fn previously_provisioned_recovers_both_specs_from_a_real_two_mount_override() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    seed_two_mount_override(&plan);
+
+    let previous = previously_provisioned(&plan);
+    assert_eq!(
+        previous.iter().map(|spec| spec.id).collect::<Vec<_>>(),
+        vec!["git", "project-scan-endpoint"],
+        "both previously-mounted specs recovered, in ModuleSpec::id order"
+    );
+}
+
+/// D-19-07's belt: a target line naming an id the registry does not
+/// know is DROPPED silently, and the known entry still resolves — the
+/// git target is mutated to a made-up id inside an otherwise-real
+/// generated override, never a fully hand-authored file.
+#[test]
+fn previously_provisioned_drops_an_id_the_registry_does_not_know() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    let path = seed_two_mount_override(&plan);
+
+    let contents = std::fs::read_to_string(&path).expect("read the real override");
+    let tampered = contents.replace(
+        "target: '/usr/local/bin/ignition/user-lib/modules/git.modl'",
+        "target: '/usr/local/bin/ignition/user-lib/modules/totally-made-up.modl'",
+    );
+    assert_ne!(
+        contents, tampered,
+        "precondition: the git target line was actually replaced"
+    );
+    std::fs::write(&path, tampered).expect("write the tampered override");
+
+    let previous = previously_provisioned(&plan);
+    assert_eq!(
+        previous.iter().map(|spec| spec.id).collect::<Vec<_>>(),
+        vec!["project-scan-endpoint"],
+        "the unregistered id must never appear; the known one still resolves"
+    );
+}
+
+/// The literal non-generated content the Phase-16 test already seeds
+/// (`provision_modules_clears_a_stale_override_when_nothing_is_declared`'s
+/// trap case): zero recognizable `target:` lines, so this must be
+/// empty, never a refusal — `rig up` must keep working on a rig whose
+/// override predates the orphan feature entirely.
+#[test]
+fn previously_provisioned_on_a_non_generated_file_is_empty_not_a_refusal() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    let stale = project_dir.path().join(OVERRIDE_FILENAME);
+    std::fs::write(&stale, "# left by a previous run\n").expect("seed stale non-generated file");
+
+    assert!(
+        previously_provisioned(&plan).is_empty(),
+        "a file with no recognizable target: lines must yield empty, never an error"
+    );
+}
+
+/// Tamper exactly ONE real `target:` line of a real generated two-mount
+/// override and return what `previously_provisioned` recovers. The other
+/// line is left untouched, so the assertions below can require it to
+/// still resolve: a guard that over-rejects (drops everything) fails just
+/// as loudly as one that under-rejects.
+fn recovered_after_tampering(from: &str, to: &str) -> Vec<&'static str> {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    let path = seed_two_mount_override(&plan);
+
+    let contents = std::fs::read_to_string(&path).expect("read the real override");
+    let tampered = contents.replace(from, to);
+    assert_ne!(
+        contents, tampered,
+        "precondition: the target line {from:?} was actually replaced"
+    );
+    std::fs::write(&path, tampered).expect("write the tampered override");
+
+    previously_provisioned(&plan)
+        .iter()
+        .map(|spec| spec.id)
+        .collect()
+}
+
+/// A target OUTSIDE `CONTAINER_MODULE_DIR` that happens to share a
+/// basename with a registry module is dropped. Regression: the parse
+/// once took only the last path segment, so `/tmp/outside/git.modl`
+/// resolved to `git` and would have been reported as an orphan.
+#[test]
+fn previously_provisioned_drops_a_target_outside_the_module_dir() {
+    assert_eq!(
+        recovered_after_tampering(
+            "target: '/usr/local/bin/ignition/user-lib/modules/git.modl'",
+            "target: '/tmp/outside/git.modl'",
+        ),
+        vec!["project-scan-endpoint"],
+        "an outside-directory target must be dropped; the untouched mount still resolves"
+    );
+}
+
+/// A sibling directory that merely starts with the module dir's text
+/// (`.../modules-evil/`) is not inside it.
+#[test]
+fn previously_provisioned_drops_a_target_in_a_sibling_directory_sharing_the_prefix() {
+    assert_eq!(
+        recovered_after_tampering(
+            "target: '/usr/local/bin/ignition/user-lib/modules/git.modl'",
+            "target: '/usr/local/bin/ignition/user-lib/modules-evil/git.modl'",
+        ),
+        vec!["project-scan-endpoint"],
+        "a sibling directory sharing the prefix text is not the module directory"
+    );
+}
+
+/// A target nested a level below the module dir is not a direct mount.
+#[test]
+fn previously_provisioned_drops_a_nested_target() {
+    assert_eq!(
+        recovered_after_tampering(
+            "target: '/usr/local/bin/ignition/user-lib/modules/git.modl'",
+            "target: '/usr/local/bin/ignition/user-lib/modules/sub/git.modl'",
+        ),
+        vec!["project-scan-endpoint"],
+        "a nested path is not a direct module mount"
+    );
+}
+
+/// A target lacking the `.modl` suffix is dropped.
+#[test]
+fn previously_provisioned_drops_a_target_missing_the_modl_suffix() {
+    assert_eq!(
+        recovered_after_tampering(
+            "target: '/usr/local/bin/ignition/user-lib/modules/project-scan-endpoint.modl'",
+            "target: '/usr/local/bin/ignition/user-lib/modules/project-scan-endpoint'",
+        ),
+        vec!["git"],
+        "a target without .modl must be dropped; the untouched mount still resolves"
+    );
+}
+
+/// Output is deduplicated and sorted by `ModuleSpec::id` no matter how
+/// the file orders or repeats its target lines. A generated override is
+/// already sorted and unique, so a bare happy-path test cannot tell
+/// whether `previously_provisioned` sorts or dedups at all. Here a real
+/// generated file (git, then project-scan-endpoint) gets a SECOND `git`
+/// target line appended: without the dedup the result has two `git`s;
+/// without the sort the non-adjacent duplicate survives `dedup`.
+#[test]
+fn previously_provisioned_dedups_and_sorts_regardless_of_line_order() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    let path = seed_two_mount_override(&plan);
+
+    let mut contents = std::fs::read_to_string(&path).expect("read the real override");
+    contents.push_str("        target: '/usr/local/bin/ignition/user-lib/modules/git.modl'\n");
+    std::fs::write(&path, contents).expect("append a repeated git target line");
+
+    let previous = previously_provisioned(&plan);
+    assert_eq!(
+        previous.iter().map(|spec| spec.id).collect::<Vec<_>>(),
+        vec!["git", "project-scan-endpoint"],
+        "a repeated target line is reported once, and output order is by id"
+    );
+}
+
+/// The pure set difference, every shape from the plan's behavior table
+/// in one test: empty/empty; both orphaned when nothing is declared;
+/// exactly the undeclared one when one of two is declared; a newly
+/// declared module (present in `declared`, absent from `previous`) is
+/// never reported; and an empty `previous` against a non-empty
+/// `declared` stays empty.
+#[test]
+fn orphaned_modules_is_the_pure_set_difference() {
+    let empty_declared: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    assert!(
+        orphaned_modules(&[], &empty_declared).is_empty(),
+        "empty previous, empty declared: empty"
+    );
+
+    let both: Vec<&'static ignition_core::module::ModuleSpec> =
+        vec![&GIT_MODULE, &PROJECT_SCAN_ENDPOINT];
+    let orphans = orphaned_modules(&both, &empty_declared);
+    assert_eq!(
+        orphans.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+        vec!["git", "project-scan-endpoint"],
+        "declared empty: both previous specs are orphaned"
+    );
+
+    let mut declared_git_only: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    declared_git_only.insert(
+        "git".to_string(),
+        ModuleDeclaration {
+            version: "2.3.4".to_string(),
+        },
+    );
+    let orphans = orphaned_modules(&both, &declared_git_only);
+    assert_eq!(
+        orphans.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+        vec!["project-scan-endpoint"],
+        "exactly the undeclared module is orphaned"
+    );
+
+    let git_only: Vec<&'static ignition_core::module::ModuleSpec> = vec![&GIT_MODULE];
+    let mut declared_both: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    declared_both.insert(
+        "git".to_string(),
+        ModuleDeclaration {
+            version: "2.3.4".to_string(),
+        },
+    );
+    declared_both.insert(
+        "project-scan-endpoint".to_string(),
+        ModuleDeclaration {
+            version: "1.0.0".to_string(),
+        },
+    );
+    assert!(
+        orphaned_modules(&git_only, &declared_both).is_empty(),
+        "a newly declared module (present in declared, absent from previous) is never an orphan"
+    );
+
+    assert!(
+        orphaned_modules(&[], &declared_git_only).is_empty(),
+        "empty previous against a non-empty declared stays empty"
+    );
+
+    let reversed: Vec<&'static ignition_core::module::ModuleSpec> =
+        vec![&PROJECT_SCAN_ENDPOINT, &GIT_MODULE];
+    let orphans = orphaned_modules(&reversed, &empty_declared);
+    assert_eq!(
+        orphans.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+        vec!["git", "project-scan-endpoint"],
+        "output is sorted by id even when `previous` arrives unsorted"
+    );
+}
+
+/// Each `OrphanedModule` carries the registry id, the GATEWAY module
+/// id (not the registry id twice), and the exact removal command —
+/// pinned by full struct equality so a future respelling of any field
+/// is caught here.
+#[test]
+fn orphaned_module_carries_registry_id_gateway_id_and_removal_command() {
+    let empty_declared: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    let orphans = orphaned_modules(&[&GIT_MODULE], &empty_declared);
+    assert_eq!(
+        orphans,
+        vec![OrphanedModule {
+            id: "git".to_string(),
+            gateway_module_id: "com.axone_io.ignition.git".to_string(),
+            remove_with: "ign rig module uninstall git --yes".to_string(),
+        }]
+    );
+}
+
+/// The real-path pair (test-matrix rule): a real two-mount override on
+/// disk, nothing declared — `undeclared_provisioning` reports BOTH as
+/// orphans AND the file is gone afterward, asserted in the SAME test so
+/// a read-after-delete regression (which would silently empty the
+/// orphan list while still deleting the file) cannot hide behind a test
+/// that only checks the deletion.
+#[test]
+fn undeclared_provisioning_reports_orphans_and_clears_the_file_in_one_test() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    let path = seed_two_mount_override(&plan);
+    assert!(
+        path.exists(),
+        "precondition: the pre-existing override exists"
+    );
+
+    let provisioning = undeclared_provisioning(&plan).expect("undeclared provisioning succeeds");
+
+    assert_eq!(
+        provisioning
+            .orphaned_modules
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["git", "project-scan-endpoint"],
+        "both previously-provisioned modules are reported as orphans"
+    );
+    assert!(
+        !path.exists(),
+        "the override must be deleted by the same call that read the orphans"
+    );
+    assert!(provisioning.override_file.is_none());
+    assert!(provisioning.modules.is_empty());
+}
+
+/// Called twice: the second call is `Ok` with an empty orphan list —
+/// nothing left on disk the second time to diff against.
+#[test]
+fn undeclared_provisioning_is_idempotent_on_a_second_call() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    seed_two_mount_override(&plan);
+
+    let first = undeclared_provisioning(&plan).expect("first call succeeds");
+    assert_eq!(first.orphaned_modules.len(), 2);
+
+    let second =
+        undeclared_provisioning(&plan).expect("second call over an already-cleared file succeeds");
+    assert!(
+        second.orphaned_modules.is_empty(),
+        "nothing left on disk to report as orphaned on the second call"
+    );
+}
+
+/// `provision_modules(feed, plan, &BTreeMap::new(), ...)` against the
+/// SAME pre-existing override must report the SAME orphans
+/// `undeclared_provisioning` reports directly — the early return and
+/// the dispatch branch must not diverge (they are now the same
+/// function).
+#[tokio::test]
+async fn provision_modules_empty_declared_matches_undeclared_provisioning_directly() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    seed_two_mount_override(&plan);
+
+    let cache_root = tempfile::tempdir().expect("cache tempdir");
+    let via_provision_modules = provision_modules(
+        &unroutable_feed(),
+        &plan,
+        &BTreeMap::new(),
+        cache_root.path(),
+        FetchPolicy::CacheFirst,
+    )
+    .await
+    .expect("empty-declared provisioning succeeds");
+
+    assert_eq!(
+        via_provision_modules
+            .orphaned_modules
+            .iter()
+            .map(|o| o.id.clone())
+            .collect::<Vec<_>>(),
+        vec!["git".to_string(), "project-scan-endpoint".to_string()],
+        "provision_modules' early return must report the same orphans \
+         undeclared_provisioning reports directly — one computation, two callers"
+    );
+}
+
+/// `provision_modules` with `git` declared and a real two-mount
+/// override present reports EXACTLY `project-scan-endpoint` as
+/// orphaned, and the rewritten override still names `git`.
+#[tokio::test]
+async fn provision_modules_with_git_declared_reports_project_scan_endpoint_orphaned() {
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let plan = base_plan(project_dir.path(), Some("ignition"), &["ignition"]);
+    let path = seed_two_mount_override(&plan);
+
+    let cache_root = tempfile::tempdir().expect("cache tempdir");
+    let payload = b"synthetic git payload for the orphan-on-declared-path test".to_vec();
+    seed_cache_file(cache_root.path(), "git", "2.3.4", &payload);
+
+    let mut declared: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
+    declared.insert(
+        "git".to_string(),
+        ModuleDeclaration {
+            version: "2.3.4".to_string(),
+        },
+    );
+
+    let provisioning = provision_modules(
+        &unroutable_feed(),
+        &plan,
+        &declared,
+        cache_root.path(),
+        FetchPolicy::CacheFirst,
+    )
+    .await
+    .expect("git-declared provisioning over a two-mount override succeeds");
+
+    assert_eq!(
+        provisioning
+            .orphaned_modules
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["project-scan-endpoint"],
+        "only the undeclared module is orphaned; the still-declared git is not"
+    );
+
+    let rewritten = std::fs::read_to_string(&path).expect("read the rewritten override");
+    assert!(
+        rewritten.contains("git.modl") && !rewritten.contains("project-scan-endpoint"),
+        "the rewritten override must still name git and drop project-scan-endpoint: {rewritten}"
+    );
 }

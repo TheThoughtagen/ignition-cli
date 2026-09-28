@@ -1147,12 +1147,13 @@ mod tests {
         rig_up, trial_reset, trial_status,
     };
     use crate::client::GatewayApi;
+    use crate::config::ModuleDeclaration;
     use crate::error::CoreError;
     use crate::rig::RigPlan;
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
     };
-    use crate::rig::modules::ModuleProvisioning;
+    use crate::rig::modules::{ModuleProvisioning, provision_modules, undeclared_provisioning};
 
     // ---------------------------------------------------------------------
     // Test doubles
@@ -1416,6 +1417,7 @@ mod tests {
         let provisioning = ModuleProvisioning {
             override_file: Some(override_path.clone()),
             modules: Vec::new(),
+            orphaned_modules: Vec::new(),
         };
 
         let runner = FakeRunner::with(up_cycle_outputs());
@@ -2335,6 +2337,216 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // 19-02: `rig up` REPORTS an orphaned module and never uninstalls it
+    // (SC-3, D-19-01). Every gateway in these tests is a [`SnapshotRig`]
+    // whose `uninstall_module` panics, so the guard fires on the CALL.
+    // ---------------------------------------------------------------------
+
+    /// `gw_plan()` rooted in a real directory, so the override file the
+    /// orphan diff reads is a real file on real disk.
+    fn orphan_plan(dir: &Path) -> RigPlan {
+        RigPlan {
+            compose_file: dir.join("compose.yml"),
+            project_dir: dir.to_path_buf(),
+            ..gw_plan()
+        }
+    }
+
+    /// Seed a REAL generated two-mount override (`git` +
+    /// `project-scan-endpoint`) through `write_override`. NEVER a
+    /// hand-written stub: the Phase-16 stale-override test seeds the
+    /// literal `"# left by a previous run\n"`, which parses zero
+    /// `target:` lines — an orphan test copying that seed would pass
+    /// while proving nothing.
+    fn seed_two_mount_override(plan: &RigPlan) -> PathBuf {
+        use crate::module::fetch::ArtifactSource;
+        use crate::module::{GIT_MODULE, PROJECT_SCAN_ENDPOINT};
+        use crate::rig::modules::{MountedModule, write_override};
+
+        let mounts = [
+            MountedModule {
+                spec: &GIT_MODULE,
+                version: "2.3.4".to_string(),
+                source: PathBuf::from("/cache/modules/git/2.3.4-deadbeef.modl"),
+                source_kind: ArtifactSource::Cache,
+            },
+            MountedModule {
+                spec: &PROJECT_SCAN_ENDPOINT,
+                version: "1.0.0".to_string(),
+                source: PathBuf::from("/cache/modules/project-scan-endpoint/1.0.0-cafebabe.modl"),
+                source_kind: ArtifactSource::Cache,
+            },
+        ];
+        write_override(plan, "ignition", &mounts)
+            .expect("seed a real two-mount override")
+            .expect("mounts were non-empty")
+    }
+
+    /// Seed a cache hit exactly where the fetcher would have written it.
+    fn seed_cache_entry(root: &Path, id: &str, version: &str, contents: &[u8]) {
+        use sha2::{Digest, Sha256};
+        let dir = root.join("modules").join(id);
+        std::fs::create_dir_all(&dir).expect("cache dir");
+        let digest = format!("{:x}", Sha256::digest(contents));
+        std::fs::write(dir.join(format!("{version}-{digest}.modl")), contents)
+            .expect("seed cached artifact");
+    }
+
+    fn declared(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, ModuleDeclaration> {
+        entries
+            .iter()
+            .map(|(id, version)| {
+                (
+                    id.to_string(),
+                    ModuleDeclaration {
+                        version: version.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn orphan_ids(provisioning: &ModuleProvisioning) -> Vec<&str> {
+        provisioning
+            .orphaned_modules
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect()
+    }
+
+    /// The fake itself must fail loudly — otherwise every test below
+    /// that leans on it would pass vacuously.
+    #[tokio::test]
+    #[should_panic(expected = "rig up must never uninstall a module")]
+    async fn the_uninstall_tripwire_actually_panics() {
+        let rig = SnapshotRig::default();
+        let _ = rig
+            .uninstall_module("com.axone_io.ignition.git", "git")
+            .await;
+    }
+
+    /// CHANGED path: the rig undeclared everything. The orphans are
+    /// reported, the stale override is gone, and `rig_up` completes
+    /// against a gateway that panics if it is asked to uninstall.
+    #[tokio::test]
+    async fn up_after_undeclaring_reports_orphans_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        let override_path = seed_two_mount_override(&plan);
+
+        let provisioning = undeclared_provisioning(&plan).expect("undeclared provisioning");
+        assert_eq!(
+            orphan_ids(&provisioning),
+            vec!["git", "project-scan-endpoint"],
+            "both undeclared modules are reported"
+        );
+        assert!(!override_path.exists(), "the stale override is deleted");
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(up_cycle_outputs());
+        let result = rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("rig up completes without touching the gateway's module list");
+        assert_eq!(result.state, "running");
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module")),
+            "no uninstall was attempted: {:?}",
+            rig.calls()
+        );
+    }
+
+    /// PARTIAL change: `git` stays declared, `project-scan-endpoint` is
+    /// dropped. Exactly the dropped one is reported and `rig_up` still
+    /// never uninstalls it.
+    #[tokio::test]
+    async fn up_after_dropping_one_module_reports_only_that_one_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        seed_two_mount_override(&plan);
+
+        let cache = tempfile::tempdir().expect("cache");
+        seed_cache_entry(cache.path(), "git", "2.3.4", b"git payload");
+        let feed = crate::module::fetch::ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("literal URL"),
+        )
+        .expect("feed");
+
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &declared(&[("git", "2.3.4")]),
+            cache.path(),
+            crate::module::fetch::FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("provisioning with git still declared");
+        assert_eq!(orphan_ids(&provisioning), vec!["project-scan-endpoint"]);
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(up_cycle_outputs());
+        rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("rig up completes");
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module"))
+        );
+    }
+
+    /// UNCHANGED path (SC-3 named literally): a real override on disk
+    /// and every module still declared. Nothing is orphaned and, again,
+    /// no uninstall — the "quiet routine `rig up`" case.
+    #[tokio::test]
+    async fn up_with_no_module_changes_reports_no_orphans_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        let override_path = seed_two_mount_override(&plan);
+
+        let cache = tempfile::tempdir().expect("cache");
+        seed_cache_entry(cache.path(), "git", "2.3.4", b"git payload");
+        seed_cache_entry(
+            cache.path(),
+            "project-scan-endpoint",
+            "1.0.0",
+            b"scan payload",
+        );
+        let feed = crate::module::fetch::ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("literal URL"),
+        )
+        .expect("feed");
+
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &declared(&[("git", "2.3.4"), ("project-scan-endpoint", "1.0.0")]),
+            cache.path(),
+            crate::module::fetch::FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("provisioning with both modules still declared");
+        assert!(
+            provisioning.orphaned_modules.is_empty(),
+            "nothing changed, nothing is orphaned: {:?}",
+            provisioning.orphaned_modules
+        );
+        assert!(override_path.exists(), "the override was regenerated");
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(up_cycle_outputs());
+        rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("rig up completes");
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module"))
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // snapshot + restore (04-04) — composition + pre-checks + warning
     // ---------------------------------------------------------------------
 
@@ -2399,12 +2611,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for SnapshotRig {
+        /// PANICS, on the call itself (D-19-01): no action driven
+        /// through this fake may uninstall a module. `rig up`/`rig
+        /// reset` only ever REPORT an orphan. A panic is a stronger
+        /// tripwire than a counted request — a request that is merely
+        /// built but never sent still fails here, and nothing can
+        /// swallow it into an `Err`. The call is recorded first so the
+        /// name shows in `calls()` if a caller catches the unwind.
         async fn uninstall_module(
             &self,
-            _gateway_module_id: &str,
+            gateway_module_id: &str,
             _module_id: &str,
         ) -> Result<(), CoreError> {
-            unreachable!("not part of this action")
+            self.record(format!("uninstall_module({gateway_module_id})"));
+            panic!(
+                "rig up must never uninstall a module (D-19-01): \
+                 uninstall_module({gateway_module_id}) was called"
+            );
         }
         async fn bundle_generate(
             &self,

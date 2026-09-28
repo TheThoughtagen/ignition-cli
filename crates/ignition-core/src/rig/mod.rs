@@ -45,8 +45,9 @@ pub use compose::{
     parse_docker_ps_ldjson, reset_preview,
 };
 pub use modules::{
-    ModuleProvisioning, MountedModule, OVERRIDE_FILENAME, ProvisionedModule, clear_override,
-    existing_override, generate_override, provision_modules, write_override,
+    ModuleProvisioning, MountedModule, OVERRIDE_FILENAME, OrphanedModule, ProvisionedModule,
+    clear_override, existing_override, generate_override, orphaned_modules, previously_provisioned,
+    provision_modules, undeclared_provisioning, write_override,
 };
 
 use crate::config::{Config, ModuleDeclaration};
