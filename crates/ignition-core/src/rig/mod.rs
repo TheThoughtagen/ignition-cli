@@ -61,6 +61,18 @@ pub struct RigPlan {
     /// Compose project name — THE identity truth (honors the rig's own
     /// `.env` `COMPOSE_PROJECT_NAME` via the resolve run).
     pub name: String,
+    /// The `[rigs.NAME]` config key this plan was resolved FROM, when it
+    /// came from config at all — `None` for a cwd or convention
+    /// discovery, which has no name to select by.
+    ///
+    /// Distinct from `name` on purpose: `name` is the compose project
+    /// (which `.env` can rename), while this is what `--rig` takes. The
+    /// orphan report's `remove_with` needs THIS one — suggesting
+    /// `--rig <compose project>` would name a rig that does not exist,
+    /// and on a multi-rig setup an unqualified uninstall can act on the
+    /// wrong gateway. That command is irreversible, so the selector has
+    /// to be right rather than merely present.
+    pub config_name: Option<String>,
     /// The compose file discovery found.
     pub compose_file: PathBuf,
     /// Its directory (`--project-directory` on every resolve; where
@@ -288,6 +300,9 @@ async fn resolve_entry(
     // D-01/D-12: modules + the service escape hatch are copied ONLY
     // here — every other discovery path leaves `plan.modules` empty,
     // which is the structural reason SC-1 holds.
+    // The ONLY place the config key is known — `parse_config` sees the
+    // compose project, not the `[rigs.NAME]` entry that selected it.
+    plan.config_name = Some(name.to_string());
     plan.modules.clone_from(&entry.modules);
     if let Some(service) = &entry.module_service {
         // VALIDATED, not merely escaped. `module_service` is free-form

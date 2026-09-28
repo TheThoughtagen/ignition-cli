@@ -555,6 +555,7 @@ pub fn parse_config(
 
     Ok(RigPlan {
         name,
+        config_name: None,
         compose_file: compose_file.to_path_buf(),
         project_dir: project_dir.to_path_buf(),
         services,
@@ -738,6 +739,7 @@ mod tests {
     fn sample_plan() -> RigPlan {
         RigPlan {
             name: "ignition-devops".into(),
+            config_name: None,
             compose_file: "/rigs/git-module/docker/docker-compose.yml".into(),
             project_dir: "/rigs/git-module/docker".into(),
             services: vec!["ignition".into(), "db".into()],

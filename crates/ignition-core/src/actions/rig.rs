@@ -1289,6 +1289,7 @@ mod tests {
     fn gw_plan() -> RigPlan {
         RigPlan {
             name: "fixture-rig".into(),
+            config_name: None,
             compose_file: "/rigs/docker/compose.yml".into(),
             project_dir: "/rigs/docker".into(),
             services: vec!["ignition".into()],

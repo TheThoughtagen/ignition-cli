@@ -422,6 +422,7 @@ mod tests {
 
         let plan = RigPlan {
             name: "fixture-rig".into(),
+            config_name: None,
             compose_file: "/rigs/docker/compose.yml".into(),
             project_dir: "/rigs/docker".into(),
             services: vec!["ignition".into()],

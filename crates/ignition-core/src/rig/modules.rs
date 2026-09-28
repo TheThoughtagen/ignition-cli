@@ -384,6 +384,7 @@ pub fn previously_provisioned(plan: &RigPlan) -> Vec<&'static ModuleSpec> {
 pub fn orphaned_modules(
     previous: &[&'static ModuleSpec],
     declared: &BTreeMap<String, ModuleDeclaration>,
+    config_name: Option<&str>,
 ) -> Vec<OrphanedModule> {
     let mut orphans: Vec<OrphanedModule> = previous
         .iter()
@@ -391,7 +392,17 @@ pub fn orphaned_modules(
         .map(|spec| OrphanedModule {
             id: spec.id.to_string(),
             gateway_module_id: spec.gateway_module_id.to_string(),
-            remove_with: format!("ign rig module uninstall {} --yes", spec.id),
+            // `--rig` is included whenever the plan came from config,
+            // even with one rig declared: the uninstall is irreversible,
+            // and an unqualified command resolves by discovery order, so
+            // on a multi-rig setup it can remove the module from a
+            // DIFFERENT gateway than the one reporting the orphan. A
+            // cwd/convention rig has no key to select by, so it gets the
+            // bare form — that rig is not addressable by `--rig` either.
+            remove_with: match config_name {
+                Some(rig) => format!("ign rig module uninstall {} --rig {rig} --yes", spec.id),
+                None => format!("ign rig module uninstall {} --yes", spec.id),
+            },
         })
         .collect();
     orphans.sort_by(|a, b| a.id.cmp(&b.id));
@@ -611,7 +622,7 @@ pub fn clear_override(plan: &RigPlan) -> Result<(), CoreError> {
 /// an empty orphan list rather than erroring.
 pub fn undeclared_provisioning(plan: &RigPlan) -> Result<ModuleProvisioning, CoreError> {
     let previous = previously_provisioned(plan);
-    let orphaned = orphaned_modules(&previous, &BTreeMap::new());
+    let orphaned = orphaned_modules(&previous, &BTreeMap::new(), plan.config_name.as_deref());
     clear_override(plan)?;
     Ok(ModuleProvisioning {
         override_file: None,
@@ -685,7 +696,7 @@ pub async fn provision_modules(
     }
 
     let override_file = write_override(plan, &service, &mounts)?;
-    let orphaned = orphaned_modules(&previous, declared);
+    let orphaned = orphaned_modules(&previous, declared, plan.config_name.as_deref());
 
     Ok(ModuleProvisioning {
         override_file,
@@ -860,6 +871,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -950,6 +962,7 @@ mod tests {
 
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: compose_path.clone(),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -1186,6 +1199,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -1278,6 +1292,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "bare-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["sidecar".to_string()],
@@ -1333,6 +1348,7 @@ mod tests {
         );
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -1436,6 +1452,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],

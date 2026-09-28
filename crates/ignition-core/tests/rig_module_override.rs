@@ -42,6 +42,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn base_plan(project_dir: &Path, gateway_service: Option<&str>, services: &[&str]) -> RigPlan {
     RigPlan {
         name: "fixture-rig".to_string(),
+        config_name: None,
         compose_file: project_dir.join("docker-compose.yml"),
         project_dir: project_dir.to_path_buf(),
         services: services.iter().map(|s| s.to_string()).collect(),
@@ -1083,13 +1084,13 @@ fn previously_provisioned_dedups_and_sorts_regardless_of_line_order() {
 fn orphaned_modules_is_the_pure_set_difference() {
     let empty_declared: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
     assert!(
-        orphaned_modules(&[], &empty_declared).is_empty(),
+        orphaned_modules(&[], &empty_declared, Some("fixture")).is_empty(),
         "empty previous, empty declared: empty"
     );
 
     let both: Vec<&'static ignition_core::module::ModuleSpec> =
         vec![&GIT_MODULE, &PROJECT_SCAN_ENDPOINT];
-    let orphans = orphaned_modules(&both, &empty_declared);
+    let orphans = orphaned_modules(&both, &empty_declared, Some("fixture"));
     assert_eq!(
         orphans.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
         vec!["git", "project-scan-endpoint"],
@@ -1103,7 +1104,7 @@ fn orphaned_modules_is_the_pure_set_difference() {
             version: "2.3.4".to_string(),
         },
     );
-    let orphans = orphaned_modules(&both, &declared_git_only);
+    let orphans = orphaned_modules(&both, &declared_git_only, Some("fixture"));
     assert_eq!(
         orphans.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
         vec!["project-scan-endpoint"],
@@ -1125,18 +1126,18 @@ fn orphaned_modules_is_the_pure_set_difference() {
         },
     );
     assert!(
-        orphaned_modules(&git_only, &declared_both).is_empty(),
+        orphaned_modules(&git_only, &declared_both, Some("fixture")).is_empty(),
         "a newly declared module (present in declared, absent from previous) is never an orphan"
     );
 
     assert!(
-        orphaned_modules(&[], &declared_git_only).is_empty(),
+        orphaned_modules(&[], &declared_git_only, Some("fixture")).is_empty(),
         "empty previous against a non-empty declared stays empty"
     );
 
     let reversed: Vec<&'static ignition_core::module::ModuleSpec> =
         vec![&PROJECT_SCAN_ENDPOINT, &GIT_MODULE];
-    let orphans = orphaned_modules(&reversed, &empty_declared);
+    let orphans = orphaned_modules(&reversed, &empty_declared, Some("fixture"));
     assert_eq!(
         orphans.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
         vec!["git", "project-scan-endpoint"],
@@ -1151,13 +1152,13 @@ fn orphaned_modules_is_the_pure_set_difference() {
 #[test]
 fn orphaned_module_carries_registry_id_gateway_id_and_removal_command() {
     let empty_declared: BTreeMap<String, ModuleDeclaration> = BTreeMap::new();
-    let orphans = orphaned_modules(&[&GIT_MODULE], &empty_declared);
+    let orphans = orphaned_modules(&[&GIT_MODULE], &empty_declared, Some("fixture"));
     assert_eq!(
         orphans,
         vec![OrphanedModule {
             id: "git".to_string(),
             gateway_module_id: "com.axone_io.ignition.git".to_string(),
-            remove_with: "ign rig module uninstall git --yes".to_string(),
+            remove_with: "ign rig module uninstall git --rig fixture --yes".to_string(),
         }]
     );
 }

@@ -1387,7 +1387,7 @@ fn rig_up_after_undeclaring_reports_the_orphan_and_deletes_the_override() {
     );
     assert_eq!(
         orphans[0]["remove_with"],
-        Value::String("ign rig module uninstall git --yes".into())
+        Value::String("ign rig module uninstall git --rig fixture --yes".into())
     );
     assert_eq!(
         body["data"]["provisioned_modules"],
@@ -1434,7 +1434,7 @@ fn rig_up_after_undeclaring_prints_the_removal_command_for_humans() {
         "the orphan is named: {stdout}"
     );
     assert!(
-        stdout.contains("ign rig module uninstall git --yes"),
+        stdout.contains("ign rig module uninstall git --rig fixture --yes"),
         "the removal command is named: {stdout}"
     );
 }
@@ -1461,7 +1461,7 @@ fn rig_reset_after_undeclaring_prints_the_removal_command() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("orphaned module: git (com.axone_io.ignition.git)")
-            && stdout.contains("ign rig module uninstall git --yes"),
+            && stdout.contains("ign rig module uninstall git --rig fixture --yes"),
         "reset names the orphan and its removal command: {stdout}"
     );
     assert!(
