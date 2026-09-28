@@ -35,6 +35,7 @@ use serde::Serialize;
 
 use crate::client::GatewayApi;
 use crate::error::CoreError;
+use crate::module::ModuleSpec;
 use crate::poll::{self, PollConfig, PollState};
 use crate::rig::compose::{
     ComposeRunner, check_output, compose_version, docker_ps_publish_args, down_args, logs_args,
@@ -777,6 +778,43 @@ pub struct RestoreResult {
     /// Data-level warnings — ALWAYS carries
     /// [`RESTORE_TOKEN_WARNING`] (Pitfall 5) plus any wait warnings.
     pub warnings: Vec<String>,
+}
+
+/// `ign rig module uninstall` output model (Phase 19, D-19-01/D-19-02)
+/// — all keys always present (the `RigUpResult` convention).
+#[derive(Debug, Serialize)]
+pub struct ModuleUninstallResult {
+    /// Compose project name — the identity truth.
+    pub rig: String,
+    /// The registry slug the caller named (`git`).
+    pub module_id: String,
+    /// The gateway's own id that was sent in the DELETE
+    /// ([`crate::module::ModuleSpec::gateway_module_id`]).
+    pub gateway_module_id: String,
+    /// `true` only on `Ok` — this call never returns any other value
+    /// (a denial is an `Err`, never a `false` here).
+    pub uninstalled: bool,
+}
+
+/// `ign rig module uninstall <ID> --yes` (Phase 19, D-19-01/D-19-02/
+/// D-19-04): the ONE gateway write this phase adds. ONE call, ONE id —
+/// `spec.gateway_module_id` is what rides the wire; `spec.id` (the
+/// registry slug) names the error without a reverse lookup. Success is
+/// the gateway's own `success:true` — never a bare HTTP 200 ([`crate::client::GatewayApi::uninstall_module`]'s
+/// denial-rides-200 contract).
+pub async fn rig_module_uninstall(
+    api: &dyn GatewayApi,
+    rig: &str,
+    spec: &'static ModuleSpec,
+) -> Result<ModuleUninstallResult, CoreError> {
+    api.uninstall_module(spec.gateway_module_id, spec.id)
+        .await?;
+    Ok(ModuleUninstallResult {
+        rig: rig.to_string(),
+        module_id: spec.id.to_string(),
+        gateway_module_id: spec.gateway_module_id.to_string(),
+        uninstalled: true,
+    })
 }
 
 /// Days since 1970-01-01 → (year, month, day) — Howard Hinnant's
@@ -2324,6 +2362,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for SnapshotRig {
+        async fn uninstall_module(
+            &self,
+            _gateway_module_id: &str,
+            _module_id: &str,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn bundle_generate(
             &self,
         ) -> Result<crate::client::diagnostics::BundleStatusWire, CoreError> {

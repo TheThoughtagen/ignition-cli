@@ -533,6 +533,19 @@ pub fn routes() -> &'static [CliRoute] {
             path: "rig restore",
             mapping: Mapping::Screen(Screen::Rig),
         },
+        // 19-01: the module-uninstall guarded write joins the Rig
+        // family for structural completeness (the clap-walk coverage
+        // test requires every row-requiring leaf to map somewhere).
+        // Registered on the Rig screen like its siblings; NOT yet
+        // wired into the `RigActions` modal (`a` on the Rig screen) —
+        // unlike every other rig verb, this one takes a REQUIRED
+        // module-id argument, so a bare menu entry would need its own
+        // id-selection step first. That TUI wiring is future work,
+        // out of this CLI-only phase's scope.
+        CliRoute {
+            path: "rig module uninstall",
+            mapping: Mapping::Screen(Screen::Rig),
+        },
         // 07-02: the standalone backup pair joins the dashboard's
         // global verbs (gateway-level — the restart/doctor host).
         // Download fires direct (a streamed read); restore is
@@ -950,6 +963,7 @@ mod tests {
             ("rig trial reset", Screen::Rig),
             ("rig snapshot", Screen::Rig),
             ("rig restore", Screen::Rig),
+            ("rig module uninstall", Screen::Rig),
         ];
         for (path, screen) in expected {
             let row = routes()
@@ -968,11 +982,11 @@ mod tests {
             .find(|route| route.path == "rig logs")
             .unwrap_or_else(|| panic!("rig logs route row missing"));
         assert_eq!(logs.mapping, super::Mapping::Streamed);
-        // Exactly the nine rig rows exist (no extras).
+        // Exactly the ten rig rows exist (no extras).
         let count = routes()
             .iter()
             .filter(|route| route.path.starts_with("rig"))
             .count();
-        assert_eq!(count, 9, "exactly the rig leaves that exist");
+        assert_eq!(count, 10, "exactly the rig leaves that exist");
     }
 }

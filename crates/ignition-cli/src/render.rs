@@ -38,8 +38,8 @@ use ignition_core::actions::resources::{
     ResourceDeleteResult, ResourceGetResult, ResourcePutResult, ResourcesResult,
 };
 use ignition_core::actions::rig::{
-    RestoreResult, RigDownResult, RigLogsResult, RigResetResult, RigStatusResult, RigUpResult,
-    SnapshotResult, TrialResetResult, TrialStatusResult,
+    ModuleUninstallResult, RestoreResult, RigDownResult, RigLogsResult, RigResetResult,
+    RigStatusResult, RigUpResult, SnapshotResult, TrialResetResult, TrialStatusResult,
 };
 use ignition_core::actions::script::ScriptRunResult;
 use ignition_core::actions::sessions::{SessionsResult, TerminateResult};
@@ -264,6 +264,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::RigLogs(result) => render_rig_logs_human(result),
         ActionOutput::RigSnapshot(result) => render_rig_snapshot_human(result),
         ActionOutput::RigRestore(result) => render_rig_restore_human(result),
+        ActionOutput::RigModuleUninstall(result) => render_rig_module_uninstall_human(result),
         ActionOutput::BackupDownload(result) => render_backup_download_human(result),
         ActionOutput::BackupRestore(result) => render_backup_restore_human(result),
         ActionOutput::EamHistory(result) => render_eam_history_human(result),
@@ -1185,6 +1186,16 @@ fn render_rig_restore_human(result: &RestoreResult) {
     for warning in &result.warnings {
         println!("warning: {warning}");
     }
+}
+
+/// `ign rig module uninstall` human line: rig + registry id + the
+/// gateway id that was removed — naming both is the point (Phase 19,
+/// D-19-05: the two ids are never interchanged).
+fn render_rig_module_uninstall_human(result: &ModuleUninstallResult) {
+    println!(
+        "rig {}: uninstalled module {} ({}) from the gateway",
+        result.rig, result.module_id, result.gateway_module_id
+    );
 }
 
 /// `ign backup download` human line — the file + the type that rode

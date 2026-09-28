@@ -1157,6 +1157,10 @@ pub enum RigCommand {
     /// (guarded) restarts an EXPIRED trial via the mechanism ladder
     /// (token-auth POST, else native gateway login)
     Trial(TrialArgs),
+    /// Third-party module lifecycle beyond declaration: `uninstall`
+    /// removes a module from the gateway entirely — guarded, and NOT
+    /// undone by re-declaring it (Phase 19)
+    Module(ModuleArgs),
     /// Snapshot the rig's gateway: native gwbk (roaming backup,
     /// streamed) + per-project exports + manifest.json, composed in a
     /// timestamped directory — repeatable state
@@ -1207,6 +1211,34 @@ pub enum TrialCommand {
         /// from IGNITION_PASSWORD — never a flag)
         #[arg(long, value_name = "NAME")]
         user: Option<String>,
+    },
+}
+
+/// Module subcommands (Phase 19) — `uninstall` is the family's ONE
+/// destructive verb: guarded (`--yes`-refused, the `rig reset`
+/// precedent), and, unlike every other guarded verb in this codebase,
+/// NOT undone by re-declaring the module afterward (recovery today
+/// means `ign rig reset`, which destroys the rig's data volume).
+#[derive(Debug, clap::Args)]
+pub struct ModuleArgs {
+    #[command(subcommand)]
+    pub command: ModuleCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ModuleCommand {
+    /// Remove a module from the gateway entirely — destructive, refused
+    /// without `--yes`. `ID` is a REGISTRY id (the same one `rig up
+    /// --with-module` takes; see `ign rig up --with-module`), never a
+    /// raw gateway module id — a hand-installed module cannot be named
+    /// here. Needs `IGNITION_TOKEN`. The gateway refuses while the
+    /// `.modl` is still mounted: undeclare the module and run `ign rig
+    /// up` first. A successful uninstall is NOT reversible by
+    /// re-declaring — recovery today means `ign rig reset --yes`,
+    /// which destroys the rig's data volume.
+    Uninstall {
+        /// The registry id to uninstall (e.g. `git`).
+        id: String,
     },
 }
 

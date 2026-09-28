@@ -34,6 +34,53 @@ pub(crate) const STATUS_PING_PATH: &str = "/StatusPing";
 pub(crate) const MODULES_HEALTHY_PATH: &str = "/data/api/v1/modules/healthy";
 pub(crate) const MODULES_QUARANTINED_PATH: &str = "/data/api/v1/modules/quarantined";
 
+/// DELETE path to uninstall a module (Phase 19, D-19-03/D-19-04).
+///
+/// **HTTP 200 is NOT the verdict.** Live-verified against a real
+/// gateway: a stock module, a bogus id, and a still-mounted module ALL
+/// answer 200 — success/failure rides the body's `success` +
+/// `failedUninstalls` fields instead. See [`ModuleUninstallResponse`].
+pub(crate) const MODULES_UNINSTALL_PATH: &str = "/data/api/v1/modules/uninstall";
+
+/// DELETE `/data/api/v1/modules/uninstall` request body — ALWAYS a
+/// single-element array (D-19-04: a mixed success+failure batch's
+/// atomicity was never observed live, so `ign` sidesteps the question
+/// entirely — one call per module id, never a batch).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModuleUninstallRequest {
+    /// Exactly one element: the target's
+    /// [`crate::module::ModuleSpec::gateway_module_id`].
+    pub uninstall: Vec<String>,
+}
+
+/// DELETE `/data/api/v1/modules/uninstall` response body.
+///
+/// **HTTP 200 is NOT the verdict** (live-verified, Phase 19 research): a
+/// stock module, a bogus id, and a still-mounted module all answered
+/// 200 with `success:false`. `success` defaults to `false` when absent
+/// and `failed_uninstalls` defaults to `None` — both defaults keep the
+/// SAFE direction: a body this shape can't fully parse never degrades
+/// into a reported success.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct ModuleUninstallResponse {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(rename = "failedUninstalls", default)]
+    pub failed_uninstalls: Option<FailedUninstalls>,
+}
+
+/// `ModuleUninstallResponse.failedUninstalls` — the gateway's detail on
+/// which ids the uninstall refused.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct FailedUninstalls {
+    /// The failed gateway module ids, verbatim. `#[serde(default)]` so
+    /// an absent key deserializes to empty rather than failing the
+    /// whole response (a present-but-empty `failedUninstalls` object is
+    /// a real shape the gateway can answer with).
+    #[serde(default)]
+    pub uninstall: Vec<String>,
+}
+
 /// GET `/data/api/v1/overview` — the status call (platform + runtime).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Overview {

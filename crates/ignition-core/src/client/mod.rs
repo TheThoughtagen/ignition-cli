@@ -110,6 +110,21 @@ pub trait GatewayApi: Send + Sync {
         quarantined: bool,
         query: &query::ListQuery,
     ) -> Result<ListEnvelope<ModuleInfo>, CoreError>;
+    /// DELETE `/data/api/v1/modules/uninstall` (Phase 19,
+    /// D-19-03/D-19-04) — uninstalls ONE module by its GATEWAY id.
+    /// **Denial rides HTTP 200**: the gateway always answers 200, so
+    /// the verdict comes from the body's `success`/`failedUninstalls`,
+    /// never the status alone (live-verified: a stock module, a bogus
+    /// id, and a still-mounted module all answer 200 with
+    /// `success:false`). Never batches — exactly one id per call
+    /// (D-19-04 sidesteps the never-observed mixed-batch shape
+    /// entirely). `module_id` is the REGISTRY slug (never sent on the
+    /// wire) so a denial can name both ids without a reverse lookup.
+    async fn uninstall_module(
+        &self,
+        gateway_module_id: &str,
+        module_id: &str,
+    ) -> Result<(), CoreError>;
     /// Fetch `/data/api/v1/systemPerformance/currentGauges` (authed) —
     /// cpu in PERCENT (contrast [`Overview::cpu`], a 0–1 fraction).
     async fn metrics_current(&self) -> Result<CurrentGauges, CoreError>;
@@ -758,6 +773,22 @@ impl ReqwestGatewayApi {
         self.send_and_classify(request, &url).await.map(|_| ())
     }
 
+    /// DELETE `path` with a JSON body → classify → hand back the
+    /// response — [`Self::delete_with_query`] cannot carry a body (it
+    /// sends an EMPTY one). Mirrors [`Self::post_json`] exactly (Phase
+    /// 19: the module-uninstall DELETE is the first DELETE-with-body
+    /// caller). Token-auth DELETEs need NO CSRF (verified 02-RESEARCH
+    /// §Auth Model).
+    async fn delete_json<T: serde::Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, CoreError> {
+        let url = self.url_for(path);
+        let request = self.apply_auth(self.client.delete(url.clone()).json(body));
+        self.send_and_classify(request, &url).await
+    }
+
     /// POST `path` with a JSON body → classify → hand back the response
     /// (callers read the body as their capability needs; the project
     /// mutations treat Ok classification AS the success contract —
@@ -958,6 +989,46 @@ impl GatewayApi for ReqwestGatewayApi {
         };
         self.get_json(path, Some(&query.to_query_pairs()), true)
             .await
+    }
+
+    async fn uninstall_module(
+        &self,
+        gateway_module_id: &str,
+        module_id: &str,
+    ) -> Result<(), CoreError> {
+        let url = self.url_for(status::MODULES_UNINSTALL_PATH);
+        let body = status::ModuleUninstallRequest {
+            uninstall: vec![gateway_module_id.to_string()],
+        };
+        let response = self
+            .delete_json(status::MODULES_UNINSTALL_PATH, &body)
+            .await?;
+        // Denial-rides-200 (D-19-03, live-verified): a stock module, a
+        // bogus id, and a still-mounted module all answered 200 with
+        // success:false. An unparseable body, a missing `success`, or
+        // an absent `failedUninstalls` must NEVER degrade into a
+        // reported success — every one of those shapes falls through
+        // to the denial below, never to `Ok`.
+        let text = response.text().await.unwrap_or_default();
+        let denial = |failed: Vec<String>| CoreError::ModuleUninstallDenied {
+            module_id: module_id.to_string(),
+            gateway_module_id: gateway_module_id.to_string(),
+            failed,
+            endpoint: Some(url.to_string()),
+        };
+        let Ok(parsed) = serde_json::from_str::<status::ModuleUninstallResponse>(text.trim())
+        else {
+            return Err(denial(vec![gateway_module_id.to_string()]));
+        };
+        if parsed.success {
+            return Ok(());
+        }
+        let failed = parsed
+            .failed_uninstalls
+            .map(|detail| detail.uninstall)
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| vec![gateway_module_id.to_string()]);
+        Err(denial(failed))
     }
 
     async fn metrics_current(&self) -> Result<CurrentGauges, CoreError> {

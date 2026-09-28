@@ -169,6 +169,10 @@ enum ActionOutput {
     RigLogs(actions::rig::RigLogsResult),
     RigSnapshot(actions::rig::SnapshotResult),
     RigRestore(actions::rig::RestoreResult),
+    /// `ign rig module uninstall` — the guarded gateway write that
+    /// makes the gateway forget a module entirely (Phase 19); NOT
+    /// undone by re-declaring it.
+    RigModuleUninstall(actions::rig::ModuleUninstallResult),
     /// `ign backup download` — the standalone gwbk streamed to disk
     /// (07-02, BKUP-01); data carries {file, type}.
     BackupDownload(actions::backup::BackupDownloadResult),
@@ -371,6 +375,7 @@ impl ActionOutput {
             ActionOutput::RigLogs(result) => render_success(profile, result, compact),
             ActionOutput::RigSnapshot(result) => render_success(profile, result, compact),
             ActionOutput::RigRestore(result) => render_success(profile, result, compact),
+            ActionOutput::RigModuleUninstall(result) => render_success(profile, result, compact),
             ActionOutput::BackupDownload(result) => render_success(profile, result, compact),
             ActionOutput::BackupRestore(result) => render_success(profile, result, compact),
             ActionOutput::EamHistory(result) => render_success(profile, result, compact),
@@ -2024,6 +2029,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     cli::TrialCommand::Reset { .. } => Some("rig trial reset"),
                     cli::TrialCommand::Status => None,
                 },
+                // guarded:rig module uninstall
+                RigCommand::Module(module_args) => match module_args.command {
+                    cli::ModuleCommand::Uninstall { .. } => Some("rig module uninstall"),
+                },
                 _ => None,
             };
             if let Some(operation) = guarded_operation
@@ -2065,7 +2074,10 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             let gateway_verb_echo = config.active.clone();
             let is_gateway_verb = matches!(
                 command,
-                RigCommand::Trial(_) | RigCommand::Snapshot { .. } | RigCommand::Restore { .. }
+                RigCommand::Trial(_)
+                    | RigCommand::Snapshot { .. }
+                    | RigCommand::Restore { .. }
+                    | RigCommand::Module(_)
             );
             let result = match ignition_core::rig::resolve_plan(&runner, selection, &config).await {
                 Ok(plan) => match command {
@@ -2304,6 +2316,46 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                             None => Err(trial_no_gateway(&plan)),
                         }
                     }
+                    // Module uninstall (Phase 19, D-19-01/D-19-02): the
+                    // ONE gateway write this phase adds — token-sourced
+                    // like snapshot/restore (no profile chain), the
+                    // registry resolves the id BEFORE any client is
+                    // built (D-19-05: a hand-installed gateway module
+                    // cannot even be named).
+                    RigCommand::Module(ref module_args) => match module_args.command.clone() {
+                        cli::ModuleCommand::Uninstall { id } => {
+                            let spec = match ignition_core::module::spec_for(&id) {
+                                Some(spec) => spec,
+                                None => {
+                                    let known = ignition_core::module::MODULES
+                                        .iter()
+                                        .map(|spec| spec.id.to_string())
+                                        .collect();
+                                    return (
+                                        gateway_verb_echo,
+                                        Err(CoreError::ModuleNotRegistered { id, known }),
+                                    );
+                                }
+                            };
+                            let Some(token) = env_non_empty("IGNITION_TOKEN") else {
+                                return (
+                                    gateway_verb_echo,
+                                    Err(CoreError::SecretUnavailable {
+                                        profile: plan.name.clone(),
+                                    }),
+                                );
+                            };
+                            let credential = Some(Credential::Token(config::Secret::new(token)));
+                            match rig_gateway_client(&plan, credential) {
+                                Some(api) => {
+                                    actions::rig::rig_module_uninstall(&*api, &plan.name, spec)
+                                        .await
+                                        .map(ActionOutput::RigModuleUninstall)
+                                }
+                                None => Err(trial_no_gateway(&plan)),
+                            }
+                        }
+                    },
                 },
                 Err(err) => Err(err),
             };
@@ -3472,6 +3524,9 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     ("rig reset", "rig reset"),
     ("rig restore", "rig restore"),
     ("rig trial reset", "rig trial reset"),
+    // 19-01: makes the gateway forget a module entirely — NOT undone
+    // by re-declaring it.
+    ("rig module uninstall", "rig module uninstall"),
     // 07-02: standalone restore overwrites THIS gateway's state.
     (
         "backup restore",
