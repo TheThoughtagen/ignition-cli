@@ -306,6 +306,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign connections [--type database\|opc]` | Database/OPC connections: `name  enabled  healthchecks` | `healthchecks` is passthrough as the gateway reports it (populated detail LOW-confidence until captured live); replaces the webpage's Connections pages |
 | `ign project list` | Every runnable project: `name  title  enabled  parent  inheritable` | inheritance info comes from the list items themselves; JSON items also carry `description` (all six keys always present, null when unset); replaces the webpage's Projects list |
 | `ign project new <NAME> [--title --description --parent --inheritable --disabled]` | Create a project | only provided fields ride the create body (never empty-string references); the result is a `find` read-back; audit-logged server-side |
+| `ign rig module uninstall <REGISTRY-ID>` | Remove a provisioned module from the rig's gateway (`DELETE /data/api/v1/modules/uninstall`) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`; refuses with exit 7 while the rig still declares the module, and exit 3 (`module_not_registered`) for an unknown registry id; the gateway refuses a module whose `.modl` is still mounted, answering exit 6 (`module_uninstall_denied`). **NOT reversible by re-declaring** — recovery is `ign rig reset`, which destroys the data volume |
 | `ign project copy <SRC> <DST>` | Copy a project with all its resources | non-destructive (creates DST) — no `--yes`; audit-logged server-side |
 | `ign project rename <OLD> <NEW>` | Rename a project (native rename, not copy+delete) | non-destructive relabel — no `--yes`; audit-logged server-side |
 | `ign project set <NAME> [--title --description --parent --set-enabled\|--disabled --inheritable BOOL]` | Set project fields — `--parent` IS the inheritance move (reparent) | only provided flags ride the modify body (absent = untouched); at least one field required; audit-logged server-side |
@@ -611,9 +612,32 @@ next `rig up` with nothing declared removes the file for you.
 **It does not uninstall the module from the gateway.** Ignition installs an
 accepted module into its own data directory, which lives in the rig's volume
 and outlives the mount — so a gateway that already loaded a module keeps
-reporting it after the override is gone (verified live, not inferred). To
-clear it today, `ign rig reset` removes the volume along with everything else
-in it.
+reporting it after the override is gone (verified live, not inferred).
+
+To remove it from the gateway, use the deliberate verb:
+
+```bash
+ign rig module uninstall git --yes
+```
+
+The id is a **registry id** — the same one `--with-module` and the config table
+take, not the gateway's own module id. The verb needs `IGNITION_TOKEN`, the same
+credential contract as `rig snapshot` and `rig restore`.
+
+**The order matters, and the gateway enforces it.** Undeclare the module, run
+`ign rig up` so the mount goes, *then* uninstall. The gateway refuses to
+uninstall a module whose `.modl` is still mounted. Once it succeeds the effect
+is immediate — no gateway restart. `ign` refuses up front if the rig's config
+still declares the module, rather than letting you get a confusing failure back
+from the gateway.
+
+**This is not undone by re-declaring the module.** A re-declared, re-mounted
+module does not come back — verified live. Recovery today means `ign rig reset`,
+which destroys the rig's whole data volume along with everything else in it.
+That makes this the most severe of `ign`'s guarded operations: the others cost
+you a re-run, this one costs the volume. It refuses without `--yes` for that
+reason, and it is a separate verb rather than something `ign rig up` offers,
+because `IGNITION_YES=1` would turn a mid-`up` prompt into no prompt at all.
 
 Provisioning **mounts** a module; it does not commission one. No
 repository, credential, or module configuration is supplied — a
