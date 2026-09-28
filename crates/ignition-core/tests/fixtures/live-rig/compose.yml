@@ -8,10 +8,12 @@
 # make the test prove nothing — do not "fix" this file by adding them.
 #
 # The image tag is pinned rather than `latest`, so this evidence stays
-# reproducible after upstream publishes a new image.
+# reproducible after upstream publishes a new image. `IGNITION_LIVE_RIG_IMAGE_TAG`
+# selects a different pinned 8.3.x for a cross-version run; UNSET reproduces
+# today's behavior exactly, so nothing about a default run changes.
 services:
   gateway:
-    image: inductiveautomation/ignition:8.3.3
+    image: inductiveautomation/ignition:${IGNITION_LIVE_RIG_IMAGE_TAG:-8.3.3}
     hostname: gateway
     ports:
       # Host port is free to change — the test derives the URL from the

@@ -15,6 +15,15 @@
 //! | `IGNITION_LIVE_RIG_MODULES` | Must equal `1`. Unset = green no-op skip (D-20). |
 //! | `IGNITION_LIVE_RIG_USER` | Gateway admin user. Defaults to `admin`, matching the fixture. |
 //! | `IGNITION_LIVE_RIG_PASSWORD` | Gateway admin password. Defaults to `password`, matching the fixture. |
+//! | `IGNITION_LIVE_RIG_IMAGE_TAG` | Ignition image tag for the fixture. Defaults to `8.3.3`. |
+//!
+//! The uninstall contract was probed live on 8.3.3 only, so run the gate on a
+//! second pinned 8.3.x before trusting it:
+//!
+//! ```text
+//! IGNITION_LIVE_RIG_MODULES=1 cargo test -p ignition-core --test live_rig_module_injection -- --ignored --nocapture
+//! IGNITION_LIVE_RIG_MODULES=1 IGNITION_LIVE_RIG_IMAGE_TAG=8.3.9 cargo test -p ignition-core --test live_rig_module_injection -- --ignored --nocapture
+//! ```
 //!
 //! **The fixture deliberately sets no acceptance variable** (D-21). That
 //! absence is the control: a module can only reach the HEALTHY list if the
@@ -29,9 +38,21 @@
 //! wrong separator shows up as "one loaded, one quarantined" rather than
 //! passing silently (D-24).
 //!
-//! Sections A, B and C run as ONE test in order. Rust does not guarantee
+//! Sections A through E run as ONE test in order. Rust does not guarantee
 //! test ordering, and §B's entire point is that it runs against §A's state;
 //! bringing a gateway up three times would also cost minutes for no signal.
+//!
+//! | Section | What it proves |
+//! |---|---|
+//! | §A | a declared module is MOUNTED and reaches the gateway's healthy list, never quarantine (SC-2, SC-5) |
+//! | §B | it survives a container recreate (SC-3) |
+//! | §C | undeclaring it makes `rig up` delete the override and report the orphans, naming only what `ign` placed (SC-4) |
+//! | §D | `ign`'s own uninstall leaves it ABSENT from the gateway's healthy list — **the only proof of SC-1 in this repository** |
+//! | §E | every gateway-installed module `ign` did NOT place is still healthy afterwards (SC-4) |
+//!
+//! §D is irreversible: a uninstalled module does not come back when
+//! re-declared (live-verified). Nothing may run after it that needs those
+//! modules present.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -53,6 +74,20 @@ const UP_TIMEOUT_S: u64 = 300;
 /// running, so the list fetch retries — bounded, never an open loop.
 const MODULE_LIST_ATTEMPTS: usize = 20;
 const MODULE_LIST_INTERVAL_S: u64 = 3;
+
+/// The tag the fixture defaults to. Kept in sync with the `:-` default in
+/// `tests/fixtures/live-rig/compose.yml` — the test only REPORTS which image
+/// a run exercised. It never sets the variable: `std::env::set_var` is unsafe
+/// under edition 2024, and the compose child already inherits the operator's
+/// environment.
+const DEFAULT_IMAGE_TAG: &str = "8.3.3";
+
+fn image_tag() -> String {
+    std::env::var("IGNITION_LIVE_RIG_IMAGE_TAG")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| DEFAULT_IMAGE_TAG.to_string())
+}
 
 /// `true` only when `IGNITION_LIVE_RIG_MODULES` is explicitly `1`.
 fn live_enabled() -> bool {
@@ -178,6 +213,51 @@ async fn healthy_module_ids(api: &dyn GatewayApi) -> Result<Vec<String>, String>
     Err(last_err)
 }
 
+/// A healthy list that ANSWERED, whatever it contains. [`healthy_module_ids`]
+/// retries until the git module appears, which is the wrong polarity once §D
+/// has removed it; this one retries only on a failed call. Pitfall 4's
+/// post-recreate 401 window is why it retries at all.
+async fn list_healthy_ids(api: &dyn GatewayApi) -> Result<Vec<String>, String> {
+    let mut last_err = String::from("never attempted");
+    for _ in 0..MODULE_LIST_ATTEMPTS {
+        match api.modules(false, &ListQuery::default()).await {
+            Ok(envelope) => return Ok(envelope.items.iter().map(|m| m.id.clone()).collect()),
+            Err(err) => last_err = format!("modules() failed: {err}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(MODULE_LIST_INTERVAL_S)).await;
+    }
+    Err(last_err)
+}
+
+/// The opposite polarity of [`healthy_module_ids`]: succeed when the id
+/// is ABSENT. Same bounded retry and the same carry-the-error discipline,
+/// because a list that fails to answer is NOT an absent module — conflating
+/// the two is how §A once reported `healthy: []` for what was really a 401.
+///
+/// The loop tolerates errors rather than treating the first as fatal: a
+/// gateway that has just recreated can answer 401 for a window before its
+/// session settles (Pitfall 4).
+async fn module_absent_from_healthy(
+    api: &dyn GatewayApi,
+    gateway_module_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut last_err = String::from("never attempted");
+    for _ in 0..MODULE_LIST_ATTEMPTS {
+        match api.modules(false, &ListQuery::default()).await {
+            Ok(envelope) => {
+                let observed: Vec<String> = envelope.items.iter().map(|m| m.id.clone()).collect();
+                if !observed.iter().any(|id| id == gateway_module_id) {
+                    return Ok(observed);
+                }
+                last_err = format!("{gateway_module_id:?} still present: {observed:?}");
+            }
+            Err(err) => last_err = format!("modules() failed: {err}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(MODULE_LIST_INTERVAL_S)).await;
+    }
+    Err(last_err)
+}
+
 async fn quarantined_module_ids(api: &dyn GatewayApi) -> Result<Vec<String>, String> {
     api.modules(true, &ListQuery::default())
         .await
@@ -207,8 +287,11 @@ fn config_for(compose_file: &Path, declared: BTreeMap<String, ModuleDeclaration>
     config
 }
 
-/// §A mounted+loaded, §B survives recreate, §C deleting the override
-/// reverts — one ordered sequence, torn down on every exit path.
+/// §A mounted+loaded, §B survives recreate, §C undeclaring clears the
+/// override and reports the orphans, §D uninstalling removes the module
+/// from the gateway (SC-1) — one ordered sequence, torn down on every
+/// exit path. §D runs last because it is irreversible: only `rig reset`
+/// brings the modules back.
 #[ignore = "live: needs Docker and IGNITION_LIVE_RIG_MODULES=1"]
 #[tokio::test]
 async fn live_rig_module_injection_sequence() {
@@ -216,6 +299,11 @@ async fn live_rig_module_injection_sequence() {
         skip("IGNITION_LIVE_RIG_MODULES is not 1");
         return;
     }
+
+    eprintln!(
+        "live gate: inductiveautomation/ignition:{} (set IGNITION_LIVE_RIG_IMAGE_TAG to select another)",
+        image_tag()
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let compose_file = seed_fixture(dir.path());
@@ -350,58 +438,167 @@ async fn run_sequence(
     ignition_core::actions::rig::rig_down(runner, &plan)
         .await
         .map_err(|e| format!("§C rig_down: {e}"))?;
-    std::fs::remove_file(&override_path).expect("delete override by hand");
-
+    // NOTE: the override is NOT deleted by hand here any more. Doing that
+    // was what masked `write_override`'s dead delete branch for a whole
+    // phase — the test performed the cleanup it was supposed to be
+    // checking. `rig up` must delete it, through the real seam.
     let bare_config = config_for(compose_file, BTreeMap::new());
     let bare_plan = resolve_plan(runner, RigSelection::Named("live".into()), &bare_config)
         .await
         .map_err(|e| format!("§C resolve_plan: {e}"))?;
-    ignition_core::actions::rig::rig_up(
-        runner,
+    // The REAL undeclared path: provision_modules with nothing declared
+    // reads the pre-overwrite override, computes the orphans, and clears
+    // the file. Passing ModuleProvisioning::default() here would bypass
+    // exactly the code under test.
+    let undeclared = provision_modules(
+        feed,
         &bare_plan,
-        UP_TIMEOUT_S,
-        None,
-        &ignition_core::rig::ModuleProvisioning::default(),
+        &BTreeMap::new(),
+        cache_root,
+        FetchPolicy::CacheFirst,
     )
     .await
-    .map_err(|e| format!("§C rig_up: {e}"))?;
+    .map_err(|e| format!("§C provision_modules: {e}"))?;
+
+    ignition_core::actions::rig::rig_up(runner, &bare_plan, UP_TIMEOUT_S, None, &undeclared)
+        .await
+        .map_err(|e| format!("§C rig_up: {e}"))?;
+
+    let orphan_ids: Vec<&str> = undeclared
+        .orphaned_modules
+        .iter()
+        .map(|o| o.gateway_module_id.as_str())
+        .collect();
+    for spec in [&GIT_MODULE, &PROJECT_SCAN_ENDPOINT] {
+        if !orphan_ids.contains(&spec.gateway_module_id) {
+            return Err(format!(
+                "§C: {:?} was provisioned last run and is no longer declared, so it must be \
+                 reported as an orphan. reported: {orphan_ids:?}",
+                spec.gateway_module_id
+            ));
+        }
+    }
+    if orphan_ids.len() != 2 {
+        return Err(format!(
+            "§C SC-4 (image {}): the orphan report must name ONLY what ign provisioned — reported \
+             {orphan_ids:?}, expected exactly the two registry modules",
+            image_tag()
+        ));
+    }
 
     if override_path.exists() {
         return Err("§C SC-4: an override was recreated for an undeclared rig".to_string());
     }
-    // §C expects NEITHER module, so an "answered but lacked it" result is
-    // the success shape here — only a transport/auth failure is fatal.
+    // The two modules are STILL INSTALLED at this point, and that is no
+    // longer a limitation — it is §D's PRECONDITION.
     //
-    // SC-4 AS ORIGINALLY WRITTEN IS FALSIFIED — recorded, not quietly
-    // weakened (D-23). RMOD-06, SC-4 and the README all claimed deleting
-    // the override "fully reverts module provisioning". It does not.
-    //
-    // Observed live: after deleting the override and bringing the rig up
-    // with NOTHING declared, the gateway still reports both modules
-    // healthy. The mount at user-lib/modules is genuinely gone — that
-    // path is not in the data volume — but Ignition INSTALLS an accepted
-    // module into its data directory, and that directory IS the
-    // persistent volume. Removing the source file does not uninstall it.
-    //
-    // So this asserts what is TRUE today: the override is gone and is not
-    // recreated. Making the gateway forget requires
-    // DELETE /data/api/v1/modules/uninstall (confirmed present in the
-    // 83-api collection) and is plan 16-04's scope — the first
-    // destructive gateway write this feature would perform, which is a
-    // guard decision, not a detail.
-    let healthy_bare = healthy_module_ids(api).await.unwrap_or_default();
-    let still_installed: Vec<&str> = [&GIT_MODULE, &PROJECT_SCAN_ENDPOINT]
+    // The mount at user-lib/modules is gone, but Ignition installed each
+    // accepted module into its data directory, which is the persistent
+    // volume. What remains is a GHOST registry entry: present in the
+    // healthy list, with an empty name/version and no state. Live-verified
+    // during Phase 19 research — and a ghost is exactly what the gateway
+    // WILL uninstall, whereas it refuses a module whose .modl is still
+    // mounted. That ordering is why §D runs after §C and not before.
+    let before = healthy_module_ids(api)
+        .await
+        .map_err(|e| format!("§D precondition: {e}"))?;
+    eprintln!("§D healthy BEFORE uninstall: {before:?}");
+
+    // The SC-4 seed (D-19-08): every module the gateway has installed that
+    // `ign` did NOT place. `ign` has no install path other than the mount,
+    // so the stock image's own modules ARE that seed — real modules, present
+    // for real reasons, and exactly what an over-broad diff or an over-broad
+    // uninstall would take.
+    let registry_ids = [
+        GIT_MODULE.gateway_module_id,
+        PROJECT_SCAN_ENDPOINT.gateway_module_id,
+    ];
+    let seed: Vec<String> = before
         .iter()
-        .map(|spec| spec.gateway_module_id)
-        .filter(|want| healthy_bare.iter().any(|id| id == want))
+        .filter(|id| !registry_ids.contains(&id.as_str()))
+        .cloned()
         .collect();
-    if !still_installed.is_empty() {
+    eprintln!(
+        "§E SC-4 seed ({} modules ign did not place): {seed:?}",
+        seed.len()
+    );
+    if seed.is_empty() {
+        return Err(format!(
+            "§E SC-4 (image {}): the seed set is EMPTY, which VOIDS SC-4 rather than \
+             satisfying it — with nothing that ign did not place, 'ign touched nothing it \
+             should not' is vacuously true. observed healthy: {before:?}",
+            image_tag()
+        ));
+    }
+
+    // SC-4, first half: ign may only ever nominate what it provisioned itself.
+    for id in &seed {
+        if orphan_ids.contains(&id.as_str()) {
+            return Err(format!(
+                "§C SC-4: {id:?} is a gateway-installed module ign never placed, and ign \
+                 nominated it as an orphan. orphans: {orphan_ids:?}, seed: {seed:?}"
+            ));
+        }
+    }
+
+    // ---- §D: SC-1 — the module is actually GONE from the gateway ----
+    //
+    // One call per module, never a batch: batch atomicity was flagged LOW
+    // confidence and never probed, so a partial failure would be
+    // indistinguishable from a total one (D-19-04).
+    for spec in [&GIT_MODULE, &PROJECT_SCAN_ENDPOINT] {
+        ignition_core::actions::rig::rig_module_uninstall(api, &plan.name, spec, &BTreeMap::new())
+            .await
+            .map_err(|e| {
+                format!(
+                    "§D: uninstalling {:?} failed — a success:false denial surfaces here as \
+                 module_uninstall_denied, and must not be swallowed: {e}",
+                    spec.gateway_module_id
+                )
+            })?;
+    }
+
+    for spec in [&GIT_MODULE, &PROJECT_SCAN_ENDPOINT] {
+        let after = module_absent_from_healthy(api, spec.gateway_module_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "§D SC-1 (image {}): {:?} is STILL in the gateway's healthy list after ign \
+                     reported a successful uninstall — the gateway did not perform what ign \
+                     reported. {e}",
+                    image_tag(),
+                    spec.gateway_module_id
+                )
+            })?;
         eprintln!(
-            "note (SC-4, known limitation): {still_installed:?} remain INSTALLED after the \
-             override was deleted — the mount reverted, the gateway's install did not. \
-             `ign rig reset` (which removes the data volume) is today's way to clear them."
+            "§D healthy AFTER uninstalling {}: {after:?}",
+            spec.gateway_module_id
         );
     }
+
+    // ---- §E: SC-4 — ign removed NOTHING it did not place ----
+    let after_all = list_healthy_ids(api)
+        .await
+        .map_err(|e| format!("§E: healthy list never answered after §D: {e}"))?;
+    for id in &seed {
+        if !after_all.contains(id) {
+            return Err(format!(
+                "§E SC-4 (image {}): {id:?} was installed on the gateway and ign never placed \
+                 it, yet it is GONE after ign's uninstall — ign removed a module the user never \
+                 asked it to touch. seed: {seed:?}, observed healthy: {after_all:?}",
+                image_tag()
+            ));
+        }
+    }
+    eprintln!(
+        "§E {} of {} seed modules ign did not place survived the uninstall: {after_all:?}",
+        seed.len(),
+        seed.len()
+    );
+
+    // Nothing may follow that assumes these modules can return: an
+    // uninstall is not undone by re-declaring (live-verified), and only
+    // `rig reset` — destroying the volume — brings the rig back.
 
     Ok(())
 }

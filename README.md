@@ -293,6 +293,28 @@ cargo test -p ignition-core --test live_gateway -- --ignored
 With no envs set the suite skips cleanly (green no-op). The file header
 carries the one-command Docker rig recipe for reproducing a test gateway.
 
+A second `#[ignore]`-gated suite
+(`crates/ignition-core/tests/live_rig_module_injection.rs`) spins a real
+stock Ignition container and is the only proof that a declared module is
+mounted, loaded, undeclared and finally **uninstalled from the gateway**.
+It needs Docker in Linux-container mode and network egress to GitHub, and it
+is destructive by design — the uninstall it performs cannot be undone within
+a run:
+
+```bash
+IGNITION_LIVE_RIG_MODULES=1 \
+  cargo test -p ignition-core --test live_rig_module_injection -- --ignored --nocapture
+
+# and again on a second pinned 8.3.x, because the uninstall contract was
+# probed live on 8.3.3 only
+IGNITION_LIVE_RIG_MODULES=1 IGNITION_LIVE_RIG_IMAGE_TAG=8.3.9 \
+  cargo test -p ignition-core --test live_rig_module_injection -- --ignored --nocapture
+```
+
+With `IGNITION_LIVE_RIG_MODULES` unset the suite skips cleanly, so CI and any
+machine without a Docker daemon are unaffected. `IGNITION_LIVE_RIG_IMAGE_TAG`
+defaults to `8.3.3`; unset reproduces the default run exactly.
+
 ## Commands
 
 | Command | What it does | Notes |
