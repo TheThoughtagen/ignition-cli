@@ -58,6 +58,7 @@ use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
 use ignition_core::error::CoreError;
 use ignition_core::output::render_failure;
+use ignition_core::rig::OrphanedModule;
 
 use crate::ActionOutput;
 
@@ -1095,6 +1096,29 @@ fn render_resource_delete_human(result: &ResourceDeleteResult) {
     println!("deleted {}", result.deleted);
 }
 
+/// Phase 19: one line per module `ign` provisioned last time that the
+/// rig no longer declares, each naming the command that removes it. An
+/// empty list yields NOTHING — a routine `rig up` stays quiet. `rig up`
+/// only REPORTS (D-19-01); the command shown is the user's to run.
+fn orphan_lines(orphans: &[OrphanedModule]) -> Vec<String> {
+    orphans
+        .iter()
+        .map(|orphan| {
+            format!(
+                "orphaned module: {} ({}) is no longer declared but is still installed on \
+                 the gateway — remove it with: {}",
+                orphan.id, orphan.gateway_module_id, orphan.remove_with
+            )
+        })
+        .collect()
+}
+
+fn render_orphaned_modules(orphans: &[OrphanedModule]) {
+    for line in orphan_lines(orphans) {
+        println!("{line}");
+    }
+}
+
 /// `ign rig up` human line: the state-forward confirmation (RUNNING,
 /// uncommissioned-with-wizard, or compose-wait-satisfied when no
 /// gateway port was derivable); warnings follow as their own lines
@@ -1116,6 +1140,7 @@ fn render_rig_up_human(result: &RigUpResult) {
     for warning in &result.warnings {
         println!("warning: {warning}");
     }
+    render_orphaned_modules(&result.orphaned_modules);
 }
 
 /// `ign rig down` human line.
@@ -1146,6 +1171,7 @@ fn render_rig_reset_human(result: &RigResetResult) {
     for warning in &result.warnings {
         println!("warning: {warning}");
     }
+    render_orphaned_modules(&result.orphaned_modules);
 }
 
 /// `ign rig logs` human tail — unreachable (the lines already streamed
@@ -2105,7 +2131,37 @@ fn human_bytes(bytes: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, iso_utc};
+    use super::{civil_from_days, iso_utc, orphan_lines};
+    use ignition_core::rig::OrphanedModule;
+
+    fn orphan(id: &str, gateway: &str) -> OrphanedModule {
+        OrphanedModule {
+            id: id.to_string(),
+            gateway_module_id: gateway.to_string(),
+            remove_with: format!("ign rig module uninstall {id} --yes"),
+        }
+    }
+
+    /// A routine `rig up` must print nothing about orphans.
+    #[test]
+    fn no_orphans_render_no_lines() {
+        assert!(orphan_lines(&[]).is_empty());
+    }
+
+    /// Each orphan is one line that names the module, the gateway id
+    /// and — the point of the report — the command that removes it.
+    #[test]
+    fn each_orphan_renders_a_line_naming_the_removal_command() {
+        let lines = orphan_lines(&[
+            orphan("git", "com.axone_io.ignition.git"),
+            orphan("project-scan-endpoint", "com.example.scan"),
+        ]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("git (com.axone_io.ignition.git)"));
+        assert!(lines[0].contains("ign rig module uninstall git --yes"));
+        assert!(lines[1].contains("ign rig module uninstall project-scan-endpoint --yes"));
+        assert!(!lines[0].contains("scan"), "lines do not bleed together");
+    }
 
     /// Known instants: the epoch, a recent date, a pre-epoch value
     /// (negative ms must still render, via euclidean division), and

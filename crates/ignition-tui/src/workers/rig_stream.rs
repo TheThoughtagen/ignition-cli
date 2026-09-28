@@ -55,7 +55,7 @@ const WAIT_TIMEOUT_S: u64 = actions::rig::DEFAULT_WAIT_TIMEOUT_S;
 ///
 /// SC-1 is preserved exactly as in the CLI: an undeclared rig builds NO
 /// `ModuleFeed`, resolves NO cache root and constructs NO network client —
-/// it only clears a stale override. There is no flag surface here, so the
+/// it only clears a stale override (reading its orphans first). There is no flag surface here, so the
 /// policy is the default `CacheFirst`; a TUI user who needs `--refresh` or
 /// `--accept-upstream-change` uses the CLI, which is where a deliberate
 /// digest decision belongs.
@@ -63,8 +63,11 @@ async fn provision_for(
     plan: &ignition_core::rig::RigPlan,
 ) -> Result<ignition_core::rig::ModuleProvisioning, CoreError> {
     if plan.modules.is_empty() {
-        ignition_core::rig::clear_override(plan)?;
-        return Ok(ignition_core::rig::ModuleProvisioning::default());
+        // The same seam the CLI dispatch uses: read the stale override's
+        // modules BEFORE it is deleted, so the two front-ends cannot
+        // diverge on the orphan computation. The TUI does not render the
+        // report; it only must not compute it differently.
+        return ignition_core::rig::undeclared_provisioning(plan);
     }
     let feed = ignition_core::module::fetch::ModuleFeed::github()?;
     let cache_root = ignition_core::module::cache_root();

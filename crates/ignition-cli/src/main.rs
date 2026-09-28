@@ -2113,14 +2113,21 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         let provisioning = if merged_modules.is_empty() {
                             // SC-1 holds — no ModuleFeed, no cache root, no
                             // network client — but a previous run's override
-                            // must still be cleared, which is why this is
-                            // clear_override and not a bare default().
-                            // Returning default() alone left D-08's delete
-                            // branch unreachable in production.
-                            if let Err(err) = ignition_core::rig::clear_override(&plan) {
-                                return (None, Err(err));
+                            // must still be cleared, which is why this is not
+                            // a bare default(): returning default() alone left
+                            // D-08's delete branch unreachable in production.
+                            //
+                            // undeclared_provisioning reads that override for
+                            // the modules it named (Phase 19's orphan report)
+                            // BEFORE clear_override deletes it. The read is a
+                            // FILE read, not a gateway call — which is what
+                            // lets it live on this credential-free,
+                            // network-free path. rig up REPORTS the orphan;
+                            // it never removes it (D-19-01).
+                            match ignition_core::rig::undeclared_provisioning(&plan) {
+                                Ok(provisioning) => provisioning,
+                                Err(err) => return (None, Err(err)),
                             }
-                            ignition_core::rig::ModuleProvisioning::default()
                         } else {
                             let feed = match ignition_core::module::fetch::ModuleFeed::github() {
                                 Ok(feed) => feed,

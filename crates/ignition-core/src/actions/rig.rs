@@ -44,7 +44,9 @@ use crate::rig::compose::{
     parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
     up_args, volume_ls_args,
 };
-use crate::rig::modules::{ModuleProvisioning, ProvisionedModule, existing_override};
+use crate::rig::modules::{
+    ModuleProvisioning, OrphanedModule, ProvisionedModule, existing_override,
+};
 use crate::rig::{RigPlan, port_preflight};
 
 /// Default wait budget for BOTH `up --wait-timeout` and the
@@ -80,6 +82,13 @@ pub struct RigUpResult {
     /// unprovisioned rig's result shape gains only this always-empty
     /// field, never a behavior change).
     pub provisioned_modules: Vec<ProvisionedModule>,
+    /// Modules `ign` provisioned LAST time that this rig no longer
+    /// declares (Phase 19) — ALWAYS present, empty for a rig that
+    /// provisioned nothing or whose modules are unchanged. This is a
+    /// REPORT: `rig up` drops the mount and never removes the module
+    /// from the gateway (D-19-01); each entry's `remove_with` names the
+    /// verb that does.
+    pub orphaned_modules: Vec<OrphanedModule>,
 }
 
 /// `ign rig down` output model.
@@ -113,6 +122,10 @@ pub struct RigResetResult {
     /// empty for a rig with no `[rigs.NAME.modules.*]` declared and no
     /// `--with-module` flag (SC-1).
     pub provisioned_modules: Vec<ProvisionedModule>,
+    /// Modules `ign` provisioned last time that this rig no longer
+    /// declares (Phase 19) — the SAME always-present, report-only
+    /// convention as [`RigUpResult::orphaned_modules`].
+    pub orphaned_modules: Vec<OrphanedModule>,
 }
 
 /// One published-port row in status output (allowlist only).
@@ -252,6 +265,7 @@ pub async fn rig_up(
         gateway_url,
         warnings,
         provisioned_modules: provisioning.modules.clone(),
+        orphaned_modules: provisioning.orphaned_modules.clone(),
     })
 }
 
@@ -428,6 +442,7 @@ pub async fn rig_reset(
         state,
         warnings,
         provisioned_modules: provisioning.modules.clone(),
+        orphaned_modules: provisioning.orphaned_modules.clone(),
     })
 }
 
@@ -2448,6 +2463,24 @@ mod tests {
             .await
             .expect("rig up completes without touching the gateway's module list");
         assert_eq!(result.state, "running");
+        // The report survives the trip through `rig_up` into the RESULT
+        // the `--json` envelope serialises — asserting only on
+        // `ModuleProvisioning` would pass with the field never copied.
+        assert_eq!(
+            result
+                .orphaned_modules
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git", "project-scan-endpoint"],
+            "rig_up copies the orphan report into RigUpResult"
+        );
+        let json = serde_json::to_value(&result).expect("serialise");
+        assert_eq!(json["orphaned_modules"][0]["id"], "git");
+        assert_eq!(
+            json["orphaned_modules"][0]["remove_with"],
+            "ign rig module uninstall git --yes"
+        );
         assert!(
             !rig.calls()
                 .iter()
@@ -2486,9 +2519,18 @@ mod tests {
 
         let rig = SnapshotRig::default();
         let runner = FakeRunner::with(up_cycle_outputs());
-        rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+        let result = rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
             .await
             .expect("rig up completes");
+        assert_eq!(
+            result
+                .orphaned_modules
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project-scan-endpoint"],
+            "RigUpResult carries exactly the dropped module"
+        );
         assert!(
             !rig.calls()
                 .iter()
@@ -2536,13 +2578,58 @@ mod tests {
 
         let rig = SnapshotRig::default();
         let runner = FakeRunner::with(up_cycle_outputs());
-        rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+        let result = rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
             .await
             .expect("rig up completes");
+        assert!(
+            result.orphaned_modules.is_empty(),
+            "an unchanged rig reports nothing on the result either"
+        );
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialise")["orphaned_modules"],
+            serde_json::json!([]),
+            "the key is present and empty, never absent"
+        );
         assert!(
             !rig.calls()
                 .iter()
                 .any(|c| c.starts_with("uninstall_module"))
+        );
+    }
+
+    /// `rig reset` carries the SAME report: a reset is a teardown plus an
+    /// up, so a user who undeclared a module and resets (not ups) must
+    /// still be told. Driven through the real `rig_reset` with a gateway
+    /// whose `uninstall_module` panics.
+    #[tokio::test]
+    async fn reset_after_undeclaring_reports_orphans_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        let override_path = seed_two_mount_override(&plan);
+
+        let provisioning = undeclared_provisioning(&plan).expect("undeclared provisioning");
+        assert!(!override_path.exists(), "the stale override is deleted");
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(reset_cycle_outputs());
+        let result = rig_reset(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("reset completes");
+        assert_eq!(
+            result
+                .orphaned_modules
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git", "project-scan-endpoint"],
+            "rig_reset copies the orphan report into RigResetResult"
+        );
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module")),
+            "no uninstall was attempted: {:?}",
+            rig.calls()
         );
     }
 
@@ -3399,6 +3486,7 @@ mod tests {
             gateway_url: None,
             warnings: vec![],
             provisioned_modules: vec![],
+            orphaned_modules: vec![],
         };
         let json = serde_json::to_value(&up).unwrap();
         for key in [
@@ -3408,6 +3496,7 @@ mod tests {
             "gateway_url",
             "warnings",
             "provisioned_modules",
+            "orphaned_modules",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
@@ -3427,6 +3516,7 @@ mod tests {
             state: "running".into(),
             warnings: vec![],
             provisioned_modules: vec![],
+            orphaned_modules: vec![],
         };
         let json = serde_json::to_value(&reset).unwrap();
         for key in [
@@ -3436,6 +3526,7 @@ mod tests {
             "state",
             "warnings",
             "provisioned_modules",
+            "orphaned_modules",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
