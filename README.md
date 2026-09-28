@@ -639,6 +639,47 @@ you a re-run, this one costs the volume. It refuses without `--yes` for that
 reason, and it is a separate verb rather than something `ign rig up` offers,
 because `IGNITION_YES=1` would turn a mid-`up` prompt into no prompt at all.
 
+**When you stop declaring a module, `ign rig up` tells you.** It drops the
+mount and deletes the override, then reports the module rather than removing it
+from the gateway:
+
+```console
+$ ign rig up
+...
+orphaned: git (com.axone_io.ignition.git) — still installed on the gateway
+  remove with: ign rig module uninstall git --rig dev --yes
+```
+
+The same data is on the `--json` envelope, on an always-present key that is an
+empty list when there is nothing orphaned:
+
+```json
+{
+  "orphaned_modules": [
+    {
+      "id": "git",
+      "gateway_module_id": "com.axone_io.ignition.git",
+      "remove_with": "ign rig module uninstall git --rig dev --yes"
+    }
+  ]
+}
+```
+
+`rig up` does not remove it for you, for two reasons that are not style
+preferences. `IGNITION_YES=1` is a documented pattern for agents and CI, and it
+merges into `--yes` — so a confirmation asked mid-`up` would be no confirmation
+at all for exactly the callers least able to notice an irreversible act. And
+`rig up` needs no gateway credential today; performing a gateway write would
+change that contract for every user of the verb. Removal stays something you
+type.
+
+**The report comes from `ign`'s own override file, not the gateway's module
+list.** `ign` diffs what it provisioned last time against what you declare now,
+so it can only ever report modules it installed itself. A module you installed
+by hand is invisible to that diff and will never be named — which is the point:
+the report leads to an irreversible command, so it must not point at something
+`ign` did not put there.
+
 Provisioning **mounts** a module; it does not commission one. No
 repository, credential, or module configuration is supplied — a
 provisioned module is present and accepted by the gateway, not set up.
