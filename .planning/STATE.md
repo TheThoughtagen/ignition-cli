@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Rig Modules & Declared Discovery
-current_phase: 15
-current_phase_name: 2/2 plans
-status: planning
-stopped_at: "Completed quick/260919-tg4 (3 commits: 063f389, a1863ea, 7859247); next: `/gsd-new-milestone`"
-last_updated: "2026-09-22T12:29:45.761Z"
-last_activity: 2026-09-21
-last_activity_desc: "Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch"
+current_phase: 19
+current_phase_name: 3/3 plans
+status: complete
+stopped_at: "Phase 19 complete (3/3 plans, 9 commits). SC-1 and SC-4 proven live on two pinned 8.3.x images. Next: PR for phase 19, then Phase 17 or 18."
+last_updated: "2026-09-28T00:00:00.000Z"
+last_activity: 2026-09-28
+last_activity_desc: "Phase 19 closed: the guarded uninstall verb, the orphan report, and the live gate that proves a module is actually gone from the gateway"
 progress:
-  total_phases: 4
-  completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 25
+  total_phases: 5
+  completed_phases: 3
+  total_plans: 8
+  completed_plans: 8
+  percent: 60
 ---
 
 # Project State
@@ -28,10 +28,11 @@ See: .planning/PROJECT.md (updated 2026-09-16)
 
 ## Current Position
 
-Phase: 16-compose-override-module-injection — COMPLETE (3/3 plans, SC-4 amended)
-Plan: — (next: 16-04 module uninstall, opened by 16-03's falsification; then Phase 17)
-Status: `ign rig up --with-module git@2.3.4` works end to end and is PROVEN LIVE — both modules healthy on a stock gateway given no acceptance variables of its own, surviving a container recreate. The comma-separated ACCEPT_MODULE_* format is confirmed correct and the gateway_service heuristic works on a real compose file. SC-4 was FALSIFIED live: deleting the override reverts the mount, not the gateway's install, because Ignition installs an accepted module into its data directory. README, SC-4 and RMOD-06 corrected; uninstall is 16-04.
-Last activity: 2026-09-21 - Completed quick task 260921-96c: workspace push confirmable over MCP (GUARDED_OPS); carried 260920-iti credential precedence fix onto this branch
+Phase: 19-module-uninstall-on-undeclare — COMPLETE (3/3 plans, all four SCs proven)
+Plan: — (next: open the PR for phase 19; then Phase 17 or Phase 18)
+Status: The gap Phase 16's live gate opened is closed. `ign rig module uninstall <id> --rig <name> --yes` removes a module from the gateway, and the live gate proves it: on both 8.3.3 and 8.3.9, 31 modules healthy before, both registry modules ABSENT after, all 29 stock modules `ign` did not place untouched. `rig up` REPORTS orphans and makes zero gateway writes (D-19-01). §C of the live gate now drives the real undeclare path instead of hand-deleting the override — the line that masked a dead branch for a whole phase.
+Unpushed: 9 commits on main ahead of origin (f206c66..26205e4).
+Last activity: 2026-09-28 - Phase 19 closed with the live gate; SC-1 has its first and only proof in the repository
 
 ## Performance Metrics
 

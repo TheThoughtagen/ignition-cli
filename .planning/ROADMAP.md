@@ -55,9 +55,9 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 - [x] **Phase 15: 15-module-artifact-fetch-verify** — Pinned signed-release resolution, sha256 verification, version+digest cache, offline-from-cache *(RMOD-02, RMOD-03)* *(complete 2026-09-20; 2/2 plans, all 4 SCs tested; live fetch confirmed the real Git-2.3.4-signed.modl byte-for-byte)*
 - [x] **Phase 16: 16-compose-override-module-injection** — Generated `compose.ign-modules.yml`, acceptance variables, recreate-durable mount, `ign`-owned regeneration, module registry with a second module proving the seam *(RMOD-01, RMOD-04, RMOD-05, RMOD-06, RMOD-07)*
-- [ ] **Phase 16-04: 16-04-module-uninstall-on-undeclare** — `DELETE /data/api/v1/modules/uninstall` so undeclaring a module actually removes it from the gateway, not just the mount. Opened by 16-03's live falsification of SC-4. Carries a guard decision: `rig up` is not in `GUARDED_OPS` and this would be the feature's first destructive gateway write *(RMOD-06 amended half)*
 - [ ] **Phase 17: 17-git-module-commissioning** — `git.yaml` generation, credential kept out via `GATEWAY_GIT_USER_SECRET`/`_FILE`, exactly-one `gateway_exportResources` validation, human-next-steps reporting *(GITM-01, GITM-02, GITM-03, GITM-04)*
 - [ ] **Phase 18: 18-declared-rig-discovery** — Convention roots move from binary consts to `[rig]` config; clear error when nothing is declared; v1.2 ledger backfill *(RDISC-01, RDISC-02, LEDG-01)*
+- [x] **Phase 19: 19-module-uninstall-on-undeclare** — `DELETE /data/api/v1/modules/uninstall` so a module the user stops declaring is actually removed from the gateway, not just unmounted. Opened by Phase 16's live falsification of SC-4 *(closes RMOD-06's amended half)* *(complete 2026-09-28; 3/3 plans; all four SCs proven, SC-1 and SC-4 LIVE on 8.3.3 and 8.3.9)*
 
 **Dependencies:** 16 depends on 15 (nothing to inject without a verified artifact). 17 depends on 16 (the override carries the generated `git.yaml` mount). 18 is independent of 15-17 and may run in parallel or slip.
 
@@ -119,6 +119,26 @@ Plans:
   4. `MILESTONES.md` records v1.2's shipped work with its requirements archived, so the ledger is continuous from v1.0 through v1.3
 **Research/Planning flags**: None — the discovery code is fully source-verified (`crates/ignition-core/src/rig/mod.rs`, five-level chain, `IGNITION_RIG_ROOTS` override already exists as the seam). Pure refactor plus config schema addition. Skip research. Note the existing `IGNITION_RIG_ROOTS` env var already does most of SC-2's job and may simply be promoted to config rather than replaced.
 
+### Phase 19: 19-module-uninstall-on-undeclare
+**Goal**: A module the user stops declaring is actually gone from the gateway — not merely unmounted — so the override's removal means what Phase 16's documentation originally promised and now cannot deliver.
+**Depends on**: Phase 16 (the provisioning seam, the registry, and `provisioned_modules`)
+**Requirements**: RMOD-06 (amended half)
+**Success Criteria** (what must be TRUE):
+  1. A gateway that has a module installed, whose rig no longer declares it, ends with that module ABSENT from the gateway's healthy module list — proven live, since no unit test can observe a gateway's installed-module state (this is exactly how the original claim survived to ship)
+  2. Removal NEVER happens without explicit confirmation: the uninstall path is in `GUARDED_OPS` and refuses without `--yes` (exit 2, `confirmation_required`), following the `project delete` precedent
+  3. `rig up` on a rig with no module changes performs no uninstall and issues no uninstall request — provable by a test that fails if a request is made
+  4. A module the user never declared through `ign` is never uninstalled — `ign` removes only what it provisioned, and the test seeds a gateway-installed module `ign` did not place to prove it
+**Outcome (2026-09-28):** all four proven. SC-1 and SC-4 LIVE on `inductiveautomation/ignition` 8.3.3 (112s) and 8.3.9 (98s): 31 modules healthy before the uninstall, both registry modules ABSENT after, and all 29 stock modules `ign` did not place still healthy. The seed's non-emptiness is asserted, so SC-4 cannot pass vacuously. Transcripts in `19-03-SUMMARY.md`.
+**Research/Planning flags**: The endpoint is confirmed present (`DELETE /data/api/v1/modules/uninstall`, body `{"uninstall": [...]}`, 83-api collection) but its response shape, whether it requires a gateway restart to take effect, and whether it accepts gateway module ids or some other handle are ALL unverified. A short live probe against a disposable rig should settle those before the plan locks a client signature.
+**Planner locks** (user decision, 2026-09-25, binding): **An uninstall REQUIRES confirmation.** It is the feature's first destructive gateway write, and undeclaring a module in config is a quiet way to trigger one — someone editing a TOML table should not lose a gateway module as a side effect. The uninstall joins `GUARDED_OPS` (`crates/ignition-cli/src/main.rs:3425`) and refuses without `--yes`. `rig up` itself stays UNGUARDED: the gate belongs on the destructive act, not on bringing a rig up.
+**Open for the planner** (design, not policy): whether an undeclared module is uninstalled at all as part of `rig up`, or whether `rig up` merely REPORTS the orphaned module and removal is a deliberate verb (`ign rig module uninstall <id> --yes`). The orchestrator's view is that the second is safer — a report makes removal something the user asks for, rather than something they are asked to approve mid-`up` — but the planner should weigh both and record why.
+**SETTLED — planner decision D-19-01 (2026-09-26, binding on plans):** `rig up` **REPORTS** the orphan (a new additive `orphaned_modules` key) and makes zero gateway writes; removal is the deliberate guarded verb `ign rig module uninstall <REGISTRY-ID> --yes`. Four reasons, in order of force: (1) `--yes` is a GLOBAL arg and `apply_env_defaults` merges `IGNITION_YES`, so the documented agent/CI pattern `IGNITION_YES=1` would turn a mid-`up` confirmation into a no-op — a gate the project's own recommended usage disables is not a gate; (2) `GUARDED_OPS` is a static registry keyed by clap leaf path and `mcp.rs` derives each tool's `confirm` property from it, so a conditionally-destructive `rig up` is structurally inexpressible; (3) `rig up` needs NO gateway credential today (the commissioned wait is header-less against `/StatusPing` on purpose) and a gateway write would change that contract for every user; (4) live fact 3 — an uninstall is not undone by re-declaring, so recovery means `ign rig reset` and a destroyed data volume, and every destructive verb in this codebase is already a deliberate separate command. **Rejected:** inline uninstall behind the confirmation, on (1) and (2) as structural grounds with (3) and (4) independent. Full record in `19-01-PLAN.md`'s `<design_decision>`.
+**Plans:** 3 plans
+Plans:
+- [ ] 19-01-PLAN.md — The guarded gateway write end to end: `CoreError::ModuleUninstallDenied` (denial-rides-200, exit 6), `GatewayApi::uninstall_module` (one id per call), the `rig module uninstall` leaf in `GUARDED_OPS`, and the three refusals — no `--yes` (exit 2 before discovery), unregistered id (exit 3, zero requests), still-declared id (exit 7, zero requests) *(SC-2, SC-4's CLI-surface half)*
+- [ ] 19-02-PLAN.md — Orphan detection and reporting: `previously_provisioned` parses the PRE-overwrite override's mount targets and intersects them with the registry, `orphaned_modules` is a pure diff, `undeclared_provisioning` reads before it deletes, and `rig up`/`rig reset` report orphans as data while a fake gateway that panics on `uninstall_module` proves no write happens *(SC-3, SC-4's on-disk half)*
+- [ ] 19-03-PLAN.md — The live gate: §C stops hand-deleting the override and drives the real undeclare path, §D uninstalls both ghost entries through `ign`'s own action and proves them ABSENT from the gateway's healthy list, §E proves a non-empty set of gateway-installed modules `ign` did not place is untouched, on two pinned 8.3.x images *(SC-1 live, SC-4 live)*
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
@@ -141,6 +161,7 @@ Plans:
 | 16. Compose Override — Module Injection | v1.3 | 3/3 | Complete (SC-4 amended) | 2026-09-25 |
 | 17. Git Module Commissioning | v1.3 | 0/? | Not started | — |
 | 18. Declared Rig Discovery | v1.3 | 0/? | Not started | — |
+| 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 
 ---
 *Roadmap created: 2026-09-04 — milestone v1.1; v1.1 completed 2026-09-16 (25/25 requirements shipped)*

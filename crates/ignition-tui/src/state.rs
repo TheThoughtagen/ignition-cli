@@ -177,8 +177,8 @@ pub enum Modal {
     ProjectsActions { selected: usize },
     /// The Rig screen's actions menu (06-06): the rig family verbs
     /// (up/down/reset/status/logs/trial status/trial reset/snapshot/
-    /// restore) with a moving selection — the same shape as
-    /// [`Modal::Actions`], its own list.
+    /// restore, plus 19-04's `module uninstall`) with a moving
+    /// selection — the same shape as [`Modal::Actions`], its own list.
     RigActions { selected: usize },
 }
 
@@ -233,6 +233,11 @@ pub enum PendingAction {
     RigReset,
     /// `ign rig restore --file <FILE>` (Confirm ≡ `--yes`).
     RigRestore { file: String },
+    /// `ign rig module uninstall <ID> --rig <NAME> --yes` (Confirm ≡
+    /// `--yes`). The gateway write is IRREVERSIBLE: an uninstalled
+    /// module does not come back when re-declared, so recovery means
+    /// `rig reset` and a destroyed data volume.
+    RigModuleUninstall { id: String },
     /// `ign rig trial reset` (Confirm ≡ `--yes`; credentials ride
     /// the env ladder — IGNITION_TOKEN / IGNITION_USER +
     /// IGNITION_PASSWORD — the CLI's `--user` flag has no cockpit
@@ -644,7 +649,7 @@ pub const PROJECT_ACTIONS: [ProjectAction; 13] = [
 /// RigCommand verb set (up/down/reset/status/logs + the trial pair +
 /// snapshot/restore). Labels are display side; the route rows in
 /// [`crate::routes`] carry the clap-exact spellings.
-pub const RIG_ACTIONS: [&str; 9] = [
+pub const RIG_ACTIONS: [&str; 10] = [
     "up",
     "down",
     "reset",
@@ -654,6 +659,7 @@ pub const RIG_ACTIONS: [&str; 9] = [
     "trial reset",
     "snapshot",
     "restore",
+    "module uninstall",
 ];
 
 /// What an accepted Input modal's buffer is for on the Tags screen
@@ -1244,6 +1250,12 @@ pub enum RigForm {
     /// `rig restore` — the gwbk FILE to restore (a Confirm gate arms
     /// next; the action's own pre-checks fence missing/empty files).
     RestoreFile,
+    /// `rig module uninstall` — the REGISTRY id to remove from the
+    /// gateway (a Confirm gate arms next). Unlike every other rig verb
+    /// this one takes a required argument, which is why it needs a form
+    /// at all; the id is validated against the module registry at
+    /// accept, so an unknown id never costs a gateway round trip.
+    ModuleUninstallId,
 }
 
 /// The raw-line ring cap for the rig logs pane — the 06-03

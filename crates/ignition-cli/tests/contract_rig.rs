@@ -412,6 +412,191 @@ fn rig_trial_reset_refuses_without_yes_before_any_discovery() {
     );
 }
 
+/// THE destructive-guard pin for `rig module uninstall` (Phase 19,
+/// SC-2, D-19-02): no `--yes` refuses exit 2 (`confirmation_required`),
+/// profile null — the ZERO WORK proof rides the same no-rig environment
+/// as `rig reset` (the cwd has NO compose file; un-guarded execution
+/// would exit 7 at discovery). Sixth destructive-verb instance
+/// (sessions terminate -> project delete -> rig reset -> rig trial
+/// reset -> rig restore -> rig module uninstall).
+#[test]
+fn rig_module_uninstall_refuses_without_yes_before_any_discovery() {
+    let (_config_dir, config) = isolated_config();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &["rig", "module", "uninstall", "git", "--compact"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "guard exit 2 — NOT the exit 7 a discovery run would produce"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["profile"], Value::Null, "docker-only: profile null");
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("confirmation_required".into()),
+        "stable slug"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("rig module uninstall"),
+        "names the operation: {message}"
+    );
+    let hint = body["error"]["hint"].as_str().expect("hint required");
+    assert!(
+        hint.contains("--yes") && hint.contains("IGNITION_YES"),
+        "hint names the flag and the env escape hatch: {hint}"
+    );
+}
+
+/// The unregistered-id refusal for `rig module uninstall` (Phase 19,
+/// D-19-05, SC-4's CLI-surface half): exit 3, `module_not_registered`,
+/// the message lists the known registry ids. Proven to fire BEFORE any
+/// credential is sourced by the environment itself: `IGNITION_TOKEN` is
+/// unset (`ign_rig`'s default `env_remove`), so if this check ran AFTER
+/// the token step the run would instead surface `secret_unavailable` —
+/// the distinct slug IS the ordering proof (the same technique as the
+/// `--yes`-guard goldens' exit-code distinction). Requires docker:
+/// `resolve_plan` parses the fixture's compose file via `docker compose
+/// config` before the `Module` arm is ever reached — skips when docker
+/// is unavailable (this file's established convention), never runs a
+/// container.
+#[test]
+fn module_uninstall_unregistered_id_is_exit_3_before_credential_step() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_compose_available() {
+        eprintln!(
+            "skipping: docker unavailable (or skip forced) — resolve_plan needs \
+             `docker compose config`"
+        );
+        return;
+    }
+
+    let (_config_dir, config, _project_dir) = rig_config_with_real_compose_file();
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "module",
+            "uninstall",
+            "not-a-real-module",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "unregistered id refuses at exit 3, never reaching the credential step"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("module_not_registered".into()),
+        "stable slug — NOT secret_unavailable, which is what an out-of-order \
+         check would produce with no IGNITION_TOKEN set"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("not-a-real-module"),
+        "names the bad id: {message}"
+    );
+    assert!(message.contains("git"), "lists a known id: {message}");
+}
+
+/// The still-declared refusal for `rig module uninstall`: a registry id
+/// the rig's own `[rigs.NAME.modules]` table still names refuses exit 7
+/// (`rig_error`), naming the config table to edit and `ign rig up` —
+/// never reaching the credential step (same ordering proof as the
+/// unregistered-id golden above: `IGNITION_TOKEN` is unset, so an
+/// out-of-order check would surface `secret_unavailable` instead).
+/// Requires docker for the same reason as the unregistered-id golden.
+#[test]
+fn module_uninstall_still_declared_id_is_exit_7_before_credential_step() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_compose_available() {
+        eprintln!(
+            "skipping: docker unavailable (or skip forced) — resolve_plan needs \
+             `docker compose config`"
+        );
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let compose_file = project_dir.path().join("docker-compose.yml");
+    std::fs::write(
+        &compose_file,
+        "services:\n  app:\n    image: alpine:latest\n",
+    )
+    .expect("write compose file");
+
+    let (_config_dir, config) = isolated_config();
+    std::fs::write(
+        &config,
+        format!(
+            "[rigs.fixture]\ncompose_file = '{}'\nproject_name = \"fixture\"\n\n\
+             [rigs.fixture.modules.git]\nversion = \"2.3.4\"\n",
+            compose_file.display()
+        ),
+    )
+    .expect("write config");
+    let (_roots_dir, roots) = isolated_roots();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let out = ign_rig(
+        &config,
+        &roots,
+        cwd.path(),
+        &[
+            "rig",
+            "--rig",
+            "fixture",
+            "module",
+            "uninstall",
+            "git",
+            "--yes",
+            "--compact",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "still-declared id refuses at exit 7, never reaching the credential step"
+    );
+    assert!(out.stdout.is_empty(), "errors never touch stdout");
+    let body: Value = serde_json::from_str(&stderr_envelope(&out)).expect("error envelope parses");
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(
+        body["error"]["code"],
+        Value::String("rig_error".into()),
+        "stable slug — NOT secret_unavailable, which is what an out-of-order \
+         check would produce with no IGNITION_TOKEN set"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("git"), "names the module: {message}");
+    assert!(message.contains("fixture"), "names the rig: {message}");
+    assert!(
+        message.contains("[rigs.fixture.modules.git]"),
+        "names the config table to edit: {message}"
+    );
+    assert!(message.contains("ign rig up"), "names the fix: {message}");
+}
+
 /// The `rig trial` help surface: both verbs + `--user`; a PASSWORD
 /// flag must NOT exist (env-only redaction discipline — pinned by
 /// this absence in the same golden as the presence checks).
@@ -970,6 +1155,11 @@ fn rig_up_with_module_json_reports_provisioned_modules() {
         .as_array()
         .expect("provisioned_modules is always an array");
     assert_eq!(modules.len(), 1, "exactly the one --with-module module");
+    assert_eq!(
+        body["data"]["orphaned_modules"],
+        serde_json::json!([]),
+        "a NEWLY declared module is not an orphan, and the key is present-and-empty"
+    );
     let module = &modules[0];
     assert_eq!(module["id"], Value::String("git".into()));
     assert_eq!(module["version"], Value::String("2.3.4".into()));
@@ -992,6 +1182,292 @@ fn rig_up_with_module_json_reports_provisioned_modules() {
     let contents = std::fs::read_to_string(&override_file).expect("read override");
     assert!(contents.contains("git.modl"), "{contents}");
     assert!(contents.contains("com.axone_io.ignition.git"), "{contents}");
+}
+
+/// A real (lightweight alpine, no gateway port) rig fixture for the
+/// Phase-19 orphan tests: a compose file, a rig config in TOML
+/// LITERAL strings (a Windows path's backslashes are escapes in a
+/// basic string), a pre-seeded module cache so `--with-module` is a
+/// pure cache hit, and a teardown guard so a mid-test panic never
+/// leaks the container.
+struct OrphanRig {
+    _config_dir: tempfile::TempDir,
+    config: PathBuf,
+    _roots_dir: tempfile::TempDir,
+    roots: PathBuf,
+    cwd: tempfile::TempDir,
+    project_dir: tempfile::TempDir,
+    compose_file: PathBuf,
+    project_name: String,
+    cache_root: tempfile::TempDir,
+}
+
+impl Drop for OrphanRig {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.project_name,
+                "-f",
+                self.compose_file.to_str().expect("utf8 path"),
+                "down",
+                "-v",
+                "--remove-orphans",
+            ])
+            .output();
+    }
+}
+
+impl OrphanRig {
+    fn new(tag: &str) -> Self {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let compose_file = project_dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose_file,
+            "services:\n  app:\n    image: alpine:latest\n    command: [\"sleep\", \"infinity\"]\n",
+        )
+        .expect("write compose file");
+        let project_name = format!(
+            "ign-cli-orphan-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let (config_dir, config) = isolated_config();
+        // NOTE: NO `[rigs.fixture.modules.*]` table — the rig declares
+        // nothing, which is the "user deleted the table" state. The
+        // `--with-module` flag stands in for the declaration on the
+        // FIRST run only.
+        std::fs::write(
+            &config,
+            format!(
+                "[rigs.fixture]\ncompose_file = '{}'\nproject_name = '{}'\nmodule_service = \"app\"\n",
+                compose_file.display(),
+                project_name
+            ),
+        )
+        .expect("write config");
+        let (roots_dir, roots) = isolated_roots();
+
+        let payload = format!("synthetic .modl payload for orphan test {tag}").into_bytes();
+        let digest = sha256_hex(&payload);
+        let cache_root = tempfile::tempdir().expect("cache tempdir");
+        let module_dir = cache_root.path().join("modules").join("git");
+        std::fs::create_dir_all(&module_dir).expect("create module cache dir");
+        std::fs::write(module_dir.join(format!("2.3.4-{digest}.modl")), &payload)
+            .expect("seed cached artifact");
+
+        Self {
+            _config_dir: config_dir,
+            config,
+            _roots_dir: roots_dir,
+            roots,
+            cwd: tempfile::tempdir().expect("cwd tempdir"),
+            project_dir,
+            compose_file,
+            project_name,
+            cache_root,
+        }
+    }
+
+    fn override_file(&self) -> PathBuf {
+        self.project_dir.path().join("compose.ign-modules.yml")
+    }
+
+    /// `ign rig --rig fixture up <extra…> --timeout 60 [--json --compact]`.
+    fn up(&self, extra: &[&str], json: bool) -> std::process::Output {
+        self.run("up", &[], extra, json)
+    }
+
+    /// `ign rig --rig fixture reset --yes --timeout 60 [--json --compact]`.
+    fn reset(&self, json: bool) -> std::process::Output {
+        self.run("reset", &["--yes"], &[], json)
+    }
+
+    fn run(&self, verb: &str, guard: &[&str], extra: &[&str], json: bool) -> std::process::Output {
+        let mut command = Command::cargo_bin("ign").expect("binary 'ign' not found");
+        command
+            .env("IGNITION_CLI_CONFIG", &self.config)
+            .env("IGNITION_RIG_ROOTS", &self.roots)
+            .env("IGNITION_CLI_CACHE", self.cache_root.path())
+            .env_remove("IGNITION_RIG")
+            .env_remove("IGNITION_TOKEN")
+            .current_dir(self.cwd.path())
+            .args(["rig", "--rig", "fixture", verb])
+            .args(guard)
+            .args(extra)
+            .args(["--timeout", "60"]);
+        if json {
+            command.args(["--json", "--compact"]);
+        }
+        command.output().expect("spawn ign")
+    }
+}
+
+fn assert_success(out: &std::process::Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} succeeds: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Phase 19 / SC-3 / the test-matrix rule, through the REAL binary with
+/// real on-disk state. Three consecutive `rig up`s against one rig:
+///
+/// 1. a rig that has never provisioned anything reports
+///    `orphaned_modules: []` — PRESENT and empty, never absent;
+/// 2. `--with-module git@2.3.4` makes `ign` itself write a real
+///    override naming `git` (not a hand-written stub);
+/// 3. that override is then TAMPERED with — a mount naming an id the
+///    registry does not know, and one whose path sits outside the
+///    module directory — and `rig up` runs with nothing declared:
+///    exactly `git` is reported (the tampered entries are dropped, SC-4),
+///    it names its removal command, and the override file is GONE
+///    (the read happened before the delete).
+#[test]
+fn rig_up_after_undeclaring_reports_the_orphan_and_deletes_the_override() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_daemon_available() {
+        eprintln!("skipping: docker unavailable (or skip forced) — this test drives a real rig");
+        return;
+    }
+    let rig = OrphanRig::new("json");
+
+    // 1. Never provisioned: key present, empty.
+    let out = rig.up(&[], true);
+    assert_success(&out, "rig up on a never-provisioned rig");
+    let body: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("stdout envelope parses");
+    assert_eq!(
+        body["data"]["orphaned_modules"],
+        serde_json::json!([]),
+        "an unprovisioned rig still carries the key"
+    );
+    assert!(!rig.override_file().exists(), "nothing was provisioned");
+
+    // 2. ign writes a real override.
+    let out = rig.up(&["--with-module", "git@2.3.4"], true);
+    assert_success(&out, "rig up --with-module git");
+    assert!(
+        rig.override_file().exists(),
+        "ign itself wrote the override that run 3 will find"
+    );
+
+    // 3. Tamper, then undeclare.
+    let mut planted = std::fs::read_to_string(rig.override_file()).expect("read override");
+    assert!(
+        planted.contains("target: '/usr/local/bin/ignition/user-lib/modules/git.modl'"),
+        "the real override names git: {planted}"
+    );
+    planted.push_str(
+        "        target: '/usr/local/bin/ignition/user-lib/modules/totally-made-up.modl'\n\
+         \x20       target: '/tmp/outside/project-scan-endpoint.modl'\n",
+    );
+    std::fs::write(rig.override_file(), planted).expect("plant tampered targets");
+
+    let out = rig.up(&[], true);
+    assert_success(&out, "rig up after undeclaring");
+    let body: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("stdout envelope parses");
+    let orphans = body["data"]["orphaned_modules"]
+        .as_array()
+        .expect("orphaned_modules is always an array");
+    assert_eq!(
+        orphans.len(),
+        1,
+        "exactly git: the unknown id and the out-of-directory path are dropped: {orphans:?}"
+    );
+    assert_eq!(orphans[0]["id"], Value::String("git".into()));
+    assert_eq!(
+        orphans[0]["gateway_module_id"],
+        Value::String("com.axone_io.ignition.git".into())
+    );
+    assert_eq!(
+        orphans[0]["remove_with"],
+        Value::String("ign rig module uninstall git --rig fixture --yes".into())
+    );
+    assert_eq!(
+        body["data"]["provisioned_modules"],
+        serde_json::json!([]),
+        "nothing is provisioned on the undeclared run"
+    );
+    assert!(
+        !rig.override_file().exists(),
+        "the stale override is deleted on the undeclare path"
+    );
+
+    // 4. Reported once, then quiet: the next up has nothing to report.
+    let out = rig.up(&[], true);
+    assert_success(&out, "rig up after the report");
+    let body: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("stdout envelope parses");
+    assert_eq!(body["data"]["orphaned_modules"], serde_json::json!([]));
+}
+
+/// The human render: the orphan line reaches the user's terminal and
+/// names the command that removes the module — the verb is otherwise
+/// undiscoverable. A routine `rig up` (no orphan) prints no orphan line.
+#[test]
+fn rig_up_after_undeclaring_prints_the_removal_command_for_humans() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_daemon_available() {
+        eprintln!("skipping: docker unavailable (or skip forced) — this test drives a real rig");
+        return;
+    }
+    let rig = OrphanRig::new("human");
+
+    let out = rig.up(&["--with-module", "git@2.3.4"], false);
+    assert_success(&out, "rig up --with-module git");
+    let routine = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !routine.contains("orphaned module"),
+        "a routine up stays quiet: {routine}"
+    );
+
+    let out = rig.up(&[], false);
+    assert_success(&out, "rig up after undeclaring");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("orphaned module: git (com.axone_io.ignition.git)"),
+        "the orphan is named: {stdout}"
+    );
+    assert!(
+        stdout.contains("ign rig module uninstall git --rig fixture --yes"),
+        "the removal command is named: {stdout}"
+    );
+}
+
+/// `rig reset` carries the same report as `rig up`: a reset is a
+/// teardown plus an up, so a user who undeclared a module and then
+/// RESETS (not ups) must still be told — through the real binary, the
+/// real `reset` dispatch and the reset human renderer (which the
+/// `rig up` tests do not reach).
+#[test]
+fn rig_reset_after_undeclaring_prints_the_removal_command() {
+    if std::env::var("IGNITION_SKIP_RIG_DOCKER_TESTS").is_ok() || !docker_daemon_available() {
+        eprintln!("skipping: docker unavailable (or skip forced) — this test drives a real rig");
+        return;
+    }
+    let rig = OrphanRig::new("reset");
+
+    let out = rig.up(&["--with-module", "git@2.3.4"], false);
+    assert_success(&out, "rig up --with-module git");
+    assert!(rig.override_file().exists(), "ign wrote the override");
+
+    let out = rig.reset(false);
+    assert_success(&out, "rig reset after undeclaring");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("orphaned module: git (com.axone_io.ignition.git)")
+            && stdout.contains("ign rig module uninstall git --rig fixture --yes"),
+        "reset names the orphan and its removal command: {stdout}"
+    );
+    assert!(
+        !rig.override_file().exists(),
+        "the stale override is deleted on the reset path too"
+    );
 }
 
 /// sha256 hex digest — local helper (no dependency added: `sha2` is

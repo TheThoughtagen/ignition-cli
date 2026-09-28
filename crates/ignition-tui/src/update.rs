@@ -2851,6 +2851,10 @@ fn execute_pending(state: &mut AppState, pending: &PendingAction) {
             workers::rig_stream::fire_rig_restore(state, file);
         }
         PendingAction::RigTrialReset => workers::rig_stream::fire_rig_trial_reset(state),
+        PendingAction::RigModuleUninstall { id } => {
+            let id = id.clone();
+            workers::rig_stream::fire_rig_module_uninstall(state, id);
+        }
         PendingAction::ProjectSync {
             profile_a,
             profile_b,
@@ -3716,6 +3720,7 @@ fn gated_cli_verb(pending: &PendingAction) -> &'static str {
         PendingAction::RigReset => "rig reset",
         PendingAction::RigRestore { .. } => "rig restore",
         PendingAction::RigTrialReset => "rig trial reset",
+        PendingAction::RigModuleUninstall { .. } => "rig module uninstall",
         PendingAction::ProjectSync { .. } => "project sync",
         PendingAction::BackupRestore { .. } => "backup restore",
         PendingAction::EamTaskNew { .. } => "eam task new",
@@ -3766,6 +3771,18 @@ fn execute_rig_menu_action(state: &mut AppState, index: usize) {
             });
         }
         Some("snapshot") => workers::rig_stream::fire_rig_snapshot(state),
+        Some("module uninstall") => {
+            state.rig.pending_form = Some(RigForm::ModuleUninstallId);
+            state.open_modal(Modal::Input {
+                title: "module uninstall — registry id".to_string(),
+                hint: Some(format!(
+                    "{}\na Confirm gate arms next\nIRREVERSIBLE: re-declaring does not \
+                     bring it back\npress ? for the CLI form",
+                    registry_id_hint()
+                )),
+                buffer: String::new(),
+            });
+        }
         Some("restore") => {
             state.rig.pending_form = Some(RigForm::RestoreFile);
             state.open_modal(Modal::Input {
@@ -3788,6 +3805,39 @@ fn accept_rig_form(state: &mut AppState, value: &str) {
         return;
     };
     match form {
+        RigForm::ModuleUninstallId => {
+            let id = value.trim();
+            if id.is_empty() {
+                clear_pending(state);
+                return;
+            }
+            // Validated HERE, against the same registry the CLI's
+            // second refusal uses: an unknown id would otherwise cost a
+            // gateway round trip to learn what is knowable locally.
+            let Some(spec) = ignition_core::module::spec_for(id) else {
+                state.open_modal(Modal::Result_ {
+                    title: "unknown module".to_string(),
+                    lines: vec![
+                        format!("{id:?} is not a module ign knows."),
+                        registry_id_hint(),
+                    ],
+                    scroll: 0,
+                });
+                return;
+            };
+            state.dashboard.pending = Some(PendingAction::RigModuleUninstall {
+                id: spec.id.to_string(),
+            });
+            state.open_modal(Modal::Confirm {
+                title: "rig module uninstall".to_string(),
+                body: format!(
+                    "uninstall {} ({}) from the rig's gateway?\n\nThis is IRREVERSIBLE — \
+                     re-declaring the module does NOT bring it back; recovery means \
+                     `rig reset`, which destroys the data volume.",
+                    spec.id, spec.gateway_module_id
+                ),
+            });
+        }
         RigForm::RestoreFile => {
             if value.trim().is_empty() {
                 clear_pending(state);
@@ -3813,7 +3863,21 @@ fn rig_cli_form(form: &RigForm) -> String {
             "ign rig restore --file <PATH> [--timeout <SECS>] --yes  (needs IGNITION_TOKEN)"
                 .to_string()
         }
+        RigForm::ModuleUninstallId => {
+            "ign rig module uninstall <ID> --rig <NAME> --yes  (needs IGNITION_TOKEN)".to_string()
+        }
     }
+}
+
+/// The registry ids a user may type into the uninstall form, named in
+/// both the hint and the unknown-id refusal so the valid set is never
+/// something they have to guess.
+fn registry_id_hint() -> String {
+    let ids: Vec<&str> = ignition_core::module::MODULES
+        .iter()
+        .map(|spec| spec.id)
+        .collect();
+    format!("known ids: {}", ids.join(", "))
 }
 
 #[cfg(test)]
@@ -7443,6 +7507,109 @@ mod tests {
         );
         update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
         assert_eq!(state.dashboard.in_flight, Some("rig restore"));
+    }
+
+    /// `module uninstall` (index 9) is REACHABLE from the menu — the
+    /// claim `routes.rs`'s `Mapping::Screen(Screen::Rig)` makes, which
+    /// before 19-04 nothing proved. It prompts for the registry id
+    /// first, arms the Confirm gate on a known id, and fires the
+    /// irreversible write only on `y`.
+    ///
+    /// Reaching it by walking the menu (rather than setting the form
+    /// directly) is the point: if the entry were dropped from
+    /// `RIG_ACTIONS` or left unhandled in `execute_rig_menu_action`,
+    /// this test fails instead of silently selecting a neighbour.
+    #[test]
+    fn rig_module_uninstall_is_reachable_from_the_menu_and_confirms() {
+        let mut state = armed_rig_state();
+        update(&mut state, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        for _ in 0..9 {
+            update(&mut state, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        match &state.modal {
+            Some(Modal::Input { title, hint, .. }) => {
+                assert!(
+                    title.contains("registry id"),
+                    "the id form opens, not a neighbour's: {title:?}"
+                );
+                let hint = hint.as_deref().unwrap_or_default();
+                assert!(
+                    hint.contains("git") && hint.contains("project-scan-endpoint"),
+                    "the valid ids are named so the user need not guess them: {hint:?}"
+                );
+                assert!(
+                    hint.contains("IRREVERSIBLE"),
+                    "the form says the write cannot be undone BEFORE it is typed: {hint:?}"
+                );
+            }
+            other => panic!("the module-id form opens, got {other:?}"),
+        }
+
+        // Empty accept cancels (the restore precedent).
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.modal.is_none());
+        assert!(state.dashboard.pending.is_none());
+
+        // A KNOWN id arms the Confirm gate.
+        let mut state = armed_rig_state();
+        state.rig.pending_form = Some(crate::state::RigForm::ModuleUninstallId);
+        state.open_modal(Modal::Input {
+            title: "module uninstall — registry id".into(),
+            hint: None,
+            buffer: "git".into(),
+        });
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        match &state.modal {
+            Some(Modal::Confirm { title, body }) => {
+                assert_eq!(title, "rig module uninstall");
+                assert!(
+                    body.contains("com.axone_io.ignition.git"),
+                    "the gateway module id is shown, not just the registry id: {body:?}"
+                );
+                assert!(
+                    body.contains("IRREVERSIBLE"),
+                    "the gate states the cost: {body:?}"
+                );
+            }
+            other => panic!("Confirm gate armed, got {other:?}"),
+        }
+        assert_eq!(
+            state.dashboard.pending,
+            Some(PendingAction::RigModuleUninstall { id: "git".into() })
+        );
+        update(&mut state, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(state.dashboard.in_flight, Some("rig module uninstall"));
+    }
+
+    /// An UNKNOWN id is refused locally — no Confirm gate, no pending
+    /// action, no gateway round trip to learn what the registry
+    /// already knows. Mirrors the CLI's second refusal.
+    #[test]
+    fn rig_module_uninstall_refuses_an_unknown_id_without_arming() {
+        let mut state = armed_rig_state();
+        state.rig.pending_form = Some(crate::state::RigForm::ModuleUninstallId);
+        state.open_modal(Modal::Input {
+            title: "module uninstall — registry id".into(),
+            hint: None,
+            buffer: "perspective".into(),
+        });
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            state.dashboard.pending.is_none(),
+            "an unknown id must NOT arm the irreversible write"
+        );
+        match &state.modal {
+            Some(Modal::Result_ { title, lines, .. }) => {
+                assert_eq!(title, "unknown module");
+                assert!(
+                    lines.iter().any(|l| l.contains("git")),
+                    "the refusal names the valid ids: {lines:?}"
+                );
+            }
+            other => panic!("local refusal shown, got {other:?}"),
+        }
     }
 
     /// `l` toggles the logs pane: on arms the shutdown rail (and

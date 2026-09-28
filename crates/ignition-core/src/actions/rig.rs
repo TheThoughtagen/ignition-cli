@@ -27,6 +27,7 @@
 //! aborts); Network/GatewayRestarting propagate for poll's native
 //! retry; Auth can't fire (the probe is header-less).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -34,14 +35,18 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::client::GatewayApi;
+use crate::config::ModuleDeclaration;
 use crate::error::CoreError;
+use crate::module::ModuleSpec;
 use crate::poll::{self, PollConfig, PollState};
 use crate::rig::compose::{
     ComposeRunner, check_output, compose_version, docker_ps_publish_args, down_args, logs_args,
     parse_docker_ps_ldjson, parse_ps_ldjson, parse_volume_ls_ldjson, ps_args, reset_preview,
     up_args, volume_ls_args,
 };
-use crate::rig::modules::{ModuleProvisioning, ProvisionedModule, existing_override};
+use crate::rig::modules::{
+    ModuleProvisioning, OrphanedModule, ProvisionedModule, existing_override,
+};
 use crate::rig::{RigPlan, port_preflight};
 
 /// Default wait budget for BOTH `up --wait-timeout` and the
@@ -77,6 +82,13 @@ pub struct RigUpResult {
     /// unprovisioned rig's result shape gains only this always-empty
     /// field, never a behavior change).
     pub provisioned_modules: Vec<ProvisionedModule>,
+    /// Modules `ign` provisioned LAST time that this rig no longer
+    /// declares (Phase 19) — ALWAYS present, empty for a rig that
+    /// provisioned nothing or whose modules are unchanged. This is a
+    /// REPORT: `rig up` drops the mount and never removes the module
+    /// from the gateway (D-19-01); each entry's `remove_with` names the
+    /// verb that does.
+    pub orphaned_modules: Vec<OrphanedModule>,
 }
 
 /// `ign rig down` output model.
@@ -110,6 +122,10 @@ pub struct RigResetResult {
     /// empty for a rig with no `[rigs.NAME.modules.*]` declared and no
     /// `--with-module` flag (SC-1).
     pub provisioned_modules: Vec<ProvisionedModule>,
+    /// Modules `ign` provisioned last time that this rig no longer
+    /// declares (Phase 19) — the SAME always-present, report-only
+    /// convention as [`RigUpResult::orphaned_modules`].
+    pub orphaned_modules: Vec<OrphanedModule>,
 }
 
 /// One published-port row in status output (allowlist only).
@@ -249,6 +265,7 @@ pub async fn rig_up(
         gateway_url,
         warnings,
         provisioned_modules: provisioning.modules.clone(),
+        orphaned_modules: provisioning.orphaned_modules.clone(),
     })
 }
 
@@ -425,6 +442,7 @@ pub async fn rig_reset(
         state,
         warnings,
         provisioned_modules: provisioning.modules.clone(),
+        orphaned_modules: provisioning.orphaned_modules.clone(),
     })
 }
 
@@ -779,6 +797,78 @@ pub struct RestoreResult {
     pub warnings: Vec<String>,
 }
 
+/// `ign rig module uninstall` output model (Phase 19, D-19-01/D-19-02)
+/// — all keys always present (the `RigUpResult` convention).
+#[derive(Debug, Serialize)]
+pub struct ModuleUninstallResult {
+    /// Compose project name — the identity truth.
+    pub rig: String,
+    /// The registry slug the caller named (`git`).
+    pub module_id: String,
+    /// The gateway's own id that was sent in the DELETE
+    /// ([`crate::module::ModuleSpec::gateway_module_id`]).
+    pub gateway_module_id: String,
+    /// `true` only on `Ok` — this call never returns any other value
+    /// (a denial is an `Err`, never a `false` here).
+    pub uninstalled: bool,
+}
+
+/// The still-declared refusal (Task 2): a registry id the rig's
+/// `[rigs.NAME.modules]` table STILL names would be undone by the very
+/// next `ign rig up` — the gateway itself already refuses this case
+/// live (fact 2: it answers `success:false` while the `.modl` is still
+/// bind-mounted), so this turns that confusing gateway denial into an
+/// actionable LOCAL one, exit 7 (`CoreError::Rig`), naming the rig, the
+/// module, the config table to edit, and `ign rig up` as the fix.
+///
+/// Shared by the CLI's pre-check (main.rs, run BEFORE any gateway
+/// client is built — the sessions-terminate/`preflight_with_module_
+/// flags` ordering precedent) and [`rig_module_uninstall`]'s own
+/// authoritative re-check below, so the two call sites can never drift
+/// apart on wording (the `preflight_with_module_flags`/
+/// `provision_modules` precedent).
+pub fn module_still_declared_error(id: &str, rig: &str) -> CoreError {
+    CoreError::Rig(format!(
+        "module {id:?} is still declared in [rigs.{rig}.modules.{id}] — \
+         uninstalling it now would be undone by the very next `ign rig up` \
+         (the gateway refuses to forget a module whose `.modl` is still \
+         mounted); remove that table entry, run `ign rig up` so the mount \
+         is dropped, then retry `ign rig module uninstall {id} --yes`"
+    ))
+}
+
+/// `ign rig module uninstall <ID> --yes` (Phase 19, D-19-01/D-19-02/
+/// D-19-04): the ONE gateway write this phase adds. ONE call, ONE id —
+/// `spec.gateway_module_id` is what rides the wire; `spec.id` (the
+/// registry slug) names the error without a reverse lookup. Success is
+/// the gateway's own `success:true` — never a bare HTTP 200 ([`crate::client::GatewayApi::uninstall_module`]'s
+/// denial-rides-200 contract).
+///
+/// `declared` is the rig's `[rigs.NAME.modules]` table (`RigPlan::
+/// modules`) — the AUTHORITATIVE re-check of the still-declared refusal
+/// (Task 2), a second belt behind the CLI's own pre-check: even a
+/// caller that reaches this function directly (bypassing main.rs'
+/// dispatch arm, as this crate's own tests do) can never issue the
+/// gateway write for a module the config still names.
+pub async fn rig_module_uninstall(
+    api: &dyn GatewayApi,
+    rig: &str,
+    spec: &'static ModuleSpec,
+    declared: &BTreeMap<String, ModuleDeclaration>,
+) -> Result<ModuleUninstallResult, CoreError> {
+    if declared.contains_key(spec.id) {
+        return Err(module_still_declared_error(spec.id, rig));
+    }
+    api.uninstall_module(spec.gateway_module_id, spec.id)
+        .await?;
+    Ok(ModuleUninstallResult {
+        rig: rig.to_string(),
+        module_id: spec.id.to_string(),
+        gateway_module_id: spec.gateway_module_id.to_string(),
+        uninstalled: true,
+    })
+}
+
 /// Days since 1970-01-01 → (year, month, day) — Howard Hinnant's
 /// `civil_from_days` (the CLI renderer's iso_utc algorithm, core
 /// edition — std-only, NO chrono: the research's dependency-free
@@ -1072,12 +1162,13 @@ mod tests {
         rig_up, trial_reset, trial_status,
     };
     use crate::client::GatewayApi;
+    use crate::config::ModuleDeclaration;
     use crate::error::CoreError;
     use crate::rig::RigPlan;
     use crate::rig::compose::{
         ComposeOutput, ComposeRunner, PortMapping, down_args, logs_args, up_args, volume_ls_args,
     };
-    use crate::rig::modules::ModuleProvisioning;
+    use crate::rig::modules::{ModuleProvisioning, provision_modules, undeclared_provisioning};
 
     // ---------------------------------------------------------------------
     // Test doubles
@@ -1198,6 +1289,7 @@ mod tests {
     fn gw_plan() -> RigPlan {
         RigPlan {
             name: "fixture-rig".into(),
+            config_name: None,
             compose_file: "/rigs/docker/compose.yml".into(),
             project_dir: "/rigs/docker".into(),
             services: vec!["ignition".into()],
@@ -1341,6 +1433,7 @@ mod tests {
         let provisioning = ModuleProvisioning {
             override_file: Some(override_path.clone()),
             modules: Vec::new(),
+            orphaned_modules: Vec::new(),
         };
 
         let runner = FakeRunner::with(up_cycle_outputs());
@@ -2260,6 +2353,288 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // 19-02: `rig up` REPORTS an orphaned module and never uninstalls it
+    // (SC-3, D-19-01). Every gateway in these tests is a [`SnapshotRig`]
+    // whose `uninstall_module` panics, so the guard fires on the CALL.
+    // ---------------------------------------------------------------------
+
+    /// `gw_plan()` rooted in a real directory, so the override file the
+    /// orphan diff reads is a real file on real disk.
+    fn orphan_plan(dir: &Path) -> RigPlan {
+        RigPlan {
+            compose_file: dir.join("compose.yml"),
+            project_dir: dir.to_path_buf(),
+            ..gw_plan()
+        }
+    }
+
+    /// Seed a REAL generated two-mount override (`git` +
+    /// `project-scan-endpoint`) through `write_override`. NEVER a
+    /// hand-written stub: the Phase-16 stale-override test seeds the
+    /// literal `"# left by a previous run\n"`, which parses zero
+    /// `target:` lines — an orphan test copying that seed would pass
+    /// while proving nothing.
+    fn seed_two_mount_override(plan: &RigPlan) -> PathBuf {
+        use crate::module::fetch::ArtifactSource;
+        use crate::module::{GIT_MODULE, PROJECT_SCAN_ENDPOINT};
+        use crate::rig::modules::{MountedModule, write_override};
+
+        let mounts = [
+            MountedModule {
+                spec: &GIT_MODULE,
+                version: "2.3.4".to_string(),
+                source: PathBuf::from("/cache/modules/git/2.3.4-deadbeef.modl"),
+                source_kind: ArtifactSource::Cache,
+            },
+            MountedModule {
+                spec: &PROJECT_SCAN_ENDPOINT,
+                version: "1.0.0".to_string(),
+                source: PathBuf::from("/cache/modules/project-scan-endpoint/1.0.0-cafebabe.modl"),
+                source_kind: ArtifactSource::Cache,
+            },
+        ];
+        write_override(plan, "ignition", &mounts)
+            .expect("seed a real two-mount override")
+            .expect("mounts were non-empty")
+    }
+
+    /// Seed a cache hit exactly where the fetcher would have written it.
+    fn seed_cache_entry(root: &Path, id: &str, version: &str, contents: &[u8]) {
+        use sha2::{Digest, Sha256};
+        let dir = root.join("modules").join(id);
+        std::fs::create_dir_all(&dir).expect("cache dir");
+        let digest = format!("{:x}", Sha256::digest(contents));
+        std::fs::write(dir.join(format!("{version}-{digest}.modl")), contents)
+            .expect("seed cached artifact");
+    }
+
+    fn declared(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, ModuleDeclaration> {
+        entries
+            .iter()
+            .map(|(id, version)| {
+                (
+                    id.to_string(),
+                    ModuleDeclaration {
+                        version: version.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn orphan_ids(provisioning: &ModuleProvisioning) -> Vec<&str> {
+        provisioning
+            .orphaned_modules
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect()
+    }
+
+    /// The fake itself must fail loudly — otherwise every test below
+    /// that leans on it would pass vacuously.
+    #[tokio::test]
+    #[should_panic(expected = "rig up must never uninstall a module")]
+    async fn the_uninstall_tripwire_actually_panics() {
+        let rig = SnapshotRig::default();
+        let _ = rig
+            .uninstall_module("com.axone_io.ignition.git", "git")
+            .await;
+    }
+
+    /// CHANGED path: the rig undeclared everything. The orphans are
+    /// reported, the stale override is gone, and `rig_up` completes
+    /// against a gateway that panics if it is asked to uninstall.
+    #[tokio::test]
+    async fn up_after_undeclaring_reports_orphans_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        let override_path = seed_two_mount_override(&plan);
+
+        let provisioning = undeclared_provisioning(&plan).expect("undeclared provisioning");
+        assert_eq!(
+            orphan_ids(&provisioning),
+            vec!["git", "project-scan-endpoint"],
+            "both undeclared modules are reported"
+        );
+        assert!(!override_path.exists(), "the stale override is deleted");
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(up_cycle_outputs());
+        let result = rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("rig up completes without touching the gateway's module list");
+        assert_eq!(result.state, "running");
+        // The report survives the trip through `rig_up` into the RESULT
+        // the `--json` envelope serialises — asserting only on
+        // `ModuleProvisioning` would pass with the field never copied.
+        assert_eq!(
+            result
+                .orphaned_modules
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git", "project-scan-endpoint"],
+            "rig_up copies the orphan report into RigUpResult"
+        );
+        let json = serde_json::to_value(&result).expect("serialise");
+        assert_eq!(json["orphaned_modules"][0]["id"], "git");
+        assert_eq!(
+            json["orphaned_modules"][0]["remove_with"],
+            "ign rig module uninstall git --yes"
+        );
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module")),
+            "no uninstall was attempted: {:?}",
+            rig.calls()
+        );
+    }
+
+    /// PARTIAL change: `git` stays declared, `project-scan-endpoint` is
+    /// dropped. Exactly the dropped one is reported and `rig_up` still
+    /// never uninstalls it.
+    #[tokio::test]
+    async fn up_after_dropping_one_module_reports_only_that_one_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        seed_two_mount_override(&plan);
+
+        let cache = tempfile::tempdir().expect("cache");
+        seed_cache_entry(cache.path(), "git", "2.3.4", b"git payload");
+        let feed = crate::module::fetch::ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("literal URL"),
+        )
+        .expect("feed");
+
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &declared(&[("git", "2.3.4")]),
+            cache.path(),
+            crate::module::fetch::FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("provisioning with git still declared");
+        assert_eq!(orphan_ids(&provisioning), vec!["project-scan-endpoint"]);
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(up_cycle_outputs());
+        let result = rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("rig up completes");
+        assert_eq!(
+            result
+                .orphaned_modules
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project-scan-endpoint"],
+            "RigUpResult carries exactly the dropped module"
+        );
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module"))
+        );
+    }
+
+    /// UNCHANGED path (SC-3 named literally): a real override on disk
+    /// and every module still declared. Nothing is orphaned and, again,
+    /// no uninstall — the "quiet routine `rig up`" case.
+    #[tokio::test]
+    async fn up_with_no_module_changes_reports_no_orphans_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        let override_path = seed_two_mount_override(&plan);
+
+        let cache = tempfile::tempdir().expect("cache");
+        seed_cache_entry(cache.path(), "git", "2.3.4", b"git payload");
+        seed_cache_entry(
+            cache.path(),
+            "project-scan-endpoint",
+            "1.0.0",
+            b"scan payload",
+        );
+        let feed = crate::module::fetch::ModuleFeed::for_base(
+            url::Url::parse("http://127.0.0.1:1").expect("literal URL"),
+        )
+        .expect("feed");
+
+        let provisioning = provision_modules(
+            &feed,
+            &plan,
+            &declared(&[("git", "2.3.4"), ("project-scan-endpoint", "1.0.0")]),
+            cache.path(),
+            crate::module::fetch::FetchPolicy::CacheFirst,
+        )
+        .await
+        .expect("provisioning with both modules still declared");
+        assert!(
+            provisioning.orphaned_modules.is_empty(),
+            "nothing changed, nothing is orphaned: {:?}",
+            provisioning.orphaned_modules
+        );
+        assert!(override_path.exists(), "the override was regenerated");
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(up_cycle_outputs());
+        let result = rig_up(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("rig up completes");
+        assert!(
+            result.orphaned_modules.is_empty(),
+            "an unchanged rig reports nothing on the result either"
+        );
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialise")["orphaned_modules"],
+            serde_json::json!([]),
+            "the key is present and empty, never absent"
+        );
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module"))
+        );
+    }
+
+    /// `rig reset` carries the SAME report: a reset is a teardown plus an
+    /// up, so a user who undeclared a module and resets (not ups) must
+    /// still be told. Driven through the real `rig_reset` with a gateway
+    /// whose `uninstall_module` panics.
+    #[tokio::test]
+    async fn reset_after_undeclaring_reports_orphans_and_issues_no_uninstall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = orphan_plan(dir.path());
+        let override_path = seed_two_mount_override(&plan);
+
+        let provisioning = undeclared_provisioning(&plan).expect("undeclared provisioning");
+        assert!(!override_path.exists(), "the stale override is deleted");
+
+        let rig = SnapshotRig::default();
+        let runner = FakeRunner::with(reset_cycle_outputs());
+        let result = rig_reset(&runner, &plan, 300, Some(&rig), &provisioning)
+            .await
+            .expect("reset completes");
+        assert_eq!(
+            result
+                .orphaned_modules
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git", "project-scan-endpoint"],
+            "rig_reset copies the orphan report into RigResetResult"
+        );
+        assert!(
+            !rig.calls()
+                .iter()
+                .any(|c| c.starts_with("uninstall_module")),
+            "no uninstall was attempted: {:?}",
+            rig.calls()
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // snapshot + restore (04-04) — composition + pre-checks + warning
     // ---------------------------------------------------------------------
 
@@ -2324,6 +2699,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for SnapshotRig {
+        /// PANICS, on the call itself (D-19-01): no action driven
+        /// through this fake may uninstall a module. `rig up`/`rig
+        /// reset` only ever REPORT an orphan. A panic is a stronger
+        /// tripwire than a counted request — a request that is merely
+        /// built but never sent still fails here, and nothing can
+        /// swallow it into an `Err`. The call is recorded first so the
+        /// name shows in `calls()` if a caller catches the unwind.
+        async fn uninstall_module(
+            &self,
+            gateway_module_id: &str,
+            _module_id: &str,
+        ) -> Result<(), CoreError> {
+            self.record(format!("uninstall_module({gateway_module_id})"));
+            panic!(
+                "rig up must never uninstall a module (D-19-01): \
+                 uninstall_module({gateway_module_id}) was called"
+            );
+        }
         async fn bundle_generate(
             &self,
         ) -> Result<crate::client::diagnostics::BundleStatusWire, CoreError> {
@@ -3094,6 +3487,7 @@ mod tests {
             gateway_url: None,
             warnings: vec![],
             provisioned_modules: vec![],
+            orphaned_modules: vec![],
         };
         let json = serde_json::to_value(&up).unwrap();
         for key in [
@@ -3103,6 +3497,7 @@ mod tests {
             "gateway_url",
             "warnings",
             "provisioned_modules",
+            "orphaned_modules",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
@@ -3122,6 +3517,7 @@ mod tests {
             state: "running".into(),
             warnings: vec![],
             provisioned_modules: vec![],
+            orphaned_modules: vec![],
         };
         let json = serde_json::to_value(&reset).unwrap();
         for key in [
@@ -3131,6 +3527,7 @@ mod tests {
             "state",
             "warnings",
             "provisioned_modules",
+            "orphaned_modules",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }

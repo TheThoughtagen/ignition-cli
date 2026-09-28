@@ -236,6 +236,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for HealthyRig {
+        async fn uninstall_module(
+            &self,
+            _gateway_module_id: &str,
+            _module_id: &str,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn bundle_generate(
             &self,
         ) -> Result<crate::client::diagnostics::BundleStatusWire, CoreError> {
@@ -635,6 +642,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for BrokenOverview {
+        async fn uninstall_module(
+            &self,
+            _gateway_module_id: &str,
+            _module_id: &str,
+        ) -> Result<(), CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn bundle_generate(
             &self,
         ) -> Result<crate::client::diagnostics::BundleStatusWire, CoreError> {

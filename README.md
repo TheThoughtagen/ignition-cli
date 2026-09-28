@@ -109,7 +109,7 @@ guarded verbs: schema-required would invite agents to auto-fill
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS | `network_error`, `module_feed_unreachable`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
-| 6    | target_state  | command invalid for the gateway's current state, or a module artifact the feed refused to serve or verify | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed` |
+| 6    | target_state  | command invalid for the gateway's current state, or a module artifact the feed refused to serve or verify | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired`, `provider_not_found`, `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error`, `tag_collision`, `alarm_journal_missing`, `import_denied`, `session_not_prunable`, `eam_not_controller`, `eam_task_type_refused`, `eam_task_in_flight`, `script_exec_not_configured`, `lint_tool_absent`, `node_tool_absent`, `provider_root_unsupported`, `bundle_not_available`, `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable`, `module_digest_changed`, `module_uninstall_denied` |
 | 7    | rig           | docker/compose rig failure (discovery, lifecycle, port conflicts) | `rig_error` |
 
 The exit-code table lives in exactly two places — this README and
@@ -293,6 +293,28 @@ cargo test -p ignition-core --test live_gateway -- --ignored
 With no envs set the suite skips cleanly (green no-op). The file header
 carries the one-command Docker rig recipe for reproducing a test gateway.
 
+A second `#[ignore]`-gated suite
+(`crates/ignition-core/tests/live_rig_module_injection.rs`) spins a real
+stock Ignition container and is the only proof that a declared module is
+mounted, loaded, undeclared and finally **uninstalled from the gateway**.
+It needs Docker in Linux-container mode and network egress to GitHub, and it
+is destructive by design — the uninstall it performs cannot be undone within
+a run:
+
+```bash
+IGNITION_LIVE_RIG_MODULES=1 \
+  cargo test -p ignition-core --test live_rig_module_injection -- --ignored --nocapture
+
+# and again on a second pinned 8.3.x, because the uninstall contract was
+# probed live on 8.3.3 only
+IGNITION_LIVE_RIG_MODULES=1 IGNITION_LIVE_RIG_IMAGE_TAG=8.3.9 \
+  cargo test -p ignition-core --test live_rig_module_injection -- --ignored --nocapture
+```
+
+With `IGNITION_LIVE_RIG_MODULES` unset the suite skips cleanly, so CI and any
+machine without a Docker daemon are unaffected. `IGNITION_LIVE_RIG_IMAGE_TAG`
+defaults to `8.3.3`; unset reproduces the default run exactly.
+
 ## Commands
 
 | Command | What it does | Notes |
@@ -306,6 +328,7 @@ carries the one-command Docker rig recipe for reproducing a test gateway.
 | `ign connections [--type database\|opc]` | Database/OPC connections: `name  enabled  healthchecks` | `healthchecks` is passthrough as the gateway reports it (populated detail LOW-confidence until captured live); replaces the webpage's Connections pages |
 | `ign project list` | Every runnable project: `name  title  enabled  parent  inheritable` | inheritance info comes from the list items themselves; JSON items also carry `description` (all six keys always present, null when unset); replaces the webpage's Projects list |
 | `ign project new <NAME> [--title --description --parent --inheritable --disabled]` | Create a project | only provided fields ride the create body (never empty-string references); the result is a `find` read-back; audit-logged server-side |
+| `ign rig module uninstall <REGISTRY-ID>` | Remove a provisioned module from the rig's gateway (`DELETE /data/api/v1/modules/uninstall`) | **destructive**: exit 2 (`confirmation_required`) without `--yes` or `IGNITION_YES=1`; refuses with exit 7 while the rig still declares the module, and exit 3 (`module_not_registered`) for an unknown registry id; the gateway refuses a module whose `.modl` is still mounted, answering exit 6 (`module_uninstall_denied`). **NOT reversible by re-declaring** — recovery is `ign rig reset`, which destroys the data volume |
 | `ign project copy <SRC> <DST>` | Copy a project with all its resources | non-destructive (creates DST) — no `--yes`; audit-logged server-side |
 | `ign project rename <OLD> <NEW>` | Rename a project (native rename, not copy+delete) | non-destructive relabel — no `--yes`; audit-logged server-side |
 | `ign project set <NAME> [--title --description --parent --set-enabled\|--disabled --inheritable BOOL]` | Set project fields — `--parent` IS the inheritance move (reparent) | only provided flags ride the modify body (absent = untouched); at least one field required; audit-logged server-side |
@@ -611,9 +634,78 @@ next `rig up` with nothing declared removes the file for you.
 **It does not uninstall the module from the gateway.** Ignition installs an
 accepted module into its own data directory, which lives in the rig's volume
 and outlives the mount — so a gateway that already loaded a module keeps
-reporting it after the override is gone (verified live, not inferred). To
-clear it today, `ign rig reset` removes the volume along with everything else
-in it.
+reporting it after the override is gone (verified live, not inferred).
+
+To remove it from the gateway, use the deliberate verb:
+
+```bash
+ign rig module uninstall git --yes
+```
+
+The id is a **registry id** — the same one `--with-module` and the config table
+take, not the gateway's own module id. The verb needs `IGNITION_TOKEN`, the same
+credential contract as `rig snapshot` and `rig restore`.
+
+In the TUI it is the Rig screen's actions menu (`a` → `module uninstall`): a
+form takes the registry id, an unknown id is refused locally against the same
+registry, and a Confirm gate — the cockpit's `--yes` — states the
+irreversibility before the write goes out.
+
+**The order matters, and the gateway enforces it.** Undeclare the module, run
+`ign rig up` so the mount goes, *then* uninstall. The gateway refuses to
+uninstall a module whose `.modl` is still mounted. Once it succeeds the effect
+is immediate — no gateway restart. `ign` refuses up front if the rig's config
+still declares the module, rather than letting you get a confusing failure back
+from the gateway.
+
+**This is not undone by re-declaring the module.** A re-declared, re-mounted
+module does not come back — verified live. Recovery today means `ign rig reset`,
+which destroys the rig's whole data volume along with everything else in it.
+That makes this the most severe of `ign`'s guarded operations: the others cost
+you a re-run, this one costs the volume. It refuses without `--yes` for that
+reason, and it is a separate verb rather than something `ign rig up` offers,
+because `IGNITION_YES=1` would turn a mid-`up` prompt into no prompt at all.
+
+**When you stop declaring a module, `ign rig up` tells you.** It drops the
+mount and deletes the override, then reports the module rather than removing it
+from the gateway:
+
+```console
+$ ign rig up
+...
+orphaned: git (com.axone_io.ignition.git) — still installed on the gateway
+  remove with: ign rig module uninstall git --rig dev --yes
+```
+
+The same data is on the `--json` envelope, on an always-present key that is an
+empty list when there is nothing orphaned:
+
+```json
+{
+  "orphaned_modules": [
+    {
+      "id": "git",
+      "gateway_module_id": "com.axone_io.ignition.git",
+      "remove_with": "ign rig module uninstall git --rig dev --yes"
+    }
+  ]
+}
+```
+
+`rig up` does not remove it for you, for two reasons that are not style
+preferences. `IGNITION_YES=1` is a documented pattern for agents and CI, and it
+merges into `--yes` — so a confirmation asked mid-`up` would be no confirmation
+at all for exactly the callers least able to notice an irreversible act. And
+`rig up` needs no gateway credential today; performing a gateway write would
+change that contract for every user of the verb. Removal stays something you
+type.
+
+**The report comes from `ign`'s own override file, not the gateway's module
+list.** `ign` diffs what it provisioned last time against what you declare now,
+so it can only ever report modules it installed itself. A module you installed
+by hand is invisible to that diff and will never be named — which is the point:
+the report leads to an irreversible command, so it must not point at something
+`ign` did not put there.
 
 Provisioning **mounts** a module; it does not commission one. No
 repository, credential, or module configuration is supplied — a

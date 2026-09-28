@@ -275,14 +275,170 @@ fn override_path(plan: &RigPlan) -> Result<PathBuf, CoreError> {
 ///
 /// A stale override surviving into a `down` is harmless: it only adds a
 /// read-only mount to a service that is about to be removed. The next
-/// `up` (through [`provision_modules`]) deletes it per D-08's tri-state
-/// if nothing is declared, or regenerates it whole if something still
-/// is — so a file this function finds never accumulates stale state
-/// across cycles.
+/// `up` (through [`provision_modules`] and, for the no-declaration case,
+/// [`undeclared_provisioning`]) deletes it per D-08's tri-state if
+/// nothing is declared, or regenerates it whole if something still is
+/// — so a file this function finds never accumulates stale state across
+/// cycles. **This is true only since commit `50cfbbc`**, which made
+/// [`clear_override`] reachable from BOTH `provision_modules`' early
+/// return and `main.rs`'s empty-merged-modules dispatch branch; before
+/// that fix, the delete branch was unreachable in production and a
+/// stale file was verified, live, to orphan across undeclare cycles.
+/// [`previously_provisioned`] (Phase 19, D-19-06) depends on that fix
+/// too: it reads this same file BEFORE the delete runs, so a stale
+/// override that never got cleared would make every subsequent orphan
+/// diff a lie.
 pub fn existing_override(plan: &RigPlan) -> Option<PathBuf> {
     let path = override_path(plan).ok()?;
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.is_file() { Some(path) } else { None }
+}
+
+/// One module the pre-overwrite override named that `declared` no
+/// longer does — the `ign rig up`/`rig reset` result-data shape (all
+/// keys always present, the [`ProvisionedModule`] convention). Carries
+/// the exact removal command in the DATA itself (`remove_with`) so an
+/// agent reading `--json` learns the next step without parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OrphanedModule {
+    /// The [`ModuleSpec::id`].
+    pub id: String,
+    /// The gateway's own acceptance-variable value.
+    pub gateway_module_id: String,
+    /// The exact command that removes this module from the gateway.
+    pub remove_with: String,
+}
+
+/// Parse one `target:` line from a generated override into a candidate
+/// module id, or `None` if the line is not a well-formed mount target
+/// line at all (not just an unregistered one — that half of D-19-07 is
+/// [`previously_provisioned`]'s job via [`crate::module::spec_for`]).
+/// Requires the [`CONTAINER_MODULE_DIR`] prefix and the `.modl` suffix
+/// exactly — a target line naming a path outside the module directory,
+/// or missing the extension, yields `None` here rather than a
+/// mis-extracted id.
+fn candidate_id_from_target_line(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("target:")?.trim();
+    let path = rest.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))?;
+    // The prefix is checked against the WHOLE path, not just the
+    // basename: a target such as `/tmp/outside/git.modl` shares a
+    // basename with a real mount but is not one `ign` generated, and
+    // taking only the last segment would resolve it to `git`.
+    let stem = path
+        .strip_prefix(CONTAINER_MODULE_DIR)?
+        .strip_prefix('/')?
+        .strip_suffix(".modl")?;
+    if stem.is_empty() || stem.contains('/') {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+/// Recover every registry-known module the PRE-overwrite override on
+/// disk named, in [`ModuleSpec::id`] order (D-19-06, D-19-07) — the
+/// ONLY derivation path for the orphan diff, never the gateway's own
+/// module list (would let `ign` "discover" modules it never provisioned,
+/// the exact over-reach SC-4 forbids, and would require a credential on
+/// `rig up`) and never the running container's mounts (already known to
+/// go stale, 19-RESEARCH.md Pitfall 3).
+///
+/// Reads [`existing_override`], then scans line by line for the
+/// long-form bind mount's `target:` entries — deliberately NOT
+/// `ACCEPT_MODULE_CERTS`/`ACCEPT_MODULE_LICENSES`, which carry the
+/// GATEWAY id directly and would bypass the registry intersection below.
+/// Each candidate id is resolved through [`crate::module::spec_for`];
+/// an id the registry does not know (a hand-edited override, a module
+/// from a future `ign` version, or an operator-typed id) is DROPPED
+/// SILENTLY — never an error, and never eligible to become an orphan
+/// report, because a module `ign` did not itself register can never be
+/// nominated for removal by `ign` (D-19-07's structural belt).
+///
+/// No override on disk, or a file that is not a generated override at
+/// all (an unreadable file, or one with no recognizable `target:`
+/// lines), yields an empty result — never a refusal, because `rig up`
+/// must keep working on a rig with no prior provisioning history.
+/// Deduplicated and sorted by [`ModuleSpec::id`] for deterministic
+/// output regardless of the file's own line order.
+pub fn previously_provisioned(plan: &RigPlan) -> Vec<&'static ModuleSpec> {
+    let Some(path) = existing_override(plan) else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut specs: Vec<&'static ModuleSpec> = contents
+        .lines()
+        .filter_map(candidate_id_from_target_line)
+        .filter_map(|id| crate::module::spec_for(&id))
+        .collect();
+    specs.sort_by_key(|spec| spec.id);
+    specs.dedup_by_key(|spec| spec.id);
+    specs
+}
+
+/// POSIX-shell-quote a `[rigs.NAME]` key for the copy-paste command in
+/// [`OrphanedModule::remove_with`].
+///
+/// A rig key is an unrestricted TOML table name and `--rig` accepts the
+/// same unrestricted string, so the key reaches a generated command line
+/// as raw text. A key with a space splits into two arguments; a key with
+/// shell syntax (`;`, `$(...)`, backticks) changes what the pasted line
+/// DOES. `remove_with` is advice a user pastes into a shell, and the
+/// command it names is the irreversible one — this is the same defect
+/// shape as the unquoted `module_service` YAML interpolation, in a
+/// different output language.
+///
+/// Safe bare tokens are returned unchanged so the common case stays
+/// readable (`--rig live`, not `--rig 'live'`). Everything else is
+/// single-quoted, with an embedded `'` closed, escaped and reopened
+/// (`'\''`) — the POSIX rule, NOT the YAML apostrophe-doubling used by
+/// [`generate_override`].
+fn shell_quote_rig(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if bare {
+        return name.to_string();
+    }
+    format!("'{}'", name.replace('\'', "'\\''"))
+}
+
+/// The pure set difference behind the orphan report: every `previous`
+/// spec whose id is absent from `declared` — no I/O, sorted by id. A
+/// module `declared` newly adds is never reported (only ABSENCE from
+/// `declared` makes a `previous` entry an orphan).
+pub fn orphaned_modules(
+    previous: &[&'static ModuleSpec],
+    declared: &BTreeMap<String, ModuleDeclaration>,
+    config_name: Option<&str>,
+) -> Vec<OrphanedModule> {
+    let mut orphans: Vec<OrphanedModule> = previous
+        .iter()
+        .filter(|spec| !declared.contains_key(spec.id))
+        .map(|spec| OrphanedModule {
+            id: spec.id.to_string(),
+            gateway_module_id: spec.gateway_module_id.to_string(),
+            // `--rig` is included whenever the plan came from config,
+            // even with one rig declared: the uninstall is irreversible,
+            // and an unqualified command resolves by discovery order, so
+            // on a multi-rig setup it can remove the module from a
+            // DIFFERENT gateway than the one reporting the orphan. A
+            // cwd/convention rig has no key to select by, so it gets the
+            // bare form — that rig is not addressable by `--rig` either.
+            remove_with: match config_name {
+                Some(rig) => format!(
+                    "ign rig module uninstall {} --rig {} --yes",
+                    spec.id,
+                    shell_quote_rig(rig)
+                ),
+                None => format!("ign rig module uninstall {} --yes", spec.id),
+            },
+        })
+        .collect();
+    orphans.sort_by(|a, b| a.id.cmp(&b.id));
+    orphans
 }
 
 /// Write, overwrite whole, or remove the override for `plan` — D-08's
@@ -418,6 +574,12 @@ pub struct ModuleProvisioning {
     pub override_file: Option<PathBuf>,
     /// The per-module outcome, in [`ModuleSpec::id`] order.
     pub modules: Vec<ProvisionedModule>,
+    /// A module the PRE-overwrite override named that `declared` no
+    /// longer does (Phase 19, D-19-01/D-19-06) — ALWAYS present, empty
+    /// for a rig whose provisioning changed nothing, the
+    /// [`ProvisionedModule`] convention. `ign` reports this; it never
+    /// removes it.
+    pub orphaned_modules: Vec<OrphanedModule>,
 }
 
 impl ModuleProvisioning {
@@ -473,6 +635,34 @@ pub fn clear_override(plan: &RigPlan) -> Result<(), CoreError> {
     write_override(plan, "", &[]).map(|_| ())
 }
 
+/// The no-declaration case, computed in ONE place for BOTH callers
+/// (`provision_modules`' own early return and `main.rs`'s
+/// empty-merged-modules dispatch branch) — Phase 19, D-19-06/D-19-07.
+///
+/// The ORDER is the whole point: [`previously_provisioned`] reads the
+/// override BEFORE [`clear_override`] deletes it. Reading after the
+/// delete would find nothing on disk and silently report an empty
+/// orphan list even when a module really was just undeclared — which is
+/// exactly the bug this function exists to make structurally
+/// unreachable, by giving the no-declaration case exactly one
+/// implementation instead of two inline call sites that could drift.
+///
+/// Returns a [`ModuleProvisioning`] with no override file, no
+/// provisioned modules, and the orphan diff against an empty declared
+/// set — [`clear_override`]'s own idempotency (a missing file is
+/// `Ok(())`) is what makes a second consecutive undeclared `up` return
+/// an empty orphan list rather than erroring.
+pub fn undeclared_provisioning(plan: &RigPlan) -> Result<ModuleProvisioning, CoreError> {
+    let previous = previously_provisioned(plan);
+    let orphaned = orphaned_modules(&previous, &BTreeMap::new(), plan.config_name.as_deref());
+    clear_override(plan)?;
+    Ok(ModuleProvisioning {
+        override_file: None,
+        modules: Vec::new(),
+        orphaned_modules: orphaned,
+    })
+}
+
 pub async fn provision_modules(
     feed: &ModuleFeed,
     plan: &RigPlan,
@@ -481,12 +671,19 @@ pub async fn provision_modules(
     policy: FetchPolicy,
 ) -> Result<ModuleProvisioning, CoreError> {
     if declared.is_empty() {
-        // Not just an early return: a previous run's override must GO.
-        // See `clear_override` for why returning default() alone left
-        // D-08's delete branch unreachable.
-        clear_override(plan)?;
-        return Ok(ModuleProvisioning::default());
+        // Not just an early return: a previous run's override must GO,
+        // and the orphan diff must be READ before that delete runs.
+        // See `undeclared_provisioning` for why this is the ONE
+        // implementation of the no-declaration case, not an inline
+        // call site that could drift from `main.rs`'s own branch.
+        return undeclared_provisioning(plan);
     }
+
+    // The orphan diff's input, captured BEFORE `write_override` below
+    // regenerates or overwrites the override (D-19-06): the PRE-write
+    // file is the one artifact `ign` wrote itself for what LAST ran,
+    // which is what the diff must compare against.
+    let previous = previously_provisioned(plan);
 
     let service = plan.gateway_service.clone().ok_or_else(|| {
         CoreError::Rig(format!(
@@ -531,10 +728,12 @@ pub async fn provision_modules(
     }
 
     let override_file = write_override(plan, &service, &mounts)?;
+    let orphaned = orphaned_modules(&previous, declared, plan.config_name.as_deref());
 
     Ok(ModuleProvisioning {
         override_file,
         modules: provisioned,
+        orphaned_modules: orphaned,
     })
 }
 
@@ -704,6 +903,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -794,6 +994,7 @@ mod tests {
 
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: compose_path.clone(),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -1030,6 +1231,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -1122,6 +1324,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "bare-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["sidecar".to_string()],
@@ -1177,6 +1380,7 @@ mod tests {
         );
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],
@@ -1280,6 +1484,7 @@ mod tests {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let plan = RigPlan {
             name: "fixture-rig".to_string(),
+            config_name: None,
             compose_file: project_dir.path().join("docker-compose.yml"),
             project_dir: project_dir.path().to_path_buf(),
             services: vec!["ignition".to_string()],

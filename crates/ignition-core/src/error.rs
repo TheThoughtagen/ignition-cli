@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -682,6 +682,35 @@ pub enum CoreError {
         /// Every currently registered [`crate::module::ModuleSpec::id`].
         known: Vec<String>,
     },
+
+    /// The gateway ANSWERED `DELETE /data/api/v1/modules/uninstall` with
+    /// HTTP 200 but the body says `{"success": false, "failedUninstalls":
+    /// {"uninstall": […]}}` — the denial-rides-200 class
+    /// ([`Self::ImportDenied`]'s precedent) applied to module uninstall
+    /// (Phase 19, D-19-03): live-verified that a stock module, a bogus
+    /// id, and a still-mounted module ALL answer 200 with
+    /// `success:false`. An unparseable body, a missing `success`, or an
+    /// absent `failedUninstalls` all map here too — absence of detail
+    /// must never degrade into a reported success. Exit 6 — target
+    /// state: names both the registry id and the gateway id that was
+    /// sent, plus every failed id the gateway reported (or the sent id
+    /// itself when the gateway gave no detail).
+    #[error(
+        "gateway refused to uninstall module {module_id:?} ({gateway_module_id}): {}",
+        failed.join(", ")
+    )]
+    ModuleUninstallDenied {
+        /// The registry slug (`git`) the caller named.
+        module_id: String,
+        /// The gateway's own id ([`crate::module::ModuleSpec::gateway_module_id`])
+        /// sent in the request.
+        gateway_module_id: String,
+        /// `failedUninstalls.uninstall` verbatim, or `[gateway_module_id]`
+        /// when the gateway's body carried no usable detail.
+        failed: Vec<String>,
+        /// URL of the refused DELETE, when known.
+        endpoint: Option<String>,
+    },
 }
 
 /// Payload of [`CoreError::ModuleDigestMismatch`], boxed to keep
@@ -785,6 +814,7 @@ impl CoreError {
             Self::ModuleFeedUnusable { .. } => "module_feed_unusable",
             Self::ModuleDigestChanged(..) => "module_digest_changed",
             Self::ModuleNotRegistered { .. } => "module_not_registered",
+            Self::ModuleUninstallDenied { .. } => "module_uninstall_denied",
         }
     }
 
@@ -832,7 +862,8 @@ impl CoreError {
             | Self::ModuleReleaseNotFound { .. }
             | Self::ModuleDigestMismatch(..)
             | Self::ModuleFeedUnusable { .. }
-            | Self::ModuleDigestChanged(..) => 6,
+            | Self::ModuleDigestChanged(..)
+            | Self::ModuleUninstallDenied { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1156,6 +1187,14 @@ impl CoreError {
                     known.join(", ")
                 )
             }),
+            Self::ModuleUninstallDenied { .. } => Some(
+                "the gateway refuses to uninstall a module whose .modl is still \
+                 mounted — remove it from [rigs.NAME.modules], run `ign rig up` \
+                 so the mount goes, then retry; a successful uninstall is NOT \
+                 undone by re-declaring the module — recovery today means \
+                 `ign rig reset --yes`, which destroys the rig's data volume"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1183,7 +1222,8 @@ impl CoreError {
             | Self::ImportDenied { endpoint, .. }
             | Self::EamNotController { endpoint }
             | Self::ProviderRootUnsupported { endpoint }
-            | Self::EamTaskInFlight { endpoint, .. } => endpoint.clone(),
+            | Self::EamTaskInFlight { endpoint, .. }
+            | Self::ModuleUninstallDenied { endpoint, .. } => endpoint.clone(),
             Self::ModuleFeedUnreachable { url, .. }
             | Self::ModuleReleaseNotFound { url, .. }
             | Self::ModuleFeedUnusable { url, .. } => Some(url.clone()),
@@ -1623,6 +1663,18 @@ mod tests {
                 3,
                 "module_not_registered",
             ),
+            (
+                CoreError::ModuleUninstallDenied {
+                    module_id: "git".into(),
+                    gateway_module_id: "com.axone_io.ignition.git".into(),
+                    failed: vec!["com.axone_io.ignition.git".into()],
+                    endpoint: Some(
+                        "http://gw:8088/data/api/v1/modules/uninstall".into(),
+                    ),
+                },
+                6,
+                "module_uninstall_denied",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1682,6 +1734,7 @@ mod tests {
         (6, "module_digest_mismatch"),
         (6, "module_feed_unusable"),
         (6, "module_digest_changed"),
+        (6, "module_uninstall_denied"),
         (7, "rig_error"),
     ];
 
