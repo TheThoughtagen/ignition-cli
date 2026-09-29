@@ -7,22 +7,25 @@
 //! ## The flow (all steps live-observed; the research's 10-step map,
 //! with the two LOW-confidence deliverables now resolved live)
 //!
-//! 1. `GET /data/app/login` → 302 into `/idp/default/oidc/auth?…`
+//! 1. `GET /data/app/login` → 302 into `/idp/<name>/oidc/auth?…` —
+//!    the IdP NAME is derived from this redirect (gateways rename the
+//!    internal IdP; `default` is only the common case, `temp` was
+//!    live-observed on 8.3.x)
 //!    (+ `idp-relay-*` cookie)
-//! 2. `GET /idp/default/oidc/auth?…` → 302 to
-//!    `/idp/default/authn/login?…&token=<T0>` (+ `idp-sid-default-*`
+//! 2. `GET /idp/<name>/oidc/auth?…` → 302 to
+//!    `/idp/<name>/authn/login?…&token=<T0>` (+ `idp-sid-<name>-*`
 //!    cookie)
-//! 3. `POST /idp/default/authn/next-challenge` `{"token":T0}` →
+//! 3. `POST /idp/<name>/authn/next-challenge` `{"token":T0}` →
 //!    `{"complete":false,"nextChallenge":[…],"token":<T1>}` — **the
 //!    token ROTATES on every call; thread it forward or the next call
 //!    400s in Jetty HTML** (research Pitfall 2)
-//! 4. `POST /idp/default/authn/submit-challenge/basic`
+//! 4. `POST /idp/<name>/authn/submit-challenge/basic`
 //!    `{"token":T1,"rememberMe":false,"challenge":{username,password}}`
 //!    → `{"success":bool,"token":<T2>}`; `success:false` = rejected
 //!    credentials (live-observed on 8.3.6 with a wrong password)
 //! 5. `POST next-challenge {"token":T2}` → `{"complete":true,…,
 //!    "token":<T3>}`
-//! 6. `GET /idp/default/oidc/auth?<orig params>&token=<T3>` → 302 to
+//! 6. `GET /idp/<name>/oidc/auth?<orig params>&token=<T3>` → 302 to
 //!    `/data/federate/callback/internal?code&state`
 //! 7. `GET /data/federate/callback/internal?…` → 302 `/app` +
 //!    **`Set-Cookie: webui-sid-<gatewayId>=…`** (the session cookie —
@@ -59,12 +62,13 @@ use crate::error::CoreError;
 
 /// Login entry point — 302s into the IdP OIDC flow.
 const APP_LOGIN_PATH: &str = "/data/app/login";
-/// The IdP's OIDC authorization endpoint (first path segment of step 1's
-/// Location).
-const OIDC_AUTH_PREFIX: &str = "/idp/default/oidc/auth";
-/// The rotating-token challenge endpoints.
-const NEXT_CHALLENGE_PATH: &str = "/idp/default/authn/next-challenge";
-const SUBMIT_BASIC_PATH: &str = "/idp/default/authn/submit-challenge/basic";
+/// The fixed shape of step 1's redirect: `/idp/<name>/oidc/auth?…`.
+/// The `<name>` segment is DERIVED per gateway — the internal IdP is
+/// not always called `default` (live-observed `temp` on 8.3.x), so
+/// every IdP URL in the flow is built from the name the gateway
+/// itself hands out.
+const IDP_PATH_PREFIX: &str = "/idp/";
+const OIDC_AUTH_PATH_SUFFIX: &str = "/oidc/auth";
 /// The session/CSRF endpoint (step 8).
 const APP_SESSION_PATH: &str = "/data/app/session";
 /// The trial reset target (step 9).
@@ -319,6 +323,29 @@ impl TapDetail for CoreError {
     }
 }
 
+/// Step 1's redirect must have the shape `/idp/<name>/oidc/auth?…` —
+/// the IdP name is DERIVED from the redirect itself (the gateway is
+/// authoritative; hardcoding `default` breaks renamed-IdP gateways).
+/// Returns the derived name; a shape mismatch fails with the observed
+/// target named so a genuine non-IdP redirect stays loud and legible.
+fn parse_oidc_start(location: &str) -> Result<&str, CoreError> {
+    let path = location.split('?').next().unwrap_or(location);
+    let name = path
+        .strip_prefix(IDP_PATH_PREFIX)
+        .and_then(|rest| rest.strip_suffix(OIDC_AUTH_PATH_SUFFIX))
+        .filter(|name| !name.is_empty() && !name.contains('/'));
+    match name {
+        Some(name) => Ok(name),
+        None => Err(IdpLoginFlow::flow_error(
+            "step 1",
+            format!(
+                "unexpected redirect target {location:?} (not the gateway IdP OIDC \
+                 endpoint — expected /idp/<name>/oidc/auth)"
+            ),
+        )),
+    }
+}
+
 /// Run the full login dance (steps 1–8) and yield the gateway session.
 /// `password` exposure happens at exactly ONE site: the step-4 JSON
 /// body construction (the redaction discipline).
@@ -329,16 +356,14 @@ pub async fn login(
 ) -> Result<(IdpLoginFlow, GatewaySession), CoreError> {
     let mut flow = flow;
 
-    // 1. Entry: /data/app/login → the OIDC authorization URL.
+    // 1. Entry: /data/app/login → the OIDC authorization URL. The IdP
+    //    name comes out of the redirect itself.
     let oidc_start = flow
         .follow_redirect("step 1 (GET /data/app/login)", APP_LOGIN_PATH)
         .await?;
-    if !oidc_start.starts_with(OIDC_AUTH_PREFIX) {
-        return Err(IdpLoginFlow::flow_error(
-            "step 1",
-            format!("unexpected redirect target {oidc_start:?} (not the internal IdP)"),
-        ));
-    }
+    let idp_name = parse_oidc_start(&oidc_start)?;
+    let next_challenge_path = format!("/idp/{idp_name}/authn/next-challenge");
+    let submit_basic_path = format!("/idp/{idp_name}/authn/submit-challenge/basic");
 
     // 2. OIDC auth → the login challenge page URL carrying T0.
     let login_url = flow
@@ -352,7 +377,7 @@ pub async fn login(
     let answer: ChallengeAnswer = serde_json::from_value(
         flow.post_json_flow(
             "step 3 (next-challenge)",
-            NEXT_CHALLENGE_PATH,
+            &next_challenge_path,
             &json!({ "token": token0 }),
         )
         .await?,
@@ -370,7 +395,7 @@ pub async fn login(
     let submit: SubmitAnswer = serde_json::from_value(
         flow.post_json_flow(
             "step 4 (submit-challenge/basic)",
-            SUBMIT_BASIC_PATH,
+            &submit_basic_path,
             &json!({
                 "token": token1,
                 "rememberMe": false,
@@ -386,7 +411,7 @@ pub async fn login(
         // is the accepted trade-off (documented at the flow's module).
         return Err(CoreError::Auth {
             status: 401,
-            endpoint: Some(SUBMIT_BASIC_PATH.to_string()),
+            endpoint: Some(submit_basic_path),
         });
     }
     let token2 = submit.token;
@@ -395,7 +420,7 @@ pub async fn login(
     let answer: ChallengeAnswer = serde_json::from_value(
         flow.post_json_flow(
             "step 5 (next-challenge)",
-            NEXT_CHALLENGE_PATH,
+            &next_challenge_path,
             &json!({ "token": token2 }),
         )
         .await?,
@@ -419,17 +444,16 @@ pub async fn login(
     let token3 = answer.token;
 
     // 6. oidc/auth with the ORIGINAL params + token=T3 → the federate
-    //    callback URL. (The orig query is step 1's Location minus its
-    //    path — live-verified shape.)
-    let oidc_query = oidc_start
-        .split_once('?')
-        .map(|(_, query)| query.to_string())
-        .unwrap_or_default();
+    //    callback URL. (Step 1's Location is replayed VERBATIM with the
+    //    token appended — the IdP name, path and query all come from the
+    //    gateway, live-verified shape.)
+    let step6_url = if oidc_start.contains('?') {
+        format!("{oidc_start}&token={token3}")
+    } else {
+        format!("{oidc_start}?token={token3}")
+    };
     let callback = flow
-        .follow_redirect(
-            "step 6 (GET oidc/auth + token)",
-            &format!("{OIDC_AUTH_PREFIX}?{oidc_query}&token={token3}"),
-        )
+        .follow_redirect("step 6 (GET oidc/auth + token)", &step6_url)
         .await?;
 
     // 7. The federate callback → the webui-sid-* session cookie.

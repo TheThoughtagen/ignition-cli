@@ -200,12 +200,28 @@ const OIDC_QUERY: &str = "app=gateway&response_type=code&client_id=ignition&redi
 /// Mount the entire 9-request login + reset dance; returns the guards
 /// for the requests the test asserts on.
 async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
+    mount_login_dance_for_idp(server, "default").await
+}
+
+/// The same dance against a gateway whose internal IdP is named
+/// `idp_name` (`temp` is the live-observed non-default spelling).
+/// Every IdP-path mock hangs off the derived name, so a flow that
+/// hardcodes `default` 404s mid-dance — the mount IS the derivation
+/// proof.
+async fn mount_login_dance_for_idp(server: &wiremock::MockServer, idp_name: &str) -> LoginGuards {
+    let oidc_auth_path = format!("/idp/{idp_name}/oidc/auth");
+    let next_challenge_path = format!("/idp/{idp_name}/authn/next-challenge");
+    let submit_basic_path = format!("/idp/{idp_name}/authn/submit-challenge/basic");
+    let sid_cookie = format!("idp-sid-{idp_name}-1766878194=sid-value");
     // 1. GET /data/app/login → 302 into the OIDC flow (+ relay cookie).
     let g1 = wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/data/app/login"))
         .respond_with(
             wiremock::ResponseTemplate::new(302)
-                .insert_header("Location", format!("/idp/default/oidc/auth?{OIDC_QUERY}"))
+                .insert_header(
+                    "Location",
+                    format!("/idp/{idp_name}/oidc/auth?{OIDC_QUERY}"),
+                )
                 .append_header("Set-Cookie", format!("{RELAY_COOKIE}; Path=/; HttpOnly")),
         )
         .expect(1)
@@ -216,16 +232,16 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
     //    replay of the same URL (same query + token) — wiremock's
     //    stable insertion-order matching needs the negative here.
     let g2 = wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+        .and(wiremock::matchers::path(&oidc_auth_path))
         .and(wiremock::matchers::query_param("state", "st"))
         .and(wiremock::matchers::query_param_is_missing("token"))
         .respond_with(
             wiremock::ResponseTemplate::new(302)
                 .insert_header(
                     "Location",
-                    format!("/idp/default/authn/login?app=gateway&token={T0}&response_type=code&client_id=ignition"),
+                    format!("/idp/{idp_name}/authn/login?app=gateway&token={T0}&response_type=code&client_id=ignition"),
                 )
-                .append_header("Set-Cookie", format!("{SID_COOKIE}; Path=/idp/default; HttpOnly; SameSite=Strict")),
+                .append_header("Set-Cookie", format!("{sid_cookie}; Path=/idp/{idp_name}; HttpOnly; SameSite=Strict")),
         )
         .expect(1)
         .mount_as_scoped(server)
@@ -233,9 +249,7 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
     // 3. POST next-challenge {"token": T0} → T1 (body-EXACT matcher =
     //    the threading proof for this hop).
     let g3 = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path(
-            "/idp/default/authn/next-challenge",
-        ))
+        .and(wiremock::matchers::path(&next_challenge_path))
         .and(wiremock::matchers::body_json(
             serde_json::json!({ "token": T0 }),
         ))
@@ -252,9 +266,7 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
         .await;
     // 4. POST submit-challenge/basic carrying T1 + the creds → T2.
     let g4 = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path(
-            "/idp/default/authn/submit-challenge/basic",
-        ))
+        .and(wiremock::matchers::path(&submit_basic_path))
         .and(wiremock::matchers::body_partial_json(serde_json::json!({
             "token": T1,
             "challenge": { "username": "admin" }
@@ -268,9 +280,7 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
         .await;
     // 5. POST next-challenge {"token": T2} → complete + T3.
     let g5 = wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path(
-            "/idp/default/authn/next-challenge",
-        ))
+        .and(wiremock::matchers::path(&next_challenge_path))
         .and(wiremock::matchers::body_json(
             serde_json::json!({ "token": T2 }),
         ))
@@ -286,7 +296,7 @@ async fn mount_login_dance(server: &wiremock::MockServer) -> LoginGuards {
         .await;
     // 6. GET oidc/auth?orig&token=T3 → the federate callback.
     let g6 = wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+        .and(wiremock::matchers::path(&oidc_auth_path))
         .and(wiremock::matchers::query_param("token", T3))
         .and(wiremock::matchers::query_param("state", "st"))
         .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
@@ -468,6 +478,47 @@ async fn tier1_login_flow_pins_the_full_request_chain() {
                 );
             }
         }
+    }
+}
+
+/// A gateway whose internal IdP is NOT named `default` — live-observed
+/// `temp` on a Stacked Energy 8.3.x slot — completes the FULL dance +
+/// reset. The mount only answers on `/idp/temp/…`, so the pre-fix
+/// hardcoded `default` paths 404 at step 3: this is the regression
+/// proof that the IdP name is derived from the gateway's redirect.
+#[tokio::test]
+async fn tier1_login_flow_derives_a_non_default_idp_name() {
+    let server = wiremock::MockServer::start().await;
+    let guards = mount_login_dance_for_idp(&server, "temp").await;
+
+    let flow = IdpLoginFlow::new(&server.uri()).expect("flow builds");
+    let password = Secret::new("correct-horse-battery");
+    let (flow, session): (IdpLoginFlow, GatewaySession) = login(flow, "admin", &password)
+        .await
+        .expect("a renamed (temp) internal IdP still completes the dance");
+    assert_eq!(session.cookie_name, SESSION_COOKIE_NAME);
+    assert_eq!(session.csrf_token, CSRF);
+
+    let fresh = trial_reset_via_session(&flow, &session)
+        .await
+        .expect("the reset POST answers the fresh trial");
+    assert!(!fresh.expired);
+    assert_eq!(fresh.trial_seconds_left, 7199);
+
+    // Every IdP-scoped hop hit its /idp/temp/… mock exactly once —
+    // the flow built its challenge URLs from the DERIVED name.
+    for (name, guard) in [
+        ("oidc_first", &guards.oidc_first),
+        ("challenge0", &guards.challenge0),
+        ("submit", &guards.submit),
+        ("challenge_complete", &guards.challenge_complete),
+        ("oidc_token", &guards.oidc_token),
+    ] {
+        assert_eq!(
+            guard.received_requests().await.len(),
+            1,
+            "exactly one hit on the /idp/temp {name} hop"
+        );
     }
 }
 
