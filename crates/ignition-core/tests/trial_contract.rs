@@ -522,6 +522,131 @@ async fn tier1_login_flow_derives_a_non_default_idp_name() {
     }
 }
 
+/// A fragment riding a redirect Location (`…?state=st#anchor`) must
+/// never leak into the flow's URLs: fragments are client-side-only,
+/// and after step 6's token append a stray `#` would leave the token
+/// OUT of the request query entirely (review-found leak). The flow
+/// strips fragments at the follow_redirect choke point — proven here
+/// by the step-6 request's PARSED query carrying the token.
+#[tokio::test]
+async fn tier1_login_flow_strips_fragments_from_redirect_locations() {
+    let server = wiremock::MockServer::start().await;
+    // 1. Step 1's Location carries a fragment — the poisoned variant.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/app/login"))
+        .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("/idp/default/oidc/auth?{OIDC_QUERY}#client-side-nonsense"),
+        ))
+        .mount(&server)
+        .await;
+    // 2–5. The challenge chain, verbatim from the default mount.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+        .and(wiremock::matchers::query_param_is_missing("token"))
+        .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("/idp/default/authn/login?app=gateway&token={T0}"),
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/next-challenge",
+        ))
+        .and(wiremock::matchers::body_json(
+            serde_json::json!({ "token": T0 }),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "complete": false,
+                "nextChallenge": [{"type": "basic", "config": {}}],
+                "token": T1
+            })),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/submit-challenge/basic",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": true, "token": T2 })),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/idp/default/authn/next-challenge",
+        ))
+        .and(wiremock::matchers::body_json(
+            serde_json::json!({ "token": T2 }),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "complete": true,
+                "token": T3
+            })),
+        )
+        .mount(&server)
+        .await;
+    // 6. The step-6 catcher — its query_param matchers DEMAND the token
+    //    in the parsed query; a token stranded after a `#` 404s here.
+    let g6 = wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/idp/default/oidc/auth"))
+        .and(wiremock::matchers::query_param("token", T3))
+        .and(wiremock::matchers::query_param("state", "st"))
+        .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+            "Location",
+            "/data/federate/callback/internal?code=auth-code&state=st",
+        ))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/federate/callback/internal"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(302)
+                .insert_header("Location", "/app")
+                .append_header(
+                    "Set-Cookie",
+                    format!("{SESSION_COOKIE_NAME}={SESSION_COOKIE_VALUE}; Path=/; HttpOnly"),
+                ),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/app/session"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "userPayload": {},
+                "csrfToken": CSRF
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let flow = IdpLoginFlow::new(&server.uri()).expect("flow builds");
+    let (_flow, session): (IdpLoginFlow, GatewaySession) =
+        login(flow, "admin", &Secret::new("correct-horse-battery"))
+            .await
+            .expect("a fragment on the Location never breaks the dance");
+    assert_eq!(session.csrf_token, CSRF);
+
+    let step6 = g6.received_requests().await;
+    assert_eq!(step6.len(), 1);
+    let query = step6[0].url.query().unwrap_or_default();
+    assert!(
+        query.contains(&format!("token={T3}")),
+        "the appended token rides the QUERY: {query}"
+    );
+    assert!(
+        !query.contains('#'),
+        "no fragment ever reaches a request URL: {query}"
+    );
+}
+
 /// Bad credentials (the live-observed 8.3.6 shape:
 /// 200 `{"success":false,…}`) → Auth (exit 5) naming the challenge
 /// endpoint — NOT a flow crash.
