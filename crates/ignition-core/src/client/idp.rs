@@ -238,8 +238,18 @@ impl IdpLoginFlow {
                     .get(reqwest::header::LOCATION)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
-                location.ok_or_else(|| {
+                let location = location.ok_or_else(|| {
                     Self::flow_error(step, "redirect carried no Location header".into())
+                })?;
+                // The fragment is client-side-only decoration: this flow
+                // only ever talks to the server, and a stray `#…` would
+                // taint token extraction (step 2's query_param) or land
+                // AFTER step 6's appended token — dropping the token out
+                // of the request query entirely. Strip it at the one
+                // choke point every hop passes through.
+                Ok(match location.split_once('#') {
+                    Some((head, _)) => head.to_string(),
+                    None => location,
                 })
             }
             status => {
