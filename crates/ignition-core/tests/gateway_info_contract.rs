@@ -324,11 +324,13 @@ async fn html_403_classifies_auth_with_three_parts_hint() {
 }
 
 /// 302 → `/idp/…` (not logged in — shouldn't happen for token auth, but
-/// observed on `/data/app/*`) → Auth class.
+/// observed on `/data/app/*`) → Auth class. The IdP name is a gateway
+/// choice (`temp` observed live, not just `default`), so the classifier
+/// must not care.
 #[tokio::test]
 async fn redirect_to_idp_classifies_auth() {
     let mock = IgnitionMock::start().await;
-    mock.redirect(GATEWAY_INFO_PATH, "/idp/default/authn/login")
+    mock.redirect(GATEWAY_INFO_PATH, "/idp/temp/authn/login")
         .await;
 
     let err = classify_scenario(mock).await;
