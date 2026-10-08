@@ -500,6 +500,64 @@ Sub-second values are refused at config load (`poll_interval_too_small`,
 exit 3 — the hard floor against hammering the gateway). The active value
 adopts live across profile switches (same ride-along path as the theme).
 
+## itop — the live monitor (`ign top`, alias `ign itop`)
+
+htop for the gateway: one full-screen ratatui instrument over ONE
+profile — header CPU/heap gauges with sparkline history, a
+thread-state mix panel, a scriptExec diagnostics probe, and a
+sortable, filterable **process list** of the gateway's live entities.
+It is deliberately NOT a cockpit tab: htop is a single-view
+instrument, and `itop` is the same actions layer composed for
+watching, not operating.
+
+![itop running live against a gateway — gauges, thread-state mix, three 240-sample history sparklines, and the entity process list](website/static/demos/itop-live.png)
+
+*(captured live against a dev gateway: 8.3.3, 35 modules, seeded
+240-sample history, the honest `Trial Expired` scriptExec refusal in
+the footer)*
+
+| What | Where |
+|------|-------|
+| Header | CPU % and heap used/max gauge bars (threshold-colored), gateway identity, RUNNING state, uptime, disk fill, license incl. trial countdown |
+| Threads | The execution-state mix as four bars — running / waiting / timed-waiting / blocked, share of the total; any blocked thread renders the `error` slot |
+| History | CPU %, heap MiB, and non-heap MiB sparklines — 240-sample rings, SEEDED from the gateway's own performance history (`systemPerformance/charts`) so they open full, then continued from the sampled gauges |
+| Table | One row per live entity: `module` (healthy list), `designer` / `perspective` / `vision` sessions, `database` / `opc` connections, `tag provider` — KIND/NAME/STATE/AGE/DETAIL columns, state-colored |
+| Footer | Per-section errors verbatim (one failing endpoint degrades its section, never the screen), cadence/pause/staleness state, key hints |
+
+![the scriptExec diagnostics probe refusing honestly — the gateway answers 402 Trial Expired and the modal names it](website/static/demos/itop-script-probe.png)
+
+The `e` probe runs one gateway-side Jython snapshot through the
+deployed scriptExec route — JMX internals (thread pool mix, JVM memory
+pools, class-loader counts) that NO REST endpoint exposes — and renders
+the result document in a modal. A profile without the route refuses
+inline (`ign webdev deploy --with-script-exec` first); a refused route
+renders the gateway's own error verbatim, as above.
+
+More views (click through): [connections](website/static/demos/itop-connections.png)
+· [filter applied](website/static/demos/itop-filter.png) ·
+[paused](website/static/demos/itop-paused.png) ·
+[keymap](website/static/demos/itop-help.png)
+
+Keys (htop's gestures, `ign`'s verbs):
+
+- `q`/Ctrl-C quit · `space`/`p` pause sampling (the rings freeze; a
+  manual `r` still works) · `+`/`-` sample interval 1–60 s (default
+  **2 s** — itop's own cadence, not the Dashboard's `poll_interval_secs`)
+- `s` cycles the sort key (kind/name/state/age/detail), `S` reverses ·
+  `/` filters by substring across every rendered column (Esc clears) ·
+  `1`–`5` switch the view (all / modules / sessions / connections /
+  providers) · `j`/`k`/arrows move (pgup/pgdn page, `g`/`G` jump)
+- `x`/F9 **terminates the selected session** (designer prune /
+  perspective terminate / vision close) behind a Confirm modal —
+  `y` ≡ `--yes`, Esc spawns nothing; non-session rows refuse honestly
+  (modules and connections have no safe per-entity restart verb)
+
+Behavior contract — the cockpit's, verbatim where it applies: a TTY is
+required (piped stdout refuses exit 2 before alt-screen), a clean exit
+prints NOTHING on stdout, resolution failures surface BEFORE the
+terminal flips, themes apply (`[ui].theme`), and the profile is fixed
+at launch — restart with `--profile` to retarget.
+
 ## Rigs (Docker compose lifecycle)
 
 `ign rig` manages a **compose rig** — a Docker compose project running

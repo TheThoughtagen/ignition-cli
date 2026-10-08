@@ -58,6 +58,17 @@ pub fn routes() -> &'static [CliRoute] {
             path: "tui",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // `ign top` (alias `ign itop`) — the standalone htop-style
+        // monitor is its OWN full-screen surface (ignition_tui::itop),
+        // not a cockpit screen; its nearest cockpit relative is the
+        // Dashboard (the same vitals+sessions read family at a slower
+        // cadence), so the row lands there. Row + clap command land
+        // together (Pitfall 5); the alias adds no walk node (the
+        // coverage walk names get_subcommands' get_name only).
+        CliRoute {
+            path: "top",
+            mapping: Mapping::Screen(Screen::Dashboard),
+        },
         CliRoute {
             path: "completions",
             mapping: Mapping::OutOfBand,

@@ -320,7 +320,7 @@ fn dashboard_actions_menu_matches_registry() {
     // (extend the exclusion comments). The pinned test IS the
     // pre-declaration (the 08-06 OutOfBand pattern).
     //
-    // Current exclusions (40 Dashboard rows − 27 menu verbs = 13):
+    // Current exclusions (41 Dashboard rows − 27 menu verbs = 14):
     //   - `tui` — the cockpit ITSELF (launching the TUI is not a verb
     //     the TUI's menu can host).
     //   - `status`, `modules`, `metrics`, `sessions` (bare) — the
@@ -352,6 +352,12 @@ fn dashboard_actions_menu_matches_registry() {
     //     CLI gate is the global --yes, whose refusal previews every
     //     member and both command lines; a TUI modal that shrank that
     //     to "OK?" would be a worse gate than no gate.
+    //   - `top` (itop) — the standalone live monitor is its OWN
+    //     full-screen surface (ignition_tui::itop): a cockpit menu
+    //     row that opens a second alternate-screen TUI over the same
+    //     terminal is a nested-alt-screen hazard, and the Dashboard
+    //     already renders the same read family live. The routes() row
+    //     exists for the coverage walk, not for a menu verb.
     let dashboard_rows: Vec<&str> = routes()
         .iter()
         .filter(|route| matches!(route.mapping, Mapping::Screen(Screen::Dashboard)))
@@ -359,7 +365,7 @@ fn dashboard_actions_menu_matches_registry() {
         .collect();
     assert_eq!(
         dashboard_rows.len(),
-        40,
+        41,
         "a new Screen(Dashboard) route landed — extend MENU_HOSTED + ACTIONS \
          + the update.rs executor arms in the same change, or justify the \
          exclusion in this test's comment block: {dashboard_rows:#?}"
