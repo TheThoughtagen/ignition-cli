@@ -29,6 +29,14 @@ use serde::Serialize;
 /// [`CoreError::tui_tty_refusal`] so the reason/hint pair cannot drift.
 pub const TUI_TTY_REFUSAL_REASON: &str = "ign tui requires a terminal (stdout is not a TTY)";
 
+/// The `ign top` (itop) TTY-refusal reason — the SAME usage class and
+/// slug as [`TUI_TTY_REFUSAL_REASON`] at one command over (the monitor
+/// is its own full-screen surface, so its refusal names ITS command —
+/// the RoutesNotDeployed rule: a hint must never name a command that
+/// does not fix it). [`CoreError::hint`] content-addresses this
+/// constant exactly like its tui sibling.
+pub const TOP_TTY_REFUSAL_REASON: &str = "ign top requires a terminal (stdout is not a TTY)";
+
 /// The TAGS-12 loss-gate refusal reason prefix (11-07 gap closure). The
 /// InvalidInput hint is content-addressed off this literal: the loss
 /// gate's reason is DYNAMIC prose (the CLI's `render_loss_prose` header
@@ -899,6 +907,12 @@ impl CoreError {
                     // --file/stdin default is meaningless for a pipe.
                     "run `ign tui` in an interactive terminal (the cockpit \
                      needs a TTY on stdout — not a pipe or redirect)"
+                } else if reason == TOP_TTY_REFUSAL_REASON {
+                    // itop's sibling refusal: same terminal-contextual
+                    // fix, naming the MONITOR's command (a hint naming
+                    // `ign tui` would not fix an `ign top` run).
+                    "run `ign top` in an interactive terminal (the monitor \
+                     needs a TTY on stdout — not a pipe or redirect)"
                 } else if reason.starts_with(LOSS_GATE_REFUSAL_REASON_PREFIX) {
                     // The loss-gate refusal (11-07): the message above already names
                     // every finding and ends with the actionable guidance — the hint
@@ -1240,6 +1254,15 @@ impl CoreError {
     pub fn tui_tty_refusal() -> Self {
         Self::InvalidInput {
             reason: TUI_TTY_REFUSAL_REASON.to_string(),
+        }
+    }
+
+    /// The `ign top` TTY refusal (itop): the tui refusal's sibling at
+    /// one command over — same slug, same exit 2, the hint naming the
+    /// monitor's command. See [`TOP_TTY_REFUSAL_REASON`].
+    pub fn top_tty_refusal() -> Self {
+        Self::InvalidInput {
+            reason: TOP_TTY_REFUSAL_REASON.to_string(),
         }
     }
 
@@ -1987,6 +2010,27 @@ mod tests {
         assert!(
             !hint.contains("--file"),
             "TTY hint must not carry the resource-put hint: {hint}"
+        );
+
+        // The itop sibling (ign top): the SAME usage class and slug,
+        // but the refusal/hint name the MONITOR's command — a hint
+        // naming `ign tui` would not fix an `ign top` run (the
+        // RoutesNotDeployed rule at the TTY pair).
+        let top = CoreError::top_tty_refusal();
+        assert_eq!(top.code(), "invalid_input", "slug unchanged");
+        assert_eq!(top.exit_code(), 2, "usage class unchanged");
+        let top_hint = top.hint().expect("hint required");
+        assert!(
+            top_hint.contains("`ign top`"),
+            "the top refusal's hint names ign top: {top_hint}"
+        );
+        assert!(
+            !top_hint.contains("ign tui"),
+            "the top refusal never names the cockpit command: {top_hint}"
+        );
+        assert!(
+            top_hint.contains("interactive terminal"),
+            "the top refusal keeps the terminal-contextual fix: {top_hint}"
         );
         let put = CoreError::InvalidInput {
             reason: "cannot read put.json".into(),

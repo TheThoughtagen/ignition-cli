@@ -303,6 +303,15 @@ pub enum Commands {
     /// Interactive TUI cockpit
     #[cfg(feature = "tui")]
     Tui,
+
+    /// Live gateway monitor — htop for Ignition: cpu/heap gauges,
+    /// sparkline history, and a sortable/filterable table of the
+    /// gateway's live entities (modules, sessions, connections,
+    /// providers); terminate a session with `x` (the routes.rs
+    /// Dashboard row lands atomically with this command)
+    #[cfg(feature = "tui")]
+    #[command(alias = "itop")]
+    Top,
 }
 
 /// Hidden args for `ign mcp serve` (14-01). `serve` is a RESTRICTED

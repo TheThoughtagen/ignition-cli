@@ -1,0 +1,691 @@
+//! The itop transition layer — the ONLY writer of
+//! [`crate::itop::state::TopState`], driven by [`TopEvent`]s (the
+//! cockpit's Elm-style `update`, scoped to itop).
+//!
+//! Modal arbitration: an open modal consumes EVERY keystroke (the
+//! cockpit's Focus::Modal rule, folded into one Option). Worker spawns
+//! ride the same convention as the cockpit's update — spawn helpers
+//! take `&mut TopState`, read the rails, and stand alone outside a
+//! tokio runtime (unit tests transition state without spawning).
+
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+use crate::itop::event::TopEvent;
+use crate::itop::state::{Family, Modal, TopState};
+use crate::itop::worker::{spawn_kill, spawn_sample_once, spawn_sample_worker, spawn_script_probe};
+
+/// Process one event. Pure over the state (spawns aside).
+pub fn update(state: &mut TopState, event: TopEvent) {
+    match event {
+        TopEvent::Input(event) => match event {
+            Event::Key(key) => handle_key(state, key),
+            Event::Resize(_, _) => {} // the next draw adopts the size
+            _ => {}                   // mouse/focus events carry no itop meaning
+        },
+        TopEvent::Tick => {} // the staleness readout is computed at render
+        TopEvent::Sample { era, sample } => {
+            if era != state.era {
+                return; // stale world — drop whole (Pitfall 9)
+            }
+            state.apply_sample(sample, std::time::Instant::now());
+            state.clamp_selection();
+        }
+        TopEvent::Killed { era, label, result } => {
+            if era != state.era {
+                return; // stale op — drop whole
+            }
+            match result {
+                Ok(summary) => state.status_msg = Some((summary, false)),
+                Err(err) => {
+                    state.status_msg = Some((format!("kill {label} failed: {err}"), true));
+                }
+            }
+        }
+        TopEvent::ScriptProbe { era, result } => {
+            if era != state.era {
+                return; // stale probe — drop whole
+            }
+            state.probe_busy = false;
+            match result {
+                Ok(done) => {
+                    let document = serde_json::to_string_pretty(&*done)
+                        .unwrap_or_else(|_| format!("{done:?}"));
+                    let elapsed = done.elapsed_ms;
+                    state.modal = Some(Modal::ScriptProbe {
+                        result: Ok(document.clone()),
+                    });
+                    state.script_result = Some(Ok(document));
+                    state.status_msg = Some((
+                        format!("scriptExec probe done ({elapsed} ms route-side)"),
+                        false,
+                    ));
+                }
+                Err(err) => {
+                    state.modal = Some(Modal::ScriptProbe {
+                        result: Err(err.clone()),
+                    });
+                    state.script_result = Some(Err(err.clone()));
+                    state.status_msg = Some((format!("scriptExec probe refused: {err}"), true));
+                }
+            }
+        }
+    }
+}
+
+/// One key event, modal-arbitrated.
+fn handle_key(state: &mut TopState, key: KeyEvent) {
+    if state.modal.is_some() {
+        handle_modal_key(state, key);
+    } else {
+        handle_table_key(state, key);
+    }
+}
+
+/// Keys while a modal is open — the modal consumes everything.
+fn handle_modal_key(state: &mut TopState, key: KeyEvent) {
+    let Some(modal) = state.modal.take() else {
+        return;
+    };
+    match modal {
+        Modal::Help => {
+            // Any key dismisses the overlay.
+            state.modal = None;
+        }
+        Modal::ScriptProbe { .. } => {
+            // Any key dismisses the document — the result stays in
+            // `script_result` until the next probe replaces it.
+            state.modal = None;
+        }
+        Modal::Filter { mut buffer } => match key.code {
+            KeyCode::Enter => {
+                state.set_filter(&buffer);
+                state.modal = None;
+            }
+            KeyCode::Esc => {
+                // Close keeping the active filter; a second Esc (no
+                // filter set) is handled by the table layer's quit-free
+                // Esc rule.
+                state.modal = None;
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                state.modal = Some(Modal::Filter { buffer });
+            }
+            KeyCode::Char(ch) => {
+                buffer.push(ch);
+                state.modal = Some(Modal::Filter { buffer });
+            }
+            _ => state.modal = Some(Modal::Filter { buffer }),
+        },
+        Modal::ConfirmKill { target } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                state.modal = None;
+                spawn_kill(state, target);
+            }
+            _ => state.modal = None, // n / Esc / anything — cancel
+        },
+    }
+}
+
+/// Keys in table mode.
+fn handle_table_key(state: &mut TopState, key: KeyEvent) {
+    // Ctrl-C always quits; plain keys follow.
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.should_quit = true;
+        return;
+    }
+    match key.code {
+        KeyCode::Char('q') => state.should_quit = true,
+        KeyCode::Char(' ') | KeyCode::Char('p') => {
+            if state.toggle_pause()
+                && let Some(tx) = &state.paused_tx
+            {
+                let _ = tx.send(state.paused);
+            }
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            if state.adjust_interval(1) {
+                respawn_sample_worker(state);
+            }
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            if state.adjust_interval(-1) {
+                respawn_sample_worker(state);
+            }
+        }
+        KeyCode::Char('r') => spawn_sample_once(state),
+        KeyCode::Char('e') => spawn_script_probe(state),
+        KeyCode::Char('s') => state.cycle_sort(),
+        KeyCode::Char('S') => state.toggle_sort_dir(),
+        KeyCode::Char('/') => {
+            state.modal = Some(Modal::Filter {
+                buffer: String::new(),
+            })
+        }
+        KeyCode::Char('?') => state.modal = Some(Modal::Help),
+        KeyCode::Char(ch @ '1'..='5') => {
+            let family = Family::ALL[(ch as u8 - b'1') as usize];
+            state.family = family;
+            state.selected = 0;
+        }
+        KeyCode::Char('x') | KeyCode::F(9) => arm_kill(state),
+        // Vim-style + arrows + pagers — the cockpit's table navigation.
+        KeyCode::Char('j') | KeyCode::Down => state.move_selection(1),
+        KeyCode::Char('k') | KeyCode::Up => state.move_selection(-1),
+        KeyCode::PageDown | KeyCode::Char('J') => state.move_selection(10),
+        KeyCode::PageUp | KeyCode::Char('K') => state.move_selection(-10),
+        KeyCode::Home | KeyCode::Char('g') => state.selected = 0,
+        KeyCode::End | KeyCode::Char('G') => {
+            let len = state.visible_rows().len();
+            state.selected = len.saturating_sub(1);
+        }
+        KeyCode::Esc if state.filter.is_some() => {
+            // Esc clears an active filter; with none set it is inert
+            // (accidental quits are not itop's genre).
+            state.filter = None;
+            state.selected = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Arm the kill confirm for the selected row — session rows only (the
+/// gate lives in `RowKind::session_type`; modules/connections/
+/// providers get an honest refusal on the status line).
+fn arm_kill(state: &mut TopState) {
+    match state.armed_kill() {
+        Some(target) => state.modal = Some(Modal::ConfirmKill { target }),
+        None => {
+            if state.visible_rows().is_empty() {
+                return; // nothing selected — inert
+            }
+            state.status_msg = Some(("the selected row has no terminate action".into(), true));
+        }
+    }
+}
+
+/// Signal the old sample worker down, then spawn the new one — the
+/// profile-switch teardown ordering (signal BEFORE adopt).
+fn respawn_sample_worker(state: &mut TopState) {
+    if let Some(shutdown) = &state.sample_shutdown {
+        let _ = shutdown.send(true);
+    }
+    spawn_sample_worker(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::itop::state::{DEFAULT_INTERVAL_SECS, Family};
+    use crate::itop::worker::TopSample;
+    use ignition_core::actions::sessions::SessionType;
+    use tokio::sync::watch;
+
+    /// A key event helper (no modifiers, no release kind).
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Arm the full spawn rails (client + sender) on a state — the
+    /// respawn/kill tests' shared setup (struct-update, so no bare
+    /// Default + assignment sites).
+    fn with_rails(state: TopState) -> TopState {
+        TopState {
+            client: Some(std::sync::Arc::new(
+                ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+            )),
+            events_tx: Some(tokio::sync::mpsc::unbounded_channel().0),
+            ..state
+        }
+    }
+
+    fn sample_event(era: u64) -> TopEvent {
+        TopEvent::Sample {
+            era,
+            sample: Box::new(TopSample::default()),
+        }
+    }
+
+    /// Stale-era samples and ops drop whole — no data from a dead
+    /// world ever lands (Pitfall 9).
+    #[test]
+    fn stale_events_drop_whole() {
+        let mut state = TopState {
+            era: 2,
+            ..TopState::default()
+        };
+        update(&mut state, sample_event(1));
+        assert!(state.last.is_none(), "stale sample dropped");
+        update(
+            &mut state,
+            TopEvent::Killed {
+                era: 1,
+                label: "perspective admin".into(),
+                result: Ok("terminated ps-1 (perspective)".into()),
+            },
+        );
+        assert!(state.status_msg.is_none(), "stale op dropped");
+
+        update(&mut state, sample_event(2));
+        assert!(state.last.is_some(), "current-era sample lands");
+    }
+
+    /// A landing sample clears the one-shot busy guard and clamps the
+    /// selection.
+    #[test]
+    fn sample_landing_clears_busy_and_clamps() {
+        let mut state = TopState {
+            refresh_busy: true,
+            selected: 9,
+            ..TopState::default()
+        };
+        update(&mut state, sample_event(0));
+        assert!(!state.refresh_busy);
+        assert_eq!(state.selected, 0, "empty list clamps to 0");
+    }
+
+    /// Pause toggles and syncs the watch the worker reads.
+    #[test]
+    fn pause_toggles_and_syncs_the_watch() {
+        let (tx, rx) = watch::channel(false);
+        let mut state = TopState {
+            paused_tx: Some(tx),
+            ..TopState::default()
+        };
+
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char(' ')))),
+        );
+        assert!(state.paused);
+        assert!(*rx.borrow(), "the worker's pause watch sees true");
+
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('p')))),
+        );
+        assert!(!state.paused);
+        assert!(!*rx.borrow());
+    }
+
+    /// Interval changes respawn the worker: a fresh shutdown rail is
+    /// armed and the era bumps, so pre-respawn samples drop. Clamp-
+    /// boundary hits do NOT churn the world.
+    #[test]
+    fn interval_change_respawns_the_worker() {
+        // The respawn reads the FULL rails (client + sender + pause
+        // watch) — arm them all, exactly as run_loop does.
+        let (paused_tx, _rx) = watch::channel(false);
+        let mut state = with_rails(TopState {
+            paused_tx: Some(paused_tx),
+            ..TopState::default()
+        });
+
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('+')))),
+        );
+        assert_eq!(state.interval_secs, DEFAULT_INTERVAL_SECS + 1);
+        assert!(state.sample_shutdown.is_some(), "fresh rail armed");
+        assert_eq!(state.era, 1, "respawn bumped the era");
+
+        // A sample stamped with the PRE-respawn era drops; the current
+        // era's lands (the respawn's stale gate, behaviorally).
+        update(&mut state, sample_event(0));
+        assert!(state.last.is_none(), "pre-respawn sample dropped");
+        update(&mut state, sample_event(1));
+        assert!(state.last.is_some(), "current-era sample lands");
+
+        // Floor: minus at 1s is a no-op — no era churn.
+        state.interval_secs = 1;
+        let era_before = state.era;
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('-')))),
+        );
+        assert_eq!(state.interval_secs, 1);
+        assert_eq!(state.era, era_before, "clamp hit must not respawn");
+    }
+
+    /// The full kill flow: x arms the Confirm modal ONLY for session
+    /// rows; y spawns (status line shows the in-flight note — no
+    /// runtime here, so the spawn itself stands down); Esc cancels.
+    #[test]
+    fn kill_flow_arms_confirms_and_cancels() {
+        let mut state = with_rails(TopState::default());
+        let sample = TopSample {
+            modules: Some(ignition_core::actions::inspect::ModulesResult {
+                items: vec![ignition_core::client::status::ModuleInfo {
+                    id: "mod".into(),
+                    name: "A Module".into(),
+                    version: "1.0".into(),
+                    state: Some("ACTIVE".into()),
+                    license_state: None,
+                    vendor_name: None,
+                    startup_time: None,
+                    extra: Default::default(),
+                }],
+                quarantined: false,
+            }),
+            ..TopSample::default()
+        };
+        state.last = Some(Box::new(sample));
+
+        // A module row: x refuses honestly.
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('x')))),
+        );
+        assert!(state.modal.is_none(), "modules never arm a kill");
+        assert!(
+            state
+                .status_msg
+                .as_ref()
+                .is_some_and(|(msg, is_err)| *is_err && msg.contains("no terminate")),
+            "the refusal is an error-styled status line"
+        );
+
+        // A session row: x arms the confirm.
+        let sample = TopSample {
+            sessions: Some(ignition_core::actions::sessions::SessionsResult {
+                designers: vec![],
+                perspective: vec![ignition_core::client::sessions::PerspectiveSession {
+                    id: "ps-9".into(),
+                    username: "admin".into(),
+                    authorized: true,
+                    project: "whiskeyhouse".into(),
+                    client_address: String::new(),
+                    last_comm: 0,
+                    active_pages: 1,
+                    user_agent: String::new(),
+                    extra: Default::default(),
+                }],
+                vision: vec![],
+            }),
+            ..TopSample::default()
+        };
+        state.last = Some(Box::new(sample));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('x')))),
+        );
+        let Some(Modal::ConfirmKill { target }) = state.modal.clone() else {
+            panic!("session row arms the confirm modal");
+        };
+        assert_eq!(target.id, "ps-9");
+        assert_eq!(target.kind, SessionType::Perspective);
+
+        // Esc cancels; then re-arm and y spawns.
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Esc))));
+        assert!(state.modal.is_none(), "cancel closes the modal");
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('x')))),
+        );
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('y')))),
+        );
+        assert!(state.modal.is_none(), "confirm closes the modal");
+        assert!(
+            state
+                .status_msg
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("terminating")),
+            "the in-flight note rides the status line"
+        );
+    }
+
+    /// The filter modal: chars land in the buffer, Enter applies
+    /// (lowercased), Esc closes keeping the active filter, table-Esc
+    /// clears it.
+    #[test]
+    fn filter_modal_applies_and_clears() {
+        let mut state = TopState::default();
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('/')))),
+        );
+        assert!(matches!(state.modal, Some(Modal::Filter { .. })));
+        for ch in ['P', 'e', 'r', 's'] {
+            update(
+                &mut state,
+                TopEvent::Input(Event::Key(key(KeyCode::Char(ch)))),
+            );
+        }
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Backspace))),
+        );
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Enter))));
+        assert_eq!(
+            state.filter.as_deref(),
+            Some("per"),
+            "lowercased after a backspace, applied"
+        );
+        assert!(state.modal.is_none());
+
+        // Table Esc clears the filter.
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Esc))));
+        assert!(state.filter.is_none());
+
+        // Enter applies again...
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('/')))),
+        );
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('x')))),
+        );
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Enter))));
+        assert_eq!(state.filter.as_deref(), Some("x"));
+
+        // ...and a MODAL Esc (typed buffer unapplied) closes without
+        // clearing or changing the ACTIVE filter.
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('/')))),
+        );
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('y')))),
+        );
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Esc))));
+        assert_eq!(
+            state.filter.as_deref(),
+            Some("x"),
+            "the active filter survives a modal Esc"
+        );
+        assert!(state.modal.is_none());
+    }
+
+    /// Family number keys switch the view and reset the selection.
+    #[test]
+    fn family_keys_switch_the_view() {
+        let mut state = TopState::default();
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('3')))),
+        );
+        assert_eq!(state.family, Family::Sessions);
+        assert_eq!(state.selected, 0);
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('1')))),
+        );
+        assert_eq!(state.family, Family::All);
+    }
+
+    /// Quit keys: q quits, Ctrl-C quits, Esc without a filter does
+    /// NOT quit.
+    #[test]
+    fn quit_keys_and_inert_esc() {
+        let mut state = TopState::default();
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('q')))),
+        );
+        assert!(state.should_quit);
+
+        let mut state = TopState::default();
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+        );
+        assert!(state.should_quit);
+
+        let mut state = TopState::default();
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Esc))));
+        assert!(!state.should_quit, "inert Esc never quits");
+    }
+
+    /// The help modal opens with ? and any key dismisses.
+    #[test]
+    fn help_opens_and_dismisses() {
+        let mut state = TopState::default();
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('?')))),
+        );
+        assert!(matches!(state.modal, Some(Modal::Help)));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('q')))),
+        );
+        assert!(state.modal.is_none(), "help consumed the q — no quit");
+        assert!(!state.should_quit);
+    }
+
+    /// The probe's honest INLINE refusal: a profile without a stored
+    /// webdev_secret → the ScriptProbe modal opens with the refusal,
+    /// zero HTTP, no busy flag (the structural gate runs synchronously
+    /// — the `ign script run` zero-requests rule). The isolated config
+    /// rides IGNITION_CLI_CONFIG under ENV_LOCK.
+    #[test]
+    fn probe_refuses_inline_without_a_secret() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[profiles.p]\nurl = \"http://127.0.0.1:1/\"\nauth = { token_env = \"NOPE\" }\n",
+        )
+        .expect("write isolated config");
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::set_var("IGNITION_CLI_CONFIG", &path) };
+        let mut state = with_rails(TopState {
+            profile_name: Some("p".into()),
+            ..TopState::default()
+        });
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('e')))),
+        );
+        assert!(!state.probe_busy, "a refusal never arms the busy guard");
+        match state.modal {
+            Some(Modal::ScriptProbe {
+                result: Err(refusal),
+            }) => {
+                assert!(
+                    refusal.contains("webdev deploy") || refusal.contains("not configured"),
+                    "the refusal names the fix: {refusal}"
+                );
+            }
+            other => panic!("expected the probe refusal modal, got {other:?}"),
+        }
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("IGNITION_CLI_CONFIG") };
+    }
+
+    /// A stored webdev_secret arms the busy guard and (outside a
+    /// runtime) spawns nothing — the state transition still ran.
+    #[test]
+    fn probe_with_secret_arms_busy_without_a_runtime() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[profiles.p]\nurl = \"http://127.0.0.1:1/\"\nauth = { token_env = \"NOPE\" }\nwebdev_secret = \"canary\"\n",
+        )
+        .expect("write isolated config");
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::set_var("IGNITION_CLI_CONFIG", &path) };
+        let mut state = with_rails(TopState {
+            profile_name: Some("p".into()),
+            ..TopState::default()
+        });
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('e')))),
+        );
+        assert!(state.probe_busy, "the probe marks busy");
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('e')))),
+        );
+        assert!(state.probe_busy, "busy guard refuses stacking");
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("IGNITION_CLI_CONFIG") };
+    }
+
+    /// The probe event lands: busy clears, the modal opens with the
+    /// pretty document, the status line names the route-side elapsed.
+    /// Stale-era probes drop whole.
+    #[test]
+    fn script_probe_event_lands_and_stale_drops() {
+        let mut state = with_rails(TopState {
+            probe_busy: true,
+            era: 3,
+            ..TopState::default()
+        });
+        let done = ignition_core::actions::script::ScriptRunResult {
+            stdout: String::new(),
+            result: serde_json::json!({"threadsLive": 71}),
+            elapsed_ms: 12,
+        };
+        update(
+            &mut state,
+            TopEvent::ScriptProbe {
+                era: 2,
+                result: Ok(Box::new(done)),
+            },
+        );
+        assert!(state.probe_busy, "stale probe dropped — busy unchanged");
+        assert!(state.modal.is_none(), "stale probe opened nothing");
+
+        let done = ignition_core::actions::script::ScriptRunResult {
+            stdout: String::new(),
+            result: serde_json::json!({"threadsLive": 71}),
+            elapsed_ms: 12,
+        };
+        update(
+            &mut state,
+            TopEvent::ScriptProbe {
+                era: 3,
+                result: Ok(Box::new(done)),
+            },
+        );
+        assert!(!state.probe_busy);
+        match state.modal {
+            Some(Modal::ScriptProbe {
+                result: Ok(document),
+            }) => {
+                assert!(document.contains("threadsLive"), "the JMX rows render");
+                assert!(document.contains("71"));
+            }
+            other => panic!("expected the probe document modal, got {other:?}"),
+        }
+        assert!(
+            state
+                .status_msg
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("12 ms")),
+            "the status line names the route-side elapsed"
+        );
+    }
+}

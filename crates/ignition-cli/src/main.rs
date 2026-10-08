@@ -3106,6 +3106,22 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 Err(err) => (None, Err(err)),
             }
         }
+        #[cfg(feature = "tui")]
+        // itop shares the Tui arm's contract verbatim: the same TTY
+        // guard (its OWN refusal — a hint must name the command that
+        // fixes it), the same lifecycle (loop/restore live in
+        // ignition-tui::itop), the same TuiExited output (render.rs
+        // suppresses the envelope for it — an exited monitor prints
+        // nothing). `ign itop` lands here through clap's alias.
+        Commands::Top => {
+            if !std::io::stdout().is_terminal() {
+                return (None, Err(CoreError::top_tty_refusal()));
+            }
+            match ignition_tui::itop::run(cli.profile.as_deref()).await {
+                Ok(()) => (None, Ok(ActionOutput::TuiExited)),
+                Err(err) => (None, Err(err)),
+            }
+        }
     }
 }
 

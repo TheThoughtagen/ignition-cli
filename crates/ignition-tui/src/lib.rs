@@ -6,6 +6,12 @@
 //! tab-bar chrome. Screen plans (06-02..06-06) plug into this loop
 //! additively — per-screen state, workers, and UI modules.
 //!
+//! The crate also hosts [`itop`] — the standalone `ign top` live
+//! monitor (htop for Ignition). It is deliberately NOT a cockpit tab:
+//! it owns its Elm loop and shares only the cockpit's vocabulary
+//! (context resolution, the theme palette, the action layer, and the
+//! era/shutdown worker conventions). The cockpit never imports it.
+//!
 //! Terminal lifecycle is `ratatui::init()`/`ratatui::restore()` — the
 //! official helpers install raw mode, the alternate screen, AND a
 //! restore-on-panic hook (research Pitfall 2). Callers guarantee a TTY
@@ -13,6 +19,7 @@
 
 pub mod context;
 pub mod event;
+pub mod itop;
 pub mod routes;
 pub mod state;
 pub mod ui;
