@@ -30,10 +30,13 @@ pub fn update(state: &mut TopState, event: TopEvent) {
             state.apply_sample(sample, std::time::Instant::now());
             state.clamp_selection();
         }
-        TopEvent::Killed { era, label, result } => {
-            if era != state.era {
-                return; // stale op — drop whole
-            }
+        // One-shot ops apply REGARDLESS of era: they are not tied to a
+        // sample-worker world, and a stale result can never corrupt the
+        // sample data. Dropping them on a world change strands their
+        // busy guards (review: the `e` probe stays disabled and the
+        // kill status shows "terminating …" forever if `+`/`-` lands
+        // mid-op). Samples keep the era gate above (Pitfall 9).
+        TopEvent::Killed { label, result, .. } => {
             match result {
                 Ok(summary) => state.status_msg = Some((summary, false)),
                 Err(err) => {
@@ -41,11 +44,8 @@ pub fn update(state: &mut TopState, event: TopEvent) {
                 }
             }
         }
-        TopEvent::ScriptProbe { era, result } => {
-            if era != state.era {
-                return; // stale probe — drop whole
-            }
-            state.probe_busy = false;
+        TopEvent::ScriptProbe { result, .. } => {
+            state.probe_busy = false; // always — see the one-shot note above
             match result {
                 Ok(done) => {
                     let document = serde_json::to_string_pretty(&*done)
@@ -246,10 +246,12 @@ mod tests {
         }
     }
 
-    /// Stale-era samples and ops drop whole — no data from a dead
-    /// world ever lands (Pitfall 9).
+    /// Stale-era samples drop whole — no data from a dead world ever
+    /// lands (Pitfall 9). One-shot ops (kill) apply regardless of era
+    /// (review: their results are not sample data; dropping strands
+    /// the status line after `+`/`-` respawns the worker).
     #[test]
-    fn stale_events_drop_whole() {
+    fn stale_samples_drop_but_ops_apply() {
         let mut state = TopState {
             era: 2,
             ..TopState::default()
@@ -264,7 +266,13 @@ mod tests {
                 result: Ok("terminated ps-1 (perspective)".into()),
             },
         );
-        assert!(state.status_msg.is_none(), "stale op dropped");
+        assert!(
+            state
+                .status_msg
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("terminated")),
+            "a one-shot op lands even from a dead era"
+        );
 
         update(&mut state, sample_event(2));
         assert!(state.last.is_some(), "current-era sample lands");
@@ -635,9 +643,11 @@ mod tests {
 
     /// The probe event lands: busy clears, the modal opens with the
     /// pretty document, the status line names the route-side elapsed.
-    /// Stale-era probes drop whole.
+    /// The probe applies regardless of era (review: dropping a
+    /// stale-era probe left `probe_busy` stuck true — every later `e`
+    /// refused until itop restarted).
     #[test]
-    fn script_probe_event_lands_and_stale_drops() {
+    fn script_probe_event_lands_regardless_of_era() {
         let mut state = with_rails(TopState {
             probe_busy: true,
             era: 3,
@@ -655,8 +665,14 @@ mod tests {
                 result: Ok(Box::new(done)),
             },
         );
-        assert!(state.probe_busy, "stale probe dropped — busy unchanged");
-        assert!(state.modal.is_none(), "stale probe opened nothing");
+        assert!(
+            !state.probe_busy,
+            "the probe lands from any era — busy always clears"
+        );
+        assert!(
+            state.modal.is_some(),
+            "the probe document modal opened from a dead era too"
+        );
 
         let done = ignition_core::actions::script::ScriptRunResult {
             stdout: String::new(),

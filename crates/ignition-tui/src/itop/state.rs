@@ -524,21 +524,14 @@ impl TopState {
     /// the one-shot busy guard. Degraded sections feed no ring (a gap
     /// is honest; the ring just stops growing).
     pub fn apply_sample(&mut self, sample: Box<TopSample>, at: Instant) {
-        if let Some(metrics) = &sample.metrics {
-            push_capped(&mut self.cpu_ring, metrics.current.cpu);
-            push_capped(&mut self.heap_ring, metrics.current.heap_memory);
-            let threads = &metrics.threads;
-            let total = (threads.running.max(0)
-                + threads.waiting.max(0)
-                + threads.timed_waiting.max(0)
-                + threads.blocked.max(0)) as u64;
-            push_capped(&mut self.thread_ring, total);
-        }
         // The charts bootstrap: an un-seeded world fills its rings from
         // the gateway's OWN history first (cpu percent / heap bytes /
         // non-heap bytes), so the sparklines open full instead of
         // growing from zero. Seeding happens once per world; the local
-        // samples continue from there.
+        // samples continue from there. Seeding runs BEFORE the live
+        // push below so the current sample lands as the ring's newest
+        // entry (push_capped would otherwise evict it at capacity and
+        // the sparkline would render it at the oldest position).
         if let Some(history) = &sample.history
             && !self.history_seeded
         {
@@ -552,6 +545,16 @@ impl TopState {
                 push_capped(&mut self.nonheap_ring, point.value);
             }
             self.history_seeded = true;
+        }
+        if let Some(metrics) = &sample.metrics {
+            push_capped(&mut self.cpu_ring, metrics.current.cpu);
+            push_capped(&mut self.heap_ring, metrics.current.heap_memory);
+            let threads = &metrics.threads;
+            let total = (threads.running.max(0)
+                + threads.waiting.max(0)
+                + threads.timed_waiting.max(0)
+                + threads.blocked.max(0)) as u64;
+            push_capped(&mut self.thread_ring, total);
         }
         self.last = Some(sample);
         self.last_at = Some(at);
