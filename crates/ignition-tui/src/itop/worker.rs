@@ -293,14 +293,17 @@ pub fn spawn_kill(state: &mut TopState, target: KillTarget) {
 }
 
 /// The scriptExec diagnostic probe's gateway-side code — a JMX
-/// snapshot through gateway-scope Jython: thread pool internals, JVM
+/// snapshot through gateway-scope Jython (`java.lang.management` —
+/// review fix: the factory lives in the management subpackage, not
+/// `java.lang`; the previous import raised NameError before any row
+/// was produced): thread pool internals, JVM
 /// memory pools, and class-loader counts that NO REST endpoint
 /// exposes. Every value is defensive (`-1` when a bean is denied by
 /// the security manager), so the probe degrades per-ROW, never fails
 /// whole. `_result` is the route's result carrier (the 05-01 route
 /// contract).
 pub const SCRIPT_PROBE_CODE: &str = r#"
-from java.lang import ManagementFactory
+from java.lang.management import ManagementFactory
 _rt = ManagementFactory.getRuntimeMXBean()
 _mem = ManagementFactory.getMemoryMXBean()
 _th = ManagementFactory.getThreadMXBean()
