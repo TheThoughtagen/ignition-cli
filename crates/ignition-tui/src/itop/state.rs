@@ -753,10 +753,7 @@ impl TopState {
         let tid = row.tid?;
         let snapshot = self.thread_dump.as_ref()?;
         let dump = snapshot.dump.as_ref()?;
-        let thread = dump
-            .threads
-            .iter()
-            .find(|thread| thread.id == Some(tid))?;
+        let thread = dump.threads.iter().find(|thread| thread.id == Some(tid))?;
         Some(Modal::ThreadStack {
             name: thread.name.clone(),
             lines: thread_stack_lines(thread, row.deadlocked),
@@ -987,7 +984,13 @@ pub fn flatten_sample(sample: &TopSample) -> Vec<Row> {
                 Some(count) => format!("{count} tags"),
                 None => String::new(),
             };
-            rows.push(Row::base(RowKind::Provider, provider.name.clone(), state, None, detail));
+            rows.push(Row::base(
+                RowKind::Provider,
+                provider.name.clone(),
+                state,
+                None,
+                detail,
+            ));
         }
     }
     rows
@@ -1013,7 +1016,10 @@ pub fn flatten_thread_dump(dump: &FormattedThreadDump, deadlocked: &[i64]) -> Ve
         .iter()
         .map(|thread| {
             let name = if thread.name.is_empty() {
-                format!("tid-{}", thread.id.map(|id| id.to_string()).unwrap_or("?".into()))
+                format!(
+                    "tid-{}",
+                    thread.id.map(|id| id.to_string()).unwrap_or("?".into())
+                )
             } else {
                 thread.name.clone()
             };

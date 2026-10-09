@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 
 use crate::itop::state::{
-    FAILING_STATES, HEALTHY_STATES, Family, Modal, Row, TopState, human_bytes, human_ms,
+    FAILING_STATES, Family, HEALTHY_STATES, Modal, Row, TopState, human_bytes, human_ms,
 };
 use crate::ui::theme::{self, Palette};
 
@@ -408,8 +408,8 @@ fn render_table(state: &TopState, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let header = TRow::new(["KIND", "NAME", "STATE", "CPU", "AGE", "DETAIL"])
-        .style(theme::header(palette));
+    let header =
+        TRow::new(["KIND", "NAME", "STATE", "CPU", "AGE", "DETAIL"]).style(theme::header(palette));
     let body: Vec<TRow> = rows.iter().map(|row| row_to_trow(row, palette)).collect();
 
     let mut table_state =
@@ -688,7 +688,9 @@ fn render_thread_stack(
     let palette = &state.palette;
     let area = frame.area();
     let width = 100u16.min(area.width.saturating_sub(2));
-    let height = (area.height.saturating_sub(2)).min(lines.len() as u16 + 4).max(6);
+    let height = (area.height.saturating_sub(2))
+        .min(lines.len() as u16 + 4)
+        .max(6);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -701,7 +703,11 @@ fn render_thread_stack(
     let block = Block::bordered()
         .title(format!("thread — {name}"))
         .title_bottom(Line::from(Span::styled(
-            format!("lines {}/{} · j/k scroll · esc closes", scroll + 1, lines.len()),
+            format!(
+                "lines {}/{} · j/k scroll · esc closes",
+                scroll + 1,
+                lines.len()
+            ),
             theme::muted(palette),
         )))
         .border_style(theme::border(palette))
@@ -1060,10 +1066,10 @@ mod tests {
 
     use crate::itop::state::{SortKey, ThreadSnapshot, thread_stack_lines};
 
-/// A fixture dump — two threads, one at 3.75% cpu holding a monitor,
-/// one blocked waiting on it, id 7 deadlocked.
-fn fixture_dump() -> ignition_core::client::threads::FormattedThreadDump {
-    serde_json::from_value(serde_json::json!({
+    /// A fixture dump — two threads, one at 3.75% cpu holding a monitor,
+    /// one blocked waiting on it, id 7 deadlocked.
+    fn fixture_dump() -> ignition_core::client::threads::FormattedThreadDump {
+        serde_json::from_value(serde_json::json!({
         "version": "dump-version-1",
         "threads": [
             {"name": "Perspective-Worker-3", "id": 42, "state": "RUNNABLE",
@@ -1077,7 +1083,7 @@ fn fixture_dump() -> ignition_core::client::threads::FormattedThreadDump {
         ]
     }))
     .expect("the fixture dump parses")
-}
+    }
 
     /// The threads view (family 6) renders the thread table sorted cpu
     /// desc — name, tid, cpu, state, web/daemon/system columns — plus

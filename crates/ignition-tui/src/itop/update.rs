@@ -39,14 +39,12 @@ pub fn update(state: &mut TopState, event: TopEvent) {
         // busy guards (review: the `e` probe stays disabled and the
         // kill status shows "terminating …" forever if `+`/`-` lands
         // mid-op). Samples keep the era gate above (Pitfall 9).
-        TopEvent::Killed { label, result, .. } => {
-            match result {
-                Ok(summary) => state.status_msg = Some((summary, false)),
-                Err(err) => {
-                    state.status_msg = Some((format!("kill {label} failed: {err}"), true));
-                }
+        TopEvent::Killed { label, result, .. } => match result {
+            Ok(summary) => state.status_msg = Some((summary, false)),
+            Err(err) => {
+                state.status_msg = Some((format!("kill {label} failed: {err}"), true));
             }
-        }
+        },
         TopEvent::ScriptProbe { result, .. } => {
             state.probe_busy = false; // always — see the one-shot note above
             match result {
@@ -101,10 +99,7 @@ pub fn update(state: &mut TopState, event: TopEvent) {
             };
             let status = match (&snap.dump, snap.deadlocked.as_deref()) {
                 (Some(dump), Some([])) => (
-                    format!(
-                        "thread dump: {} threads · no deadlocks",
-                        dump.threads.len()
-                    ),
+                    format!("thread dump: {} threads · no deadlocks", dump.threads.len()),
                     false,
                 ),
                 (Some(dump), Some(ids)) => (
@@ -852,16 +847,25 @@ mod tests {
     #[test]
     fn six_enters_threads_and_arms_the_dump() {
         let mut state = with_rails(TopState::default());
-        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('6')))));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('6')))),
+        );
         assert_eq!(state.family, Family::Threads);
         assert!(state.threads_busy, "entering the view fetches the dump");
         assert_eq!(state.sort_key, SortKey::Cpu, "cpu desc is the view default");
 
-        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('6')))));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('6')))),
+        );
         assert!(state.threads_busy, "re-press re-runs, still guarded");
 
         // Away and back: 1 leaves the view, 6 re-enters + re-dumps.
-        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('1')))));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('1')))),
+        );
         assert_eq!(state.family, Family::All);
         assert_eq!(state.sort_key, SortKey::Cpu, "the user's sort persists");
     }
@@ -885,10 +889,7 @@ mod tests {
             !state.threads_busy,
             "the dump lands from any era — busy always clears"
         );
-        let snapshot = state
-            .thread_dump
-            .as_ref()
-            .expect("the snapshot stored");
+        let snapshot = state.thread_dump.as_ref().expect("the snapshot stored");
         assert_eq!(
             snapshot.dump.as_ref().expect("dump ok").threads.len(),
             2,
@@ -927,7 +928,10 @@ mod tests {
             era: 1,
             ..TopState::default()
         });
-        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('6')))));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('6')))),
+        );
         // Simulate the op landing in-era: busy clears, the snapshot
         // stores (selection 0 is the hot thread under the cpu-desc
         // default `6` armed).
@@ -942,7 +946,11 @@ mod tests {
 
         update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Enter))));
         match state.modal.as_ref() {
-            Some(Modal::ThreadStack { name, lines, scroll }) => {
+            Some(Modal::ThreadStack {
+                name,
+                lines,
+                scroll,
+            }) => {
                 assert_eq!(name, "Perspective-Worker-3", "the selected row's thread");
                 assert_eq!(*scroll, 0);
                 assert!(lines[0].contains("RUNNABLE"), "{}", lines[0]);
@@ -964,7 +972,10 @@ mod tests {
         }
 
         // j scrolls, Esc closes.
-        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('j')))));
+        update(
+            &mut state,
+            TopEvent::Input(Event::Key(key(KeyCode::Char('j')))),
+        );
         match state.modal.as_ref() {
             Some(Modal::ThreadStack { scroll, .. }) => assert_eq!(*scroll, 1, "j scrolled"),
             other => panic!("scroll kept the modal, got {other:?}"),

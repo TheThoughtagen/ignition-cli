@@ -1940,15 +1940,15 @@ mod tests {
             .and(wiremock::matchers::path(
                 "/data/api/v1/diagnostics/threads/dump/formatted",
             ))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "version": "dump-version-1",
                     "threads": [
                         {"name": "Perspective-Worker-3", "id": 42, "state": "RUNNABLE",
                          "daemon": true, "cpuUsage": 3.75, "stacktrace": ["frame-0"]}
                     ]
-                }),
-            ))
+                })),
+            )
             .expect(1)
             .mount_as_scoped(&server)
             .await;

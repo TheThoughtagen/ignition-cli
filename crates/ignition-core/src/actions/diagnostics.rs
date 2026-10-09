@@ -93,9 +93,7 @@ pub async fn thread_dump(api: &dyn GatewayApi) -> Result<FormattedThreadDump, Co
 }
 
 /// The deadlocked-thread id list (empty = healthy — thin wrapper).
-pub async fn thread_deadlocks(
-    api: &dyn GatewayApi,
-) -> Result<threads::DeadlocksWire, CoreError> {
+pub async fn thread_deadlocks(api: &dyn GatewayApi) -> Result<threads::DeadlocksWire, CoreError> {
     api.thread_deadlocks().await
 }
 

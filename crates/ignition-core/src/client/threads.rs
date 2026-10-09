@@ -185,12 +185,13 @@ mod tests {
 
         let blocked = &dump.threads[1];
         assert_eq!(blocked.state, "BLOCKED");
-        assert!(
-            !blocked.daemon,
-            "absent daemon defaults false"
-        );
+        assert!(!blocked.daemon, "absent daemon defaults false");
         assert_eq!(
-            blocked.waiting_for.as_ref().and_then(|w| w.lock.clone()).as_deref(),
+            blocked
+                .waiting_for
+                .as_ref()
+                .and_then(|w| w.lock.clone())
+                .as_deref(),
             Some("<0x1a2b> (a com.inductiveautomation...)"),
             "the waiting-for lock parses through the nested object"
         );
@@ -224,17 +225,23 @@ mod tests {
         );
 
         let round = serde_json::to_value(thread).expect("serialize");
-        assert_eq!(round["name"], "minimal", "gateway-native key on the way out");
-        assert_eq!(round["cpuUsage"], serde_json::Value::Null, "camelCase rename");
+        assert_eq!(
+            round["name"], "minimal",
+            "gateway-native key on the way out"
+        );
+        assert_eq!(
+            round["cpuUsage"],
+            serde_json::Value::Null,
+            "camelCase rename"
+        );
     }
 
     /// The deadlocks body: `{"deadlocks": [id, …]}` — ids match the
     /// dump's `id` field, and an EMPTY list is the healthy answer.
     #[test]
     fn deadlocks_wire_parses_the_id_list() {
-        let wire: DeadlocksWire =
-            serde_json::from_value(serde_json::json!({"deadlocks": [7, 42]}))
-                .expect("the deadlocks shape must parse");
+        let wire: DeadlocksWire = serde_json::from_value(serde_json::json!({"deadlocks": [7, 42]}))
+            .expect("the deadlocks shape must parse");
         assert_eq!(wire.deadlocks, vec![7, 42]);
 
         let healthy: DeadlocksWire = serde_json::from_value(serde_json::json!({}))
