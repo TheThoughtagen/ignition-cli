@@ -43,6 +43,7 @@ use serde::Serialize;
 
 use crate::client::GatewayApi;
 use crate::client::diagnostics::{self};
+use crate::client::threads;
 use crate::error::CoreError;
 use crate::poll::{self, PollConfig, PollState};
 
@@ -52,6 +53,7 @@ pub use crate::client::diagnostics::{
     BUNDLE_CAPTURED_STATES, BUNDLE_DOWNLOAD_TIMEOUT, BUNDLE_GENERATING_STATES,
     BUNDLE_UNAVAILABLE_STATES, BundleStatusWire, is_bundle_unavailable, is_generating,
 };
+pub use crate::client::threads::FormattedThreadDump;
 
 /// `ign diagnostics bundle generate` / `status` / `wait` — the three
 /// status-carrying verbs return the CAPTURED wire directly (the
@@ -81,6 +83,20 @@ pub async fn bundle_generate(api: &dyn GatewayApi) -> Result<BundleStatusWire, C
 /// Read the bundle status — thin wrapper.
 pub async fn bundle_status(api: &dyn GatewayApi) -> Result<BundleStatusWire, CoreError> {
     api.bundle_status().await
+}
+
+/// The formatted thread dump — the Gateway web UI's Diagnostics→Threads
+/// page data (thin wrapper; the model's tolerance contract lives in
+/// [`crate::client::threads`]).
+pub async fn thread_dump(api: &dyn GatewayApi) -> Result<FormattedThreadDump, CoreError> {
+    api.thread_dump().await
+}
+
+/// The deadlocked-thread id list (empty = healthy — thin wrapper).
+pub async fn thread_deadlocks(
+    api: &dyn GatewayApi,
+) -> Result<threads::DeadlocksWire, CoreError> {
+    api.thread_deadlocks().await
 }
 
 /// Poll the status until the bundle is ready. The captured
@@ -240,6 +256,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for WaitRig {
+        async fn thread_dump(
+            &self,
+        ) -> Result<crate::client::threads::FormattedThreadDump, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn thread_deadlocks(
+            &self,
+        ) -> Result<crate::client::threads::DeadlocksWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn uninstall_module(
             &self,
             _gateway_module_id: &str,

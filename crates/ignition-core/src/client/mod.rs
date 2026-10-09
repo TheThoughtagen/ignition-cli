@@ -53,6 +53,7 @@ pub mod scripts_codec;
 pub mod sessions;
 pub mod status;
 pub mod tags;
+pub mod threads;
 pub mod trial;
 pub mod version;
 pub mod webdev;
@@ -134,6 +135,15 @@ pub trait GatewayApi: Send + Sync {
     /// Fetch `/data/api/v1/systemPerformance/threads` (authed) — thread
     /// execution counts (running/waiting/timedWaiting/blocked).
     async fn metrics_threads(&self) -> Result<ThreadCounts, CoreError>;
+    /// Fetch `/data/api/v1/diagnostics/threads/dump/formatted` (authed)
+    /// — the Gateway web UI's Diagnostics→Threads page data: one entry
+    /// per JVM thread (state, daemon, cpuUsage, stacktrace, monitors).
+    /// Every field tolerant — the spec's own "not all fields
+    /// guaranteed" caveat.
+    async fn thread_dump(&self) -> Result<threads::FormattedThreadDump, CoreError>;
+    /// Fetch `/data/api/v1/diagnostics/threads/deadlocks` (authed) —
+    /// the JVM-reported deadlocked thread ids (empty = healthy).
+    async fn thread_deadlocks(&self) -> Result<threads::DeadlocksWire, CoreError>;
     /// Fetch `/data/api/v1/designers` (authed) — active Designer
     /// sessions (02-03, HLTH-08).
     async fn designers(
@@ -1044,6 +1054,16 @@ impl GatewayApi for ReqwestGatewayApi {
         self.get_json(metrics::THREADS_PATH, None, true).await
     }
 
+    async fn thread_dump(&self) -> Result<threads::FormattedThreadDump, CoreError> {
+        self.get_json(threads::THREAD_DUMP_FORMATTED_PATH, None, true)
+            .await
+    }
+
+    async fn thread_deadlocks(&self) -> Result<threads::DeadlocksWire, CoreError> {
+        self.get_json(threads::THREAD_DEADLOCKS_PATH, None, true)
+            .await
+    }
+
     async fn designers(
         &self,
         query: &query::ListQuery,
@@ -1871,7 +1891,7 @@ impl GatewayApi for ReqwestGatewayApi {
 
 #[cfg(test)]
 mod tests {
-    use super::ReqwestGatewayApi;
+    use super::{GatewayApi, ReqwestGatewayApi};
 
     /// Exercises `post_empty` end-to-end with the shape 02-04's
     /// set-logger-level route uses (query param + empty body): the
@@ -1907,5 +1927,64 @@ mod tests {
             requests[0].body.is_empty(),
             "the POST carries NO body — params ride the query string"
         );
+    }
+
+    /// The formatted thread dump rides its EXACT path
+    /// (`/data/api/v1/diagnostics/threads/dump/formatted` — the
+    /// Gateway web UI's Diagnostics→Threads endpoint, live-spec
+    /// pinned) and parses into the tolerant model.
+    #[tokio::test]
+    async fn thread_dump_rides_the_formatted_dump_path() {
+        let server = wiremock::MockServer::start().await;
+        let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/data/api/v1/diagnostics/threads/dump/formatted",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "version": "dump-version-1",
+                    "threads": [
+                        {"name": "Perspective-Worker-3", "id": 42, "state": "RUNNABLE",
+                         "daemon": true, "cpuUsage": 3.75, "stacktrace": ["frame-0"]}
+                    ]
+                }),
+            ))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let dump = api.thread_dump().await.expect("200 + spec shape parses");
+        assert_eq!(dump.threads.len(), 1);
+        assert_eq!(dump.threads[0].id, Some(42));
+        assert_eq!(dump.threads[0].state, "RUNNABLE");
+        assert_eq!(guard.received_requests().await.len(), 1);
+    }
+
+    /// The deadlocked-id list rides its EXACT path
+    /// (`/data/api/v1/diagnostics/threads/deadlocks`) and the healthy
+    /// empty-list body parses.
+    #[tokio::test]
+    async fn thread_deadlocks_rides_the_deadlocks_path() {
+        let server = wiremock::MockServer::start().await;
+        let guard = wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/data/api/v1/diagnostics/threads/deadlocks",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"deadlocks": [7, 42]})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let wire = api
+            .thread_deadlocks()
+            .await
+            .expect("200 + the deadlocks shape parses");
+        assert_eq!(wire.deadlocks, vec![7, 42]);
+        assert_eq!(guard.received_requests().await.len(), 1);
     }
 }

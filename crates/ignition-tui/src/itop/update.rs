@@ -11,8 +11,11 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::itop::event::TopEvent;
-use crate::itop::state::{Family, Modal, TopState};
-use crate::itop::worker::{spawn_kill, spawn_sample_once, spawn_sample_worker, spawn_script_probe};
+use crate::itop::state::{Family, Modal, SortKey, ThreadSnapshot, TopState};
+use crate::itop::worker::{
+    spawn_kill, spawn_sample_once, spawn_sample_worker, spawn_script_probe,
+    spawn_thread_diagnostics,
+};
 
 /// Process one event. Pure over the state (spawns aside).
 pub fn update(state: &mut TopState, event: TopEvent) {
@@ -69,6 +72,66 @@ pub fn update(state: &mut TopState, event: TopEvent) {
                 }
             }
         }
+        TopEvent::ThreadDiagnostics {
+            at,
+            dump,
+            deadlocked,
+        } => {
+            state.threads_busy = false; // always — the one-shot note above
+            let (dump, dump_error) = match dump {
+                Ok(dump) => (Some(dump), None),
+                Err(err) => (None, Some(err)),
+            };
+            let (deadlocked, deadlocks_error) = match deadlocked {
+                Ok(ids) => (Some(ids), None),
+                Err(err) => (None, Some(err)),
+            };
+            state.thread_dump = Some(Box::new(ThreadSnapshot {
+                at,
+                dump,
+                dump_error,
+                deadlocked,
+                deadlocks_error,
+            }));
+            state.clamp_selection();
+            // The status line summarizes the op — the table itself
+            // carries the detail (cpu column + the ⚠ deadlock marks).
+            let Some(snap) = state.thread_dump.as_ref() else {
+                return;
+            };
+            let status = match (&snap.dump, snap.deadlocked.as_deref()) {
+                (Some(dump), Some([])) => (
+                    format!(
+                        "thread dump: {} threads · no deadlocks",
+                        dump.threads.len()
+                    ),
+                    false,
+                ),
+                (Some(dump), Some(ids)) => (
+                    format!(
+                        "thread dump: {} threads · ⚠ {} DEADLOCKED",
+                        dump.threads.len(),
+                        ids.len()
+                    ),
+                    true,
+                ),
+                (Some(dump), None) => (
+                    format!(
+                        "thread dump: {} threads · deadlocks check failed",
+                        dump.threads.len()
+                    ),
+                    true,
+                ),
+                (None, _) => (
+                    format!(
+                        "thread dump failed: {}",
+                        snap.dump_error.as_deref().unwrap_or("unknown error")
+                    ),
+                    true,
+                ),
+            };
+            state.status_msg = Some(status);
+        }
     }
 }
 
@@ -124,6 +187,40 @@ fn handle_modal_key(state: &mut TopState, key: KeyEvent) {
             }
             _ => state.modal = None, // n / Esc / anything — cancel
         },
+        Modal::ThreadStack {
+            name,
+            lines,
+            mut scroll,
+        } => {
+            // Scrollable (a real stack outgrows any modal): navigation
+            // keys move the offset; Esc/Enter/q close.
+            let page = 10usize;
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    scroll = (scroll + 1).min(lines.len().saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    scroll = scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown | KeyCode::Char('J') => {
+                    scroll = (scroll + page).min(lines.len().saturating_sub(1));
+                }
+                KeyCode::PageUp | KeyCode::Char('K') => {
+                    scroll = scroll.saturating_sub(page);
+                }
+                KeyCode::Home | KeyCode::Char('g') => scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => scroll = lines.len().saturating_sub(1),
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    return; // modal stays closed — the take() already cleared it
+                }
+                _ => {}
+            }
+            state.modal = Some(Modal::ThreadStack {
+                name,
+                lines,
+                scroll,
+            });
+        }
     }
 }
 
@@ -163,10 +260,27 @@ fn handle_table_key(state: &mut TopState, key: KeyEvent) {
             })
         }
         KeyCode::Char('?') => state.modal = Some(Modal::Help),
-        KeyCode::Char(ch @ '1'..='5') => {
+        KeyCode::Char(ch @ '1'..='6') => {
             let family = Family::ALL[(ch as u8 - b'1') as usize];
             state.family = family;
             state.selected = 0;
+            if family == Family::Threads {
+                // Entering the threads view IS the fetch (the web UI's
+                // click-to-load); a re-press re-dumps, busy-guarded.
+                // First entry defaults the sort to CPU DESC — the hot
+                // thread leads, the web column's instinct.
+                spawn_thread_diagnostics(state);
+                if state.sort_key == SortKey::Kind {
+                    state.sort_key = SortKey::Cpu;
+                }
+            }
+        }
+        KeyCode::Enter => {
+            // The threads view's stack viewer — inert elsewhere (the
+            // Esc-without-filter rule: accidental nothing is fine).
+            if let Some(modal) = state.armed_thread_stack() {
+                state.modal = Some(modal);
+            }
         }
         KeyCode::Char('x') | KeyCode::F(9) => arm_kill(state),
         // Vim-style + arrows + pagers — the cockpit's table navigation.
@@ -703,5 +817,159 @@ mod tests {
                 .is_some_and(|(msg, _)| msg.contains("12 ms")),
             "the status line names the route-side elapsed"
         );
+    }
+
+    /// A fixture dump — two threads, one at 3.75% cpu holding a
+    /// monitor, one blocked waiting on it, id 7 deadlocked.
+    fn fixture_dump() -> ignition_core::client::threads::FormattedThreadDump {
+        serde_json::from_value(serde_json::json!({
+            "version": "dump-version-1",
+            "threads": [
+                {"name": "Perspective-Worker-3", "id": 42, "state": "RUNNABLE",
+                 "daemon": true, "cpuUsage": 3.75,
+                 "lockedMonitors": [{"lock": "<0x1a2b> (a Worker)", "frame": "Worker.lock - line 88"}]},
+                {"name": "pool-2-thread-1", "id": 7, "state": "BLOCKED",
+                 "cpuUsage": 0.0,
+                 "waitingFor": {"lock": "<0x1a2b> (a Worker)"}}
+            ]
+        }))
+        .expect("the fixture dump parses")
+    }
+
+    fn thread_diagnostics_event(
+        dump: ignition_core::client::threads::FormattedThreadDump,
+    ) -> TopEvent {
+        TopEvent::ThreadDiagnostics {
+            at: std::time::Instant::now(),
+            dump: Ok(Box::new(dump)),
+            deadlocked: Ok(vec![7]),
+        }
+    }
+
+    /// Key 6 enters the threads view AND arms the dump op (busy-guarded
+    /// on re-press); the first entry defaults the sort to cpu desc —
+    /// the hot thread leads, the web column's instinct.
+    #[test]
+    fn six_enters_threads_and_arms_the_dump() {
+        let mut state = with_rails(TopState::default());
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('6')))));
+        assert_eq!(state.family, Family::Threads);
+        assert!(state.threads_busy, "entering the view fetches the dump");
+        assert_eq!(state.sort_key, SortKey::Cpu, "cpu desc is the view default");
+
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('6')))));
+        assert!(state.threads_busy, "re-press re-runs, still guarded");
+
+        // Away and back: 1 leaves the view, 6 re-enters + re-dumps.
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('1')))));
+        assert_eq!(state.family, Family::All);
+        assert_eq!(state.sort_key, SortKey::Cpu, "the user's sort persists");
+    }
+
+    /// The thread-diagnostics event lands regardless of era (the
+    /// one-shot convention): busy clears, the snapshot stores both
+    /// degraded calls, and the status line names the deadlock count.
+    #[test]
+    fn thread_diagnostics_event_lands_regardless_of_era() {
+        let mut state = with_rails(TopState {
+            threads_busy: true,
+            family: Family::Threads, // the dump landed in the threads view
+            era: 3,
+            ..TopState::default()
+        });
+        update(
+            &mut state,
+            thread_diagnostics_event(fixture_dump()), // lands from any era
+        );
+        assert!(
+            !state.threads_busy,
+            "the dump lands from any era — busy always clears"
+        );
+        let snapshot = state
+            .thread_dump
+            .as_ref()
+            .expect("the snapshot stored");
+        assert_eq!(
+            snapshot.dump.as_ref().expect("dump ok").threads.len(),
+            2,
+            "both threads stored"
+        );
+        assert_eq!(
+            snapshot.deadlocked.as_deref(),
+            Some(&[7][..]),
+            "the deadlocked ids stored"
+        );
+        let (msg, is_err) = state.status_msg.as_ref().expect("status set");
+        assert!(msg.contains("2 threads"), "{msg}");
+        assert!(msg.contains("⚠ 1 DEADLOCKED"), "{msg}");
+        assert!(*is_err, "a deadlock is the alarm case");
+
+        // The rows flatten: the threads view's visible list.
+        let rows = state.visible_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Perspective-Worker-3", "cpu desc — hot first");
+        assert!((rows[0].cpu.unwrap() - 3.75).abs() < f64::EPSILON);
+        assert!(!rows[0].deadlocked);
+        assert_eq!(rows[1].name, "pool-2-thread-1");
+        assert!(rows[1].deadlocked, "tid 7 is in the deadlocked list");
+        assert!(
+            rows[1].detail.contains("waiting <0x1a2b> (a Worker)"),
+            "the waiting-for lock rides detail verbatim"
+        );
+    }
+
+    /// Enter on a thread row opens the scrollable stack modal — header
+    /// facts, the hold/wait annotations, frames verbatim; j/k scroll,
+    /// Esc closes.
+    #[test]
+    fn enter_opens_the_thread_stack_modal() {
+        let mut state = with_rails(TopState {
+            era: 1,
+            ..TopState::default()
+        });
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('6')))));
+        // Simulate the op landing in-era: busy clears, the snapshot
+        // stores (selection 0 is the hot thread under the cpu-desc
+        // default `6` armed).
+        state.threads_busy = false;
+        state.thread_dump = Some(Box::new(ThreadSnapshot {
+            at: std::time::Instant::now(),
+            dump: Some(Box::new(fixture_dump())),
+            dump_error: None,
+            deadlocked: Some(vec![7]),
+            deadlocks_error: None,
+        }));
+
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Enter))));
+        match state.modal.as_ref() {
+            Some(Modal::ThreadStack { name, lines, scroll }) => {
+                assert_eq!(name, "Perspective-Worker-3", "the selected row's thread");
+                assert_eq!(*scroll, 0);
+                assert!(lines[0].contains("RUNNABLE"), "{}", lines[0]);
+                assert!(lines[0].contains("cpu 3.8%"), "{}", lines[0]);
+                assert!(
+                    lines.iter().any(|line| {
+                        line.contains("holds <0x1a2b> (a Worker) — Worker.lock - line 88")
+                    }),
+                    "the locked monitor renders with its frame"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line == "(the dump carries no stack for this thread)"),
+                    "the honest absence renders when the dump has no stack"
+                );
+            }
+            other => panic!("expected the thread stack modal, got {other:?}"),
+        }
+
+        // j scrolls, Esc closes.
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Char('j')))));
+        match state.modal.as_ref() {
+            Some(Modal::ThreadStack { scroll, .. }) => assert_eq!(*scroll, 1, "j scrolled"),
+            other => panic!("scroll kept the modal, got {other:?}"),
+        }
+        update(&mut state, TopEvent::Input(Event::Key(key(KeyCode::Esc))));
+        assert!(state.modal.is_none(), "esc closes the stack");
     }
 }

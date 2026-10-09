@@ -384,6 +384,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for TailRig {
+        async fn thread_dump(
+            &self,
+        ) -> Result<crate::client::threads::FormattedThreadDump, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn thread_deadlocks(
+            &self,
+        ) -> Result<crate::client::threads::DeadlocksWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         async fn uninstall_module(
             &self,
             _gateway_module_id: &str,
@@ -795,6 +805,16 @@ mod tests {
         struct AuthRig;
         #[async_trait::async_trait]
         impl GatewayApi for AuthRig {
+            async fn thread_dump(
+                &self,
+            ) -> Result<crate::client::threads::FormattedThreadDump, CoreError> {
+                unreachable!("not part of this action")
+            }
+            async fn thread_deadlocks(
+                &self,
+            ) -> Result<crate::client::threads::DeadlocksWire, CoreError> {
+                unreachable!("not part of this action")
+            }
             async fn uninstall_module(
                 &self,
                 _gateway_module_id: &str,

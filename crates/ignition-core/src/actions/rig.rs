@@ -2699,6 +2699,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for SnapshotRig {
+        async fn thread_dump(
+            &self,
+        ) -> Result<crate::client::threads::FormattedThreadDump, CoreError> {
+            unreachable!("not part of this action")
+        }
+        async fn thread_deadlocks(
+            &self,
+        ) -> Result<crate::client::threads::DeadlocksWire, CoreError> {
+            unreachable!("not part of this action")
+        }
         /// PANICS, on the call itself (D-19-01): no action driven
         /// through this fake may uninstall a module. `rig up`/`rig
         /// reset` only ever REPORT an orphan. A panic is a stronger

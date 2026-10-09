@@ -59,4 +59,18 @@ pub enum TopEvent {
         /// The probe's outcome.
         result: Result<Box<ignition_core::actions::script::ScriptRunResult>, String>,
     },
+    /// The thread-diagnostics op (`6`) finished — the formatted dump
+    /// and the deadlocked-id list, each degraded INDEPENDENTLY (a
+    /// deadlocks failure never hides the dump). A one-shot op: it
+    /// applies regardless of era (not sample data — the kill/probe
+    /// convention).
+    ThreadDiagnostics {
+        /// When the op landed (the dump-age footer readout).
+        at: std::time::Instant,
+        /// The formatted dump; Err the honest failure.
+        dump: Result<Box<ignition_core::client::threads::FormattedThreadDump>, String>,
+        /// Deadlocked thread ids — `Ok(empty)` is the HEALTHY answer
+        /// (the JVM's "no deadlocks"); Err the honest failure.
+        deadlocked: Result<Vec<i64>, String>,
+    },
 }

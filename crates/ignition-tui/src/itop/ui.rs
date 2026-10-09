@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 
 use crate::itop::state::{
-    FAILING_STATES, HEALTHY_STATES, Modal, Row, TopState, human_bytes, human_ms,
+    FAILING_STATES, HEALTHY_STATES, Family, Modal, Row, TopState, human_bytes, human_ms,
 };
 use crate::ui::theme::{self, Palette};
 
@@ -46,6 +46,11 @@ pub fn render(state: &TopState, frame: &mut Frame) {
             Modal::Filter { buffer } => render_filter(state, frame, buffer),
             Modal::ConfirmKill { target } => render_confirm_kill(state, frame, target),
             Modal::ScriptProbe { result } => render_script_probe(state, frame, result),
+            Modal::ThreadStack {
+                name,
+                lines,
+                scroll,
+            } => render_thread_stack(state, frame, name, lines, *scroll),
         }
     }
 }
@@ -320,9 +325,39 @@ fn render_table(state: &TopState, frame: &mut Frame, area: Rect) {
     let palette = &state.palette;
     let rows = state.visible_rows();
 
+    // The threads view's title carries the dump's own truth: age,
+    // deadlock banner, and busy state (the web UI's Diagnostics→
+    // Threads header facts).
+    let threads_note = if state.family == Family::Threads {
+        match (&state.thread_dump, state.threads_busy) {
+            (Some(snapshot), _) => {
+                let age = std::time::Instant::now().saturating_duration_since(snapshot.at);
+                let mut note = format!(" · dump {}s ago", age.as_secs());
+                if let Some(ids) = &snapshot.deadlocked {
+                    if ids.is_empty() {
+                        note.push_str(" · no deadlocks");
+                    } else {
+                        note.push_str(&format!(" · ⚠ {} DEADLOCKED", ids.len()));
+                    }
+                }
+                if let Some(err) = &snapshot.deadlocks_error {
+                    note.push_str(&format!(" · deadlocks check failed: {err}"));
+                }
+                note
+            }
+            (None, true) => " · dumping threads…".to_string(),
+            (None, false) => " · no dump yet — 6 fetches it".to_string(),
+        }
+    } else {
+        String::new()
+    };
+
     let title = match &state.filter {
-        Some(filter) => format!("entities — {} — /{filter}", state.family.label(),),
-        None => format!("entities — {}", state.family.label()),
+        Some(filter) => format!(
+            "entities — {}{threads_note} — /{filter}",
+            state.family.label(),
+        ),
+        None => format!("entities — {}{threads_note}", state.family.label()),
     };
     let block = Block::bordered()
         .title(title)
@@ -344,10 +379,27 @@ fn render_table(state: &TopState, frame: &mut Frame, area: Rect) {
     }
 
     if rows.is_empty() {
-        let why = if state.filter.is_some() {
-            "no entities match the filter — Esc clears it"
+        let why = if state.family == Family::Threads {
+            // The threads view's honest empty ladder: busy → failed →
+            // un-fetched → filtered-to-nothing.
+            match &state.thread_dump {
+                None => {
+                    if state.threads_busy {
+                        "dumping threads…".to_string()
+                    } else {
+                        "no thread dump yet — 6 fetches it".to_string()
+                    }
+                }
+                Some(snapshot) => match (&snapshot.dump, &snapshot.dump_error) {
+                    (None, Some(err)) => format!("thread dump failed: {err}"),
+                    (None, None) => "thread dump pending…".to_string(),
+                    (Some(_), _) => "no threads match the filter — Esc clears it".to_string(),
+                },
+            }
+        } else if state.filter.is_some() {
+            "no entities match the filter — Esc clears it".to_string()
         } else {
-            "no entities in this view — 1 shows all"
+            "no entities in this view — 1 shows all".to_string()
         };
         frame.render_widget(
             Paragraph::new(Span::styled(why, theme::muted(palette))),
@@ -356,8 +408,8 @@ fn render_table(state: &TopState, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let header =
-        TRow::new(["KIND", "NAME", "STATE", "AGE", "DETAIL"]).style(theme::header(palette));
+    let header = TRow::new(["KIND", "NAME", "STATE", "CPU", "AGE", "DETAIL"])
+        .style(theme::header(palette));
     let body: Vec<TRow> = rows.iter().map(|row| row_to_trow(row, palette)).collect();
 
     let mut table_state =
@@ -368,6 +420,7 @@ fn render_table(state: &TopState, frame: &mut Frame, area: Rect) {
             Length(10), // KIND
             Fill(1),    // NAME
             Length(13), // STATE
+            Length(11), // CPU · tid (thread rows; `—` elsewhere)
             Length(9),  // AGE
             Fill(2),    // DETAIL
         ],
@@ -379,21 +432,42 @@ fn render_table(state: &TopState, frame: &mut Frame, area: Rect) {
 }
 
 /// One table row, state-colored: the STATE span picks success/error/
-/// warning by the honest-state word lists; everything else rides
-/// text/muted.
+/// warning by the honest-state word lists; a deadlocked thread's row
+/// carries the ⚠ marker in the error slot; the CPU cell thresholds
+/// like the header gauges. Everything else rides text/muted.
 fn row_to_trow(row: &Row, palette: &Palette) -> TRow<'static> {
-    let state_style = if HEALTHY_STATES.contains(&row.state.to_lowercase().as_str()) {
+    let state_style = if row.deadlocked {
+        // The JVM's deadlock detection outranks the word lists —
+        // the alarm IS the state.
+        theme::error(palette)
+    } else if HEALTHY_STATES.contains(&row.state.to_lowercase().as_str()) {
         theme::success(palette)
     } else if FAILING_STATES.contains(&row.state.to_lowercase().as_str()) {
         theme::error(palette)
     } else {
         theme::warning(palette)
     };
+    let state_text = if row.deadlocked {
+        format!("⚠ {}", row.state)
+    } else {
+        row.state.clone()
+    };
     let age = row.age_ms.map(human_ms).unwrap_or_else(|| "—".into());
+    // The CPU cell carries the tid too (the web UI's Thread ID column,
+    // folded in — a full column would starve NAME/DETAIL at 80 cols).
+    let cpu = match (row.cpu, row.tid) {
+        (Some(cpu), Some(tid)) => {
+            Span::styled(format!("{cpu:.1}·{tid}"), threshold_style(palette, cpu))
+        }
+        (Some(cpu), None) => Span::styled(format!("{cpu:.1}"), threshold_style(palette, cpu)),
+        (None, Some(tid)) => Span::styled(format!("—·{tid}"), theme::muted(palette)),
+        (None, None) => Span::styled("—".to_string(), theme::muted(palette)),
+    };
     TRow::new([
         Span::styled(row.kind.label().to_string(), theme::muted(palette)),
         Span::styled(row.name.clone(), theme::text(palette)),
-        Span::styled(row.state.clone(), state_style),
+        Span::styled(state_text, state_style),
+        cpu,
         Span::styled(age, theme::text(palette)),
         Span::styled(row.detail.clone(), theme::muted(palette)),
     ])
@@ -457,6 +531,13 @@ fn render_footer(state: &TopState, frame: &mut Frame, area: Rect) {
         Some(filter) => format!(" · /{filter}"),
         None => String::new(),
     };
+    // The threads view swaps its family-specific gestures into the
+    // hint line (the web page's click affordances, keyed).
+    let hints = if state.family == Family::Threads {
+        "  │  q quit · space pause · +/- interval · r refresh · s sort · 1-6 view · ⏎ stack · 6 re-dump · x kill · ? help"
+    } else {
+        "  │  q quit · space pause · +/- interval · r refresh · e probe · s sort · S reverse · / filter · 1-6 view · x kill · ? help"
+    };
     let line2 = Line::from(vec![
         // The profile name leads — the monitor is profile-fixed at
         // launch, so the name IS the target identity on screen.
@@ -478,10 +559,7 @@ fn render_footer(state: &TopState, frame: &mut Frame, area: Rect) {
             ),
             theme::muted(palette),
         ),
-        Span::styled(
-            "  │  q quit · space pause · +/- interval · r refresh · e probe · s sort · S reverse · / filter · 1-5 view · x kill · ? help",
-            theme::muted(palette),
-        ),
+        Span::styled(hints, theme::muted(palette)),
     ]);
     frame.render_widget(line2, keys_line);
 }
@@ -555,9 +633,16 @@ fn render_help(state: &TopState, frame: &mut Frame) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("1-5         ", theme::success(palette)),
+            Span::styled("1-6         ", theme::success(palette)),
             Span::styled(
-                "view all / modules / sessions / connections / providers",
+                "view all / modules / sessions / connections / providers / threads",
+                theme::text(palette),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("6 (threads) ", theme::success(palette)),
+            Span::styled(
+                "fetch the live thread dump again — Enter on a row opens its stack",
                 theme::text(palette),
             ),
         ]),
@@ -587,6 +672,48 @@ fn render_help(state: &TopState, frame: &mut Frame) {
     ];
     let height = lines.len() as u16 + 2;
     render_centered(state, frame, "itop help", lines, 60, height);
+}
+
+/// The thread stack viewer — the web UI's per-thread stack pane.
+/// SCROLLABLE (a real stack outgrows any modal): the offset moves the
+/// window over the frozen snapshot lines; the scroll position and the
+/// line count ride the title (where you are, honestly).
+fn render_thread_stack(
+    state: &TopState,
+    frame: &mut Frame,
+    name: &str,
+    lines: &[String],
+    scroll: usize,
+) {
+    let palette = &state.palette;
+    let area = frame.area();
+    let width = 100u16.min(area.width.saturating_sub(2));
+    let height = (area.height.saturating_sub(2)).min(lines.len() as u16 + 4).max(6);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let scroll = scroll.min(lines.len().saturating_sub(1));
+    let body: Vec<Line> = lines
+        .iter()
+        .map(|line| Line::from(Span::styled(line.clone(), theme::text(palette))))
+        .collect();
+    let block = Block::bordered()
+        .title(format!("thread — {name}"))
+        .title_bottom(Line::from(Span::styled(
+            format!("lines {}/{} · j/k scroll · esc closes", scroll + 1, lines.len()),
+            theme::muted(palette),
+        )))
+        .border_style(theme::border(palette))
+        .title_style(theme::title(palette));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(block)
+            .scroll((scroll as u16, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// The filter prompt — bottom-centered one-line input.
@@ -711,7 +838,14 @@ mod tests {
     /// Render one frame on a fixed 100×30 TestBackend and return the
     /// full text grid (the dashboard render-proof idiom).
     fn rendered(state: &TopState) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        rendered_at(state, 100, 30)
+    }
+
+    /// The grid at an explicit size — the threads table needs ~150
+    /// columns to show a full thread name, its tid, and lock strings
+    /// (the live captures run at 190).
+    fn rendered_at(state: &TopState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal.draw(|frame| render(state, frame)).expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -922,5 +1056,79 @@ mod tests {
         }))
         .expect("the minimal overview shape parses");
         assert_eq!(overview.uptime, 1);
+    }
+
+    use crate::itop::state::{SortKey, ThreadSnapshot, thread_stack_lines};
+
+/// A fixture dump — two threads, one at 3.75% cpu holding a monitor,
+/// one blocked waiting on it, id 7 deadlocked.
+fn fixture_dump() -> ignition_core::client::threads::FormattedThreadDump {
+    serde_json::from_value(serde_json::json!({
+        "version": "dump-version-1",
+        "threads": [
+            {"name": "Perspective-Worker-3", "id": 42, "state": "RUNNABLE",
+             "daemon": true, "cpuUsage": 3.75, "stacktrace": [
+                "Worker.lock - line 88",
+                "java.lang.Thread.sleep(Native Method)"
+             ],
+             "lockedMonitors": [{"lock": "<0x1a2b> (a Worker)", "frame": "Worker.lock - line 88"}]},
+            {"name": "pool-2-thread-1", "id": 7, "state": "BLOCKED", "cpuUsage": 0.0,
+             "waitingFor": {"lock": "<0x1a2b> (a Worker)"}}
+        ]
+    }))
+    .expect("the fixture dump parses")
+}
+
+    /// The threads view (family 6) renders the thread table sorted cpu
+    /// desc — name, tid, cpu, state, web/daemon/system columns — plus
+    /// the deadlock alarm in the title and the `⏎ stack` hint.
+    #[test]
+    fn threads_view_renders_rows_and_the_deadlock_alarm() {
+        let dump = fixture_dump();
+        let state = TopState {
+            family: Family::Threads,
+            sort_key: SortKey::Cpu,
+            thread_dump: Some(Box::new(ThreadSnapshot {
+                at: std::time::Instant::now(),
+                dump: Some(Box::new(dump)),
+                dump_error: None,
+                deadlocked: Some(vec![7]),
+                deadlocks_error: None,
+            })),
+            ..fixture_state()
+        };
+        let text = rendered_at(&state, 150, 30);
+        assert!(text.contains("Perspective-Worker-3"), "{text}");
+        assert!(text.contains("42"), "the tid column renders");
+        assert!(text.contains("3.8"), "the cpu column renders");
+        assert!(text.contains("RUNNABLE"), "the state column renders");
+        assert!(text.contains("⏎ stack"), "the enter hint renders");
+        assert!(
+            text.contains("⚠ 1 DEADLOCKED"),
+            "the deadlock alarm renders in the title"
+        );
+        assert!(
+            text.contains("pool-2-thread-1"),
+            "all rows render (deadlocked included)"
+        );
+    }
+
+    /// The thread stack modal renders the selected thread's name and
+    /// its stack frame verbatim, with the scroll label.
+    #[test]
+    fn thread_stack_modal_renders_the_selected_stack() {
+        let dump = fixture_dump();
+        let state = TopState {
+            modal: Some(Modal::ThreadStack {
+                name: "Perspective-Worker-3".into(),
+                lines: thread_stack_lines(&dump.threads[0], false),
+                scroll: 0,
+            }),
+            ..fixture_state()
+        };
+        let text = rendered(&state);
+        assert!(text.contains("Perspective-Worker-3"), "{text}");
+        assert!(text.contains("Worker.lock - line 88"), "{text}");
+        assert!(text.contains("lines 1/"), "the scroll label renders");
     }
 }
