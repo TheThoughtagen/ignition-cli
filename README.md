@@ -521,7 +521,7 @@ the footer)*
 | Header | CPU % and heap used/max gauge bars (threshold-colored), gateway identity, RUNNING state, uptime, disk fill, license incl. trial countdown |
 | Threads | The execution-state mix as four bars — running / waiting / timed-waiting / blocked, share of the total; any blocked thread renders the `error` slot |
 | History | CPU %, heap MiB, and non-heap MiB sparklines — 240-sample rings, SEEDED from the gateway's own performance history (`systemPerformance/charts`) so they open full, then continued from the sampled gauges |
-| Table | One row per live entity: `module` (healthy list), `designer` / `perspective` / `vision` sessions, `database` / `opc` connections, `tag provider` — KIND/NAME/STATE/AGE/DETAIL columns, state-colored |
+| Table | One row per live entity: `module` (healthy list), `designer` / `perspective` / `vision` sessions, `database` / `opc` connections, `tag provider` — KIND/NAME/STATE/CPU/AGE/DETAIL columns, state-colored |
 | Footer | Per-section errors verbatim (one failing endpoint degrades its section, never the screen), cadence/pause/staleness state, key hints |
 
 ![the scriptExec diagnostics probe refusing honestly — the gateway answers 402 Trial Expired and the modal names it](website/static/demos/itop-script-probe.png)
@@ -538,15 +538,42 @@ More views (click through): [connections](website/static/demos/itop-connections.
 [paused](website/static/demos/itop-paused.png) ·
 [keymap](website/static/demos/itop-help.png)
 
+### The threads view (`6`) — Gateway-web-UI parity
+
+`6` enters the threads view AND fetches the live dump
+(`/data/api/v1/diagnostics/threads/dump/formatted` + `…/deadlocks`,
+fetched concurrently, each call degrading independently). One JVM
+thread per row: NAME, verbatim `java.lang.Thread` STATE, CPU (the
+dump's `cpuUsage`, threshold-colored) with the Thread ID folded in,
+and the DETAIL column's monitor evidence — daemon / system / scope
+markers, what the thread is waiting on, and what it holds. Threads the
+JVM's own deadlock detection names carry the `⚠` in the STATE cell and
+the banner in the table title.
+
+![the threads view live — 355 JVM threads sorted cpu-desc, tid folded into the CPU column, monitor evidence in DETAIL, no deadlocks](website/static/demos/itop-threads.png)
+
+`Enter` on a row opens the stack viewer: header facts, the holds/
+waiting annotations, then the stack frames verbatim — scrollable
+(`j`/`k`, pgup/pgdn), with the line position in the title.
+
+![the stack viewer over the hottest thread — a Milo OPC filterRead stack, frames verbatim, scroll label](website/static/demos/itop-thread-stack.png)
+
+The dump is ON-DEMAND, never on the sample cadence (a hundreds-of-
+threads snapshot every 2 s would hammer the gateway; the web UI
+fetches on click and so does itop). Re-pressing `6` re-dumps;
+`1` returns to the mixed view.
+
 Keys (htop's gestures, `ign`'s verbs):
 
 - `q`/Ctrl-C quit · `space`/`p` pause sampling (the rings freeze; a
   manual `r` still works) · `+`/`-` sample interval 1–60 s (default
   **2 s** — itop's own cadence, not the Dashboard's `poll_interval_secs`)
-- `s` cycles the sort key (kind/name/state/age/detail), `S` reverses ·
+- `s` cycles the sort key (kind/name/state/age/cpu/detail), `S` reverses ·
   `/` filters by substring across every rendered column (Esc clears) ·
-  `1`–`5` switch the view (all / modules / sessions / connections /
-  providers) · `j`/`k`/arrows move (pgup/pgdn page, `g`/`G` jump)
+  `1`–`6` switch the view (all / modules / sessions / connections /
+  providers / threads) · `j`/`k`/arrows move (pgup/pgdn page, `g`/`G`
+  jump) · in the threads view, `6` re-dumps and Enter opens the row's
+  stack viewer
 - `x`/F9 **terminates the selected session** (designer prune /
   perspective terminate / vision close) behind a Confirm modal —
   `y` ≡ `--yes`, Esc spawns nothing; non-session rows refuse honestly
