@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ignition_core::actions::{connections, inspect, sessions, tags};
+use ignition_core::actions::{connections, diagnostics, inspect, sessions, tags};
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::error::CoreError;
 use tokio::sync::{mpsc, watch};
@@ -393,6 +393,46 @@ pub fn spawn_script_probe(state: &mut TopState) {
                     Ok(done) => Ok(Box::new(done)),
                     Err(err) => Err(err.to_string()),
                 },
+            });
+        });
+    }
+}
+
+/// Spawn the thread-diagnostics op (the `6` keystroke / re-press): the
+/// formatted dump AND the deadlocked-id list, fetched CONCURRENTLY
+/// (`tokio::join!`), each call degraded independently — a deadlocks
+/// failure must never hide the dump, and vice versa. On-demand, NOT on
+/// the sample cadence (a hundreds-of-threads dump every 2 s would
+/// hammer the gateway; the web UI fetches on click, and so does itop).
+/// One-shot busy-guarded; the result applies regardless of era (the
+/// one-shot convention — it is not sample data).
+///
+/// Outside a tokio runtime nothing spawns (the arming transition still
+/// ran).
+pub fn spawn_thread_diagnostics(state: &mut TopState) {
+    if state.threads_busy {
+        return; // the busy guard — dumps cannot stack
+    }
+    let Some(client) = state.client.as_ref().map(|api| api.clone()) else {
+        return;
+    };
+    let Some(tx) = state.events_tx.clone() else {
+        return;
+    };
+    state.threads_busy = true;
+    state.status_msg = Some(("dumping threads…".into(), false));
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let (dump, deadlocks) = tokio::join!(
+                diagnostics::thread_dump(&*client),
+                diagnostics::thread_deadlocks(&*client),
+            );
+            let _ = tx.send(TopEvent::ThreadDiagnostics {
+                at: std::time::Instant::now(),
+                dump: dump.map(Box::new).map_err(|err| err.to_string()),
+                deadlocked: deadlocks
+                    .map(|wire| wire.deadlocks)
+                    .map_err(|err| err.to_string()),
             });
         });
     }

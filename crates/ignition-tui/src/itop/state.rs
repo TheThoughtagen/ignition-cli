@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use ignition_core::actions::sessions::SessionType;
 use ignition_core::client::ReqwestGatewayApi;
+use ignition_core::client::threads::{FormattedThreadDump, ThreadInfo};
 use tokio::sync::{mpsc, watch};
 
 use crate::itop::event::TopEvent;
@@ -39,6 +40,10 @@ pub enum RowKind {
     Opc,
     /// A tag provider.
     Provider,
+    /// One JVM thread from the on-demand thread dump (`6`) — the
+    /// Gateway web UI's Diagnostics→Threads page, not part of the
+    /// sample cadence.
+    Thread,
 }
 
 impl RowKind {
@@ -52,6 +57,7 @@ impl RowKind {
             RowKind::Database => "database",
             RowKind::Opc => "opc",
             RowKind::Provider => "provider",
+            RowKind::Thread => "thread",
         }
     }
 
@@ -68,6 +74,9 @@ impl RowKind {
             RowKind::Database => 4,
             RowKind::Opc => 5,
             RowKind::Provider => 6,
+            // LAST: threads are the on-demand view, never part of the
+            // grouped default table.
+            RowKind::Thread => 7,
         }
     }
 
@@ -81,6 +90,7 @@ impl RowKind {
             RowKind::Perspective => Some(SessionType::Perspective),
             RowKind::Vision => Some(SessionType::Vision),
             RowKind::Module | RowKind::Database | RowKind::Opc | RowKind::Provider => None,
+            RowKind::Thread => None,
         }
     }
 }
@@ -88,24 +98,36 @@ impl RowKind {
 /// One table row — the flattened, sortable view of any live entity.
 /// Columns render verbatim from the fields; there is no per-kind
 /// branching at render time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// PartialEq only: thread rows carry an f64 CPU percent (no Eq) — no
+// site needs Eq on a Row.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     /// The entity family (the KIND column).
     pub kind: RowKind,
     /// The NAME column — the human identifier (module name, session
-    /// user, connection name, provider name).
+    /// user, connection name, provider name, thread name).
     pub name: String,
     /// The STATE column — the gateway's state-ish field verbatim
-    /// (module state, authorized, enabled, provider health); never an
-    /// invented verdict.
+    /// (module state, authorized, enabled, provider health, thread
+    /// state); never an invented verdict.
     pub state: String,
     /// Session uptime in epoch MILLISECONDS where the gateway reports
     /// one (designers/vision) — `None` renders `—` and sorts last.
     pub age_ms: Option<i64>,
     /// The DETAIL column — kind-specific supporting facts (module
     /// version, session project/address, connection healthchecks,
-    /// provider tag count).
+    /// provider tag count, thread daemon/system/waiting-for marks).
     pub detail: String,
+    /// CPU PERCENT for thread rows (the dump's `cpuUsage`, the web
+    /// UI's CPU column) — `None` renders `—` and sorts last.
+    pub cpu: Option<f64>,
+    /// The JVM thread id (thread rows) — the deadlocked list's key.
+    pub tid: Option<i64>,
+    /// The daemon flag (thread rows).
+    pub daemon: Option<bool>,
+    /// Whether the JVM's deadlock detection names this thread (thread
+    /// rows; the honest `false` elsewhere).
+    pub deadlocked: bool,
 }
 
 /// Which entity families the table shows.
@@ -122,16 +144,20 @@ pub enum Family {
     Connections,
     /// Tag providers.
     Providers,
+    /// The JVM's live threads (the on-demand `6` dump — NOT the
+    /// sample's thread-count mix bars).
+    Threads,
 }
 
 impl Family {
-    /// Number-key order 1..=5 (also the help text order).
-    pub const ALL: [Family; 5] = [
+    /// Number-key order 1..=6 (also the help text order).
+    pub const ALL: [Family; 6] = [
         Family::All,
         Family::Modules,
         Family::Sessions,
         Family::Connections,
         Family::Providers,
+        Family::Threads,
     ];
 
     /// The footer label.
@@ -142,6 +168,7 @@ impl Family {
             Family::Sessions => "sessions",
             Family::Connections => "connections",
             Family::Providers => "providers",
+            Family::Threads => "threads",
         }
     }
 
@@ -158,10 +185,11 @@ impl Family {
             }
             Family::Connections => matches!(kind, RowKind::Database | RowKind::Opc),
             Family::Providers => kind == RowKind::Provider,
+            Family::Threads => kind == RowKind::Thread,
         }
     }
 
-    /// The next family in the 1..=5 cycle (wraps).
+    /// The next family in the 1..=6 cycle (wraps).
     pub fn next(self) -> Family {
         let all = &Self::ALL;
         let idx = all
@@ -185,17 +213,22 @@ pub enum SortKey {
     /// AGE descending (longest-lived first — htop's TIME+ instinct);
     /// rows without an age sort last in either direction.
     Age,
+    /// CPU PERCENT descending (the threads view's default instinct —
+    /// the hot thread leads, exactly like the web UI's CPU column);
+    /// rows without a cpu sort last in either direction.
+    Cpu,
     /// DETAIL (case-insensitive).
     Detail,
 }
 
 impl SortKey {
     /// The `s` cycle order (also the help text order).
-    pub const ALL: [SortKey; 5] = [
+    pub const ALL: [SortKey; 6] = [
         SortKey::Kind,
         SortKey::Name,
         SortKey::State,
         SortKey::Age,
+        SortKey::Cpu,
         SortKey::Detail,
     ];
 
@@ -206,6 +239,7 @@ impl SortKey {
             SortKey::Name => "name",
             SortKey::State => "state",
             SortKey::Age => "age",
+            SortKey::Cpu => "cpu",
             SortKey::Detail => "detail",
         }
     }
@@ -221,8 +255,9 @@ impl SortKey {
     }
 }
 
-/// The state columns colored as healthy (`success` slot).
-pub const HEALTHY_STATES: [&str; 7] = [
+/// The state columns colored as healthy (`success` slot) — `runnable`
+/// is the JVM thread-state green (the web UI's Diagnostics→Threads).
+pub const HEALTHY_STATES: [&str; 8] = [
     "active",
     "connected",
     "authorized",
@@ -230,6 +265,7 @@ pub const HEALTHY_STATES: [&str; 7] = [
     "ready",
     "running",
     "healthy",
+    "runnable",
 ];
 
 /// The state columns colored as failing (`error` slot).
@@ -286,6 +322,39 @@ pub enum Modal {
         /// Ok: the rendered document lines. Err: the refusal text.
         result: Result<String, String>,
     },
+    /// The thread stack viewer (Enter on a thread row) — the Gateway
+    /// web UI's per-thread stack pane. SCROLLABLE (a real stack
+    /// outgrows any modal): j/k/arrows/pgup/pgdn move the offset,
+    /// Esc/Enter closes. The lines freeze at open time — the dump is
+    /// a snapshot, and the modal must show what the user read.
+    ThreadStack {
+        /// The thread's display name (the modal title).
+        name: String,
+        /// The rendered lines (header facts, hold/wait annotations,
+        /// then the stack frames verbatim).
+        lines: Vec<String>,
+        /// The scroll offset (top visible line).
+        scroll: usize,
+    },
+}
+
+/// The thread-diagnostics snapshot — the `6` op's landing. Each call
+/// degrades independently: a deadlocks failure never hides the dump,
+/// a dump failure never hides the honest error.
+#[derive(Debug, Clone)]
+pub struct ThreadSnapshot {
+    /// When the op landed (the dump-age footer readout).
+    pub at: Instant,
+    /// The formatted dump — `None` when the call failed (the error
+    /// rides [`Self::dump_error`]).
+    pub dump: Option<Box<FormattedThreadDump>>,
+    /// Why the dump call failed, when it did.
+    pub dump_error: Option<String>,
+    /// Deadlocked thread ids — `Some(empty)` is the HEALTHY answer
+    /// (the JVM's "no deadlocks"); `None` the call failed.
+    pub deadlocked: Option<Vec<i64>>,
+    /// Why the deadlocks call failed, when it did.
+    pub deadlocks_error: Option<String>,
 }
 
 /// The DEFAULT sample cadence — itop's own, deliberately FASTER than
@@ -354,6 +423,15 @@ pub struct TopState {
     /// Whether the charts bootstrap has landed (rings seeded once per
     /// world — a respawn re-seeds, a resume does not).
     pub history_seeded: bool,
+    /// The thread-diagnostics snapshot (`6`) — ON-DEMAND, never part
+    /// of the sample cadence (a hundreds-of-threads dump every 2 s
+    /// would hammer the gateway; the web UI fetches on click, and so
+    /// does itop).
+    pub thread_dump: Option<Box<ThreadSnapshot>>,
+    /// The thread-dump op's busy guard (keystrokes cannot stack
+    /// dumps; cleared when the ThreadDiagnostics event lands —
+    /// regardless of era, the one-shot convention).
+    pub threads_busy: bool,
 
     // ── Table configuration ────────────────────────────────────────
     /// The active family filter.
@@ -417,6 +495,8 @@ impl Default for TopState {
             nonheap_ring: VecDeque::with_capacity(RING_CAPACITY),
             thread_ring: VecDeque::with_capacity(RING_CAPACITY),
             history_seeded: false,
+            thread_dump: None,
+            threads_busy: false,
             family: Family::default(),
             sort_key: SortKey::default(),
             sort_rev: false,
@@ -457,6 +537,30 @@ impl TopState {
     /// text-filtered, then sorted. The single derivation the table and
     /// the kill gate share (selection indexes into exactly this list).
     pub fn visible_rows(&self) -> Vec<Row> {
+        // The threads view draws from the ON-DEMAND dump snapshot, not
+        // the sample — the sample carries thread COUNTS (the mix
+        // bars), never a per-thread list. Empty until `6` lands a
+        // dump (the ui explains the empty state honestly).
+        if self.family == Family::Threads {
+            let Some(snapshot) = &self.thread_dump else {
+                return Vec::new();
+            };
+            let Some(dump) = &snapshot.dump else {
+                return Vec::new();
+            };
+            let deadlocked = snapshot.deadlocked.as_deref().unwrap_or(&[]);
+            let mut rows = flatten_thread_dump(dump, deadlocked);
+            if let Some(filter) = &self.filter {
+                rows.retain(|row| row.matches_filter(filter));
+            }
+            let key = self.sort_key;
+            let rev = self.sort_rev;
+            rows.sort_by(|a, b| {
+                let ord = key.compare(a, b);
+                if rev { ord.reverse() } else { ord }
+            });
+            return rows;
+        }
         let Some(sample) = self.last.as_deref() else {
             return Vec::new();
         };
@@ -637,9 +741,54 @@ impl TopState {
             label: format!("{} {}", row.kind.label(), row.name),
         })
     }
+
+    /// The selected thread row's stack-viewer modal — `None` unless
+    /// the threads view holds a dump AND the selected row is a thread
+    /// (`armed_kill`'s shape for the Enter key). The lines freeze at
+    /// open time: the modal shows the snapshot the user read, even if
+    /// a later `6` re-dump lands underneath.
+    pub fn armed_thread_stack(&self) -> Option<Modal> {
+        let rows = self.visible_rows();
+        let row = rows.get(self.selected)?;
+        let tid = row.tid?;
+        let snapshot = self.thread_dump.as_ref()?;
+        let dump = snapshot.dump.as_ref()?;
+        let thread = dump
+            .threads
+            .iter()
+            .find(|thread| thread.id == Some(tid))?;
+        Some(Modal::ThreadStack {
+            name: thread.name.clone(),
+            lines: thread_stack_lines(thread, row.deadlocked),
+            scroll: 0,
+        })
+    }
 }
 
 impl Row {
+    /// The NON-thread row constructor — the five shared columns, the
+    /// thread-only fields defaulted (one honest call site per family
+    /// instead of four `None`/`false` fields of noise).
+    fn base(
+        kind: RowKind,
+        name: String,
+        state: String,
+        age_ms: Option<i64>,
+        detail: String,
+    ) -> Row {
+        Row {
+            kind,
+            name,
+            state,
+            age_ms,
+            detail,
+            cpu: None,
+            tid: None,
+            daemon: None,
+            deadlocked: false,
+        }
+    }
+
     /// Whether the row survives a lowercased substring filter — the
     /// haystack is every rendered column joined with spaces, so a
     /// filter like `persp active` matches only what the eye could
@@ -679,6 +828,18 @@ impl SortKey {
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
+            },
+            // CPU DESC (hot first). The f64 domain has no Eq — NaN
+            // (never reported by the gateway) falls back to Equal and
+            // the name tiebreak; `None` sorts last, the Age rule.
+            SortKey::Cpu => match (a.cpu, b.cpu) {
+                (Some(x), Some(y)) => y
+                    .partial_cmp(&x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             },
             SortKey::Detail => a
                 .detail
@@ -736,25 +897,19 @@ pub fn flatten_sample(sample: &TopSample) -> Vec<Row> {
                 detail.push_str(" · ");
                 detail.push_str(license);
             }
-            rows.push(Row {
-                kind: RowKind::Module,
-                name,
-                state,
-                age_ms: None,
-                detail,
-            });
+            rows.push(Row::base(RowKind::Module, name, state, None, detail));
         }
     }
     if let Some(sessions) = &sample.sessions {
         for designer in &sessions.designers {
             let name = first_non_empty(&[&designer.user, &designer.address, &designer.id]);
-            rows.push(Row {
-                kind: RowKind::Designer,
-                name: name.to_string(),
-                state: "connected".into(),
-                age_ms: Some(designer.uptime),
-                detail: session_detail(&designer.project, &designer.address, &designer.id, None),
-            });
+            rows.push(Row::base(
+                RowKind::Designer,
+                name.to_string(),
+                "connected".into(),
+                Some(designer.uptime),
+                session_detail(&designer.project, &designer.address, &designer.id, None),
+            ));
         }
         for perspective in &sessions.perspective {
             let name = if perspective.username.is_empty() {
@@ -767,56 +922,56 @@ pub fn flatten_sample(sample: &TopSample) -> Vec<Row> {
             } else {
                 "unauthorized".into()
             };
-            rows.push(Row {
-                kind: RowKind::Perspective,
+            rows.push(Row::base(
+                RowKind::Perspective,
                 name,
                 state,
-                age_ms: None,
-                detail: session_detail(
+                None,
+                session_detail(
                     &perspective.project,
                     &perspective.client_address,
                     &perspective.id,
                     Some(perspective.active_pages),
                 ),
-            });
+            ));
         }
         for vision in &sessions.vision {
             let name = first_non_empty(&[&vision.user, &vision.address, &vision.id]);
-            rows.push(Row {
-                kind: RowKind::Vision,
-                name: name.to_string(),
-                state: "connected".into(),
-                age_ms: Some(vision.uptime),
-                detail: session_detail(&vision.project, &vision.address, &vision.id, None),
-            });
+            rows.push(Row::base(
+                RowKind::Vision,
+                name.to_string(),
+                "connected".into(),
+                Some(vision.uptime),
+                session_detail(&vision.project, &vision.address, &vision.id, None),
+            ));
         }
     }
     if let Some(connections) = &sample.connections {
         for connection in &connections.database {
-            rows.push(Row {
-                kind: RowKind::Database,
-                name: connection.name.clone(),
-                state: if connection.enabled {
+            rows.push(Row::base(
+                RowKind::Database,
+                connection.name.clone(),
+                if connection.enabled {
                     "enabled".into()
                 } else {
                     "disabled".into()
                 },
-                age_ms: None,
-                detail: healthcheck_summary(&connection.healthchecks),
-            });
+                None,
+                healthcheck_summary(&connection.healthchecks),
+            ));
         }
         for connection in &connections.opc {
-            rows.push(Row {
-                kind: RowKind::Opc,
-                name: connection.name.clone(),
-                state: if connection.enabled {
+            rows.push(Row::base(
+                RowKind::Opc,
+                connection.name.clone(),
+                if connection.enabled {
                     "enabled".into()
                 } else {
                     "disabled".into()
                 },
-                age_ms: None,
-                detail: healthcheck_summary(&connection.healthchecks),
-            });
+                None,
+                healthcheck_summary(&connection.healthchecks),
+            ));
         }
     }
     if let Some(providers) = &sample.providers {
@@ -832,13 +987,7 @@ pub fn flatten_sample(sample: &TopSample) -> Vec<Row> {
                 Some(count) => format!("{count} tags"),
                 None => String::new(),
             };
-            rows.push(Row {
-                kind: RowKind::Provider,
-                name: provider.name.clone(),
-                state,
-                age_ms: None,
-                detail,
-            });
+            rows.push(Row::base(RowKind::Provider, provider.name.clone(), state, None, detail));
         }
     }
     rows
@@ -852,6 +1001,111 @@ fn first_non_empty<'a>(candidates: &[&'a str]) -> &'a str {
         .copied()
         .find(|candidate| !candidate.is_empty())
         .unwrap_or("")
+}
+
+/// Flatten a formatted thread dump into rows — the Gateway web UI's
+/// Diagnostics→Threads table. CPU rides the dump's `cpuUsage` (the
+/// web column's percent scale); the JVM's own deadlock detection marks
+/// its threads. Fields the gateway omits render as their honest
+/// defaults (`—`, empty detail) — never invented verdicts.
+pub fn flatten_thread_dump(dump: &FormattedThreadDump, deadlocked: &[i64]) -> Vec<Row> {
+    dump.threads
+        .iter()
+        .map(|thread| {
+            let name = if thread.name.is_empty() {
+                format!("tid-{}", thread.id.map(|id| id.to_string()).unwrap_or("?".into()))
+            } else {
+                thread.name.clone()
+            };
+            let state = if thread.state.is_empty() {
+                "unknown".into()
+            } else {
+                thread.state.clone()
+            };
+            Row {
+                kind: RowKind::Thread,
+                name,
+                state,
+                age_ms: None,
+                detail: thread_detail(thread),
+                cpu: thread.cpu_usage,
+                tid: thread.id,
+                daemon: Some(thread.daemon),
+                deadlocked: thread.id.is_some_and(|id| deadlocked.contains(&id)),
+            }
+        })
+        .collect()
+}
+
+/// The thread row's DETAIL text — the supporting facts the web UI's
+/// thread table shows: daemon, system/scope markers, and the monitor
+/// evidence (waiting-for + held locks). Lock strings pass through
+/// verbatim (the table clips; a mangled lock id helps nobody).
+fn thread_detail(thread: &ThreadInfo) -> String {
+    let mut parts = Vec::new();
+    if thread.daemon {
+        parts.push("daemon".to_string());
+    }
+    if !thread.system.is_empty() {
+        parts.push(format!("system:{}", thread.system));
+    }
+    if !thread.scope.is_empty() {
+        parts.push(format!("scope:{}", thread.scope));
+    }
+    if let Some(lock) = thread.waiting_for.as_ref().and_then(|w| w.lock.clone()) {
+        parts.push(format!("waiting {lock}"));
+    }
+    for monitor in &thread.locked_monitors {
+        if let Some(lock) = &monitor.lock {
+            parts.push(format!("holds {lock}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+/// The stack-viewer modal's lines for one thread — header facts, the
+/// hold/wait annotations, then the stack frames VERBATIM (the web
+/// UI's stack pane content; a mangled frame is a bug, not a summary).
+pub(crate) fn thread_stack_lines(thread: &ThreadInfo, deadlocked: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut header = vec![format!("state {}", thread.state)];
+    if thread.daemon {
+        header.push("daemon".to_string());
+    }
+    if let Some(cpu) = thread.cpu_usage {
+        header.push(format!("cpu {cpu:.1}%"));
+    }
+    if let Some(id) = thread.id {
+        header.push(format!("tid {id}"));
+    }
+    if !thread.scope.is_empty() {
+        header.push(format!("scope {}", thread.scope));
+    }
+    lines.push(header.join(" · "));
+    if deadlocked {
+        lines.push("⚠ DEADLOCKED — the JVM's deadlock detection owns this thread".to_string());
+    }
+    for monitor in &thread.locked_monitors {
+        match (&monitor.lock, &monitor.frame) {
+            (Some(lock), Some(frame)) => lines.push(format!("holds {lock} — {frame}")),
+            (Some(lock), None) => lines.push(format!("holds {lock}")),
+            (None, Some(frame)) => lines.push(format!("holds a monitor — {frame}")),
+            (None, None) => {}
+        }
+    }
+    if let Some(lock) = thread.waiting_for.as_ref().and_then(|w| w.lock.clone()) {
+        lines.push(format!("waiting for {lock}"));
+    }
+    if !thread.stacktrace.is_empty() {
+        lines.push(String::new());
+        for frame in &thread.stacktrace {
+            lines.push(frame.clone());
+        }
+    } else {
+        lines.push(String::new());
+        lines.push("(the dump carries no stack for this thread)".to_string());
+    }
+    lines
 }
 
 /// The session DETAIL text: project, address, active pages (when the
@@ -985,13 +1239,13 @@ mod tests {
     }
 
     fn module_row(name: &str, state: Option<&str>, version: &str) -> Row {
-        Row {
-            kind: RowKind::Module,
-            name: name.to_string(),
-            state: state.unwrap_or("unknown").to_string(),
-            age_ms: None,
-            detail: version.to_string(),
-        }
+        Row::base(
+            RowKind::Module,
+            name.to_string(),
+            state.unwrap_or("unknown").to_string(),
+            None,
+            version.to_string(),
+        )
     }
 
     /// human_bytes' boundaries: sub-KiB exact, one decimal below 10
