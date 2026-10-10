@@ -111,7 +111,74 @@ Numbering: new categories. **47 requirements.**
 
 ## Traceability
 
-(Filled by the roadmap.)
+v1.6 only. The parked v1.3 requirements below keep their own section.
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| DAPI-01 | Phase 20 | Pending |
+| DAPI-02 | Phase 20 | Pending |
+| DAPI-03 | Phase 20 | Pending |
+| DAPI-04 | Phase 20 | Pending |
+| DAPI-05 | Phase 20 | Pending |
+| DAPI-06 | Phase 20 | Pending |
+| DAPI-07 | Phase 20 | Pending |
+| DRND-01 | Phase 21 | Pending |
+| DRND-02 | Phase 21 | Pending |
+| DRND-03 | Phase 21 | Pending |
+| DRND-04 | Phase 21 | Pending |
+| DRND-05 | Phase 21 | Pending |
+| DRND-06 | Phase 21 | Pending |
+| DRND-07 | Phase 21 | Pending |
+| DRND-08 | Phase 21 | Pending |
+| DPLN-01 | Phase 22 | Pending |
+| DPLN-02 | Phase 22 | Pending |
+| DPLN-03 | Phase 22 | Pending |
+| DPLN-04 | Phase 22 | Pending |
+| DPLN-05 | Phase 22 | Pending |
+| DPLN-06 | Phase 22 | Pending |
+| DPLN-07 | Phase 22 | Pending |
+| DPLN-08 | Phase 22 | Pending |
+| DPLN-09 | Phase 22 | Pending |
+| DAPL-01 | Phase 23 | Pending |
+| DAPL-02 | Phase 23 | Pending |
+| DAPL-03 | Phase 23 | Pending |
+| DAPL-04 | Phase 23 | Pending |
+| DAPL-05 | Phase 23 | Pending |
+| DAPL-06 | Phase 23 | Pending |
+| DAPL-07 | Phase 23 | Pending |
+| DAPL-08 | Phase 23 | Pending |
+| DAPL-09 | Phase 23 | Pending |
+| DAPL-10 | Phase 23 | Pending |
+| DPAIR-01 | Phase 24 | Pending |
+| DPAIR-02 | Phase 24 | Pending |
+| DPAIR-03 | Phase 24 | Pending |
+| DPAIR-04 | Phase 24 | Pending |
+| DPRJ-01 | Phase 25 | Pending |
+| DPRJ-02 | Phase 25 | Pending |
+| DPRJ-03 | Phase 25 | Pending |
+| DPRJ-04 | Phase 25 | Pending |
+| DPRJ-05 | Phase 25 | Pending |
+| DSURF-01 | Phase 21 | Pending |
+| DSURF-02 | Phase 23 | Pending |
+| DSURF-03 | Phase 23 | Pending |
+| DSURF-04 | Phase 22 | Pending |
+
+**Coverage:** 47 v1.6 requirements, 47 mapped, 0 unmapped, 0 mapped twice.
+
+| Phase | Requirements | Count |
+|-------|--------------|-------|
+| 20. Config API Client | DAPI-01..07 | 7 |
+| 21. Deploy Render | DRND-01..08, DSURF-01 | 9 |
+| 22. Transport, Plan, Pull & Verify | DPLN-01..09, DSURF-04 | 10 |
+| 23. Guarded Apply & Rollback | DAPL-01..10, DSURF-02, DSURF-03 | 12 |
+| 24. Redundant Pair | DPAIR-01..04 | 4 |
+| 25. Guarded Project Deploy | DPRJ-01..05 | 5 |
+
+**Cross-cutting assignments** (each is mapped to the phase where it is first fully provable; later phases must keep it green):
+- **DSURF-01** closes in Phase 21 with the first verb (`render`) and the `deploy` family coverage test. Phases 22–25 keep it green as `plan`, `pull`, `verify`, `apply`, `rollback`, `--node both` and `projects` land.
+- **DSURF-03** closes in Phase 23, the first phase with apply output, a run directory and events. Phase 22 starts the canary over `plan` and `verify` output; Phases 24 and 25 keep it green.
+- **DSURF-02** closes in Phase 23, where the MCP exclusion for guarded deploy verbs is built and `apply`/`rollback` are registered. Phase 25 registers `projects` under the same rule.
+- **DSURF-04** closes in Phase 22 with the first verdict-producing verb (`verify`); Phases 23 and 24 reuse the same verdict envelope.
 
 ---
 

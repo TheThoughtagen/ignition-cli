@@ -2,11 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
+current_phase: 20
+current_phase_name: Config API Client
 status: planning
-last_updated: "2026-10-10T18:44:41.256Z"
+stopped_at: "v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped); next: /gsd-plan-phase 20 (Phase 21 can be planned in parallel)"
+last_updated: "2026-10-10T20:45:19.875Z"
 last_activity: 2026-10-10
+last_activity_desc: v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped)
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,17 +21,19 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-09-16)
+See: .planning/PROJECT.md (updated 2026-10-10)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Planning next milestone (v1.1 Agent Surface & IDE Integration shipped 2026-09-16; start with `/gsd-new-milestone`)
+**Current focus:** Phase 20 — Config API Client (Phase 21 Deploy Render can be planned in parallel); milestone v1.6 Declared Gateway Deploy, Phases 20-25
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-10-10 — Milestone v1.6 started
+Phase: 20 of 25 (Config API Client)
+Plan: — (not planned yet)
+Status: Ready to plan
+Last activity: 2026-10-10 — v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped)
+
+Progress: [░░░░░░░░░░] 0% (0 of 6 v1.6 phases complete)
 
 ## Performance Metrics
 
@@ -51,7 +57,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ### Blockers
 
-(None — clean milestone boundary.)
+- [Before Phase 23 planning] Decision B (staging location / svc-ignition-deploy write scope) is OPEN. Resolve in Phase 22 from capture C6 and record it; Phase 23 also needs the OQ5 measured hold budget.
 
 ### Quick Tasks Completed
 
@@ -65,6 +71,6 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-09-20T01:15:00Z
-**Stopped At:** Completed quick/260919-tg4 (3 commits: 063f389, a1863ea, 7859247); next: `/gsd-new-milestone`
+**Last session:** 2026-10-10T20:45:19.751Z
+**Stopped At:** v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped); next: /gsd-plan-phase 20 (Phase 21 can be planned in parallel)
 **Resume file:** None

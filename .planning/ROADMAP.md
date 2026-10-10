@@ -11,7 +11,8 @@ Build `ign` — a single Rust binary + ratatui cockpit that replaces both the Ig
 - ✅ **v1.0 MVP** — Phases 1-7 (shipped 2026-08-30) — [archive](milestones/v1.0-ROADMAP.md)
 - ✅ **v1.1 Agent Surface & IDE Integration** — Phases 8-14 (shipped 2026-09-16) — [archive](milestones/v1.1-ROADMAP.md)
 - ✅ **v1.2** — shipped 2026-09-19 outside the milestone workflow (tag `v1.2.0`, PR #8: `ign testing run`, `ign session login`, e2e Playwright scaffold); no phase structure, ledger backfill tracked as LEDG-01
-- 🚧 **v1.3 Rig Modules & Declared Discovery** — Phases 15-18 (started 2026-09-20)
+- ⏸ **v1.3 Rig Modules & Declared Discovery** — Phases 15,16,19 shipped; 17,18 parked behind v1.6
+- 🚧 **v1.6 Declared Gateway Deploy** — Phases 20-25 (started 2026-10-10)
 
 ## Phases
 
@@ -45,7 +46,9 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 </details>
 
-### 🚧 v1.3 Rig Modules & Declared Discovery (Phases 15-18, In Progress)
+### ⏸ v1.3 Rig Modules & Declared Discovery (Phases 15-19, Parked)
+
+**Parked 2026-10-10:** Phases 15, 16 and 19 shipped (RMOD-01..07). Phases 17 and 18 stay open and are parked behind v1.6 Declared Gateway Deploy, per the PROJECT.md sequencing.
 
 **Milestone Goal:** A developer can opt into running an Ignition module on a rig — signed, verified, and commissioned by `ign` — and rig selection becomes something declared rather than guessed.
 
@@ -61,7 +64,34 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 **Dependencies:** 16 depends on 15 (nothing to inject without a verified artifact). 17 depends on 16 (the override carries the generated `git.yaml` mount). 18 is independent of 15-17 and may run in parallel or slip.
 
-## Phase Details
+### 🚧 v1.6 Declared Gateway Deploy (Phases 20-25, In Progress)
+
+**Milestone Goal:** `ign` deploys a declared gateway config tree (`gateways/<name>/`) to a redundant Ignition 8.3 pair through the `production` deployment-mode collection — plan, apply, verify, roll back — with no dependency on the git module.
+
+**Design spec:** whk-environment-orchestration PR #60 — `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` (§3 verified 8.3.6 facts, §4 layout, §5–§6 pipeline, §8 rollback, §11, §15 fleet model; evidence in `spikes/gateway-modes/results/`, incl. `RIG.md`). This milestone is that roadmap's Plan 2. Research: [research/SUMMARY.md](research/SUMMARY.md) (conflict resolutions, capture backlog C1–C12, spec flags SF-1..SF-10).
+
+**Structure rationale:** Correctness rests on a few verified gateway facts and on byte-level fidelity for files the gateway writes, so the order is capture-first and read-before-write. The wire client (20) and the offline renderer (21) share nothing and can run in parallel; every later phase needs one or both. Transport, `plan`, `pull` and master `verify` (22) come before any write, so the pipeline proves "pull, render, plan is empty" while the only thing at risk is a read. Both transport halves are written in 22 as a pair, so the write path is built and tested once even though no verb calls it until 23. All write logic lands in 23 on a single ephemeral gateway, where fault injection is cheap; rollback and auto-rollback reuse the apply engine instead of a second code path. Pair semantics (24) need their own two-node fixture, and a backup failure must never roll back a good master, so they come after the master path is trusted. Project deploy (25) reuses the existing import/export machinery and needs only 23's run store, so it may overlap 24. Surface parity (TUI rows, README and exit-table rows, guarded-ops markers, the secret canary) lands with each verb, never as a final sweep: the coverage and guarded-ops drift tests fail otherwise.
+
+**Decisions in force** (recorded in REQUIREMENTS.md at scoping, 2026-10-10):
+- **A — verdict envelope:** post-write red outcomes keep the frozen envelope: `ok:true`, `data.ok=false`, verdict slug in `data`, exit 6. Pre-write refusals stay `CoreError` envelopes.
+- **B — staging location: OPEN.** Resolved in Phase 22 from capture C6 and recorded before Phase 23 is planned: (i) home-relative staging outside `data/config/` (needs a spec §9 amendment) if C6 confirms write access and no collection-read risk, otherwise (ii) in-place mirror with the scan-lock covering the transfer.
+- **C — plan-hash handshake:** CI and agent callers must pass `--plan-sha256`; it is optional interactively.
+- **D — MCP exposure:** `apply`, `rollback` and `projects` are not MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are.
+- **Scope:** bootstrap (`ign deploy pull`) is in; the spec §13.5 core strip is not (SF-5). Also in: the `--base` drift gate, verify tag probes, the `.gwbk` snapshot default-on, the Designer preflight.
+- **Spec correction:** rendered JSON preserves source key order. Spec §4 "sorted keys" is falsified by the 183-file corpus.
+
+**Capture discipline:** each phase records its "Capture first" items in a `*-LIVE-CAPTURES.md` doc before the code that depends on them. Nothing still open is stated as fact in a success criterion. S5/C9 (a child project reading an inherited resource after its parent is overwritten) is OPEN. The Windows transport behaviors (sftp path form, quoting, key ACLs, the stdin hang, robocopy, sharing violations) are INFERRED until C7a and C7b are captured.
+
+- [ ] **Phase 20: Config API Client** — Library-only wire client for config resources, scan-lock, scan and deployment modes, with capture-proven success predicates *(DAPI-01..07)*
+- [ ] **Phase 21: Deploy Render** — `ign deploy render`: manifest plus mode overlay rendered to the gateway's on-disk layout; byte-faithful, deterministic, secret-safe and Windows-safe *(DRND-01..08, DSURF-01)*
+- [ ] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)*
+- [ ] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)*
+- [ ] **Phase 24: Redundant Pair** — Backup verified through its own API and file hashes, never written; `deploy_backup_unsynced`; `verify --node both`; two-node live gate *(DPAIR-01..04)*
+- [ ] **Phase 25: Guarded Project Deploy** — `ign deploy projects`: pinned, parent-first, exported before overwrite, hash-verified, never deleting an unmanaged project *(DPRJ-01..05)*
+
+**Dependencies:** 20 and 21 are independent and may run in parallel. 22 depends on 20 and 21. 23 depends on 22 and on Decision B being recorded from capture C6. 24 depends on 23. 25 depends on 23's run store and guarded gate (and on 21's manifest parsing); it may overlap 24.
+
+## v1.3 Rig Modules & Declared Discovery (Phase Details)
 
 ### Phase 15: 15-module-artifact-fetch-verify
 **Goal**: `ign` can obtain a specific, signed Ignition module artifact and prove it is the right bytes before anything else in the milestone is allowed to depend on it — the only phase that touches a third-party feed, isolated so its failure modes are visible rather than buried inside a Docker flow.
@@ -139,6 +169,92 @@ Plans:
 - [ ] 19-02-PLAN.md — Orphan detection and reporting: `previously_provisioned` parses the PRE-overwrite override's mount targets and intersects them with the registry, `orphaned_modules` is a pure diff, `undeclared_provisioning` reads before it deletes, and `rig up`/`rig reset` report orphans as data while a fake gateway that panics on `uninstall_module` proves no write happens *(SC-3, SC-4's on-disk half)*
 - [ ] 19-03-PLAN.md — The live gate: §C stops hand-deleting the override and drives the real undeclare path, §D uninstalls both ghost entries through `ign`'s own action and proves them ABSENT from the gateway's healthy list, §E proves a non-empty set of gateway-installed modules `ign` did not place is untouched, on two pinned 8.3.x images *(SC-1 live, SC-4 live)*
 
+## v1.6 Declared Gateway Deploy (Phase Details)
+
+### Phase 20: Config API Client
+**Goal**: The core library speaks the 8.3.6 config-resource, scan-lock, scan and deployment-mode APIs with success predicates taken from live captures, so every later deploy verb builds on wire truth rather than on HTTP status codes.
+**Depends on**: Nothing (first v1.6 phase; runs in parallel with Phase 21)
+**Requirements**: DAPI-01, DAPI-02, DAPI-03, DAPI-04, DAPI-05, DAPI-06, DAPI-07
+**Success Criteria** (what must be TRUE):
+  1. Against an ephemeral 8.3.6 gateway, the library lists and reads config resources by type and name from the effective view and from a named collection, and creates and updates them with the signature-checked array PUT; a stale or missing signature comes back as its own typed error, never a generic failure
+  2. The library acquires the scan-lock, reads its remaining time while held, and detects expiry from the response change alone (200 JSON while held, 204 after); a test with a deliberately skewed local clock still decides correctly. A lock held by another actor surfaces as `scan_lock_held` naming the holder
+  3. A config scan counts as complete only when `scanActive` is false and `lastScanTimestamp` has advanced on the same gateway; a contract test in which the trigger returns 200 but the status never advances reports the scan as not complete
+  4. The library lists and creates deployment modes and reports the active `deploymentMode`, reading `null` and `""` both as "no mode"; redundancy status names the active node by activity level using the live `Master`/`Backup` vocabulary, and the `redundancy.rs` doc no longer says `Primary`
+  5. Every new endpoint has a declared response shape (JSON, empty 2xx or 204) recorded in `20-LIVE-CAPTURES.md` before the code that depends on it and pinned by a wiremock contract test; any gateway body echoed into an error is size-capped
+**Capture first**: C1 (scan-lock 409 body; held GET with `remaining` and actor vs expired 204; whether any release/DELETE route exists, grepped from the 617-route OpenAPI; scan/config status JSON and the completion rule); C3a (stale or omitted signature PUT: 422 vs 500 "signature mismatch"; add a message-based error arm only if the two are distinguishable); the `null` vs `""` `deploymentMode` reading on a no-mode gateway
+**Constraints**: Library-only: no clap surface, no verb. A new `DeployApi` trait rather than new `GatewayApi` methods (avoids editing 15 hand-written `unreachable!()` doubles and allows one stateful in-memory fake gateway). Do not enable `serde_json/preserve_order` or `arbitrary_precision` workspace-wide; feature unification would reorder frozen-contract payloads. Every new slug follows the four-place rule. Live gate: one ephemeral 8.3.6 with a bind-mounted `resources/`; no pair rig.
+**Plans**: TBD
+
+### Phase 21: Deploy Render
+**Goal**: A user can turn a `gateways/<name>/` tree into the exact bytes the gateway would hold on disk for one environment, offline and deterministically, and render refuses anything that would leak a secret, lock out an administrator, or break on a Windows host.
+**Depends on**: Nothing (offline; runs in parallel with Phase 20)
+**Requirements**: DRND-01, DRND-02, DRND-03, DRND-04, DRND-05, DRND-06, DRND-07, DRND-08, DSURF-01
+**Success Criteria** (what must be TRUE):
+  1. `ign deploy render` on the same tree and environment yields the same `render_sha256` on every run; a `manifest.yaml` or `targets/<env>.yaml` with an unknown field or a wrong `schema_version` fails as `deploy_tree_invalid` naming file, line and column
+  2. A file under `modes/<env>/` replaces its base-tree counterpart whole-file by path; only manifest-allowlisted resource types are rendered, and a tree that declares security-properties, security-levels, an API token or a user source is refused
+  3. Gateway-written files pass through byte-for-byte: the 183-file gateway corpus round-trips byte-identical on Linux, macOS and Windows. Files `ign` synthesizes come from a Gson-compatible writer that keeps source key order. A new named resource gets a deterministic name-based `attributes.uuid`, a singleton type gets none, and an existing uuid is kept
+  4. Render refuses an `Embedded` secret or a plaintext secret field as `embedded_secret`, naming the path and never the value, and refuses case-fold collisions, Windows-illegal names, paths over the Windows length budget and CR bytes anywhere in the tree
+  5. `deploy render` lands with its TUI route row, README entry and exit-table rows, its new slugs pass the four-place rule, and a family coverage test fails if any `deploy` leaf ships without them; every later verb phase keeps this test green
+**Capture first**: C4 (named, uuid-bearing vs singleton resource types: census from the prod `core` bootstrap, feeding the uuid rule table); C5 (hostile-name encoding in tag and resource directories, covering `:`, `?`, trailing dot, case collision, spaces and commas, against WHK01's 637 tag files); C3b (whether a stale or omitted `lastModificationSignature` loads, is rewritten or is flagged, and whether the gateway rewrites a hand-written `resource.json` after load); OQ1 (gateway-written bytes of `tags.json`, `udts.json` and `unary-resource.json`; the spike fixtures are synthetic); OQ4 (repo-path to collection-path mapping for tag-definition nesting and name depth); OQ8 (exact 8.3.6 JSON shape of Embedded vs Referenced secret fields). Also check `cargo tree` for `sha1` before choosing the uuid derivation.
+**Constraints**: Spec correction: preserve source key order. Spec §4 "sorted keys" is wrong; use an order-preserving node tree, Gson HTML-safe escaping, 2-space indent and no trailing newline, and rewrite a gateway file only when `write(parse(bytes)) == bytes`, otherwise copy it opaque. YAML via `yaml_serde` 0.10 (compiles on the 1.88 floor; not serde-saphyr); no `uuid` crate. The manifest and target schemas include `verify.tag_probes[]` (SF-8) and the target `ssh` block (SF-10) now, so strict parsing does not reject them in Phase 22. Overlays are add/override only; "absent in env" is documented, not built (SF-7). The render golden runs on `windows-latest`, and fixture `gateways/` trees carry no `\r`. `render` reaches the MCP catalog by clap derivation (Decision D).
+**Plans**: TBD
+
+### Phase 22: Transport, Plan, Pull & Verify
+**Goal**: A user can see exactly what a deploy would change on the live master, bootstrap a declared tree from a running gateway, and verify a gateway against its tree, all read-only, over a transport whose write half is built and tested here but not yet called by any verb.
+**Depends on**: Phase 20 (wire client), Phase 21 (rendered tree)
+**Requirements**: DPLN-01, DPLN-02, DPLN-03, DPLN-04, DPLN-05, DPLN-06, DPLN-07, DPLN-08, DPLN-09, DSURF-04
+**Success Criteria** (what must be TRUE):
+  1. `ign` reads a gateway's config tree over system OpenSSH, proven against a real Windows OpenSSH host, and over the local filesystem, with batch mode, a pinned host key, per-call timeouts, argv-only invocation and client-side file hashes; the write half (a mirror driven by an explicit delete set) passes its tests against a scratch directory, and no verb calls it
+  2. `ign deploy plan` against the master makes zero writes and takes no lock, exits 0, and lists every resource as added, changed, removed or same with `data.summary.has_changes` and a `plan_sha256`; each entry carries its `core` relation (none, identical, differs, hidden, shadows_removal) and its destructive and lockout-risk flags, and the plan states the exact delete set (previously declared names minus rendered names), which never contains `config-mode.json` or an undeclared resource
+  3. With `--base <previous render>`, plan entries the live gateway changed outside the pipeline are marked as drift; `ign deploy pull` bootstraps a `gateways/<name>/` tree from a live gateway without writing to it, and `render` then `plan` against that same gateway reports no changes
+  4. `ign deploy verify` against the master checks that the scan is complete, `deploymentMode` equals the target, every declared resource reads back equal in the effective view, the gateway log has no "will not be loaded" entry for a declared resource, and every `verify.tag_probes[]` tag is Good (an absent probe list is a warning, never a pass); a red verify returns the frozen envelope with findings in `data` and exit 6, documented as a dated README contract exception
+  5. `plan`, `pull` and `verify` land with their TUI rows, README entries and exit-table rows (the DSURF-01 coverage test stays green), appear in the MCP catalog, and their output, `plan --diff` included, is already under the secret canary that Phase 23 completes
+**Capture first**: C6 (can `svc-ignition-deploy` write a home-relative staging directory outside `data/config/`, and is that directory ever read as a collection; this decides Decision B); C7a (Win32-OpenSSH sftp path form `/C:/` vs `C:/`, quoting, key ACL, the stdin hang, CLIXML on stderr, sftp-server long paths; all INFERRED until captured); OQ5 (real-transport write and scan timings from WFLWVM01 with a prod-sized tree, setting the `holdTimeout` p95 and margin and the Defender-exclusion decision). All three block Phase 23 planning.
+**Exit gate before Phase 23 is planned**: Decision B is recorded from C6, and the hold budget measured under OQ5 (p95, floored, ceilinged) replaces the spec's 5 s figure, which came from a local `docker cp`.
+**Constraints**: Decision A governs the verify verdict (`ok:true`, `data.ok=false`, slug in `data`, exit 6; verdict slugs never appear in exit tables). `plan` always exits 0; no `--detailed-exitcode` (SF-2). `--base` is the three-way drift input (SF-4); the apply-side drift gate is Phase 23. `pull` is in scope; a core-strip command is not (SF-5). System `ssh`/`sftp` only, with no SSH library crate. One layered seam: `RemoteShell` under `FileTransport` (`SftpTransport`, `LocalFsTransport`). `robocopy /MIR` is rejected; deletes come only from the bounded list. Snapshots and staging never go inside `data/config/resources/`, and nothing dot-named is created there (Designer `NameInvalidException`).
+**Plans**: TBD
+
+### Phase 23: Guarded Apply & Rollback
+**Goal**: A user can apply a reviewed plan to a single gateway and end with either a verified deploy or the snapshot restored, never a partially loaded tree, and can roll a past run back from a fresh process.
+**Depends on**: Phase 22 (transport, plan, verify), with Decision B recorded
+**Requirements**: DAPL-01, DAPL-02, DAPL-03, DAPL-04, DAPL-05, DAPL-06, DAPL-07, DAPL-08, DAPL-09, DAPL-10, DSURF-02, DSURF-03
+**Success Criteria** (what must be TRUE):
+  1. `ign deploy apply` without `--yes` refuses and prints the plan as the refusal; with `--plan-sha256`, a plan that changed since review refuses as `plan_stale`; destructive entries need `--allow-destructive`, drift entries need `--allow-drift "<reason>"` (recorded in the run), and `shadows_removal` entries block regardless of flags; an empty plan exits 0 with no lock, snapshot or scan
+  2. Before any write, apply runs every preflight (`deploymentMode` on both nodes, wrong-target guard, write-permission probe, no on-box journal, open Designer sessions under `--designers fail|wait|proceed`, default fail) and reports all failures in one refusal; it then snapshots the target collection on the gateway host and in the run directory with hashes, and downloads a `.gwbk` unless `--skip-gwbk` (recorded); neither is ever uploaded off-prem
+  3. Apply writes inside the scan-lock within the hold budget measured in Phase 22; fault-injection tests that expire the lock or fail a write mid-way end with the collection equal to the snapshot and scanned, never a partial tree loaded. A master verify failure after apply rolls back automatically through the same engine and reports `deploy_rolled_back` with exit 6; a failed rollback reports `rollback_failed` with recovery guidance
+  4. `ign deploy rollback --run <id>` from a fresh process restores that run's snapshot, and refuses when live state differs from the run's post-apply fingerprint unless `--discard-live-changes`. An apply killed mid-write leaves an on-box journal, and `plan`, `apply` and `rollback` refuse until recovery runs. Every run, failed ones included, writes a private run directory (`run.json`, `result.json`, `plan.json`, `events.ndjson`), and apply reports `restart_pending` without restarting or failing over a gateway
+  5. `apply` and `rollback` are in `GUARDED_OPS` and absent from the MCP catalog while `render`, `plan`, `pull` and `verify` remain in it; a secret canary proves no secret value appears in plan, apply, rollback or verify output, `--json`, run-directory files or events. Phases 24 and 25 keep this canary and the DSURF-01 coverage test green
+**Capture first**: C2 (does the scan-lock block UI, Designer and API writes to the active mode collection; if not, the Designer preflight is the only guard against a write racing the apply); C7b (ACL after copy vs rename, sharing violation on a loaded JDBC jar under `ignition/database-driver/`, Defender cost, long paths; INFERRED until captured); C11 (single-scan ordering when a provider and its definitions arrive together)
+**Constraints**: Decision B must be recorded in Phase 22 before this phase is planned; the write flow and hold budget depend on it. Decision A for verdicts (`deploy_rolled_back` in `data`, exit 6, never an exit-table row). Decision C: CI and agent callers must pass `--plan-sha256`. Decision D: `apply` and `rollback` are not MCP tools in v1.6. The `.gwbk` default-on (SF-6) and the Designer preflight are in scope. Apply reports restarts and never performs them (SF-3). No `--force`, `--skip-verify` or `--no-rollback`. One `restore_snapshot(run)` serves abort, auto-rollback and manual rollback. Lock decisions use the gateway's `remaining` and a monotonic local clock, never gateway timestamps against the runner clock. Built on a single ephemeral 8.3.6 with `LocalFsTransport`, where fault injection is cheap; the both-nodes mode preflight is exercised against the stateful in-memory fake, and backup checks and backup-lag handling belong to Phase 24.
+**Plans**: TBD
+
+### Phase 24: Redundant Pair
+**Goal**: A deploy to a redundant pair ends with proof that the backup holds the same config as the master, checked through the backup's own API and files and never by writing to it, and a backup that did not converge is reported without undoing a good master deploy.
+**Depends on**: Phase 23 (apply engine, run store, master verify)
+**Requirements**: DPAIR-01, DPAIR-02, DPAIR-03, DPAIR-04
+**Success Criteria** (what must be TRUE):
+  1. After a master-verified apply, `ign` checks the backup through its own API and file hashes (same `deploymentMode`, effective view equal to the master's, redundancy healthy) after a bounded convergence wait and at most one resync, and sends no write to the backup
+  2. A backup that stopped syncing or still differs after that wait reports `deploy_backup_unsynced` with exit 6, and the master is not rolled back
+  3. `ign deploy verify --node both` runs the backup checks on demand and fails when a secret name the tree references is missing on either node
+  4. A two-node 8.3.6 rig with a trusted gateway-network link live-gates the three behaviors above, including at least one run that ends `deploy_backup_unsynced`; the DSURF-01 coverage test and the DSURF-03 canary stay green with `--node both` and the backup verdicts added
+**Capture first**: C12 (does a lagging backup recover through `resync` alone after "failed 5 times"; decides whether one resync is enough before reporting unsynced); GAN trust recipe on 8.3.6 (certificate move plus `toggleApproval`, from `s3_redundancy.sh`) for the pair fixture
+**Constraints**: Any write to the backup is out of scope; its state comes from redundancy sync. Decision A for `deploy_backup_unsynced` (payload slug, exit 6). The active node is decided by activity level, never by role; `uptime: -1` or `Cold` on a healthy backup is normal. Secret values do not replicate between nodes (ENT-3115), so only names are checked. A `failover` library method may exist, but no verb calls it, and nothing restarts inside apply (SF-3). A backup project-sync failure (TEC-5105) gets its own finding and never triggers a master rollback. May run in parallel with Phase 25.
+**Plans**: TBD
+
+### Phase 25: Guarded Project Deploy
+**Goal**: A user can deploy the manifest-pinned project set to a gateway (verified before upload, imported parents first, exported before overwrite and hash-verified after) without ever deleting a project the manifest does not name.
+**Depends on**: Phase 23 (run store and guarded gate) and Phase 21 (manifest parsing); may overlap Phase 24
+**Requirements**: DPRJ-01, DPRJ-02, DPRJ-03, DPRJ-04, DPRJ-05
+**Success Criteria** (what must be TRUE):
+  1. `ign deploy projects` checks every project artifact against its manifest sha256 pin before any upload; a mismatch refuses as `project_hash_mismatch` with nothing uploaded
+  2. Projects import parent-first from `project.json` inheritance; a cycle or an unknown parent refuses before any import, and a project whose canonical hash already matches is skipped
+  3. Each project is exported before it is overwritten and, after import, verified by canonical hash with `lastModification*` and signatures ignored
+  4. A project absent from the manifest is reported and never deleted, a project with `.git` present is refused, and `ign deploy projects --check` reports what would change with zero writes
+  5. `projects` joins `GUARDED_OPS` and stays out of the MCP catalog under the Phase 23 rule, lands with its TUI row, README entry and exit-table rows, and its output and run files pass the secret canary
+**Capture first**: C8 (does `import?overwrite=true` delete resources absent from the zip; does export-after-import equal the zip once `lastModification*` is normalized); C9 (does a child read an inherited resource after its parent is overwritten, and what is the session impact; S5 residual, OPEN, and no criterion here claims it); C10 (can the prod git module's `git.yaml`/commissioning recreate a stripped `core` or revert API imports)
+**Constraints**: Decision D: `projects` is not an MCP tool in v1.6. Deleting projects absent from the manifest is out of scope. Reuse `MemberSource::Zip` (projects only), `project_import`'s 200-denial check, `project_export_to_file` and a promoted `validate_import`. Designer/session pre-check before import. Cutover prerequisite (human work, not code): spec §13 step 8, removing `.git` and uninstalling the git module on the target, comes before unattended project deploys; `ign` never deletes `.git`.
+**Plans**: TBD
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
@@ -159,11 +275,18 @@ Plans:
 | 14. Transports — MCP/LSP | v1.1 | 6/6 | Complete | 2026-09-16 |
 | 15. Module Artifact — Fetch & Verify | v1.3 | 2/2 | Complete | 2026-09-20 |
 | 16. Compose Override — Module Injection | v1.3 | 3/3 | Complete (SC-4 amended) | 2026-09-25 |
-| 17. Git Module Commissioning | v1.3 | 0/? | Not started | — |
-| 18. Declared Rig Discovery | v1.3 | 0/? | Not started | — |
+| 17. Git Module Commissioning | v1.3 | 0/? | Parked behind v1.6 | — |
+| 18. Declared Rig Discovery | v1.3 | 0/? | Parked behind v1.6 | — |
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
+| 20. Config API Client | v1.6 | 0/? | Not started | — |
+| 21. Deploy Render | v1.6 | 0/? | Not started | — |
+| 22. Transport, Plan, Pull & Verify | v1.6 | 0/? | Not started | — |
+| 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
+| 24. Redundant Pair | v1.6 | 0/? | Not started | — |
+| 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
 ---
 *Roadmap created: 2026-09-04 — milestone v1.1; v1.1 completed 2026-09-16 (25/25 requirements shipped)*
 *v1.2 shipped 2026-09-19 outside the milestone workflow (tag `v1.2.0`, PR #8) — no phase structure; ledger backfill tracked as LEDG-01 in Phase 18*
 *v1.3 started 2026-09-20 — Phases 15-18, 14 requirements*
+*v1.6 started 2026-10-10 — Phases 20-25, 47 requirements; v1.3 Phases 17-18 parked behind it*
