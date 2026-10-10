@@ -1,423 +1,573 @@
-# Pitfalls Research — ignition-cli v1.1
+# Pitfalls Research — ignition-cli v1.6 Declared Gateway Deploy
 
-**Project:** ignition-cli — Rust CLI + ratatui TUI cockpit for Ignition 8.3+ gateways
-**Milestone:** v1.1 Agent Surface & IDE Integration (subsequent milestone — adding features to a contract-frozen, live-verified system)
-**Researched:** 2026-09-04
-**Overall confidence:** HIGH (system-internal pitfalls verified against the actual code/CI/tests; protocol claims verified against primary sources today; gateway-side specifics carry MEDIUM flags inline)
+**Project:** ignition-cli — adding `ign deploy {render,plan,apply,rollback,verify,projects}`
+**Milestone:** v1.6 (subsequent milestone; phases 20 client / 21 render / 22 plan / 23 apply-rollback-verify / 24 projects)
+**Target:** production Ignition 8.3.6 redundant pair on Windows Server (master WIGNVM01 10.4.8.15, backup WIGNVM04 10.4.8.29), deployed from the Windows self-hosted runner WFLWVM01 over the VPN, into the `production` deployment-mode collection.
+**Researched:** 2026-10-10
+**Overall confidence:** MEDIUM-HIGH. Pitfalls built on the spike facts are HIGH (cited to the result file). Windows transport pitfalls are MEDIUM (well-known platform behaviour, NOT yet observed on WIGNVM01/04 — each carries a capture task). Items tagged **OPEN** are unverified and must be captured on a rig before code depends on them.
 
-**Mode note:** This is a *subsequent-milestone* pitfalls doc. The v1.0 pitfalls research (gateway API, TUI, docker/rig, agentic CLI foundations) remains valid and lives at commit `9d2cc32` (`.planning/research/PITFALLS.md` as of 2026-08-20). The still-operational carry-forwards are listed at the bottom. This file focuses on the v1.1 risk surfaces: **what breaks when you add features to a system whose output contract, exit taxonomy, TUI↔CLI parity, and route bundle are frozen and CI-enforced.**
+## How to read the evidence tags
+
+| Tag | Meaning |
+|-----|---------|
+| **[SPIKE Sx]** | Proven on 8.3.6 in `whk-environment-orchestration/spikes/gateway-modes/results/Sx.md` (or `RIG.md` / `SUMMARY.md`). Do not re-guess. |
+| **[SPEC §n]** | Stated in `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md`. |
+| **[REPO]** | Observed in a real file in this repo or in `gw-config/` (the dev core snapshot), checked 2026-10-10. |
+| **[MEM name]** | From the user's verified project memory (named note). |
+| **[DOC url]** | Public IA documentation or IA-staff forum statement. |
+| **[INFERRED]** | Reasoned from platform behaviour. Treat as a hypothesis; the pitfall's "capture" step proves or kills it. |
+
+Path shorthand: `results/` = `/Users/pmannion/data/worktrees/whk-environment-orchestration/gateway-config-spec/spikes/gateway-modes/results/`.
+
+Note on `.planning/WINDOWS.md`: despite the name it is the Broken Windows *defect ledger*, not platform notes. Two of its entries bind this milestone directly (Pitfalls 31 and 32).
 
 ---
 
 ## Critical Pitfalls
 
-### Pitfall 1: Contract mutation via golden-churn — the "just regenerate the snapshot" reflex
+These cause an outage, a silent wrong-state production gateway, or a rewrite.
 
-**What goes wrong:**
-Every v1.1 feature lands in a repo where ~30 snapbox golden files pin exact JSON shapes, exit codes, and help text. Under deadline pressure, a failing golden gets regenerated (`SNAPSHOTS=overwrite cargo test`) and the diff is skimmed. A field rename, a reordered enum, a changed error message slug, or a renumbered exit code ships. Agents depending on the frozen envelope break silently — they don't file bugs, they hallucinate.
+### Pitfall 1: Writing into a collection that is not the active one (mode not live on a node)
 
-**Why it happens:**
-Goldens fail *loudly* for harmless reasons (trailing whitespace — v1.0 hit exactly this with the aligned-table renderer, fixed to ride unpadded) and *silently* for harmful ones. The failure mode looks identical in CI either way, so "make it green" wins over "review the diff."
+**What goes wrong:** `apply` writes `data/config/resources/production/` on the master, scans, and the read-back "passes" because it read `find ...?collection=production`, which returns exactly what was written. But the node never activated the mode, so effective config is still `core`. The backup is the likelier victim: it boots, sees no such mode locally, logs a warning, and never re-evaluates. At the next failover prod silently reverts to `core` config.
+
+**Why it happens:** The JVM arg is ignored when the mode does not exist at boot, with only a log line ("Config mode set to "production", but no such mode exists. Ignoring.") [SPIKE S3, RIG.md]. A pair with differing modes only produces a backup-side warning ("Active deployment mode differs from peer node!") [RIG.md]. API reads that name a `collection` read the file, not the live view [SPIKE S1].
 
 **How to avoid:**
-- Additive-only rule, stated in every v1.1 PLAN's success criteria: new fields OK, new slugs OK, **renames/reorders/renumbers never** without a deliberate contract-version decision.
-- The Three-Place rule for new error slugs (v1.0 precedent, enforced by `exit_code_mapping_enumerated` in `error.rs`): (1) the enumerated test in `error.rs`, (2) the README exit table, (3) README prose. New slugs **join the existing exit bucket** (v1.0 added `eam_task_in_flight` and `provider_root_unsupported` to the exit-6 operation/denial bucket — neither renumbered anything).
-- Golden regeneration is a review event: the PR description must carry the golden diff, and any diff touching an *existing* line of an *existing* golden needs explicit justification, not just a green check.
-- EXT-01's envelope deserves an explicit documented exception *inside* the contract docs: `api call`'s `data` is gateway-verbatim by design (the one sanctioned passthrough) — write that down so the normalization instinct doesn't get applied to it later, breaking passthrough users instead.
+- Pre-check, before any lock or write: `gateway-info.deploymentMode == target.mode` on BOTH nodes (read each node's API directly). Refuse with a dedicated slug (`deploy_mode_inactive`). An empty string `""` means no mode active.
+- `verify` compares the EFFECTIVE view (`find` with no `collection`) against the render, never `?collection=production` alone. Reading `?collection=` is only for the shadowing diagnostic (Pitfall 2).
+- Never auto-fix by creating/activating modes inside `apply` (cutover is a restart-class, ordered operation, SPEC §13 step 4).
 
-**Warning signs:**
-- A PR diff that changes existing lines (not appends) inside `tests/contract_*.rs` goldens.
-- A new `CoreError` variant whose `code()`/`exit_code()`/`hint()` arms are unwritten (the enumerated test will catch — let it, don't `#[ignore]` it).
-- Any commit message containing "regen" or "fix goldens" without a shape rationale.
+**Warning signs:** Verify green but `deploymentMode` is `""` on either node; backup log contains "no such mode exists"; effective value equals the `core` value after apply.
 
-**Phase to address:** The first phase that adds a slug or output shape (almost certainly the EXT-01/EXT-02 phase) — bake the review ritual into its PLAN; every later phase inherits it.
+**Phase to address:** 20 (client exposes per-node `deploymentMode`), 23 (pre-check + effective-view verify). Test: rig pair with the backup booted before the mode existed (the S3 wrong-order run); apply must refuse.
 
 ---
 
-### Pitfall 2: Fighting the tui_coverage walk instead of designing for it
+### Pitfall 2: Core-shadow blindness — declared deletes and core-only folders
 
-**What goes wrong:**
-v1.1 adds roughly a dozen new row-requiring clap nodes (`api call`, the diagnostics verbs, EAM write verbs, tags xml/csv verbs, `edit`, `lsp`, `mcp`, `checkout`…). The CI-enforced bidirectional walk (`crates/ignition-cli/tests/tui_coverage.rs`) will refuse every one of them until each has a `routes()` row — or a sanctioned `Mapping::OutOfBand` entry. Two failure directions: (a) someone treats the red CI as an obstacle and adds OutOfBand rows casually, eroding the parity invariant ("full cockpit" quietly stops being true); (b) someone hides a command from the walk (`hide = true` in clap) so coverage never sees it. Additionally, the pinned test `out_of_band_rows_are_exactly_the_completions_leaf` asserts the OutOfBand set is *exactly* `["completions"]` — protocol and interactive modes **cannot** reuse the mechanism without a deliberate, documented change to that pinned assertion.
+**What goes wrong:** A resource or tag deleted from the declared tree is deleted from the mode collection, but a copy still in `core` shows through, so the "delete" is a no-op and verify (if it reads only the collection) passes. Worse for tags: a core-only tag inside a folder the mode also defines is hidden, but a core-only FOLDER shows through, so behaviour depends on tree shape.
 
-**Why it happens:**
-The walk is a designed inconvenience. It exists to force a decision per command; decisions are expensive, so people look for a shortcut.
+**Why it happens:** Tags override at folder granularity [SPIKE S2: S2 core-only tag NO, S2b core-only folder YES]. Mode wins over core for config [SPIKE S1]. Commissioning creates `core` resources that shadow `external` [SPIKE RIG.md "core overrides external"].
 
 **How to avoid:**
-- Decide the classification taxonomy up front, in the first v1.1 phase that ships CLI surface, and write it into `routes.rs` comments next to the existing four-exception state list:
-  - **Screen-mappable data verbs** (EXT-02 diagnostics, EAM writes, tags xml/csv): get real Screen rows. No exceptions. These are ordinary data screens.
-  - **Interactive/protocol modes** (`edit` shells out to `$EDITOR`, `lsp`, `mcp` are long-running protocol processes): OutOfBand rows, and the pinned `out_of_band_rows_are_exactly_…` test gets updated **in the same PR** with a comment justifying each addition.
-  - Never `hide = true`; add a CI grep or clippy deny if tempting.
-- The `edit` round-trip can still be TUI-reachable later (a Screen row that invokes the same action with an in-TUI diff/confirm step) — but ship the OutOfBand row first and upgrade deliberately, not silently.
+- `plan` computes, for every declared type, the set of names present in `core` (`find ?collection=core`) and flags (a) declared-and-still-in-core (shadow, benign but strip-pending), (b) removed-from-declared-but-still-in-core (the delete will not take effect: BLOCKING unless `--allow-shadowed`), (c) core-only folders under declared tag providers.
+- Mode resources replace the core resource WHOLESALE (whole-resource override, [SPIKE S1]). A declared singleton that is a partial copy silently drops every core field it omits. Render must emit the complete effective resource.
+- `ign deploy` never writes `core` in v1.6. The strip is a separate, snapshotted cutover step (SPEC §13 step 5); `plan` only reports it.
 
-**Warning signs:**
-- `every_row_requiring_cli_node_is_mapped_and_no_orphans` red on any v1.1 branch.
-- The OutOfBand set growing by more than the three justified entries (`edit`, `lsp`, `mcp`) across the whole milestone.
-- Any `hide`/`hide(true)` in `cli.rs`.
+**Warning signs:** After "delete" the resource still appears in effective view; `tags/export` shows a folder that is absent from the declared tree.
 
-**Phase to address:** First v1.1 CLI-surface phase (EXT-01/EXT-02). The classification decision must precede the second command that needs it.
+**Phase to address:** 22 (shadow report is a plan feature), 21 (render emits complete resources). Test: rig with a folder present only in `core`.
 
 ---
 
-### Pitfall 3: Stdout purity violation when protocol modes share the dispatch chassis
+### Pitfall 3: Lock expiry mid-write leaves a torn tree that the NEXT scan applies
 
-**What goes wrong:**
-MCP over stdio is newline-delimited JSON-RPC; the spec is blunt: the server **MUST NOT write anything to stdout that is not a valid MCP message** (verified: MCP spec 2025-06-18, Transports). LSP over stdio is Content-Length-framed — equally brittle. The current chassis (`main.rs`) routes diagnostics to stderr and envelopes to stdout — correct for CLI mode — but `render_ok`/`render_error` print to stdout and clap's own error path prints and `exit(2)`s. If `ign mcp` or `ign lsp` ride the normal dispatch path, *any* error, warning, clap usage message, or stray `println!` in a shared helper lands in the protocol stream. The client (nvim, Claude Desktop) logs a parse error or kills the server — and the failure looks like a server bug, not a code-path bug.
+**What goes wrong:** The deploy detects `GET /scan-lock/config` → 204 and correctly refuses to scan. But the half-written tree is still on disk. Any later scan (a second deploy, a Designer/UI config save, a project scan, gateway-internal triggers) applies the torn state. "Failed safely" was false.
 
-**Why it happens:**
-The single-exit-point chassis is the project's best structural decision — so the instinct is to extend it rather than bypass it. But protocol modes are not commands; they are alternate front doors.
+**Why it happens:** Expiry applies nothing and gives no signal on a later `POST /scan` [SPIKE S4, SPEC §6.4.3]. The lock is the only thing standing between disk and the gateway, and it has a timer.
 
 **How to avoid:**
-- Protocol modes must branch **before** envelope/render resolution: match the mode subcommand in `main` and enter a dedicated loop that never touches `render_ok`/`render_error`. The frozen contract is untouched because these modes are additive, not replacements.
-- Enforce mechanically, not by convention:
-  - Integration test that spawns the real binary, performs a full handshake, exchanges several messages (including one that triggers an internal error), and byte-scans stdout for anything unframed. This test must fail on a single stray byte.
-  - `#![deny(clippy::print_stdout)]` (or a lint pass) on the protocol-mode modules.
-  - Verify `init_tracing` has no stdout sink reachable from protocol mode.
-- Both MCP and LSP get the *same* pattern; the framing differs (newline-delimited vs Content-Length) but the pre-dispatch entry and purity test are shared. Factor framing into distinct modules with their own tests — the classic cross-transport bug is mixing the two framings because one binary hosts both modes.
+- Abort path = restore, not just exit. On expiry/transport error, immediately re-acquire a lock and restore the pre-write on-box snapshot (Pitfall 21), then scan, then verify. Only then report `failed`.
+- TOCTOU: checking "lock still held" and then calling scan is racy. Use the gateway-reported `remaining` from `GET /scan-lock/config` (it has a `remaining` field [SPIKE S4]) and require `remaining >= safety_margin` before issuing the scan; do not compute remaining from the runner's clock.
+- Check the lock immediately before the scan AND treat "scan POST returned 200" as only "requested" (Pitfall 6).
+- Keep the write window tiny (Pitfall 18: stage outside the lock, mirror inside it).
 
-**Warning signs:**
-- "parse error" or unexpected-disconnect in client logs right after server startup.
-- Any `print!`/`println!`/`dbg!` reachable from a protocol-mode call path.
-- Handshake works but the first tool/request response corrupts the stream.
+**Warning signs:** Verify disagrees with the render after a run that reported a lock problem; `plan` right after a failed apply shows changes already half-applied.
 
-**Phase to address:** EXT-04 (MCP) phase establishes the pattern — it will likely land first among protocol modes; IDE-02 (LSP) phase reuses it verbatim. The purity test should be written in whichever phase ships first and generalized, not rewritten.
+**Phase to address:** 23. Fault-injection test: acquire with `holdTimeout=2`, `sleep` mid-write, assert no scan was issued AND the collection equals the pre-write snapshot AND exit code is the distinct failure slug.
 
 ---
 
-### Pitfall 4: Version skew — new features vs stale route bundle or stale installed binary
+### Pitfall 4: `holdTimeout` sized from spike numbers
 
-**What goes wrong:**
-Two concrete skew surfaces, both already demonstrated in v1.0:
-1. Tag xml/csv transfer will likely require WebDev route changes → the bundle must bump 1.1.0 → 1.2.0 across **seven lockstep copies** (`routes/VERSION`, five `doPost.py` `ROUTE_VERSION` constants, `ROUTE_BUNDLE_VERSION` in `webdev/mod.rs`) with equality-enforcing drift tests. Miss one copy or forget a direction of the stale-refusal and either new CLI refuses old routes forever, or worse — new CLI happily calls routes missing the new logic and misparses.
-2. The 07-VERIFICATION note is direct evidence: the author's own `~/.cargo/bin/ign` was stale and exhibited *already-fixed* bugs on the live gateway. A v1.1 user with a v1.0 binary calling v1.1-aware routes (or vice versa) produces confusing failures far from the cause.
+**What goes wrong:** `holdTimeout = 2*(write+scan)+1` evaluated with the spike values gives 5 s [SPIKE S4]. Real prod: file transfer over the VPN/SFTP plus Defender scanning plus a larger tree, and the scan itself is slower on the real gateway. The lock expires on the first real deploy (Pitfall 3).
 
-**Why it happens:**
-The lockstep is enforced for the version *strings* but the refusal logic and the "upgrade hint" path are per-feature work that's easy to skip when the happy path works on the dev machine (which is always freshly deployed).
+**Why it happens:** The spike numbers are `docker cp` on localhost against ~1.3k files; SUMMARY.md and SPEC §6.4.3 both say "measured on the TARGET transport". Project scans measured 7.5 s on prod and 14.6 s on dev [MEM ignition-83-platform-scan-api], already above 5 s; config scan on a larger tree is unmeasured.
 
 **How to avoid:**
-- Route bump = one atomic commit: all seven copies + both drift tests (new CLI ↔ old route refuses; old CLI ↔ new route refuses) + e2e redeploy gate. Copy the 07-06 pattern exactly — it was live-proven in both directions.
-- Any feature that needs route N must fail on route < N with `route_version_mismatch` **plus a hint naming the fix** ("run `ign webdev deploy`"). No feature may silently degrade against an old bundle.
-- Protocol modes (MCP/LSP) must report a coherent version triple (CLI version, route bundle version, protocol version) in their handshake/serverInfo so remote agents can diagnose skew themselves.
+- Never hard-code. `holdTimeout` comes from the target config with enforced floor/ceiling, and `plan` prints the computed value and its inputs. Measure p95 of (mirror + scan) on the `test`/rig target with a prod-sized tree and derive.
+- Ceiling matters too: a crashed deploy holds the lock for the full hold and blocks gateway config application (409 for others). Keep it as tight as the measurement allows.
+- Poll cadence for `GET /scan/config` ~500 ms; per-phase deadlines (acquire, write, scan-complete) separately configured.
+- `acquireTimeout` handling: 409 = someone else holds it ("Lock already held by <actor>"), report the actor, never wait indefinitely [MEM ignition-83-platform-scan-api].
 
-**Warning signs:**
-- `route_version_mismatch` appearing during development on the shared dev rig (stale deploy).
-- A drift test that only pins equality of strings, not behavior of the refusal.
-- e2e gates passing on a machine where nobody remembers deploying routes recently.
+**Warning signs:** `lock_expired` on the first production run; scan duration near the hold.
 
-**Phase to address:** Tag-transfer phase owns the bump discipline; EXT-04/IDE-02 phases own coherent version reporting in handshakes.
+**Phase to address:** 23 (value derivation), 20 (client surfaces `remaining`, `actor`, 409).
 
 ---
 
-### Pitfall 5: Live-gate erosion — write features verified only against wiremock
+### Pitfall 5: Mirror-with-deletes erases gateway-owned files in the mode collection
 
-**What goes wrong:**
-v1.1 is write-heavy against real infrastructure: raw passthrough, EAM writes on a **production controller** (WHK), resource pushes, workspace sync. The single most expensive v1.0 lesson (05-06) was that five plans' worth of wiremock-green routes were **dead on real gateways** (the byte-0 loader contract) because the live run came last. The inverse pressure also exists: live gates mutate real gateways, so verifying "just this once" against the WHK production controller is dangerous — 07-VERIFICATION deliberately declined a live re-probe of `eam task force` because a freed slot would mean dispatching a real task.
+**What goes wrong:** "Mirror the rendered tree into `data/config/resources/production` over SSH (deletes included)" literally wipes (a) `production/config-mode.json`, the file that DEFINES the mode, and (b) every resource of an undeclared type that the gateway or a UI/API edit put there. After `config-mode.json` disappears the mode is gone from the master and syncs to the backup; the next restart ignores the JVM arg (Pitfall 1).
 
-**Why it happens:**
-Wiremock passes feel sufficient; live rigs are slow (gateway commissioning 30–90s+), stateful, and mutation-risky. Under time pressure the env-gated gate gets "run later."
+**Why it happens:** `POST /mode` writes `resources/<mode>/config-mode.json` [SPIKE S1: shown in S1.md]. API/UI edits with no `collection` land in the active mode collection [SPIKE S1c], so the collection holds gateway-created content of undeclared types (e.g. a UI-made API token or user source). A naive `robocopy /MIR` or `rm -r` treats all of it as stale.
 
 **How to avoid:**
-- Every v1.1 write feature ships with at least one env-gated live gate, run and recorded during the phase — gate-first, not gate-last. 05-06's own words: "the env-gated gates exist to be RUN."
-- Endpoint-sensitive features (EXT-02 diagnostics, historian binding, any EAM verb) gate on **both** live rigs (8.3.3 and 8.3.6), not one.
-- Reuse the v1.0 harness unchanged: `LIVE_GATE` static mutex serialization (409-race prevention), pre-clean helpers for idempotent re-runs, throwaway compose rigs for destructive suites, production-controller probes limited to read-only or explicitly human-approved mutations (documented in VERIFICATION as human-verification items, never silently skipped).
-- EXT-01 is special: its live gate must itself be designed so the passthrough can't nuke the rig (read-only method matrix in the gate; destructive methods verified against wiremock + a refusal test, not against the rig).
+- The delete set = (files under declared types/names in the previous applied manifest) minus (rendered set). Nothing else is ever deleted. Types outside the manifest allowlist are untouchable (SPEC §4: "Anything not listed stays owned by the gateway").
+- `config-mode.json` is a protected path: either render emits it byte-identical to the gateway's, or the mirror excludes it. Add a hard guard that aborts if the post-mirror tree lacks it.
+- `plan` lists every file it would delete, grouped as declared-removal vs unmanaged; unmanaged-in-collection is reported, not deleted.
 
-**Warning signs:**
-- A plan whose verification section lists only wiremock contracts for a mutating path.
-- Live gates filtered out of a test run (`cargo test -- --skip live` habitually).
-- The WHK controller's task list gaining entries nobody can attribute.
+**Warning signs:** `production/config-mode.json` missing; resources vanish that nobody declared; backup `GET /mode` lacks `production`.
 
-**Phase to address:** Every v1.1 phase with a write path; the harness exists — this is a discipline pitfall, not a tooling one.
+**Phase to address:** 22 (plan names exact delete set), 23 (mirror implementation + guard). Test: seed an undeclared resource + `config-mode.json`, apply, assert both survive.
 
 ---
 
-### Pitfall 6: EXT-01 raw passthrough that leaks the envelope or mis-classifies everything into exit 1
+### Pitfall 6: Believing a 200 from `POST /scan/config`
 
-**What goes wrong:**
-Three distinct failure shapes:
-(a) **Unclassified 4xx → exit 1.** `classify.rs` classifies via path-scoped arms (`is_config_resource_url`, `is_eam_force_url`, …). A passthrough to an arbitrary URL matches none of them; the live-proven v1.0 lesson (`debug/eam-create-422.md`) is that an unclassified 4xx falls through to `internal_error` — "a 4xx validation response surfacing as internal error is itself a taxonomy gap." A raw-passthrough feature whose *entire job* is hitting arbitrary URLs will turn the gateway's rich 4xx surface into a wall of exit-1 "internal errors are bugs."
-(b) **Envelope/diagnostics leakage.** Non-2xx bodies are sometimes HTML (auth redirect, gateway mid-restart — v1.0 pitfall 1.2); a serde parse of that is a panic-shaped failure; and any progress/verbose output on stdout breaks the one-envelope rule.
-(c) **Binary corruption.** `api call` against an export endpoint returns ZIP bytes; printing those through a UTF-8 JSON envelope corrupts both the file and the terminal.
+**What goes wrong:** Scan returns 200 immediately with the OLD `lastScanTimestamp` and `scanActive:true`. A deploy that proceeds on 200, or that polls only `scanActive == false` (which may be true before the scan even starts), declares victory against unapplied files. Separately, scan "completing" does not mean resources loaded: an invalid resource (missing `attributes.uuid`, bad reference) is dropped with only a WARN in the gateway log.
 
-**Why it happens:**
-The passthrough is conceived as "thin" — and thinness gets implemented as *no handling*, which is exactly wrong: the escape hatch must be thin in *transformation* (body verbatim) but strict in *classification and framing* (taxonomy, content-type sniffing, envelope always).
+**Why it happens:** Async scan [MEM ignition-83-platform-scan-api: green curl = "scan requested"]. Unloadable resources log "does not have required UUID attribute, will not be loaded" and carry on [SPIKE RIG.md].
 
 **How to avoid:**
-- Install a passthrough catch-all classifier: any 4xx → exit 2 `invalid_input` (or one new additive slug such as `gateway_rejected`, same exit bucket) carrying the status code and body text verbatim in the error payload. 5xx → exit 3-class (gateway-side). Only genuinely unexpected local failures get exit 1.
-- Sniff content-type before parsing: `text/html` → surface "gateway returned HTML (auth redirect or not fully up)" mapped to the auth/unreachable class, never parsed as JSON.
-- Non-JSON content types require `-o FILE` (documented); attempt to emit binary through the envelope is a usage-class refusal.
-- The envelope still wraps success: `{"ok":true,"profile":…,"data":<verbatim gateway body>}`. Document `data` as gateway-verbatim for this command only.
+- Completion predicate: `scanActive == false && lastScanTimestamp > before`, where `before` is read from the same gateway just before the POST. Never compare gateway timestamps to the runner clock (Pitfall 24).
+- Read-back every declared resource from the effective view and diff semantically; absence is a failure, not a skip.
+- Scrape the gateway log for WARN/ERROR since the scan began (`will not be loaded`, `UUID`, `NamedResourceHandler`), using `ign logs`, and fail verify on any hit naming a declared resource.
+- Use `allowInvalidReferences=false` on read-back (SPEC §6.1).
 
-**Warning signs:**
-- Exit 1 in any transcript where the gateway clearly returned 4xx.
-- `serde_json::Error`/`expected value` in output for a failed call.
-- A terminal trashed by binary bytes.
+**Warning signs:** Scan duration ~0; `lastScanTimestamp` unchanged; read-back count lower than rendered count.
 
-**Phase to address:** EXT-01 phase — the catch-all classifier is the first task, before the happy path is even wired.
+**Phase to address:** 20 (typed scan-status), 23 (predicate + log scrape + read-back).
 
 ---
 
-### Pitfall 7: EXT-01 method/auth-header injection and destructive-by-accident passthrough
+### Pitfall 7: Writing a new resource without a uuid, or generating an unstable one
 
-**What goes wrong:**
-`ign api call --method DELETE /data/api/v1/resources/.../signature` against a live gateway is one flag away. Worse: `-H "X-Ignition-API-Token: <other token>"` overrides or duplicates the profile's auth header, creating confusing auth states and — via verbose request logging — a leak path for *user-supplied* auth headers (v1.0 pitfall 4.4 redacted the CLI's own token; user headers are a new surface). Raw writes to `/data/api/v1/resources/` also collide with signature semantics (v1.0 pitfall 1.4): DELETEs without a current signature 400/409 confusingly.
+**What goes wrong:** (a) No `attributes.uuid` on a NAMED resource: the resource is silently ignored. (b) A random uuid on every render makes each render differ, so `plan` is never empty and rename tracking breaks. (c) Adding a uuid to a singleton that has none is a shape change.
 
-**Why it happens:**
-An escape hatch feels like it should accept everything. But "everything" includes the CLI's own auth invariants, which the user can now violate.
+**Why it happens:** Missing uuid → "will not be loaded" [SPIKE RIG.md, SPEC §3]. IA: a resource that tracks renames and lacks a UUID "is just ignored and treated as if it doesn't exist", and no attempt is made to add one [DOC forum.inductiveautomation.com/t/deployment-modes-and-resource-definition-uuids/114966]. Singletons (`system-properties`, `security-properties`, `security-levels`) have none by default (same thread). In this repo's `gw-config/` snapshot 30 of 91 `resource.json` have no `uuid`, so "always add one" is wrong [REPO gw-config resource.json census, 2026-10-10: 61 carry uuid, 30 have none (16 with only lastModification+signature+enabled, 12 with only lastModification+signature, 2 near-empty)]. Per IA, each resource in each collection should carry a unique uuid, so copying a uuid from core into the mode copy is discouraged (same thread).
 
 **How to avoid:**
-- Non-GET methods require `--yes` (same ladder as `sessions terminate`), with the URL echoed in the confirmation prompt for humans.
-- Refuse `X-Ignition-API-Token` (and any profile-auth header) in `-H` with a clear "auth is owned by the profile" error — one source of auth.
-- Extend redaction to **all** request headers matching auth patterns in verbose/debug logs, including user-supplied ones.
-- When the URL matches `is_config_resource_url` and the method is mutating, append the existing signature hint to the error envelope so raw users discover read-modify-write instead of fighting 400s.
+- Per-type rule table (named vs singleton), captured from a real bootstrap, drives render. Bootstrapped resources keep the gateway's own uuid (SPIKE S1/SPEC §3).
+- New uuids are deterministic: UUIDv5 over (gateway, type, name) stored once in the declared tree, never `now()`/random at render time. A resource that exists in core with uuid U gets a distinct, stable uuid in the mode copy.
+- Lint: named type without uuid fails render.
 
-**Warning signs:**
-- Verbose logs containing a second token value.
-- A CI/e2e test that exercises raw DELETE against the live rig as a *positive* case.
+**Warning signs:** Read-back count short by exactly the new resources; `plan` non-empty immediately after apply with only uuid diffs.
 
-**Phase to address:** EXT-01 phase (same task as the classifier).
+**Phase to address:** 21 (rule table, deterministic uuid), 23 (log-scrape catch). Capture first: list which resource types in the 8.3.6 prod bootstrap carry uuid.
 
 ---
 
-### Pitfall 8: EXT-02 diagnostics — endpoint variance across 8.3.x point releases
+### Pitfall 8: Self-lockout by shipping the deploy token's authorization away
 
-**What goes wrong:**
-License, redundancy, GAN, and diagnostics-bundle endpoints are less contractual than the core REST surface the CLI already wraps; shapes and even availability move between 8.3.x minors. v1.0 already lived this at small scale: EAM *history* decoding needed a wire-faithful UUID-string model pinned from a live capture; the working-vs-sent EAM create body differed from every doc sketch. A diagnostics command built against the dev rig's shape breaks on the other rig — and v1.1's promise is curated *reliable* views, so a broken diagnostics command is worse than none.
+**What goes wrong:** The declared tree includes a resource that defines security levels / security-properties. Applied wholesale into the mode collection, it overrides core's version, which is where the `Authenticated/Deploy` level mapping for `ci-deploy` lives. The very next call (scan, verify, rollback) is 403 and the gateway is stuck half-deployed with no API path to scan or roll back.
 
-**Why it happens:**
-Endpoint docs describe one version; rigs run two; production runs a third someday.
+**Why it happens:** Config-defined API tokens cannot hold system `Roles` levels ("Security level 'Authenticated/Roles' cannot be granted via config and will be ignored") so a custom level is required [SPIKE RIG.md]. In the spike, API calls stayed 403 until the level was written into `core/ignition/security-properties`, and core overrides external [SPIKE RIG.md]. Mode resources override core WHOLE-resource (Pitfall 2). IA notes 8.3.0-8.3.5 could overwrite a custom mode's `security-properties/config.json` at first boot with a forced password reset, fixed in 8.3.6 [DOC forum thread above].
 
 **How to avoid:**
-- Version-tolerant parsing by default: `deny_unknown_fields` OFF, optional fields explicit (present-but-null in the envelope) so agents can rely on field presence as the stable contract even when the gateway omits data.
-- Live gates on **both** rigs for every diagnostics verb.
-- When an endpoint 404s or shape-shifts, honest degradation: an additive slug (`endpoint_absent_on_gateway_version`-style, exit-6 bucket) with a hint naming the gateway version probed — never exit 1, never a guessed partial payload.
-- Curate the payload in the action layer (v1.0's proven pattern): the gateway's shape is an implementation detail; the envelope shape is the contract.
+- Treat `security-properties`, `security-levels`, api-token and user-source types as DENY in the allowlist for v1.6 (SPEC §1 non-goal: API tokens and user stores); security zones are declarable but never the singletons above.
+- Pre-write lint: if the render touches any security singleton, assert the deploy token's custom level survives, else refuse.
+- Acquire the scan-lock FIRST (a write-permission probe): a 403 here fails before any file is touched. Existing `classify` maps 403 to an auth class; make sure the hint says "token lacks the custom Deploy level in gateway write permissions".
+- Rollback must not depend on anything the apply could have broken: SSH restore + scan uses the same token, so keep the token path out of the render entirely.
 
-**Warning signs:**
-- A command green on 8.3.3, red on 8.3.6 (or vice versa).
-- Golden churn every time the suite runs against a different rig — a shape assumption leaking through.
+**Warning signs:** 403 right after a scan on a token that worked before; `security-properties` in the render diff.
 
-**Phase to address:** EXT-02 phase; both-rig gating is a phase success criterion, not a stretch goal.
+**Phase to address:** 21 (allowlist deny), 22 (plan flags), 23 (lock-first probe). Test: render containing a security singleton must be refused.
 
 ---
 
-### Pitfall 9: EXT-03 EAM writes — wire-shape recomposition and guard-ladder erosion
+### Pitfall 9: Backup false-green: `syncPending=false` is not "backup has it"
 
-**What goes wrong:**
-The EAM create-body split (`config.profile` vs `config.settings`; `config.settings` REQUIRED, `targetGateways` belongs in settings) was learned live the hard way (422 `Settings cannot be null`, pinned in `debug/eam-create-422.md`). Every *new* EAM write verb (delete, new task types, definition edits) re-enters this minefield: the temptation is to compose bodies from docs sketches again. Separately, the guard ladder (`REFUSED_TYPES`/`MUTATING_TYPES`/benign) must extend coherently: a new type token that isn't classified defaults to *unclassified behavior* rather than *refusal*, and the `--help` taxonomy must match the token lists exactly (07-04 line-by-line verified — that equality is load-bearing for trust). New conflict shapes (e.g., deleting an in-flight task) will produce 409/422 variants not covered by `EamTaskInFlight`'s force-URL sniff.
+**What goes wrong:** Verify reads master `GET /redundancy` (`peerConnected:true`, `syncPending:false`, `projectState:Good`), sees success, but the backup never converged. A backup that exhausts sync retries stops trying silently; a snapshot mismatch after diff aplication fails the sync; and a backup running the wrong mode shows only a warning.
 
-**Why it happens:**
-Each new verb looks like the previous one, so the composition helper and the classification lists get copied-and-extended casually instead of through the established seams.
+**Why it happens:** RIG.md: `[config-resource] After applying diff, new local system snapshot ... did not match remote system snapshot`, then "Sync operation has failed 5 time(s) ... No further synchronization attempts will be made." [SPIKE RIG.md]. Mode divergence is a log warning only [SPIKE S3]. A clean, correctly ordered pair converges in ~4 s [SPIKE S3] but that says nothing about degraded pairs.
 
 **How to avoid:**
-- All new EAM verbs compose bodies through the existing `composed_settings` seam; each new type gets a wire-pinned contract test captured from a live read-back (the `eam-working-definition.json` method), never from docs.
-- Guard discipline: any new type token is added to a class **at creation time**; default-refuse is the fallback for anything unlisted; a contract test asserts help-taxonomy == token lists (extend the existing 07-04 check).
-- New conflict classifications go through the classify.rs path-scoped-arm pattern (body-sniffing, additive slug, both exit-table places) — same shape as `EamTaskInFlight`, not ad-hoc string matching.
-- Task IDs are UUID *strings* on the wire — keep wire-faithful string models (the gap-1 lesson); never coerce to numbers.
-- WHK production controller: mutating e2e probes need the explicit mutation-risk policy from 07-VERIFICATION (wiremock pin + captured live envelope may substitute for a repeat probe).
+- Verify the backup by CONTENT, not by status flags: read the effective resources directly from the backup's own API (10.4.8.29:8043) and compare to the render; read the file hash of the backup's `production` collection over SSH; compare `deploymentMode` on both nodes.
+- `lastSyncTimestamp` is epoch-ms (S3.md values ~1.79e12) and must ADVANCE past a pre-apply sample from the same node; do not compare it to the runner clock.
+- Timeout derived from S3's ~4 s with a large multiplier, then `POST /redundancy/gwaction/resync`, then re-check. `resync` returns 200 with an empty body, so a green resync proves nothing; re-verify content afterwards [SPIKE S3, MEM].
+- Backup mismatch after a CLEAN master verify is a different failure class from master-verify failure: it must NOT trigger auto-rollback of the master (Pitfall 23). It reports `deploy_backup_lagging`.
+- Do not interpret backup `uptime: -1` or `activityLevel: Cold` as unhealthy [SPIKE S3.md shows both on a healthy backup]. The client doc in `redundancy.rs` says role strings are `Primary`/`Backup`; real 8.3.6 pairs report `Master`/`Backup` [SPIKE S3]. Do not match on `Primary`, and use `activityLevel` (who is serving), not `role`, to decide which node is active; after a failover the `Master`-role node can be `Cold`.
 
-**Warning signs:**
-- 422s during development of any EAM verb (means the split was re-guessed).
-- A type token appearing in `cli.rs` help text but not in `REFUSED_TYPES`/`MUTATING_TYPES` (or vice versa).
-- New 409 text landing as `internal_error` in a transcript.
+**Warning signs:** Master API shows new value, backup API shows old; "No further synchronization attempts" in the backup log.
 
-**Phase to address:** EXT-03 phase.
+**Phase to address:** 23 (backup verification), 20 (client reads from either node; fix stale role vocabulary).
 
 ---
 
-### Pitfall 10: EXT-04 MCP shim — protocol lifecycle, framing, catalog drift, and blocked loops
+### Pitfall 10: Secret VALUES do not replicate; references do
 
-**What goes wrong:**
-Six distinct traps in one feature:
-(a) **Framing confusion:** MCP stdio is newline-delimited JSON-RPC with no embedded newlines — *not* LSP's Content-Length framing. One binary hosting both modes makes cross-contamination likely (verified: MCP spec 2025-06-18).
-(b) **Handshake/version:** responding to `initialize` with a hardcoded or wrong protocolVersion, or failing politely on an unsupported one; ignoring that version negotiation is part of the initialize result.
-(c) **Notification mishandling:** sending a *response* to `notifications/initialized` (notifications get no response — breaks clients) or treating notifications as requests.
-(d) **Tool-catalog drift:** hand-maintained tool schemas drift from the clap tree; agents see stale params after every CLI change. This is the *same* failure class tui_coverage was built to kill — reimplementing it as a hand-written catalog undoes that protection.
-(e) **Blocked loop:** a long gateway call (import, restart-wait) executed inline in the server loop stalls everything — including `ping` — until the client declares the server dead.
-(f) **Lifetime/lifecycle errors:** not exiting on stdin close; prompting interactively (impossible — stdin is the protocol); crashing on one malformed message instead of answering with a JSON-RPC error.
+**What goes wrong:** The declared config replicates and reads back identical on the backup (it only holds a secret NAME). But the secret value written to the internal provider on the master via the API never reached the backup. Failover then yields a DB connection / OAuth client that cannot decrypt. Verify was green.
 
-**Why it happens:**
-"Thin shim" is read as "small effort" rather than "small *transformation* with strict protocol obligations." The CLI's non-interactive and envelope discipline make the mapping trivial — but the protocol lifecycle itself is new code with new obligations.
+**Why it happens:** Secrets are per-gateway state that redundancy does not replicate; `manage-secrets.sh` encrypts against the target gateway's own key; every gateway must be written independently [MEM gateway-secrets-dont-replicate-to-backup, ENT-3115]. SPEC §9 requires identical root/KEK keys on both nodes and a one-time check, but the VALUE write still has to hit both.
 
 **How to avoid:**
-- Pin one spec revision (the settled stack is hand-rolled JSON-RPC 2.0 stdio, so pin to the spec text the shim implements — e.g. 2025-06-18), implement `initialize` by echoing a supported version or answering `unsupported protocol version`, and never respond to notifications.
-- Derive the tool catalog from `Cli::command()` — the *same* CommandFactory the tui_coverage walk uses — with a CI test asserting tool names/params ↔ clap tree parity. The catalog is then structurally incapable of drifting.
-- The shim maps tool call → the same actions layer → the **same frozen envelope** inside the tool-result content, so agent-side parsing stays identical to CLI mode. Mutating tools must preserve `--yes` refusal semantics *inside* the shim: the refusal envelope is the tool result — never a silent escalation or a bypass flag.
-- Run gateway calls on a worker/tokio task; keep the loop responsive (answer `ping` immediately); per-operation-class timeouts per v1.0's 1.10 rule; gateway-down yields a JSON-RPC error / `isError: true` tool result, never a hang or crash.
-- Exit cleanly on stdin EOF; malformed inbound message → JSON-RPC parse error response, continue serving.
-- Non-interactive profile resolution only (env/flags/config at spawn); never prompt.
+- The secrets step writes to BOTH nodes' APIs; `verify` checks that every secret NAME referenced by the render exists on both nodes via `GET /secret-providers/{name}/secrets` (names only; never log values).
+- Report per-node results in the structured output.
+- Keep the key-identity check as a blocking pre-flight, not documentation.
 
-**Warning signs:**
-- Client logs: "invalid JSON", protocol errors right after startup, or server marked unresponsive during a long op.
-- The tool list missing a verb that shipped in the same release (catalog is hand-written).
-- The shim code containing any `--yes` bypass or guard removal "for agent convenience."
+**Warning signs:** "works on the master, not the backup" reports; bogus downstream errors (the ENT-3115 `AttributeError: 'unicode'` tell).
 
-**Phase to address:** EXT-04 phase. A scripted-client CI harness (fake MCP client over real stdio) is the phase's first deliverable — handshake, notification, error, ping, EOF cases all scripted.
+**Phase to address:** 23 (secret-name presence per node), 21 (render emits references only).
 
 ---
 
-### Pitfall 11: Tag xml/csv transfer — round-trip fidelity loss and spreadsheet mangling
+### Pitfall 11: Embedded secret ciphertext committed in the declared tree
 
-**What goes wrong:**
-JSON shipped as the native interchange in v1.0 precisely because tags are tree-typed: nested UDT structures, arrays, nulls, dataType precision, parameters. CSV flattening loses structure; XML half-solves structure but loses types the same way the WebDev layer stringifies values (v1.0's alarm-history `str()` lesson — numbers/dates arrive as strings, and once stringified the type is gone for good). The real-world corruptor is Excel: `001` → `1`, dates reinterpreted, BOMs added, quoting broken. A `tags export --format csv` → edit → `import` loop that *looks* symmetric silently mutates types, and users blame the gateway.
+**What goes wrong:** Bootstrapping from core copies `"type": "Embedded"` blobs into git. They look "encrypted, so safe" but: they are KEK-bound (undecryptable on test/ci gateways, so rehearsals break), nondeterministic (a re-encrypt changes the bytes, so perpetual diffs), and are credentials at rest in git history.
 
-**Why it happens:**
-XML/CSV are requested because humans and spreadsheets want them. The formats get built symmetric-by-appearance instead of export-honest.
+**Why it happens:** The dev snapshot already has this: 10 files in `gw-config/` contain `ciphertext`, e.g. the database-connection `password` is `{"data":{"ciphertext","encrypted_key","iv","protected","tag"},"type":"Embedded"}` with an `iat` in the protected header [REPO gw-config/ignition/database-connection/WHK01_PG_MES/config.json].
 
 **How to avoid:**
-- Position xml/csv as **export-honest, import-guarded**: export freely; import validates and produces an explicit **loss report** (dropped fields, coerced types, flattened structures) and refuses ambiguous round-trips without `--yes`.
-- RFC4180 quoting everywhere (commas, newlines, and quotes in tag paths/expressions are routine); UTF-8 explicit; unit-pin round-trip fixtures (JSON → csv → parse → JSON + loss list) on the existing v1.0 tag fixtures.
-- Import reuses the proven `effective_top_level_names` collision semantics and the `_types_` structural skip — do not re-derive collision logic per format.
-- Document loudly: "Excel-touched files must pass validation; the loss report is the safety net."
-- If a route change is needed for server-side conversion, it's a bundle bump (Pitfall 4) — prefer CLI-side conversion from the JSON interchange to keep the route bundle frozen.
+- Render lint: ANY `"type": "Embedded"` fails, regardless of field name. Deny-by-default; additionally lint secret-typed plain-string fields per resource type (OIDC client secret, MQTT/OPC passwords, SMTP, JWTs), plus a high-entropy heuristic as backstop.
+- Bootstrap converts to `Referenced` (provider `default`, name `<resource>.<field>`) (SPEC §9).
+- Offer a `--bootstrap` helper in render/plan that rewrites Embedded to a reference and emits the "secret names to seed" list; never writes ciphertext.
 
-**Warning signs:**
-- A round-trip test comparing JSON == JSON after a csv detour without a loss list (it can only pass if the loss list is empty — which means it's not testing real data).
-- First user report of "tags changed after I just re-exported them."
+**Warning signs:** `ciphertext` or `encrypted_key` anywhere under `gateways/`; git-secrets hits.
 
-**Phase to address:** Tag-transfer phase.
+**Phase to address:** 21. Test: golden fixture with an Embedded password must fail with exit 2 slug and a message that names the path but NOT the value.
 
 ---
 
-### Pitfall 12: Tag↔historian binding — guessing wire shapes instead of taking the Designer diff
+### Pitfall 12: Secrets leak through `plan`/`verify` output, envelopes, errors and artifacts
 
-**What goes wrong:**
-The 05-06 spike ran five candidate REST bodies against a live InternalHistorian rig and **none produced data**; the documented resolution path is a Designer diff (capture tag/resource config before+after configuring the binding in Designer, replicate that). The v1.1 trap is building the feature on guessed field names before the diff evidence exists — committing a roadmap/phase deliverable the wire doesn't accept. Secondary traps: the diff requires a *licensed* Historian-capable rig (the InternalHistorian fixture may not exhibit the real binding), the binding config may live **outside** the tag config resource (provider/module config — "edit the tag" alone can't replicate it), and shapes may differ 8.3.3 ↔ 8.3.6.
+**What goes wrong:** `plan` prints a diff of `config.json` containing a secret field; the output goes to CI logs, the JSON envelope, MCP tool results, TUI scrollback, and run artifacts. GitHub log masking only knows the secrets Doppler registered.
 
-**Why it happens:**
-It's the last remaining v1.0 limitation, so there's pressure to *ship the closure* rather than *run the experiment*. Docs sketches feel authoritative; 05-06 proved they aren't.
+**Why it happens:** Diff code is generic. Existing `classify` already rides a raw 422 body into the error `reason` when the gateway has no `messages` array (`gateway rejected the resource body (HTTP 422 from {url}): {body}`), and config-resource 422 bodies can echo the submitted config [REPO crates/ignition-core/src/client/classify.rs].
 
 **How to avoid:**
-- Spike-first design, exactly as v1.0 pre-cleared: the phase's plan 01 is a time-boxed live diff on **both** rigs; **no CLI surface commits until the diff lands a wire shape.**
-- The roadmap item must explicitly allow the fallback outcome ("documented limitation remains, now with diff evidence of why") — that fallback was legitimate in v1.0 and remains legitimate.
-- If the diff lands: new fields ride as additive optional fields in the existing tag config model + a live gate proving data actually flows (the spike's success criterion was data, not a 200).
+- Redact by SCHEMA PATH (secret-typed fields per resource type), printing `<redacted sha256:abcd…>` so changes are still visible. Never by regex on values.
+- Cap + redact any gateway body quoted in an error on deploy paths; no raw-body fallback.
+- The `X-Ignition-API-Token` value must never appear in debug output; `actor` echoes (`api-token:<name>:<ip>`) are fine, the token secret is not.
+- Snapshots (Pitfall 22) are treated as secrets.
+- Property test: for every fixture containing a canary secret string, assert it appears in no stdout/stderr/envelope/error output across `plan`, `apply`, `verify`, `--json`, MCP.
 
-**Warning signs:**
-- A plan sketching REST bodies from documentation alone.
-- No licensed-rig access plan before the phase starts.
-- Any commit adding binding fields without a captured live diff artifact.
+**Warning signs:** a canary string in any captured output.
 
-**Phase to address:** Historian-binding phase (spike = its first plan). The roadmapper should hold the feature's "done" definition loose until the spike reports.
+**Phase to address:** 21 (redactor), 22 (plan output), 23 (errors/verify), 20 (client error bodies).
 
 ---
 
-### Pitfall 13: TUI theming — retrofitting a palette onto hardcoded colors, then fighting style-pinned buffer tests
+### Pitfall 13: Line endings: `text=auto` on a Windows runner converts the declared tree to CRLF
 
-**What goes wrong:**
-After 11 plans of rapid TUI build, `ui/*.rs` almost certainly hardcodes `Color::…` literals. Declaring "themes" while half the widgets bypass the palette produces a fiction that breaks on the first screen someone forgot. Compounding it: `TestBackend` buffer assertions pin exact styles, so theme work churns tests confusingly; and color-mode variance (truecolor / 256 / 16 / mono, plus light-background terminals) means the dev terminal's readability proves nothing — the 16-color and mono renderings are the ones that matter for the floor experience. Parity CI implications are mild (theming shouldn't change `routes()`), but theme plumbing that adds new leaves would trip the walk.
+**What goes wrong:** `actions/checkout` on WFLWVM01 with Git for Windows' default autocrlf, plus a repo `.gitattributes` of `* text=auto` (this repo's setting [REPO whk-environment-orchestration .gitattributes: `* text=auto`, `*.sh text eol=lf`]), checks out JSON/CSS as CRLF. Anything that byte-copies (non-JSON members) or hashes raw files now differs from what Ignition wrote (LF, no trailing newline), so file-hash verify and drift never converge.
 
-**Why it happens:**
-"Theming" sounds like a config file; in a ratatui codebase it's an architecture precondition (tokenization) plus rendering work.
+**Why it happens:** Gateway-written files are LF with NO trailing newline [REPO: `tail -c` of gw-config `resource.json`/`config.json` ends `}` with no `\n`; zero `\r` bytes]. Platform eol translation is applied only to the checkout.
 
 **How to avoid:**
-- Phase order inside the theme work: **tokenize first** — a style-tokens module as the *only* place `Color`/`Modifier` literals appear; CI grep enforcing no raw literals outside it; themes are token sets on top.
-- Buffer assertions reference tokens or normalize styles during comparison so theme changes don't churn them.
-- Respect the environment ladder: `NO_COLOR`, `CLICOLOR_FORCE`, `COLORTERM=truecolor`, TERM 256/16 detection — with a forced-mode override flag for tests; TestBackend renders at each mode.
-- Ship **monochrome as the floor theme** (readable in any terminal, light or dark); verify contrast at 16 colors explicitly — that's where themes die.
-- Theme plumbing adds zero new clap nodes; if it seems to, it's scope creep (Pitfall 2).
+- `gateways/** -text` (or `binary`) in `.gitattributes`, with a CI check that no CR exists in `gateways/`. The renderer must also tolerate CRLF input defensively.
+- JSON is parsed and re-serialized (never copied); non-JSON members (CSS, JAR) are byte-copied.
+- Hash over canonical bytes (what will land on disk), computed after render.
+- Run the render golden test in the `windows-latest` CI leg (the matrix already includes it).
 
-**Warning signs:**
-- `Color::` literals appearing outside the tokens module during theme work.
-- Buffer-test churn that isn't a deliberate token rename.
-- "Looks fine on my terminal" as the only readability evidence.
+**Warning signs:** Verify hash mismatch only when run from the Windows runner; `git diff` clean but byte hashes differ.
 
-**Phase to address:** TUI phase; tokenization is its first plan, themes second.
+**Phase to address:** 21 (+ a repo-level fix in whk-environment-orchestration).
 
 ---
 
-### Pitfall 14: TUIX-01 polling cadence — gateway hammering and config drift
+### Pitfall 14: Gson-compat serialization: sorted keys is NOT a universal rule; perpetual diffs from formatting
 
-**What goes wrong:**
-Configurable cadence invites sub-second rates. Against a real gateway that's controller CPU and log spam; against a **production** gateway it's an operational incident with the CLI's name on it. Multiple TUI instances poll in synchronized bursts. And the config itself introduces a new schema surface: an invalid cadence value that *exits* makes the TUI unopenable — the worst possible failure for a config typo.
+**What goes wrong:** A renderer that blanket-sorts keys and uses a typical JSON writer produces bytes the gateway never writes, so every `plan` shows changes and every drift check fires.
 
-**Why it happens:**
-Cadence is a one-line change from the user's perspective; the blast radius (gateway load, fleet effects, config-schema validity) is invisible locally where the dev rig shrugs at anything.
+**Why it happens (observed):**
+- `config.json` keys are alphabetical (case-sensitive ASCII: `connectURL` before `connectionProps`), but `resource.json` is NOT sorted. Its order is POJO order: `scope, [description,] version, restricted, overridable, files, attributes`, and inside `attributes`: `lastModification, uuid, lastModificationSignature, enabled` (also `legacyId`) [REPO gw-config census, 2026-10-10: 63 resources with 6 top-level keys, 28 with `description` in 2nd position].
+- Explicit `null` values are preserved (`"connectionProps": null`) [REPO]. Dropping nulls changes the file.
+- 2-space indent, `": "` separator, no trailing newline [REPO].
+- Gson HTML-safe escaping: `=`, `'`, `<`, `>`, `&` as `\u003d` etc [SPEC §4]. (Gson also emits U+2028/2029 escaped and other non-ASCII raw.) Number formatting (`1.0` vs `1`, exponent forms, big ints) differs between libraries.
+- `serde_json` default `Map` is a sorted BTreeMap (the wrong order for resource.json) unless `preserve_order` is enabled, and `f64` round-tripping can rewrite numbers; arbitrary-precision or raw number tokens are needed.
 
 **How to avoid:**
-- Conservative default (e.g. 5–10s), a hard floor (e.g. 1s) with a visible warning when configured below it, and jitter to de-synchronize instances.
-- Back off on 429/503/timeouts (halve the rate, respect retry hints) — the TUI must survive a gateway that pushes back.
-- Invalid cadence config **degrades to default with a warning** (stderr + TUI status line), never exit; profile validation surfaces the value in `doctor` so `--json` consumers see it too.
-- One shared cadence source consumed by all workers (refresh, watch, tail, rig_stream) — not per-worker timers that drift.
-- Per-profile scoping (the feature's own requirement) with validation at `profile add`/`profile set` time.
+- Per-file-kind serializer: `config.json` = sorted/escaped; `resource.json` = fixed struct order with optional `description`.
+- GOLDEN CORPUS GATE: take every JSON file from the real core snapshot (183 in `gw-config/`) plus a sample from prod `core` (tags included), parse → render → assert byte-identical. This is the proof that "files the gateway produced round-trip byte-identical" (SPEC §4). Run on all three CI OSes.
+- Property: `render(parse(render(x))) == render(x)`.
+- Cover hostile data: `=`/`'`/`<` in JDBC URLs and SQL, non-ASCII, emoji, U+2028, large ints, floats, empty `{}`/`[]`.
+- No `HashMap`, no `read_dir` order, no `now()`, no locale in render; sort explicitly. Java string order is UTF-16 code units while Rust `str` is UTF-8 bytes (differ only for supplementary vs U+E000..U+FFFF); the corpus catches any real case.
 
-**Warning signs:**
-- Gateway metrics/audit logs showing request spikes correlated with TUI sessions.
-- The TUI failing to open on a config typo.
-- Different screens refreshing at different effective rates.
+**Warning signs:** Any non-empty `plan` immediately after `apply` (see the idempotence gate, Pitfall 26).
 
-**Phase to address:** TUI phase (adjacent plan to theming; shares the config-validation work).
+**Phase to address:** 21 (serializer + corpus gate), 22 (idempotence gate).
 
 ---
 
-### Pitfall 15: IDE-01 edit round-trip — adversarial `$EDITOR`, stale pushes, and fail-open encoding
+### Pitfall 15: Windows path semantics: drive letters, spaces, MAX_PATH, case, reserved names
 
-**What goes wrong:**
-`$EDITOR` is adversarial: emacs/vscode fork or daemonize (process exit ≠ editing done; vscode needs `--wait` semantics), some IDEs return immediately, editors write backup files or don't flush before exit. Treating exit code as truth causes the CLI to read a half-written file or an unchanged one. Temp-file mistakes compound it: wrong suffix (`.json` for a script) breaks both highlighting and the Flint encode step; temp files in shared TMPDIR leak project code and invite symlink games. The encode-back step can fail on user-introduced syntax — a fail-open push sends broken resources to a live gateway. And the push itself is zip-member surgery + import: pushing clobbers concurrent gateway-side edits unless the read-modify-write signature discipline (v1.0 pitfall 1.4) is honored.
-
-**Why it happens:**
-The round-trip is tested with vim, which is the *best-behaved* editor. Everything unusual is deferred until real users hit it.
+**What goes wrong:** Transfers fail or land in the wrong place: the target is `C:\Program Files\Inductive Automation\Ignition\data\config\resources\production` (spaces, colon). `scp host:C:/Program Files/...` mis-parses the colon; a local `C:\...` source on the Windows runner reads as host `C`. Resource directory names contain spaces and commas (`Barry-Wehmiller Companies, Inc._7eeb…`, `Default Group`, `Microsoft SQLServer`, `WHK01 Distillery UNS`) [REPO gw-config names]. Deep tag trees can exceed MAX_PATH: the fixed prefix alone is 80 chars, the config snapshot's longest relative dir is 122 [REPO, measured], and tag folders nest deeper [INFERRED]. NTFS is case-insensitive and rejects trailing dots/spaces, `<>:"|?*`, and `CON/NUL/AUX`-style names that Ignition tag/resource names can legally contain [INFERRED].
 
 **How to avoid:**
-- Editor handling: spawn with a private tempdir (0700), content-correct suffix and a name derived from the resource path; treat exit code as advisory — content-hash comparison decides "changed vs no-op" (unchanged → clean no-op, no push, no confirmation prompt); on failure paths keep the temp file and tell the user where it is.
-- Encode-back: Flint encode failure = **fail closed** — print the codec error, keep the temp file for re-edit, never push. The gateway may *accept* syntactically broken Jython (it fails later at runtime), so CLI-side encode is the only gate that fires before damage.
-- Staleness: before push, re-verify the target is unchanged since fetch (signature or re-read compare); if changed, refuse with a "resource changed on gateway" error and a re-fetch path — clobbering is not a `--yes`-able outcome by default.
-- Push UX: show a diff summary, require explicit `--yes` (the existing destructive ladder), then push.
-- Cleanup: Drop-guard deletes the tempdir on abort/Ctrl-C.
-- Editor-fixture tests at least for the three archetypes: blocking (vim), deferred-exit (vscode `--wait` pattern), forked (emacs daemon) — as spawned-process fixtures, not mocks of `std::process`.
+- Use the SFTP protocol (not scp-style `host:path` parsing and not shell-quoted commands) with `/C:/…` style absolute remote paths, or stage under a short path (e.g. `D:\deploy\…`) and mirror locally on the box. Never build remote commands by string concatenation (Pitfall 19).
+- Take the gateway's OWN on-disk name encoding as truth: scan prod `core` for hostile names (WHK01 637 tag files) before assuming an encoding, and fail render on case-fold collisions or names NTFS cannot hold. (v1.1's injective path mapping in `ign workspace` solved a related problem but its mapping is not the gateway's; do not reuse it for the gateway's own layout.)
+- Pre-flight: assert max rendered path length plus prefix < 248 (or confirm `LongPathsEnabled` and that every tool in the chain is long-path aware: sftp-server, robocopy, JVM).
 
-**Warning signs:**
-- Round-trip works with vim but hangs or mis-fires with anything else.
-- Temp files accumulating in `/tmp`.
-- A user report of "my edit pushed but other things changed."
+**Warning signs:** "No such file" only for deep or space-named resources; copies that "succeed" into a wrong directory.
 
-**Phase to address:** IDE-01 phase; the editor-fixture harness is its first deliverable.
+**Phase to address:** 21 (name/length lint), 23 (transport). Capture: longest tag path in prod; test with spaces and a >200-char path on the Windows box.
 
 ---
 
-### Pitfall 16: IDE-02 LSP mode — state machine discipline and blocking gateway calls inside the loop
+### Pitfall 16: Moved files keep the wrong ACL; the service cannot read what was "deployed"
 
-**What goes wrong:**
-`lsp-server` 0.10 is a *synchronous crossbeam-channel scaffold* — "you control the message dispatch loop yourself" (verified: docs.rs 0.10.0). So: (a) a blocking gateway call inside the loop stalls every request including `$` notifications and shutdown — nvim appears frozen; (b) state-machine shortcuts break clients: requests before `initialize` must answer `ServerNotInitialized` (-32002); advertising capabilities you don't implement makes nvim send requests that error; incremental sync advertised but not implemented corrupts buffers — full-text sync is the safe default; `shutdown` → `exit` sequencing must be exact; (c) gateway slow/unreachable is *normal*, not exceptional — a completion that blocks on a 10s gateway call is an unusable editor; (d) the server is launched by nvim, so profile resolution must be non-interactive (env/args only) and a gateway error must degrade to empty results with a stderr log, not kill the server; (e) a panic in the loop kills the server mid-session (nvim restarts it, all state lost); (f) stdout framing belongs to lsp-server — any direct write is the Pitfall 3 violation in its purest form.
+**What goes wrong:** Files are uploaded to a staging dir and `move`d/`rename`d into the collection. On Windows a rename within a volume preserves the source file's ACL/owner and does NOT inherit the destination's, so the Ignition service account may be denied. Resources are then dropped or error at scan with no 4xx anywhere.
 
-**Why it happens:**
-LSP demos are written against a fast local gateway and a cooperative client. The real deployment is nvim + a gateway that's restarting half the time.
+**Why it happens:** Windows ACL inheritance applies on creation/copy, not on same-volume move [INFERRED, standard NTFS behaviour; capture on WIGNVM01]. The deploy account (`svc-ignition-deploy`) is not the account the service runs as, and the two nodes already differ in account naming (`pmannion` on .15, `Administrator` on .29) [MEM prod-ign-gateways-ssh-key-auth].
 
 **How to avoid:**
-- Async-at-the-edge: worker threads fetch/caches gateway data; the loop serves from cache with TTL and bounded waits; a miss returns empty results (with a log) rather than blocking.
-- Honest capabilities: advertise only completion + diagnostics as actually implemented; full-text sync (`change: None`) unless incremental is implemented and tested; strict initialize/shutdown sequencing with a scripted-client CI test (same harness family as MCP's).
-- `-32002` for anything pre-initialize; catch_unwind around per-request handling so one panic degrades one response.
-- Profile from env/args only; `ign lsp --check` (offline doctor: profile resolvable, gateway reachable, route version OK) so misconfiguration is diagnosable from nvim's log window, which is where stderr goes.
-- The gateway-latency contract: completions < 50ms from cache, worst-case bounded; *never* a synchronous gateway round-trip inside a completion request.
+- Create/copy into the destination (robocopy default copies data/attributes/timestamps and lets new files inherit the parent ACL) instead of renaming from outside the tree.
+- After a mirror, verify by the gateway's read-back (effective view) rather than `icacls`; additionally record an ACL sanity check (`icacls` on one new file) in `verify --deep`.
+- Provision `svc-ignition-deploy` identically on both nodes via a documented/idempotent script; reuse the admin-key ACL knowledge (`administrators_authorized_keys` must be limited to Administrators and SYSTEM via `icacls /inheritance:r` or sshd ignores it) [MEM prod-ign-gateways-ssh-key-auth].
 
-**Warning signs:**
-- nvim log: "request timed out", server restarts in the middle of a session.
-- Completions freezing while a gateway restarts or the network blips.
-- One malformed message taking down the server.
+**Warning signs:** Resource present in files, absent in effective view, scan log "Access is denied".
 
-**Phase to address:** IDE-02 phase — deliberately **last** among the IDE features: it reuses the protocol-mode pattern from EXT-04 (Pitfall 3) and the cache/latency discipline, and it's the most novel failure surface.
+**Phase to address:** 23. Capture on a Windows test box before the prod rehearsal.
 
 ---
 
-### Pitfall 17: IDE-03 workspace checkout — non-injective path mapping, case collisions, and gateway clobbering
+### Pitfall 17: File locks and robocopy defaults inside the lock window
 
-**What goes wrong:**
-Resource paths → filesystem paths must be a **bijection**. Ignition resource names can differ only in case — and the dev machine is macOS with default case-insensitive APFS, so two distinct resources map to one path and one is silently lost (then pushed back, deleting it server-side). Names can contain characters illegal on some filesystems and can carry traversal (`../`) — the mapping must be escaping + traversal-safe. Partial sync without a state manifest can't distinguish "user edited locally" from "gateway changed since checkout," so `sync --push` clobbers concurrent edits — and in this ecosystem the concurrent editor is real: the Designer and the git-module edit the same projects.
-
-**Why it happens:**
-Checkout works perfectly on the happy-path project where no two names differ by case. The bijection property is never tested, so it's never enforced.
+**What goes wrong:** (a) Overwriting/deleting a file the JVM or Defender holds open fails with a sharing violation: Java's classic file I/O on Windows opens without delete-share, so a loaded JDBC driver `.jar` under `ignition/database-driver/*/` (4 jars in the snapshot [REPO]) cannot be replaced while loaded [INFERRED; capture]. (b) `robocopy` retries a locked file 1,000,000 times with 30 s waits by default, so a single locked file consumes the lock window and then some. (c) `robocopy`'s exit code is a bitmask: 0-7 are success variants (1 = files copied), >=8 is failure; a wrapper that treats non-zero as failure fails every real deploy, and one that ignores it hides errors.
 
 **How to avoid:**
-- Define the mapping as an explicit injective encoding; unit-test the bijection property over adversarial name fixtures (case pairs, filesystem-hostile characters, traversal attempts, unicode) — a property test, not examples.
-- Refuse to map two resources to one path with an explicit error; never last-write-wins.
-- Checkout writes a **manifest** (gateway resource path + content hash + signature at checkout). Push = only manifest-tracked modified files, gated by the `--yes` ladder, preceded by a gateway-side diff summary; pull uses the same three-way comparison. The manifest is the conflict detector — without it, every sync is a gamble.
-- Refuse traversal-shaped mappings (write outside the checkout root = hard error) — test with hostile names.
-- Decide manifest gitignore-vs-committed deliberately and document; the checkout dir is likely a git repo and the manifest's presence changes diffs.
+- Delta-only writes: skip files whose bytes already match (idempotent apply means jars are touched only on a version change).
+- Always pass explicit `/R:2 /W:1` (small, bounded by remaining lock) and `/NP /NFL` for parse-friendly logs; decode the exit bitmask in one function with a unit test of all values.
+- Treat a driver-jar change as restart-class (SPEC §7) and flag it in `plan`; never attempt it as a hot replace.
+- Defender: document an exclusion for the collection directory or measure its cost in the holdTimeout derivation (Pitfall 4).
 
-**Warning signs:**
-- Files "missing" after checkout on macOS but present in the export.
-- `sync --push` pushing files nobody edited.
-- Any checkout test suite that only uses well-behaved names.
+**Warning signs:** Apply hangs for minutes inside the lock; sporadic "being used by another process".
 
-**Phase to address:** IDE-03 phase; the bijection test and the manifest are plan-01 deliverables.
+**Phase to address:** 22 (restart-class flagging), 23.
+
+---
+
+### Pitfall 18: Doing the slow work inside the lock (per-file SFTP over a VPN)
+
+**What goes wrong:** Hundreds to thousands of sequential SFTP round trips inside the lock blow the window; spike timing was `docker cp` [SUMMARY.md].
+
+**How to avoid:**
+- Two-phase transport: (1) BEFORE the lock, upload the rendered tree as a single archive or parallel pipelined upload to a staging dir on the same volume but OUTSIDE `data/config/resources/` (a dir beside the collections could itself be read as a collection [INFERRED]); verify staged hashes. (2) INSIDE the lock only fast local operations on the box (delta mirror from staging into the collection), then scan.
+- Also take the on-box pre-write snapshot (Pitfall 21) in that locked window by a local copy, which is cheap, before the mirror.
+- Prefer Windows `tar.exe`/`robocopy` over per-file protocol calls; keep binary-safe (no text-mode transfers for jar/css).
+
+**Phase to address:** 23.
+
+---
+
+### Pitfall 19: Non-interactive SSH to Windows: shell, quoting, host keys, key files
+
+**What goes wrong:**
+- Windows OpenSSH default shell is `cmd.exe`; PowerShell needs `-EncodedCommand` (UTF-16LE base64) and quoting collides with names containing spaces/commas [MEM prod-ign-gateways-ssh-key-auth].
+- First-connect host-key prompt hangs a CI job; "fixing" it with `StrictHostKeyChecking=no` removes the MITM protection on a path that writes production config.
+- The Windows OpenSSH client refuses a private key whose ACL is not restricted to the current user.
+- A key written from a GitHub secret onto a persistent runner stays on disk (WFLWVM01 is not ephemeral and is also used for local dev; its runner group is visible to every WhiskeyHouse repo [MEM onprem-windows-runner-for-vpn-deploys]).
+- A half-dead VPN stalls an `ssh` for minutes, outliving `holdTimeout`.
+- Today NO CD SSHes to the Windows gateways [MEM prod-ign-gateways-ssh-key-auth]; this is a brand-new trust path.
+
+**How to avoid:**
+- `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval/CountMax`, pinned `UserKnownHostsFile` with the gateway host keys committed in `targets/`, `StrictHostKeyChecking=yes`. Key file mode set via `icacls`, deleted in an `always()` step (or use an in-process SSH implementation and keep the key in memory; this is a stack decision Phase 23 should make explicitly).
+- No remote command built by string interpolation; use SFTP operations and a small fixed set of encoded, parameter-free remote scripts.
+- Restrict the runner group for the deploy workflow to this repo (SPEC §5.5) and pin `runs-on: [self-hosted, Windows, onprem-deploy]`, never bare `self-hosted` (STGWECHVM01 has no VPN route and has already received a prod job) [MEM onprem-windows-runner-for-vpn-deploys].
+- Workflow assumptions that have already bitten this runner: no default bash, Git `bin` not on PATH, `jq` not installed [MEM production-cd-pipeline-windows-shell-bug]. The deploy step should call only `ign`; install/pin `ign` and gate on `ign version`.
+
+**Warning signs:** Job hangs at connect; "UNPROTECTED PRIVATE KEY FILE"; key file found in the workspace after a run.
+
+**Phase to address:** 23 (+ runner/target setup checklist).
+
+---
+
+### Pitfall 20: Runner cancel or crash mid-apply (no journal, no recovery)
+
+**What goes wrong:** GitHub cancels the job or the VM reboots after files are half-mirrored. Nothing records that a deploy was in flight; the lock times out silently (Pitfall 3); the next run starts from a torn tree that its plan misreads as drift.
+
+**How to avoid:**
+- Write a run journal OUTSIDE the collection on the box (`deploy.inprogress` with run id, phase, snapshot path, hashes) before the first write; remove only after verify. `apply`/`plan`/`rollback` refuse (or auto-offer `rollback --run <id>`) while a journal exists.
+- Workflow: `concurrency:` group per environment with `cancel-in-progress: false`; no `timeout-minutes` shorter than the worst case; handle SIGINT/Ctrl-C by running the abort-restore path (Pitfall 3).
+- `rollback` must be callable from a fresh process with only the run id (state read from the box + the local snapshot dir).
+
+**Phase to address:** 23. Test: kill -9 the process after N files; next invocation detects, refuses, and `rollback` restores.
+
+---
+
+### Pitfall 21: Snapshot and rollback are themselves unverified transactions
+
+**What goes wrong:** Rollback restores files, scans, and reports success without verifying; or the snapshot was taken outside the lock and a UI edit that landed in between is reverted/lost; or the snapshot lacks `config-mode.json` and the restore deletes the mode (Pitfall 5); or rollback is only runnable from the same runner that just died.
+
+**How to avoid:**
+- Snapshot = on-box local copy of the declared-type files in the collection taken INSIDE the lock, immediately before the mirror, plus a hash manifest; pulled to the runner afterwards. Rollback = same lock-mirror-scan-poll-verify procedure as apply with the snapshot as the "render", under the same expiry rules.
+- Rollback verification uses the same strict `verify` plus the log scrape.
+- Result vocabulary is explicit: `applied`, `failed_unchanged`, `rolled_back`, `rollback_failed` (needs human). Rolled back MUST NOT map to ok:true (Pitfall 28).
+- Documented non-reversible items (SPEC §8): deleted tag runtime values (memory-tag values), project imports, secret writes, restart-class changes. `plan` marks each, `apply` requires the `destructive` acknowledgement for tag deletion.
+- Auto-rollback only on MASTER effective-state verification failure. It must not fire for backup lag, transient `restart-tasks/pending` from something else, or a probe flake (Pitfall 9, 23).
+
+**Phase to address:** 23.
+
+---
+
+### Pitfall 22: Snapshot artifacts are the most sensitive files you will produce
+
+**What goes wrong:** SPEC §6.4.2 uploads `GET /backup` (.gwbk), the collection copy and project exports as run artifacts retained 30 days. A .gwbk contains the whole gateway configuration including secret material; GitHub artifacts are readable by anyone with repo read access and are logged/downloadable by tokens.
+
+**How to avoid:**
+- Decide explicitly in Phase 23: keep snapshots on the runner/on-prem share with restricted ACL, or encrypt (age/GPG to a recovery key) before upload; never upload raw .gwbk. Document retention and purge.
+- The collection snapshot excludes nothing but contains Embedded ciphertext for any not-yet-converted resource; treat as secret.
+- CI checks that artifact upload paths exclude `*.gwbk`.
+
+**Phase to address:** 23 (decision) + pipeline repo.
+
+---
+
+### Pitfall 23: Auto-rollback misattribution and error masking
+
+**What goes wrong:** Verification fails because of an environment condition (backup lag, a slow tag probe, unrelated pending restart) and the deploy rolls the master back, discarding a good deploy. Or the rollback's own result overwrites the original failure so the operator never sees WHY.
+
+**How to avoid:**
+- Classify verify failures: `master_effective_mismatch` (rollback), `backup_lagging` (resync/alert, keep), `probe_flake` (retry within budget), `unloaded_resource` (rollback).
+- The structured output carries BOTH the original verify failure and the rollback outcome in `data`; exit code reflects the worst.
+- The `restart-tasks/pending` pre-check must be empty AND the post-check compared to the pre-deploy set so only NEW tasks are attributed to this deploy.
+
+**Phase to address:** 23.
+
+---
+
+### Pitfall 24: Clock and timestamp confusion
+
+**What goes wrong:** Comparing gateway timestamps to the runner's clock (skew, DST, VM drift); treating the lock `timestamp` as epoch; interpreting `lastSyncTimestamp` in the wrong unit.
+
+**Evidence:** The lock info `timestamp` is `149795344` [SPIKE S4], clearly not epoch-ms (`lastScanTimestamp` is `1791584841451`, `lastSyncTimestamp` is ~`1791586091827` [SPIKE S4, S3]). The client's existing `redundancy.rs` documents `lastSyncTimestamp` unit as "not capture-proven"; S3 now proves epoch-ms.
+
+**How to avoid:** Only compare a gateway timestamp to an earlier sample from the SAME gateway; use the gateway-supplied `remaining` for lock budgeting; update the redundancy wire doc/tests to the S3 evidence; keep the runner's monotonic clock (`Instant`) for local deadlines, never wall-clock.
+
+**Phase to address:** 20.
+
+---
+
+### Pitfall 25: Concurrent deploys, and the plan-to-apply gap
+
+**What goes wrong:** Two actors (a PR deploy, a laptop `ign`, the drift job, a Designer user) overlap. The scan-lock 409 only protects the lock window, and it expires. Also: `plan` ran hours ago (before an approval gate), the gateway changed since, and `apply` blindly enforces a stale plan, clobbering an emergency edit (SPEC §14 risk).
+
+**Why it happens:** UI/API edits land in the ACTIVE mode collection, which is the deploy target [SPIKE S1c]. Whether the scan-lock blocks UI/Designer writes is unknown (OPEN).
+
+**How to avoid:**
+- Bind apply to a plan: `apply --plan <hash>`; `apply` re-reads the remote state AFTER acquiring the lock and aborts (`deploy_plan_stale`, NOT `--yes`-able, matching v1.1's staleness-gate convention) if the remote collection hash differs from the plan's base hash.
+- Local + remote mutual exclusion beyond the lock: the on-box journal (Pitfall 20) rejects a second `ign` regardless of lock expiry. GitHub `concurrency` group on the prod environment with `cancel-in-progress: false`.
+- Pre-checks from SPEC §6.4.1 (master is the active node via `activityLevel`, no open Designers via `GET /designers`, no open drift) are re-run at lock time.
+- Wrong-target guard: assert gateway-info identity (system name / expected hostname) equals the target's declared identity so a mis-pointed profile cannot deploy to dev or to the backup.
+
+**Phase to address:** 22 (plan hash), 23 (re-check under lock, journal).
+
+---
+
+### Pitfall 26: Perpetual diffs: signature churn, lastModification, gateway-added defaults
+
+**What goes wrong:** `plan` is never empty; drift fires forever; operators learn to ignore it.
+
+**Why it happens:**
+- `resource.json` carries `lastModification{actor,timestamp}` and `lastModificationSignature`. IA staff advise tracking `resource.json` "even though lastModificationSignature causes churn" [DOC forum 114966]. The signature algorithm is not published; the SDK `LastModification.verify` checks that the signature is valid for the resource contents [DOC sdk.inductiveautomation.com LastModification javadoc], so it cannot be computed client-side. A forum statement says 8.3 leaves a file alone when the signature is invalid rather than rewriting it [DOC forum "Git Version Control Resource.Json Files"; unverified for 8.3.6].
+- A PUT-mutated resource gets a new signature [SPIKE S1: `newSignature`]; import/UI paths stamp `actor`/`timestamp`.
+- The gateway may normalize/add default fields to `config.json` on load [INFERRED].
+- A rendered `lastModification.timestamp` of `now` would churn every render.
+
+**How to avoid:**
+- OPEN capture on the rig before Phase 21 freezes the format: write a `config.json` change with (a) stale signature, (b) signature omitted, scan, then read back `find` and re-read the file. Does the gateway rewrite the file? Does the effective view show the change? Is the resource flagged?
+- Semantic comparison ignores `lastModification` and `lastModificationSignature` (and `enabled` only where the type owns it) in `plan`/`verify`/drift; byte-hash comparison covers `config.json` plus stable attributes.
+- Render is pure: a fixed `lastModification` actor/timestamp policy (e.g. carry the bootstrap value; never `now`).
+- IDEMPOTENCE GATE (a test, run on every PR): `bootstrap → plan` empty (SPEC §13 step 2), and `apply → plan` empty, `apply → apply` writes zero files and issues no scan.
+
+**Phase to address:** 20 (capture), 21 (render policy), 22 (compare rules + gate).
+
+---
+
+### Pitfall 27: Tolerant client that tolerates too much (2xx with empty/non-JSON bodies)
+
+**What goes wrong:** To handle `204`/empty/HTML-ish 2xx bodies, the new client becomes "any 2xx is success". Then the failover that returns 200 while unable to reach the backup, `resync` 200-empty, and WebDev rejections riding HTTP 200 all read as success.
+
+**Why it happens:** `PUT /redundancy/config` and `GET /scan-lock` return empty/non-JSON; failover returns 200 even when it fails ("Could not dispatch node responsibility request to backup") [SPIKE RIG.md, S3, MEM ignition-83-mode-and-config-api-facts]. `ign api call` ERRORS on those (so the new typed client cannot be built on the api-call passthrough). WebDev ignores the `status` key, returning 200 with the rejection in the body [MEM webdev-ignores-status-key]. The current client defaults to a 30 s total timeout and JSON bodies [REPO crates/ignition-core/src/client/mod.rs `build_client`].
+
+**How to avoid:**
+- Typed per-endpoint response shapes: `Json<T>`, `EmptyOk`, `NoContent`, `JsonOrEmpty<T>` with a documented success predicate per endpoint (lock-held vs lock-expired by 200 JSON vs 204 [SPIKE S4]).
+- Success for state-changing calls is ALWAYS a follow-up read of state, never the status code: failover → `GET /redundancy` activity levels on BOTH nodes [SPIKE RIG.md]; resync → content re-verify; WebDev routes → parse body `status`/`result`.
+- Per-request timeouts for backups/exports (client already has `get_bytes` overrides); never auto-retry non-idempotent POSTs (`scan`, `lock`, `failover`) [REPO: client rule "never silently retry"].
+- Library-only in Phase 20 means every shape needs a recorded fixture (capture-first) including the empty/204 ones.
+
+**Phase to address:** 20; 23 for follow-up-read rules.
+
+---
+
+### Pitfall 28: Frozen contract: new failure modes force envelope, exit-code, MCP and TUI decisions
+
+**What goes wrong:** (a) A rolled-back deploy returns `ok:true` because the command ran. (b) New error variants with large payloads re-trigger the `clippy::result_large_err` problem (CoreError hit exactly 128 bytes in Phase 15 [REPO .planning/WINDOWS.md #3]). (c) The MCP catalog is derived from the clap tree, so `deploy apply/rollback/projects` become one-call agent tools unless marked guarded. (d) `tui_coverage` fails the build for a CLI verb without TUI parity or an exemption.
+
+**How to avoid:**
+- Additive slugs only, within exit classes 0-7, kept in the Three-Place rule (CoreError, README, enumerated test): e.g. `deploy_mode_inactive`, `deploy_lock_expired`, `deploy_plan_stale`, `deploy_verify_failed`, `deploy_rolled_back`, `deploy_rollback_failed`, `deploy_backup_lagging`, `deploy_journal_present`. Box large payloads.
+- Partial/structured results ride in `data` of an `ok:false` envelope; stdout stays pure.
+- Mark `// guarded:deploy apply` / `rollback` / `projects` so they route through `preview_then_confirm`; the refusal message IS the preview, `--yes` never overrides stale/journal/lock gates (v1.1 convention). Require the plan-hash handshake rather than a bare `--yes` for agent callers.
+- Decide TUI parity up front (a read-only plan/verify view, or a documented exemption in the parity allowlist).
+- Standing rule from the ledger: every plan's `<verification>` lists all FIVE CI gates verbatim (fmt, clippy `--all-targets -D warnings`, `build --workspace`, `build -p ignition-cli --no-default-features`, `test --workspace`) [REPO .planning/WINDOWS.md #4].
+
+**Phase to address:** 20 (error variants/slugs), 23 (guard + envelope), all phases (CI gates).
+
+---
+
+### Pitfall 29: Project import: order, restarts, and what "hash verified" means
+
+**What goes wrong:**
+- Ordering by manifest order or alphabet instead of the inheritance graph.
+- Importing a parent restarts bound children and drops their Perspective sessions; this was observed ("Starting project: SPIKE_CHILD… collection=SPIKE_PARENT…") but session impact was NOT observable on the rig [SPIKE S5].
+- Whether a child can actually READ inherited resources after a parent overwrite is OPEN (no REST inherited view) [SPIKE S5, SUMMARY.md]. A parent hash match proves nothing about the child.
+- Verify "by hash against the release zip" (SPEC §6.5) can never match raw: import stamps `lastModification` into each project resource's `resource.json` (project resources carry `attributes.lastModification {actor,timestamp}` [REPO resource-json example, MEM resource-json-needs-attributes]), and zip metadata (entry order, mtimes, compression) differs. Also, `overwrite=true` semantics (replace vs merge: are views removed from the project but absent from the zip?) are unproven.
+
+**How to avoid:**
+- Topological order from each project's `parent`/inheritance field; cycle and missing-parent detection at plan time; parents first, no child re-import [SPIKE S5].
+- Canonical content hash: per-resource data files plus normalized `resource.json` (strip `lastModification*`, signatures), independent of zip bytes; compare release-zip hash to hash of post-import `GET /projects/export/{name}`. Reuse the existing `MemberSource` engine for tree/zip normalization [REPO .planning/PROJECT.md].
+- Verify deletion semantics on a rig: import a zip lacking a resource that exists on the gateway; record whether it is removed.
+- Pre-check no Perspective sessions on the target and its children (or require `--allow-session-disruption`); report the child restarts expected.
+- Child functional probe on `test` (e.g. a view resolves via a Perspective session or a page-config read), since REST cannot show inheritance.
+
+**Phase to address:** 24. Capture first: overwrite delete semantics; export-vs-zip normalization diff; session impact on a rig with real WHK-Global/QSI.
+
+---
+
+### Pitfall 30: The git module is still live on prod during the transition
+
+**What goes wrong:** The git module on prod (Git-2.3.4) commits every Designer save locally, never pushes, and runs its own sync/commissioning cycles against project directories [MEM prod-gateway-repo-drift-reconcile]. An API project import into a git-managed project can be committed over, reverted by the next commissioning import from the `production` branch, or flip branches; restarts and sync cycles already flip repos to the enforced branch and auto-stash uncommitted work on the dev gateway [MEM gateway-restart-forces-branch-checkout]. The deploy "succeeds", and an unrelated restart silently reverts it. Separately, the module's commissioning flags could re-import gateway resources into `core` after the cutover strip (unverified; check the prod `git.yaml`).
+
+**How to avoid:**
+- `deploy projects` refuses a project that has a `.git` directory under `data/projects/<name>` (checked over SSH/SFTP) unless explicitly allowed, and if allowed re-verifies the hash AFTER the next module sync cycle. SPEC §13 step 8 (remove `.git`, uninstall the module) is the real fix and a hard prerequisite for unattended project deploys.
+- Pre-check module state via `GET /modules/healthy`/module list and record the git module version in every deploy report.
+- Never delete `.git` as part of deploy; that is a human cutover step.
+- Verify the git module's commissioning configuration on prod does not recreate stripped core resources.
+
+**Phase to address:** 24 (refusal + post-sync re-verify), cutover checklist.
+
+---
+
+### Pitfall 31: Backup projects do not sync today (TEC-5105): false failures and misdiagnosis
+
+**What goes wrong:** Project sync to WIGNVM04 is currently broken in prod (TEC-5105) [SPEC §3, §14], possibly because of the git module. S3 showed project sync works (~4 s) on a clean pair [SPIKE S3], so a first prod project deploy may "fail backup verification" for a reason unrelated to the deploy.
+
+**How to avoid:**
+- Backup project mismatch has its own slug and message; offer `resync`, re-verify, and never roll back master projects for it (Pitfall 23).
+- Record per-node project state before the deploy so only NEW divergence is attributed.
+- Do not treat TEC-5105 as fixed until the git module is gone.
+
+**Phase to address:** 24, 23.
+
+---
+
+### Pitfall 32: Pair rig and Windows transport are untestable with the current rigs
+
+**What goes wrong:** Everything above that involves the backup (Pitfalls 1, 9, 10), failover, or Windows (13-19) is "verified" against wiremock or a single-node Linux rig. The result is green CI and a red prod, the exact green-wash class this team has been burned by (StatusPing-only smoke tests that pass against the old process [MEM verify-staging-gateway-synced-commit]; WebDev 200-with-error [MEM webdev-ignores-status-key]; wiremock-only live-gate erosion, v1.1 Pitfall 5).
+
+**How to avoid:**
+- Phase 20 builds on a TWO-NODE pair rig using the spike's compose pair; GAN/pair linking needs the local-PKI certificate move (`rejected → trusted/certs`, no API) plus `PUT /gateway-network-incoming/toggleApproval/{id}/true` [SPIKE RIG.md, MEM ignition-83-mode-and-config-api-facts]. Rigs must be 8.3.6 (prod runs 8.3.6, staging/CI have been 8.3.3 [MEM onprem-windows-runner-for-vpn-deploys]); gate `ign deploy` on gateway version >= the verified floor.
+- Windows-specific behaviour (ACL, robocopy, sshd quoting, locks, MAX_PATH, CRLF) can only be proven on a Windows host: GitHub's `windows-latest` has no Linux containers, so use WFLWVM01 against a SCRATCH directory (never the prod data dir) for transport tests and a throwaway Windows Ignition for the end-to-end rehearsal. Mark these tests `#[ignore]` + a named workflow dispatched on the runner.
+- Negative-assertion test matrix (each must assert the BAD state is reported):
+
+| Fault | Expected |
+|-------|----------|
+| Backup booted before mode existed (S3 wrong order) | pre-check refuses |
+| Lock expires mid-write | no scan; collection restored; failure slug |
+| Failover returns 200, peer unreachable | reported as failed via activity levels |
+| Stale signature | 422 mapped to a retry-after-reread conflict, not usage error |
+| Resource without uuid | verify fails via read-back + log scrape |
+| Core-only folder | plan flags shadow; delete not claimed done |
+| Process killed mid-apply | journal blocks next run; rollback restores |
+| Undeclared resource + config-mode.json present | both survive mirror |
+| Canary secret in config | appears in no output |
+| 204 on `GET /scan-lock` | classified as expired, not as error and not as held |
+
+- Evidence-ledger discipline for human-verify items (VERIFIED / MACHINE-EVIDENCE / WAIVED) carries over from v1.1.
+
+**Phase to address:** 20 (pair rig, capture), every phase (negative tests).
 
 ---
 
@@ -425,139 +575,175 @@ Checkout works perfectly on the happy-path project where no two names differ by 
 
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Hand-written MCP tool catalog | Fast first ship | Permanent drift from the clap tree; agents mis-call tools after every CLI change | Never — derive from `Cli::command()` + CI parity test |
-| Hardcoded `Color::` literals in `ui/*.rs` before theming | Speed now | Full-sweep rewrite when the theming phase lands | Only if the tokenization refactor is *scheduled as the theming phase's plan 01* — the debt is then self-extinguishing |
-| Stringly-typed xml/csv cells (no type tags) | Simple format | Silent type loss on every round-trip | Only for explicitly documented lossy display export — never for import-capable formats |
-| Bypassing `classify.rs` in `api call` ("it's raw, skip classification") | Fewer arms to write | Unclassified 4xx storm → exit 1; agents misread gateway state | Never — the catch-all classifier *is* the feature |
-| Per-worker polling timers | Quick wiring | Cadence drift between screens, synchronized gateway hammering | Never — one shared cadence source |
-| Regenerating goldens to unblock CI | Green build today | Contract breakage ships silently | Never — regeneration is a review event (Pitfall 1) |
-| Extending the dispatch chassis for MCP/LSP | Reuse feeling | Stdout purity violations in every error path | Never — protocol modes get a pre-dispatch front door (Pitfall 3) |
-| Ignoring the second rig (8.3.3 XOR 8.3.6) in live gates | One less rig to maintain | Point-release endpoint variance ships (Pitfall 8) | Never for EXT-02/EXT-03/historian; acceptable only for features pinned to version-stable endpoints |
+| `robocopy /MIR` straight at the collection | One line | Deletes `config-mode.json` and unmanaged resources (Pitfall 5); default retries hang (17) | Never |
+| Verify by `?collection=production` read | Simple | False green when mode inactive (1) | Only as a secondary shadow diagnostic |
+| Blanket sorted-key JSON writer | Reuses serde_json default | Perpetual diffs, wrong resource.json bytes (14) | Never |
+| Random uuid for new resources | Trivial | Unstable renders, rename tracking (7) | Never |
+| `StrictHostKeyChecking=no` | Avoids first-connect failure | MITM on the prod write path (19) | Never on prod; throwaway rigs only |
+| `ssl_verify=false` profile for prod | Works with IP URLs/self-signed | Token sent over unauthenticated TLS; the client then silently accepts invalid certs [REPO build_client] | Rig only. Prod: hostname that matches the cert, or pin the fingerprint |
+| Raw 422 body in error text | Easy debugging | Secret echo (12) | Never on deploy paths |
+| Skipping the on-box journal | Less code | Torn state undetectable after cancel (20) | Never |
+| Treating backup lag as a rollback trigger | One failure class | Discards good deploys (23) | Never |
+| Uploading .gwbk as an Actions artifact | Spec-literal | Secrets exposed for 30 days (22) | Only encrypted |
+| Per-resource sequential `find` read-back | Simple loop | N VPN round trips; throttling | Small N only; batch via `list` |
 
 ## Integration Gotchas
 
 | Integration | Common Mistake | Correct Approach |
 |-------------|----------------|------------------|
-| MCP clients (Claude Desktop, nvim MCP) | Assuming SSE or Content-Length framing; responding to notifications | Newline-delimited JSON-RPC per spec 2025-06-18; notifications get no response; stderr is the log channel |
-| nvim as LSP client | Advertising unimplemented capabilities; incremental sync half-implemented; interactive profile prompts at spawn | Honest capabilities; full-text sync by default; env/args profile resolution; `-32002` pre-init |
-| `$EDITOR` variants (vscode, emacs daemon) | Treating editor exit as done; assuming the file saved | Content-hash decides; content-correct temp suffix; document `--wait` expectations for IDE editors |
-| Excel / spreadsheet round-trips | Trusting a csv file that passed through Excel | Import loss report + refuse ambiguous without `--yes` (Pitfall 11) |
-| 8.3.x point releases | Assuming the dev rig's shapes generalize | Both-rig live gates; optional fields; honest `endpoint absent` degradation (Pitfall 8) |
-| WebDev route bundle | Forgetting the 7-copy version lockstep on bump | Single-commit bump + both-direction drift tests + redeploy gate (Pitfall 4) |
-| Gateway resource signatures (v1.0 1.4) | Fire-and-forget raw writes to `/resources/` | Read-signature-mutate; signature hints surfaced on raw-path conflicts (Pitfalls 7, 15) |
-| Designer / git-module concurrency | Assuming the CLI is the only writer | Checkout manifest + three-way compare + `--yes` push (Pitfall 17) |
-| EAM on the WHK production controller | Re-probing mutations "just to check" live | Wiremock pin + captured live envelope may stand in for repeat probes; read-only probes only without explicit human approval (Pitfall 5) |
+| `POST /scan-lock/config` | Missing body (400); not handling 409 `Lock already held by <actor>` | Always send `{acquireTimeout, holdTimeout}`; surface actor; no infinite wait [MEM ignition-83-platform-scan-api] |
+| `GET /scan-lock/config` | Treating 204 as error/empty-parse failure | 200 JSON = held (read `remaining`), 204 = expired/not held [SPIKE S4] |
+| `POST /scan/config` | Trusting the 200 | Poll `scanActive==false && lastScanTimestamp>before` [MEM] |
+| Resource PUT | Sending an object; omitting/old `signature`; blind retry with a fresh signature | Array of `{name, signature, config}`; 422 = re-read and re-plan (optimistic concurrency exists to detect concurrent edits); keep PUT off the apply path (SPEC D5) [SPIKE S1, MEM] |
+| Resource `find` | Omitting `collection` when reading a collection; reading only collection for verify | `?collection=` for shadow analysis; effective (no param) for verify [SPIKE S1] |
+| `POST /mode` | Calling it from `apply`; assuming JVM arg activates | Cutover-only; node must have the mode locally BEFORE boot with the arg [SPIKE S3] |
+| `POST /redundancy/gwaction/failover` | Trusting 200 | Read `GET /redundancy` on both nodes; require `peerConnected`, `syncPending=false`, same `deploymentMode` before [SPIKE RIG.md, SPEC §7] |
+| `POST /redundancy/gwaction/resync` | 200 means fixed | Re-verify content afterwards [SPIKE S3] |
+| API token | `Authorization: Bearer`; whole header mishandled | `X-Ignition-API-Token: <name>:<key>` [MEM ignition-83-platform-scan-api] |
+| `/projects/import/{name}?overwrite=true` | Child-first or re-import children; raw zip hash | Parents first; canonical content hash [SPIKE S5] |
+| WebDev routes (ign bundle, project hash helpers) | HTTP status as truth | Parse body `status`/`result` [MEM webdev-ignores-status-key] |
+| SSH to Windows | cmd.exe quoting, `Program Files`, `C:` colon, host-key prompts | SFTP + pinned host keys + fixed encoded scripts (19, 15) |
+| Redundancy wire parsing | Matching `role == "Primary"`; `uptime -1` as dead | Real strings are `Master`/`Backup`; `uptime:-1` and `Cold` are normal on a healthy backup [SPIKE S3] |
+| Tags read-back | `GET /tags/export` full provider; compares runtime `value` | Scope to declared providers; compare config subset only (export includes `value`/`defaultValue` [SPIKE S2]); exclude MQTT providers (SPEC §1) |
 
 ## Performance Traps
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| Sub-second polling cadence | Gateway CPU/log spikes; production complaints | Floors + jitter + backoff on 429/503 (Pitfall 14) | Immediately on production gateways; dev rigs hide it |
-| Blocking LSP loop on gateway calls | nvim frozen; request timeouts in client log | Cache + TTL + bounded waits + workers (Pitfall 16) | First slow/restarting gateway |
-| Blocking MCP loop on long ops (import, restart-wait) | Client marks server dead mid-tool | Worker tasks + per-op-class timeouts + immediate `ping` (Pitfall 10) | First long operation invoked as a tool |
-| Zip round-trip per single-resource edit (IDE-01 push = export→surgery→import) | Edit feels slow on large projects | Accept and document (v1.0 accepted the same cost for resource editing); optimize only if painful | WHK-Global-sized projects |
-| Golden/contract suite growth | CI timeouts (the v1.0 verifier already hit 10/15-min tool timeouts on the >15-min subprocess-heavy suite) | Targeted goldens per new feature; batch contract tests; keep one live gate per feature, not per case | v1.1 adds ~11 features' worth of goldens to an already slow suite |
-| Serialized live e2e gates growing long | Suite wall-time balloons | LIVE_GATE mutex is for *mutation* serialization only — keep read-only probes parallel where safe | When every new feature adds gates to one mutex |
+| Per-file SFTP inside the lock | Lock expires mid-write | Stage outside lock; local mirror inside (18) | >~100 files over the VPN |
+| Per-resource API read-back | Verify takes minutes; gateway CPU | Batch `list`/`find`; bounded concurrency; file hash tree over SSH for bulk, API for sample | Thousands of tag-definition files; prod core has ~15.8k files / 14,117 tag-definition (13,166 MQTT) [SPEC §3] |
+| Full `tags/export` read-back | Large slow response, 30 s client timeout | Per-provider scoped, per-request timeout override | Big providers |
+| Hash-comparing the whole collection each poll | CPU/IO on the gateway host | Hash once, compare manifests | Each 30-min drift cycle |
+| Defender real-time scan on the collection | Writes slow, intermittent sharing violations | Measure in holdTimeout derivation; request exclusion | First prod-size deploy |
+| Scan duration scale | S4 (1-3 s) is for 1.3k local files; project scan on prod already 7.5 s | Re-measure on prod-sized tree | Prod |
+| Reading plan from API only | Cannot see files the gateway rejected/ignored | Hash tree over SSH + effective API; label API-only plans "partial" | Any invalid resource on disk |
 
 ## Security Mistakes
 
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| Verbose logging of user-supplied `-H` headers in `api call` | Second token leaked into agent transcripts | Extend redaction to all auth-pattern headers including user-supplied (Pitfall 7) |
-| MCP/LSP shim exposing mutating tools without the CLI's guard semantics | Agents trigger destructive ops accidentally, or a "convenience" bypass ships | The shim preserves refusal semantics server-side: the refusal envelope *is* the tool result; no bypass flags (Pitfall 10) |
-| Edit-round-trip temp files in shared TMPDIR | Project code exposure; symlink attacks | Private tempdir 0700, Drop-guard cleanup, unique per session (Pitfall 15) |
-| Workspace checkout trusting resource names as paths | Path traversal writing outside the checkout root | Injective escaping scheme + traversal refusal + hostile-name property tests (Pitfall 17) |
-| Raw passthrough to session/CSRF endpoints (`/data/app/login` etc.) | Half-authenticated flows; CSRF-shaped state the CLI doesn't own | API-token is the only auth path; document session endpoints as unsupported in `api call` (or refuse with a hint) |
-| LSP server running with a broad profile from any directory | Untrusted workspaces gain gateway access | Explicit profile resolution (env/args); document the trust model; `ign lsp --check` shows what would be used |
+| Embedded ciphertext/plaintext secrets in `gateways/` | Credential at rest in git (11) | Deny `Embedded`, field-typed lint, references only |
+| Secrets in plan/verify/error output | Logs/artifacts/MCP expose them (12) | Schema-path redaction + canary property test |
+| Raw .gwbk / collection snapshot artifacts | Whole-gateway secret exposure (22) | Encrypt or keep on-prem; never upload raw |
+| `ssl_verify=false` against prod | Token and writes exposed to MITM | Verified TLS or pinned fingerprint on prod profiles |
+| Unpinned SSH host keys | MITM on config write path (19) | Committed known_hosts, `StrictHostKeyChecking=yes` |
+| Persistent runner holds keys/renders; runner group open to all repos | Other workflows read them [MEM onprem-windows-runner-for-vpn-deploys] | Restrict runner group; `always()` cleanup; key in memory if possible |
+| `ci-deploy` token over-privileged | Token compromise = full gateway write | Custom `Authenticated/Deploy` level only [SPIKE RIG.md]; per-env tokens; rotation |
+| Agent can invoke prod apply via MCP | Unreviewed prod change | Guarded marker + plan-hash handshake; deploy tools excluded from unattended catalog if the gate cannot be enforced |
+| Deploy token via command-line args | Visible in process list | Env/keyring chain only; never argv |
+| Writing the declared tree with secret-bearing `description`/comments | Leak via free text | Lint free-text fields too |
 
 ## UX Pitfalls
 
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| Themes readable only on the dev terminal (dark, truecolor) | Unusable for 16-color/light-terminal users | Monochrome floor theme; contrast verified at 16 colors (Pitfall 13) |
-| Invalid cadence config kills TUI startup | Config typo = cockpit won't open | Degrade to default + visible warning; `doctor` surfaces it (Pitfall 14) |
-| Encode errors swallowed by the edit round-trip | User believes push succeeded; gateway fails later at runtime | Fail closed with the codec error + kept temp file for re-edit (Pitfall 15) |
-| LSP failures invisible (stderr hidden in nvim) | Mystery broken completions | One-line log-window-friendly diagnostics + `ign lsp --check` doctor (Pitfall 16) |
-| Raw `api call` errors rendered raw | Agents/users misclassify gateway problems | Envelope still adds classification + hints for known URL classes while the body rides verbatim (Pitfall 6) |
-| Workspace sync with no conflict story | Silent clobbering of concurrent edits | Manifest-driven three-way compare; diff shown before push (Pitfall 17) |
+| "Applied" printed before verify | Operator believes done | Distinct phases in output; final status only after verify and backup check |
+| `plan` shows 400 lines of byte diffs | Reviewers skim past the destructive item | Group: adds/changes/deletes/shadowed/destructive/restart-class/unmanaged; counts first |
+| Rolled back deploy exits 0 | CI green on a no-op | `ok:false`, dedicated slug, both failure and rollback outcome in `data` |
+| Refusing with a generic 409 | User waits/retries | Name the actor and remaining time of the held lock; name the journal run id |
+| `--yes` bypasses staleness | Clobbers an emergency edit | Staleness/journal/mode gates not `--yes`-able |
+| Output differs between CLI, MCP, TUI | Agent and human disagree | One result struct, three renderers (existing contract pattern) |
+| API-only `plan` claims "no changes" | False confidence | Label "partial: cannot see unloaded files" and exit non-zero under `--strict` |
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **EXT-01:** Missing content-type sniffing — verify an HTML 401 body yields the auth class (not a serde panic), and a binary-response URL forces `-o FILE`.
-- [ ] **EXT-01:** Missing user-header redaction in verbose logs — verify a supplied auth-pattern header prints redacted.
-- [ ] **EXT-01:** Missing the 4xx catch-all — verify an unmatched-path 422 exits 2-class, never 1.
-- [ ] **EXT-02:** Missing the second-rig gate — verify live gates ran on **both** 8.3.3 and 8.3.6 and are recorded.
-- [ ] **EXT-03:** Missing help-taxonomy ↔ token-list equality for new types — extend the 07-04 line-by-line check.
-- [ ] **EXT-04:** Missing "no response to notifications" and "exit on stdin EOF" — scripted-client test must cover both.
-- [ ] **EXT-04:** Missing tool-catalog ↔ clap parity CI test — verify it exists and would fail if a verb were added without a tool.
-- [ ] **MCP/LSP:** Missing the stdout-purity byte-scan test — verify it exists in whichever phase ships first and actually catches a stray `println!`.
-- [ ] **Tag transfer:** Missing the import loss report — verify a lossy csv import refuses without `--yes` and names every loss.
-- [ ] **Route bundle:** After a 1.2.0 bump — verify *both directions* of staleness refusal are tested (new CLI↔old route, old CLI↔new route).
-- [ ] **IDE-01:** Missing unchanged-file no-op and temp cleanup on Ctrl-C — verify content-hash no-op and Drop-guard.
-- [ ] **IDE-01:** Missing signature/re-read staleness check before push — verify a gateway-side concurrent change refuses the push.
-- [ ] **IDE-02:** Missing `-32002` pre-init and shutdown→exit sequencing — scripted-client CI test.
-- [ ] **IDE-03:** Missing the bijection property test (case pairs, hostile chars, traversal) and the checkout manifest.
-- [ ] **Theming:** Missing the "no `Color::` outside the tokens module" CI grep.
-- [ ] **TUIX-01:** Missing invalid-config degradation — verify the TUI opens with default cadence + warning on a corrupt config value.
-- [ ] **All:** New slugs present in BOTH exit-table places (`error.rs` enumerated test + README table + prose).
+- [ ] **Apply:** Often missing the pre-check that BOTH nodes run the mode; verify the refusal against a backup booted pre-mode.
+- [ ] **Apply:** Often missing restore-on-abort; kill the process mid-write and assert the collection equals the snapshot.
+- [ ] **Verify:** Often reads `?collection=` only; assert it reads the effective view and the backup's own API.
+- [ ] **Verify:** Often misses unloaded resources; assert a uuid-less resource FAILS verify and the log-scrape names it.
+- [ ] **Mirror:** Often deletes `config-mode.json`/unmanaged resources; assert both survive.
+- [ ] **Render:** Often not byte-identical to gateway output; the 183-file corpus round-trip passes on Linux, macOS and Windows.
+- [ ] **Render:** Often has CR bytes via checkout; CI asserts no `\r` in `gateways/`.
+- [ ] **Plan:** Often non-empty immediately after apply; the apply-then-plan-empty gate passes against a real rig.
+- [ ] **Plan:** Often doesn't flag core shadowing; a core-only folder fixture is flagged.
+- [ ] **Secrets:** Often only the plaintext case is linted; an `Embedded` fixture fails and the canary property test passes across all outputs.
+- [ ] **Backup:** Often trusts `syncPending=false`; assert a stale backup (sync gave up) fails verify, and secret NAMES exist on both nodes.
+- [ ] **Failover/resync:** Often trusts HTTP 200; assert activity levels are read afterwards.
+- [ ] **Rollback:** Often untested after a real failure; rollback runs the full lock-write-scan-verify and is itself fault-injected.
+- [ ] **Projects:** Often hash-compares raw zips; a canonical hash ignoring `lastModification` matches post-import export; git-managed project refused.
+- [ ] **Windows:** Often only tested from macOS; transport suite run on WFLWVM01 against a scratch dir with spaces and a >200-char path.
+- [ ] **Contract:** Often adds slugs in one of three places; the Three-Place test and README table pass; TUI parity and guarded markers present; all five CI gates run locally.
+- [ ] **Smoke tests:** Never StatusPing-only; every check asserts a body-level fact (version/hash/uuid/activity level), per [MEM verify-staging-gateway-synced-commit].
 
 ## Recovery Strategies
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Contract/golden breakage shipped | MEDIUM | Next release restores the old shape as a deprecated alias (additive repair), changelog + version note; agents re-converge on the next sync |
-| Route bundle skew in the wild | LOW | `route_version_mismatch` already refuses safely; publish "run `ign webdev deploy`" guidance; both-direction tests prevent recurrence |
-| Broken resource pushed to live gateway (IDE-01) | HIGH | Re-export the prior resource from gwbk backup / git-module history; re-import; then add the signature pre-check that was missing |
-| Workspace checkout clobbered gateway edits | MEDIUM | Re-pull affected resources from gateway backup/Designer history; rebuild the manifest; add the three-way compare |
-| MCP/LSP stdout pollution in the field | LOW | Fix the leak; the byte-scan test makes recurrence impossible; clients reconnect cleanly |
-| Cadence hammering incident | LOW | Floor + backoff already bound the blast radius; restart TUI; tighten the floor |
-| Excel-corrupted csv imported | LOW–MEDIUM | The loss report should have refused; re-export from gateway as JSON (lossless); if it slipped through, re-import corrected values |
-| Unclassified 4xx storm (exit 1 flood) | LOW | Additive catch-all slug; transcripts remain parseable retroactively since the envelope shape held |
+| Torn tree on disk, lock expired (3, 20) | MEDIUM | `ign deploy rollback --run <id>` (lock, restore on-box snapshot, scan, verify); if the process is gone, the journal names the snapshot; manual: acquire lock, robocopy snapshot back, scan |
+| `config-mode.json` deleted (5) | HIGH | Re-create the mode via `POST /mode` on the master; confirm on backup BEFORE any restart; follow SPEC §13 step 4 ordering; backups: snapshot contains the file |
+| Backup on wrong mode / stale (1, 9) | MEDIUM | Confirm mode+collection on backup; add the JVM arg (jvm-args.txt) and restart the backup; `POST /redundancy/gwaction/resync`; re-verify by content |
+| Deploy token locked out (8) | HIGH | SSH restore of snapshot (SSH path does not need the token), then re-add the level in `core` security-properties via the UI with an admin; scan from the Designer/UI |
+| Secret missing on backup (10) | LOW | Write the secrets to the backup's API; verify names |
+| Perpetual diff after deploy (14, 26) | LOW-MEDIUM | Capture the differing bytes (`diff` of rendered vs on-disk), add to the golden corpus, fix serializer, no gateway change needed |
+| Project reverted by git module (30) | MEDIUM | Re-import; check module; execute SPEC §13 step 8 |
+| Child project broken after parent import (29) | MEDIUM | Re-import parent (no child re-import); check children restart in gateway log; session refresh |
+| Snapshot leaked via artifact (22) | HIGH | Delete artifact, rotate everything in the gateway (DB passwords, OAuth secrets, API tokens), treat as incident |
+| Robocopy hung in lock (17) | LOW | Abort-restore path; lower `/R /W`; locate the locking process |
 
 ## Pitfall-to-Phase Mapping
 
-v1.1 phases are not yet numbered; feature-ID anchors with a recommended grouping follow. Ordering rationale for the roadmapper: (1) the first CLI-surface phase must establish the slug discipline, OutOfBand classification, and protocol-mode front door *before* the second command needs them; (2) tag transfer carries the route-bundle bump and should land before MCP so the derived tool catalog is stable; (3) MCP precedes LSP so the protocol-mode pattern (stdout purity, scripted-client harness, version reporting) is proven once and reused; (4) IDE-01/03 precede IDE-02 because they share the checkout/codec substrate the LSP diagnostics will read.
-
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| 1 Golden churn / contract mutation | Every phase; codified in the first slug-adding phase | Goldens diff-reviewed; `exit_code_mapping_enumerated` green; no existing-line golden edits without justification |
-| 2 tui_coverage fight | First CLI-surface phase | CI walk green; pinned OutOfBand test updated once, with per-entry justification comments |
-| 3 Stdout purity | EXT-04 phase (pattern), reused by IDE-02 | Byte-scan integration test over a real spawned binary |
-| 4 Version skew | Tag-transfer phase (bump); EXT-04/IDE-02 (version reporting) | Both-direction drift tests; coherent version triple in protocol handshakes |
-| 5 Live-gate erosion | Every write-feature phase | Env-gated gates run and recorded; both rigs for endpoint-sensitive features |
-| 6–7 EXT-01 classification & injection | EXT-01 phase | Wiremock pins for 4xx/HTML/binary; refusal tests for destructive methods; redaction test |
-| 8 EXT-02 point-release variance | EXT-02 phase | Both-rig live gates; honest-degradation slug test |
-| 9 EXT-03 guard ladder & composition | EXT-03 phase | Composition contract pins from live read-backs; help-taxonomy equality check |
-| 10 EXT-04 protocol lifecycle & drift | EXT-04 phase | Scripted-client harness (handshake, notifications, ping, EOF, malformed); catalog parity test |
-| 11 xml/csv fidelity | Tag-transfer phase | Round-trip loss-list fixtures; refusal-without-`--yes` test |
-| 12 Historian guess-shapes | Historian phase, plan 01 spike | Captured live diff artifact — or the documented-limitation fallback, either is "done" |
-| 13 Theming tokenization | TUI phase, plan 01 | CI grep for stray `Color::`; forced-mode buffer tests incl. 16-color/mono |
-| 14 Cadence hammering | TUI phase | Backoff contract tests; profile validation; corrupt-config degradation test |
-| 15 Editor round-trip | IDE-01 phase | Editor-archetype fixtures (blocking/deferred/forked); staleness-check pin; no-op test |
-| 16 LSP state machine & latency | IDE-02 phase (last IDE phase) | Scripted-client state-machine tests; cache-latency contract; panic-isolation test |
-| 17 Checkout bijection & manifest | IDE-03 phase | Bijection property tests over hostile names; manifest three-way compare tests |
+| 1 Inactive mode / writes to wrong collection | 20, 23 | Rig pair w/ wrong-order backup: apply refuses; verify reads effective view |
+| 2 Core shadow / folder granularity | 21, 22 | Core-only folder fixture flagged; delete not claimed |
+| 3 Lock expiry torn tree | 23 | Fault-injection: `holdTimeout=2` mid-write, no scan, restored |
+| 4 holdTimeout from spike numbers | 20, 23 | Measured p95 on prod-size rig; floor/ceiling enforced; value printed |
+| 5 Mirror deletes gateway-owned files | 22, 23 | config-mode.json + undeclared resource survive |
+| 6 Scan 200 / unloaded resources | 20, 23 | uuid-less fixture fails verify; scan predicate unit tests |
+| 7 uuid rules / stability | 21 | Per-type table from bootstrap; double-render byte-equal |
+| 8 Self-lockout | 21, 22, 23 | Security singleton refused; lock-first 403 aborts before writes |
+| 9 Backup false-green | 20, 23 | Stale-backup rig (sync gave up) fails verify |
+| 10 Secret values per node | 21, 23 | Name presence checked on both nodes |
+| 11 Embedded ciphertext | 21 | Embedded fixture fails render |
+| 12 Secret leakage in output | 20, 21, 22, 23 | Canary property test across all surfaces |
+| 13 CRLF | 21 | No `\r` in `gateways/`; Windows CI leg golden |
+| 14 Gson-compat bytes | 21, 22 | 183-file corpus round-trip on 3 OSes |
+| 15 Windows paths | 21, 23 | Space/colon/long-path tests on WFLWVM01 scratch |
+| 16 ACL on moved files | 23 | Read-back after mirror on a Windows box |
+| 17 Locks/robocopy defaults | 22, 23 | Exit-code bitmask unit test; `/R:2 /W:1` asserted |
+| 18 Slow work in lock | 23 | Staging outside lock; lock-held time measured |
+| 19 SSH non-interactive/Windows | 23 | BatchMode, pinned keys, key cleanup test |
+| 20 Cancel/crash journal | 23 | kill -9 mid-apply; next run refuses; rollback restores |
+| 21 Rollback unverified | 23 | Rollback fault-injected; verify after rollback |
+| 22 Snapshot artifact secrecy | 23 | CI check excludes `*.gwbk`; encryption decision recorded |
+| 23 Auto-rollback misattribution | 23 | Backup-lag scenario does NOT roll back master |
+| 24 Clocks | 20 | No wall-clock comparisons; redundancy wire docs updated to S3 |
+| 25 Concurrency / stale plan | 22, 23 | Plan-hash binding; re-hash under lock; two-process test |
+| 26 Perpetual diffs / signatures | 20, 21, 22 | apply→plan empty; apply→apply writes zero; capture-first test recorded |
+| 27 Tolerant-client over-tolerance | 20, 23 | Per-endpoint success predicates; failover 200-fail fixture |
+| 28 Frozen contract/MCP/TUI | 20, 23 | Three-Place test; guarded marker; tui_coverage; five gates |
+| 29 Project order/restart/hash | 24 | Topological-order test; canonical hash vs export |
+| 30 Git module during transition | 24 | `.git` project refused; post-sync re-verify |
+| 31 TEC-5105 backup project sync | 23, 24 | Distinct slug; no master rollback |
+| 32 Rig and Windows test gap | 20 (+ all) | Pair rig exists; negative-assertion matrix green; Windows suite on WFLWVM01 |
 
-## Carry-Forward from v1.0 (still operational)
+## Capture-first backlog (record in `*-LIVE-CAPTURES.md` BEFORE writing dependent code)
 
-Full text: `.planning/research/PITFALLS.md` @ commit `9d2cc32`. The items below remain binding constraints on v1.1 design:
-
-- **1.4** Signature-based optimistic concurrency on config resources — now load-bearing for EXT-01 raw writes, IDE-01 pushes, IDE-03 sync.
-- **1.7** `wait_until_ready` multi-stage restart poll — reused by any v1.1 flow that restarts/wait on gateways.
-- **1.8** WebDev route contract discipline (versioned bundle, refusal both directions) — the basis of Pitfall 4.
-- **1.10 / 4.5** Per-operation-class timeouts and progress/cancellation on long ops — now applies to MCP tool calls and LSP request handling.
-- **2.1** Never block the TUI event loop — cadence and theme work must not regress it.
-- **3.6 / 4.4** Secret redaction (config perms, logs, verbose) — extended by Pitfall 7 to user-supplied headers.
-- **4.2** Non-interactive by default — extended by MCP/LSP (never prompt from a protocol process).
-- **6.1 / 6.2** Layered testing (wiremock contracts + trait-seam mocks + env-gated live) and the live e2e harness rules (LIVE_GATE, pre-clean, throwaway rigs) — the substrate of Pitfall 5.
+| # | Question | Needed by |
+|---|----------|-----------|
+| C1 | Exact request/response of scan-lock acquire (409 body), `GET` held vs expired, any release/DELETE; scan/config status JSON | 20 |
+| C2 | Does a scan-lock block UI/Designer/API writes to the active mode collection? | 23 |
+| C3 | Stale/omitted `lastModificationSignature` on a file-written resource: loaded? rewritten? flagged? | 21 |
+| C4 | Which prod resource types are named (uuid) vs singleton; bootstrap census from prod core | 21 |
+| C5 | How Ignition encodes hostile names (`:` `?` trailing dot, case-collisions) in tag/resource directories | 21 |
+| C6 | Does a mode-collection directory neighbour (staging dir) get read as a collection? Where may staging live? | 23 |
+| C7 | Windows: ACL after robocopy vs rename; sharing violation on a loaded driver jar; Defender cost; long-path behaviour in sftp-server/robocopy | 23 |
+| C8 | Does import `overwrite=true` delete resources absent from the zip? Does export-after-import equal the zip after normalization? | 24 |
+| C9 | Child reads inherited resource after parent overwrite; Perspective session impact | 24 (S5 OPEN) |
+| C10 | Prod git module `git.yaml`/commissioning flags: can it recreate stripped core resources or revert API imports? | 24 |
+| C11 | Single-scan ordering when a tag-provider and its tag-definitions arrive together | 23 |
+| C12 | Does a half-lagging backup recover through `resync` alone after "failed 5 times"? | 23 |
 
 ## Sources
 
-- **Local system evidence (HIGH):** `crates/ignition-cli/tests/tui_coverage.rs` (bidirectional walk, pinned OutOfBand set, row-requiring rules); `crates/ignition-cli/src/main.rs` (single-exit-point chassis, render/stdout discipline, sanctioned stdout exceptions); `crates/ignition-core/src/error.rs` (exit_code mapping, enumerated test — exit-6 operation/denial bucket verified); `crates/ignition-core/src/client/classify.rs` path-scoped arms (per 07-VERIFICATION-GAPS.md evidence).
-- **Local milestone artifacts (HIGH):** `.planning/phases/05-webdev-backend-tag-operations/05-06-SUMMARY.md` (byte-0 loader contract, live-gate discipline, export-shape normalization, historian spike outcome + Designer-diff fallback); `.planning/phases/07-ecosystem-interop-advanced-ops/07-VERIFICATION-GAPS.md` (guard ladder, Two-Place exit-table rule, mutation-risk human-verification policy, stale-binary note, route 1.1.0 lockstep); `.planning/debug/eam-create-422.md` (422→internal_error taxonomy gap, config.profile/settings split); v1.0 `PITFALLS.md` @ `9d2cc32` (carry-forwards).
-- **MCP specification (HIGH — fetched 2026-09-04):** modelcontextprotocol.io/specification/2025-06-18/basic/transports — stdio newline-delimited JSON-RPC, no embedded newlines, MUST NOT write non-MCP output to stdout, stderr for logs, stdin-close termination, version negotiation at initialize.
-- **lsp-server crate docs (HIGH — fetched 2026-09-04):** docs.rs/lsp-server/0.10.0 — synchronous crossbeam-channel scaffold; handles handshaking/parsing; "you control the message dispatch loop yourself"; IoThreads/Connection/ReqQueue structure.
-- **Domain knowledge (MEDIUM, flagged inline):** nvim LSP client behavior specifics; editor-archetype behaviors (vscode `--wait`, emacs daemon); Excel round-trip corruption modes; 8.3.x point-release endpoint drift beyond the two live-verified rigs. Each is backed by a testable prevention in this doc — the phase's verification, not the claim, is the safety net.
+- `results/S1.md` ... `S5.md`, `results/SUMMARY.md`, `results/RIG.md` (spike evidence, 8.3.6, 2026-10-09). HIGH.
+- `/Users/pmannion/data/worktrees/whk-environment-orchestration/gateway-config-spec/docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` §1, §3, §4, §6, §7, §8, §9, §10, §12, §13, §14. HIGH (design intent); its own caveats (S5 OPEN, holdTimeout on target transport) are carried here.
+- `/Users/pmannion/data/worktrees/whk-environment-orchestration/gateway-config-spec/gw-config/` file census and byte inspection (resource.json key order, absence of trailing newline, no CR, 10 Embedded ciphertext files, resource names with spaces). HIGH for what it shows; a dev snapshot, not prod.
+- `/Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/src/client/{mod.rs,classify.rs,redundancy.rs}`, `.planning/PROJECT.md`, `.planning/WINDOWS.md`, `.github/workflows/ci.yml`. HIGH.
+- User memory notes: `ignition-83-mode-and-config-api-facts`, `ignition-83-platform-scan-api`, `gateway-secrets-dont-replicate-to-backup`, `webdev-ignores-status-key`, `verify-staging-gateway-synced-commit`, `prod-ign-gateways-ssh-key-auth`, `onprem-windows-runner-for-vpn-deploys`, `production-cd-pipeline-windows-shell-bug`, `prod-gateway-repo-drift-reconcile`, `gateway-restart-forces-branch-checkout`, `resource-json-needs-attributes`. HIGH (first-hand verified), dated.
+- IA docs and forum (MEDIUM; staff statements, not contractual): [resource.json file](https://docs.inductiveautomation.com/docs/8.3/appendix/reference-pages/resource-json-file), [gateway folder structure](https://docs.inductiveautomation.com/docs/8.3/appendix/reference-pages/gateway-folder-structure), [Deployment Modes and resource definition UUIDs](https://forum.inductiveautomation.com/t/deployment-modes-and-resource-definition-uuids/114966), [Git Version Control Resource.Json Files](https://forum.inductiveautomation.com/t/git-version-control-resource-json-files/111329/2), [LastModification javadoc 8.3.x](https://sdk.inductiveautomation.com/javadoc/ignition83/8.3.7/com/inductiveautomation/ignition/common/resourcecollection/LastModification.html). The signature algorithm is unpublished (searched 2026-10-10).
+- Windows platform behaviour (NTFS ACL inheritance on move, robocopy retry defaults/exit bitmask, Java file sharing, MAX_PATH, OpenSSH client key ACL): general platform knowledge, MEDIUM, tagged [INFERRED] where used; every one has a capture task (C7) before dependent code.
 
 ---
-*Pitfalls research for: ignition-cli v1.1 — Agent Surface & IDE Integration (contract-frozen system)*
-*Researched: 2026-09-04*
+*Pitfalls research for: declared-config deploy (`ign deploy`) against Ignition 8.3.6 redundant Windows pair*
+*Researched: 2026-10-10*
