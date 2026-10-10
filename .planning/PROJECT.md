@@ -26,16 +26,20 @@ Carry-forwards (tracked, not blockers):
 - EAM live-gate §2 vanish-poll deadline needs a capture-driven re-size (10-LIVE-GATE.md §4 D1/§6)
 - `trial_reset` defensive-tail error message names a URL instead of a profile (minor UX polish)
 
-## Next Milestone Goals
+## Current Milestone: v1.6 Declared Gateway Deploy
 
-Not yet defined. Candidate seeds carried from v1.1 (commit none of these — `/gsd-new-milestone` questioning decides):
+**Goal:** `ign` deploys a declared gateway config tree (`gateways/<name>/`) to a redundant Ignition 8.3 pair through the `production` deployment-mode collection — plan, apply, verify, roll back — with no dependency on the git module.
 
-- EXT-05: EAM fleet-upgrade automation with pre-flight/rollback design
-- EXT-06: MCP resources/sampling/elicitation surface (escalate to rmcp when a consumer exists)
-- TAGS-15: Historian provider CRUD
-- TUIX-06: GAN topology diagram visualization
-- IDE-05: Watch-mode auto-push editing (requires relaxing the no-daemon constraint)
-- EAM live-gate §2 vanish-poll capture work → re-size the 90s deadline
+**Design input:** whk-environment-orchestration PR #60 — `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` (§3 verified 8.3.6 facts, §4 layout, §5–§6 pipeline, §8 rollback, §11, §15 fleet model; evidence in `spikes/gateway-modes/results/`, incl. `RIG.md`). This milestone is that roadmap's Plan 2.
+
+**Target features:**
+- Config API client (library-only): config resources with signature-checked PUT and `attributes.uuid`, scan-lock, `scan/config`, mode API; tolerant of empty/204 bodies
+- `ign deploy render` — manifest + mode overlay rendered to the gateway's on-disk resource layout (Gson-compatible writer, uuid for new resources, embedded-secret lint)
+- `ign deploy plan` — read-only diff, flags resources still shadowed in `core` and destructive changes
+- Guarded `ign deploy apply/rollback/verify` — SSH file transport (Windows OpenSSH both ends), lock-expiry detection, snapshot + auto-rollback, backup-node verification
+- Guarded `ign deploy projects` — manifest-pinned project set, parents-first import, hash verification
+
+**Sequencing:** takes priority over v1.3's open Phases 17 (git-module commissioning) and 18 (declared rig discovery), which stay parked in ROADMAP.md. `ign drift` is deferred to a later milestone.
 
 ## Requirements
 
@@ -65,7 +69,7 @@ Not yet defined. Candidate seeds carried from v1.1 (commit none of these — `/g
 
 ### Active
 
-(None — next milestone not yet planned. Start with `/gsd-new-milestone`.)
+v1.6 requirements are defined in `.planning/REQUIREMENTS.md` (deploy client, render, plan, apply/rollback/verify, projects).
 
 ### Out of Scope
 
@@ -142,4 +146,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-16 after v1.1 milestone*
+*Last updated: 2026-10-10 at the start of milestone v1.6 Declared Gateway Deploy*
