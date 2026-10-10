@@ -1,11 +1,125 @@
-# Requirements: ignition-cli — v1.3 Rig Modules & Declared Discovery
+# Requirements: ignition-cli — v1.6 Declared Gateway Deploy
 
-**Defined:** 2026-09-20
+**Defined:** 2026-10-10
 **Core Value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
 
-**Design spec:** [`research/2026-09-20-rig-module-provisioning-DESIGN.md`](research/2026-09-20-rig-module-provisioning-DESIGN.md) (approved 2026-09-20, commit `2fd00c7`)
+**Design spec:** whk-environment-orchestration PR #60 — `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` (Plan 2 of that roadmap). **Research:** [`research/SUMMARY.md`](research/SUMMARY.md) — conflict resolutions, capture backlog C1–C12, spec flags SF-1..SF-10.
 
-## v1.3 Requirements
+**Decisions recorded at scoping (2026-10-10):**
+- Bootstrap (`ign deploy pull`) is in v1.6; the spec §13.5 core strip is not (SF-5).
+- Post-write red outcomes keep the frozen envelope: `ok:true`, `data.ok=false`, verdict slug in `data`, exit 6 (Decision A).
+- CI and agent callers must pass `--plan-sha256`; `apply`/`rollback`/`projects` are not exposed as MCP tools in v1.6 (Decisions C, D).
+- In: `--base` drift gate, verify tag probes, `.gwbk` snapshot default-on, Designer preflight.
+- Spec correction: rendered JSON preserves source key order (spec §4 "sorted keys" is falsified by the 183-file corpus).
+
+## v1.6 Requirements
+
+Numbering: new categories. **47 requirements.**
+
+### Config API Client (library-only)
+
+- [ ] **DAPI-01**: The core library can list and read config resources by type and name, from the effective view or a named collection
+- [ ] **DAPI-02**: The core library can create and update config resources with the signature-checked array PUT; a stale or missing signature surfaces as its own error, never a generic failure
+- [ ] **DAPI-03**: The core library can acquire the config scan-lock, read its remaining time, and detect expiry (200 JSON while held → 204 after) without comparing gateway timestamps to the local clock
+- [ ] **DAPI-04**: The core library can trigger a config scan and decide completion by `scanActive == false` and `lastScanTimestamp` advanced on the same gateway — HTTP 200 alone is never success
+- [ ] **DAPI-05**: The core library can list and create deployment modes and reads the active `deploymentMode`, normalizing `null` and `""` to "no mode"
+- [ ] **DAPI-06**: Every new endpoint has a declared response shape (JSON, empty 2xx, or 204) proven by a live capture; gateway bodies echoed into errors are size-capped
+- [ ] **DAPI-07**: A held scan-lock (409) surfaces as `scan_lock_held` naming the holder, and redundancy status decides the active node by activity level with the live `Master`/`Backup` vocabulary
+
+### Render
+
+- [ ] **DRND-01**: User can run `ign deploy render` on a `gateways/<name>/` tree for an environment and get a rendered tree whose `render_sha256` is identical for identical inputs
+- [ ] **DRND-02**: `manifest.yaml` and `targets/<env>.yaml` parse strictly — unknown fields and a wrong `schema_version` fail with file, line and column
+- [ ] **DRND-03**: Files under `modes/<env>/` override the base tree by path, whole-file
+- [ ] **DRND-04**: Only manifest-allowlisted resource types are rendered; security singletons (security-properties, security-levels, API tokens, user sources) are refused
+- [ ] **DRND-05**: Gateway-written files pass through byte-for-byte; files `ign` synthesizes use a Gson-compatible, order-preserving writer, proven by the gateway corpus round-tripping byte-identical on Linux, macOS and Windows
+- [ ] **DRND-06**: New named resources get a deterministic name-based `attributes.uuid` from a per-type rule table; singleton types get none; existing uuids are kept
+- [ ] **DRND-07**: Render refuses an embedded secret (an `Embedded` secret value or a plaintext secret field), naming the path and never the value
+- [ ] **DRND-08**: Render refuses case-fold collisions, Windows-illegal names, paths over the Windows length budget, and CR bytes in the tree
+
+### Transport, Plan, Pull, Verify (read-only)
+
+- [ ] **DPLN-01**: `ign` reads and writes a gateway's config tree over system OpenSSH to a Windows OpenSSH host (and over the local filesystem for rigs and tests) with batch mode, a pinned host key, per-call timeouts and argv-only invocation; file hashes are computed client-side
+- [ ] **DPLN-02**: User can run `ign deploy plan` to see each resource as added, changed, removed or same against the live master, with zero writes and zero locks, exit 0, `data.summary.has_changes`, and a `plan_sha256`
+- [ ] **DPLN-03**: The plan classifies every entry's relation to `core` (none, identical, differs, hidden, shadows_removal) and flags destructive and lockout-risk entries
+- [ ] **DPLN-04**: The plan states the exact delete set — previously declared names minus rendered names — which never includes `config-mode.json` or an undeclared resource
+- [ ] **DPLN-05**: User can pass `--base <previous render>` to mark entries the live gateway changed outside the pipeline as drift
+- [ ] **DPLN-06**: User can run `ign deploy pull` to bootstrap a `gateways/<name>/` tree from a live gateway read-only, such that `render` then `plan` against that gateway is empty
+- [ ] **DPLN-07**: User can run `ign deploy verify` against the master: scan complete, `deploymentMode` equals the target, every declared resource reads back equal in the effective view, and the gateway log has no "will not be loaded" entry for a declared resource
+- [ ] **DPLN-08**: `verify` reads the manifest's `verify.tag_probes[]` and fails when a probed tag is not Good; an absent probe list is a warning, never a pass
+- [ ] **DPLN-09**: A red `verify` returns the frozen envelope with findings in `data` and exit 6
+
+### Apply and Rollback (single gateway)
+
+- [ ] **DAPL-01**: `ign deploy apply` without `--yes` refuses and prints the plan as the refusal; with `--plan-sha256`, a plan that changed since review refuses as `plan_stale`
+- [ ] **DAPL-02**: Destructive entries require `--allow-destructive`; drift entries require `--allow-drift "<reason>"`, recorded in the run; `shadows_removal` entries block apply regardless of flags
+- [ ] **DAPL-03**: An empty plan exits 0 as a no-op with no lock, snapshot or scan
+- [ ] **DAPL-04**: Before any write, apply runs every preflight and reports all failures at once: `deploymentMode` on both nodes, wrong-target guard, write-permission probe, no on-box journal, and open Designer sessions (`--designers fail|wait|proceed`, default fail)
+- [ ] **DAPL-05**: Before writing, apply snapshots the target collection (on the gateway host and in the run directory, with hashes) and downloads a `.gwbk` by default; `--skip-gwbk` is recorded; neither is ever uploaded off-prem
+- [ ] **DAPL-06**: Apply writes inside the scan-lock with a measured hold budget; if the lock expires or a write fails mid-way, apply restores the snapshot and scans, so no partial tree is ever loaded
+- [ ] **DAPL-07**: A master verify failure after apply triggers automatic rollback through the same engine and reports `deploy_rolled_back` with exit 6; a failed rollback reports `rollback_failed` with recovery guidance
+- [ ] **DAPL-08**: User can run `ign deploy rollback --run <id>` from a fresh process to restore that run's snapshot; it refuses when live state differs from the run's post-apply fingerprint unless `--discard-live-changes`
+- [ ] **DAPL-09**: An interrupted apply leaves an on-box journal, and plan, apply and rollback refuse while it is present until recovery runs
+- [ ] **DAPL-10**: Every run, including failed ones, writes a private run directory (`run.json`, `result.json`, `plan.json`, `events.ndjson`); apply reports `restart_pending` and never restarts or fails over a gateway
+
+### Redundant Pair
+
+- [ ] **DPAIR-01**: Apply ends by verifying the backup through its own API and file hashes: same `deploymentMode`, effective view equal to master, redundancy healthy — after a bounded convergence wait and at most one resync
+- [ ] **DPAIR-02**: A backup that stopped syncing or still differs reports `deploy_backup_unsynced` with exit 6 and never rolls back the master
+- [ ] **DPAIR-03**: User can run `ign deploy verify --node both`, which also checks that every referenced secret name exists on both nodes
+- [ ] **DPAIR-04**: A two-node 8.3.6 rig with a trusted gateway-network link live-gates DPAIR-01..03
+
+### Projects
+
+- [ ] **DPRJ-01**: `ign deploy projects` verifies every project artifact against its manifest sha256 pin before any upload
+- [ ] **DPRJ-02**: Projects import parent-first from `project.json` inheritance; cycles and unknown parents refuse; unchanged projects (canonical hash) are skipped
+- [ ] **DPRJ-03**: Each project is exported before it is overwritten and verified after import by canonical hash, ignoring `lastModification*` and signatures
+- [ ] **DPRJ-04**: Projects not in the manifest are reported and never deleted; a git-managed project (`.git` present) is refused
+- [ ] **DPRJ-05**: `ign deploy projects --check` reports what would change with no writes
+
+### Surface and Contract
+
+- [ ] **DSURF-01**: Each deploy verb lands with its TUI route row, README entry and exit-table rows in the same phase; every new error follows the four-place rule
+- [ ] **DSURF-02**: `apply`, `rollback` and `projects` are registered in `GUARDED_OPS` and are not exposed as MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are
+- [ ] **DSURF-03**: A secret canary test proves no secret value appears in plan, apply or verify output, `--json`, run-directory files or events
+- [ ] **DSURF-04**: The verdict envelope (`ok:true`, `data.ok=false`, exit 6) is documented as a dated README contract exception
+
+## Future Requirements (deferred)
+
+- `ign drift` — scheduled drift detection and alerting (roadmap Plan 6)
+- `ign redundancy restart --rolling` — restart-class changes and failover sequencing (roadmap Plan 5)
+- Guarded `apply --strip-core` with core snapshot (spec §13.5, SF-5)
+- `--detailed-exitcode` for "changes present" (needs an exit-taxonomy change)
+- `rollback --list`, tombstone overlays ("absent in env"), restart-class hints
+- A real TUI deploy panel beyond registry rows
+- MCP exposure of `apply`/`rollback`/`projects` once the plan-hash handshake has shipped and been used
+
+## Out of Scope (v1.6)
+
+| Item | Reason |
+|------|--------|
+| `--force`, `--skip-verify`, `--no-rollback` | Each removes a safety the design depends on |
+| Auto-reverting drift | Drift is reported and gated, never silently overwritten |
+| Any write to the backup node | Backup state comes from redundancy sync; `ign` only checks it |
+| Templated or JSON-patch overlays | Whole-file overlays keep render reviewable |
+| Secret values in the rendered tree | References only; values stay in the gateway secret store |
+| Deleting projects absent from the manifest | Unmanaged projects are reported, not removed |
+| "Rollback to a git ref" | That is render + plan + apply of the old commit |
+| An SSH library dependency (russh, ssh2, openssh) | MSRV 1.89, dependency weight, Windows client gaps; system OpenSSH is used instead |
+| Workspace MSRV bump | Not coupled to this milestone |
+| Edge gateway (8.1) and controls/HMI stack | Spec 3 and later fleet plans |
+
+## Traceability
+
+(Filled by the roadmap.)
+
+---
+
+# Parked: v1.3 Rig Modules & Declared Discovery (open)
+
+v1.3 Phases 15, 16 and 19 shipped (RMOD-01..07). Phases 17 and 18 are parked behind v1.6; their requirements stay open below.
+
+### v1.3 Requirements
 
 Requirements for the v1.3 release. Numbering continues v1.1 (v1.0 shipped 44,
 v1.1 shipped 25 — see `milestones/`). **14 requirements.**
