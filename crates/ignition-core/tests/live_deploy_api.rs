@@ -1,6 +1,12 @@
-//! Phase 20's live gate (20-06): every `DeployApi` method against a real,
-//! disposable Ignition 8.3.6 gateway on localhost, plus a check that the
-//! `FakeDeploy` test double behaves like that gateway.
+//! Phase 20's live gate (20-06): the `DeployApi` methods listed below against
+//! a real, disposable Ignition 8.3.6 gateway on localhost, plus a check that
+//! the `FakeDeploy` test double behaves like that gateway.
+//!
+//! The recorded green run (`20-06-live-gate.log`) predates sections C2 and
+//! C3 (filtered list, singleton, per-collection list, `from_record` updates,
+//! the `projects` scan kind): they are written but have not been run against
+//! a gateway yet (20-REVIEW WR-03, WR-04). Run the gate again before
+//! trusting them.
 //!
 //! The wiremock pins replay captured bytes. This file is the only place the
 //! same methods run against a live gateway in one ordered run, and where the
@@ -48,7 +54,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ignition_core::client::config_resources::{ResourceCreate, ResourceUpdate};
-use ignition_core::client::deploy_api::scan_and_wait;
+use ignition_core::client::deploy_api::{resource_list_in_collection, scan_and_wait};
 use ignition_core::client::mode::ModeCreate;
 use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::{
@@ -426,6 +432,72 @@ async fn live_deploy_api_end_to_end() {
         names.items.iter().any(|item| item.name == name),
         "C: resource_names includes the name"
     );
+    // WR-04 (C2): the filtered list. The client sends `name[eq]=v` through
+    // reqwest, which percent-encodes the brackets (`name%5Beq%5D=v`); D7 was
+    // learned with literal brackets (curl -g). A filter that silently
+    // matches nothing is the failure D7 recorded, so assert one match for
+    // the created name and none for a name that does not exist.
+    let by_name = |wanted: &str| ListQuery {
+        filter: Some(format!("name[eq]={wanted}")),
+        ..ListQuery::default()
+    };
+    let hit = a
+        .resource_list("ignition", "database-connection", &by_name(&name))
+        .await
+        .expect("C2: filtered list");
+    assert_eq!(
+        hit.items.len(),
+        1,
+        "C2: name[eq] must match the created resource exactly once (percent-encoded brackets)"
+    );
+    let miss = a
+        .resource_list(
+            "ignition",
+            "database-connection",
+            &by_name("IGN_LIVE_NO_SUCH_NAME"),
+        )
+        .await
+        .expect("C2: filtered list, no match");
+    assert!(
+        miss.items.is_empty(),
+        "C2: name[eq] of an absent name matches nothing"
+    );
+
+    // WR-04 (C2): the D7 per-collection list and the singleton read.
+    for collection in ["core", "production"] {
+        let in_collection =
+            resource_list_in_collection(&a, "ignition", "database-connection", collection)
+                .await
+                .unwrap_or_else(|err| panic!("C2: list in {collection}: {err:?}"));
+        assert!(
+            in_collection
+                .iter()
+                .any(|record| record.name.as_deref() == Some(name.as_str())),
+            "C2: the {collection} collection lists the resource"
+        );
+    }
+    for collection in [None, Some("core")] {
+        let singleton = a
+            .resource_singleton("ignition", "security-properties", collection)
+            .await
+            .unwrap_or_else(|err| panic!("C2: singleton {collection:?}: {err:?}"));
+        assert_eq!(singleton.resource_type, "ignition/security-properties");
+        assert!(singleton.name.is_none(), "C2: a singleton has no name");
+        assert!(
+            singleton.signature.is_some(),
+            "C2: a singleton carries a signature"
+        );
+    }
+
+    // WR-04 (C3): the `projects` scan kind is wiremock-pinned only; read it
+    // live (no lock is taken and no scan is triggered).
+    a.scan_status(ScanKind::Projects)
+        .await
+        .expect("C3: projects scan status");
+    a.scan_lock_info(ScanKind::Projects)
+        .await
+        .expect("C3: projects scan-lock info");
+
     // D10: the duplicate create is a 409, typed `resource_exists` (exit 6).
     match a
         .resource_create(

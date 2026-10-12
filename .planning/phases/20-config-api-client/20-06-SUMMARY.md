@@ -10,7 +10,7 @@ requires:
   - phase: 20-05
     provides: "FakeGateway/FakeDeploy and the shared scenario with ScenarioTiming::{fake, live}"
 provides:
-  - "tests/live_deploy_api.rs: local_url_guard, RIG_GATEWAY_NAME, CI-run guard tests, and one ordered #[ignore] live gate over every DeployApi method"
+  - "tests/live_deploy_api.rs: local_url_guard, RIG_GATEWAY_NAME, CI-run guard tests, and one ordered #[ignore] live gate over the lock, scan, mode, create, find, update, list and names methods (not resource_singleton, resource_list_in_collection, a filtered list, ScanKind::Projects or from_record updates until the next live run; see 20-REVIEW-FIX WR-04)"
   - "20-06-live-gate.log: the committed, key-free output of the green live run"
   - "Dated Live gate 20-06 entry under Drift and limits in 20-LIVE-CAPTURES.md"
 affects: [22, 23, 24]
@@ -45,7 +45,7 @@ actuals:
 
 # Phase 20 Plan 06: Live gate against the ephemeral 8.3.6 rig Summary
 
-**One recorded green run of every `DeployApi` method against a disposable loopback 8.3.6 gateway (lock, scan, modes, resources), with the `FakeDeploy` trace equal to the live trace tag for tag and no wire drift.**
+**One recorded green run of the `DeployApi` lock, scan, mode, create, find, update, list and names methods against a disposable loopback 8.3.6 gateway (not run live in that run: `resource_singleton`, `resource_list_in_collection`, a filtered list, `ScanKind::Projects`, `from_record`/`with_collection` updates), with the `FakeDeploy` trace equal to the live trace tag for tag and no wire drift.**
 
 ## Task Commits
 
