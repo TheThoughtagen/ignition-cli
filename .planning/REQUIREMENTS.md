@@ -25,7 +25,7 @@ Numbering: new categories. **47 requirements.**
 - [x] **DAPI-04**: The core library can trigger a config scan and decide completion by `scanActive == false` and `lastScanTimestamp` advanced on the same gateway — HTTP 200 alone is never success
 - [x] **DAPI-05**: The core library can list and create deployment modes and reads the active `deploymentMode`, normalizing `null` and `""` to "no mode"
 - [x] **DAPI-06**: Every new endpoint has a declared response shape (JSON, empty 2xx, or 204) proven by a live capture; gateway bodies echoed into errors are size-capped
-- [ ] **DAPI-07**: A held scan-lock (409) surfaces as `scan_lock_held` naming the holder, and redundancy status decides the active node by activity level with the live `Master`/`Backup` vocabulary
+- [x] **DAPI-07**: A held scan-lock (409) surfaces as `scan_lock_held` naming the holder, and redundancy status decides the active node by activity level with the live `Master`/`Backup` vocabulary
 
 ### Render
 
@@ -122,7 +122,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DAPI-04 | Phase 20 | Complete |
 | DAPI-05 | Phase 20 | Complete |
 | DAPI-06 | Phase 20 | Complete |
-| DAPI-07 | Phase 20 | Pending — satisfied at library level (`active_node`); `ign redundancy status` CLI surface deferred to Phase 24 (user decision 2026-10-12) |
+| DAPI-07 | Phase 20 | Complete — library level (`scan_lock_held`, `active_node`); `ign redundancy status` CLI wiring tracked in Phase 24 |
 | DRND-01 | Phase 21 | Pending |
 | DRND-02 | Phase 21 | Pending |
 | DRND-03 | Phase 21 | Pending |
