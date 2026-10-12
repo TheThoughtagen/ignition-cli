@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use ignition_core::client::config_resources::{ResourceCreate, ResourceUpdate};
 use ignition_core::client::deploy_api::{resource_list_in_collection, scan_and_wait};
+use ignition_core::client::mode::ModeCreate;
 use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::{
     LockObservation, LockVerdict, ScanKind, ScanOutcome, lock_verdict,
@@ -1710,4 +1711,259 @@ async fn cap_422_body_is_truncated_on_a_read() {
     };
     assert!(reason.ends_with(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER));
     assert!(reason.len() < 4096 + 400, "{} bytes", reason.len());
+}
+
+// ---------------------------------------------------------------------------
+// 20-05: deployment modes (DAPI-05)
+// ---------------------------------------------------------------------------
+
+const GATEWAY_INFO: &str = "/data/api/v1/gateway-info";
+const MODE: &str = "/data/api/v1/mode";
+
+/// C-null (no mode), "GET gateway-info (raw)": `"deploymentMode":""`.
+const CNULL_NO_MODE: &str = r#"{"name":"ign-deploy-rig","redundancyRole":"Independent","edition":"standard","hostname":"localhost","port":"18290","ignitionVersion":"8.3.6 (b2026042713)","deploymentMode":"","timeZone":"Coordinated Universal Time","timeZoneId":"Etc/UTC","jvmVersion":"17.0.18","allowUnsignedModules":false,"license":{"mode":"Trial","validForVersion":8,"expirationDate":"Oct 12, 2026, 4:31:03 PM","licenseRestrictions":[]}}"#;
+
+/// C-null (mode production), "GET gateway-info (raw)".
+const CNULL_PRODUCTION: &str = r#"{"name":"ign-deploy-rig","redundancyRole":"Independent","edition":"standard","hostname":"localhost","port":"18290","ignitionVersion":"8.3.6 (b2026042713)","deploymentMode":"production","timeZone":"Coordinated Universal Time","timeZoneId":"Etc/UTC","jvmVersion":"17.0.18","allowUnsignedModules":false,"license":{"mode":"Trial","validForVersion":8,"expirationDate":"Oct 12, 2026, 4:32:16 PM","licenseRestrictions":[]}}"#;
+
+/// C-mode "GET /mode (before)": no modes yet.
+const CMODE_EMPTY: &str =
+    r#"{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}"#;
+
+/// C-mode "GET /mode (after)": the one created mode.
+const CMODE_AFTER: &str = r#"{"items":[{"name":"production","title":"Production","description":"ign-deploy-rig","resourceCount":0}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}"#;
+
+/// C-mode "POST /mode production": the 200 body (pretty-printed).
+const CMODE_CREATED: &str = "{\n  \"name\": \"production\",\n  \"title\": \"Production\",\n  \"description\": \"ign-deploy-rig\",\n  \"resourceCount\": 0\n}";
+
+/// C-mode "POST /mode production again (duplicate)": 409 Jetty HTML.
+const CMODE_DUP_409: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Mode already exists</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/mode</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Mode already exists</td></tr>\n</table>\n\n</body>\n</html>\n";
+
+async fn mount_gateway_info(mock: &IgnitionMock, body: &str) {
+    Mock::given(method("GET"))
+        .and(path(GATEWAY_INFO))
+        .respond_with(json(200, body))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+}
+
+/// C-null (no mode) verbatim: `""` is no mode.
+#[tokio::test]
+async fn mode_deployment_mode_no_mode_is_none() {
+    let mock = IgnitionMock::start().await;
+    mount_gateway_info(&mock, CNULL_NO_MODE).await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    assert_eq!(api.deployment_mode().await.expect("reads"), None);
+}
+
+/// D5 covers other versions: `null`, the key absent and a whitespace-only
+/// string each read as no mode too.
+#[tokio::test]
+async fn mode_deployment_mode_null_absent_and_blank_are_none() {
+    for body in [
+        r#"{"name":"g","deploymentMode":null}"#,
+        r#"{"name":"g"}"#,
+        r#"{"name":"g","deploymentMode":"   "}"#,
+    ] {
+        let mock = IgnitionMock::start().await;
+        mount_gateway_info(&mock, body).await;
+        let concrete = api_for(&mock);
+        let api: &dyn DeployApi = &concrete;
+        assert_eq!(api.deployment_mode().await.expect("reads"), None, "{body}");
+    }
+}
+
+/// C-null (mode production) verbatim: the active mode, by name.
+#[tokio::test]
+async fn mode_deployment_mode_reads_the_active_mode() {
+    let mock = IgnitionMock::start().await;
+    mount_gateway_info(&mock, CNULL_PRODUCTION).await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    assert_eq!(
+        api.deployment_mode().await.expect("reads").as_deref(),
+        Some("production")
+    );
+}
+
+/// C-mode "GET /mode (before)": an empty list is Ok; the request carries
+/// `limit=-1` and `offset=0`.
+#[tokio::test]
+async fn mode_list_empty_is_ok_and_sends_limit_and_offset() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(MODE))
+        .and(query_param("limit", "-1"))
+        .and(query_param("offset", "0"))
+        .respond_with(json(200, CMODE_EMPTY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let page = api.modes().await.expect("lists");
+    assert!(page.items.is_empty());
+    assert_eq!(page.metadata.total, 0);
+}
+
+/// C-mode "GET /mode (after)" parses, and two modes keep gateway order.
+#[tokio::test]
+async fn mode_list_keeps_order() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(MODE))
+        .respond_with(json(
+            200,
+            r#"{"items":[{"name":"zeta","title":"Z","description":"","resourceCount":2},{"name":"alpha","title":"A","description":"","resourceCount":0}],"metadata":{"total":2,"matching":2,"limit":-1,"offset":0}}"#,
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let names: Vec<String> = api
+        .modes()
+        .await
+        .expect("lists")
+        .items
+        .into_iter()
+        .map(|mode| mode.name)
+        .collect();
+    assert_eq!(names, ["zeta", "alpha"]);
+
+    // The captured single-item body parses too.
+    let parsed: ignition_core::client::query::ListEnvelope<
+        ignition_core::client::mode::ModeRecord,
+    > = serde_json::from_str(CMODE_AFTER).expect("C-mode after parses");
+    assert_eq!(parsed.items[0].resource_count, Some(0));
+}
+
+fn production_mode() -> ModeCreate {
+    ModeCreate {
+        name: "production".to_string(),
+        title: "Production".to_string(),
+        description: "x".to_string(),
+    }
+}
+
+/// C-mode + D6: one POST with exactly the three keys, then a GET list that
+/// confirms the mode; the listed record comes back.
+#[tokio::test]
+async fn mode_create_posts_body_and_confirms_by_list() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(MODE))
+        .respond_with(json(200, CMODE_CREATED))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MODE))
+        .respond_with(json(200, CMODE_AFTER))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+
+    let record = api.mode_create(&production_mode()).await.expect("created");
+
+    assert_eq!(record.name, "production");
+    assert_eq!(record.description.as_deref(), Some("ign-deploy-rig"));
+    let seen = requests_of(&mock).await;
+    let post = seen
+        .iter()
+        .find(|req| req.method.as_str() == "POST")
+        .expect("a POST was sent");
+    assert_eq!(
+        post.body,
+        br#"{"name":"production","title":"Production","description":"x"}"#
+    );
+    assert!(
+        post.headers
+            .get("x-ignition-api-token")
+            .is_some_and(|v| v.as_bytes() == b"cap-a:tokengeneratedlive"),
+        "the create is authenticated"
+    );
+}
+
+/// T-20-23: a 2xx whose mode is absent from the follow-up list is an
+/// `internal` error naming the method and the mode.
+#[tokio::test]
+async fn mode_create_absent_from_follow_up_list_is_an_error() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(MODE))
+        .respond_with(json(200, CMODE_CREATED))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MODE))
+        .respond_with(json(200, CMODE_EMPTY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+
+    let err = api
+        .mode_create(&production_mode())
+        .await
+        .expect_err("unconfirmed is never Ok");
+
+    assert_eq!(err.code(), "internal");
+    let text = err.to_string();
+    assert!(text.contains("mode_create"), "{text}");
+    assert!(text.contains("production"), "{text}");
+}
+
+/// D6: the duplicate (409 HTML) and the illegal name (400 HTML) answered
+/// by the gateway are errors, never Ok, and no list read follows.
+#[tokio::test]
+async fn mode_create_duplicate_is_never_ok() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(MODE))
+        .respond_with(html(409, CMODE_DUP_409))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+
+    let err = api
+        .mode_create(&production_mode())
+        .await
+        .expect_err("a duplicate is never Ok");
+
+    assert!(
+        err.to_string().contains("409"),
+        "the refusal names its status: {err}"
+    );
+    assert_eq!(requests_of(&mock).await.len(), 1, "no confirming read");
+}
+
+/// T-20-22: a name outside `[A-Za-z0-9._-]` is `invalid_input`, exit 2,
+/// with zero requests.
+#[tokio::test]
+async fn mode_name_validation_refuses_before_any_request() {
+    let mock = IgnitionMock::start().await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    for bad in ["a b/", "", "..", "é"] {
+        let err = api
+            .mode_create(&ModeCreate {
+                name: bad.to_string(),
+                title: "T".to_string(),
+                description: "d".to_string(),
+            })
+            .await
+            .expect_err(bad);
+        assert_eq!(err.code(), "invalid_input", "{bad:?}");
+        assert_eq!(err.exit_code(), 2, "{bad:?}");
+    }
+    assert!(requests_of(&mock).await.is_empty(), "nothing was sent");
 }

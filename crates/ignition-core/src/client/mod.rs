@@ -46,6 +46,7 @@ pub mod idp;
 pub mod license;
 pub mod logs;
 pub mod metrics;
+pub mod mode;
 pub mod projects;
 pub mod query;
 pub mod redundancy;

@@ -24,14 +24,17 @@ use serde::de::DeserializeOwned;
 use crate::client::config_resources::{
     MutationOutcome, ResourceCreate, ResourceName, ResourceRecord, ResourceUpdate,
     list_query_pairs, resource_find_path, resource_list_path, resource_names_path,
-    resource_singleton_path, resource_write_path,
+    resource_singleton_path, resource_write_path, validate_segment,
+};
+use crate::client::mode::{
+    GatewayModeProbe, MODE_PATH, ModeCreate, ModeRecord, normalize_deployment_mode,
 };
 use crate::client::query::{ListEnvelope, ListQuery};
 use crate::client::scan::{
     LockObservation, LockRequest, ScanKind, ScanLockInfo, ScanOutcome, ScanStatus, scan_complete,
     scan_lock_path, scan_path,
 };
-use crate::client::{ReqwestGatewayApi, classify};
+use crate::client::{GATEWAY_INFO_PATH, ReqwestGatewayApi, classify};
 use crate::error::{CoreError, SignatureReason};
 use crate::poll::{self, PollConfig, PollState};
 
@@ -145,6 +148,27 @@ pub const DEPLOY_ENDPOINTS: &[EndpointDecl] = &[
         path_template: "/data/api/v1/scan/{kind}",
         shape: ResponseShape::EmptyOk,
         capture_ref: "C1i",
+    },
+    EndpointDecl {
+        id: "modes",
+        method: "GET",
+        path_template: "/data/api/v1/mode",
+        shape: ResponseShape::Json,
+        capture_ref: "C-mode",
+    },
+    EndpointDecl {
+        id: "mode_create",
+        method: "POST",
+        path_template: "/data/api/v1/mode",
+        shape: ResponseShape::EmptyOk,
+        capture_ref: "C-mode",
+    },
+    EndpointDecl {
+        id: "deployment_mode",
+        method: "GET",
+        path_template: "/data/api/v1/gateway-info",
+        shape: ResponseShape::Json,
+        capture_ref: "C-null",
     },
 ];
 
@@ -285,6 +309,29 @@ pub trait DeployApi: Send + Sync {
     /// (D4: a non-holder's POST answered 200 and ran), so no refusal is
     /// classified on this route. The POST is sent once per call.
     async fn scan_request(&self, kind: ScanKind) -> Result<(), CoreError>;
+
+    /// List the deployment modes (`modes`, capture C-mode "GET /mode"):
+    /// `limit=-1` and `offset=0` go out, the answer is the `{items,
+    /// metadata}` envelope, and gateway order is kept. A gateway with no
+    /// modes is Ok with no items.
+    async fn modes(&self) -> Result<ListEnvelope<ModeRecord>, CoreError>;
+
+    /// Define a deployment mode (`mode_create`, capture C-mode, D6).
+    ///
+    /// The name is validated before any request (`invalid_input`). The POST
+    /// is sent exactly once and its 2xx body is ignored; success is
+    /// confirmed by a follow-up [`DeployApi::modes`] read, and the listed
+    /// record is returned. A 2xx whose mode is absent from that list is
+    /// `internal`. A duplicate (409) and an illegal name (400) are errors,
+    /// never Ok. This only DEFINES a mode: it never activates one, restarts
+    /// a gateway or sets a JVM argument.
+    async fn mode_create(&self, body: &ModeCreate) -> Result<ModeRecord, CoreError>;
+
+    /// The gateway's active deployment mode (`deployment_mode`, captures
+    /// C-null, D5): `None` when `deploymentMode` is `null`, `""`, absent
+    /// or whitespace-only (no mode), else the name verbatim. Read through
+    /// a private probe, so `GatewayInfo` is untouched.
+    async fn deployment_mode(&self) -> Result<Option<String>, CoreError>;
 }
 
 /// A 2xx body after the declared shape was enforced.
@@ -686,6 +733,61 @@ impl DeployApi for ReqwestGatewayApi {
         let request = self.apply_auth(self.client.post(url.clone()));
         self.send_shaped(decl, request, &url).await.map(|_| ())
     }
+
+    async fn modes(&self) -> Result<ListEnvelope<ModeRecord>, CoreError> {
+        let decl = decl("modes")?;
+        let url = self.url_for(MODE_PATH);
+        let request = self.apply_auth(
+            self.client
+                .get(url.clone())
+                .query(&ListQuery::default().to_query_pairs()),
+        );
+        match self.send_shaped(decl, request, &url).await? {
+            ShapedBody::Json(text) => parse_json(decl, &url, &text),
+            ShapedBody::Empty | ShapedBody::NoContent => Err(CoreError::Internal(format!(
+                "endpoint {} produced no body",
+                decl.id
+            ))),
+        }
+    }
+
+    async fn mode_create(&self, body: &ModeCreate) -> Result<ModeRecord, CoreError> {
+        validate_segment("mode name", &body.name)?;
+        let decl = decl("mode_create")?;
+        let url = self.url_for(MODE_PATH);
+        let request = self.apply_auth(self.client.post(url.clone()).json(body));
+        // Exactly one POST: a repeated create is never silent.
+        self.send_shaped(decl, request, &url).await?;
+        // The 2xx is not the confirmation (D6): the list is.
+        let listed = self.modes().await?;
+        listed
+            .items
+            .into_iter()
+            .find(|mode| mode.name == body.name)
+            .ok_or_else(|| {
+                CoreError::Internal(format!(
+                    "mode_create answered 2xx from {url} but mode {:?} is not in the \
+                     follow-up mode list",
+                    body.name
+                ))
+            })
+    }
+
+    async fn deployment_mode(&self) -> Result<Option<String>, CoreError> {
+        let decl = decl("deployment_mode")?;
+        let url = self.url_for(GATEWAY_INFO_PATH);
+        let request = self.apply_auth(self.client.get(url.clone()));
+        match self.send_shaped(decl, request, &url).await? {
+            ShapedBody::Json(text) => {
+                let probe: GatewayModeProbe = parse_json(decl, &url, &text)?;
+                Ok(normalize_deployment_mode(probe.deployment_mode))
+            }
+            ShapedBody::Empty | ShapedBody::NoContent => Err(CoreError::Internal(format!(
+                "endpoint {} produced no body",
+                decl.id
+            ))),
+        }
+    }
 }
 
 /// The `collection` query pair, only when a collection was asked for.
@@ -876,7 +978,7 @@ mod tests {
     /// The rows copied from the 20-LIVE-CAPTURES Endpoint shapes table.
     #[test]
     fn endpoint_rows_match_the_capture_table() {
-        let expected: [(&str, &str, &str, ResponseShape, &str); 10] = [
+        let expected: [(&str, &str, &str, ResponseShape, &str); 13] = [
             (
                 "resource_names",
                 "GET",
@@ -947,6 +1049,27 @@ mod tests {
                 ResponseShape::EmptyOk,
                 "C1i",
             ),
+            (
+                "modes",
+                "GET",
+                "/data/api/v1/mode",
+                ResponseShape::Json,
+                "C-mode",
+            ),
+            (
+                "mode_create",
+                "POST",
+                "/data/api/v1/mode",
+                ResponseShape::EmptyOk,
+                "C-mode",
+            ),
+            (
+                "deployment_mode",
+                "GET",
+                "/data/api/v1/gateway-info",
+                ResponseShape::Json,
+                "C-null",
+            ),
         ];
         assert_eq!(DEPLOY_ENDPOINTS.len(), expected.len());
         for (id, method, template, shape, capture) in expected {
@@ -973,8 +1096,49 @@ mod tests {
             "scan_lock_info",
             "scan_status",
             "scan_request",
+            "modes",
+            "mode_create",
+            "deployment_mode",
         ] {
             assert!(decl(id).is_ok(), "{id}");
+        }
+    }
+
+    /// DAPI-06: the table is closed. Thirteen rows, in trait declaration
+    /// order, unique ids, every row backed by a capture block, every verb
+    /// one of GET, POST and PUT.
+    #[test]
+    fn deploy_endpoints_cover_every_method() {
+        let ids: Vec<&str> = DEPLOY_ENDPOINTS.iter().map(|row| row.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "resource_names",
+                "resource_list",
+                "resource_find",
+                "resource_singleton",
+                "resource_create",
+                "resource_update",
+                "scan_lock_acquire",
+                "scan_lock_info",
+                "scan_status",
+                "scan_request",
+                "modes",
+                "mode_create",
+                "deployment_mode",
+            ]
+        );
+        assert_eq!(DEPLOY_ENDPOINTS.len(), 13);
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "ids are unique");
+        for row in DEPLOY_ENDPOINTS {
+            assert!(!row.capture_ref.is_empty(), "{}", row.id);
+            assert!(
+                matches!(row.method, "GET" | "POST" | "PUT"),
+                "{} uses {}",
+                row.id,
+                row.method
+            );
         }
     }
 
