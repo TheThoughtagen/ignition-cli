@@ -600,23 +600,33 @@ pub struct TrialResetResult {
 /// (`rig_error`) with the honest target state: no running service,
 /// no knock. Rides [`rig_status`]'s read (a down rig is Ok-data
 /// there — state is data; here the state REFUSES the verb).
+///
+/// The check keys on the plan's GATEWAY service
+/// ([`RigPlan::gateway_service`] — the 8088/443-publishing service),
+/// not ANY service: a running `db` beside a stopped gateway must not
+/// pass (review finding — that is the squatter-knock again, one
+/// service over). A plan with no gateway service skips the check:
+/// the verb's own no-gateway-port refusal names that state better.
 pub async fn require_rig_up_for_verb(
     runner: &dyn ComposeRunner,
     plan: &RigPlan,
     verb: &str,
 ) -> Result<(), CoreError> {
+    let Some(gateway_service) = plan.gateway_service.as_deref() else {
+        return Ok(());
+    };
     let status = rig_status(runner, plan).await?;
-    if status
+    let gateway_running = status
         .services
         .iter()
-        .any(|service| service.state == "running")
-    {
+        .any(|service| service.name == gateway_service && service.state == "running");
+    if gateway_running {
         Ok(())
     } else {
         Err(CoreError::Rig(format!(
-            "rig {:?} is DOWN — {verb} addresses the rig's gateway and nothing of \
-             this rig is running; `ign rig up` brings it back (if its ports report \
-             held, whatever squats on them is NOT the rig)",
+            "rig {:?} is DOWN — {verb} addresses the rig's gateway and its gateway \
+             service {gateway_service:?} is not running; `ign rig up` brings it back \
+             (if its ports report held, whatever squats on them is NOT the rig)",
             plan.name
         )))
     }
@@ -692,11 +702,18 @@ pub async fn trial_reset(
         // rendered a URL in the profile slot and hinted at a nonsense
         // keyring entry for it). Rig-class (exit 7): the failure is
         // THIS operation's credential sourcing, and the message
-        // names both rungs.
+        // names both rungs — accurately: "the POST was refused" only
+        // when a POST was actually attempted (review finding).
+        let detail = if token_available {
+            "the token POST was refused and no login pair (IGNITION_USER + \
+             IGNITION_PASSWORD) is set"
+        } else {
+            "no API token (IGNITION_TOKEN) and no login pair (IGNITION_USER + \
+             IGNITION_PASSWORD) resolved"
+        };
         return Err(CoreError::Rig(format!(
-            "trial reset at {rig_url}: the token POST was refused and no login pair \
-             (IGNITION_USER + IGNITION_PASSWORD) is set — the reset needs one \
-             working credential for the rig's gateway"
+            "trial reset at {rig_url}: {detail} — the reset needs one working \
+             credential for the rig's gateway"
         )));
     };
     let flow = crate::client::idp::IdpLoginFlow::new(rig_url)?;
