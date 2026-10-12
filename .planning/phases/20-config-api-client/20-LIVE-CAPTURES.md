@@ -4068,3 +4068,11 @@ Rows `resource_create` and `resource_update` are `Json` only for their 2xx. Thei
 - The same `IGN_DEPLOY_RIG_DB_<epoch>` name was used in `core` and then `production` (C-list), so the `production` copy carries the same name as the `core` copy; both exist on the rig until teardown.
 - `curl -i` bodies were kept verbatim, including the roughly 6 KB `stacktrace` arrays of the 409 and 500 `problem` bodies; they are in the blocks above and add nothing beyond `message`.
 - Signatures in these blocks are opaque per-write hashes of a disposable gateway that is destroyed after the captures (T-20-04). No API-token key appears anywhere in this file.
+
+### Live gate 20-06 (2026-10-12)
+
+- Image `inductiveautomation/ignition:8.3.6` (linux/amd64 under emulation), compose variant `compose.yml` alone (no bind mount; D11 allows it), project `ign-deploy-rig`, 127.0.0.1:18290. Boot RUNNING on the 13th 10 s poll; after the token mint and restart RUNNING again on the 5th poll. Run: `cargo test -p ignition-core --test live_deploy_api -- --ignored --nocapture`, 13.24 s, committed as `20-06-live-gate.log`.
+- Per-section results: PASS guard (loopback URL, gateway name `ign-deploy-rig`); PASS A (lock held by cap-a, cap-b refused naming cap-a, Free after expiry); PASS B (`scan_and_wait` Complete, `lastScanTimestamp` advanced); PASS D (no active mode, `production` mode created and listed, still no active mode); PASS C (create, effective/core/production reads, update, stale refusal leaves the signature unchanged, list, names, duplicate refused); PASS E (live trace equals fake trace, 13 steps); PASS Z (cleanup scan).
+- Live trace: `lock:acquired, lock:held-by-a, lock:refused-held-by-a, lock:free, scan:complete, create:ok, find:ok, update:ok, update:stale, create-duplicate:internal, mode:created, modes:listed, deployment-mode:none`. Fake trace: identical.
+- Drift found: none: live trace equals fake trace. A collection-less PUT (the open question from 20-05) was accepted on the live gateway as `update:ok` when only the core copy existed in the scenario run's names; which copy it updates is still not shown by a capture.
+- The rig was run with no active mode throughout; the rig and its volume were destroyed after the run.
