@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -731,6 +731,63 @@ pub enum CoreError {
         /// URL of the refused DELETE, when known.
         endpoint: Option<String>,
     },
+
+    /// Another actor holds the gateway's scan-lock. Exit 6 — target
+    /// state. Constructed by the route-scoped scan-lock arm in
+    /// classify.rs (20-03); `kind` is `config` or `projects`. `actor`
+    /// is the holder's opaque identity string when the gateway named
+    /// it (`api-token:<name>:<ip>`), echoed and never parsed; `None`
+    /// when the refusal did not name one.
+    #[error(
+        "the {kind} scan-lock is held by {}",
+        actor.as_deref().unwrap_or("another actor")
+    )]
+    ScanLockHeld {
+        /// The holder's identity string, when the gateway named it.
+        actor: Option<String>,
+        /// Which scan-lock: `config` or `projects`.
+        kind: String,
+        /// URL of the refused request, when known.
+        endpoint: Option<String>,
+    },
+
+    /// The gateway refused a resource write over its signature. Exit 6 —
+    /// target state. Constructed ONLY by the deploy-scoped write helper
+    /// in client/deploy_api.rs (20-04), never by classify.rs, so the
+    /// v1.1 EAM 500 pin stays exit 1 `internal`. The payload
+    /// deliberately carries no signature and no gateway problem text:
+    /// 8.3.3 problem messages leak the live signature.
+    #[error("gateway refused the write to resource {name:?}: {reason} signature")]
+    ResourceSignatureRejected {
+        /// The resource name that was being written.
+        name: String,
+        /// Why the signature was refused.
+        reason: SignatureReason,
+        /// URL of the refused request, when known.
+        endpoint: Option<String>,
+    },
+}
+
+/// Why a resource write's signature was refused
+/// ([`CoreError::ResourceSignatureRejected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureReason {
+    /// The gateway refused a signature that no longer matches: the
+    /// resource changed since it was read.
+    Stale,
+    /// No usable signature was supplied: either refused before any
+    /// request because it was empty, or a gateway refusal that the live
+    /// capture shows is distinguishable.
+    Missing,
+}
+
+impl std::fmt::Display for SignatureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stale => "stale",
+            Self::Missing => "missing",
+        })
+    }
 }
 
 /// Payload of [`CoreError::ModuleDigestMismatch`], boxed to keep
@@ -836,6 +893,8 @@ impl CoreError {
             Self::ModuleDigestChanged(..) => "module_digest_changed",
             Self::ModuleNotRegistered { .. } => "module_not_registered",
             Self::ModuleUninstallDenied { .. } => "module_uninstall_denied",
+            Self::ScanLockHeld { .. } => "scan_lock_held",
+            Self::ResourceSignatureRejected { .. } => "resource_signature_rejected",
         }
     }
 
@@ -885,7 +944,9 @@ impl CoreError {
             | Self::ModuleDigestMismatch(..)
             | Self::ModuleFeedUnusable { .. }
             | Self::ModuleDigestChanged(..)
-            | Self::ModuleUninstallDenied { .. } => 6,
+            | Self::ModuleUninstallDenied { .. }
+            | Self::ScanLockHeld { .. }
+            | Self::ResourceSignatureRejected { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1233,6 +1294,16 @@ impl CoreError {
                  `ign rig reset --yes`, which destroys the rig's data volume"
                     .to_string(),
             ),
+            Self::ScanLockHeld { .. } => Some(
+                "the scan-lock is released when the holder's scan runs or its \
+                 holdTimeout expires — wait for that, then retry"
+                    .to_string(),
+            ),
+            Self::ResourceSignatureRejected { .. } => Some(
+                "re-read the resource for its current signature and retry — \
+                 signatures change on every write"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1261,7 +1332,9 @@ impl CoreError {
             | Self::EamNotController { endpoint }
             | Self::ProviderRootUnsupported { endpoint }
             | Self::EamTaskInFlight { endpoint, .. }
-            | Self::ModuleUninstallDenied { endpoint, .. } => endpoint.clone(),
+            | Self::ModuleUninstallDenied { endpoint, .. }
+            | Self::ScanLockHeld { endpoint, .. }
+            | Self::ResourceSignatureRejected { endpoint, .. } => endpoint.clone(),
             Self::ModuleFeedUnreachable { url, .. }
             | Self::ModuleReleaseNotFound { url, .. }
             | Self::ModuleFeedUnusable { url, .. } => Some(url.clone()),
@@ -1339,8 +1412,8 @@ mod tests {
     use super::{
         CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
-        ModuleDigestChangedDetails, ModuleDigestMismatchDetails, TESTING_ROUTE_PREFIX,
-        truncate_api_body,
+        ModuleDigestChangedDetails, ModuleDigestMismatchDetails, SignatureReason,
+        TESTING_ROUTE_PREFIX, truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -1729,6 +1802,27 @@ mod tests {
                 6,
                 "module_uninstall_denied",
             ),
+            (
+                CoreError::ScanLockHeld {
+                    actor: Some("api-token:cap-a:172.17.0.1".into()),
+                    kind: "config".into(),
+                    endpoint: Some("http://gw:8088/data/api/v1/scan-lock/config".into()),
+                },
+                6,
+                "scan_lock_held",
+            ),
+            (
+                CoreError::ResourceSignatureRejected {
+                    name: "DB_A".into(),
+                    reason: SignatureReason::Stale,
+                    endpoint: Some(
+                        "http://gw:8088/data/api/v1/resources/find/ignition/database-connection/DB_A"
+                            .into(),
+                    ),
+                },
+                6,
+                "resource_signature_rejected",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1790,8 +1884,61 @@ mod tests {
         (6, "module_feed_unusable"),
         (6, "module_digest_changed"),
         (6, "module_uninstall_denied"),
+        (6, "scan_lock_held"),
+        (6, "resource_signature_rejected"),
         (7, "rig_error"),
     ];
+
+    /// The two deploy slugs (20-02) never carry a signature value or
+    /// gateway problem text, and render their payloads sensibly.
+    #[test]
+    fn deploy_slugs_never_carry_signature_or_problem_text() {
+        const SAMPLE_SIG: &str = "d80c81d167362252bf389893ea0f3a81479521ba0bb68ee3bfc46e94bc2540b7";
+
+        let held = CoreError::ScanLockHeld {
+            actor: Some("api-token:cap-a:172.17.0.1".into()),
+            kind: "config".into(),
+            endpoint: Some("http://gw:8088/data/api/v1/scan-lock/config".into()),
+        };
+        assert_eq!(held.code(), "scan_lock_held");
+        assert_eq!(held.exit_code(), 6);
+        let shown = held.to_string();
+        assert!(shown.contains("api-token:cap-a:172.17.0.1"), "{shown}");
+        assert!(shown.contains("config"), "{shown}");
+        assert_eq!(
+            held.endpoint().as_deref(),
+            Some("http://gw:8088/data/api/v1/scan-lock/config")
+        );
+
+        let anonymous = CoreError::ScanLockHeld {
+            actor: None,
+            kind: "config".into(),
+            endpoint: None,
+        };
+        let shown = anonymous.to_string();
+        assert!(shown.contains("another actor"), "{shown}");
+        assert!(!shown.contains("None"), "{shown}");
+
+        for reason in [SignatureReason::Stale, SignatureReason::Missing] {
+            let err = CoreError::ResourceSignatureRejected {
+                name: "DB_A".into(),
+                reason,
+                endpoint: Some("http://gw:8088/data/api/v1/resources/x".into()),
+            };
+            assert_eq!(err.code(), "resource_signature_rejected");
+            assert_eq!(err.exit_code(), 6);
+            let shown = err.to_string();
+            assert!(shown.contains("DB_A"), "{shown}");
+            assert!(shown.contains(&reason.to_string()), "{shown}");
+            assert!(!shown.contains(SAMPLE_SIG), "{shown}");
+            let hint = err.hint().expect("hint required");
+            assert!(!hint.contains(SAMPLE_SIG), "{hint}");
+            let endpoint = err.endpoint().expect("endpoint");
+            assert!(!endpoint.contains(SAMPLE_SIG), "{endpoint}");
+        }
+        assert_eq!(SignatureReason::Stale.to_string(), "stale");
+        assert_eq!(SignatureReason::Missing.to_string(), "missing");
+    }
 
     /// Parse the README's exit-code table: rows `| <exit> | class | meaning |
     /// \`slug\`, ... |` where `<exit>` is 1–7 (row 0 is the success row, no
@@ -2025,6 +2172,35 @@ mod tests {
         assert!(
             hint.contains("stale entries"),
             "prune hint must name stale-only semantics: {hint}"
+        );
+
+        // The scan-lock refusal (20-02): the hint names the release
+        // conditions and no ign command.
+        let held = CoreError::ScanLockHeld {
+            actor: None,
+            kind: "config".into(),
+            endpoint: None,
+        };
+        let hint = held.hint().expect("hint required");
+        assert!(
+            hint.contains("holdTimeout") && hint.contains("scan runs"),
+            "scan-lock hint names the release conditions: {hint}"
+        );
+        assert!(
+            !hint.contains("ign "),
+            "scan-lock hint names no ign command: {hint}"
+        );
+
+        // The signature refusal (20-02): re-read and retry.
+        let rejected = CoreError::ResourceSignatureRejected {
+            name: "DB_A".into(),
+            reason: SignatureReason::Stale,
+            endpoint: None,
+        };
+        let hint = rejected.hint().expect("hint required");
+        assert!(
+            hint.contains("re-read") && hint.contains("signatures change on every write"),
+            "signature hint names the action: {hint}"
         );
 
         // The TTY refusal's hint is contextual (06-07): the ONE
