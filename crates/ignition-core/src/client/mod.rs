@@ -37,6 +37,7 @@ pub mod apicall;
 pub mod backup;
 mod classify;
 pub mod connections;
+pub mod deploy_api;
 pub mod diagnostics;
 pub mod eam;
 pub mod gan;
@@ -49,6 +50,7 @@ pub mod query;
 pub mod redundancy;
 pub mod resources;
 pub mod restart;
+pub mod scan;
 pub mod scripts_codec;
 pub mod sessions;
 pub mod status;
@@ -58,6 +60,10 @@ pub mod trial;
 pub mod version;
 pub mod webdev;
 pub mod workspace;
+
+/// The deploy-facing scan-lock and scan calls (a trait of their own, so
+/// [`GatewayApi`] and its test doubles stay untouched).
+pub use deploy_api::DeployApi;
 
 use crate::client::connections::GatewayConnection;
 use crate::client::diagnostics::BundleStatusWire;

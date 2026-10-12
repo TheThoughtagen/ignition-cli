@@ -18,6 +18,11 @@
 //! 6. Anything else → `Internal`, enriched with the Jetty HTML page's
 //!    own title/message when the body is HTML (see [`html_error_parts`]).
 //!
+//! **409/408 on the scan-lock route** (`/data/api/v1/scan-lock/`) →
+//! `ScanLockHeld` (exit 6) naming the holder scraped from the Jetty page
+//! (live 8.3.6, 20-LIVE-CAPTURES D1). Route-scoped via the URL; it runs
+//! with the other route-scoped 409 arms, after the 404 arm.
+//!
 //! **6b.** api-call path + unclassified 4xx → `GatewayClientError` (exit
 //! 2, verbatim body): the `api_call` parameter scopes this arm to the raw
 //! api-call pipeline (the `send_and_classify_for_api` entry, 09-01) — a
@@ -108,6 +113,23 @@ pub(crate) async fn classify(
         S::NOT_FOUND => Err(CoreError::NotFound {
             endpoint: Some(url.to_string()),
         }),
+        // 409 or 408 on the SCAN-LOCK route only (20-03, DAPI-07):
+        // another actor holds the gateway's scan-lock. Live 8.3.6
+        // answers a competing acquire with an immediate 409 and Jetty's
+        // stock HTML page naming the holder (20-LIVE-CAPTURES D1, C1e);
+        // the same-token re-acquire is the same 409 (D2). The OpenAPI
+        // also declares 408 ("Unable to acquire lock within timeout"),
+        // never observed live, so both map to the same error. The
+        // holder is scraped from the page and the body is never echoed;
+        // a refusal that names no holder is enriched by the caller.
+        S::CONFLICT | S::REQUEST_TIMEOUT if is_scan_lock_url(url) => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(CoreError::ScanLockHeld {
+                actor: parse_lock_holder(&body),
+                kind: scan_lock_kind(url),
+                endpoint: Some(url.to_string()),
+            })
+        }
         // 409 on the DESIGNER-PRUNE route only — route-scoped via the
         // URL (the singular prune path `/data/api/v1/designer/{id}` is
         // distinct from the plural `/designers` list; see
@@ -227,6 +249,43 @@ pub(crate) async fn classify(
     }
 }
 
+/// Longest holder string kept from a gateway body (T-20-13).
+const LOCK_HOLDER_CAP: usize = 256;
+
+/// Is `url` on the scan-lock route (`/data/api/v1/scan-lock/`)? The
+/// trailing slash keeps the scan route (`/data/api/v1/scan/`) out.
+fn is_scan_lock_url(url: &str) -> bool {
+    url.contains("/data/api/v1/scan-lock/")
+}
+
+/// The lock kind: the path segment after `/scan-lock/`, query-safe.
+fn scan_lock_kind(url: &str) -> String {
+    url.split_once("/data/api/v1/scan-lock/")
+        .map(|(_, tail)| {
+            tail.split(['?', '/'])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// The holder named by the refusal page (D1): the token after
+/// `Lock already held by ` up to whitespace, a quote, `<` or `,`, minus
+/// one trailing period, capped at [`LOCK_HOLDER_CAP`] chars. `None` when
+/// the marker is absent or nothing follows it.
+fn parse_lock_holder(body: &str) -> Option<String> {
+    const MARKER: &str = "Lock already held by ";
+    let tail = &body[body.find(MARKER)? + MARKER.len()..];
+    let end = tail
+        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | ','))
+        .unwrap_or(tail.len());
+    let token = &tail[..end];
+    let token = token.strip_suffix('.').unwrap_or(token);
+    let holder: String = token.chars().take(LOCK_HOLDER_CAP).collect();
+    (!holder.is_empty()).then_some(holder)
+}
+
 /// Is `url` on the EAM runtime surface (`/data/eam/`)? The
 /// controller-403 classification is scoped to this prefix — the
 /// module-scoped seam (the designer-prune route scoping precedent).
@@ -325,7 +384,8 @@ fn html_error_parts(body: &str) -> Option<(u16, String)> {
 mod tests {
     use super::{
         designer_prune_id, eam_force_task_name, html_error_parts, is_config_resource_url,
-        is_designer_prune_url, is_eam_force_url, is_eam_url,
+        is_designer_prune_url, is_eam_force_url, is_eam_url, is_scan_lock_url, parse_lock_holder,
+        scan_lock_kind,
     };
 
     /// The 422 arm's path scoping (07-05): the EAM create path (and
@@ -476,6 +536,54 @@ mod tests {
                 "http://gw:8088/data/eam/api/v1/eam-tasks/force/eam/nightly-backup?x=1"
             ),
             "nightly-backup"
+        );
+    }
+
+    /// The C1e refusal page, verbatim (20-LIVE-CAPTURES D1).
+    const C1E_409_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Lock already held by api-token:cap-a:192.168.97.1</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/scan-lock/config</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Lock already held by api-token:cap-a:192.168.97.1</td></tr>\n</table>\n\n</body>\n</html>\n";
+
+    #[test]
+    fn parse_lock_holder_reads_the_captured_page() {
+        assert_eq!(
+            parse_lock_holder(C1E_409_BODY).as_deref(),
+            Some("api-token:cap-a:192.168.97.1")
+        );
+    }
+
+    #[test]
+    fn parse_lock_holder_empty_or_unmarked_is_none() {
+        assert_eq!(parse_lock_holder(""), None);
+        assert_eq!(parse_lock_holder("<html>Conflict</html>"), None);
+        assert_eq!(parse_lock_holder("Lock already held by <b>"), None);
+    }
+
+    #[test]
+    fn parse_lock_holder_strips_one_trailing_period_and_caps_length() {
+        assert_eq!(
+            parse_lock_holder("Lock already held by api-token:a:1.2.3.4.").as_deref(),
+            Some("api-token:a:1.2.3.4")
+        );
+        let oversized = format!("Lock already held by {}", "a".repeat(10_000));
+        let holder = parse_lock_holder(&oversized).expect("holder");
+        assert_eq!(holder.chars().count(), 256);
+    }
+
+    /// The scan-lock arm is route-scoped: the scan route and the other
+    /// 409 routes do not match.
+    #[test]
+    fn scan_lock_url_detection_and_kind() {
+        assert!(is_scan_lock_url(
+            "http://gw:8088/data/api/v1/scan-lock/config"
+        ));
+        assert!(!is_scan_lock_url("http://gw:8088/data/api/v1/scan/config"));
+        assert!(!is_scan_lock_url("http://gw:8088/data/api/v1/mode"));
+        assert_eq!(
+            scan_lock_kind("http://gw:8088/data/api/v1/scan-lock/projects"),
+            "projects"
+        );
+        assert_eq!(
+            scan_lock_kind("http://gw:8088/data/api/v1/scan-lock/config?x=1"),
+            "config"
         );
     }
 }
