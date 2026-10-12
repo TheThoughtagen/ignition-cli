@@ -1,5 +1,6 @@
-//! Wiremock contract tests for the `DeployApi` scan-lock and scan calls
-//! (20-03, DAPI-03 / DAPI-04 / DAPI-06 / DAPI-07).
+//! Wiremock contract tests for the `DeployApi` scan-lock, scan and config
+//! resource calls (20-03, DAPI-03 / DAPI-04 / DAPI-06 / DAPI-07; 20-04,
+//! DAPI-01 / DAPI-02 / DAPI-06).
 //!
 //! Capture-pinning rule: every body below is copied verbatim from
 //! `.planning/phases/20-config-api-client/20-LIVE-CAPTURES.md` (live 8.3.6)
@@ -13,7 +14,8 @@ mod common;
 use common::IgnitionMock;
 use std::time::Duration;
 
-use ignition_core::client::deploy_api::scan_and_wait;
+use ignition_core::client::deploy_api::{resource_list_in_collection, scan_and_wait};
+use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::{
     LockObservation, LockVerdict, ScanKind, ScanOutcome, lock_verdict,
 };
@@ -21,7 +23,7 @@ use ignition_core::client::{DeployApi, ReqwestGatewayApi};
 use ignition_core::config::{Credential, Secret};
 use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 const LOCK_CONFIG: &str = "/data/api/v1/scan-lock/config";
@@ -552,4 +554,479 @@ async fn scan_wait_auth_failure_fails_fast_without_posting() {
         .expect_err("a rejected token cannot succeed");
     assert!(matches!(err, CoreError::Auth { .. }), "{err:?}");
     assert_eq!(count_requests(&mock, "POST", SCAN_CONFIG).await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 20-04 Task 1: config resource reads (DAPI-01)
+// ---------------------------------------------------------------------------
+
+const DB_FIND_BASE: &str = "/data/api/v1/resources/find/ignition/database-connection/";
+/// `IGN_DEPLOY_RIG_DB_1791815701` as the client encodes it (the shared
+/// `encode_segment` percent-encodes every non-alphanumeric byte).
+const DB_NAME_ENC: &str = "IGN%5FDEPLOY%5FRIG%5FDB%5F1791815701";
+const DB_NAME: &str = "IGN_DEPLOY_RIG_DB_1791815701";
+
+fn find_path() -> String {
+    format!("{DB_FIND_BASE}{DB_NAME_ENC}")
+}
+
+/// The captured `config` object of the C3a resource (C3a "GET find"), the
+/// same keys in every copy; only `poolMaxActive` differs between copies.
+fn db_config(pool_max_active: u32) -> String {
+    format!(
+        r#"{{"driver":"PostgreSQL","translator":"POSTGRES","includeSchemaInTableName":false,"connectURL":"jdbc:postgresql://mode-host:5432/spike","username":"spike","connectionProps":"","connectionResetParams":"","defaultTransactionLevel":"DEFAULT","poolInitSize":0,"poolMaxActive":{pool_max_active},"poolMaxIdle":8,"poolMinIdle":0,"poolMaxWait":5000,"validationQuery":"SELECT 1","testOnBorrow":true,"testOnReturn":false,"testWhileIdle":false,"evictionRate":-1,"evictionTests":3,"evictionTime":1800000,"failoverMode":"STANDARD","slowQueryLogThreshold":60000,"validationSleepTime":10000}}"#
+    )
+}
+
+/// C-list "GET find, no collection (effective view)" and "GET
+/// find?collection=production": the production copy. The captured
+/// `metrics` and `healthchecks` blocks are elided; every other key is
+/// verbatim.
+fn clist_production_body() -> String {
+    format!(
+        r#"{{"type":"ignition/database-connection","name":"{DB_NAME}","description":"c-list production override","enabled":true,"version":1,"collection":"production","collections":["core","production"],"signature":"c3ee2b70350a263381b5c1a4f92c3cdacb26ea949f255a48ead9a468aaeafcb9","config":{},"data":["config.json"],"attributes":{{"uuid":"ef39fc66-c7b4-441a-a907-b02df07b17aa","enabled":true}},"metrics":{{}},"healthchecks":{{}}}}"#,
+        db_config(20)
+    )
+}
+
+/// C-list "GET find?collection=core": the core copy, a different
+/// description, config and signature than the effective one.
+fn clist_core_body() -> String {
+    format!(
+        r#"{{"type":"ignition/database-connection","name":"{DB_NAME}","description":"c3a update","enabled":true,"version":1,"collection":"core","collections":["core","production"],"signature":"8e01629a0ccc4115d874626df494edf5cdb1cd7510789a4ce9cc39cc85063f14","config":{},"data":["config.json"],"attributes":{{"lastModification":{{"actor":"api-token:cap-a:192.168.97.1","timestamp":"2026-10-12T14:35:03Z"}},"uuid":"0939907f-c2a5-44d8-ac13-2a8d252f312f","lastModificationSignature":"ffc636164e849e022d4eee0e76ab409a129a36e526d354c2609eab2615128172","enabled":true}},"metrics":{{}},"healthchecks":{{}}}}"#,
+        db_config(9)
+    )
+}
+
+/// C-list "GET names", verbatim.
+const CLIST_NAMES_BODY: &str = r#"{"items":[{"name":"IGN_DEPLOY_RIG_DB_1791815701","enabled":true,"modes":["core","production"]}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}"#;
+
+/// C-list "GET singleton security-properties (effective)": no `name` key.
+/// The config is cut to its first scalar keys; the rest is verbatim shape.
+const CLIST_SINGLETON_BODY: &str = r#"{"type":"ignition/security-properties","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"cac5b33f86d5ffca2b1f8ad1486e8da8ccde9bcd14d244bc2d4b970f61cb5de8","config":{"systemAuthProfile":"default","systemIdentityProvider":"default","forceIdpAuth":false,"designerAuthStrategy":"CLASSIC"},"data":["config.json"],"attributes":{},"metrics":{},"healthchecks":{}}"#;
+
+/// C3a "GET find of the unknown name": 404 with Jetty's HTML page.
+const C3A_FIND_404_BODY: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 404</title>\n</head>\n<body><h2>HTTP ERROR 404 Resource not found: ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701_NOPE</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/resources/find/ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701_NOPE</td></tr>\n<tr><th>STATUS:</th><td>404</td></tr>\n<tr><th>MESSAGE:</th><td>Resource not found: ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701_NOPE</td></tr>\n</table>\n\n</body>\n</html>\n";
+
+fn api_for(mock: &IgnitionMock) -> ReqwestGatewayApi {
+    ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()))
+}
+
+async fn requests_of(mock: &IgnitionMock) -> Vec<wiremock::Request> {
+    mock.server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+}
+
+/// C-list "GET find, no collection (effective view)": no `collection` key
+/// goes out, and the production body parses.
+#[tokio::test]
+async fn resource_find_effective_view_sends_no_collection() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(find_path()))
+        .respond_with(json(200, &clist_production_body()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let record = api
+        .resource_find("ignition", "database-connection", DB_NAME, None)
+        .await
+        .expect("find");
+
+    assert_eq!(record.name.as_deref(), Some(DB_NAME));
+    assert_eq!(record.collection.as_deref(), Some("production"));
+    assert_eq!(record.collections, vec!["core", "production"]);
+    assert_eq!(record.resource_type, "ignition/database-connection");
+    assert_eq!(record.config["poolMaxActive"], 20);
+    assert!(
+        record
+            .signature
+            .as_deref()
+            .is_some_and(|s| s.starts_with("c3ee2b70"))
+    );
+    let seen = requests_of(&mock).await;
+    assert_eq!(seen.len(), 1);
+    assert!(
+        !seen[0].url.query_pairs().any(|(k, _)| k == "collection"),
+        "the effective view sends no collection: {:?}",
+        seen[0].url.query()
+    );
+}
+
+/// C-list "GET find?collection=core" and "...=production": exactly
+/// `collection=<c>` goes out, and the two copies differ.
+#[tokio::test]
+async fn resource_find_named_collection_sends_collection_param() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(find_path()))
+        .and(query_param("collection", "production"))
+        .respond_with(json(200, &clist_production_body()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(find_path()))
+        .and(query_param("collection", "core"))
+        .respond_with(json(200, &clist_core_body()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let production = api
+        .resource_find(
+            "ignition",
+            "database-connection",
+            DB_NAME,
+            Some("production"),
+        )
+        .await
+        .expect("production copy");
+    let core = api
+        .resource_find("ignition", "database-connection", DB_NAME, Some("core"))
+        .await
+        .expect("core copy");
+
+    assert_eq!(production.collection.as_deref(), Some("production"));
+    assert_eq!(core.collection.as_deref(), Some("core"));
+    assert_ne!(
+        production.signature, core.signature,
+        "each copy has its own"
+    );
+    assert_ne!(production.description, core.description);
+    assert_eq!(core.config["poolMaxActive"], 9);
+    for req in requests_of(&mock).await {
+        assert_eq!(
+            req.url.query_pairs().count(),
+            1,
+            "only collection: {:?}",
+            req.url.query()
+        );
+    }
+}
+
+/// C-list "GET list?limit=-1": `limit=-1` and `offset=0` go out, and the
+/// items keep the gateway's order (Z before A is NOT re-sorted).
+#[tokio::test]
+async fn resource_list_sends_limit_and_offset() {
+    let mock = IgnitionMock::start().await;
+    let body = r#"{"items":[{"type":"ignition/database-connection","name":"Z","collection":"core","collections":["core"],"signature":"aa","config":{}},{"type":"ignition/database-connection","name":"A","collection":"core","collections":["core"],"signature":"bb","config":{}}],"metadata":{"total":2,"matching":2,"limit":-1,"offset":0}}"#;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-connection",
+        ))
+        .respond_with(json(200, body))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let page = api
+        .resource_list("ignition", "database-connection", &ListQuery::default())
+        .await
+        .expect("list");
+
+    let names: Vec<_> = page
+        .items
+        .iter()
+        .map(|r| r.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Z", "A"], "gateway order is kept");
+    assert_eq!(page.metadata.total, 2);
+    let seen = requests_of(&mock).await;
+    let pairs: Vec<(String, String)> = seen[0]
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("limit".to_string(), "-1".to_string()),
+            ("offset".to_string(), "0".to_string())
+        ]
+    );
+}
+
+/// C-list "GET list?limit=-1&collection[eq]=production (object-style
+/// filter)" and Decision D7: a filter goes out as its own `field[op]`
+/// parameter, never as `filter=`.
+#[tokio::test]
+async fn resource_list_filter_is_sent_object_style() {
+    let mock = IgnitionMock::start().await;
+    let body = format!(
+        r#"{{"items":[{}],"metadata":{{"total":1,"matching":1,"limit":-1,"offset":0}}}}"#,
+        clist_production_body()
+    );
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-connection",
+        ))
+        .and(query_param("name[eq]", DB_NAME))
+        .respond_with(json(200, &body))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let q = ListQuery {
+        filter: Some(format!("name[eq]={DB_NAME}")),
+        ..ListQuery::default()
+    };
+    let page = api
+        .resource_list("ignition", "database-connection", &q)
+        .await
+        .expect("filtered list");
+    assert_eq!(page.items.len(), 1);
+    let seen = requests_of(&mock).await;
+    assert!(!seen[0].url.query_pairs().any(|(k, _)| k == "filter"));
+
+    // The form that matches nothing on the gateway is refused up front.
+    let bad = ListQuery {
+        filter: Some("not-a-filter".to_string()),
+        ..ListQuery::default()
+    };
+    let err = api
+        .resource_list("ignition", "database-connection", &bad)
+        .await
+        .expect_err("malformed filter");
+    assert_eq!(err.code(), "invalid_input");
+    assert_eq!(
+        requests_of(&mock).await.len(),
+        1,
+        "no request for the bad filter"
+    );
+}
+
+/// An empty type is Ok with no items.
+#[tokio::test]
+async fn resource_list_empty_is_ok() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-connection",
+        ))
+        .respond_with(json(
+            200,
+            r#"{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}"#,
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let page = api
+        .resource_list("ignition", "database-connection", &ListQuery::default())
+        .await
+        .expect("empty list is Ok");
+    assert!(page.items.is_empty());
+}
+
+/// C3a "GET find of the unknown name": a 404 is `not_found`, exit 6.
+#[tokio::test]
+async fn resource_find_absent_is_not_found() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{DB_FIND_BASE}{DB_NAME_ENC}%5FNOPE")))
+        .respond_with(html(404, C3A_FIND_404_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_find(
+            "ignition",
+            "database-connection",
+            &format!("{DB_NAME}_NOPE"),
+            None,
+        )
+        .await
+        .expect_err("absent name");
+    assert_eq!(err.code(), "not_found");
+    assert_eq!(err.exit_code(), 6);
+}
+
+/// C-list "GET names", verbatim.
+#[tokio::test]
+async fn resource_names_parses_captured_body() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/names/ignition/database-connection",
+        ))
+        .respond_with(json(200, CLIST_NAMES_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let names = api
+        .resource_names("ignition", "database-connection")
+        .await
+        .expect("names");
+    assert_eq!(names.items.len(), 1);
+    assert_eq!(names.items[0].name, DB_NAME);
+    assert_eq!(names.items[0].modes, vec!["core", "production"]);
+    assert_eq!(names.items[0].enabled, Some(true));
+    assert_eq!(names.metadata.matching, 1);
+}
+
+/// C-list "GET singleton security-properties?collection=core": the
+/// collection goes out and the body (which has no `name`) parses.
+#[tokio::test]
+async fn resource_singleton_with_collection() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/singleton/ignition/security-properties",
+        ))
+        .and(query_param("collection", "core"))
+        .respond_with(json(200, CLIST_SINGLETON_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let record = api
+        .resource_singleton("ignition", "security-properties", Some("core"))
+        .await
+        .expect("singleton");
+    assert_eq!(record.name, None, "a singleton has no name");
+    assert_eq!(record.collection.as_deref(), Some("core"));
+    assert_eq!(record.config["systemAuthProfile"], "default");
+}
+
+/// T-20-16: a malformed module or type is refused with zero requests.
+#[tokio::test]
+async fn resource_segment_validation_refuses_before_any_request() {
+    let mock = IgnitionMock::start().await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let q = ListQuery::default();
+    for (module, ty) in [
+        ("../etc", "database-connection"),
+        ("ignition", "a/b"),
+        ("", "database-connection"),
+        ("ignition", "."),
+        ("ignition", ".."),
+        ("db conn", "database-connection"),
+    ] {
+        let errs = [
+            api.resource_names(module, ty).await.map(|_| ()),
+            api.resource_list(module, ty, &q).await.map(|_| ()),
+            api.resource_find(module, ty, "x", None).await.map(|_| ()),
+            api.resource_singleton(module, ty, None).await.map(|_| ()),
+        ];
+        for result in errs {
+            let err = result.expect_err("refused");
+            assert_eq!(err.code(), "invalid_input", "{module:?}/{ty:?}");
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+    let err = api
+        .resource_find("ignition", "database-connection", "", None)
+        .await
+        .expect_err("empty name");
+    assert_eq!(err.code(), "invalid_input");
+    assert!(requests_of(&mock).await.is_empty(), "zero requests");
+}
+
+/// The name is percent-encoded from its UTF-8 bytes; a module id keeps its
+/// dots.
+#[tokio::test]
+async fn resource_name_is_percent_encoded() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .respond_with(json(200, &clist_core_body()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    api.resource_find("com.inductiveautomation.eam", "eam-tasks", "a/b c é", None)
+        .await
+        .expect("find");
+    let seen = requests_of(&mock).await;
+    assert_eq!(
+        seen[0].url.path(),
+        "/data/api/v1/resources/find/com.inductiveautomation.eam/eam-tasks/a%2Fb%20c%20%C3%A9"
+    );
+}
+
+/// Decision D7: a collection is listed by `names` (its `modes`) then
+/// `find?collection=` per name. A name the collection does not hold is
+/// skipped (by `modes`, or by a `not_found`), a copy stamped with another
+/// collection is never returned as this one's, and names order is kept.
+#[tokio::test]
+async fn resource_list_in_collection_composes_names_and_find() {
+    let mock = IgnitionMock::start().await;
+    let names = r#"{"items":[{"name":"B","enabled":true,"modes":["core","production"]},{"name":"CORE_ONLY","enabled":true,"modes":["core"]},{"name":"GONE","enabled":true,"modes":["production"]},{"name":"FALLBACK","enabled":true,"modes":["production"]},{"name":"A","enabled":true,"modes":["production"]}],"metadata":{"total":5,"matching":5,"limit":-1,"offset":0}}"#;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/names/ignition/database-connection",
+        ))
+        .respond_with(json(200, names))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let record = |name: &str, collection: &str| {
+        format!(
+            r#"{{"type":"ignition/database-connection","name":"{name}","collection":"{collection}","collections":["core","production"],"signature":"sig-{name}","config":{{}}}}"#
+        )
+    };
+    // `B` is the first name, then `A`: names order, not alphabetical.
+    // Alphanumeric names are not altered by the segment encoding.
+    for (name, body) in [
+        ("B", record("B", "production")),
+        ("A", record("A", "production")),
+        ("FALLBACK", record("FALLBACK", "core")),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("{DB_FIND_BASE}{name}")))
+            .and(query_param("collection", "production"))
+            .respond_with(json(200, &body))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    // `GONE` answers 404: absent from the collection after all.
+    Mock::given(method("GET"))
+        .and(path(format!("{DB_FIND_BASE}GONE")))
+        .respond_with(html(404, C3A_FIND_404_BODY))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let found = resource_list_in_collection(api, "ignition", "database-connection", "production")
+        .await
+        .expect("composed list");
+    let names: Vec<_> = found.iter().map(|r| r.name.as_deref().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["B", "A"],
+        "names order kept, absent copies skipped"
+    );
+    let finds = requests_of(&mock)
+        .await
+        .iter()
+        .filter(|r| r.url.path().contains("/find/"))
+        .count();
+    assert_eq!(finds, 4, "CORE_ONLY is skipped by modes with no request");
+
+    let err = resource_list_in_collection(api, "ignition", "database-connection", "")
+        .await
+        .expect_err("empty collection");
+    assert_eq!(err.code(), "invalid_input");
 }

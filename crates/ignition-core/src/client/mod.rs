@@ -36,6 +36,7 @@ pub mod adopt;
 pub mod apicall;
 pub mod backup;
 mod classify;
+pub mod config_resources;
 pub mod connections;
 pub mod deploy_api;
 pub mod diagnostics;

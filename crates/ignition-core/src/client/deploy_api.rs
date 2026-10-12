@@ -1,4 +1,5 @@
-//! The deploy wire: scan-lock and scan calls on a trait of their own.
+//! The deploy wire: config resources, scan-lock and scan calls on a trait of
+//! their own.
 //!
 //! A separate trait by roadmap lock: [`super::GatewayApi`] has 15
 //! hand-written test doubles, and the deploy wire must not force a change
@@ -21,6 +22,11 @@ use std::time::{Duration, Instant};
 use serde::de::DeserializeOwned;
 
 use crate::client::ReqwestGatewayApi;
+use crate::client::config_resources::{
+    ResourceName, ResourceRecord, list_query_pairs, resource_find_path, resource_list_path,
+    resource_names_path, resource_singleton_path,
+};
+use crate::client::query::{ListEnvelope, ListQuery};
 use crate::client::scan::{
     LockObservation, LockRequest, ScanKind, ScanLockInfo, ScanOutcome, ScanStatus, scan_complete,
     scan_lock_path, scan_path,
@@ -57,7 +63,8 @@ pub struct EndpointDecl {
     pub id: &'static str,
     /// HTTP method.
     pub method: &'static str,
-    /// Path with `{kind}` where the scan kind goes.
+    /// Path with `{kind}` where the scan kind goes, and `{module}`, `{type}`
+    /// and `{name}` where a resource route takes them.
     pub path_template: &'static str,
     /// What a 2xx answer must look like.
     pub shape: ResponseShape,
@@ -68,6 +75,34 @@ pub struct EndpointDecl {
 /// The declared deploy endpoints. Shapes are copied from the
 /// `20-LIVE-CAPTURES.md` Endpoint shapes table.
 pub const DEPLOY_ENDPOINTS: &[EndpointDecl] = &[
+    EndpointDecl {
+        id: "resource_names",
+        method: "GET",
+        path_template: "/data/api/v1/resources/names/{module}/{type}",
+        shape: ResponseShape::Json,
+        capture_ref: "C-list",
+    },
+    EndpointDecl {
+        id: "resource_list",
+        method: "GET",
+        path_template: "/data/api/v1/resources/list/{module}/{type}",
+        shape: ResponseShape::Json,
+        capture_ref: "C-list",
+    },
+    EndpointDecl {
+        id: "resource_find",
+        method: "GET",
+        path_template: "/data/api/v1/resources/find/{module}/{type}/{name}",
+        shape: ResponseShape::Json,
+        capture_ref: "C3a",
+    },
+    EndpointDecl {
+        id: "resource_singleton",
+        method: "GET",
+        path_template: "/data/api/v1/resources/singleton/{module}/{type}",
+        shape: ResponseShape::Json,
+        capture_ref: "C-list",
+    },
     EndpointDecl {
         id: "scan_lock_acquire",
         method: "POST",
@@ -118,6 +153,51 @@ fn acquire_request_timeout(acquire_s: u64) -> Duration {
 /// The deploy-facing gateway calls. Not part of [`super::GatewayApi`].
 #[async_trait::async_trait]
 pub trait DeployApi: Send + Sync {
+    /// List the names of a resource type (`resource_names`, capture
+    /// C-list "GET names"): each item carries the collections (`modes`)
+    /// that hold it. The answer is the `{items, metadata}` envelope; a
+    /// type with no resources is Ok with no items. Gateway order is kept.
+    async fn resource_names(
+        &self,
+        module: &str,
+        ty: &str,
+    ) -> Result<ListEnvelope<ResourceName>, CoreError>;
+
+    /// List the resources of a type (`resource_list`, capture C-list "GET
+    /// list"). Decision D7: this sees the EFFECTIVE view only, one item per
+    /// name, so a shadowed collection cannot be listed here; use
+    /// [`resource_list_in_collection`] for that. The gateway reads a filter
+    /// as its own `field[op]=value` parameter, so `q.filter` must be of
+    /// that form (see `config_resources::list_query_pairs`). Gateway order
+    /// is kept.
+    async fn resource_list(
+        &self,
+        module: &str,
+        ty: &str,
+        q: &ListQuery,
+    ) -> Result<ListEnvelope<ResourceRecord>, CoreError>;
+
+    /// Read one resource by name (`resource_find`, captures C3a / C-list).
+    /// `None` sends no `collection` parameter and reads the effective view;
+    /// `Some(c)` sends exactly `collection=c` and reads that copy. The two
+    /// carry different signatures (D7). An absent name is `not_found`.
+    async fn resource_find(
+        &self,
+        module: &str,
+        ty: &str,
+        name: &str,
+        collection: Option<&str>,
+    ) -> Result<ResourceRecord, CoreError>;
+
+    /// Read a singleton resource (`resource_singleton`, capture C-list
+    /// "GET singleton"), from the effective view or from `collection`.
+    async fn resource_singleton(
+        &self,
+        module: &str,
+        ty: &str,
+        collection: Option<&str>,
+    ) -> Result<ResourceRecord, CoreError>;
+
     /// Acquire the scan-lock (`scan_lock_acquire`, capture C1b).
     ///
     /// Success is the gateway's 2xx; the 200 body is ignored. A lock held
@@ -193,6 +273,30 @@ impl ReqwestGatewayApi {
         }
         Ok(ShapedBody::Json(text))
     }
+
+    /// GET `path` with `pairs`, enforce the declared shape and parse the
+    /// JSON body into `T`. The shared tail of the four resource reads.
+    async fn read_resource_json<T: DeserializeOwned>(
+        &self,
+        id: &'static str,
+        path: &str,
+        pairs: &[(String, String)],
+    ) -> Result<T, CoreError> {
+        let decl = decl(id)?;
+        let url = self.url_for(path);
+        let mut request = self.client.get(url.clone());
+        if !pairs.is_empty() {
+            request = request.query(pairs);
+        }
+        let request = self.apply_auth(request);
+        match self.send_shaped(decl, request, &url).await? {
+            ShapedBody::Json(text) => parse_json(decl, &url, &text),
+            ShapedBody::Empty | ShapedBody::NoContent => Err(CoreError::Internal(format!(
+                "endpoint {} produced no body",
+                decl.id
+            ))),
+        }
+    }
 }
 
 /// Parse a JSON body, naming the endpoint id and URL on failure and never
@@ -213,6 +317,50 @@ fn parse_json<T: DeserializeOwned>(
 
 #[async_trait::async_trait]
 impl DeployApi for ReqwestGatewayApi {
+    async fn resource_names(
+        &self,
+        module: &str,
+        ty: &str,
+    ) -> Result<ListEnvelope<ResourceName>, CoreError> {
+        let path = resource_names_path(module, ty)?;
+        self.read_resource_json("resource_names", &path, &[]).await
+    }
+
+    async fn resource_list(
+        &self,
+        module: &str,
+        ty: &str,
+        q: &ListQuery,
+    ) -> Result<ListEnvelope<ResourceRecord>, CoreError> {
+        let path = resource_list_path(module, ty)?;
+        let pairs = list_query_pairs(q)?;
+        self.read_resource_json("resource_list", &path, &pairs)
+            .await
+    }
+
+    async fn resource_find(
+        &self,
+        module: &str,
+        ty: &str,
+        name: &str,
+        collection: Option<&str>,
+    ) -> Result<ResourceRecord, CoreError> {
+        let path = resource_find_path(module, ty, name)?;
+        self.read_resource_json("resource_find", &path, &collection_pairs(collection))
+            .await
+    }
+
+    async fn resource_singleton(
+        &self,
+        module: &str,
+        ty: &str,
+        collection: Option<&str>,
+    ) -> Result<ResourceRecord, CoreError> {
+        let path = resource_singleton_path(module, ty)?;
+        self.read_resource_json("resource_singleton", &path, &collection_pairs(collection))
+            .await
+    }
+
     async fn scan_lock_acquire(
         &self,
         kind: ScanKind,
@@ -291,6 +439,65 @@ impl DeployApi for ReqwestGatewayApi {
         let request = self.apply_auth(self.client.post(url.clone()));
         self.send_shaped(decl, request, &url).await.map(|_| ())
     }
+}
+
+/// The `collection` query pair, only when a collection was asked for.
+fn collection_pairs(collection: Option<&str>) -> Vec<(String, String)> {
+    collection
+        .map(|c| vec![("collection".to_string(), c.to_string())])
+        .unwrap_or_default()
+}
+
+/// Read every resource of a type from one NAMED collection.
+///
+/// Decision D7: `list` sees the effective view only, so a collection that
+/// is shadowed (C-list: a `core` copy under a `production` override) cannot
+/// be listed. This composes the two calls that can: `names` (each item's
+/// `modes` says which collections hold it), then `find?collection=` per
+/// name. Results keep the order of `names`.
+///
+/// A name whose `modes` is non-empty and lacks `collection` is skipped
+/// without a request. A `not_found` for a name means it is absent from that
+/// collection and is skipped; any other error propagates. Because the
+/// captures never show what `find?collection=` answers for a collection
+/// that does not hold the name, a record that comes back stamped with a
+/// different collection is skipped too, never returned as if it were
+/// `collection`'s copy.
+pub async fn resource_list_in_collection(
+    api: &dyn DeployApi,
+    module: &str,
+    ty: &str,
+    collection: &str,
+) -> Result<Vec<ResourceRecord>, CoreError> {
+    if collection.is_empty() {
+        return Err(CoreError::InvalidInput {
+            reason: "resource collection must not be empty".to_string(),
+        });
+    }
+    let names = api.resource_names(module, ty).await?;
+    let mut records = Vec::new();
+    for item in names.items {
+        if !item.modes.is_empty() && !item.modes.iter().any(|m| m == collection) {
+            continue;
+        }
+        match api
+            .resource_find(module, ty, &item.name, Some(collection))
+            .await
+        {
+            Ok(record) => {
+                if record
+                    .collection
+                    .as_deref()
+                    .is_none_or(|held| held == collection)
+                {
+                    records.push(record);
+                }
+            }
+            Err(CoreError::NotFound { .. }) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(records)
 }
 
 /// Everything a wait probe reads, owned by the poll loop.
@@ -422,7 +629,35 @@ mod tests {
     /// The rows copied from the 20-LIVE-CAPTURES Endpoint shapes table.
     #[test]
     fn endpoint_rows_match_the_capture_table() {
-        let expected: [(&str, &str, &str, ResponseShape, &str); 4] = [
+        let expected: [(&str, &str, &str, ResponseShape, &str); 8] = [
+            (
+                "resource_names",
+                "GET",
+                "/data/api/v1/resources/names/{module}/{type}",
+                ResponseShape::Json,
+                "C-list",
+            ),
+            (
+                "resource_list",
+                "GET",
+                "/data/api/v1/resources/list/{module}/{type}",
+                ResponseShape::Json,
+                "C-list",
+            ),
+            (
+                "resource_find",
+                "GET",
+                "/data/api/v1/resources/find/{module}/{type}/{name}",
+                ResponseShape::Json,
+                "C3a",
+            ),
+            (
+                "resource_singleton",
+                "GET",
+                "/data/api/v1/resources/singleton/{module}/{type}",
+                ResponseShape::Json,
+                "C-list",
+            ),
             (
                 "scan_lock_acquire",
                 "POST",
@@ -467,6 +702,10 @@ mod tests {
     #[test]
     fn every_method_id_is_declared() {
         for id in [
+            "resource_names",
+            "resource_list",
+            "resource_find",
+            "resource_singleton",
             "scan_lock_acquire",
             "scan_lock_info",
             "scan_status",
