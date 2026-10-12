@@ -295,6 +295,10 @@ pub fn fire_rig_trial_status(state: &mut AppState) {
 pub fn fire_rig_trial_reset(state: &mut AppState) {
     super::spawn_action(state, "trial reset", async {
         let plan = resolve_auto_plan().await?;
+        // The DOWN-rig pre-flight (2026-10-11, live-witnessed from
+        // THIS modal): against a down rig with a squatted port, the
+        // ladder authenticates against the squatter.
+        actions::rig::require_rig_up_for_verb(&DockerCompose, &plan, "rig trial reset").await?;
         let url = rig_url(&plan)?;
         let (token, basic) = context::rig_trial_ladder()?;
         let api = match token.as_deref() {
