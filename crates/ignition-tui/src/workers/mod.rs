@@ -149,6 +149,7 @@ pub fn spawn_eam_preview(state: &mut crate::state::AppState, pending: crate::sta
     }
 }
 
+pub mod jvm;
 pub mod ops;
 pub mod refresh;
 pub mod rig_stream;

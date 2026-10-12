@@ -7,6 +7,7 @@
 
 pub mod alarms;
 pub mod dashboard;
+pub mod jvm;
 pub mod logs;
 pub mod profiles;
 pub mod projects;
@@ -76,6 +77,7 @@ pub fn render(state: &AppState, frame: &mut Frame) {
         Screen::Alarms => alarms::render(state, frame, body),
         Screen::Projects => projects::render(state, frame, body),
         Screen::Rig => rig::render(state, frame, body),
+        Screen::Jvm => jvm::render(state, frame, body),
     }
 
     if let Some(modal) = &state.modal {
@@ -90,14 +92,23 @@ pub fn render(state: &AppState, frame: &mut Frame) {
 /// colors, research doctrine). At the mono tier fg is Reset but BOLD
 /// survives — the active tab stays visible on ANY terminal.
 fn render_tab_bar(state: &AppState, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let titles: Vec<Line> = Screen::ALL
+    let mut titles: Vec<Line> = Screen::ALL
         .iter()
         .map(|screen| Line::from(screen.title().to_string()))
         .collect();
     let active = Screen::ALL
         .iter()
-        .position(|screen| *screen == state.screen)
-        .unwrap_or(0);
+        .position(|screen| *screen == state.screen);
+    // The Jvm special mode is NOT a tab: while it owns the screen, NO
+    // ordinary tab is highlighted (a highlighted Dashboard would lie
+    // about where you are) and the bar carries the mode's own red
+    // marker instead.
+    if active.is_none() {
+        titles.push(Line::from(Span::styled(
+            "⚠ JVM PROFILING",
+            theme::error(&state.palette).add_modifier(Modifier::BOLD),
+        )));
+    }
     // Base style = `muted`: the INACTIVE tab labels tint with the
     // theme's muted slot (12-04 round 2), the active one overrides
     // via highlight_style (emphasis + BOLD). At the default/mono
@@ -196,6 +207,15 @@ fn render_modal(palette: &theme::Palette, modal: &Modal, frame: &mut Frame) {
         Modal::Profiles { .. } | Modal::ProfileAdd { .. } => 5,
         // The ack form owns its geometry (screen-owned render).
         Modal::Ack { .. } => 9,
+        // The JVM gate: the wrapped production warning + the fixed
+        // scaffold (bold lead, blank lines, the keys line — itself
+        // wrapped — the input row, the footer) + the two border rows.
+        // An over-estimate is safe (the Confirm doctrine above).
+        Modal::JvmGate { .. } => {
+            let inner = (frame.area().width / 2).saturating_sub(2);
+            wrapped_row_count(ignition_core::actions::jvm::PRODUCTION_WARNING, inner)
+                .saturating_add(11)
+        }
     } as u16;
     // CLAMPED to the frame: a modal never exceeds the terminal — a
     // small frame clips content INSIDE the bordered box (the Result
@@ -240,6 +260,51 @@ fn render_modal(palette: &theme::Palette, modal: &Modal, frame: &mut Frame) {
         // module — the alarms twin of the profiles pattern).
         Modal::Ack { .. } => {
             alarms::render_ack_overlay(palette, modal, frame);
+        }
+        // The JVM-profiling risk gate: the production warning in red,
+        // the typed-`ACKNOWLEDGE` input, and a footer that only arms
+        // Enter when the phrase is EXACT (the render half of the
+        // required-text gate — update enforces it, this shows why
+        // Enter "isn't working").
+        Modal::JvmGate { buffer } => {
+            let accepted = buffer.trim() == "ACKNOWLEDGE";
+            let keys_line = "inside: s sample 30s · f flight-recording start (60s cap) · F stop + fetch · r refresh";
+            let text = vec![
+                Line::from(Span::styled(
+                    "This is a SPECIAL MODE — it actively instruments the gateway JVM.",
+                    theme::error(palette).add_modifier(Modifier::BOLD),
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    ignition_core::actions::jvm::PRODUCTION_WARNING,
+                    theme::text(palette),
+                )),
+                Line::default(),
+                Line::from(Span::styled(keys_line, theme::muted(palette))),
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("type ACKNOWLEDGE to enter: ", theme::muted(palette)),
+                    Span::styled(format!("{buffer}▏"), theme::text(palette)),
+                ]),
+                Line::default(),
+                if accepted {
+                    Line::from(Span::styled(
+                        "Enter to enter · Esc to cancel",
+                        theme::success(palette),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        "Enter arms ONLY on the exact word ACKNOWLEDGE · Esc to cancel",
+                        theme::error(palette),
+                    ))
+                },
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(modal_block(palette, modal.title().to_string())),
+                area,
+            );
         }
         Modal::Input {
             title,

@@ -303,8 +303,9 @@ fn render_status_line(state: &AppState, frame: &mut Frame, area: Rect) {
         .in_flight
         .map(|label| format!(" · running: {label}"))
         .unwrap_or_default();
-    let tail =
-        format!("{freshness}{busy}{in_flight} · p profiles · a actions · r refresh · t terminate");
+    let tail = format!(
+        "{freshness}{busy}{in_flight} · p profiles · a actions · r refresh · t terminate · J jvm profiling"
+    );
     // The profile NAME rides the palette's accent slot (12-04 UAT
     // tuning: the slot existed but nothing consumed it — the status
     // line was default-styled in every theme). UAT round 2: the

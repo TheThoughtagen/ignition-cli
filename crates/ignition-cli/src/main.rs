@@ -47,6 +47,7 @@ use ignition_cli::cli::{
     TagsProviderCommand, TagsUdtCommand, TestingArgs, TestingCommand, WaitArgs, WaitCmd,
     WebdevArgs, WebdevCommand, WorkspaceArgs, WorkspaceCommand,
 };
+use ignition_cli::cli::{JfrSettingsArg, JvmArgs, JvmCommand, JvmJfrArgs, JvmJfrCommand};
 
 /// What a dispatched subcommand produced. One variant per command; grows in
 /// later plans. The payload serializes as the envelope's `data` (see
@@ -206,6 +207,15 @@ enum ActionOutput {
     /// keys {stdout, result, elapsedMs} (ALL keys always; the
     /// secret never rides any output path).
     ScriptRun(actions::script::ScriptRunResult),
+    /// `ign jvm sample` — the SPECIAL-MODE sampling profile; the
+    /// `warning` field leads the data (ALL keys always).
+    JvmSample(actions::jvm::JvmSampleResult),
+    /// `ign jvm jfr start` — the gated flight-recording start.
+    JvmJfrStart(actions::jvm::JvmJfrStartResult),
+    /// `ign jvm jfr status` — the read-only recording list.
+    JvmJfrStatus(actions::jvm::JvmJfrStatusResult),
+    /// `ign jvm jfr stop` — stop + dump + fetch + remote cleanup.
+    JvmJfrStop(actions::jvm::JvmJfrStopResult),
     /// `ign testing run` — the gateway suite's discover list or run
     /// verdict (ALL keys always). A red run renders THIS success
     /// envelope and exits 6 afterwards (the `ign lint --strict`
@@ -387,6 +397,10 @@ impl ActionOutput {
             ActionOutput::EamTaskModify(result) => render_success(profile, result, compact),
             ActionOutput::EamTaskDelete(result) => render_success(profile, result, compact),
             ActionOutput::ScriptRun(result) => render_success(profile, result, compact),
+            ActionOutput::JvmSample(result) => render_success(profile, result, compact),
+            ActionOutput::JvmJfrStart(result) => render_success(profile, result, compact),
+            ActionOutput::JvmJfrStatus(result) => render_success(profile, result, compact),
+            ActionOutput::JvmJfrStop(result) => render_success(profile, result, compact),
             ActionOutput::TestingRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
@@ -2252,6 +2266,21 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                                     }),
                                 );
                             }
+                            // The DOWN-rig pre-flight (2026-10-11,
+                            // live-witnessed): the reset's URL is
+                            // DERIVED from the compose file — against
+                            // a down rig with a squatted port, the
+                            // ladder would AUTHENTICATE against
+                            // whatever foreign gateway answers there.
+                            if let Err(err) = actions::rig::require_rig_up_for_verb(
+                                &ignition_core::rig::DockerCompose,
+                                &plan,
+                                "rig trial reset",
+                            )
+                            .await
+                            {
+                                return (gateway_verb_echo, Err(err));
+                            }
                             let credential =
                                 token.map(|token| Credential::Token(config::Secret::new(token)));
                             let token_available = credential.is_some();
@@ -2759,6 +2788,167 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Err(err) => (error_profile(&err), Err(err)),
                 }
             }
+        },
+        // `ign jvm` — the SPECIAL-MODE profiling family. The usage-class
+        // validation (the hard caps) runs BEFORE profile resolution (the
+        // 03-03 put convention: usage errors lead, exit 2, profile
+        // null); the risk gate lives IN the action so the TUI surface
+        // enforces the identical rule — the CLI simply passes the
+        // `--i-accept-the-risk` bool down (the global --yes is never
+        // consulted here BY DESIGN).
+        Commands::Jvm(JvmArgs { command }) => match command {
+            JvmCommand::Sample {
+                duration_secs,
+                interval_ms,
+                top,
+                folded_out,
+                follow,
+                i_accept_the_risk,
+                project,
+            } => {
+                // --follow + --folded-out: the sidecar would be
+                // overwritten per window — refuse pre-resolution
+                // (usage errors lead, exit 2, profile null).
+                if follow && folded_out.is_some() {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "--folded-out writes ONE window's folded stacks; with \
+                                     --follow each window would overwrite it — drop the sidecar \
+                                     (the folded stacks ride every streamed window)"
+                                .to_string(),
+                        }),
+                    );
+                }
+                let opts = resolve_sample_options(follow, duration_secs, interval_ms, top);
+                if let Err(err) = actions::jvm::validate_sample_options(&opts) {
+                    return (None, Err(err));
+                }
+                match Session::resolve(cli.profile.as_deref()) {
+                    Ok(session) if follow => {
+                        // CONTINUOUS MODE (the `logs -f` streaming
+                        // exception): banner + profile header ONCE,
+                        // then each window prints as it lands (human
+                        // body / compact-envelope NDJSON line) — the
+                        // loop only RETURNS on error; Ctrl-C kills the
+                        // process (the tail's posture: no signal
+                        // handling anywhere in the codebase). The
+                        // risk gate re-checks per window inside the
+                        // action — a constant true here.
+                        let name = session.profile_name().to_string();
+                        if mode == RenderMode::Human {
+                            render::render_jvm_banner();
+                            println!("[profile: {name}]");
+                        }
+                        let err = follow_sample_loop(
+                            &*session,
+                            &config,
+                            &name,
+                            &project,
+                            &opts,
+                            i_accept_the_risk,
+                            mode,
+                        )
+                        .await;
+                        (Some(name), Err(err))
+                    }
+                    Ok(session) => {
+                        let name = session.profile_name().to_string();
+                        let result = actions::jvm::jvm_sample(
+                            &*session,
+                            &config,
+                            &name,
+                            &project,
+                            &opts,
+                            i_accept_the_risk,
+                        )
+                        .await
+                        .and_then(|res| {
+                            // The folded sidecar: flamegraph input, written
+                            // AFTER the profile lands (a write failure is a
+                            // local usage-class error, honestly surfaced).
+                            if let Some(path) = &folded_out {
+                                std::fs::write(path, &res.folded).map_err(|err| {
+                                    CoreError::InvalidInput {
+                                        reason: format!("cannot write {}: {err}", path.display()),
+                                    }
+                                })?;
+                            }
+                            Ok(res)
+                        })
+                        .map(ActionOutput::JvmSample);
+                        (Some(name), result)
+                    }
+                    Err(err) => (error_profile(&err), Err(err)),
+                }
+            }
+            JvmCommand::Jfr(JvmJfrArgs { command }) => match command {
+                JvmJfrCommand::Start {
+                    duration_secs,
+                    settings,
+                    i_accept_the_risk,
+                    project,
+                } => {
+                    let opts = actions::jvm::JvmJfrStartOptions {
+                        duration_secs,
+                        settings: match settings {
+                            JfrSettingsArg::Default => actions::jvm::JfrSettings::Default,
+                            JfrSettingsArg::Profile => actions::jvm::JfrSettings::Profile,
+                        },
+                    };
+                    if let Err(err) = actions::jvm::validate_jfr_start_options(&opts) {
+                        return (None, Err(err));
+                    }
+                    match Session::resolve(cli.profile.as_deref()) {
+                        Ok(session) => {
+                            let name = session.profile_name().to_string();
+                            let result = actions::jvm::jvm_jfr_start(
+                                &*session,
+                                &config,
+                                &name,
+                                &project,
+                                &opts,
+                                i_accept_the_risk,
+                            )
+                            .await
+                            .map(ActionOutput::JvmJfrStart);
+                            (Some(name), result)
+                        }
+                        Err(err) => (error_profile(&err), Err(err)),
+                    }
+                }
+                JvmJfrCommand::Status { project } => {
+                    match Session::resolve(cli.profile.as_deref()) {
+                        Ok(session) => {
+                            let name = session.profile_name().to_string();
+                            let result =
+                                actions::jvm::jvm_jfr_status(&*session, &config, &name, &project)
+                                    .await
+                                    .map(ActionOutput::JvmJfrStatus);
+                            (Some(name), result)
+                        }
+                        Err(err) => (error_profile(&err), Err(err)),
+                    }
+                }
+                JvmJfrCommand::Stop { output, project } => {
+                    match Session::resolve(cli.profile.as_deref()) {
+                        Ok(session) => {
+                            let name = session.profile_name().to_string();
+                            let result = actions::jvm::jvm_jfr_stop(
+                                &*session,
+                                &config,
+                                &name,
+                                &project,
+                                output.as_deref(),
+                            )
+                            .await
+                            .map(ActionOutput::JvmJfrStop);
+                            (Some(name), result)
+                        }
+                        Err(err) => (error_profile(&err), Err(err)),
+                    }
+                }
+            },
         },
         // `ign testing run` (QUICK-p0g): the standalone wrapper over
         // the deployed testing bundle. `--project` is REQUIRED (clap
@@ -3507,6 +3697,62 @@ fn require_confirmation(yes: bool, operation: &str) -> Result<(), CoreError> {
     }
 }
 
+/// The `--follow` window resolver: continuous mode's cadence is 10 s
+/// @ 50 ms (gentler per-dump rate for an open-ended loop); one-shot
+/// keeps 30 s @ 20 ms. Explicit flags always win; the caps validate
+/// afterwards regardless.
+fn resolve_sample_options(
+    follow: bool,
+    duration_secs: Option<u64>,
+    interval_ms: Option<u64>,
+    top: u64,
+) -> actions::jvm::JvmSampleOptions {
+    let (default_duration, default_interval) = if follow { (10, 50) } else { (30, 20) };
+    actions::jvm::JvmSampleOptions {
+        duration_secs: duration_secs.unwrap_or(default_duration),
+        interval_ms: interval_ms.unwrap_or(default_interval),
+        top,
+    }
+}
+
+/// The `--follow` loop: window after window, rendering each as it
+/// lands — the human body (banner-free; the dispatch arm printed the
+/// banner + profile header once) or ONE compact-envelope line per
+/// window (NDJSON, the `logs -f` streaming exception — and
+/// `data.warning` rides every line, so a piped consumer re-reads the
+/// caution per window). Only ever RETURNS the terminal error; Ctrl-C
+/// kills the process (the tail's posture — no signal handling
+/// anywhere in the codebase).
+async fn follow_sample_loop(
+    api: &dyn ignition_core::client::GatewayApi,
+    config: &ignition_core::config::Config,
+    profile_name: &str,
+    project: &str,
+    opts: &actions::jvm::JvmSampleOptions,
+    risk_accepted: bool,
+    mode: RenderMode,
+) -> CoreError {
+    loop {
+        match actions::jvm::jvm_sample(api, config, profile_name, project, opts, risk_accepted)
+            .await
+        {
+            Ok(window) => match mode {
+                RenderMode::Human => {
+                    println!();
+                    render::render_jvm_sample_window(&window);
+                }
+                RenderMode::PrettyJson | RenderMode::CompactJson => {
+                    println!(
+                        "{}",
+                        ignition_core::output::render_success(Some(profile_name), &window, true)
+                    );
+                }
+            },
+            Err(err) => return err,
+        }
+    }
+}
+
 /// The guarded-verb registry (14-01): ONE const enumerating every
 /// `--yes`-guarded clap leaf as `(clap leaf path, refusal operation
 /// prose)` pairs. `--yes` is a GLOBAL arg, so guardedness is invisible
@@ -3990,6 +4236,24 @@ mod tests {
         );
 
         require_confirmation(true, "project delete").expect("--yes confirms");
+    }
+
+    /// The `--follow` window resolver: one-shot keeps 30 s @ 20 ms,
+    /// continuous mode drops to the gentler 10 s @ 50 ms cadence, and
+    /// explicit flags always win (the caps validate afterwards).
+    #[test]
+    fn resolve_sample_options_splits_defaults_by_follow() {
+        let one_shot = super::resolve_sample_options(false, None, None, 25);
+        assert_eq!(one_shot.duration_secs, 30);
+        assert_eq!(one_shot.interval_ms, 20);
+
+        let follow = super::resolve_sample_options(true, None, None, 25);
+        assert_eq!(follow.duration_secs, 10);
+        assert_eq!(follow.interval_ms, 50);
+
+        let explicit = super::resolve_sample_options(true, Some(60), Some(100), 25);
+        assert_eq!(explicit.duration_secs, 60);
+        assert_eq!(explicit.interval_ms, 100);
     }
 
     /// D-17: the two fetch-policy flags map to `FetchPolicy::Refresh`

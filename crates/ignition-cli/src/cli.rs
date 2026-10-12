@@ -244,6 +244,16 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Testing(TestingArgs),
 
+    /// JVM profiling — a SPECIAL MODE, not a routine diagnostic:
+    /// these verbs ACTIVELY instrument the gateway JVM (stack
+    /// sampling burns CPU; flight recordings buffer JVM memory and
+    /// dump to gateway disk). NEVER use against a production server
+    /// outside an approved change window with a rollback plan. The
+    /// intrusive verbs require --i-accept-the-risk — the global
+    /// --yes deliberately does NOT satisfy that gate
+    #[command(arg_required_else_help = true)]
+    Jvm(JvmArgs),
+
     /// Lint local project files by delegating to ignition-lint (PATH
     /// discovery) — doctor posture: findings are DATA, exit 0
     /// whenever the tool ran; --strict passes the tool's exit code
@@ -1856,6 +1866,128 @@ pub enum BundleCommand {
         #[arg(long, default_value_t = 300, value_name = "SECS")]
         timeout: u64,
     },
+}
+
+/// `ign jvm` args — the SPECIAL-MODE profiling family. Every leaf
+/// carries `--project` (the deployed scriptExec route's home, the
+/// `script run` default) and the intrusive leaves carry the family's
+/// own gate flag: `--i-accept-the-risk` is deliberately NOT the
+/// global `--yes` — a generic "confirm destructive ops" blanket must
+/// never silently cover ACTIVE JVM instrumentation.
+#[derive(Debug, clap::Args)]
+pub struct JvmArgs {
+    #[command(subcommand)]
+    pub command: JvmCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JvmCommand {
+    /// Sample every JVM thread's stack for a capped window and rank
+    /// the hottest methods and stacks (the folded output is
+    /// flamegraph-ready). ACTIVE instrumentation: CPU overhead grows
+    /// with thread count x frequency — refused without
+    /// --i-accept-the-risk; duration is HARD-CAPPED at 120s
+    Sample {
+        /// Seconds to sample per window (default 30 — 10 with
+        /// --follow; 5–120, the cap is not configurable)
+        #[arg(long, value_name = "SECS")]
+        duration_secs: Option<u64>,
+        /// Milliseconds between thread dumps (default 20 — 50 with
+        /// --follow; 5–1000 — below 5ms the sampler thread itself
+        /// skews the JVM)
+        #[arg(long, value_name = "MS")]
+        interval_ms: Option<u64>,
+        /// Hot-method rows to report (default 25; cap 100)
+        #[arg(long, default_value_t = 25, value_name = "N")]
+        top: u64,
+        /// Also write the folded stacks to this file (flamegraph.pl /
+        /// speedscope input; one-shot only — refused with --follow)
+        #[arg(long, value_name = "PATH")]
+        folded_out: Option<PathBuf>,
+        /// CONTINUOUS MODE: repeat bounded sampling windows
+        /// back-to-back, streaming each window's rollup as it lands
+        /// (NDJSON envelopes under --json/--compact, the `logs -f`
+        /// precedent), until Ctrl-C. Continuous sampling IS
+        /// continuous gateway overhead — watch it, then stop it
+        #[arg(long, action = ArgAction::SetTrue)]
+        follow: bool,
+        /// REQUIRED acknowledgment that this actively instruments the
+        /// gateway JVM and must not run on production casually —
+        /// --yes does NOT satisfy this gate
+        #[arg(long, action = ArgAction::SetTrue)]
+        i_accept_the_risk: bool,
+        /// The deployed routes' project (default ign-cli — where
+        /// `ign webdev deploy` put scriptExec)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Java Flight Recorder operations — `start` is gated active
+    /// instrumentation; `status` and `stop` are ungated (checking and
+    /// cleaning up must always be cheap to reach)
+    #[command(arg_required_else_help = true)]
+    Jfr(JvmJfrArgs),
+}
+
+/// `ign jvm jfr` args (the `tags provider` grouped-subfamily pattern).
+#[derive(Debug, clap::Args)]
+pub struct JvmJfrArgs {
+    #[command(subcommand)]
+    pub command: JvmJfrCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JvmJfrCommand {
+    /// Start a flight recording named `ign-cli` — memory-buffered
+    /// (nothing touches gateway disk until `stop` dumps) and
+    /// duration-capped so it auto-stops even if you forget. Refused
+    /// without --i-accept-the-risk; duration HARD-CAPPED at 300s
+    Start {
+        /// Recording duration in seconds — the auto-stop deadline
+        /// (default 60; 10–300, the cap is not configurable)
+        #[arg(long, default_value_t = 60, value_name = "SECS")]
+        duration_secs: u64,
+        /// The JDK's bundled settings: `default` (lower overhead) or
+        /// `profile` (deeper, heavier)
+        #[arg(long, value_enum, default_value_t = JfrSettingsArg::Default, value_name = "NAME")]
+        settings: JfrSettingsArg,
+        /// REQUIRED acknowledgment that this actively instruments the
+        /// gateway JVM and must not run on production casually —
+        /// --yes does NOT satisfy this gate
+        #[arg(long, action = ArgAction::SetTrue)]
+        i_accept_the_risk: bool,
+        /// The deployed routes' project (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// List the JVM's flight recordings verbatim (READ-only — not
+    /// gated; this is how you confirm a recording is really gone)
+    Status {
+        /// The deployed routes' project (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+    /// Stop the `ign-cli` recording, dump it, fetch the .jfr, and
+    /// delete the gateway-side file (cleanup — NOT gated: stopping
+    /// reduces risk and must never be refused). Dumps over 32 MiB
+    /// are left on the gateway with the remote path reported
+    Stop {
+        /// Local output file (default: ign-cli-<unix_ts>.jfr)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// The deployed routes' project (default ign-cli)
+        #[arg(long, default_value = "ign-cli", value_name = "NAME")]
+        project: String,
+    },
+}
+
+/// The JFR settings whitelist as a clap ValueEnum (free text never
+/// reaches the MBean invocation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum JfrSettingsArg {
+    /// `settings=default` — the lower-overhead bundled config
+    Default,
+    /// `settings=profile` — the deeper, heavier bundled config
+    Profile,
 }
 
 /// Profile subcommands (nested: a struct wrapper carrying the subcommand

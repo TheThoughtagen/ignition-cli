@@ -106,6 +106,18 @@ pub enum CoreError {
     #[error("{operation} is destructive; rerun with --yes to confirm")]
     ConfirmationRequired { operation: String },
 
+    /// JVM profiling invoked without `--i-accept-the-risk`. Exit 2
+    /// (usage class — it names a flag the caller must add, like
+    /// [`Self::ConfirmationRequired`]) but DELIBERATELY NOT satisfiable
+    /// by the global `--yes`/`IGNITION_YES`: active JVM instrumentation
+    /// is a stronger opt-in than the destructive-verb guard — the
+    /// caller must acknowledge THIS specific production risk, not
+    /// confirm generically.
+    #[error(
+        "{operation} actively instruments the gateway JVM; rerun with --i-accept-the-risk to acknowledge the production risk"
+    )]
+    ProfilingRiskNotAccepted { operation: String },
+
     /// An import byte source the caller must fix (wrong file, too big,
     /// unreadable). Exit 2 — usage class: it names what the CALLER must
     /// change, like [`Self::ConfirmationRequired`] (03-02).
@@ -780,6 +792,7 @@ impl CoreError {
         match self {
             Self::Internal(_) => "internal",
             Self::ConfirmationRequired { .. } => "confirmation_required",
+            Self::ProfilingRiskNotAccepted { .. } => "profiling_risk_not_accepted",
             Self::InvalidImportFile { .. } => "invalid_import_file",
             Self::ImportDenied { .. } => "import_denied",
             Self::InvalidInput { .. } => "invalid_input",
@@ -831,6 +844,7 @@ impl CoreError {
         match self {
             Self::Internal(_) => 1,
             Self::ConfirmationRequired { .. }
+            | Self::ProfilingRiskNotAccepted { .. }
             | Self::InvalidImportFile { .. }
             | Self::InvalidInput { .. }
             | Self::GatewayClientError { .. } => 2,
@@ -887,6 +901,16 @@ impl CoreError {
             Self::ConfirmationRequired { .. } => Some(
                 "this operation is destructive; re-run with --yes or set \
                    IGNITION_YES=1"
+                    .to_string(),
+            ),
+            Self::ProfilingRiskNotAccepted { .. } => Some(
+                "JVM profiling ACTIVELY instruments the gateway: stack sampling \
+                   adds CPU overhead proportional to thread count x frequency, \
+                   and flight recordings buffer in JVM memory and write to \
+                   gateway disk. On a PRODUCTION server this belongs inside an \
+                   approved change window with a rollback plan — never as a \
+                   casual probe. --yes deliberately does NOT satisfy this gate; \
+                   re-run with --i-accept-the-risk after confirming that"
                     .to_string(),
             ),
             Self::InvalidImportFile { .. } => Some(
@@ -1379,6 +1403,13 @@ mod tests {
                 "confirmation_required",
             ),
             (
+                CoreError::ProfilingRiskNotAccepted {
+                    operation: "jvm sample".into(),
+                },
+                2,
+                "profiling_risk_not_accepted",
+            ),
+            (
                 CoreError::InvalidImportFile {
                     reason: "missing ZIP magic".into(),
                 },
@@ -1716,6 +1747,7 @@ mod tests {
     const EXIT_SLUG_LITERALS: &[(u8, &str)] = &[
         (1, "internal"),
         (2, "confirmation_required"),
+        (2, "profiling_risk_not_accepted"),
         (2, "invalid_import_file"),
         (2, "invalid_input"),
         (2, "gateway_client_error"),
