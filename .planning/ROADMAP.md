@@ -215,7 +215,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 20-03-PLAN.md — Tracer: held scan-lock → `scan_lock_held` through `DeployApi` end to end; scan completion (`scanActive` false + timestamp advanced)
+- [x] 20-03-PLAN.md — Tracer: held scan-lock → `scan_lock_held` through `DeployApi` end to end; scan completion (`scanActive` false + timestamp advanced)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -337,7 +337,7 @@ Plans:
 | 17. Git Module Commissioning | v1.3 | 0/? | Parked behind v1.6 | — |
 | 18. Declared Rig Discovery | v1.3 | 0/? | Parked behind v1.6 | — |
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
-| 20. Config API Client | v1.6 | 2/6 | In Progress|  |
+| 20. Config API Client | v1.6 | 3/6 | In Progress|  |
 | 21. Deploy Render | v1.6 | 0/? | Not started | — |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 0/? | Not started | — |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |

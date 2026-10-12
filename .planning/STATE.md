@@ -2,19 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 20
-current_phase_name: config-api-client
 status: executing
-stopped_at: Completed 20-02-PLAN.md
-last_updated: "2026-10-12T15:06:45.991Z"
+stopped_at: Completed 20-03-PLAN.md
+last_updated: "2026-10-12T15:26:10.947Z"
 last_activity: 2026-10-12
-last_activity_desc: Phase 20 execution started
 progress:
-  total_phases: 6
+  total_phases: 1
   completed_phases: 0
   total_plans: 6
-  completed_plans: 2
-  percent: 0
+  completed_plans: 3
+  percent: 50
 ---
 
 # Project State
@@ -29,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 20 (config-api-client) — EXECUTING
-Plan: 3 of 6
+Plan: 4 of 6
 Status: Ready to execute
-Last activity: 2026-10-12 — Phase 20 execution started
+Last activity: 2026-10-12
 
-Progress: [███░░░░░░░] 33% (0 of 6 v1.6 phases complete)
+Progress: [█████░░░░░] 50%
 
 ## Performance Metrics
 
@@ -48,6 +45,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 |------|----------|-------|-------|
 | Phase 20 P01 | 35min | 2 tasks | 11 files |
 | Phase 20 P02 | 30min | 3 tasks | 7 files |
+| Phase 20 P03 | 50min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -77,8 +75,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-12T15:06:45.978Z
-**Stopped At:** Completed 20-02-PLAN.md
+**Last session:** 2026-10-12T15:26:10.935Z
+**Stopped At:** Completed 20-03-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -89,3 +87,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [20-01] Any actor's scan releases the scan-lock at trigger time; a no-op scan advances lastScanTimestamp (D4, D12)
 - [Phase ?]: 20-02: active_node decides by activityLevel only; role is configuration (C-S3 failover keeps Master fixed while activity moves)
 - [Phase ?]: 20-02: ResourceSignatureRejected carries only name, reason and endpoint; never a signature or gateway problem text
+- [Phase ?]: 20-03: D1 makes 409 the primary scan-lock refusal pin (408 mapped, enrichment-pinned); D4 added no scan-route classify arm; ScanStatus decisive fields required
