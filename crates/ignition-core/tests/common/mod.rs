@@ -14,6 +14,9 @@
 
 #![allow(dead_code)]
 
+pub mod deploy_scenario;
+pub mod fake_deploy;
+
 /// Wraps a [`wiremock::MockServer`] with Ignition-shaped fixture builders.
 pub struct IgnitionMock {
     /// The underlying server — mount bespoke mocks directly when a test

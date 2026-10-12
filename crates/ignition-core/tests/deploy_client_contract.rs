@@ -12,6 +12,8 @@
 mod common;
 
 use common::IgnitionMock;
+use common::deploy_scenario::{ScenarioTiming, scenario};
+use common::fake_deploy::FakeGateway;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1966,4 +1968,339 @@ async fn mode_name_validation_refuses_before_any_request() {
         assert_eq!(err.exit_code(), 2, "{bad:?}");
     }
     assert!(requests_of(&mock).await.is_empty(), "nothing was sent");
+}
+
+// ---------------------------------------------------------------------------
+// 20-05: the stateful fake gateway (FakeDeploy) and the shared scenario
+// ---------------------------------------------------------------------------
+
+/// D9 + C1c: cap-a acquires with a hold of 3; successive info reads count
+/// down 3, 2, 1, then the lock is free. The actor is `api-token:cap-a:...`.
+#[tokio::test]
+async fn fake_lock_counts_down_then_frees() {
+    let gateway = FakeGateway::new();
+    let a = gateway.client("cap-a");
+    a.scan_lock_acquire(ScanKind::Config, 2, 3)
+        .await
+        .expect("acquires");
+
+    let mut remaining = Vec::new();
+    for _ in 0..3 {
+        match a.scan_lock_info(ScanKind::Config).await.expect("reads") {
+            LockObservation::Held(info) => {
+                assert_eq!(info.actor.as_deref(), Some("api-token:cap-a:127.0.0.1"));
+                remaining.push(info.remaining);
+            }
+            LockObservation::Free => panic!("freed too early"),
+        }
+    }
+    assert_eq!(remaining, [3, 2, 1]);
+    assert_eq!(
+        a.scan_lock_info(ScanKind::Config).await.expect("reads"),
+        LockObservation::Free
+    );
+}
+
+/// D1: a competing acquire is `scan_lock_held` (exit 6) naming the holder;
+/// D2: the holder's own re-acquire is refused too.
+#[tokio::test]
+async fn fake_lock_held_by_other_is_scan_lock_held() {
+    let gateway = FakeGateway::new();
+    let a = gateway.client("cap-a");
+    let b = gateway.client("cap-b");
+    a.scan_lock_acquire(ScanKind::Config, 2, 30)
+        .await
+        .expect("acquires");
+
+    for (who, err) in [
+        ("cap-b", b.scan_lock_acquire(ScanKind::Config, 2, 5).await),
+        ("cap-a", a.scan_lock_acquire(ScanKind::Config, 2, 5).await),
+    ] {
+        let err = err.expect_err(who);
+        assert_eq!(err.code(), "scan_lock_held", "{who}");
+        assert_eq!(err.exit_code(), 6, "{who}");
+        let (actor, kind, _) = held_parts(err);
+        assert_eq!(actor.as_deref(), Some("api-token:cap-a:127.0.0.1"));
+        assert_eq!(kind, "config");
+    }
+}
+
+/// D12: a scan releases the lock at trigger time; D4: a non-holder's scan
+/// is accepted while the lock is held.
+#[tokio::test]
+async fn fake_scan_by_any_actor_releases_the_lock() {
+    let gateway = FakeGateway::new();
+    let a = gateway.client("cap-a");
+    let b = gateway.client("cap-b");
+    a.scan_lock_acquire(ScanKind::Config, 2, 30)
+        .await
+        .expect("acquires");
+    b.scan_request(ScanKind::Config)
+        .await
+        .expect("a non-holder's scan is accepted");
+    assert_eq!(
+        a.scan_lock_info(ScanKind::Config).await.expect("reads"),
+        LockObservation::Free
+    );
+}
+
+/// D3 + D10: a wrong signature is the typed stale refusal, a successful
+/// update rotates the signature so the old one is stale, and an unknown
+/// name is `not_found`.
+#[tokio::test]
+async fn fake_stale_signature_is_the_client_error() {
+    let gateway = FakeGateway::new();
+    let api = gateway.client("cap-a");
+    api.resource_create(
+        "ignition",
+        "database-connection",
+        &[ResourceCreate::new(DB_NAME, config_value())],
+    )
+    .await
+    .expect("creates");
+    let record = api
+        .resource_find("ignition", "database-connection", DB_NAME, None)
+        .await
+        .expect("finds");
+    let good = record.signature.clone().expect("a signature");
+
+    let wrong = ResourceUpdate::new(DB_NAME, SENT_SIG, config_value()).expect("non-empty");
+    let err = api
+        .resource_update("ignition", "database-connection", &[wrong])
+        .await
+        .expect_err("a wrong signature");
+    assert_eq!(err.code(), "resource_signature_rejected");
+    assert_eq!(err.exit_code(), 6);
+    assert!(matches!(
+        err,
+        CoreError::ResourceSignatureRejected {
+            reason: SignatureReason::Stale,
+            ..
+        }
+    ));
+
+    let first = update_item(DB_NAME, &good);
+    let outcome = api
+        .resource_update("ignition", "database-connection", &[first])
+        .await
+        .expect("the current signature is accepted");
+    assert_ne!(
+        outcome.changes[0].new_signature.as_deref(),
+        Some(good.as_str()),
+        "the write rotated the signature"
+    );
+    let again = update_item(DB_NAME, &good);
+    let err = api
+        .resource_update("ignition", "database-connection", &[again])
+        .await
+        .expect_err("re-using the old signature");
+    assert_eq!(err.code(), "resource_signature_rejected");
+
+    let unknown = update_item("NO_SUCH_RESOURCE", &good);
+    let err = api
+        .resource_update("ignition", "database-connection", &[unknown])
+        .await
+        .expect_err("an unknown name");
+    assert_eq!(err.code(), "not_found");
+}
+
+/// D10: a duplicate create is never Ok; the fake reports it as the same
+/// `internal` the real client gives a 409 there.
+#[tokio::test]
+async fn fake_duplicate_create_is_internal() {
+    let gateway = FakeGateway::new();
+    let api = gateway.client("cap-a");
+    let item = || [ResourceCreate::new(DB_NAME, config_value())];
+    api.resource_create("ignition", "database-connection", &item())
+        .await
+        .expect("creates");
+    let err = api
+        .resource_create("ignition", "database-connection", &item())
+        .await
+        .expect_err("duplicate");
+    assert_eq!(err.code(), "internal");
+}
+
+/// C-list + D7: with the mode `production` active and a copy in each
+/// collection, find with no collection is the production copy and
+/// `Some("core")` the core copy; the list shows the effective copy only.
+#[tokio::test]
+async fn fake_effective_view_prefers_the_active_mode_copy() {
+    let gateway = FakeGateway::new();
+    let api = gateway.client("cap-a");
+    for collection in ["core", "production"] {
+        api.resource_create(
+            "ignition",
+            "database-connection",
+            &[ResourceCreate::new(DB_NAME, config_value()).with_collection(collection)],
+        )
+        .await
+        .expect("creates");
+    }
+    gateway.set_deployment_mode(Some("production".to_string()));
+
+    let effective = api
+        .resource_find("ignition", "database-connection", DB_NAME, None)
+        .await
+        .expect("effective");
+    assert_eq!(effective.collection.as_deref(), Some("production"));
+    assert_eq!(effective.collections, ["core", "production"]);
+    let core = api
+        .resource_find("ignition", "database-connection", DB_NAME, Some("core"))
+        .await
+        .expect("core copy");
+    assert_eq!(core.collection.as_deref(), Some("core"));
+    assert_ne!(core.signature, effective.signature, "copies differ (D7)");
+
+    let list = api
+        .resource_list("ignition", "database-connection", &ListQuery::default())
+        .await
+        .expect("lists");
+    assert_eq!(list.items.len(), 1, "D7: one item per name");
+    assert_eq!(list.items[0].collection.as_deref(), Some("production"));
+
+    let names = api
+        .resource_names("ignition", "database-connection")
+        .await
+        .expect("names");
+    assert_eq!(names.items[0].modes, ["core", "production"]);
+
+    // With no active mode the effective view is `core`.
+    gateway.set_deployment_mode(None);
+    let effective = api
+        .resource_find("ignition", "database-connection", DB_NAME, None)
+        .await
+        .expect("effective");
+    assert_eq!(effective.collection.as_deref(), Some("core"));
+}
+
+/// The shared scan wait, driven against the fake, ends Complete with the
+/// timestamp advanced.
+#[tokio::test]
+async fn fake_scan_completes_by_the_shared_predicate() {
+    let gateway = FakeGateway::new();
+    let api = gateway.client("cap-a");
+    let before = api.scan_status(ScanKind::Config).await.expect("status");
+    let cfg = ScenarioTiming::fake().scan;
+    match scan_and_wait(&api, ScanKind::Config, cfg)
+        .await
+        .expect("waits")
+    {
+        ScanOutcome::Complete(now) => {
+            assert!(!now.scan_active);
+            assert!(now.last_scan_timestamp > before.last_scan_timestamp);
+        }
+        ScanOutcome::NotComplete { .. } => panic!("the fake scan completes"),
+    }
+}
+
+/// D6 + T-20-26: modes keep insertion order, a duplicate is an error, and
+/// creating a mode never activates it.
+#[tokio::test]
+async fn fake_modes_never_activate_and_reject_duplicates() {
+    let gateway = FakeGateway::new();
+    let api = gateway.client("cap-a");
+    assert_eq!(api.deployment_mode().await.expect("reads"), None);
+    api.mode_create(&production_mode()).await.expect("created");
+    api.mode_create(&ModeCreate {
+        name: "alpha".to_string(),
+        title: "A".to_string(),
+        description: "d".to_string(),
+    })
+    .await
+    .expect("created");
+    let names: Vec<String> = api
+        .modes()
+        .await
+        .expect("lists")
+        .items
+        .into_iter()
+        .map(|mode| mode.name)
+        .collect();
+    assert_eq!(names, ["production", "alpha"]);
+    assert_eq!(
+        api.deployment_mode().await.expect("reads"),
+        None,
+        "defining a mode does not activate it"
+    );
+    assert!(api.mode_create(&production_mode()).await.is_err());
+    let err = api
+        .mode_create(&ModeCreate {
+            name: "a b/".to_string(),
+            title: "T".to_string(),
+            description: "d".to_string(),
+        })
+        .await
+        .expect_err("invalid name");
+    assert_eq!(err.code(), "invalid_input");
+
+    // `""` and a blank string are no mode, a name is the mode (D5).
+    gateway.set_deployment_mode(Some("  ".to_string()));
+    assert_eq!(api.deployment_mode().await.expect("reads"), None);
+    gateway.set_deployment_mode(Some("production".to_string()));
+    assert_eq!(
+        api.deployment_mode().await.expect("reads").as_deref(),
+        Some("production")
+    );
+}
+
+/// The segment guard is the library's: a bad module or an empty batch is
+/// refused with no state change.
+#[tokio::test]
+async fn fake_refuses_invalid_segments_and_empty_batches() {
+    let gateway = FakeGateway::new();
+    let api = gateway.client("cap-a");
+    let err = api
+        .resource_names("ig/nition", "database-connection")
+        .await
+        .expect_err("bad module");
+    assert_eq!(err.code(), "invalid_input");
+    let err = api
+        .resource_create("ignition", "database-connection", &[])
+        .await
+        .expect_err("empty batch");
+    assert_eq!(err.code(), "invalid_input");
+    let err = api
+        .resource_find("ignition", "database-connection", "x", None)
+        .await
+        .expect_err("absent");
+    assert_eq!(err.code(), "not_found");
+}
+
+/// The shared scenario run against two fake handles yields exactly the
+/// trace the 20-LIVE-CAPTURES Decisions predict. 20-06 diffs the live trace
+/// against this literal; each tag names the Decision that fixes it.
+#[tokio::test]
+async fn fake_scenario_trace_matches_the_capture_decisions() {
+    let gateway = FakeGateway::new();
+    let a = gateway.client("cap-a");
+    let b = gateway.client("cap-b");
+
+    let trace = scenario(&a, &b, "cap-a", "t", &ScenarioTiming::fake()).await;
+
+    let expected = [
+        // D1: the acquire answers at once; D9: the info read names the actor.
+        "lock:acquired",
+        "lock:held-by-a",
+        // D1 + C1e: the competing acquire is refused, naming a.
+        "lock:refused-held-by-a",
+        // D9: the hold lapses, the info read is a 204.
+        "lock:free",
+        // D4: a no-op scan advances lastScanTimestamp.
+        "scan:complete",
+        // D10: create needs only name and config.
+        "create:ok",
+        "find:ok",
+        // D3: the current signature is accepted, the rotated-away one stale.
+        "update:ok",
+        "update:stale",
+        // D10: the duplicate create is a 409 (`internal` client-side).
+        "create-duplicate:internal",
+        // D6: create answers 200 and the list confirms it.
+        "mode:created",
+        "modes:listed",
+        // D5 + T-20-26: a defined mode is not an active mode.
+        "deployment-mode:none",
+    ];
+    assert_eq!(trace, expected);
 }
