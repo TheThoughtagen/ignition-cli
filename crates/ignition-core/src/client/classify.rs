@@ -186,28 +186,7 @@ pub(crate) async fn classify(
         // body-reading precedent).
         S::UNPROCESSABLE_ENTITY if is_config_resource_url(url) => {
             let body = resp.text().await.unwrap_or_default();
-            let joined = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|parsed| {
-                    parsed["messages"].as_array().map(|messages| {
-                        messages
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    })
-                })
-                .filter(|joined| !joined.is_empty());
-            let reason = match joined {
-                Some(joined) => {
-                    format!("gateway rejected the resource body (HTTP 422 from {url}): {joined}")
-                }
-                None if !body.trim().is_empty() => {
-                    format!("gateway rejected the resource body (HTTP 422 from {url}): {body}")
-                }
-                None => format!("gateway rejected the resource body (HTTP 422 from {url})"),
-            };
-            Err(CoreError::InvalidInput { reason })
+            Err(resource_body_rejected(url, &body))
         }
         _ => {
             // The api-call catch-all (09-01): an UNCLASSIFIED 4xx on the
@@ -247,6 +226,39 @@ pub(crate) async fn classify(
             )))
         }
     }
+}
+
+/// The `invalid_input` a 422 on a config-resource path maps to (07-05
+/// gap 3): the `messages` array joined, else the raw body text, else a
+/// bare note. Shared with the deploy-scoped write helper (20-04), which
+/// reads the 422 body itself to look for a signature field first and
+/// falls back to this for every other 422. DAPI-06: the echoed text,
+/// joined or raw, is capped through [`crate::error::truncate_api_body`].
+pub(crate) fn resource_body_rejected(url: &str, body: &str) -> CoreError {
+    let joined = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            parsed["messages"].as_array().map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        })
+        .filter(|joined| !joined.is_empty());
+    let reason = match joined {
+        Some(joined) => format!(
+            "gateway rejected the resource body (HTTP 422 from {url}): {}",
+            crate::error::truncate_api_body(&joined)
+        ),
+        None if !body.trim().is_empty() => format!(
+            "gateway rejected the resource body (HTTP 422 from {url}): {}",
+            crate::error::truncate_api_body(body)
+        ),
+        None => format!("gateway rejected the resource body (HTTP 422 from {url})"),
+    };
+    CoreError::InvalidInput { reason }
 }
 
 /// Longest holder string kept from a gateway body (T-20-13).

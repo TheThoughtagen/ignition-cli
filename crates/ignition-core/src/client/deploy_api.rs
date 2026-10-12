@@ -21,17 +21,18 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
-use crate::client::ReqwestGatewayApi;
 use crate::client::config_resources::{
-    ResourceName, ResourceRecord, list_query_pairs, resource_find_path, resource_list_path,
-    resource_names_path, resource_singleton_path,
+    MutationOutcome, ResourceCreate, ResourceName, ResourceRecord, ResourceUpdate,
+    list_query_pairs, resource_find_path, resource_list_path, resource_names_path,
+    resource_singleton_path, resource_write_path,
 };
 use crate::client::query::{ListEnvelope, ListQuery};
 use crate::client::scan::{
     LockObservation, LockRequest, ScanKind, ScanLockInfo, ScanOutcome, ScanStatus, scan_complete,
     scan_lock_path, scan_path,
 };
-use crate::error::CoreError;
+use crate::client::{ReqwestGatewayApi, classify};
+use crate::error::{CoreError, SignatureReason};
 use crate::poll::{self, PollConfig, PollState};
 
 /// Added to `acquireTimeout` for the per-request client timeout, so a
@@ -102,6 +103,20 @@ pub const DEPLOY_ENDPOINTS: &[EndpointDecl] = &[
         path_template: "/data/api/v1/resources/singleton/{module}/{type}",
         shape: ResponseShape::Json,
         capture_ref: "C-list",
+    },
+    EndpointDecl {
+        id: "resource_create",
+        method: "POST",
+        path_template: "/data/api/v1/resources/{module}/{type}",
+        shape: ResponseShape::Json,
+        capture_ref: "C3a",
+    },
+    EndpointDecl {
+        id: "resource_update",
+        method: "PUT",
+        path_template: "/data/api/v1/resources/{module}/{type}",
+        shape: ResponseShape::Json,
+        capture_ref: "C3a",
     },
     EndpointDecl {
         id: "scan_lock_acquire",
@@ -197,6 +212,49 @@ pub trait DeployApi: Send + Sync {
         ty: &str,
         collection: Option<&str>,
     ) -> Result<ResourceRecord, CoreError>;
+
+    /// Create resources (`resource_create`), `POST` of an array body:
+    /// DAPI-02 as amended 2026-10-12 (create by POST, update by the
+    /// signature-checked array PUT). Capture C3a and Decision D10 are the
+    /// 8.3.6 confirmation: `[{name, config}]` answers 200 with
+    /// `{success, changes[].newSignature}`.
+    ///
+    /// A 2xx whose body says `success:false` is an error, never Ok. A
+    /// duplicate name is a 409 (D10) and is an error. The POST is sent once
+    /// per call and never retried: a repeated create against a production
+    /// gateway must never be silent. An empty `items` is `invalid_input`
+    /// with no request.
+    async fn resource_create(
+        &self,
+        module: &str,
+        ty: &str,
+        items: &[ResourceCreate],
+    ) -> Result<MutationOutcome, CoreError>;
+
+    /// Update resources (`resource_update`), `PUT` of an array body whose
+    /// every item carries a name and a signature: DAPI-02 as amended
+    /// 2026-10-12. Capture C3a and Decision D10 are the 8.3.6
+    /// confirmation: a `PUT` of an unknown name answers a bare 404
+    /// (`not_found`), so a create is never done by PUT.
+    ///
+    /// Decision D3 fixes the refusals. A stale signature is a 500 whose
+    /// `problem.message` says `signature mismatch`, and it comes back as
+    /// `resource_signature_rejected` (stale, exit 6). An omitted or empty
+    /// signature is one byte-identical 422 with `fieldName` `signature`
+    /// (the two cannot be told apart) and comes back as the same error
+    /// (missing); an empty signature is refused before any request. The
+    /// refusals leave the resource unchanged. Neither error carries the
+    /// signature or the gateway's problem text. Every successful write
+    /// rotates the signature, so an update reusing the pre-write one is
+    /// stale. The PUT is sent once per call and never retried. When two
+    /// writers race, the gateway's check serializes them and the loser
+    /// gets the stale refusal; the client adds no lock of its own.
+    async fn resource_update(
+        &self,
+        module: &str,
+        ty: &str,
+        items: &[ResourceUpdate],
+    ) -> Result<MutationOutcome, CoreError>;
 
     /// Acquire the scan-lock (`scan_lock_acquire`, capture C1b).
     ///
@@ -297,6 +355,152 @@ impl ReqwestGatewayApi {
             ))),
         }
     }
+
+    /// Send a resource write and decide its outcome. Deploy-scoped: this is
+    /// the ONLY place a signature refusal gets its typed
+    /// [`CoreError::ResourceSignatureRejected`], so the v1.1
+    /// EAM routes (a 500 signature refusal is `internal` there) keep their
+    /// behaviour, and `classify` gains no signature arm.
+    ///
+    /// Decision D3 (capture C3a) keys the guard:
+    /// - a 500 whose JSON `problem.message` contains [`SIGNATURE_MARKER`]
+    ///   is a stale signature; any other 500 is `internal`;
+    /// - a 422 whose `fieldMessages` name the field `signature` is a
+    ///   missing signature (omitted and empty are the same bytes); any
+    ///   other 422 goes to the shared resource 422 mapping;
+    /// - every other status goes to `classify` unchanged.
+    ///
+    /// On a 2xx the body is parsed: `success:true` is Ok, `success:false`
+    /// is an error, stale when the problem carries the marker, `internal`
+    /// otherwise. No error built here carries the signature, the problem
+    /// message or the stacktrace, and the request is never retried.
+    async fn send_resource_write(
+        &self,
+        decl: &EndpointDecl,
+        request: reqwest::RequestBuilder,
+        url: &url::Url,
+        names: &[&str],
+    ) -> Result<MutationOutcome, CoreError> {
+        let network = |err: reqwest::Error| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        };
+        let response = request.send().await.map_err(network)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+            let body = response.text().await.unwrap_or_default();
+            if problem_has_marker(&body) {
+                return Err(signature_rejected(
+                    names,
+                    SignatureReason::Stale,
+                    url,
+                    Some(&body),
+                ));
+            }
+            return Err(CoreError::Internal(format!(
+                "unexpected HTTP {status} from {url} (the gateway's problem text is withheld)"
+            )));
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let body = response.text().await.unwrap_or_default();
+            if names_signature_field(&body) {
+                return Err(signature_rejected(
+                    names,
+                    SignatureReason::Missing,
+                    url,
+                    None,
+                ));
+            }
+            return Err(classify::resource_body_rejected(url.as_str(), &body));
+        }
+        let response = classify::classify(response, url.as_str(), false).await?;
+        let text = response.text().await.map_err(network)?;
+        if text.trim().is_empty() {
+            return Err(CoreError::Internal(format!(
+                "endpoint {} answered HTTP {status} from {url} with an empty body, \
+                 but its declared shape is {:?}",
+                decl.id, decl.shape
+            )));
+        }
+        let outcome: MutationOutcome = parse_json(decl, url, &text)?;
+        if outcome.success {
+            return Ok(outcome);
+        }
+        let stale = outcome
+            .problem
+            .as_ref()
+            .is_some_and(|problem| problem.message.contains(SIGNATURE_MARKER));
+        if stale {
+            let message = outcome.problem.map(|p| p.message);
+            return Err(signature_rejected(
+                names,
+                SignatureReason::Stale,
+                url,
+                message.as_deref(),
+            ));
+        }
+        Err(CoreError::Internal(format!(
+            "endpoint {} answered HTTP {status} from {url} with success:false \
+             (the gateway's problem text is withheld)",
+            decl.id
+        )))
+    }
+}
+
+/// The marker D3 recorded for a stale signature: the lowercase phrase in
+/// the 500 body's `problem.message` (`MODIFY illegal: signature mismatch
+/// for 'ResourceId{...}'`). It is the same discriminator v1.1 recorded for
+/// the EAM routes; frames and prose around it drift between versions.
+const SIGNATURE_MARKER: &str = "signature mismatch";
+
+/// Does `body` parse as a mutation envelope whose problem message carries
+/// [`SIGNATURE_MARKER`]?
+fn problem_has_marker(body: &str) -> bool {
+    serde_json::from_str::<MutationOutcome>(body)
+        .ok()
+        .and_then(|outcome| outcome.problem)
+        .is_some_and(|problem| problem.message.contains(SIGNATURE_MARKER))
+}
+
+/// Does a 422 body name the field `signature` in `fieldMessages` (D3:
+/// `Missing 'signature' parameter`)?
+fn names_signature_field(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|parsed| parsed["fieldMessages"].as_array().cloned())
+        .is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| field["fieldName"].as_str() == Some("signature"))
+        })
+}
+
+/// Build the typed [`CoreError::ResourceSignatureRejected`] without the
+/// signature or the problem text. The
+/// resource is named by the batch item whose name appears in the gateway's
+/// resource path (`message`), else the only item, else `<batch of N>`.
+fn signature_rejected(
+    names: &[&str],
+    reason: SignatureReason,
+    url: &url::Url,
+    message: Option<&str>,
+) -> CoreError {
+    let from_message = message.and_then(|message| {
+        names
+            .iter()
+            .find(|name| message.contains(&format!("/{name},")))
+            .map(|name| (*name).to_string())
+    });
+    let name = from_message.unwrap_or_else(|| match names {
+        [only] => (*only).to_string(),
+        _ => format!("<batch of {}>", names.len()),
+    });
+    CoreError::ResourceSignatureRejected {
+        name,
+        reason,
+        endpoint: Some(url.to_string()),
+    }
 }
 
 /// Parse a JSON body, naming the endpoint id and URL on failure and never
@@ -359,6 +563,49 @@ impl DeployApi for ReqwestGatewayApi {
         let path = resource_singleton_path(module, ty)?;
         self.read_resource_json("resource_singleton", &path, &collection_pairs(collection))
             .await
+    }
+
+    async fn resource_create(
+        &self,
+        module: &str,
+        ty: &str,
+        items: &[ResourceCreate],
+    ) -> Result<MutationOutcome, CoreError> {
+        let path = resource_write_path(module, ty)?;
+        if items.is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: "resource create needs at least one item".to_string(),
+            });
+        }
+        if items.iter().any(|item| item.name.is_empty()) {
+            return Err(CoreError::InvalidInput {
+                reason: "resource name must not be empty".to_string(),
+            });
+        }
+        let decl = decl("resource_create")?;
+        let url = self.url_for(&path);
+        let request = self.apply_auth(self.client.post(url.clone()).json(items));
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        self.send_resource_write(decl, request, &url, &names).await
+    }
+
+    async fn resource_update(
+        &self,
+        module: &str,
+        ty: &str,
+        items: &[ResourceUpdate],
+    ) -> Result<MutationOutcome, CoreError> {
+        let path = resource_write_path(module, ty)?;
+        if items.is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: "resource update needs at least one item".to_string(),
+            });
+        }
+        let decl = decl("resource_update")?;
+        let url = self.url_for(&path);
+        let request = self.apply_auth(self.client.put(url.clone()).json(items));
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        self.send_resource_write(decl, request, &url, &names).await
     }
 
     async fn scan_lock_acquire(
@@ -629,7 +876,7 @@ mod tests {
     /// The rows copied from the 20-LIVE-CAPTURES Endpoint shapes table.
     #[test]
     fn endpoint_rows_match_the_capture_table() {
-        let expected: [(&str, &str, &str, ResponseShape, &str); 8] = [
+        let expected: [(&str, &str, &str, ResponseShape, &str); 10] = [
             (
                 "resource_names",
                 "GET",
@@ -657,6 +904,20 @@ mod tests {
                 "/data/api/v1/resources/singleton/{module}/{type}",
                 ResponseShape::Json,
                 "C-list",
+            ),
+            (
+                "resource_create",
+                "POST",
+                "/data/api/v1/resources/{module}/{type}",
+                ResponseShape::Json,
+                "C3a",
+            ),
+            (
+                "resource_update",
+                "PUT",
+                "/data/api/v1/resources/{module}/{type}",
+                ResponseShape::Json,
+                "C3a",
             ),
             (
                 "scan_lock_acquire",
@@ -706,6 +967,8 @@ mod tests {
             "resource_list",
             "resource_find",
             "resource_singleton",
+            "resource_create",
+            "resource_update",
             "scan_lock_acquire",
             "scan_lock_info",
             "scan_status",

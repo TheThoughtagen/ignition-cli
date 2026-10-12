@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::projects::encode_segment;
 use crate::client::query::ListQuery;
-use crate::error::CoreError;
+use crate::error::{CoreError, SignatureReason};
 
 /// Base of every resource route.
 const RESOURCES_BASE: &str = "/data/api/v1/resources";
@@ -223,6 +223,204 @@ pub struct ResourceName {
     /// Any other key.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The mutation envelope of a create or update: `{success, changes[],
+/// problem}` (captures C3a "POST create" and "PUT with the right
+/// signature"). `changes[].new_signature` is the POST-write signature: each
+/// write rotates it, so it is what the next update must carry.
+/// `problem.message` is never surfaced verbatim by this crate (8.3.3
+/// messages carry the live signature; the 8.3.6 stacktrace is about 6 KB).
+pub type MutationOutcome = crate::client::eam::ModifyOutcome;
+
+/// One resource to create, `POST .../resources/{module}/{type}` (capture
+/// C3a "POST create"; Decision D10: a create needs only `name` and
+/// `config`, and assumption A9 holds, so there is no `attributes` field).
+/// Absent options are not sent, never sent as `null`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResourceCreate {
+    /// The resource name.
+    pub name: String,
+    /// Target collection; the gateway picks one when absent (`core` on the
+    /// capture). C-list created a `production` copy by sending it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    /// `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `description`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The resource config.
+    pub config: serde_json::Value,
+    /// `backupConfig`.
+    #[serde(rename = "backupConfig", skip_serializing_if = "Option::is_none")]
+    pub backup_config: Option<serde_json::Value>,
+}
+
+impl ResourceCreate {
+    /// A create of `name` with `config` and nothing else.
+    pub fn new(name: impl Into<String>, config: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            collection: None,
+            enabled: None,
+            description: None,
+            config,
+            backup_config: None,
+        }
+    }
+
+    /// Target a collection.
+    #[must_use]
+    pub fn with_collection(mut self, collection: impl Into<String>) -> Self {
+        self.collection = Some(collection.into());
+        self
+    }
+
+    /// Set `enabled`.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+
+    /// Set `description`.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set `backupConfig`.
+    #[must_use]
+    pub fn with_backup_config(mut self, backup_config: serde_json::Value) -> Self {
+        self.backup_config = Some(backup_config);
+        self
+    }
+}
+
+/// One resource to update, an item of the signature-checked array PUT
+/// (capture C3a, Decision D3). The signature is PRIVATE and always
+/// serialized, so an update without one cannot be built: construction
+/// goes through [`ResourceUpdate::new`] or [`ResourceUpdate::from_record`],
+/// both of which refuse an empty signature as
+/// `resource_signature_rejected` (missing) before any request exists.
+///
+/// The signature must be the one of the copy being updated (D7: copies in
+/// different collections carry different signatures), read just before the
+/// write; every successful write rotates it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResourceUpdate {
+    /// The resource name; an update of an unknown name is a bare 404 (D10).
+    pub name: String,
+    /// Collection of the copy being updated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    /// `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `description`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The new resource config.
+    pub config: serde_json::Value,
+    /// `backupConfig`.
+    #[serde(rename = "backupConfig", skip_serializing_if = "Option::is_none")]
+    pub backup_config: Option<serde_json::Value>,
+    signature: String,
+}
+
+impl ResourceUpdate {
+    /// An update of `name` carrying `signature` and the new `config`.
+    ///
+    /// An empty or whitespace-only signature is
+    /// `resource_signature_rejected` (missing); an empty name is
+    /// `invalid_input`. Both are refused before any request.
+    pub fn new(
+        name: impl Into<String>,
+        signature: impl Into<String>,
+        config: serde_json::Value,
+    ) -> Result<Self, CoreError> {
+        let name = name.into();
+        let signature = signature.into();
+        if name.is_empty() {
+            return Err(CoreError::InvalidInput {
+                reason: "resource name must not be empty".to_string(),
+            });
+        }
+        if signature.trim().is_empty() {
+            return Err(CoreError::ResourceSignatureRejected {
+                name,
+                reason: SignatureReason::Missing,
+                endpoint: None,
+            });
+        }
+        Ok(Self {
+            name,
+            collection: None,
+            enabled: None,
+            description: None,
+            config,
+            backup_config: None,
+            signature,
+        })
+    }
+
+    /// An update seeded from a record just read: its name, signature,
+    /// collection, `enabled`, `description`, `config` and `backupConfig`.
+    /// A record without a signature is `resource_signature_rejected`
+    /// (missing); one without a name (a singleton) is `invalid_input`.
+    /// Whether the gateway wants `collection` on a PUT is not shown by the
+    /// captures; the 20-06 live gate settles it.
+    pub fn from_record(record: &ResourceRecord) -> Result<Self, CoreError> {
+        let name = record.name.clone().ok_or_else(|| CoreError::InvalidInput {
+            reason: "the record has no name, so it cannot be updated by name".to_string(),
+        })?;
+        let mut update = Self::new(
+            name,
+            record.signature.clone().unwrap_or_default(),
+            record.config.clone(),
+        )?;
+        update.collection = record.collection.clone();
+        update.enabled = record.enabled;
+        update.description = record.description.clone();
+        update.backup_config = record.backup_config.clone();
+        Ok(update)
+    }
+
+    /// The signature this update carries.
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    /// Target a collection.
+    #[must_use]
+    pub fn with_collection(mut self, collection: impl Into<String>) -> Self {
+        self.collection = Some(collection.into());
+        self
+    }
+
+    /// Set `enabled`.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+
+    /// Set `description`.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set `backupConfig`.
+    #[must_use]
+    pub fn with_backup_config(mut self, backup_config: serde_json::Value) -> Self {
+        self.backup_config = Some(backup_config);
+        self
+    }
 }
 
 #[cfg(test)]

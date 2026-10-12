@@ -12,8 +12,11 @@
 mod common;
 
 use common::IgnitionMock;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ignition_core::client::config_resources::{ResourceCreate, ResourceUpdate};
 use ignition_core::client::deploy_api::{resource_list_in_collection, scan_and_wait};
 use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::{
@@ -21,7 +24,10 @@ use ignition_core::client::scan::{
 };
 use ignition_core::client::{DeployApi, ReqwestGatewayApi};
 use ignition_core::config::{Credential, Secret};
-use ignition_core::error::CoreError;
+use ignition_core::error::{
+    CoreError, GATEWAY_CLIENT_BODY_CAP_BYTES, GATEWAY_CLIENT_BODY_TRUNCATION_MARKER,
+    SignatureReason,
+};
 use ignition_core::poll::PollConfig;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -1029,4 +1035,679 @@ async fn resource_list_in_collection_composes_names_and_find() {
         .await
         .expect_err("empty collection");
     assert_eq!(err.code(), "invalid_input");
+}
+
+// ---------------------------------------------------------------------------
+// 20-04 Task 2: signature-checked writes (DAPI-02) and the 422 cap (DAPI-06)
+// ---------------------------------------------------------------------------
+
+const WRITE_PATH: &str = "/data/api/v1/resources/ignition/database-connection";
+
+/// The signature a test sends: 64 hex characters, none of which may ever
+/// appear in an error.
+const SENT_SIG: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// C3a "POST create": 200, `success:true`, one change with `newSignature`.
+const C3A_CREATE_200: &str = r#"{"success":true,"changes":[{"name":"IGN_DEPLOY_RIG_DB_1791815701","type":"ignition/database-connection","collection":"core","newSignature":"5de3e2f09a55346efa902ca0369b55829507e18e8d64d10c82d8a5e1eb9ea57c"}],"problem":null}"#;
+
+/// C3a "PUT with the right signature": 200 with the rotated signature.
+const C3A_PUT_200: &str = r#"{"success":true,"changes":[{"name":"IGN_DEPLOY_RIG_DB_1791815701","type":"ignition/database-connection","collection":"core","newSignature":"8e01629a0ccc4115d874626df494edf5cdb1cd7510789a4ce9cc39cc85063f14"}],"problem":null}"#;
+
+/// C3a "POST the same name again (duplicate)": 409, JSON `problem`. Only the
+/// first two of the roughly 55 captured stack frames are kept.
+const C3A_DUPLICATE_409: &str = r#"{"success":false,"changes":[],"problem":{"message":"CREATE conflict: 'ResourceId{resourcePath=ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701, collectionName=core}' already exists","stacktrace":["com.inductiveautomation.ignition.common.resourcecollection.PushConflictException: CREATE conflict: 'ResourceId{resourcePath=ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701, collectionName=core}' already exists","\tat com.inductiveautomation.ignition.gateway.resourcecollection.ChangeOperationValidationHandler$AtomicPushValidationHandler.throwIfInvalid(ChangeOperationValidationHandler.java:58)"]}}"#;
+
+/// C3a "PUT with a stale (64-hex wrong) signature": 500, JSON `problem`.
+/// Only the first two of the roughly 55 captured stack frames are kept.
+const C3A_STALE_500: &str = r#"{"success":false,"changes":[],"problem":{"message":"MODIFY illegal: signature mismatch for 'ResourceId{resourcePath=ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701, collectionName=core}'","stacktrace":["com.inductiveautomation.ignition.common.resourcecollection.PushException: MODIFY illegal: signature mismatch for 'ResourceId{resourcePath=ignition/database-connection/IGN_DEPLOY_RIG_DB_1791815701, collectionName=core}'","\tat com.inductiveautomation.ignition.gateway.resourcecollection.ChangeOperationValidationHandler$AtomicPushValidationHandler.throwIfInvalid(ChangeOperationValidationHandler.java:61)"]}}"#;
+
+/// C3a "PUT with the signature key omitted" (byte-identical to the
+/// empty-string case): 422 with `fieldName` `signature`.
+const C3A_MISSING_422: &str = "{\n  \"messages\": [],\n  \"fieldMessages\": [\n    {\n      \"fieldName\": \"signature\",\n      \"messages\": [\n        \"Missing \\u0027signature\\u0027 parameter\"\n      ]\n    }\n  ]\n}";
+
+fn config_value() -> serde_json::Value {
+    serde_json::from_str(&db_config(9)).expect("captured config parses")
+}
+
+fn update_item(name: &str, signature: &str) -> ResourceUpdate {
+    ResourceUpdate::new(name, signature, config_value()).expect("a non-empty signature")
+}
+
+/// Every text an error exposes: Display, Debug-free hint and endpoint.
+fn exposed(err: &CoreError) -> String {
+    format!(
+        "{err}\n{}\n{}",
+        err.hint().unwrap_or_default(),
+        err.endpoint().unwrap_or_default()
+    )
+}
+
+fn assert_no_leak(err: &CoreError) {
+    let text = exposed(err);
+    for forbidden in [
+        SENT_SIG,
+        "ResourceId{",
+        "MODIFY illegal",
+        "stacktrace",
+        "com.inductive",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden:?} leaked: {text}");
+    }
+}
+
+fn body_of(req: &wiremock::Request) -> serde_json::Value {
+    serde_json::from_slice(&req.body).expect("the request body is JSON")
+}
+
+/// C3a "POST create" + D10: a one-element array with `name` and `config`
+/// only (no `signature`, no null-valued key); the 200 body parses.
+#[tokio::test]
+async fn resource_create_posts_an_array_body() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(200, C3A_CREATE_200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+
+    let outcome = api
+        .resource_create(
+            "ignition",
+            "database-connection",
+            &[ResourceCreate::new(DB_NAME, config_value())],
+        )
+        .await
+        .expect("create");
+
+    assert!(outcome.success);
+    assert!(outcome.changes[0].new_signature.is_some());
+    let seen = requests_of(&mock).await;
+    assert_eq!(
+        body_of(&seen[0]),
+        serde_json::json!([{ "name": DB_NAME, "config": config_value() }]),
+        "exactly name and config"
+    );
+    assert!(
+        seen[0]
+            .headers
+            .get("x-ignition-api-token")
+            .is_some_and(|v| v.as_bytes() == b"cap-a:tokengeneratedlive"),
+        "the write is authenticated"
+    );
+}
+
+/// C3a "PUT with the right signature": a PUT whose array item carries
+/// `name`, `signature` and `config`.
+#[tokio::test]
+async fn resource_update_puts_an_array_with_signature() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(200, C3A_PUT_200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+
+    let outcome = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item(DB_NAME, SENT_SIG)],
+        )
+        .await
+        .expect("update");
+
+    assert!(outcome.success);
+    assert!(
+        outcome.changes[0]
+            .new_signature
+            .as_deref()
+            .is_some_and(|s| s.starts_with("8e01629a"))
+    );
+    let seen = requests_of(&mock).await;
+    let body = body_of(&seen[0]);
+    let items = body.as_array().expect("an array body");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], DB_NAME);
+    assert_eq!(items[0]["signature"], SENT_SIG);
+    assert_eq!(items[0]["config"], config_value());
+}
+
+/// D10 (C3a "PUT of an unknown name"): a bare 404 is `not_found`, exit 6.
+/// This is the 8.3.6 confirmation of DAPI-02 as amended: update is the
+/// signature-checked PUT, and it cannot create.
+#[tokio::test]
+async fn resource_update_unknown_name_is_not_found() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item("NOPE", SENT_SIG)],
+        )
+        .await
+        .expect_err("unknown name");
+    assert_eq!(err.code(), "not_found");
+    assert_eq!(err.exit_code(), 6);
+}
+
+/// D3 stale: 500 with `signature mismatch` in the problem message.
+#[tokio::test]
+async fn signature_stale_is_resource_signature_rejected() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(500, C3A_STALE_500))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item(DB_NAME, SENT_SIG)],
+        )
+        .await
+        .expect_err("stale");
+
+    assert_eq!(err.code(), "resource_signature_rejected");
+    assert_eq!(err.exit_code(), 6);
+    assert_no_leak(&err);
+    match err {
+        CoreError::ResourceSignatureRejected {
+            name,
+            reason,
+            endpoint,
+        } => {
+            assert_eq!(name, DB_NAME, "named from the gateway's resource path");
+            assert_eq!(reason, SignatureReason::Stale);
+            assert!(endpoint.is_some_and(|e| e.ends_with(WRITE_PATH)));
+        }
+        other => panic!("expected the typed refusal, got {other:?}"),
+    }
+}
+
+/// 8.3.3 problem messages carry the live signature; even then it is never
+/// echoed (T-20-17).
+#[tokio::test]
+async fn signature_stale_message_carrying_the_signature_does_not_leak() {
+    let mock = IgnitionMock::start().await;
+    let body = format!(
+        r#"{{"success":false,"changes":[],"problem":{{"message":"MODIFY illegal: signature mismatch for {SENT_SIG} ResourceId{{x}}","stacktrace":[]}}}}"#
+    );
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(500, &body))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item("A", SENT_SIG), update_item("B", SENT_SIG)],
+        )
+        .await
+        .expect_err("stale");
+    assert_eq!(err.code(), "resource_signature_rejected");
+    assert_no_leak(&err);
+    assert!(err.to_string().contains("<batch of 2>"), "{err}");
+}
+
+/// An empty or whitespace-only signature is refused before any request.
+#[tokio::test]
+async fn signature_empty_is_refused_before_any_request() {
+    let mock = IgnitionMock::start().await;
+    for empty in ["", "   ", "\t\n"] {
+        let err = ResourceUpdate::new("DB_A", empty, serde_json::json!({}))
+            .expect_err("an empty signature cannot build an update");
+        assert_eq!(err.code(), "resource_signature_rejected");
+        assert_eq!(err.exit_code(), 6);
+        assert!(matches!(
+            err,
+            CoreError::ResourceSignatureRejected {
+                reason: SignatureReason::Missing,
+                ..
+            }
+        ));
+    }
+    let unsigned = ignition_core::client::config_resources::ResourceRecord {
+        resource_type: "ignition/database-connection".to_string(),
+        name: Some("DB_A".to_string()),
+        description: None,
+        enabled: None,
+        version: None,
+        collection: None,
+        collections: vec![],
+        signature: None,
+        config: serde_json::json!({}),
+        backup_config: None,
+        attributes: None,
+        extra: Default::default(),
+    };
+    let err = ResourceUpdate::from_record(&unsigned).expect_err("no signature on the record");
+    assert_eq!(err.code(), "resource_signature_rejected");
+    assert!(requests_of(&mock).await.is_empty(), "zero requests");
+}
+
+/// D3 omitted/empty on the wire: one byte-identical 422 naming the field
+/// `signature`; it is distinguishable from stale and maps to Missing.
+#[tokio::test]
+async fn signature_missing_on_wire_maps_per_d3() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(422, C3A_MISSING_422))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item(DB_NAME, SENT_SIG)],
+        )
+        .await
+        .expect_err("missing");
+    assert_eq!(err.code(), "resource_signature_rejected");
+    assert!(matches!(
+        err,
+        CoreError::ResourceSignatureRejected {
+            reason: SignatureReason::Missing,
+            ..
+        }
+    ));
+    assert_no_leak(&err);
+}
+
+/// A 422 that does not name `signature` stays the resource-body
+/// `invalid_input` (classify's mapping, unchanged).
+#[tokio::test]
+async fn resource_update_other_422_is_invalid_input() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(
+            422,
+            r#"{"messages":["Settings cannot be null"],"fieldMessages":[]}"#,
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item(DB_NAME, SENT_SIG)],
+        )
+        .await
+        .expect_err("422");
+    assert_eq!(err.code(), "invalid_input");
+    assert!(err.to_string().contains("Settings cannot be null"));
+}
+
+/// A 2xx whose body says `success:false` is an error (T-20-19): Stale when
+/// the problem carries the marker, `internal` otherwise, with no problem
+/// text in either.
+#[tokio::test]
+async fn resource_update_2xx_success_false_is_an_error() {
+    let mock = IgnitionMock::start().await;
+    let stale_guard = Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(200, C3A_STALE_500))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let items = [update_item(DB_NAME, SENT_SIG)];
+    let err = api
+        .resource_update("ignition", "database-connection", &items)
+        .await
+        .expect_err("success:false is an error");
+    assert!(matches!(
+        err,
+        CoreError::ResourceSignatureRejected {
+            reason: SignatureReason::Stale,
+            ..
+        }
+    ));
+    assert_no_leak(&err);
+    drop(stale_guard);
+
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(
+            200,
+            r#"{"success":false,"changes":[],"problem":{"message":"boom 0123456789abcdef","stacktrace":[]}}"#,
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let err = api
+        .resource_update("ignition", "database-connection", &items)
+        .await
+        .expect_err("success:false is an error");
+    assert_eq!(err.code(), "internal");
+    assert!(!err.to_string().contains("boom"), "{err}");
+    assert_no_leak(&err);
+}
+
+/// Any other 500 is `internal`, with the problem text withheld.
+#[tokio::test]
+async fn resource_update_500_other_is_internal_without_problem_text() {
+    let mock = IgnitionMock::start().await;
+    let body = format!(
+        r#"{{"success":false,"changes":[],"problem":{{"message":"boom {SENT_SIG}","stacktrace":["at x"]}}}}"#
+    );
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(500, &body))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item(DB_NAME, SENT_SIG)],
+        )
+        .await
+        .expect_err("500");
+    assert_eq!(err.code(), "internal");
+    assert!(!err.to_string().contains("boom"), "{err}");
+    assert_no_leak(&err);
+}
+
+/// Writes are sent once per call, a 500 included (T-20-20).
+#[tokio::test]
+async fn resource_write_is_never_retried() {
+    let mock = IgnitionMock::start().await;
+    let put = Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+    let post = Mock::given(method("POST"))
+        .and(path(WRITE_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount_as_scoped(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    assert!(
+        api.resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item(DB_NAME, SENT_SIG)]
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        api.resource_create(
+            "ignition",
+            "database-connection",
+            &[ResourceCreate::new(DB_NAME, config_value())]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(put.received_requests().await.len(), 1);
+    assert_eq!(post.received_requests().await.len(), 1);
+}
+
+/// An empty batch is `invalid_input`, exit 2, with zero requests.
+#[tokio::test]
+async fn resource_items_empty_is_refused() {
+    let mock = IgnitionMock::start().await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    for result in [
+        api.resource_create("ignition", "database-connection", &[])
+            .await,
+        api.resource_update("ignition", "database-connection", &[])
+            .await,
+    ] {
+        let err = result.expect_err("empty batch");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(err.exit_code(), 2);
+    }
+    let err = api
+        .resource_create(
+            "../x",
+            "database-connection",
+            &[ResourceCreate::new("A", serde_json::json!({}))],
+        )
+        .await
+        .expect_err("bad module");
+    assert_eq!(err.code(), "invalid_input");
+    let err = api
+        .resource_create(
+            "ignition",
+            "database-connection",
+            &[ResourceCreate::new("", serde_json::json!({}))],
+        )
+        .await
+        .expect_err("empty name");
+    assert_eq!(err.code(), "invalid_input");
+    assert!(requests_of(&mock).await.is_empty(), "zero requests");
+}
+
+/// D10: the duplicate create is a 409 JSON problem and is never Ok; the
+/// problem text and stack are not echoed.
+#[tokio::test]
+async fn resource_duplicate_create_is_never_ok() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(409, C3A_DUPLICATE_409))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_create(
+            "ignition",
+            "database-connection",
+            &[ResourceCreate::new(DB_NAME, config_value())],
+        )
+        .await
+        .expect_err("a duplicate is never Ok");
+    assert!(!err.to_string().contains("com.inductive"), "{err}");
+    assert!(!err.to_string().contains("ResourceId{"), "{err}");
+}
+
+/// Each write rotates the signature: PUT with S1 succeeds and answers S2; a
+/// second PUT reusing S1 is the stale refusal.
+#[tokio::test]
+async fn resource_stale_after_successful_write() {
+    let mock = IgnitionMock::start().await;
+    let written = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&written);
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json");
+            let sent = body[0]["signature"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if sent == SENT_SIG && !flag.swap(true, Ordering::SeqCst) {
+                ResponseTemplate::new(200).set_body_raw(C3A_PUT_200, "application/json")
+            } else {
+                ResponseTemplate::new(500).set_body_raw(C3A_STALE_500, "application/json")
+            }
+        })
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let items = [update_item(DB_NAME, SENT_SIG)];
+
+    let first = api
+        .resource_update("ignition", "database-connection", &items)
+        .await
+        .expect("first write");
+    let rotated = first.changes[0]
+        .new_signature
+        .clone()
+        .expect("newSignature");
+    assert_ne!(rotated, SENT_SIG);
+
+    let err = api
+        .resource_update("ignition", "database-connection", &items)
+        .await
+        .expect_err("reusing the pre-write signature");
+    assert!(matches!(
+        err,
+        CoreError::ResourceSignatureRejected {
+            reason: SignatureReason::Stale,
+            ..
+        }
+    ));
+}
+
+/// Batch bodies keep caller order; nothing is sorted client-side.
+#[tokio::test]
+async fn resource_batch_order_is_preserved() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("PUT"))
+        .and(path(WRITE_PATH))
+        .respond_with(json(
+            200,
+            r#"{"success":true,"changes":[{"name":"B","type":"t","collection":"core","newSignature":"s1"},{"name":"A","type":"t","collection":"core","newSignature":"s2"}],"problem":null}"#,
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let outcome = api
+        .resource_update(
+            "ignition",
+            "database-connection",
+            &[update_item("B", SENT_SIG), update_item("A", SENT_SIG)],
+        )
+        .await
+        .expect("batch");
+    let order: Vec<_> = outcome.changes.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(order, vec!["B", "A"], "changes keep gateway order");
+    let seen = requests_of(&mock).await;
+    let sent: Vec<_> = body_of(&seen[0])
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|item| item["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(sent, vec!["B", "A"], "the body keeps caller order");
+}
+
+/// DAPI-06: the 422 echo is capped on both the joined `messages` and the
+/// raw body, and a body of exactly the cap is echoed whole.
+#[tokio::test]
+async fn cap_422_body_is_truncated() {
+    let big = "x".repeat(100 * 1024);
+    let joined_body = format!(r#"{{"messages":["{big}"],"fieldMessages":[]}}"#);
+    let exact = "y".repeat(GATEWAY_CLIENT_BODY_CAP_BYTES);
+    let one_over = "z".repeat(GATEWAY_CLIENT_BODY_CAP_BYTES + 1);
+
+    for (label, body, expect_marker) in [
+        ("100 KB messages", joined_body, true),
+        ("100 KB raw text", big.clone(), true),
+        ("exactly the cap, raw", exact.clone(), false),
+        ("one byte over the cap, raw", one_over, true),
+    ] {
+        let mock = IgnitionMock::start().await;
+        Mock::given(method("PUT"))
+            .and(path(WRITE_PATH))
+            .respond_with(ResponseTemplate::new(422).set_body_raw(body.clone(), "text/plain"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+        let concrete = api_for(&mock);
+        let api: &dyn DeployApi = &concrete;
+        let err = api
+            .resource_update(
+                "ignition",
+                "database-connection",
+                &[update_item(DB_NAME, SENT_SIG)],
+            )
+            .await
+            .expect_err(label);
+        let CoreError::InvalidInput { reason } = err else {
+            panic!("{label}: expected invalid_input");
+        };
+        let (_, echoed) = reason
+            .split_once("): ")
+            .expect("the reason carries the echo");
+        assert!(
+            echoed.len()
+                <= GATEWAY_CLIENT_BODY_CAP_BYTES + GATEWAY_CLIENT_BODY_TRUNCATION_MARKER.len(),
+            "{label}: {} bytes",
+            echoed.len()
+        );
+        assert_eq!(
+            echoed.ends_with(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER),
+            expect_marker,
+            "{label}"
+        );
+        if !expect_marker {
+            assert_eq!(echoed, exact, "{label}: echoed whole");
+        }
+    }
+}
+
+/// The cap lives in classify's arm too: a 422 on a read of a resource path
+/// is capped the same way.
+#[tokio::test]
+async fn cap_422_body_is_truncated_on_a_read() {
+    let mock = IgnitionMock::start().await;
+    let big = "w".repeat(100 * 1024);
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/names/ignition/database-connection",
+        ))
+        .respond_with(ResponseTemplate::new(422).set_body_raw(big, "text/plain"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .resource_names("ignition", "database-connection")
+        .await
+        .expect_err("422");
+    let CoreError::InvalidInput { reason } = err else {
+        panic!("expected invalid_input");
+    };
+    assert!(reason.ends_with(GATEWAY_CLIENT_BODY_TRUNCATION_MARKER));
+    assert!(reason.len() < 4096 + 400, "{} bytes", reason.len());
 }
