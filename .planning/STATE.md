@@ -2,16 +2,18 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
+current_phase: 20
+current_phase_name: config-api-client
 status: executing
-stopped_at: Completed 20-03-PLAN.md
-last_updated: "2026-10-12T15:26:10.947Z"
+stopped_at: Completed 20-04-PLAN.md
+last_updated: "2026-10-12T15:48:04.469Z"
 last_activity: 2026-10-12
 progress:
-  total_phases: 1
+  total_phases: 6
   completed_phases: 0
   total_plans: 6
-  completed_plans: 3
-  percent: 50
+  completed_plans: 4
+  percent: 0
 ---
 
 # Project State
@@ -26,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 20 (config-api-client) — EXECUTING
-Plan: 4 of 6
+Plan: 5 of 6
 Status: Ready to execute
 Last activity: 2026-10-12
 
-Progress: [█████░░░░░] 50%
+Progress: [███████░░░] 67%
 
 ## Performance Metrics
 
@@ -46,6 +48,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 20 P01 | 35min | 2 tasks | 11 files |
 | Phase 20 P02 | 30min | 3 tasks | 7 files |
 | Phase 20 P03 | 50min | 2 tasks | 5 files |
+| Phase 20 P04 | 55min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -75,8 +78,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-12T15:26:10.935Z
-**Stopped At:** Completed 20-03-PLAN.md
+**Last session:** 2026-10-12T15:48:04.456Z
+**Stopped At:** Completed 20-04-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -88,3 +91,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 20-02: active_node decides by activityLevel only; role is configuration (C-S3 failover keeps Master fixed while activity moves)
 - [Phase ?]: 20-02: ResourceSignatureRejected carries only name, reason and endpoint; never a signature or gateway problem text
 - [Phase ?]: 20-03: D1 makes 409 the primary scan-lock refusal pin (408 mapped, enrichment-pinned); D4 added no scan-route classify arm; ScanStatus decisive fields required
+- [Phase ?]: 20-04: resource_list sees the effective view only (D7); named collections are listed by names then find?collection= (resource_list_in_collection); filters go out object-style field[op]=v
+- [Phase ?]: 20-04: stale signature (500 + 'signature mismatch') and missing signature (422 fieldName signature) are typed only in the deploy-scoped write guard, never in classify.rs

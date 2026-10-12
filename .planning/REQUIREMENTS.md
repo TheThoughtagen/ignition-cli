@@ -19,8 +19,8 @@ Numbering: new categories. **47 requirements.**
 
 ### Config API Client (library-only)
 
-- [ ] **DAPI-01**: The core library can list and read config resources by type and name, from the effective view or a named collection
-- [ ] **DAPI-02**: The core library can create config resources by POST and update them with the signature-checked array PUT; a stale or missing signature surfaces as its own error, never a generic failure *(amended 2026-10-12: create is POST per OpenAPI and the v1.1 capture of PUT-unknown-name → 404; confirmed on 8.3.6 by capture C3a)*
+- [x] **DAPI-01**: The core library can list and read config resources by type and name, from the effective view or a named collection
+- [x] **DAPI-02**: The core library can create config resources by POST and update them with the signature-checked array PUT; a stale or missing signature surfaces as its own error, never a generic failure *(amended 2026-10-12: create is POST per OpenAPI and the v1.1 capture of PUT-unknown-name → 404; confirmed on 8.3.6 by capture C3a)*
 - [x] **DAPI-03**: The core library can acquire the config scan-lock, read its remaining time, and detect expiry (200 JSON while held → 204 after) without comparing gateway timestamps to the local clock
 - [x] **DAPI-04**: The core library can trigger a config scan and decide completion by `scanActive == false` and `lastScanTimestamp` advanced on the same gateway — HTTP 200 alone is never success
 - [ ] **DAPI-05**: The core library can list and create deployment modes and reads the active `deploymentMode`, normalizing `null` and `""` to "no mode"
@@ -116,8 +116,8 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DAPI-01 | Phase 20 | Pending |
-| DAPI-02 | Phase 20 | Pending |
+| DAPI-01 | Phase 20 | Complete |
+| DAPI-02 | Phase 20 | Complete |
 | DAPI-03 | Phase 20 | Complete |
 | DAPI-04 | Phase 20 | Complete |
 | DAPI-05 | Phase 20 | Pending |
