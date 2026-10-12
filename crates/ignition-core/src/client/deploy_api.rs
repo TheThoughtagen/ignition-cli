@@ -5,7 +5,9 @@
 //! hand-written test doubles, and the deploy wire must not force a change
 //! on any of them. Every method here maps to exactly one [`EndpointDecl`]
 //! in [`DEPLOY_ENDPOINTS`], whose declared [`ResponseShape`] is enforced in
-//! one place, `send_shaped`. A state-changing call is confirmed by a
+//! one place, `send_shaped`. Only `id` and `shape` are read at runtime; the
+//! `method` and `path_template` columns are tied to what each method sends
+//! by the `wire_matches_the_endpoint_table` contract test. A state-changing call is confirmed by a
 //! follow-up read, never by its status: the scan POST's own 200 is a
 //! trigger-time snapshot (D4), and an acquire's 200 body adds nothing the
 //! info read does not give.

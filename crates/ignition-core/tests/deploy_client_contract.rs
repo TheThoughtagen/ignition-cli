@@ -2030,6 +2030,80 @@ async fn mode_name_validation_refuses_before_any_request() {
     assert!(requests_of(&mock).await.is_empty(), "nothing was sent");
 }
 
+/// WR-06: the `DEPLOY_ENDPOINTS` method and path columns are tied to the
+/// wire. Each trait method runs once against a catch-all mock, and the FIRST
+/// request it sent must carry the verb and path of its own row (templates
+/// filled with the values below). Every row must be exercised, so a new row
+/// without a call here, or a method that drifts from its row, fails.
+#[tokio::test]
+async fn wire_matches_the_endpoint_table() {
+    use ignition_core::client::deploy_api::{DEPLOY_ENDPOINTS, endpoint_decl};
+
+    const MODULE: &str = "ignition";
+    const TY: &str = "database-connection";
+    const NAME: &str = "DB";
+
+    macro_rules! row {
+        ($seen:ident, $id:literal, $api:ident => $call:expr) => {{
+            let mock = IgnitionMock::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .mount(&mock.server)
+                .await;
+            let concrete = api_for(&mock);
+            let $api: &dyn DeployApi = &concrete;
+            // Only the request matters; the answer may well fail to parse.
+            let _ = $call.await;
+            let first = requests_of(&mock)
+                .await
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{} sent no request", $id));
+            let row = endpoint_decl($id).unwrap_or_else(|| panic!("no row {}", $id));
+            let expected = row
+                .path_template
+                .replace("{module}", MODULE)
+                .replace("{type}", TY)
+                .replace("{name}", NAME)
+                .replace("{kind}", "config");
+            assert_eq!(first.method.as_str(), row.method, "{} verb", $id);
+            assert_eq!(first.url.path(), expected, "{} path", $id);
+            $seen.push($id);
+        }};
+    }
+
+    let mut seen: Vec<&str> = Vec::new();
+    row!(seen, "resource_names", api => api.resource_names(MODULE, TY));
+    row!(seen, "resource_list", api => api.resource_list(MODULE, TY, &ListQuery::default()));
+    row!(seen, "resource_find", api => api.resource_find(MODULE, TY, NAME, None));
+    row!(seen, "resource_singleton", api => api.resource_singleton(MODULE, TY, None));
+    row!(
+        seen,
+        "resource_create",
+        api => api.resource_create(MODULE, TY, &[ResourceCreate::new(NAME, config_value())])
+    );
+    row!(
+        seen,
+        "resource_update",
+        api => api.resource_update(MODULE, TY, &[update_item(NAME, SENT_SIG)])
+    );
+    row!(seen, "scan_lock_acquire", api => api.scan_lock_acquire(ScanKind::Config, 2, 5));
+    row!(seen, "scan_lock_info", api => api.scan_lock_info(ScanKind::Config));
+    row!(seen, "scan_status", api => api.scan_status(ScanKind::Config));
+    row!(seen, "scan_request", api => api.scan_request(ScanKind::Config));
+    row!(seen, "modes", api => api.modes());
+    row!(seen, "mode_create", api => api.mode_create(&production_mode()));
+    row!(seen, "deployment_mode", api => api.deployment_mode());
+
+    let mut declared: Vec<&str> = DEPLOY_ENDPOINTS.iter().map(|row| row.id).collect();
+    declared.sort_unstable();
+    seen.sort_unstable();
+    assert_eq!(
+        seen, declared,
+        "every declared row is exercised exactly once"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 20-05: the stateful fake gateway (FakeDeploy) and the shared scenario
 // ---------------------------------------------------------------------------
