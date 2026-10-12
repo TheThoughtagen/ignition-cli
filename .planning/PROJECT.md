@@ -67,6 +67,10 @@ Carry-forwards (tracked, not blockers):
 - ✓ Backups/EAM (gwbk download/restore, guarded EAM tasks) and opt-in script exec — v1.0
 - ✓ Ecosystem interop (decode/encode scripts, lint delegation, offline export browsing) — v1.0
 
+**v1.6 (in progress):**
+
+- ✓ Config API client (library-only): config resources with signature-checked PUT, scan-lock, scan completion, deployment modes; every endpoint capture-backed — Phase 20 (DAPI-01..07; `ign redundancy status` CLI wiring carried to Phase 24)
+
 ### Active
 
 v1.6 requirements are defined in `.planning/REQUIREMENTS.md` (deploy client, render, plan, apply/rollback/verify, projects).
@@ -127,6 +131,9 @@ v1.6 requirements are defined in `.planning/REQUIREMENTS.md` (deploy client, ren
 | **v1.1** One guarded-write gate site (`preview_then_confirm`); refusal message IS the deterministic preview | Per-verb gates drift; agents read the blast radius from stderr alone | ✓ Good — all six EAM verbs + edit + workspace push compose the identical refusal shape |
 | **v1.1** Fail-closed injective path mapping (percent-escaping, proptest-proven) + manifest-as-workspace-identity | Hostile names and case-folded filesystems are the clobber class; the manifest is the fs truth | ✓ Good — sabotage-proven tests; staleness/conflict gates NOT --yes-able |
 | **v1.1** Evidence-ledger discipline for human-verify checkpoints (VERIFIED / MACHINE-EVIDENCE / WAIVED) | Checkpoints must close honestly, never silently merged | ✓ Good — adopted at 14-06; carry-forward labels recorded per item |
+| **v1.6** Separate `DeployApi` trait with one stateful `FakeDeploy`, checked tag-for-tag against a live 8.3.6 run | Avoids editing 15 `GatewayApi` doubles; a single fake that later phases share must not encode guesses | ✓ Good — Phase 20 live trace equals fake trace (14 steps) after review fixes |
+| **v1.6** 8.3.6 wire truth overrides research and OpenAPI | Captures falsified 408-on-held-lock (→409 HTML), `filter=` syntax (→`field[op]=v`), a release route (none), and declared 400s (→500 NPE) | ✓ Good — D1-D12 in 20-LIVE-CAPTURES.md are the planning currency for Phases 21-25 |
+| **v1.6** Deploy refusals are typed per helper, never in generic `classify` | Keeps the v1.1 EAM exit contract frozen while deploy gets `scan_lock_held`, `resource_signature_rejected`, `resource_exists`, `mode_exists` (exit 6) | ✓ Good — `eam_contract` and `api_classify_contract` unchanged |
 
 ## Evolution
 
@@ -146,4 +153,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-10 at the start of milestone v1.6 Declared Gateway Deploy*
+*Last updated: 2026-10-12 after Phase 20*

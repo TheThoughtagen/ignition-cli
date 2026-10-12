@@ -83,7 +83,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 
 **Capture discipline:** each phase records its "Capture first" items in a `*-LIVE-CAPTURES.md` doc before the code that depends on them. Nothing still open is stated as fact in a success criterion. S5/C9 (a child project reading an inherited resource after its parent is overwritten) is OPEN. The Windows transport behaviors (sftp path form, quoting, key ACLs, the stdin hang, robocopy, sharing violations) are INFERRED until C7a and C7b are captured.
 
-- [ ] **Phase 20: Config API Client** — Library-only wire client for config resources, scan-lock, scan and deployment modes, with capture-proven success predicates *(DAPI-01..07)*
+- [x] **Phase 20: Config API Client** — Library-only wire client for config resources, scan-lock, scan and deployment modes, with capture-proven success predicates *(DAPI-01..07)* (completed 2026-10-12)
 - [ ] **Phase 21: Deploy Render** — `ign deploy render`: manifest plus mode overlay rendered to the gateway's on-disk layout; byte-faithful, deterministic, secret-safe and Windows-safe *(DRND-01..08, DSURF-01)*
 - [ ] **Phase 22: Transport, Plan, Pull & Verify** — Both transport halves (system OpenSSH and local filesystem); read-only `ign deploy plan`, `pull` and master `verify`; the verdict envelope *(DPLN-01..09, DSURF-04)*
 - [ ] **Phase 23: Guarded Apply & Rollback** — Single-gateway `ign deploy apply` and `rollback` under the scan-lock, with snapshot, auto-rollback, on-box journal and run store *(DAPL-01..10, DSURF-02, DSURF-03)*
@@ -337,7 +337,7 @@ Plans:
 | 17. Git Module Commissioning | v1.3 | 0/? | Parked behind v1.6 | — |
 | 18. Declared Rig Discovery | v1.3 | 0/? | Parked behind v1.6 | — |
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
-| 20. Config API Client | v1.6 | 6/6 | In Progress|  |
+| 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 0/? | Not started | — |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 0/? | Not started | — |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
