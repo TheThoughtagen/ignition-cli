@@ -120,7 +120,9 @@ pub struct Overview {
 /// `overview.redundancy` — `{role, activityLevel, projectState, …}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RedundancyInfo {
-    /// `"Independent"` / `"Backup"` / `"Primary"`, when reported.
+    /// `"Independent"` / `"Master"` / `"Backup"`, when reported. The
+    /// active node is decided by `activityLevel`
+    /// (`client::redundancy::active_node`), not by role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(

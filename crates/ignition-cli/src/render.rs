@@ -1638,9 +1638,8 @@ fn render_license_status_human(result: &LicenseStatusResult) {
 /// `ign redundancy status` human shape (09-04): role/peer/
 /// project-state/sync rows, then uptime + last-sync with the units
 /// AS CAPTURED (uptime = ms since gateway start, wall-clock-proven;
-/// lastSyncTimestamp = the -1 never-synced sentinel on fresh rigs —
-/// a non-negative value reads epoch-ms flagged as inference, never
-/// presented as proven).
+/// lastSyncTimestamp = the -1 never-synced sentinel on fresh rigs, and
+/// epoch-ms otherwise, proven by block C-S3 of 20-LIVE-CAPTURES.md).
 fn render_redundancy_status_human(result: &RedundancyStatusResult) {
     let status = &result.status;
     println!("role: {}", status.role);
@@ -1679,7 +1678,7 @@ fn render_redundancy_status_human(result: &RedundancyStatusResult) {
         );
     }
     match status.last_sync_epoch_ms() {
-        Some(ms) => println!("last sync: {ms} epoch-ms (unit inferred, not capture-proven)"),
+        Some(ms) => println!("last sync: {ms} epoch-ms"),
         None => println!("last sync: never (-1 sentinel)"),
     }
 }

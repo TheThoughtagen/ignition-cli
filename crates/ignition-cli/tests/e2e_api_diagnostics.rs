@@ -217,8 +217,8 @@ fn license_status_live() {
 /// captured vocabulary, `uptime` ms-since-gateway-start (wall-clock
 /// PROVEN twice on the captures — decision 4; a live value is
 /// therefore a non-negative number of millisecond magnitude), and
-/// `lastSyncTimestamp` where `-1` is the never-synced sentinel (unit
-/// NOT capture-proven — never interpreted here, only type-pinned).
+/// `lastSyncTimestamp` where `-1` is the never-synced sentinel (epoch-ms
+/// otherwise, block C-S3 — never interpreted here, only type-pinned).
 #[test]
 #[ignore = "opt-in e2e: set IGNITION_LIVE_URL + IGNITION_LIVE_TOKEN"]
 fn redundancy_status_live() {
@@ -237,14 +237,14 @@ fn redundancy_status_live() {
     assert_eq!(body["ok"], Value::Bool(true), "{body}");
     let status = &body["data"]["status"];
     assert!(status.is_object(), "data.status parses: {body}");
-    // Captured role vocabulary (§3): `Independent` observed live on
-    // both rigs; Primary/Backup are the configured-peer shapes that
-    // were not capturable on a fresh rig — the gate accepts the full
-    // captured set and refuses anything outside it (a NEW role string
-    // is point-release variance worth a capture, not a silent pass).
+    // Live role vocabulary: `Independent` observed on fresh rigs (09
+    // captures), `Master` and `Backup` on a live pair (block C-S3, the
+    // S3 spike, 2026-10-09). The gate accepts exactly those three and
+    // refuses anything outside them (a NEW role string is point-release
+    // variance worth a capture, not a silent pass).
     let role = status["role"].as_str().expect("role is a string");
     assert!(
-        ["Independent", "Primary", "Backup"].contains(&role),
+        ["Independent", "Master", "Backup"].contains(&role),
         "role within the captured vocabulary: {role}"
     );
     // UNITS per capture decision 4: uptime = ms since gateway start
@@ -252,9 +252,8 @@ fn redundancy_status_live() {
     // assert the type and non-negativity, never a hardcoded value.
     let uptime = status["uptime"].as_i64().expect("uptime is an integer");
     assert!(uptime >= 0, "uptime non-negative: {uptime}");
-    // The `-1` never-synced sentinel (§3): type-only pin — the unit
-    // is flagged INFERENCE in the model docs, so the gate never
-    // interprets the value.
+    // The `-1` never-synced sentinel (§3): type-only pin — the gate
+    // never interprets the value.
     assert!(
         status["lastSyncTimestamp"].is_i64(),
         "lastSyncTimestamp rides as an integer: {body}"

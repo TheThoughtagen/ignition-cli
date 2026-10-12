@@ -21,8 +21,9 @@ pub struct GatewayInfo {
     /// Gateway display name, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Redundancy role (`"Independent"` / `"Backup"` / `"Primary"`), when
-    /// reported.
+    /// Redundancy role (`"Independent"` / `"Master"` / `"Backup"`), when
+    /// reported. Configuration only: the active node is decided by
+    /// `activityLevel` (`client::redundancy::active_node`), not by role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy_role: Option<String>,
     /// Edition (`"standard"` / `"maker"` / …), when reported.
