@@ -244,7 +244,38 @@ Plans:
 
 **Capture first**: C4 (named, uuid-bearing vs singleton resource types: census from the prod `core` bootstrap, feeding the uuid rule table); C5 (hostile-name encoding in tag and resource directories, covering `:`, `?`, trailing dot, case collision, spaces and commas, against WHK01's 637 tag files); C3b (whether a stale or omitted `lastModificationSignature` loads, is rewritten or is flagged, and whether the gateway rewrites a hand-written `resource.json` after load); OQ1 (gateway-written bytes of `tags.json`, `udts.json` and `unary-resource.json`; the spike fixtures are synthetic); OQ4 (repo-path to collection-path mapping for tag-definition nesting and name depth); OQ8 (exact 8.3.6 JSON shape of Embedded vs Referenced secret fields). Also check `cargo tree` for `sha1` before choosing the uuid derivation.
 **Constraints**: Spec correction: preserve source key order. Spec §4 "sorted keys" is wrong; use an order-preserving node tree, Gson HTML-safe escaping, 2-space indent and no trailing newline, and rewrite a gateway file only when `write(parse(bytes)) == bytes`, otherwise copy it opaque. YAML via `yaml_serde` 0.10 (compiles on the 1.88 floor; not serde-saphyr); no `uuid` crate. The manifest and target schemas include `verify.tag_probes[]` (SF-8) and the target `ssh` block (SF-10) now, so strict parsing does not reject them in Phase 22. Overlays are add/override only; "absent in env" is documented, not built (SF-7). The render golden runs on `windows-latest`, and fixture `gateways/` trees carry no `\r`. `render` reaches the MCP catalog by clap derivation (Decision D).
-**Plans**: TBD
+**Plans**: 9 plans (waves: 1 = 21-01 ∥ 21-02 ∥ 21-03, 2 = 21-04, 3 = 21-05, 4 = 21-06, 5 = 21-07, 6 = 21-08, 7 = 21-09)
+
+Plans:
+**Wave 1**
+
+- [ ] 21-01-PLAN.md — Sanitized 183-file corpus (public-repo safe, stand-in jars with CR for D-01), OpenAPI resource-type/secret-field extract, fixture guard test, `-text` gitattributes
+- [ ] 21-02-PLAN.md — Live captures on the 8.3.6 rig: D-03 v8-uuid load check, C3b, C4, OQ8, OQ1 tag bytes, OQ4 tag mapping, C5 hostile names (Linux only, D-04); Decisions CD1–CD7
+- [ ] 21-03-PLAN.md — `deploy_tree_invalid` + `embedded_secret` in ONE four-place commit; `yaml_serde` strict parse with file:line:column; manifest/target schemas (SF-8, SF-10)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 21-04-PLAN.md — Tracer: `ign deploy render --env` end to end (allowlist + D-02 refusal, `render_sha256` golden), TUI row, README, deploy family coverage test, MCP exposure
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 21-05-PLAN.md — Order-preserving Node + Gson writer, identity gate (gateway-format vs opaque), corpus byte-fidelity on all OSes
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 21-06-PLAN.md — `modes/<env>/` overlay, `tags/` mapping (CD5), deny security singletons, refuse `config-mode.json` and dot-names (`.gitkeep` skipped)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 21-07-PLAN.md — Evidence-backed type rule table and sha2 version-8 name-based `attributes.uuid` (D-03, live vector CD1)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 21-08-PLAN.md — Lints: `embedded_secret` (paths only, canaries), case-fold, Windows names, path budget, CR in text members only (D-01)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 21-09-PLAN.md — `--out` clobber ladder + `render.json` marker (never deletes); phase closure: five CI gates, installed-binary smoke
 
 ### Phase 22: Transport, Plan, Pull & Verify
 
@@ -338,7 +369,7 @@ Plans:
 | 18. Declared Rig Discovery | v1.3 | 0/? | Parked behind v1.6 | — |
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
-| 21. Deploy Render | v1.6 | 0/? | Not started | — |
+| 21. Deploy Render | v1.6 | 0/9 | Planned | — |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 0/? | Not started | — |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
