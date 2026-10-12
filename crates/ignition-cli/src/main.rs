@@ -2824,6 +2824,17 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 if let Err(err) = actions::jvm::validate_sample_options(&opts) {
                     return (None, Err(err));
                 }
+                // The gate rides pre-resolution TOO (review finding):
+                // without it, --follow would print the profiling
+                // banner + profile header for a run the first window
+                // then refused. The action keeps its own gate (the
+                // TUI's enforcement); this copy keeps the refusal
+                // usage-clean (exit 2, profile null, zero output).
+                if let Err(err) =
+                    actions::jvm::require_risk_acceptance(i_accept_the_risk, "jvm sample")
+                {
+                    return (None, Err(err));
+                }
                 match Session::resolve(cli.profile.as_deref()) {
                     Ok(session) if follow => {
                         // CONTINUOUS MODE (the `logs -f` streaming
@@ -2897,6 +2908,14 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         },
                     };
                     if let Err(err) = actions::jvm::validate_jfr_start_options(&opts) {
+                        return (None, Err(err));
+                    }
+                    // Same pre-resolution gate as `sample` (usage
+                    // leads: exit 2, profile null, zero output); the
+                    // action's own gate stays the TUI's enforcement.
+                    if let Err(err) =
+                        actions::jvm::require_risk_acceptance(i_accept_the_risk, "jvm jfr start")
+                    {
                         return (None, Err(err));
                     }
                     match Session::resolve(cli.profile.as_deref()) {

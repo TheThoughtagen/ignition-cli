@@ -567,14 +567,27 @@ if _size > __MAX_BYTES__:
         'tooLarge': True, 'data': None, 'deleted': False,
     })
 else:
-    _fh = open(_path, 'rb')
-    _raw = _fh.read()
-    _fh.close()
+    # The dump holds JVM memory contents: a failed read/encode must
+    # NOT strand it on the gateway (review finding — the old
+    # read-then-delete sequence left the file with its path
+    # unreported). Delete in the failure path and name the path in
+    # the raised error as the last-resort breadcrumb.
     import base64
+    try:
+        _fh = open(_path, 'rb')
+        try:
+            _raw = _fh.read()
+        finally:
+            _fh.close()
+        _b64 = base64.b64encode(_raw)
+    except Exception as _e:
+        _cleaned = _f.delete()
+        raise Exception('jfr dump fetch failed at ' + _path +
+            ' (gateway-side delete: ' + str(_cleaned) + '): ' + str(_e))
     _deleted = _f.delete()
     _result = system.util.jsonEncode({
         'remoteFile': _path, 'bytes': _size,
-        'tooLarge': False, 'data': base64.b64encode(_raw),
+        'tooLarge': False, 'data': _b64,
         'deleted': bool(_deleted),
     })
 "#;

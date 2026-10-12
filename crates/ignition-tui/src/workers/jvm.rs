@@ -173,6 +173,14 @@ pub const WATCH_WINDOW_SECS: u64 = 10;
 /// open-ended loop earns a gentler cadence).
 pub const WATCH_INTERVAL_MS: u64 = 50;
 
+/// The retry backoff after a FAILED window (review finding): fast
+/// failures — config errors, `script_exec_not_configured`, auth, an
+/// unreachable gateway — return in milliseconds, and a naive loop
+/// would hammer the failing gateway with requests, config reloads,
+/// and unbounded JvmWatchTick events. Five seconds keeps the retry
+/// honest; the wait rides `select!` so a stop lands at once.
+pub const WATCH_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `w` — the CONTINUOUS sampler: bounded windows back-to-back, each
 /// landing as a [`AppEvent::JvmWatchTick`] that refreshes the result
 /// pane. The tail's conventions: a `watch<bool>` shutdown channel
@@ -223,11 +231,22 @@ pub fn spawn_jvm_watch(state: &mut AppState) {
                     biased;
                     _ = shutdown_rx.changed() => break,
                     res = window => {
+                        let failed = res.is_err();
                         let result = res
                             .map(|value| sample_lines(&value))
                             .map_err(|err| err.to_string());
                         if tx.send(AppEvent::JvmWatchTick { era, result }).is_err() {
                             break;
+                        }
+                        if failed {
+                            // Back off after a fast failure — the
+                            // wait rides select! so a stop lands at
+                            // once (the WATCH_ERROR_BACKOFF doc).
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.changed() => break,
+                                _ = tokio::time::sleep(WATCH_ERROR_BACKOFF) => {}
+                            }
                         }
                     }
                 }
