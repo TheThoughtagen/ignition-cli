@@ -24,8 +24,10 @@
 //!   a trigger-time snapshot (`scanActive: true`, OLD timestamp) and is
 //!   never completion (D4).
 
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 /// Which scan surface a lock or scan call addresses. The live OpenAPI
 /// declares both kinds (C1h); only `config` was exercised live, so
@@ -51,6 +53,11 @@ impl ScanKind {
 /// `/data/api/v1/scan-lock/{kind}` (GET info, POST acquire).
 pub fn scan_lock_path(kind: ScanKind) -> String {
     format!("/data/api/v1/scan-lock/{}", kind.as_str())
+}
+
+/// `/data/api/v1/scan/{kind}` (GET status, POST trigger).
+pub fn scan_path(kind: ScanKind) -> String {
+    format!("/data/api/v1/scan/{}", kind.as_str())
 }
 
 /// POST body of a lock acquire. Field order is the wire order, so the
@@ -135,10 +142,64 @@ pub fn lock_verdict(obs: &LockObservation, margin_s: i64) -> LockVerdict {
     }
 }
 
+/// Body of `GET scan/{kind}` (C1i). The two fields that decide completion
+/// are required: a reading without them is a loud parse error, never a
+/// default that could read as "complete". Unknown keys ride in `extra`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanStatus {
+    /// True while a scan runs.
+    #[serde(rename = "scanActive")]
+    pub scan_active: bool,
+    /// Epoch-ms of the last scan's end, on the GATEWAY clock.
+    #[serde(rename = "lastScanTimestamp")]
+    pub last_scan_timestamp: i64,
+    /// Milliseconds the last scan took.
+    #[serde(
+        rename = "lastScanDuration",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_scan_duration: Option<i64>,
+    /// Keys this client does not model.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// True exactly when `now` is not active and its timestamp is greater than
+/// `before`'s. Both readings must come from the same gateway: they are
+/// never compared with local time or with another node's value.
+pub fn scan_complete(before: &ScanStatus, now: &ScanStatus) -> bool {
+    !now.scan_active && now.last_scan_timestamp > before.last_scan_timestamp
+}
+
+/// How a scan wait ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanOutcome {
+    /// Inactive with an advanced timestamp; carries that final reading.
+    Complete(ScanStatus),
+    /// The budget ran out first. A trigger answering 200 is not success:
+    /// this is what a scan that never advances reports.
+    NotComplete {
+        /// The last reading taken.
+        last: ScanStatus,
+        /// How long the wait ran.
+        waited: Duration,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn status(active: bool, ts: i64) -> ScanStatus {
+        ScanStatus {
+            scan_active: active,
+            last_scan_timestamp: ts,
+            last_scan_duration: None,
+            extra: BTreeMap::new(),
+        }
+    }
 
     fn held(timestamp: Option<i64>, remaining: i64) -> LockObservation {
         LockObservation::Held(ScanLockInfo {
@@ -147,6 +208,15 @@ mod tests {
             actor: Some("api-token:cap-a:192.168.97.1".to_string()),
             extra: BTreeMap::new(),
         })
+    }
+
+    #[test]
+    fn scan_complete_truth_table() {
+        let before = status(false, 100);
+        assert!(!scan_complete(&before, &status(true, 100)));
+        assert!(!scan_complete(&before, &status(false, 100)));
+        assert!(scan_complete(&before, &status(false, 101)));
+        assert!(!scan_complete(&before, &status(true, 101)));
     }
 
     #[test]
@@ -215,6 +285,15 @@ mod tests {
         .expect("C1c parses");
         assert_eq!(info.remaining, 59);
         assert_eq!(info.timestamp, Some(380_308_558));
+        // C1i idle body, verbatim.
+        let idle: ScanStatus = serde_json::from_str(
+            "{\n  \"scanActive\": false,\n  \"lastScanTimestamp\": 1791815654089,\n  \"lastScanDuration\": 2081\n}",
+        )
+        .expect("C1i parses");
+        assert!(!idle.scan_active);
+        assert_eq!(idle.last_scan_timestamp, 1_791_815_654_089);
+        // A status without the deciding fields is refused, not defaulted.
+        assert!(serde_json::from_str::<ScanStatus>("{}").is_err());
     }
 
     #[test]
@@ -223,5 +302,6 @@ mod tests {
             scan_lock_path(ScanKind::Projects),
             "/data/api/v1/scan-lock/projects"
         );
+        assert_eq!(scan_path(ScanKind::Config), "/data/api/v1/scan/config");
     }
 }

@@ -11,10 +11,16 @@
 mod common;
 
 use common::IgnitionMock;
-use ignition_core::client::scan::{LockObservation, LockVerdict, ScanKind, lock_verdict};
+use std::time::Duration;
+
+use ignition_core::client::deploy_api::scan_and_wait;
+use ignition_core::client::scan::{
+    LockObservation, LockVerdict, ScanKind, ScanOutcome, lock_verdict,
+};
 use ignition_core::client::{DeployApi, ReqwestGatewayApi};
 use ignition_core::config::{Credential, Secret};
 use ignition_core::error::CoreError;
+use ignition_core::poll::PollConfig;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -299,4 +305,251 @@ async fn lock_projects_refusal_names_the_projects_kind() {
         .expect_err("refused");
     let (_, kind, _) = held_parts(err);
     assert_eq!(kind, "projects");
+}
+
+// ---- scan completion (Task 2) ----
+
+const SCAN_CONFIG: &str = "/data/api/v1/scan/config";
+
+/// C1i, sub-block "GET idle": no scan running, timestamp 1791815654089.
+const C1I_IDLE: &str = "{\n  \"scanActive\": false,\n  \"lastScanTimestamp\": 1791815654089,\n  \"lastScanDuration\": 2081\n}";
+
+/// C1i, sub-block "POST scan #1": the trigger-time snapshot, `scanActive`
+/// true with the OLD timestamp. Never completion (D4).
+const C1I_POST_SNAPSHOT: &str = "{\n  \"scanActive\": true,\n  \"lastScanTimestamp\": 1791815654089,\n  \"lastScanDuration\": 2081\n}";
+
+/// C1i, poll sub-block `t+1s`: the scan finished, timestamp advanced.
+const C1I_DONE: &str = "{\n  \"scanActive\": false,\n  \"lastScanTimestamp\": 1791815676996,\n  \"lastScanDuration\": 582\n}";
+
+/// C1j, poll sub-block `t+1s`: a later finished scan, timestamp advanced again.
+const C1J_DONE: &str = "{\n  \"scanActive\": false,\n  \"lastScanTimestamp\": 1791815677748,\n  \"lastScanDuration\": 246\n}";
+
+const TS_IDLE: i64 = 1_791_815_654_089;
+const TS_DONE: i64 = 1_791_815_676_996;
+const TS_DONE_2: i64 = 1_791_815_677_748;
+
+fn fast_poll(deadline_ms: u64) -> PollConfig {
+    PollConfig {
+        subject: "scan test".to_string(),
+        interval: Duration::from_millis(20),
+        max: Duration::from_millis(20),
+        deadline: Duration::from_millis(deadline_ms),
+    }
+}
+
+/// Count the received requests of one method on one path.
+async fn count_requests(mock: &IgnitionMock, verb: &str, on: &str) -> usize {
+    mock.server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter(|req| req.method.as_str() == verb && req.url.path() == on)
+        .count()
+}
+
+/// DAPI-04 / T-20-11 (C1i, D4): the trigger answers 200 but the status
+/// never advances. The wait reports NotComplete, never Complete, never Err,
+/// and the POST was sent exactly once.
+#[tokio::test]
+async fn scan_trigger_200_but_status_never_advances_is_not_complete() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(json(200, C1I_IDLE))
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(json(200, C1I_POST_SNAPSHOT))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let api: &dyn DeployApi = &concrete;
+    let outcome = scan_and_wait(api, ScanKind::Config, fast_poll(300))
+        .await
+        .expect("a slow scan is not an error");
+
+    match outcome {
+        ScanOutcome::NotComplete { last, waited } => {
+            assert_eq!(last.last_scan_timestamp, TS_IDLE);
+            assert!(!last.scan_active);
+            assert!(
+                waited >= Duration::from_millis(300),
+                "waited the whole budget: {waited:?}"
+            );
+        }
+        other => panic!("expected NotComplete, got {other:?}"),
+    }
+    assert_eq!(count_requests(&mock, "POST", SCAN_CONFIG).await, 1);
+}
+
+/// DAPI-04: idle(T), active(T), then inactive with an advanced timestamp
+/// is Complete carrying that final reading. The sequence is C1i bodies.
+#[tokio::test]
+async fn scan_complete_requires_inactive_and_advanced() {
+    let mock = IgnitionMock::start().await;
+    for (body, times) in [(C1I_IDLE, 1), (C1I_POST_SNAPSHOT, 1)] {
+        Mock::given(method("GET"))
+            .and(path(SCAN_CONFIG))
+            .respond_with(json(200, body))
+            .up_to_n_times(times)
+            .mount(&mock.server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(json(200, C1I_DONE))
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(json(200, C1I_POST_SNAPSHOT))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let api: &dyn DeployApi = &concrete;
+    let outcome = scan_and_wait(api, ScanKind::Config, fast_poll(5_000))
+        .await
+        .expect("scan completes");
+    match outcome {
+        ScanOutcome::Complete(done) => assert_eq!(done.last_scan_timestamp, TS_DONE),
+        other => panic!("expected Complete, got {other:?}"),
+    }
+}
+
+/// D4 / Pitfall 3: a scan already active when the pre-trigger status is
+/// read is waited out BEFORE the trigger, and its completion is never
+/// counted as ours. Sequence: active(T0), inactive(T1), [POST], inactive(T1),
+/// inactive(T2); the result carries T2, and the POST follows the first
+/// inactive read.
+#[tokio::test]
+async fn scan_foreign_scan_active_at_before_is_not_counted() {
+    let mock = IgnitionMock::start().await;
+    for (body, times) in [(C1I_POST_SNAPSHOT, 1), (C1I_DONE, 2)] {
+        Mock::given(method("GET"))
+            .and(path(SCAN_CONFIG))
+            .respond_with(json(200, body))
+            .up_to_n_times(times)
+            .mount(&mock.server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(json(200, C1J_DONE))
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(json(200, C1I_POST_SNAPSHOT))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let api: &dyn DeployApi = &concrete;
+    let outcome = scan_and_wait(api, ScanKind::Config, fast_poll(5_000))
+        .await
+        .expect("scan completes");
+    match outcome {
+        ScanOutcome::Complete(done) => assert_eq!(
+            done.last_scan_timestamp, TS_DONE_2,
+            "the foreign scan's completion (T1) was not counted"
+        ),
+        other => panic!("expected Complete, got {other:?}"),
+    }
+
+    let verbs: Vec<String> = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .map(|req| req.method.to_string())
+        .collect();
+    assert_eq!(
+        verbs[..3],
+        ["GET", "GET", "POST"],
+        "the POST follows the first inactive read: {verbs:?}"
+    );
+}
+
+/// D4 (C1i, "cap-b POST scan while cap-a holds the lock"): the lock does
+/// not block another actor's scan. The POST answers 200 and is accepted
+/// (no classify arm on the scan route), the trigger body is ignored, and
+/// the lock then reads free because a scan releases it (D12).
+#[tokio::test]
+async fn scan_by_other_actor_while_lock_held() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(SCAN_CONFIG))
+        .and(header("X-Ignition-API-Token", "cap-b:tokengeneratedlive"))
+        .respond_with(json(200, C1I_POST_SNAPSHOT))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(LOCK_CONFIG))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let cap_b = ReqwestGatewayApi::for_tests(
+        &mock.uri(),
+        Some(Credential::Token(Secret::new("cap-b:tokengeneratedlive"))),
+    );
+    let api: &dyn DeployApi = &cap_b;
+    api.scan_request(ScanKind::Config)
+        .await
+        .expect("the held lock does not refuse a scan");
+    assert_eq!(
+        api.scan_lock_info(ScanKind::Config).await.expect("lock"),
+        LockObservation::Free,
+        "the scan released the lock"
+    );
+}
+
+/// The status read parses the captured idle body and rides the token.
+#[tokio::test]
+async fn scan_status_parses_the_captured_body() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/scan/projects"))
+        .and(header("X-Ignition-API-Token", "cap-a:tokengeneratedlive"))
+        .respond_with(json(200, C1I_IDLE))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let concrete = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let api: &dyn DeployApi = &concrete;
+    let status = api.scan_status(ScanKind::Projects).await.expect("status");
+    assert!(!status.scan_active);
+    assert_eq!(status.last_scan_timestamp, TS_IDLE);
+    assert_eq!(status.last_scan_duration, Some(2081));
+}
+
+/// An auth failure during the wait fails fast and never reaches the
+/// trigger POST.
+#[tokio::test]
+async fn scan_wait_auth_failure_fails_fast_without_posting() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("GET"))
+        .and(path(SCAN_CONFIG))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock.server)
+        .await;
+
+    let concrete = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let api: &dyn DeployApi = &concrete;
+    let err = scan_and_wait(api, ScanKind::Config, fast_poll(5_000))
+        .await
+        .expect_err("a rejected token cannot succeed");
+    assert!(matches!(err, CoreError::Auth { .. }), "{err:?}");
+    assert_eq!(count_requests(&mock, "POST", SCAN_CONFIG).await, 0);
 }

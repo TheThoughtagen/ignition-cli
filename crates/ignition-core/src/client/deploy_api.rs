@@ -16,13 +16,17 @@
 //! included: a repeated non-idempotent call against a production gateway
 //! is never silent. The poll engine wraps only the GET probes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
 use crate::client::ReqwestGatewayApi;
-use crate::client::scan::{LockObservation, LockRequest, ScanKind, ScanLockInfo, scan_lock_path};
+use crate::client::scan::{
+    LockObservation, LockRequest, ScanKind, ScanLockInfo, ScanOutcome, ScanStatus, scan_complete,
+    scan_lock_path, scan_path,
+};
 use crate::error::CoreError;
+use crate::poll::{self, PollConfig, PollState};
 
 /// Added to `acquireTimeout` for the per-request client timeout, so a
 /// gateway that does wait out the acquire window answers before the client
@@ -78,6 +82,20 @@ pub const DEPLOY_ENDPOINTS: &[EndpointDecl] = &[
         shape: ResponseShape::JsonOrNoContent,
         capture_ref: "C1c",
     },
+    EndpointDecl {
+        id: "scan_status",
+        method: "GET",
+        path_template: "/data/api/v1/scan/{kind}",
+        shape: ResponseShape::Json,
+        capture_ref: "C1i",
+    },
+    EndpointDecl {
+        id: "scan_request",
+        method: "POST",
+        path_template: "/data/api/v1/scan/{kind}",
+        shape: ResponseShape::EmptyOk,
+        capture_ref: "C1i",
+    },
 ];
 
 /// Look a declared endpoint up by id.
@@ -118,6 +136,17 @@ pub trait DeployApi: Send + Sync {
     /// Read the scan-lock (`scan_lock_info`, capture C1c): 200 with a body
     /// is `Held`, 204 is `Free`.
     async fn scan_lock_info(&self, kind: ScanKind) -> Result<LockObservation, CoreError>;
+
+    /// Read the scan state (`scan_status`, capture C1i).
+    async fn scan_status(&self, kind: ScanKind) -> Result<ScanStatus, CoreError>;
+
+    /// Trigger a scan (`scan_request`, capture C1i). The POST answering 200
+    /// is NEVER completion: its body is a trigger-time snapshot (D4), so it
+    /// is ignored; completion comes from [`DeployApi::scan_status`] via
+    /// `scan_complete`. The scan-lock does not block another actor's scan
+    /// (D4: a non-holder's POST answered 200 and ran), so no refusal is
+    /// classified on this route. The POST is sent once per call.
+    async fn scan_request(&self, kind: ScanKind) -> Result<(), CoreError>;
 }
 
 /// A 2xx body after the declared shape was enforced.
@@ -242,6 +271,148 @@ impl DeployApi for ReqwestGatewayApi {
             ))),
         }
     }
+
+    async fn scan_status(&self, kind: ScanKind) -> Result<ScanStatus, CoreError> {
+        let decl = decl("scan_status")?;
+        let url = self.url_for(&scan_path(kind));
+        let request = self.apply_auth(self.client.get(url.clone()));
+        match self.send_shaped(decl, request, &url).await? {
+            ShapedBody::Json(text) => parse_json(decl, &url, &text),
+            ShapedBody::Empty | ShapedBody::NoContent => Err(CoreError::Internal(format!(
+                "endpoint {} produced no body",
+                decl.id
+            ))),
+        }
+    }
+
+    async fn scan_request(&self, kind: ScanKind) -> Result<(), CoreError> {
+        let decl = decl("scan_request")?;
+        let url = self.url_for(&scan_path(kind));
+        let request = self.apply_auth(self.client.post(url.clone()));
+        self.send_shaped(decl, request, &url).await.map(|_| ())
+    }
+}
+
+/// Everything a wait probe reads, owned by the poll loop.
+#[derive(Clone, Copy)]
+struct WaitCtx<'a> {
+    api: &'a dyn DeployApi,
+    kind: ScanKind,
+    started: Instant,
+    budget: Duration,
+    /// The pre-trigger reading; `None` during the first phase.
+    before: Option<&'a ScanStatus>,
+}
+
+/// What one wait phase reached.
+enum Waited {
+    /// The phase's condition was met; carries the reading that met it.
+    Reached(ScanStatus),
+    /// The budget ran out first; carries the last reading.
+    OutOfBudget(ScanStatus),
+}
+
+/// Trigger a scan and wait until it is done: `scanActive` is false and
+/// `lastScanTimestamp` exceeds the pre-trigger value read from the same
+/// gateway. An HTTP 200 on the trigger is never success on its own.
+///
+/// Steps: read the status; if a scan is already active, wait it out BEFORE
+/// triggering, so its completion is never counted as ours (D4); POST the
+/// trigger exactly once; then poll the status until
+/// [`scan_complete`]. The budget is `cfg.deadline`, measured here with a
+/// local monotonic clock; a gateway timestamp is never compared with it.
+/// When the budget runs out the answer is `Ok(NotComplete)`, not an error.
+///
+/// `crate::poll::poll` drives both waits, so transient network and
+/// restarting answers are retried and an auth failure fails fast. The
+/// probe owns the budget check, and poll's own deadline (budget plus two
+/// intervals) is only a transport backstop, so `Err` means a transport or
+/// auth failure, not a slow scan.
+pub async fn scan_and_wait(
+    api: &dyn DeployApi,
+    kind: ScanKind,
+    cfg: PollConfig,
+) -> Result<ScanOutcome, CoreError> {
+    let started = Instant::now();
+    let budget = cfg.deadline;
+    let backstop = budget.saturating_add(cfg.interval.saturating_mul(2));
+    let poll_cfg = PollConfig {
+        deadline: backstop,
+        ..cfg
+    };
+
+    // The probe state carries every borrow: poll lends the probe a
+    // `&mut` of it, which ties the borrows' lifetimes to the poll call.
+    let mut ctx = WaitCtx {
+        api,
+        kind,
+        started,
+        budget,
+        before: None,
+    };
+
+    // Phase 1: the pre-trigger reading, taken while no scan is active.
+    let before = match poll::poll(poll_cfg.clone(), ctx, |ctx| {
+        Box::pin(async move {
+            let status = ctx.api.scan_status(ctx.kind).await?;
+            if !status.scan_active {
+                return Ok(PollState::Done(Waited::Reached(status)));
+            }
+            if ctx.started.elapsed() >= ctx.budget {
+                return Ok(PollState::Done(Waited::OutOfBudget(status)));
+            }
+            Ok(PollState::Pending(Some(
+                "a scan is already active — waiting it out before triggering".to_string(),
+            )))
+        })
+    })
+    .await?
+    {
+        Waited::Reached(before) => before,
+        Waited::OutOfBudget(last) => {
+            return Ok(ScanOutcome::NotComplete {
+                last,
+                waited: started.elapsed(),
+            });
+        }
+    };
+
+    // Exactly one trigger POST, never retried.
+    api.scan_request(kind).await?;
+
+    // Phase 2: wait for inactive plus an advanced timestamp.
+    ctx = WaitCtx {
+        before: Some(&before),
+        ..ctx
+    };
+    let outcome = poll::poll(poll_cfg, ctx, |ctx| {
+        Box::pin(async move {
+            let now = ctx.api.scan_status(ctx.kind).await?;
+            let Some(before) = ctx.before else {
+                return Err(CoreError::Internal(
+                    "scan wait lost its pre-trigger reading".to_string(),
+                ));
+            };
+            if scan_complete(before, &now) {
+                return Ok(PollState::Done(Waited::Reached(now)));
+            }
+            if ctx.started.elapsed() >= ctx.budget {
+                return Ok(PollState::Done(Waited::OutOfBudget(now)));
+            }
+            Ok(PollState::Pending(Some(format!(
+                "scanActive {} lastScanTimestamp {} (before {})",
+                now.scan_active, now.last_scan_timestamp, before.last_scan_timestamp
+            ))))
+        })
+    })
+    .await?;
+    Ok(match outcome {
+        Waited::Reached(now) => ScanOutcome::Complete(now),
+        Waited::OutOfBudget(last) => ScanOutcome::NotComplete {
+            last,
+            waited: started.elapsed(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -251,7 +422,7 @@ mod tests {
     /// The rows copied from the 20-LIVE-CAPTURES Endpoint shapes table.
     #[test]
     fn endpoint_rows_match_the_capture_table() {
-        let expected: [(&str, &str, &str, ResponseShape, &str); 2] = [
+        let expected: [(&str, &str, &str, ResponseShape, &str); 4] = [
             (
                 "scan_lock_acquire",
                 "POST",
@@ -265,6 +436,20 @@ mod tests {
                 "/data/api/v1/scan-lock/{kind}",
                 ResponseShape::JsonOrNoContent,
                 "C1c",
+            ),
+            (
+                "scan_status",
+                "GET",
+                "/data/api/v1/scan/{kind}",
+                ResponseShape::Json,
+                "C1i",
+            ),
+            (
+                "scan_request",
+                "POST",
+                "/data/api/v1/scan/{kind}",
+                ResponseShape::EmptyOk,
+                "C1i",
             ),
         ];
         assert_eq!(DEPLOY_ENDPOINTS.len(), expected.len());
@@ -281,7 +466,12 @@ mod tests {
     /// Every id a method of this file asks for resolves.
     #[test]
     fn every_method_id_is_declared() {
-        for id in ["scan_lock_acquire", "scan_lock_info"] {
+        for id in [
+            "scan_lock_acquire",
+            "scan_lock_info",
+            "scan_status",
+            "scan_request",
+        ] {
             assert!(decl(id).is_ok(), "{id}");
         }
     }
