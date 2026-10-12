@@ -110,15 +110,14 @@ async fn lock_held_names_the_holder_from_the_captured_body() {
     );
 }
 
-/// D1 declares 408 as well as 409 on this route, so a refusal with an
-/// empty body takes the one-shot enrichment path: the actor comes from a
+/// A 409 whose body names no holder takes the one-shot enrichment path: the actor comes from a
 /// single follow-up GET (C1c body), and the POST is never re-sent.
 #[tokio::test]
 async fn lock_held_without_actor_is_enriched_from_lock_info() {
     let mock = IgnitionMock::start().await;
     let post_guard = Mock::given(method("POST"))
         .and(path(LOCK_CONFIG))
-        .respond_with(ResponseTemplate::new(408))
+        .respond_with(ResponseTemplate::new(409))
         .expect(1)
         .mount_as_scoped(&mock.server)
         .await;
@@ -146,6 +145,28 @@ async fn lock_held_without_actor_is_enriched_from_lock_info() {
     );
 }
 
+/// WR-02: a 408 is not capture-proven and a proxy or idle timeout can
+/// produce one with no lock held, so it is never `scan_lock_held`: it falls
+/// to the generic unexpected-status error, with no enrichment read.
+#[tokio::test]
+async fn lock_408_is_not_scan_lock_held() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(LOCK_CONFIG))
+        .respond_with(ResponseTemplate::new(408))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = ReqwestGatewayApi::for_tests(&mock.uri(), Some(token_credential()));
+    let api: &dyn DeployApi = &concrete;
+    let err = api
+        .scan_lock_acquire(ScanKind::Config, 2, 5)
+        .await
+        .expect_err("a 408 is not a held lock");
+    assert_ne!(err.code(), "scan_lock_held", "{err}");
+    assert_eq!(requests_of(&mock).await.len(), 1, "no enrichment read");
+}
+
 /// A refusal whose enrichment read fails still reports the held lock,
 /// with no actor: the held signal is never masked.
 #[tokio::test]
@@ -153,7 +174,7 @@ async fn lock_held_survives_a_failed_enrichment() {
     let mock = IgnitionMock::start().await;
     Mock::given(method("POST"))
         .and(path(LOCK_CONFIG))
-        .respond_with(ResponseTemplate::new(408))
+        .respond_with(ResponseTemplate::new(409))
         .expect(1)
         .mount(&mock.server)
         .await;

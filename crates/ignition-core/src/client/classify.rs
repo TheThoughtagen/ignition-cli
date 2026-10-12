@@ -18,10 +18,12 @@
 //! 6. Anything else → `Internal`, enriched with the Jetty HTML page's
 //!    own title/message when the body is HTML (see [`html_error_parts`]).
 //!
-//! **409/408 on the scan-lock route** (`/data/api/v1/scan-lock/`) →
+//! **409 on the scan-lock route** (`/data/api/v1/scan-lock/`) →
 //! `ScanLockHeld` (exit 6) naming the holder scraped from the Jetty page
 //! (live 8.3.6, 20-LIVE-CAPTURES D1). Route-scoped via the URL; it runs
-//! with the other route-scoped 409 arms, after the 404 arm.
+//! with the other route-scoped 409 arms, after the 404 arm. A 408 is NOT
+//! mapped: it never appeared live, and a proxy or idle timeout produces
+//! one with no lock held (20-REVIEW WR-02), so it keeps the fallback.
 //!
 //! **6b.** api-call path + unclassified 4xx → `GatewayClientError` (exit
 //! 2, verbatim body): the `api_call` parameter scopes this arm to the raw
@@ -113,16 +115,17 @@ pub(crate) async fn classify(
         S::NOT_FOUND => Err(CoreError::NotFound {
             endpoint: Some(url.to_string()),
         }),
-        // 409 or 408 on the SCAN-LOCK route only (20-03, DAPI-07):
-        // another actor holds the gateway's scan-lock. Live 8.3.6
-        // answers a competing acquire with an immediate 409 and Jetty's
-        // stock HTML page naming the holder (20-LIVE-CAPTURES D1, C1e);
-        // the same-token re-acquire is the same 409 (D2). The OpenAPI
-        // also declares 408 ("Unable to acquire lock within timeout"),
-        // never observed live, so both map to the same error. The
+        // 409 on the SCAN-LOCK route only (20-03, DAPI-07): another actor
+        // holds the gateway's scan-lock. Live 8.3.6 answers a competing
+        // acquire with an immediate 409 and Jetty's stock HTML page naming
+        // the holder (20-LIVE-CAPTURES D1, C1e); the same-token re-acquire
+        // is the same 409 (D2). The OpenAPI also declares a 408 ("Unable to
+        // acquire lock within timeout") that was never observed live; a
+        // proxy or idle timeout produces one on any verb with no lock held,
+        // so it is deliberately not mapped here (20-REVIEW WR-02). The
         // holder is scraped from the page and the body is never echoed;
         // a refusal that names no holder is enriched by the caller.
-        S::CONFLICT | S::REQUEST_TIMEOUT if is_scan_lock_url(url) => {
+        S::CONFLICT if is_scan_lock_url(url) => {
             let body = resp.text().await.unwrap_or_default();
             Err(CoreError::ScanLockHeld {
                 actor: parse_lock_holder(&body),
