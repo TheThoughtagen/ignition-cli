@@ -5,14 +5,14 @@ milestone_name: Declared Gateway Deploy
 current_phase: 20
 current_phase_name: config-api-client
 status: executing
-stopped_at: Completed 20-04-PLAN.md
-last_updated: "2026-10-12T15:48:04.469Z"
+stopped_at: Completed 20-05-PLAN.md
+last_updated: "2026-10-12T16:23:14.626Z"
 last_activity: 2026-10-12
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 6
-  completed_plans: 4
+  completed_plans: 5
   percent: 0
 ---
 
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 20 (config-api-client) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-10-12
 
-Progress: [███████░░░] 67%
+Progress: [████████░░] 83%
 
 ## Performance Metrics
 
@@ -49,6 +49,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 20 P02 | 30min | 3 tasks | 7 files |
 | Phase 20 P03 | 50min | 2 tasks | 5 files |
 | Phase 20 P04 | 55min | 2 tasks | 5 files |
+| Phase 20 P05 | 70min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -78,8 +79,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-12T15:48:04.456Z
-**Stopped At:** Completed 20-04-PLAN.md
+**Last session:** 2026-10-12T16:23:14.615Z
+**Stopped At:** Completed 20-05-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -93,3 +94,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 20-03: D1 makes 409 the primary scan-lock refusal pin (408 mapped, enrichment-pinned); D4 added no scan-route classify arm; ScanStatus decisive fields required
 - [Phase ?]: 20-04: resource_list sees the effective view only (D7); named collections are listed by names then find?collection= (resource_list_in_collection); filters go out object-style field[op]=v
 - [Phase ?]: 20-04: stale signature (500 + 'signature mismatch') and missing signature (422 fieldName signature) are typed only in the deploy-scoped write guard, never in classify.rs
+- [Phase ?]: [20-05] deployment_mode() returns Option<String>; null, empty, absent, blank all read as no mode (D5); GatewayInfo untouched via private GatewayModeProbe
+- [Phase ?]: [20-05] mode_create is confirmed by a follow-up modes() read; duplicate (409) and illegal name (400) are internal via classify fallback; FakeDeploy reuses lock_verdict/scan_complete/normalize_deployment_mode/validate_segment

@@ -205,7 +205,7 @@ Plans:
 
 **Capture first**: C1 (scan-lock 409 body; held GET with `remaining` and actor vs expired 204; whether any release/DELETE route exists, grepped from the 617-route OpenAPI; scan/config status JSON and the completion rule); C3a (stale or omitted signature PUT: 422 vs 500 "signature mismatch"; add a message-based error arm only if the two are distinguishable); the `null` vs `""` `deploymentMode` reading on a no-mode gateway
 **Constraints**: Library-only: no clap surface, no verb. A new `DeployApi` trait rather than new `GatewayApi` methods (avoids editing 15 hand-written `unreachable!()` doubles and allows one stateful in-memory fake gateway). Do not enable `serde_json/preserve_order` or `arbitrary_precision` workspace-wide; feature unification would reorder frozen-contract payloads. Every new slug follows the four-place rule. Live gate: one ephemeral 8.3.6 with a bind-mounted `resources/`; no pair rig.
-**Plans**: 4/6 plans executed (waves: 1 = 20-01 ∥ 20-02, 2 = 20-03, 3 = 20-04, 4 = 20-05, 5 = 20-06)
+**Plans**: 5/6 plans executed (waves: 1 = 20-01 ∥ 20-02, 2 = 20-03, 3 = 20-04, 4 = 20-05, 5 = 20-06)
 
 Plans:
 **Wave 1**
@@ -223,7 +223,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 20-05-PLAN.md — Deployment modes + normalized `deploymentMode`; 13-row endpoint closure; FakeDeploy + shared differential scenario
+- [x] 20-05-PLAN.md — Deployment modes + normalized `deploymentMode`; 13-row endpoint closure; FakeDeploy + shared differential scenario
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -337,7 +337,7 @@ Plans:
 | 17. Git Module Commissioning | v1.3 | 0/? | Parked behind v1.6 | — |
 | 18. Declared Rig Discovery | v1.3 | 0/? | Parked behind v1.6 | — |
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
-| 20. Config API Client | v1.6 | 4/6 | In Progress|  |
+| 20. Config API Client | v1.6 | 5/6 | In Progress|  |
 | 21. Deploy Render | v1.6 | 0/? | Not started | — |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 0/? | Not started | — |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
