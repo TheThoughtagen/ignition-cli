@@ -592,6 +592,36 @@ pub struct TrialResetResult {
     pub trial_remaining_s: i64,
 }
 
+/// The DOWN-rig pre-flight for gateway-addressing rig verbs (trial
+/// reset) — live-witnessed 2026-10-11: fired at a DOWN rig whose
+/// port a FOREIGN gateway squatted, the ladder AUTHENTICATED against
+/// the squatter (the rig family derives the gateway URL from the
+/// compose file, never from what actually answers). Refuses exit 7
+/// (`rig_error`) with the honest target state: no running service,
+/// no knock. Rides [`rig_status`]'s read (a down rig is Ok-data
+/// there — state is data; here the state REFUSES the verb).
+pub async fn require_rig_up_for_verb(
+    runner: &dyn ComposeRunner,
+    plan: &RigPlan,
+    verb: &str,
+) -> Result<(), CoreError> {
+    let status = rig_status(runner, plan).await?;
+    if status
+        .services
+        .iter()
+        .any(|service| service.state == "running")
+    {
+        Ok(())
+    } else {
+        Err(CoreError::Rig(format!(
+            "rig {:?} is DOWN — {verb} addresses the rig's gateway and nothing of \
+             this rig is running; `ign rig up` brings it back (if its ports report \
+             held, whatever squats on them is NOT the rig)",
+            plan.name
+        )))
+    }
+}
+
 /// `ign rig trial reset` (04-03, RIG-03): the evidence-chosen LADDER —
 /// tier 0 (token-auth `POST /trial` through the existing client, one
 /// cheap call) falls through to tier 1 (the native OIDC login →
@@ -603,6 +633,13 @@ pub struct TrialResetResult {
 /// exact UI headers. The pre-check refuses those up front
 /// ([`CoreError::TrialNotExpired`]) so the refusal stays an honest
 /// target-state error instead of a misleading auth-shaped 403.
+///
+/// **DOWN-rig pre-flight (live-witnessed 2026-10-11):** fired at a
+/// DOWN rig whose port a FOREIGN gateway squatted, the ladder
+/// AUTHENTICATED against the squatter (token POST → 401 there) —
+/// the rig family derives the gateway URL from the compose file,
+/// not from what actually answers. [`require_rig_up_for_verb`] is
+/// the callers' shared refusal: no running service, no knock.
 ///
 /// Success REQUIRES the read-back flip: after a 2xx the trial is
 /// re-fetched and `expired` must be false (mutations read back — the
@@ -650,13 +687,17 @@ pub async fn trial_reset(
     // 3. Tier 1 — the native OIDC session+CSRF flow (the
     //    live-verified mechanism).
     let Some((username, password)) = basic else {
-        // No token that worked AND no login pair: if tier 0 was even
-        // attempted, surface ITS error (the token was the only rung);
-        // otherwise the dispatch should have refused up front — this
-        // is the defensive tail.
-        return Err(CoreError::SecretUnavailable {
-            profile: rig_url.to_string(),
-        });
+        // No token that worked AND no login pair: the HONEST tail
+        // (2026-10-11 — the old SecretUnavailable{profile: URL} tail
+        // rendered a URL in the profile slot and hinted at a nonsense
+        // keyring entry for it). Rig-class (exit 7): the failure is
+        // THIS operation's credential sourcing, and the message
+        // names both rungs.
+        return Err(CoreError::Rig(format!(
+            "trial reset at {rig_url}: the token POST was refused and no login pair \
+             (IGNITION_USER + IGNITION_PASSWORD) is set — the reset needs one \
+             working credential for the rig's gateway"
+        )));
     };
     let flow = crate::client::idp::IdpLoginFlow::new(rig_url)?;
     let (flow, session) = crate::client::idp::login(flow, username, password).await?;
@@ -1158,8 +1199,8 @@ mod tests {
 
     use super::{
         DEFAULT_WAIT_TIMEOUT_S, RigDownResult, RigResetResult, RigStatusResult, RigUpResult,
-        gateway_url_from, rig_down, rig_logs, rig_reset, rig_restore, rig_snapshot, rig_status,
-        rig_up, trial_reset, trial_status,
+        gateway_url_from, require_rig_up_for_verb, rig_down, rig_logs, rig_reset, rig_restore,
+        rig_snapshot, rig_status, rig_up, trial_reset, trial_status,
     };
     use crate::client::GatewayApi;
     use crate::config::ModuleDeclaration;
@@ -2191,9 +2232,11 @@ mod tests {
         );
     }
 
-    /// Tier 0 refused (401) with NO login pair: the token rung's error
-    /// propagates as the credential-less tail (SecretUnavailable,
-    /// exit 3).
+    /// Tier 0 refused (401) with NO login pair: the HONEST tail —
+    /// a rig-class error (exit 7) naming the URL, the refused rung,
+    /// and the missing login pair (2026-10-11: the old
+    /// SecretUnavailable{profile: URL} tail rendered a URL in the
+    /// profile slot and hinted at a nonsense keyring entry).
     #[tokio::test]
     async fn trial_reset_token_refused_without_login_errors() {
         let (server, _script) = trial_reset_server(401).await;
@@ -2203,8 +2246,50 @@ mod tests {
         let err = trial_reset(&api, &server.uri(), true, None)
             .await
             .expect_err("the refused token rung has no fallback");
-        assert!(matches!(err, CoreError::SecretUnavailable { .. }), "{err}");
-        assert_eq!(err.exit_code(), 3);
+        assert!(matches!(err, CoreError::Rig(_)), "{err}");
+        assert_eq!(err.exit_code(), 7);
+        assert_eq!(err.code(), "rig_error");
+        assert!(
+            err.to_string().contains("IGNITION_USER")
+                && err.to_string().contains("IGNITION_PASSWORD")
+                && err.to_string().contains(&server.uri()),
+            "the tail names the URL and both rungs: {err}"
+        );
+    }
+
+    /// The DOWN-rig pre-flight: no RUNNING service → exit 7
+    /// `rig_error` naming the rig and `ign rig up` (a verb whose
+    /// subject does not exist cannot knock on a port squatter).
+    #[tokio::test]
+    async fn require_rig_up_refuses_a_down_rig() {
+        let runner = FakeRunner::with(vec![version_ok(), ok(""), ok(""), ok(""), ok("")]);
+        let err = require_rig_up_for_verb(&runner, &gw_plan(), "rig trial reset")
+            .await
+            .expect_err("a down rig refuses");
+        assert!(matches!(err, CoreError::Rig(_)), "{err}");
+        assert_eq!(err.exit_code(), 7);
+        assert!(
+            err.to_string().contains("ign rig up") && err.to_string().contains("DOWN"),
+            "names the state and the way back: {err}"
+        );
+    }
+
+    /// The pre-flight passes when ANY service runs (the gateway may
+    /// still be starting — the verb's own ladder reports that
+    /// honestly; the pre-flight only stops the squatter-knock).
+    #[tokio::test]
+    async fn require_rig_up_passes_a_running_rig() {
+        let occupant = r#"{"Names":"fixture-rig-ignition-1","Labels":"com.docker.compose.project=fixture-rig"}"#;
+        let runner = FakeRunner::with(vec![
+            version_ok(),
+            ok(PS_STDOUT),
+            ok(VOLUME_STDOUT),
+            ok(occupant),
+            ok(occupant),
+        ]);
+        require_rig_up_for_verb(&runner, &gw_plan(), "rig trial reset")
+            .await
+            .expect("a running rig passes");
     }
 
     /// The minimal tier-1 dance mount (the full request-chain pins
