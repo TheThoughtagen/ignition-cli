@@ -349,6 +349,64 @@ async fn live_deploy_api_end_to_end() {
         "C: the refused write must leave the signature unchanged"
     );
 
+    // WR-03: update from a record just read (`from_record` carries
+    // `collection`, `enabled` and `backupConfig`, which no capture shows in a
+    // PUT body), once per copy, with both copies present. The collection-less
+    // PUT above must not have touched the production copy if the gateway
+    // honours the effective view; what it did is logged, not asserted.
+    let production_sig_before = production
+        .signature
+        .clone()
+        .expect("C: production copy carries a signature");
+    let production_now = a
+        .resource_find("ignition", "database-connection", &name, Some("production"))
+        .await
+        .expect("C: find production after the collection-less update");
+    eprintln!(
+        "OBSERVED C: the collection-less PUT {} the production copy",
+        if production_now.signature.as_deref() == Some(production_sig_before.as_str()) {
+            "left"
+        } else {
+            "also changed"
+        }
+    );
+    for (target, other, pool) in [("core", "production", 8), ("production", "core", 7)] {
+        let record = a
+            .resource_find("ignition", "database-connection", &name, Some(target))
+            .await
+            .unwrap_or_else(|err| panic!("C: find {target}: {err:?}"));
+        let other_before = a
+            .resource_find("ignition", "database-connection", &name, Some(other))
+            .await
+            .unwrap_or_else(|err| panic!("C: find {other}: {err:?}"))
+            .signature;
+        let mut from_record = ResourceUpdate::from_record(&record)
+            .unwrap_or_else(|err| panic!("C: from_record {target}: {err:?}"));
+        from_record.config["poolMaxActive"] = serde_json::json!(pool);
+        let written = a
+            .resource_update("ignition", "database-connection", &[from_record])
+            .await
+            .unwrap_or_else(|err| panic!("C: from_record update of {target}: {err:?}"));
+        assert!(written.success, "C: from_record update of {target} failed");
+        let target_after = a
+            .resource_find("ignition", "database-connection", &name, Some(target))
+            .await
+            .unwrap_or_else(|err| panic!("C: find {target} after: {err:?}"));
+        assert_ne!(
+            target_after.signature, record.signature,
+            "C: the {target} copy must rotate its signature"
+        );
+        let other_after = a
+            .resource_find("ignition", "database-connection", &name, Some(other))
+            .await
+            .unwrap_or_else(|err| panic!("C: find {other} after: {err:?}"))
+            .signature;
+        assert_eq!(
+            other_after, other_before,
+            "C: updating the {target} copy must leave the {other} copy alone"
+        );
+    }
+
     let listed = a
         .resource_list("ignition", "database-connection", &ListQuery::default())
         .await

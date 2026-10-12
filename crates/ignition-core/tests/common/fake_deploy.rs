@@ -23,8 +23,9 @@
 //!
 //! Where the captures are silent:
 //! - Which copy a collection-less PUT updates: the fake updates the
-//!   effective copy (active mode's collection, else `core`). 20-06 settles
-//!   it live.
+//!   effective copy (active mode's collection, else `core`). No capture
+//!   shows the gateway's choice; the live gate logs what it observes
+//!   (20-REVIEW WR-03) but the fake's choice stays a guess until then.
 //! - `remaining` right after an acquire: the live gateway reads
 //!   `holdTimeout - 1` (D9, C1b); the fake reads `holdTimeout` and counts
 //!   one gateway second per info read, so a hold of 3 reads 3, 2, 1, then

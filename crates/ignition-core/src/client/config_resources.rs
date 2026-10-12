@@ -371,8 +371,16 @@ impl ResourceUpdate {
     /// collection, `enabled`, `description`, `config` and `backupConfig`.
     /// A record without a signature is `resource_signature_rejected`
     /// (missing); one without a name (a singleton) is `invalid_input`.
-    /// Whether the gateway wants `collection` on a PUT is not shown by the
-    /// captures; the 20-06 live gate settles it.
+    /// Every capture of a PUT body (C3a) carries only `name`, `signature`,
+    /// `description` and `config`. Whether the gateway accepts `collection`,
+    /// `enabled` and `backupConfig` on a PUT, and which copy a collection-less
+    /// PUT updates, is NOT settled by any capture: the 20-06 live gate
+    /// updates with [`ResourceUpdate::new`] only. The live section that
+    /// exercises this constructor (two copies present, one update per copy)
+    /// is written but has not been run against a gateway yet (20-REVIEW
+    /// WR-03), so until it has, treat the extra keys as unproven and prefer
+    /// [`ResourceUpdate::new`] with [`ResourceUpdate::with_collection`] only
+    /// when a copy must be targeted.
     pub fn from_record(record: &ResourceRecord) -> Result<Self, CoreError> {
         let name = record.name.clone().ok_or_else(|| CoreError::InvalidInput {
             reason: "the record has no name, so it cannot be updated by name".to_string(),
