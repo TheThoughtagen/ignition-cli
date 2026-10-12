@@ -63,7 +63,7 @@ cap() {
     -X "$method" -H "X-Ignition-API-Token: $tok" "$@" "$BASE$path" > "$raw" || true
   {
     printf '\n### %s\n\n~~~\n%s %s @ %s\n' "$label" "$method" "$path" "$started"
-    cat "$raw"
+    tr -d '\r' < "$raw"
     printf '~~~\n'
   } >> "$OUT"
   LAST_STATUS=$(sed -n 's/^\[curl http=\([0-9]*\) .*/\1/p' "$raw" | tail -1)
@@ -267,8 +267,27 @@ clist() {
   cap 'GET singleton security-properties?collection=core' IGN_TOKEN_CAP_A GET "$RES/singleton/ignition/security-properties?collection=core"
 }
 
+# clist_extra: extra D7 probes appended under the existing C-list heading (no new heading).
+clist_extra() {
+  local name; name=$(cat "$STATE/c3a-name")
+  cap 'GET list?limit=-1&collection=core (undeclared param)' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&collection=core"
+  cap 'GET list?limit=-1&filter=collection[eq]=core' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&filter=collection[eq]=core"
+  cap 'GET list?limit=-1&filter=name[eq]=<c3a name> (control: a filter on another field)' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&filter=name[eq]=$name"
+}
+
+# clist_extra2: the filter parameter is a form-style object (`field[op]=value` is its OWN query
+# parameter, per the live OpenAPI), not `filter=field[op]=value`. Run after clist_extra.
+clist_extra2() {
+  local name; name=$(cat "$STATE/c3a-name")
+  cap 'GET list?limit=-1&collection[eq]=production (object-style filter)' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&collection[eq]=production"
+  cap 'GET list?limit=-1&collection[eq]=core (the core copy exists but is shadowed)' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&collection[eq]=core"
+  cap 'GET list?limit=-1&name[eq]=<c3a name> (control)' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&name[eq]=$name"
+}
+
 case "${1:-}" in
   c1) c1 ;;
+  clist_extra2) clist_extra2 ;;
+  clist_extra) clist_extra ;;
   cnull) cnull "${2:-(no mode)}" ;;
   cmode) cmode ;;
   c3a) c3a ;;
