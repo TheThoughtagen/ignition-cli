@@ -42,6 +42,12 @@ pub enum Screen {
     Projects,
     /// The local Docker compose rig.
     Rig,
+    /// JVM profiling — a SPECIAL MODE, deliberately NOT in [`Screen::ALL`]:
+    /// no Tab rotation lands here. The ONLY entry is the `J` key through
+    /// the [`Modal::JvmGate`] typed-`ACKNOWLEDGE` interstitial (the
+    /// caller-owns-guard contract, one level harder than the Confirm
+    /// modals — the TUI-side answer to the CLI's `--i-accept-the-risk`).
+    Jvm,
 }
 
 impl Screen {
@@ -55,23 +61,21 @@ impl Screen {
         Screen::Rig,
     ];
 
-    /// The screen Tab lands on (wraps around).
+    /// The screen Tab lands on (wraps around). A screen OUTSIDE
+    /// [`Screen::ALL`] (the Jvm special mode) behaves as if Dashboard
+    /// were active — Tab is always a way OUT of the special mode,
+    /// never a way in.
     pub fn next(self) -> Screen {
         let all = &Self::ALL;
-        let idx = all
-            .iter()
-            .position(|screen| *screen == self)
-            .expect("every Screen variant is in ALL");
+        let idx = all.iter().position(|screen| *screen == self).unwrap_or(0);
         all[(idx + 1) % all.len()]
     }
 
-    /// The screen Shift+Tab (Backtab) lands on (wraps around).
+    /// The screen Shift+Tab (Backtab) lands on (wraps around) — the
+    /// same out-of-rotation fallback as [`Screen::next`].
     pub fn prev(self) -> Screen {
         let all = &Self::ALL;
-        let idx = all
-            .iter()
-            .position(|screen| *screen == self)
-            .expect("every Screen variant is in ALL");
+        let idx = all.iter().position(|screen| *screen == self).unwrap_or(0);
         all[(idx + all.len() - 1) % all.len()]
     }
 
@@ -84,6 +88,9 @@ impl Screen {
             Screen::Alarms => "Alarms",
             Screen::Projects => "Projects",
             Screen::Rig => "Rig",
+            // Not a tab (never rendered by the tab bar — the label
+            // exists for the screen's own banner/status line).
+            Screen::Jvm => "JVM PROFILING",
         }
     }
 }
@@ -180,6 +187,14 @@ pub enum Modal {
     /// restore, plus 19-04's `module uninstall`) with a moving
     /// selection — the same shape as [`Modal::Actions`], its own list.
     RigActions { selected: usize },
+    /// The JVM-profiling risk gate — the typed-`ACKNOWLEDGE`
+    /// interstitial that is the ONLY way into [`Screen::Jvm`] (the
+    /// special mode's entry guard; the `Ack` required-text pattern
+    /// with an EXACT-phrase rule: Enter is a no-op until the buffer
+    /// IS `ACKNOWLEDGE`, Esc cancels). This is the TUI-side answer to
+    /// the CLI's `--i-accept-the-risk` — a Confirm modal's single `y`
+    /// is deliberately NOT enough for active JVM instrumentation.
+    JvmGate { buffer: String },
 }
 
 /// What a confirmed modal executes — the TUI-side `--yes`. Modal accept
@@ -399,6 +414,7 @@ impl Modal {
             Modal::Profiles { .. } => "profiles",
             Modal::ProfileAdd { .. } => "profile add",
             Modal::Ack { .. } => "ack alarm",
+            Modal::JvmGate { .. } => "JVM PROFILING — read before entering",
         }
     }
 }
@@ -710,6 +726,45 @@ pub enum TagsForm {
     /// `history query` — the tag PATH (the trailing-24h window rides
     /// like the alarms history browse).
     HistoryQueryPath,
+}
+
+/// The JVM-profiling screen's data — the SPECIAL MODE. `acknowledged`
+/// is the session-scoped gate set ONLY by the [`Modal::JvmGate`]
+/// typed-`ACKNOWLEDGE` accept (and reset on profile switch — a new
+/// gateway is a new risk decision). The action verbs pass it down as
+/// the action layer's `risk_accepted` — the screen is unreachable
+/// without it, and the action enforces it again (belt and braces:
+/// the gate is not a UI hint, it is the shared contract).
+#[derive(Debug, Default)]
+pub struct JvmData {
+    /// The typed-`ACKNOWLEDGE` acceptance for THIS profile session.
+    pub acknowledged: bool,
+    /// The running one-shot action's label ("jvm sample") — the busy
+    /// guard + the status-line liveness signal (the dashboard's
+    /// `in_flight` pattern, screen-owned so a Jvm action never
+    /// hijacks the dashboard's slot).
+    pub in_flight: Option<&'static str>,
+    /// Whether a recording named `ign-cli` exists (the last status
+    /// poll; None until the first answer).
+    pub jfr_active: Option<bool>,
+    /// The JDK's verbatim jfrCheck text (the last status poll).
+    pub jfr_recordings: Option<String>,
+    /// The last status poll's error, honestly surfaced (a missing
+    /// scriptExec deploy lands here — the screen still renders).
+    pub jfr_error: Option<String>,
+    /// The last action's title ("jvm sample — 30s @ 20ms").
+    pub last_label: Option<String>,
+    /// The last action's rendered outcome lines (hot methods / the
+    /// stop outcome / an action error) — bounded by the workers.
+    pub last_lines: Vec<String>,
+    /// The last result pane's scroll (PgUp/PgDn/j/k — the Result_
+    /// modal's one-mechanism scroll, in-screen).
+    pub last_scroll: u16,
+    /// The live-watch worker's shutdown switch (`w` toggles) — the
+    /// tail's watch-channel convention: `Some` = the continuous
+    /// sampler is running (stopped on toggle, screen exit, and
+    /// profile switch).
+    pub watch_shutdown: Option<watch::Sender<bool>>,
 }
 
 /// The dashboard screen's data (06-02).
@@ -1359,6 +1414,9 @@ pub struct AppState {
     /// Rig screen data (06-06) — the status summary + the raw logs
     /// pane.
     pub rig: RigData,
+    /// JVM-profiling screen data — the SPECIAL MODE (gate + JFR
+    /// status + last action outcome).
+    pub jvm: JvmData,
     /// The active profile's name (workers' target — what `p` switches).
     pub profile: Option<String>,
     /// The status-line banner — set by a landed profile switch
@@ -1396,6 +1454,7 @@ impl Default for AppState {
             tags: TagsData::default(),
             projects: ProjectsData::default(),
             rig: RigData::default(),
+            jvm: JvmData::default(),
             profile: None,
             banner: None,
         }

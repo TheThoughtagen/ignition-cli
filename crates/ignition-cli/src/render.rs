@@ -277,6 +277,10 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::EamTaskModify(result) => render_eam_task_modify_human(result),
         ActionOutput::EamTaskDelete(result) => render_eam_task_delete_human(result),
         ActionOutput::ScriptRun(result) => render_script_run_human(result),
+        ActionOutput::JvmSample(result) => render_jvm_sample_human(result),
+        ActionOutput::JvmJfrStart(result) => render_jvm_jfr_start_human(result),
+        ActionOutput::JvmJfrStatus(result) => render_jvm_jfr_status_human(result),
+        ActionOutput::JvmJfrStop(result) => render_jvm_jfr_stop_human(result),
         ActionOutput::TestingRun(result) => render_testing_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
@@ -1420,6 +1424,124 @@ fn render_script_run_human(result: &ScriptRunResult) {
     }
     println!("result: {}", result.result);
     println!("elapsed: {} ms", result.elapsed_ms);
+}
+
+/// The SPECIAL-MODE banner — EVERY `ign jvm` human render leads with
+/// it on STDERR (stdout stays the pipeable report; the pipe never
+/// swallows the caution — the tags-export warnings precedent).
+/// `pub(crate)` so the `--follow` loop prints it exactly once up
+/// front (the per-window body is the streaming part).
+pub(crate) fn render_jvm_banner() {
+    eprintln!("================================================================================");
+    eprintln!("!! JVM PROFILING — ACTIVE GATEWAY INSTRUMENTATION — NOT A ROUTINE DIAGNOSTIC !!");
+    eprintln!("================================================================================");
+    eprintln!(
+        "warning: {}",
+        ignition_core::actions::jvm::PRODUCTION_WARNING
+    );
+}
+
+/// `ign jvm sample` human shape: banner (stderr), then the window
+/// body (the one-shot verb = banner + ONE window).
+fn render_jvm_sample_human(result: &ignition_core::actions::jvm::JvmSampleResult) {
+    render_jvm_banner();
+    render_jvm_sample_window(result);
+}
+
+/// ONE sampling window's human body — the `--follow` loop's
+/// per-window render (banner-free; the loop owns the banner and the
+/// profile header). `pub(crate)` for the follow loop.
+pub(crate) fn render_jvm_sample_window(result: &ignition_core::actions::jvm::JvmSampleResult) {
+    println!(
+        "sampled {} times over a {}s window (wall {} ms — the {}ms interval rides on \
+         dump cost; {} thread stacks observed, peak {} live)",
+        result.samples,
+        result.duration_secs,
+        result.wall_ms,
+        result.interval_ms,
+        result.observations,
+        result.thread_peak
+    );
+    println!();
+    println!("hot methods (self):");
+    if result.hot_methods.is_empty() {
+        println!("  (no stacks captured)");
+    }
+    for method in &result.hot_methods {
+        println!(
+            "  {:>5.1}%  {:>6}  {}",
+            method.pct, method.count, method.frame
+        );
+    }
+    println!();
+    println!("heaviest stacks:");
+    for stack in result.top_stacks.iter().take(10) {
+        println!("  {:>5.1}%  {:>6}  {}", stack.pct, stack.count, stack.stack);
+    }
+    if result.top_stacks.len() > 10 {
+        println!(
+            "  … {} more stacks in the JSON output / folded sidecar",
+            result.top_stacks.len() - 10
+        );
+    }
+}
+
+/// `ign jvm jfr start` human shape: banner + the recording's terms +
+/// the cleanup path named (the forgetfulness guard is a feature —
+/// say it).
+fn render_jvm_jfr_start_human(result: &ignition_core::actions::jvm::JvmJfrStartResult) {
+    render_jvm_banner();
+    println!(
+        "started flight recording '{}' ({}s, settings={}) — memory-buffered, auto-stops at the deadline",
+        result.name, result.duration_secs, result.settings
+    );
+    if !result.detail.is_empty() {
+        println!("jfr: {}", result.detail.trim());
+    }
+    println!("fetch + clean up with: ign jvm jfr stop   (check: ign jvm jfr status)");
+}
+
+/// `ign jvm jfr status` human shape: banner + the JDK's verbatim
+/// recording list + an explicit marker for OUR recording.
+fn render_jvm_jfr_status_human(result: &ignition_core::actions::jvm::JvmJfrStatusResult) {
+    render_jvm_banner();
+    println!(
+        "ign-cli recording: {}",
+        if result.active { "ACTIVE" } else { "none" }
+    );
+    println!("recordings (jfrCheck verbatim):");
+    for line in result.recordings.lines() {
+        println!("  {line}");
+    }
+}
+
+/// `ign jvm jfr stop` human shape: banner + the fetch outcome — an
+/// over-cap dump is a loud IN-PLACE report, never a silent truncate.
+fn render_jvm_jfr_stop_human(result: &ignition_core::actions::jvm::JvmJfrStopResult) {
+    render_jvm_banner();
+    println!("stopped flight recording '{}'", result.name);
+    if result.fetched {
+        println!(
+            "wrote {} ({} bytes)",
+            result.file.as_deref().unwrap_or_default(),
+            result.bytes
+        );
+        println!(
+            "gateway-side {}: {}",
+            result.remote_file,
+            if result.remote_deleted {
+                "deleted"
+            } else {
+                "NOT deleted — remove it manually"
+            }
+        );
+    } else {
+        eprintln!(
+            "dump is {} bytes — over the 32 MiB fetch cap; LEFT ON THE GATEWAY at {}",
+            result.bytes, result.remote_file
+        );
+        eprintln!("retrieve it manually and delete it — it holds gateway memory contents");
+    }
 }
 
 /// `ign testing run` human shape (QUICK-p0g): discover prints one

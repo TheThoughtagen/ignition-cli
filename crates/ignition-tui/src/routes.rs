@@ -191,6 +191,30 @@ pub fn routes() -> &'static [CliRoute] {
             path: "diagnostics bundle wait",
             mapping: Mapping::Screen(Screen::Dashboard),
         },
+        // The JVM-profiling family — the SPECIAL MODE's four rows.
+        // All four map to the Jvm screen, which is deliberately NOT a
+        // tab: it is reachable only through the `J` key's typed-
+        // `ACKNOWLEDGE` interstitial (the TUI-side answer to the
+        // CLI's `--i-accept-the-risk`). `jvm jfr status`/`stop` are
+        // ungated CLI-side (read / cleanup) but share the screen —
+        // the surface is one gated room, not four doors. Rows land
+        // in the SAME task as their clap commands (Pitfall 5).
+        CliRoute {
+            path: "jvm sample",
+            mapping: Mapping::Screen(Screen::Jvm),
+        },
+        CliRoute {
+            path: "jvm jfr start",
+            mapping: Mapping::Screen(Screen::Jvm),
+        },
+        CliRoute {
+            path: "jvm jfr status",
+            mapping: Mapping::Screen(Screen::Jvm),
+        },
+        CliRoute {
+            path: "jvm jfr stop",
+            mapping: Mapping::Screen(Screen::Jvm),
+        },
         // 06-02: the dashboard's read panels + its actions-menu verbs.
         // `sessions` is the BARE form (SessionsArgs.command is Option —
         // bare `ign sessions` IS the list action; there is no

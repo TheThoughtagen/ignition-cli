@@ -197,6 +197,42 @@ pub enum AppEvent {
         /// The composed preview body, or the fetch's error.
         result: Result<String, String>,
     },
+    /// A JVM-profiling status poll landed: `Ok((active, recordings))`
+    /// refreshes the screen's JFR panel, `Err` degrades to the honest
+    /// error state (an undeployed scriptExec route lands here — the
+    /// screen still renders its banner). Stale eras drop (Pitfall 9).
+    JvmStatus {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// (our recording exists, the JDK's verbatim jfrCheck text),
+        /// or the poll's error.
+        result: Result<(bool, String), String>,
+    },
+    /// A JVM-profiling ACTION finished (sample / jfr start / jfr
+    /// stop): the worker pre-rendered the outcome lines (hot methods,
+    /// the stop's fetch outcome) or the error text — the screen's
+    /// result pane renders them verbatim (the ActionDone one-
+    /// mechanism, in-screen instead of modal). Stale eras drop.
+    JvmDone {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The action's label ("jvm sample") — the pane title.
+        label: &'static str,
+        /// The rendered outcome lines, or the action's error text.
+        result: Result<Vec<String>, String>,
+    },
+    /// ONE live-watch sampling window landed (the Jvm screen's
+    /// continuous mode): replaces the result pane WITHOUT touching
+    /// the busy slot — the watch owns `in_flight` for its whole
+    /// life, not per window. Stale eras drop (Pitfall 9).
+    JvmWatchTick {
+        /// Era the worker was spawned under.
+        era: u64,
+        /// The window's rendered rollup lines, or the window's
+        /// error text (the loop keeps sampling after a failure —
+        /// one bad window is data, not a death).
+        result: Result<Vec<String>, String>,
+    },
 }
 
 /// Worker shutdown convention: the receiving half of a `watch<bool>`

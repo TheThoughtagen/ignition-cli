@@ -105,7 +105,7 @@ guarded verbs: schema-required would invite agents to auto-fill
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, an invalid import file, an unreadable command input, or a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim) | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9)
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, or a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim) | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9)
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS | `network_error`, `module_feed_unreachable`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
@@ -412,6 +412,10 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign diagnostics bundle status` | The bundle status: captured state + size | `fileSize` (bytes) is ABSENT while `Generating` (the key is missing on the wire — not null, not 0) and appears with `Valid`, equal to the download's byte count exactly; JSON data `{state, fileSize}`; authed read |
 | `ign diagnostics bundle download [-o FILE]` | Download the bundle ZIP (streamed to disk) | the request rides a **300 s per-request timeout override** (the 30 s client default would truncate MB-sized bundles — Pitfall 8); bytes land verbatim (`PK\x03\x04` ZIP magic live-verified); default filename is the gateway's `Content-Disposition` basename, else `ignition-diagnostics-bundle-<unix_ts>.zip`; the ready state persists after download (repeatable — live-captured); JSON data `{file, bytes, content_type}` |
 | `ign diagnostics bundle wait [--interval SECS] [--timeout SECS]` | Poll the status until the bundle is ready — defaults 2 s / 300 s (the restart --wait shape) | **the captured vocabulary drives termination** (three states, live-proven on the 09-02 rigs + the 2026-09-07 UAT): `Valid` (terminal/ready) exits 0 with `{state, fileSize}`; `Generating` (mid-generation) keeps polling; **`Invalid` is a TERMINAL steady state — the gateway's "no current bundle" answer** (observed 2026-09-07 on 8.3.6: a `Valid` bundle decays to `Invalid` within ~2 min unprompted and stays `Invalid`) — wait exits IMMEDIATELY exit 6 `bundle_not_available` naming the state; only a fresh `generate` changes it (polling cannot); an UNKNOWN state (outside the captured vocabulary) is honestly NOT terminal — it keeps polling until the deadline, and the deadline message carries the last observation instead of claiming unreachability (the gateway answered, so it never says the gateway was unreachable); a deadline with NO observation stays exit 4 `network_error`; JSON data `{state, fileSize}`; authed read |
+| `ign jvm sample [--duration-secs 5–120] [--interval-ms 5–1000] [--top 1–100] [--folded-out PATH] [--follow] --i-accept-the-risk [--project NAME]` | **SPECIAL MODE** — sample every JVM thread's stack for a capped window through the secret-gated `scriptExec` route and rank the hottest methods/stacks (folded output is flamegraph-ready); `--follow` is CONTINUOUS mode: bounded windows back-to-back until Ctrl-C | **ACTIVE instrumentation — never a routine diagnostic**: refused exit 2 `profiling_risk_not_accepted` without `--i-accept-the-risk` (the global `--yes`/`IGNITION_YES` deliberately does NOT satisfy this gate — zero HTTP either way); durations are HARD-CAPPED (120 s; refused, never clamped — over-cap is exit 2 `invalid_input`, profile null, before any resolution); CPU overhead grows with thread count × frequency — **never run on a production server outside an approved change window**; every render leads with the production warning (stderr banner in human mode, `data.warning` in JSON); `--follow` streams each window as it lands — NDJSON envelopes under `--json`/`--compact` (the `logs -f` streaming exception, `data.warning` on every line), defaults drop to the gentler 10 s @ 50 ms cadence, and `--folded-out` is refused with it (exit 2 — one sidecar cannot hold every window); requires the scriptExec deploy (`ign webdev deploy --with-script-exec`, else exit 6 `script_exec_not_configured`); JSON data `{warning, duration_secs, interval_ms, samples, thread_peak, observations, wall_ms, hot_methods, top_stacks, folded, elapsedMs}` — ALL keys always, `warning` first; every `pct` is `count / observations` (per-THREAD counts normalize against total thread stacks observed, never against samples), and `wall_ms` is the gateway-measured loop time (the requested interval rides on dump cost — the effective cadence is longer on busy gateways) |
+| `ign jvm jfr start [--duration-secs 10–300] [--settings default\|profile] --i-accept-the-risk [--project NAME]` | Start a Java Flight Recording named `ign-cli` via the JVM's DiagnosticCommand MBean | **same special-mode gate as `sample`** (`--i-accept-the-risk` required, `--yes` does not satisfy); memory-buffered (nothing touches gateway disk until `stop` dumps) and duration-capped so it AUTO-STOPS even if you forget (hard cap 300 s, refused not clamped); a leftover `ign-cli` recording refuses route-side naming `ign jvm jfr stop`; JSON data `{warning, name, duration_secs, settings, detail, elapsedMs}` |
+| `ign jvm jfr status [--project NAME]` | List the JVM's flight recordings verbatim (`jfrCheck`) | READ-only and **ungated** — checking is how you confirm cleanup; JSON data `{warning, active, recordings, elapsedMs}` (`active` = an `ign-cli` recording exists) |
+| `ign jvm jfr stop [-o FILE] [--project NAME]` | Stop the `ign-cli` recording, dump it, fetch the `.jfr` (base64 through the envelope), and DELETE the gateway-side file | cleanup — **ungated by design** (stopping reduces risk and must never be refused); dumps over 32 MiB are NOT streamed: the recording stops, the file stays on the gateway, and `fetched:false` + `remote_file` report it (never silently truncated); default local name `ign-cli-<unix_ts>.jfr`; JSON data `{warning, name, file?, fetched, bytes, remote_file, remote_deleted, elapsedMs}` |
 | `ign profile add/list/use` | Manage gateway profiles | — |
 | `ign completions <SHELL>` | Shell completion scripts | raw stdout regardless of `--json` |
 
@@ -435,6 +439,7 @@ a parallel implementation:
 | Tags | The k9s-style browser: providers → tree → detail with on-demand reads; live watch (`w`); the tags family behind `a`; the Alarms tab carries active/history/ack |
 | Projects | Project list → detail (record + resources) → resource preview; the project/resource/webdev families behind `a` |
 | Rig | The compose rig's status summary, the full rig verb menu behind `a`, and a raw `rig logs -f` pane (`l`) |
+| **JVM profiling (special mode — not a tab)** | Deliberately outside the Tab rotation: `J` opens a typed-`ACKNOWLEDGE` interstitial (the TUI-side `--i-accept-the-risk`) before the screen exists; inside, a persistent red banner, a flight-recorder status pane, and the capped safe defaults only — `s` sample 30 s @ 20 ms, `w` live watch (continuous 10 s @ 50 ms windows; stops on toggle/exit), `f` JFR start (60 s cap), `F` JFR stop + fetch, `r` refresh, `Esc` leaves. Switching profiles revokes the acknowledgment (see JVM profiling below) |
 
 Behavior contract:
 
@@ -456,7 +461,9 @@ Behavior contract:
   the CLI deliberately leaves unguarded.
 - **Keybindings.** `q`/Ctrl-C quit (Ctrl-C works even behind a modal;
   `q` never quits behind a modal — it types) · Tab/Shift-Tab cycle
-  screens · Enter/Esc navigate (Esc ascends one level on the browser
+  screens (the JVM-profiling special mode is NOT in the cycle — `J`
+  enters it through its gate, `Esc` or Tab leaves) · Enter/Esc
+  navigate (Esc ascends one level on the browser
   screens) · `a` opens the screen's actions menu (grouped and
   prose-labeled — the Projects menu clusters project/resource/webdev
   verbs with each row naming its consequence) · `p` opens the profile
@@ -1937,6 +1944,93 @@ its security posture is the deploy flag — nothing more:
   above applies to every `script run` invocation — the gate makes
   the surface opt-in and auditable; it does not defend against
   gateway insiders who can read the project's resources.
+
+## JVM profiling (`ign jvm`) — the special mode
+
+`ign jvm` is a **special mode, not a routine diagnostic**: every
+intrusive verb ACTIVELY instruments the gateway JVM. Do not run it
+against a production server casually — it belongs inside an approved
+change window, with a rollback plan, at the shortest duration that
+answers the question. The mode exists for the non-production
+deep-dive (a rig, a UAT gateway, a repro environment) and for the
+rare, deliberate production incident.
+
+Both mechanisms ride the ALREADY-deployed, secret-gated `scriptExec`
+route (the posture above applies in full — an undeployed route
+refuses exit 6 `script_exec_not_configured` with zero HTTP):
+
+- **`ign jvm sample`** — a sampling thread profiler: a Jython loop
+  inside the gateway JVM takes `ThreadMXBean.dumpAllThreads` every
+  `--interval-ms` for `--duration-secs`, aggregating server-side into
+  a hot-methods rollup and occurrence-counted stacks. The `folded`
+  field (and `--folded-out PATH` sidecar) is
+  [flamegraph](https://www.brendangregg.com/flamegraphs.html)-ready
+  input. Pure JVM reads — no JVM flags, no agents, no disk. CPU
+  overhead grows with thread count × frequency.
+- **`ign jvm jfr`** — Java Flight Recorder over the
+  `com.sun.management:type=DiagnosticCommand` MBean (the
+  jcmd-over-MBean trick). `start` is memory-buffered and
+  duration-capped so the recording auto-stops even if you forget;
+  `stop` dumps to the gateway's temp dir, streams the bytes back
+  base64, and deletes the remote file; `status` lists recordings
+  verbatim.
+
+The safety contract, in order of enforcement:
+
+1. **A dedicated gate flag, not `--yes`.** The intrusive verbs
+   (`sample`, `jfr start`) refuse exit 2
+   `profiling_risk_not_accepted` without `--i-accept-the-risk` —
+   BEFORE any HTTP request. The global `--yes`/`IGNITION_YES`
+   deliberately does NOT satisfy this gate: a blanket
+   destructive-ops confirm must never silently cover active JVM
+   instrumentation. (`jfr status` and `jfr stop` are ungated —
+   checking and cleaning up must always be cheap to reach; stopping
+   reduces risk and is never refused.)
+2. **Hard caps, refused — never clamped.** Sample duration ≤ 120 s
+   (default 30), interval 5–1000 ms (default 20); JFR duration ≤
+   300 s (default 60) with an auto-stop deadline baked into the
+   recording itself; JFR dumps over 32 MiB are NOT streamed (the
+   recording stops, the file stays on the gateway, and
+   `fetched:false` + `remote_file` report it — retrieve and delete
+   it manually). Over-cap asks exit 2 `invalid_input` BEFORE profile
+   resolution (profile null): you must SEE the boundary, not have
+   it silently moved.
+3. **The warning rides everything.** Every result — JSON envelope,
+   compact, and human render — leads with the production warning
+   (`data.warning` first field; a stderr banner in human mode so
+   piping the report never swallows it).
+
+### The TUI surface
+
+The cockpit mirrors the mode as a **gated room, not a tab**: press
+`J` anywhere in `ign tui` and an interstitial makes you type
+`ACKNOWLEDGE` (Enter is inert until the phrase is exact) before the
+JVM screen opens. The screen carries a persistent red banner, a
+flight-recorder status pane, and the result of the last action; the
+keys are `s` (sample, fixed safe defaults 30 s @ 20 ms), `w` (live
+watch — continuous 10 s @ 50 ms windows refreshing the result pane;
+the status line shouts `sampling LIVE` while it runs and it stops on
+toggle, `Esc`, or a profile switch), `f` (JFR start, 60 s cap), `F`
+(JFR stop + fetch), `r` (refresh status), `Esc` (leave the mode).
+The TUI deliberately exposes NO way to raise durations or intervals —
+raising them is a CLI-side, still-capped decision. Switching profiles
+REVOKES the acknowledgment: a new gateway is a new risk decision.
+
+### Continuous mode (`--follow`, `w`)
+
+For a live, ongoing view instead of a bounded capture: the CLI's
+`ign jvm sample --follow` and the TUI's `w` watch run bounded
+sampling windows back-to-back — the per-window caps are unchanged,
+but the LOOP is open-ended and so is the gateway overhead. Defaults
+drop to the gentler 10 s @ 50 ms cadence (explicit
+`--duration-secs`/`--interval-ms` still apply, still capped). The
+CLI streams each window's rollup as it lands (NDJSON envelopes under
+`--json`/`--compact`, human reports otherwise) until Ctrl-C — the
+same "live, but only while you're watching" posture as `logs -f`;
+`--folded-out` is refused with `--follow` (a sidecar is one window's
+stacks). In the TUI the watch stops the moment you leave the mode or
+switch profiles: continuous instrumentation never outlives the
+surface showing it.
 
 ## Linting (`ign lint`)
 

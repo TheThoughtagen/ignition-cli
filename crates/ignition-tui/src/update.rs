@@ -304,6 +304,76 @@ pub fn update(state: &mut AppState, event: AppEvent) {
                 }
             }
         }
+        // The Jvm screen's JFR status poll landed: refresh the panel
+        // (Ok) or degrade to the honest error state (Err — an
+        // undeployed scriptExec route lands here; the screen and its
+        // banner still render). Stale eras drop whole (Pitfall 9).
+        AppEvent::JvmStatus { era, result } => {
+            if workers::is_current(state.era, era) {
+                match result {
+                    Ok((active, recordings)) => {
+                        state.jvm.jfr_active = Some(active);
+                        state.jvm.jfr_recordings = Some(recordings);
+                        state.jvm.jfr_error = None;
+                    }
+                    Err(message) => {
+                        state.jvm.jfr_active = None;
+                        state.jvm.jfr_recordings = None;
+                        state.jvm.jfr_error = Some(message);
+                    }
+                }
+            }
+        }
+        // A Jvm ACTION finished: clear the screen-owned busy slot and
+        // render the pre-rendered outcome lines (or the error text)
+        // into the result pane, scrolled back to the top. A start or
+        // stop changes the recording list — re-poll so the panel and
+        // the banner stay honest. Stale eras drop whole.
+        AppEvent::JvmDone { era, label, result } => {
+            if workers::is_current(state.era, era) {
+                state.jvm.in_flight = None;
+                let (lines, failed) = match result {
+                    Ok(lines) => (lines, false),
+                    Err(message) => (
+                        message.lines().map(str::to_string).collect::<Vec<_>>(),
+                        true,
+                    ),
+                };
+                state.jvm.last_label = Some(if failed {
+                    format!("{label} — FAILED")
+                } else {
+                    label.to_string()
+                });
+                state.jvm.last_lines = lines;
+                state.jvm.last_scroll = 0;
+                if label != "jvm sample" {
+                    workers::jvm::spawn_jvm_status(state);
+                }
+            }
+        }
+        // ONE live-watch window landed: refresh the result pane and
+        // hand the scroll back to the top (a live view re-reads from
+        // the rollup each tick). The busy slot is the WATCH's — it
+        // stays held across ticks and clears only on stop. Stale
+        // eras drop whole (Pitfall 9).
+        AppEvent::JvmWatchTick { era, result } => {
+            if workers::is_current(state.era, era) {
+                let lines = match result {
+                    Ok(lines) => lines,
+                    Err(message) => vec![
+                        "window failed (the watch keeps sampling):".to_string(),
+                        message,
+                    ],
+                };
+                state.jvm.last_label = Some(format!(
+                    "jvm watch — live ({}s @ {}ms windows)",
+                    workers::jvm::WATCH_WINDOW_SECS,
+                    workers::jvm::WATCH_INTERVAL_MS
+                ));
+                state.jvm.last_lines = lines;
+                state.jvm.last_scroll = 0;
+            }
+        }
         // A profile switch landed: the era-gated banner confirmation
         // ("profile: NAME" in the status line until the new world's
         // first refresh retires it). Stale banners drop (Pitfall 9).
@@ -459,6 +529,14 @@ fn handle_input(state: &mut AppState, event: Event) {
         // it fall through to the global quit. The Projects screen
         // carries the same contract (resource → project → list).
         KeyCode::Esc => {
+            // Leaving the Jvm SPECIAL MODE is the FIRST thing Esc
+            // does there — it never quits from under a profiling
+            // screen (the exit must be deliberate and cheap: one key,
+            // back to the ordinary cockpit).
+            if state.screen == Screen::Jvm {
+                set_screen(state, Screen::Dashboard);
+                return;
+            }
             let ascended = match state.screen {
                 Screen::Tags => tags_ascend(state),
                 Screen::Projects => projects_ascend(state),
@@ -469,11 +547,23 @@ fn handle_input(state: &mut AppState, event: Event) {
             }
         }
         // Tab / Shift+Tab cycle screens (wrap-around). Screen-scoped
-        // workers (the logs tail) start/stop on the transition.
+        // workers (the logs tail) start/stop on the transition. The
+        // Jvm screen is NOT in the cycle — Tab FROM it falls back to
+        // Dashboard (Screen::next/prev's out-of-rotation fallback).
         KeyCode::Tab => set_screen(state, state.screen.next()),
         KeyCode::BackTab => set_screen(state, state.screen.prev()),
         // `p` opens the profile switcher from ANY screen (no modal).
         KeyCode::Char('p') => open_profiles_modal(state),
+        // `J` is the ONLY door into the JVM-profiling special mode —
+        // and it opens the typed-`ACKNOWLEDGE` gate, never the screen
+        // directly (the TUI-side `--i-accept-the-risk`).
+        KeyCode::Char('J') => {
+            if state.screen != Screen::Jvm {
+                state.open_modal(Modal::JvmGate {
+                    buffer: String::new(),
+                });
+            }
+        }
         // Everything else belongs to the active screen's keymap.
         _ => handle_screen_keys(state, key.code),
     }
@@ -494,6 +584,10 @@ fn set_screen(state: &mut AppState, screen: Screen) {
         Screen::Alarms => workers::watch::stop_alarms(state),
         Screen::Tags => workers::watch::stop_tag_watch(state),
         Screen::Rig => workers::rig_stream::stop_rig_logs(state),
+        // Leaving the special mode stops the live sampler (the
+        // tail-exit convention: continuous overhead never outlives
+        // the surface showing it).
+        Screen::Jvm => workers::jvm::stop_jvm_watch(state),
         _ => {}
     }
     state.screen = screen;
@@ -522,6 +616,10 @@ fn set_screen(state: &mut AppState, screen: Screen) {
                 workers::rig_stream::spawn_rig_logs(state);
             }
         }
+        // Entering the Jvm special mode polls the JFR recording list
+        // (one-shot, ungated read — the screen's entry read, the
+        // Projects convention).
+        Screen::Jvm => workers::jvm::spawn_jvm_status(state),
         _ => {}
     }
 }
@@ -607,6 +705,18 @@ fn switch_profile(state: &mut AppState, name: &str) {
     state.tags = crate::state::TagsData::default();
     state.projects = crate::state::ProjectsData::default();
     state.rig = crate::state::RigData::default();
+    // A profile switch RESETS the Jvm gate: the typed `ACKNOWLEDGE`
+    // was for THAT gateway — a new gateway is a new risk decision,
+    // never an inherited one. The gate's revocation CLOSES the room:
+    // a switch from inside the special mode lands back on the
+    // Dashboard (the screen may not exist un-acknowledged). The live
+    // sampler stops BEFORE the reset — its shutdown sender rides the
+    // old JvmData.
+    workers::jvm::stop_jvm_watch(state);
+    state.jvm = crate::state::JvmData::default();
+    if state.screen == Screen::Jvm {
+        state.screen = Screen::Dashboard;
+    }
     state.close_modal();
     // Re-spawn under a new era (bumps) + post the banner through the
     // rail so the loop redraws on it.
@@ -622,6 +732,9 @@ fn switch_profile(state: &mut AppState, name: &str) {
         }
         Screen::Projects => workers::ops::spawn_project_list(state),
         Screen::Rig => workers::rig_stream::spawn_rig_status(state),
+        // (No Jvm arm: the switch above already bounced a Jvm-active
+        // cockpit back to the Dashboard — the gate's revocation
+        // closes the room.)
         _ => {}
     }
     if let Some(tx) = &state.events_tx {
@@ -668,6 +781,48 @@ fn handle_screen_keys(state: &mut AppState, code: KeyCode) {
         Screen::Tags => tags_keys(state, code),
         Screen::Projects => projects_keys(state, code),
         Screen::Rig => rig_keys(state, code),
+        Screen::Jvm => jvm_keys(state, code),
+    }
+}
+
+// ---- Jvm screen (the SPECIAL MODE) ----
+
+/// The Jvm keymap: `s` samples at the fixed safe defaults, `f` starts
+/// the capped flight recording, `F` stops+dumps+fetches it, `r`
+/// re-polls the recording list. PgUp/PgDn (and j/k) scroll the result
+/// pane — the Result_ modal's one-mechanism scroll, in-screen. There
+/// are deliberately NO keys that raise durations or intervals: the
+/// TUI exposes only the capped safe defaults (raising them is a
+/// CLI-side, still-capped decision).
+fn jvm_keys(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Char('s') => workers::jvm::spawn_jvm_sample(state),
+        KeyCode::Char('f') => workers::jvm::spawn_jvm_jfr_start(state),
+        KeyCode::Char('F') => workers::jvm::spawn_jvm_jfr_stop(state),
+        KeyCode::Char('r') => workers::jvm::spawn_jvm_status(state),
+        // The live watch toggle — continuous bounded-window sampling
+        // (10s @ 50ms) that stops on toggle, Esc/Tab out of the mode,
+        // or a profile switch.
+        KeyCode::Char('w') => {
+            if state.jvm.watch_shutdown.is_some() {
+                workers::jvm::stop_jvm_watch(state);
+            } else {
+                workers::jvm::spawn_jvm_watch(state);
+            }
+        }
+        KeyCode::PageDown => {
+            state.jvm.last_scroll = state.jvm.last_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            state.jvm.last_scroll = state.jvm.last_scroll.saturating_sub(10);
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.jvm.last_scroll = state.jvm.last_scroll.saturating_add(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.jvm.last_scroll = state.jvm.last_scroll.saturating_sub(1);
+        }
+        _ => {}
     }
 }
 
@@ -3252,6 +3407,25 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
         }
     }
 
+    // The JVM-profiling risk gate (the Ack required-text pattern with
+    // an EXACT-phrase rule): Enter is a no-op until the buffer IS
+    // `ACKNOWLEDGE` — a Confirm modal's single `y` is deliberately
+    // NOT enough for active JVM instrumentation. On accept: the
+    // session-scoped acknowledgment arms (the workers pass it down as
+    // the action layer's `risk_accepted`) and the special mode opens.
+    // Esc falls through to the shared cancel (nothing arms).
+    if let Some(Modal::JvmGate { buffer }) = state.modal.as_mut()
+        && code == KeyCode::Enter
+    {
+        if buffer.trim() != "ACKNOWLEDGE" {
+            return; // the exact-phrase gate — the form cannot OK
+        }
+        state.jvm.acknowledged = true;
+        state.close_modal();
+        set_screen(state, Screen::Jvm);
+        return;
+    }
+
     // The Logs actions menu: the shared menu nav (arrows + vim
     // motions), Enter executes — over the loggers family.
     if let Some(Modal::LogsActions { selected }) = state.modal.as_mut()
@@ -3668,6 +3842,15 @@ fn handle_modal_input(state: &mut AppState, code: KeyCode, modifiers: KeyModifie
                 }
                 return;
             }
+            // The JvmGate's single buffer (the typed `ACKNOWLEDGE`).
+            (Some(Modal::JvmGate { buffer }), KeyCode::Char(c)) => {
+                buffer.push(c);
+                return;
+            }
+            (Some(Modal::JvmGate { buffer }), KeyCode::Backspace) => {
+                buffer.pop();
+                return;
+            }
             _ => {}
         }
     }
@@ -3972,6 +4155,225 @@ mod tests {
         // Backtab wraps the other way: Dashboard → Rig.
         update(&mut state, key(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(state.screen, Screen::Rig);
+    }
+
+    // ---- The JVM-profiling special mode ----
+
+    /// `J` is the ONLY door into the special mode — and it opens the
+    /// gate modal, NEVER the screen directly. Tab cycling never lands
+    /// on Jvm (it is not in Screen::ALL).
+    #[test]
+    fn jvm_mode_enters_only_through_the_gate_modal() {
+        let mut state = AppState::new();
+        update(&mut state, key(KeyCode::Char('J'), KeyModifiers::SHIFT));
+        assert!(
+            matches!(state.modal, Some(Modal::JvmGate { .. })),
+            "J opens the gate modal: {:?}",
+            state.modal
+        );
+        assert_eq!(state.screen, Screen::Dashboard, "the screen has not moved");
+        assert!(!state.jvm.acknowledged);
+    }
+
+    /// The exact-phrase rule: a wrong buffer (or a partial one) leaves
+    /// Enter INERT — the modal stays, nothing acknowledges, the screen
+    /// never moves. Only `ACKNOWLEDGE` exactly (trimmable) arms Enter.
+    #[test]
+    fn jvm_gate_enter_is_inert_until_the_exact_phrase() {
+        let mut state = AppState::new();
+        update(&mut state, key(KeyCode::Char('J'), KeyModifiers::SHIFT));
+
+        // A wrong phrase: Enter is a no-op.
+        for ch in "yes".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(state.modal, Some(Modal::JvmGate { .. })),
+            "still gated"
+        );
+        assert!(!state.jvm.acknowledged);
+        assert_eq!(state.screen, Screen::Dashboard);
+
+        // Backspace back out, type the exact phrase, Enter enters.
+        for _ in 0..3 {
+            update(&mut state, key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for ch in "ACKNOWLEDGE".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::SHIFT));
+        }
+        update(&mut state, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.modal, None, "the gate closes behind you");
+        assert!(state.jvm.acknowledged, "the session is acknowledged");
+        assert_eq!(state.screen, Screen::Jvm, "the special mode opens");
+    }
+
+    /// Esc on the gate cancels WITHOUT acknowledging (the shared
+    /// modal-cancel path): nothing arms, the screen never moved.
+    #[test]
+    fn jvm_gate_esc_cancels_without_acknowledging() {
+        let mut state = AppState::new();
+        update(&mut state, key(KeyCode::Char('J'), KeyModifiers::SHIFT));
+        for ch in "ACKNOWLED".chars() {
+            update(&mut state, key(KeyCode::Char(ch), KeyModifiers::SHIFT));
+        }
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.modal, None);
+        assert!(!state.jvm.acknowledged);
+        assert_eq!(state.screen, Screen::Dashboard);
+        assert!(!state.should_quit, "Esc behind a modal never quits");
+    }
+
+    /// Leaving the mode is always one cheap key: Esc lands back on the
+    /// Dashboard (NEVER quits from under the special mode), and
+    /// Tab/BackTab fall back out of the rotation without panicking.
+    #[test]
+    fn jvm_mode_esc_and_tab_leave_safely() {
+        let mut state = AppState::new();
+        state.jvm.acknowledged = true;
+        state.screen = Screen::Jvm;
+
+        update(&mut state, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Logs, "Tab falls back into the cycle");
+
+        state.screen = Screen::Jvm;
+        update(&mut state, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.screen,
+            Screen::Rig,
+            "BackTab falls back the other way"
+        );
+
+        state.screen = Screen::Jvm;
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Dashboard, "Esc exits the mode");
+        assert!(!state.should_quit, "Esc from Jvm NEVER quits");
+    }
+
+    /// A JvmDone lands the rendered lines in the result pane and
+    /// clears the screen-owned busy slot (the era gate drops stale
+    /// arrivals).
+    #[test]
+    fn jvm_done_lands_lines_and_clears_busy() {
+        let mut state = AppState::new();
+        state.jvm.acknowledged = true;
+        state.screen = Screen::Jvm;
+        state.jvm.in_flight = Some("jvm sample");
+        let era = state.era;
+        update(
+            &mut state,
+            AppEvent::JvmDone {
+                era,
+                label: "jvm sample",
+                result: Ok(vec!["sampled 100 times".to_string()]),
+            },
+        );
+        assert_eq!(state.jvm.in_flight, None);
+        assert_eq!(state.jvm.last_label.as_deref(), Some("jvm sample"));
+        assert_eq!(state.jvm.last_lines, vec!["sampled 100 times"]);
+        assert_eq!(state.jvm.last_scroll, 0);
+
+        // A stale era drops whole (Pitfall 9).
+        state.jvm.in_flight = Some("jvm sample");
+        let stale_era = state.era.wrapping_sub(1);
+        update(
+            &mut state,
+            AppEvent::JvmDone {
+                era: stale_era,
+                label: "jvm sample",
+                result: Ok(vec!["STALE".to_string()]),
+            },
+        );
+        assert_eq!(state.jvm.last_lines, vec!["sampled 100 times"]);
+    }
+
+    /// The live watch toggles through its shutdown slot (arming
+    /// holds `in_flight` for the watch's WHOLE life; toggle-off
+    /// releases both) — and Esc out of the mode stops it (the
+    /// tail-exit convention: continuous overhead never outlives the
+    /// surface). No runtime in tests: the fields arm, no worker
+    /// spawns.
+    #[test]
+    fn jvm_watch_toggles_and_stops_on_exit() {
+        let mut state = AppState::new();
+        state.jvm.acknowledged = true;
+        state.screen = Screen::Jvm;
+        state.profile = Some("dev".to_string());
+        state.client = Some(crate::state::ClientHandle(std::sync::Arc::new(
+            ignition_core::client::ReqwestGatewayApi::for_tests("http://127.0.0.1:1/", None),
+        )));
+        let (events_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.events_tx = Some(events_tx);
+
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(state.jvm.watch_shutdown.is_some(), "the watch armed");
+        assert_eq!(state.jvm.in_flight, Some("jvm watch (live)"));
+
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(state.jvm.watch_shutdown.is_none(), "toggle-off disarmed");
+        assert_eq!(state.jvm.in_flight, None, "the busy slot released");
+
+        // Re-arm, then Esc out of the mode: the exit stops the watch.
+        update(&mut state, key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(state.jvm.watch_shutdown.is_some());
+        update(&mut state, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.screen, Screen::Dashboard);
+        assert!(
+            state.jvm.watch_shutdown.is_none(),
+            "leaving the mode stopped the watch"
+        );
+        assert_eq!(state.jvm.in_flight, None);
+    }
+
+    /// A watch tick refreshes the pane WITHOUT touching the busy
+    /// slot — the watch owns `in_flight` for its whole life, not
+    /// per window; a failed window lands as data (the loop keeps
+    /// sampling).
+    #[test]
+    fn jvm_watch_tick_refreshes_without_touching_busy() {
+        let mut state = AppState::new();
+        state.jvm.acknowledged = true;
+        state.screen = Screen::Jvm;
+        state.jvm.in_flight = Some("jvm watch (live)");
+        let era = state.era;
+
+        update(
+            &mut state,
+            AppEvent::JvmWatchTick {
+                era,
+                result: Ok(vec!["hot methods…".to_string()]),
+            },
+        );
+        assert_eq!(
+            state.jvm.in_flight,
+            Some("jvm watch (live)"),
+            "still the watch's"
+        );
+        assert_eq!(state.jvm.last_lines, vec!["hot methods…"]);
+        assert!(
+            state
+                .jvm
+                .last_label
+                .as_deref()
+                .expect("label set")
+                .contains("live"),
+            "the pane says live: {:?}",
+            state.jvm.last_label
+        );
+
+        update(
+            &mut state,
+            AppEvent::JvmWatchTick {
+                era,
+                result: Err("gateway gone".to_string()),
+            },
+        );
+        assert!(
+            state.jvm.last_lines[0].contains("window failed"),
+            "a failed window is data: {:?}",
+            state.jvm.last_lines
+        );
+        assert_eq!(state.jvm.in_flight, Some("jvm watch (live)"));
     }
 
     /// Non-Press key events (Release/Repeat on kitty-protocol

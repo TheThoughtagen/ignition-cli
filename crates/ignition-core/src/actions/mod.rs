@@ -15,6 +15,7 @@ pub mod eam;
 pub mod edit;
 pub mod gan;
 pub mod inspect;
+pub mod jvm;
 pub mod license;
 pub mod lint;
 pub mod login;
