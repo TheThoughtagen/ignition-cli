@@ -174,7 +174,12 @@ async fn live_deploy_api_end_to_end() {
     let kind = ScanKind::Config;
 
     // Section A: the scan-lock.
-    a.scan_lock_acquire(kind, 10, 4)
+    // A hold of 12 s, not 4: C1g recorded a 1.92 s acquire on this emulated
+    // rig, and a stall that long between the acquire and the next call must
+    // not let the hold lapse before the held-then-refused steps run
+    // (20-REVIEW WR-05).
+    const LOCK_HOLD_S: u64 = 12;
+    a.scan_lock_acquire(kind, 10, LOCK_HOLD_S)
         .await
         .expect("A: cap-a acquires the lock");
     match a.scan_lock_info(kind).await.expect("A: lock info") {
@@ -185,14 +190,14 @@ async fn live_deploy_api_end_to_end() {
                 "A: holder is cap-a, got {actor:?}"
             );
             assert!(
-                (1..=4).contains(&held.remaining),
-                "A: remaining {} outside 1..=4",
+                (1..=LOCK_HOLD_S as i64).contains(&held.remaining),
+                "A: remaining {} outside 1..={LOCK_HOLD_S}",
                 held.remaining
             );
         }
         LockObservation::Free => panic!("A: lock reads Free right after the acquire"),
     }
-    match b.scan_lock_acquire(kind, 2, 4).await {
+    match b.scan_lock_acquire(kind, 2, LOCK_HOLD_S).await {
         Err(err @ CoreError::ScanLockHeld { .. }) => {
             assert_eq!(err.code(), "scan_lock_held");
             let CoreError::ScanLockHeld { actor, .. } = &err else {
@@ -206,7 +211,7 @@ async fn live_deploy_api_end_to_end() {
         other => panic!("A: cap-b acquire must be scan_lock_held, got {other:?}"),
     }
     let mut freed = false;
-    for _ in 0..15 {
+    for _ in 0..30 {
         let obs = a.scan_lock_info(kind).await.expect("A: expiry poll");
         if matches!(obs, LockObservation::Free) {
             assert_eq!(lock_verdict(&obs, 2), LockVerdict::NotHeld);
@@ -215,7 +220,7 @@ async fn live_deploy_api_end_to_end() {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    assert!(freed, "A: the lock never read Free within 15 s");
+    assert!(freed, "A: the lock never read Free within 30 s");
     eprintln!("PASS A: lock held by cap-a, cap-b refused naming cap-a, then Free after expiry");
 
     // Section B: a scan completes by the shared predicate.

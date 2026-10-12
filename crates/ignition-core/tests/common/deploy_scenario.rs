@@ -53,12 +53,16 @@ impl ScenarioTiming {
         }
     }
 
-    /// Real-time clocks for a live gateway (20-06).
+    /// Real-time clocks for a live gateway (20-06). The hold is long
+    /// enough that a 2 s stall between the acquire and the next call (C1g
+    /// recorded a 1.92 s acquire on the emulated rig) cannot lapse it
+    /// before the held-then-refused steps have run (20-REVIEW WR-05); the
+    /// expiry budget covers the whole hold with room to spare.
     pub fn live() -> Self {
         Self {
             poll: Duration::from_secs(1),
-            lock_hold_s: 4,
-            expiry_budget: Duration::from_secs(15),
+            lock_hold_s: 12,
+            expiry_budget: Duration::from_secs(30),
             scan: PollConfig {
                 subject: "scenario scan".to_string(),
                 interval: Duration::from_millis(500),
