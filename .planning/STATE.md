@@ -4,16 +4,16 @@ milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 20
 current_phase_name: config-api-client
-status: executing
-stopped_at: Completed 20-05-PLAN.md
-last_updated: "2026-10-12T16:23:14.626Z"
+status: verifying
+stopped_at: Completed 20-06-PLAN.md
+last_updated: "2026-10-12T16:37:10.644Z"
 last_activity: 2026-10-12
 progress:
   total_phases: 6
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 6
-  completed_plans: 5
-  percent: 0
+  completed_plans: 6
+  percent: 17
 ---
 
 # Project State
@@ -29,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 
 Phase: 20 (config-api-client) — EXECUTING
 Plan: 6 of 6
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-10-12
 
-Progress: [████████░░] 83%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -50,6 +50,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 20 P03 | 50min | 2 tasks | 5 files |
 | Phase 20 P04 | 55min | 2 tasks | 5 files |
 | Phase 20 P05 | 70min | 2 tasks | 7 files |
+| Phase 20 P06 | 35min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -79,8 +80,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-12T16:23:14.615Z
-**Stopped At:** Completed 20-05-PLAN.md
+**Last session:** 2026-10-12T16:37:10.632Z
+**Stopped At:** Completed 20-06-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -96,3 +97,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 20-04: stale signature (500 + 'signature mismatch') and missing signature (422 fieldName signature) are typed only in the deploy-scoped write guard, never in classify.rs
 - [Phase ?]: [20-05] deployment_mode() returns Option<String>; null, empty, absent, blank all read as no mode (D5); GatewayInfo untouched via private GatewayModeProbe
 - [Phase ?]: [20-05] mode_create is confirmed by a follow-up modes() read; duplicate (409) and illegal name (400) are internal via classify fallback; FakeDeploy reuses lock_verdict/scan_complete/normalize_deployment_mode/validate_segment
+- [Phase ?]: 20-06: live gate booted with plain compose.yml; no wire drift, fake trace equals live trace
