@@ -1,0 +1,37 @@
+# Disposable 8.3.6 gateway for the Phase 20 captures (20-01) and the 20-06 live gate.
+#
+# DISPOSABLE. Compose project name `ign-deploy-rig`; the gateway is named
+# `ign-deploy-rig`. NEVER point this at a real gateway, and never reuse its
+# admin password anywhere. The host port is bound to 127.0.0.1 only, so the
+# known admin password below is not reachable from the LAN.
+#
+# Tear down with: docker compose -p ign-deploy-rig down -v
+# (-v drops the `gw-data` volume; a rig left behind keeps stale tokens and modes).
+#
+# Start:  docker compose -p ign-deploy-rig -f compose.yml up -d
+# Mode:   IGN_DEPLOY_RIG_MODE_ARG=-Dignition.config.mode=production \
+#           docker compose -p ign-deploy-rig -f compose.yml up -d   (recreates, keeps the volume)
+# Bind:   add -f compose.bind.yml and set IGN_DEPLOY_RIG_RESOURCES (outside the repo).
+#
+# 20-06 reuses this file, the project name, port 18290 and mint-token.sh.
+services:
+  gw:
+    image: inductiveautomation/ignition:${IGNITION_LIVE_RIG_IMAGE_TAG:-8.3.6}
+    # The host is arm64; the image is amd64 only. The spike pins this.
+    platform: linux/amd64
+    hostname: gw
+    ports:
+      - "127.0.0.1:18290:8088"
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_ADMIN_USERNAME: admin
+      GATEWAY_ADMIN_PASSWORD: ign-deploy-rig
+      IGNITION_EDITION: standard
+      IGNITION_UID: "2003"
+      IGNITION_GID: "2003"
+    command: ["-n", "ign-deploy-rig", "--", "${IGN_DEPLOY_RIG_MODE_ARG:--Dign.deploy.rig.noop=true}"]
+    volumes:
+      - gw-data:/usr/local/bin/ignition/data
+
+volumes:
+  gw-data: {}

@@ -1,0 +1,12 @@
+# Bind-mount override for compose.yml: the A7 falsifier for the roadmap's
+# "bind-mounted resources/" gate. Use as:
+#
+#   IGN_DEPLOY_RIG_RESOURCES=$HOME/.cache/ign-deploy-rig/resources \
+#     docker compose -p ign-deploy-rig -f compose.yml -f compose.bind.yml up -d
+#
+# IGN_DEPLOY_RIG_RESOURCES must point OUTSIDE the repository. Disposable: tear
+# down with `docker compose -p ign-deploy-rig down -v`.
+services:
+  gw:
+    volumes:
+      - ${IGN_DEPLOY_RIG_RESOURCES:?set IGN_DEPLOY_RIG_RESOURCES to a host directory outside the repo}:/usr/local/bin/ignition/data/config/resources

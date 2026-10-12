@@ -1,0 +1,139 @@
+{
+  "accessPermissions": {
+    "securityLevels": [
+      {
+        "name": "Authenticated",
+        "children": [
+          {
+            "name": "Roles",
+            "children": [
+              {
+                "name": "Administrator",
+                "children": []
+              }
+            ]
+          },
+          {
+            "name": "Deploy",
+            "children": []
+          }
+        ]
+      }
+    ],
+    "type": "AnyOf"
+  },
+  "allowDesignerSSO": false,
+  "allowUserAdmin": false,
+  "createProjectPermissions": {
+    "securityLevels": [
+      {
+        "children": [
+          {
+            "children": [
+              {
+                "children": [],
+                "name": "Administrator"
+              }
+            ],
+            "name": "Roles"
+          },
+          {
+            "children": [
+              {
+                "children": [],
+                "name": "admin"
+              }
+            ],
+            "name": "it"
+          }
+        ],
+        "name": "Authenticated"
+      }
+    ],
+    "type": "AnyOf"
+  },
+  "createProjectRoleName": "",
+  "designerAuthStrategy": "CLASSIC",
+  "designerAuthTokenInactivityTimeout": 10,
+  "designerAuthTokenTimeToLive": 0,
+  "designerPermissions": {
+    "securityLevels": [
+      {
+        "children": [
+          {
+            "children": [
+              {
+                "children": [],
+                "name": "Administrator"
+              }
+            ],
+            "name": "Roles"
+          },
+          {
+            "name": "it",
+            "children": [
+              {
+                "name": "admin",
+                "children": []
+              }
+            ]
+          }
+        ],
+        "name": "Authenticated"
+      }
+    ],
+    "type": "AnyOf"
+  },
+  "designerRoleName": "Administrator",
+  "forceIdpAuth": false,
+  "gatewayAuditProfile": "WIGNVM01_Audit",
+  "readPermissions": {
+    "securityLevels": [
+      {
+        "name": "Authenticated",
+        "children": [
+          {
+            "name": "Roles",
+            "children": [
+              {
+                "name": "Administrator",
+                "children": []
+              }
+            ]
+          },
+          {
+            "name": "Deploy",
+            "children": []
+          }
+        ]
+      }
+    ],
+    "type": "AnyOf"
+  },
+  "systemAuthProfile": "default",
+  "systemIdentityProvider": "default",
+  "userInactivityTimeout": 10,
+  "writePermissions": {
+    "securityLevels": [
+      {
+        "name": "Authenticated",
+        "children": [
+          {
+            "name": "Roles",
+            "children": [
+              {
+                "name": "Administrator",
+                "children": []
+              }
+            ]
+          },
+          {
+            "name": "Deploy",
+            "children": []
+          }
+        ]
+      }
+    ],
+    "type": "AnyOf"
+  }
+}

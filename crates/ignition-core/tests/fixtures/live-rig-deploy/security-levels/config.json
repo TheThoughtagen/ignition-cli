@@ -1,0 +1,12 @@
+{
+  "securityLevels": [
+    {
+      "name": "Authenticated",
+      "description": "Represents a user who has been authenticated by the system.",
+      "children": [
+        {"name": "Roles", "description": "Represents the roles that a user has.", "children": [{"name": "Administrator", "description": "System generated security level representing read and write privileges to Gateway configuration", "children": []}]},
+        {"name": "Deploy", "description": "Custom level for pipeline API tokens (system Roles levels cannot be granted to config-defined tokens in 8.3.6)", "children": []}
+      ]
+    }
+  ]
+}

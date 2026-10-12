@@ -1,0 +1,1 @@
+{"connectURL":"jdbc:postgresql://mode-host:5432/spike","driver":"PostgreSQL","translator":"POSTGRES","username":"spike","validationQuery":"SELECT 1","poolMaxActive":8}
