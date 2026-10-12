@@ -17,8 +17,8 @@
 //!
 //! The fake's errors are the ones the real client yields for the same wire
 //! outcome: `scan_lock_held` and `resource_signature_rejected` are typed,
-//! a duplicate create or mode create is `internal` (the real client maps a
-//! 409 outside the scan-lock route to `internal`), an unknown update name
+//! a duplicate create is `resource_exists` and a duplicate mode create is
+//! `mode_exists` (the real client types both 409s), an unknown update name
 //! is `not_found`.
 //!
 //! Where the captures are silent:
@@ -287,14 +287,6 @@ fn outcome(changes: Vec<ResourceChange>) -> MutationOutcome {
     }
 }
 
-/// The `internal` a real client reports for a 409 outside the scan-lock
-/// route (classify's fallback arm).
-fn conflict(path: &str, detail: &str) -> CoreError {
-    CoreError::Internal(format!(
-        "unexpected HTTP 409 Conflict from {FAKE_BASE}{path}{detail}"
-    ))
-}
-
 fn envelope<T>(items: Vec<T>) -> ListEnvelope<T> {
     let count = items.len() as i64;
     ListEnvelope {
@@ -479,7 +471,11 @@ impl DeployApi for FakeDeploy {
                 .locate(&resource_type, Some(&item.name), Some(target))
                 .is_some()
             {
-                return Err(conflict(&path, ""));
+                // The real client types the 409 as `resource_exists`.
+                return Err(CoreError::ResourceExists {
+                    name: item.name.clone(),
+                    endpoint: Some(format!("{FAKE_BASE}{path}")),
+                });
             }
         }
         let mut changes = Vec::new();
@@ -673,11 +669,12 @@ impl DeployApi for FakeDeploy {
         validate_segment("mode name", &body.name)?;
         let mut state = self.state();
         if state.modes.iter().any(|mode| mode.name == body.name) {
-            // D6: the duplicate is a 409 Jetty page, `internal` client-side.
-            return Err(conflict(
-                "/data/api/v1/mode",
-                " (gateway error page: Error 409: Mode already exists)",
-            ));
+            // D6: the duplicate is a 409 Jetty page, typed `mode_exists`
+            // client-side.
+            return Err(CoreError::ModeExists {
+                name: body.name.clone(),
+                endpoint: Some(format!("{FAKE_BASE}/data/api/v1/mode")),
+            });
         }
         let record = ModeRecord {
             name: body.name.clone(),

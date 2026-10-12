@@ -1543,6 +1543,12 @@ async fn resource_duplicate_create_is_never_ok() {
         )
         .await
         .expect_err("a duplicate is never Ok");
+    assert_eq!(err.code(), "resource_exists");
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.to_string().contains(DB_NAME),
+        "names the resource: {err}"
+    );
     assert!(!err.to_string().contains("com.inductive"), "{err}");
     assert!(!err.to_string().contains("ResourceId{"), "{err}");
 }
@@ -1741,6 +1747,9 @@ const CMODE_CREATED: &str = "{\n  \"name\": \"production\",\n  \"title\": \"Prod
 /// C-mode "POST /mode production again (duplicate)": 409 Jetty HTML.
 const CMODE_DUP_409: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 409</title>\n</head>\n<body><h2>HTTP ERROR 409 Mode already exists</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/mode</td></tr>\n<tr><th>STATUS:</th><td>409</td></tr>\n<tr><th>MESSAGE:</th><td>Mode already exists</td></tr>\n</table>\n\n</body>\n</html>\n";
 
+/// C-mode "POST /mode with the illegal name": 400 Jetty HTML.
+const CMODE_ILLEGAL_400: &str = "<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html;charset=ISO-8859-1\"/>\n<title>Error 400</title>\n</head>\n<body><h2>HTTP ERROR 400 Invalid mode name</h2>\n<table>\n<tr><th>URI:</th><td>/data/api/v1/mode</td></tr>\n<tr><th>STATUS:</th><td>400</td></tr>\n<tr><th>MESSAGE:</th><td>Invalid mode name</td></tr>\n</table>\n\n</body>\n</html>\n";
+
 async fn mount_gateway_info(mock: &IgnitionMock, body: &str) {
     Mock::given(method("GET"))
         .and(path(GATEWAY_INFO))
@@ -1922,8 +1931,8 @@ async fn mode_create_absent_from_follow_up_list_is_an_error() {
     assert!(text.contains("production"), "{text}");
 }
 
-/// D6: the duplicate (409 HTML) and the illegal name (400 HTML) answered
-/// by the gateway are errors, never Ok, and no list read follows.
+/// D6: the duplicate (409 HTML) answered by the gateway is `mode_exists`,
+/// never Ok, and no list read follows.
 #[tokio::test]
 async fn mode_create_duplicate_is_never_ok() {
     let mock = IgnitionMock::start().await;
@@ -1941,9 +1950,39 @@ async fn mode_create_duplicate_is_never_ok() {
         .await
         .expect_err("a duplicate is never Ok");
 
+    assert_eq!(err.code(), "mode_exists");
+    assert_eq!(err.exit_code(), 6);
     assert!(
-        err.to_string().contains("409"),
-        "the refusal names its status: {err}"
+        err.to_string().contains("production"),
+        "names the mode: {err}"
+    );
+    assert_eq!(requests_of(&mock).await.len(), 1, "no confirming read");
+}
+
+/// D6: an illegal name the gateway refuses with a 400 HTML page is
+/// `invalid_input` (exit 2), not a bug report, and no list read follows.
+#[tokio::test]
+async fn mode_create_gateway_400_is_invalid_input() {
+    let mock = IgnitionMock::start().await;
+    Mock::given(method("POST"))
+        .and(path(MODE))
+        .respond_with(html(400, CMODE_ILLEGAL_400))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let concrete = api_for(&mock);
+    let api: &dyn DeployApi = &concrete;
+
+    let err = api
+        .mode_create(&production_mode())
+        .await
+        .expect_err("an illegal name is never Ok");
+
+    assert_eq!(err.code(), "invalid_input");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        !err.to_string().contains("<html"),
+        "the page is not echoed: {err}"
     );
     assert_eq!(requests_of(&mock).await.len(), 1, "no confirming read");
 }
@@ -2105,9 +2144,9 @@ async fn fake_stale_signature_is_the_client_error() {
 }
 
 /// D10: a duplicate create is never Ok; the fake reports it as the same
-/// `internal` the real client gives a 409 there.
+/// `resource_exists` the real client gives a 409 there.
 #[tokio::test]
-async fn fake_duplicate_create_is_internal() {
+async fn fake_duplicate_create_is_resource_exists() {
     let gateway = FakeGateway::new();
     let api = gateway.client("cap-a");
     let item = || [ResourceCreate::new(DB_NAME, config_value())];
@@ -2118,7 +2157,8 @@ async fn fake_duplicate_create_is_internal() {
         .resource_create("ignition", "database-connection", &item())
         .await
         .expect_err("duplicate");
-    assert_eq!(err.code(), "internal");
+    assert_eq!(err.code(), "resource_exists");
+    assert_eq!(err.exit_code(), 6);
 }
 
 /// C-list + D7: with the mode `production` active and a copy in each
@@ -2223,7 +2263,11 @@ async fn fake_modes_never_activate_and_reject_duplicates() {
         None,
         "defining a mode does not activate it"
     );
-    assert!(api.mode_create(&production_mode()).await.is_err());
+    let err = api
+        .mode_create(&production_mode())
+        .await
+        .expect_err("duplicate mode");
+    assert_eq!(err.code(), "mode_exists");
     let err = api
         .mode_create(&ModeCreate {
             name: "a b/".to_string(),
@@ -2294,10 +2338,12 @@ async fn fake_scenario_trace_matches_the_capture_decisions() {
         // D3: the current signature is accepted, the rotated-away one stale.
         "update:ok",
         "update:stale",
-        // D10: the duplicate create is a 409 (`internal` client-side).
-        "create-duplicate:internal",
+        // D10: the duplicate create is a 409, typed `resource_exists`.
+        "create-duplicate:resource_exists",
         // D6: create answers 200 and the list confirms it.
         "mode:created",
+        // D6: the duplicate mode is a 409, typed `mode_exists`.
+        "mode-duplicate:mode_exists",
         "modes:listed",
         // D5 + T-20-26: a defined mode is not an active mode.
         "deployment-mode:none",

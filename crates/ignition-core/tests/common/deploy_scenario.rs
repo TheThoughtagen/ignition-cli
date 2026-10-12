@@ -230,7 +230,7 @@ pub async fn scenario(
         }
     }
 
-    // D10: the duplicate create is a 409, never Ok.
+    // D10: the duplicate create is a 409, typed `resource_exists`, never Ok.
     match a
         .resource_create(
             "ignition",
@@ -255,6 +255,18 @@ pub async fn scenario(
     {
         Ok(_) => push("mode:created".to_string()),
         Err(err) => push(err_tag("mode", &err)),
+    }
+    // D6: the same mode again is a 409, typed `mode_exists`, never Ok.
+    match a
+        .mode_create(&ModeCreate {
+            name: mode_name.clone(),
+            title: "Scenario".to_string(),
+            description: "ign-cli deploy scenario".to_string(),
+        })
+        .await
+    {
+        Ok(_) => push("mode-duplicate:ok-unexpected".to_string()),
+        Err(err) => push(format!("mode-duplicate:{}", err.code())),
     }
     match a.modes().await {
         Ok(page) if page.items.iter().any(|mode| mode.name == mode_name) => {

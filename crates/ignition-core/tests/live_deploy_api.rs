@@ -368,16 +368,24 @@ async fn live_deploy_api_end_to_end() {
         names.items.iter().any(|item| item.name == name),
         "C: resource_names includes the name"
     );
-    assert!(
-        a.resource_create(
+    // D10: the duplicate create is a 409, typed `resource_exists` (exit 6).
+    match a
+        .resource_create(
             "ignition",
             "database-connection",
             &[ResourceCreate::new(name.clone(), config)],
         )
         .await
-        .is_err(),
-        "C: a duplicate create must be an error"
-    );
+    {
+        Err(err @ CoreError::ResourceExists { .. }) => {
+            assert_eq!(
+                err.exit_code(),
+                6,
+                "C: resource_exists is a target-state exit"
+            );
+        }
+        other => panic!("C: a duplicate create must be resource_exists, got {other:?}"),
+    }
     eprintln!(
         "PASS C: create, effective/core/production reads, update, stale refusal leaves signature, list, names, duplicate refused"
     );

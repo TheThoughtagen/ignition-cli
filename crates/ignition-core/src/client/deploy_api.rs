@@ -244,7 +244,7 @@ pub trait DeployApi: Send + Sync {
     /// `{success, changes[].newSignature}`.
     ///
     /// A 2xx whose body says `success:false` is an error, never Ok. A
-    /// duplicate name is a 409 (D10) and is an error. The POST is sent once
+    /// duplicate name is a 409 (D10) and is `resource_exists` (exit 6). The POST is sent once
     /// per call and never retried: a repeated create against a production
     /// gateway must never be silent. An empty `items` is `invalid_input`
     /// with no request.
@@ -322,8 +322,8 @@ pub trait DeployApi: Send + Sync {
     /// is sent exactly once and its 2xx body is ignored; success is
     /// confirmed by a follow-up [`DeployApi::modes`] read, and the listed
     /// record is returned. A 2xx whose mode is absent from that list is
-    /// `internal`. A duplicate (409) and an illegal name (400) are errors,
-    /// never Ok. This only DEFINES a mode: it never activates one, restarts
+    /// `internal`. A duplicate (409) is `mode_exists` (exit 6) and an
+    /// illegal name (400) is `invalid_input` (exit 2), never Ok. This only DEFINES a mode: it never activates one, restarts
     /// a gateway or sets a JVM argument.
     async fn mode_create(&self, body: &ModeCreate) -> Result<ModeRecord, CoreError>;
 
@@ -461,6 +461,16 @@ impl ReqwestGatewayApi {
             }
             return Err(classify::resource_body_rejected(url.as_str(), &body));
         }
+        // D10: a duplicate create is a 409 with a JSON `problem` naming the
+        // resource. Scoped to the create endpoint; a 409 on any other write
+        // keeps the shared mapping.
+        if status == reqwest::StatusCode::CONFLICT && decl.id == "resource_create" {
+            let body = response.text().await.unwrap_or_default();
+            return Err(CoreError::ResourceExists {
+                name: resource_name_for(names, Some(&body)),
+                endpoint: Some(url.to_string()),
+            });
+        }
         let response = classify::classify(response, url.as_str(), false).await?;
         let text = response.text().await.map_err(network)?;
         if text.trim().is_empty() {
@@ -523,28 +533,33 @@ fn names_signature_field(body: &str) -> bool {
         })
 }
 
-/// Build the typed [`CoreError::ResourceSignatureRejected`] without the
-/// signature or the problem text. The
-/// resource is named by the batch item whose name appears in the gateway's
-/// resource path (`message`), else the only item, else `<batch of N>`.
-fn signature_rejected(
-    names: &[&str],
-    reason: SignatureReason,
-    url: &url::Url,
-    message: Option<&str>,
-) -> CoreError {
+/// The resource a refusal is about: the batch item whose name appears in the
+/// gateway's resource path (`message`), else the only item, else
+/// `<batch of N>`. Never echoes the message itself.
+fn resource_name_for(names: &[&str], message: Option<&str>) -> String {
     let from_message = message.and_then(|message| {
         names
             .iter()
             .find(|name| message.contains(&format!("/{name},")))
             .map(|name| (*name).to_string())
     });
-    let name = from_message.unwrap_or_else(|| match names {
+    from_message.unwrap_or_else(|| match names {
         [only] => (*only).to_string(),
         _ => format!("<batch of {}>", names.len()),
-    });
+    })
+}
+
+/// Build the typed [`CoreError::ResourceSignatureRejected`] without the
+/// signature or the problem text. The resource is named by
+/// [`resource_name_for`].
+fn signature_rejected(
+    names: &[&str],
+    reason: SignatureReason,
+    url: &url::Url,
+    message: Option<&str>,
+) -> CoreError {
     CoreError::ResourceSignatureRejected {
-        name,
+        name: resource_name_for(names, message),
         reason,
         endpoint: Some(url.to_string()),
     }
@@ -753,11 +768,37 @@ impl DeployApi for ReqwestGatewayApi {
 
     async fn mode_create(&self, body: &ModeCreate) -> Result<ModeRecord, CoreError> {
         validate_segment("mode name", &body.name)?;
-        let decl = decl("mode_create")?;
+        decl("mode_create")?;
         let url = self.url_for(MODE_PATH);
         let request = self.apply_auth(self.client.post(url.clone()).json(body));
-        // Exactly one POST: a repeated create is never silent.
-        self.send_shaped(decl, request, &url).await?;
+        // Exactly one POST: a repeated create is never silent. D6: a
+        // duplicate is a 409 and an illegal name a 400, both Jetty HTML;
+        // both are typed here (deploy-scoped, so classify stays as is) and
+        // neither echoes the gateway's page.
+        let response = request.send().await.map_err(|err| CoreError::Network {
+            url: url.to_string(),
+            source: Some(err),
+            observation: None,
+        })?;
+        match response.status() {
+            reqwest::StatusCode::CONFLICT => {
+                return Err(CoreError::ModeExists {
+                    name: body.name.clone(),
+                    endpoint: Some(url.to_string()),
+                });
+            }
+            reqwest::StatusCode::BAD_REQUEST => {
+                return Err(CoreError::InvalidInput {
+                    reason: format!(
+                        "gateway rejected the deployment mode name {:?} (HTTP 400 from {url})",
+                        body.name
+                    ),
+                });
+            }
+            _ => {}
+        }
+        // Success is any 2xx (EmptyOk); every other status is classified.
+        classify::classify(response, url.as_str(), false).await?;
         // The 2xx is not the confirmation (D6): the list is.
         let listed = self.modes().await?;
         listed

@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -766,6 +766,30 @@ pub enum CoreError {
         /// URL of the refused request, when known.
         endpoint: Option<String>,
     },
+
+    /// A resource create named a resource that already exists. Exit 6 —
+    /// target state. Constructed ONLY by the deploy-scoped create helper
+    /// in client/deploy_api.rs from the live 409 JSON `problem` body
+    /// (20-LIVE-CAPTURES D10), never by classify.rs. The payload carries
+    /// no gateway problem text or stacktrace.
+    #[error("resource {name:?} already exists")]
+    ResourceExists {
+        /// The resource name that was being created.
+        name: String,
+        /// URL of the refused request, when known.
+        endpoint: Option<String>,
+    },
+
+    /// A deployment-mode create named a mode that is already defined.
+    /// Exit 6 — target state. Constructed ONLY by the deploy-scoped mode
+    /// create in client/deploy_api.rs from the live 409 (D6).
+    #[error("deployment mode {name:?} is already defined")]
+    ModeExists {
+        /// The mode name that was being created.
+        name: String,
+        /// URL of the refused request, when known.
+        endpoint: Option<String>,
+    },
 }
 
 /// Why a resource write's signature was refused
@@ -895,6 +919,8 @@ impl CoreError {
             Self::ModuleUninstallDenied { .. } => "module_uninstall_denied",
             Self::ScanLockHeld { .. } => "scan_lock_held",
             Self::ResourceSignatureRejected { .. } => "resource_signature_rejected",
+            Self::ResourceExists { .. } => "resource_exists",
+            Self::ModeExists { .. } => "mode_exists",
         }
     }
 
@@ -946,7 +972,9 @@ impl CoreError {
             | Self::ModuleDigestChanged(..)
             | Self::ModuleUninstallDenied { .. }
             | Self::ScanLockHeld { .. }
-            | Self::ResourceSignatureRejected { .. } => 6,
+            | Self::ResourceSignatureRejected { .. }
+            | Self::ResourceExists { .. }
+            | Self::ModeExists { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1304,6 +1332,16 @@ impl CoreError {
                  signatures change on every write"
                     .to_string(),
             ),
+            Self::ResourceExists { .. } => Some(
+                "a resource of that name is already present — read it for its \
+                 current signature and update it, or choose another name"
+                    .to_string(),
+            ),
+            Self::ModeExists { .. } => Some(
+                "that deployment mode is already defined — list the modes and \
+                 skip the create"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1334,7 +1372,9 @@ impl CoreError {
             | Self::EamTaskInFlight { endpoint, .. }
             | Self::ModuleUninstallDenied { endpoint, .. }
             | Self::ScanLockHeld { endpoint, .. }
-            | Self::ResourceSignatureRejected { endpoint, .. } => endpoint.clone(),
+            | Self::ResourceSignatureRejected { endpoint, .. }
+            | Self::ResourceExists { endpoint, .. }
+            | Self::ModeExists { endpoint, .. } => endpoint.clone(),
             Self::ModuleFeedUnreachable { url, .. }
             | Self::ModuleReleaseNotFound { url, .. }
             | Self::ModuleFeedUnusable { url, .. } => Some(url.clone()),
@@ -1823,6 +1863,22 @@ mod tests {
                 6,
                 "resource_signature_rejected",
             ),
+            (
+                CoreError::ResourceExists {
+                    name: "DB_A".into(),
+                    endpoint: Some("http://gw:8088/data/api/v1/resources/ignition/database-connection".into()),
+                },
+                6,
+                "resource_exists",
+            ),
+            (
+                CoreError::ModeExists {
+                    name: "production".into(),
+                    endpoint: Some("http://gw:8088/data/api/v1/mode".into()),
+                },
+                6,
+                "mode_exists",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1886,6 +1942,8 @@ mod tests {
         (6, "module_uninstall_denied"),
         (6, "scan_lock_held"),
         (6, "resource_signature_rejected"),
+        (6, "resource_exists"),
+        (6, "mode_exists"),
         (7, "rig_error"),
     ];
 
@@ -2201,6 +2259,28 @@ mod tests {
         assert!(
             hint.contains("re-read") && hint.contains("signatures change on every write"),
             "signature hint names the action: {hint}"
+        );
+
+        // The duplicate-create refusals (20-REVIEW WR-01): each names the
+        // next step and carries no gateway problem text.
+        let exists = CoreError::ResourceExists {
+            name: "DB_A".into(),
+            endpoint: None,
+        };
+        let hint = exists.hint().expect("hint required");
+        assert!(
+            hint.contains("update it"),
+            "resource_exists hint names the action: {hint}"
+        );
+        assert_eq!(exists.to_string(), "resource \"DB_A\" already exists");
+        let mode_exists = CoreError::ModeExists {
+            name: "production".into(),
+            endpoint: None,
+        };
+        let hint = mode_exists.hint().expect("hint required");
+        assert!(
+            hint.contains("skip the create"),
+            "mode_exists hint names the action: {hint}"
         );
 
         // The TTY refusal's hint is contextual (06-07): the ONE
