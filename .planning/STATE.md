@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 20
 current_phase_name: config-api-client
 status: executing
-stopped_at: Completed 20-01-PLAN.md
-last_updated: "2026-10-12T14:53:11.342Z"
+stopped_at: Completed 20-02-PLAN.md
+last_updated: "2026-10-12T15:06:45.991Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 20 execution started
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 6
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 20 (config-api-client) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 20 execution started
 
-Progress: [██░░░░░░░░] 17% (0 of 6 v1.6 phases complete)
+Progress: [███░░░░░░░] 33% (0 of 6 v1.6 phases complete)
 
 ## Performance Metrics
 
@@ -47,6 +47,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 20 P01 | 35min | 2 tasks | 11 files |
+| Phase 20 P02 | 30min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -76,8 +77,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-12T14:53:11.315Z
-**Stopped At:** Completed 20-01-PLAN.md
+**Last session:** 2026-10-12T15:06:45.978Z
+**Stopped At:** Completed 20-02-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -86,3 +87,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [20-01] Stale signature is a 500 marked 'signature mismatch'; omitted and empty signatures are one identical 422 (D3)
 - [Phase ?]: [20-01] list is effective-view only and filters with object-style field[op]=value; list-by-collection is names then find?collection= (D7)
 - [Phase ?]: [20-01] Any actor's scan releases the scan-lock at trigger time; a no-op scan advances lastScanTimestamp (D4, D12)
+- [Phase ?]: 20-02: active_node decides by activityLevel only; role is configuration (C-S3 failover keeps Master fixed while activity moves)
+- [Phase ?]: 20-02: ResourceSignatureRejected carries only name, reason and endpoint; never a signature or gateway problem text
