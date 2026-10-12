@@ -679,10 +679,16 @@ mod tests {
         ));
 
         // First tick is immediate: a Sample event arrives (all-error
-        // sample against the dead endpoint) stamped with era 7.
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        // sample against the dead endpoint) stamped with era 7. The
+        // 30 s ceiling: the sample chains SEQUENTIAL requests against
+        // the dead endpoint, and a refused connect's latency is
+        // platform luck (instant RST on macOS/Linux, seconds on a
+        // filtered Windows CI runner — the 2026-10-12 Windows flake:
+        // a 5 s ceiling passed on one runner and Elapsed'd on two
+        // more). The ceiling only needs to prove the event lands.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
-            .expect("first sample within 5s")
+            .expect("first sample within 30s")
             .expect("worker holds the sender");
         match event {
             TopEvent::Sample { era, sample } => {
@@ -695,8 +701,14 @@ mod tests {
         }
 
         // Shutdown stops the worker promptly (not at the next tick).
+        // Same 30 s ceiling rationale as above: the worker can be
+        // MID-sample when the signal lands (the sample call is not
+        // select-ed against shutdown), so "prompt" is bounded by the
+        // dead endpoint's refuse latency, not the 50 ms tick. The
+        // assertion's substance — the worker EXITS instead of hanging
+        // forever — is unchanged.
         shutdown_tx.send(true).expect("worker holds the receiver");
-        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+        tokio::time::timeout(std::time::Duration::from_secs(30), worker)
             .await
             .expect("worker exits on shutdown")
             .expect("worker task not cancelled");
