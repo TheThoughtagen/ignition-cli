@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 20
-current_phase_name: Config API Client
+current_phase_name: config-api-client
 status: executing
-stopped_at: "v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped); next: /gsd-plan-phase 20 (Phase 21 can be planned in parallel)"
-last_updated: "2026-10-12T12:12:35.646Z"
-last_activity: 2026-10-10
-last_activity_desc: v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped)
+stopped_at: Completed 20-01-PLAN.md
+last_updated: "2026-10-12T14:53:11.342Z"
+last_activity: 2026-10-12
+last_activity_desc: Phase 20 execution started
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 6
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,16 +24,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-10)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 20 — Config API Client (Phase 21 Deploy Render can be planned in parallel); milestone v1.6 Declared Gateway Deploy, Phases 20-25
+**Current focus:** Phase 20 — config-api-client
 
 ## Current Position
 
-Phase: 20 of 25 (Config API Client)
-Plan: — (not planned yet)
+Phase: 20 (config-api-client) — EXECUTING
+Plan: 2 of 6
 Status: Ready to execute
-Last activity: 2026-10-10 — v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped)
+Last activity: 2026-10-12 — Phase 20 execution started
 
-Progress: [░░░░░░░░░░] 0% (0 of 6 v1.6 phases complete)
+Progress: [██░░░░░░░░] 17% (0 of 6 v1.6 phases complete)
 
 ## Performance Metrics
 
@@ -42,6 +42,11 @@ Progress: [░░░░░░░░░░] 0% (0 of 6 v1.6 phases complete)
 **v1.1 final:** 7 phases (8-14), 47 plans, 113 tasks, 12 days (2026-09-04 → 2026-09-16); ~107,954 LOC Rust (+34k); ~1,255 test fns; 236 commits, 263 files changed (+76,357/−2,351).
 
 Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/plan avg — live-rig windows dominate); polish phases ran fastest (12: 22 min/plan avg). Full per-plan timings preserved in the git history and phase summaries.
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 20 P01 | 35min | 2 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -71,6 +76,13 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-10T20:45:19.751Z
-**Stopped At:** v1.6 roadmap created (Phases 20-25, 47/47 requirements mapped); next: /gsd-plan-phase 20 (Phase 21 can be planned in parallel)
+**Last session:** 2026-10-12T14:53:11.315Z
+**Stopped At:** Completed 20-01-PLAN.md
 **Resume file:** None
+
+## Decisions
+
+- [Phase ?]: [20-01] Competing scan-lock acquire is an immediate 409 with an HTML body naming the actor; 408 never observed (D1)
+- [Phase ?]: [20-01] Stale signature is a 500 marked 'signature mismatch'; omitted and empty signatures are one identical 422 (D3)
+- [Phase ?]: [20-01] list is effective-view only and filters with object-style field[op]=value; list-by-collection is names then find?collection= (D7)
+- [Phase ?]: [20-01] Any actor's scan releases the scan-lock at trigger time; a no-op scan advances lastScanTimestamp (D4, D12)

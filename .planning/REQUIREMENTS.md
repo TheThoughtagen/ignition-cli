@@ -6,6 +6,7 @@
 **Design spec:** whk-environment-orchestration PR #60 — `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` (Plan 2 of that roadmap). **Research:** [`research/SUMMARY.md`](research/SUMMARY.md) — conflict resolutions, capture backlog C1–C12, spec flags SF-1..SF-10.
 
 **Decisions recorded at scoping (2026-10-10):**
+
 - Bootstrap (`ign deploy pull`) is in v1.6; the spec §13.5 core strip is not (SF-5).
 - Post-write red outcomes keep the frozen envelope: `ok:true`, `data.ok=false`, verdict slug in `data`, exit 6 (Decision A).
 - CI and agent callers must pass `--plan-sha256`; `apply`/`rollback`/`projects` are not exposed as MCP tools in v1.6 (Decisions C, D).
@@ -23,7 +24,7 @@ Numbering: new categories. **47 requirements.**
 - [ ] **DAPI-03**: The core library can acquire the config scan-lock, read its remaining time, and detect expiry (200 JSON while held → 204 after) without comparing gateway timestamps to the local clock
 - [ ] **DAPI-04**: The core library can trigger a config scan and decide completion by `scanActive == false` and `lastScanTimestamp` advanced on the same gateway — HTTP 200 alone is never success
 - [ ] **DAPI-05**: The core library can list and create deployment modes and reads the active `deploymentMode`, normalizing `null` and `""` to "no mode"
-- [ ] **DAPI-06**: Every new endpoint has a declared response shape (JSON, empty 2xx, or 204) proven by a live capture; gateway bodies echoed into errors are size-capped
+- [x] **DAPI-06**: Every new endpoint has a declared response shape (JSON, empty 2xx, or 204) proven by a live capture; gateway bodies echoed into errors are size-capped
 - [ ] **DAPI-07**: A held scan-lock (409) surfaces as `scan_lock_held` naming the holder, and redundancy status decides the active node by activity level with the live `Master`/`Backup` vocabulary
 
 ### Render
@@ -120,7 +121,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DAPI-03 | Phase 20 | Pending |
 | DAPI-04 | Phase 20 | Pending |
 | DAPI-05 | Phase 20 | Pending |
-| DAPI-06 | Phase 20 | Pending |
+| DAPI-06 | Phase 20 | Complete |
 | DAPI-07 | Phase 20 | Pending — satisfied at library level (`active_node`); `ign redundancy status` CLI surface deferred to Phase 24 (user decision 2026-10-12) |
 | DRND-01 | Phase 21 | Pending |
 | DRND-02 | Phase 21 | Pending |
@@ -175,6 +176,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | 25. Guarded Project Deploy | DPRJ-01..05 | 5 |
 
 **Cross-cutting assignments** (each is mapped to the phase where it is first fully provable; later phases must keep it green):
+
 - **DSURF-01** closes in Phase 21 with the first verb (`render`) and the `deploy` family coverage test. Phases 22–25 keep it green as `plan`, `pull`, `verify`, `apply`, `rollback`, `--node both` and `projects` land.
 - **DSURF-03** closes in Phase 23, the first phase with apply output, a run directory and events. Phase 22 starts the canary over `plan` and `verify` output; Phases 24 and 25 keep it green.
 - **DSURF-02** closes in Phase 23, where the MCP exclusion for guarded deploy verbs is built and `apply`/`rollback` are registered. Phase 25 registers `projects` under the same rule.
