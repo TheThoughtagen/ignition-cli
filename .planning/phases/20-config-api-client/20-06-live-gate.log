@@ -1,4 +1,4 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
      Running tests/live_deploy_api.rs (/Users/pmannion/Library/Caches/cargo-target/debug/deps/live_deploy_api-d6a2b5a56edbfcc4)
 
 running 1 test
@@ -6,12 +6,13 @@ PASS guard: loopback URL, gateway name is ign-deploy-rig
 PASS A: lock held by cap-a, cap-b refused naming cap-a, then Free after expiry
 PASS B: scan_and_wait Complete, lastScanTimestamp advanced
 PASS D: no active mode, production mode created and listed, still no active mode
+OBSERVED C: the collection-less PUT left the production copy
 PASS C: create, effective/core/production reads, update, stale refusal leaves signature, list, names, duplicate refused
-live trace: ["lock:acquired", "lock:held-by-a", "lock:refused-held-by-a", "lock:free", "scan:complete", "create:ok", "find:ok", "update:ok", "update:stale", "create-duplicate:internal", "mode:created", "modes:listed", "deployment-mode:none"]
-fake trace: ["lock:acquired", "lock:held-by-a", "lock:refused-held-by-a", "lock:free", "scan:complete", "create:ok", "find:ok", "update:ok", "update:stale", "create-duplicate:internal", "mode:created", "modes:listed", "deployment-mode:none"]
-PASS E: live trace equals fake trace (13 steps)
+live trace: ["lock:acquired", "lock:held-by-a", "lock:refused-held-by-a", "lock:free", "scan:complete", "create:ok", "find:ok", "update:ok", "update:stale", "create-duplicate:resource_exists", "mode:created", "mode-duplicate:mode_exists", "modes:listed", "deployment-mode:none"]
+fake trace: ["lock:acquired", "lock:held-by-a", "lock:refused-held-by-a", "lock:free", "scan:complete", "create:ok", "find:ok", "update:ok", "update:stale", "create-duplicate:resource_exists", "mode:created", "mode-duplicate:mode_exists", "modes:listed", "deployment-mode:none"]
+PASS E: live trace equals fake trace (14 steps)
 PASS Z: cleanup scan complete
 test live_deploy_api_end_to_end ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 13.24s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 31.66s
 
