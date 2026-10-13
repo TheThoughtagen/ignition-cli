@@ -80,7 +80,7 @@ Numbering: new categories. **47 requirements.**
 
 ### Surface and Contract
 
-- [ ] **DSURF-01**: Each deploy verb lands with its TUI route row, README entry and exit-table rows in the same phase; every new error follows the four-place rule
+- [x] **DSURF-01**: Each deploy verb lands with its TUI route row, README entry and exit-table rows in the same phase; every new error follows the four-place rule
 - [ ] **DSURF-02**: `apply`, `rollback` and `projects` are registered in `GUARDED_OPS` and are not exposed as MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are
 - [ ] **DSURF-03**: A secret canary test proves no secret value appears in plan, apply or verify output, `--json`, run-directory files or events
 - [ ] **DSURF-04**: The verdict envelope (`ok:true`, `data.ok=false`, exit 6) is documented as a dated README contract exception
@@ -159,7 +159,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DPRJ-03 | Phase 25 | Pending |
 | DPRJ-04 | Phase 25 | Pending |
 | DPRJ-05 | Phase 25 | Pending |
-| DSURF-01 | Phase 21 | Pending |
+| DSURF-01 | Phase 21 | Complete |
 | DSURF-02 | Phase 23 | Pending |
 | DSURF-03 | Phase 23 | Pending |
 | DSURF-04 | Phase 22 | Pending |
