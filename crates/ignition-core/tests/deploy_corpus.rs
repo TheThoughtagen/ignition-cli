@@ -263,3 +263,79 @@ fn render_refuses_unparseable_json() {
     assert!(text.contains("duplicate key `k`"), "{text}");
     assert!(!text.contains("\"s\"") && !text.contains("\"t\""), "{text}");
 }
+
+/// 21-07: every `TYPE_RULES` row agrees with the corpus, and every corpus
+/// type outside the deny list has a row.
+#[test]
+fn type_rules_agree_with_corpus() {
+    use ignition_core::deploy::node::Node;
+    use ignition_core::deploy::rules::{TYPE_RULES, UuidRule, is_denied, type_rule};
+
+    let tree = read_tree(Path::new(CORPUS));
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut problems: Vec<String> = Vec::new();
+    for (path, bytes) in tree.iter().filter(|(p, _)| p.ends_with("resource.json")) {
+        let parts: Vec<&str> = path.split('/').collect();
+        let (module, ty) = (parts[0], parts[1]);
+        if is_denied(module, ty) {
+            continue;
+        }
+        let Some(rule) = type_rule(module, ty) else {
+            problems.push(format!("{path}: no TYPE_RULES row for {module}/{ty}"));
+            continue;
+        };
+        seen.insert((module.to_string(), ty.to_string()));
+
+        // placement: a singleton's resource.json is `<m>/<t>/resource.json`,
+        // every other class `<m>/<t>/<name>/resource.json`
+        let expected_depth = if rule.uuid == UuidRule::Singleton {
+            3
+        } else {
+            4
+        };
+        if parts.len() != expected_depth {
+            problems.push(format!("{path}: placement does not match {:?}", rule.uuid));
+        }
+
+        let (_, node) = classify(bytes).unwrap_or_else(|why| panic!("{path}: {why}"));
+        let has_uuid = node.get("attributes").and_then(|a| a.get("uuid")).is_some();
+        let want_uuid = rule.uuid == UuidRule::Named;
+        if has_uuid != want_uuid {
+            problems.push(format!(
+                "{path}: uuid present={has_uuid} but the {:?} rule expects {want_uuid}",
+                rule.uuid
+            ));
+        }
+        match node.get("scope") {
+            Some(Node::Str(scope)) if scope == rule.scope => {}
+            _ => problems.push(format!(
+                "{path}: scope differs from the row's {}",
+                rule.scope
+            )),
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+
+    // rows exist only for corpus types and the five types CD3 captured
+    // (database-translator is both)
+    const CD3_ONLY: [(&str, &str); 5] = [
+        (
+            "com.inductiveautomation.alarm-notification",
+            "alarm-notification-profile",
+        ),
+        ("ignition", "holiday"),
+        ("ignition", "oauth2-client"),
+        ("ignition", "roster-config"),
+        ("ignition", "service-connector"),
+    ];
+    for rule in TYPE_RULES {
+        let key = (rule.module.to_string(), rule.ty.to_string());
+        assert!(
+            seen.contains(&key) || CD3_ONLY.contains(&(rule.module, rule.ty)),
+            "{}/{} has a row but neither corpus nor CD3 evidence",
+            rule.module,
+            rule.ty
+        );
+    }
+    assert_eq!(TYPE_RULES.len(), seen.len() + CD3_ONLY.len());
+}
