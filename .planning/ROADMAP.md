@@ -244,7 +244,7 @@ Plans:
 
 **Capture first**: C4 (named, uuid-bearing vs singleton resource types: census from the prod `core` bootstrap, feeding the uuid rule table); C5 (hostile-name encoding in tag and resource directories, covering `:`, `?`, trailing dot, case collision, spaces and commas, against WHK01's 637 tag files); C3b (whether a stale or omitted `lastModificationSignature` loads, is rewritten or is flagged, and whether the gateway rewrites a hand-written `resource.json` after load); OQ1 (gateway-written bytes of `tags.json`, `udts.json` and `unary-resource.json`; the spike fixtures are synthetic); OQ4 (repo-path to collection-path mapping for tag-definition nesting and name depth); OQ8 (exact 8.3.6 JSON shape of Embedded vs Referenced secret fields). Also check `cargo tree` for `sha1` before choosing the uuid derivation.
 **Constraints**: Spec correction: preserve source key order. Spec §4 "sorted keys" is wrong; use an order-preserving node tree, Gson HTML-safe escaping, 2-space indent and no trailing newline, and rewrite a gateway file only when `write(parse(bytes)) == bytes`, otherwise copy it opaque. YAML via `yaml_serde` 0.10 (compiles on the 1.88 floor; not serde-saphyr); no `uuid` crate. The manifest and target schemas include `verify.tag_probes[]` (SF-8) and the target `ssh` block (SF-10) now, so strict parsing does not reject them in Phase 22. Overlays are add/override only; "absent in env" is documented, not built (SF-7). The render golden runs on `windows-latest`, and fixture `gateways/` trees carry no `\r`. `render` reaches the MCP catalog by clap derivation (Decision D).
-**Plans**: 7/9 plans executed (waves: 1 = 21-01 ∥ 21-02 ∥ 21-03, 2 = 21-04, 3 = 21-05, 4 = 21-06, 5 = 21-07, 6 = 21-08, 7 = 21-09)
+**Plans**: 8/9 plans executed (waves: 1 = 21-01 ∥ 21-02 ∥ 21-03, 2 = 21-04, 3 = 21-05, 4 = 21-06, 5 = 21-07, 6 = 21-08, 7 = 21-09)
 
 Plans:
 **Wave 1**
@@ -271,7 +271,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 21-08-PLAN.md — Lints: `embedded_secret` (paths only, canaries), case-fold, Windows names, path budget, CR in text members only (D-01)
+- [x] 21-08-PLAN.md — Lints: `embedded_secret` (paths only, canaries), case-fold, Windows names, path budget, CR in text members only (D-01)
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
@@ -369,7 +369,7 @@ Plans:
 | 18. Declared Rig Discovery | v1.3 | 0/? | Parked behind v1.6 | — |
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
-| 21. Deploy Render | v1.6 | 7/9 | In Progress|  |
+| 21. Deploy Render | v1.6 | 8/9 | In Progress|  |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 0/? | Not started | — |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
