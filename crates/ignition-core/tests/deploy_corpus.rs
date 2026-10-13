@@ -218,6 +218,11 @@ fn corpus_render_is_byte_identical() {
     );
     assert_eq!(outcome.opaque_files, expected_opaque);
     assert!(outcome.uuids_minted.is_empty(), "render mints no uuid yet");
+    assert!(
+        outcome.warnings.is_empty(),
+        "the corpus renders with no lint warning: {:?}",
+        outcome.warnings
+    );
 }
 
 #[test]
@@ -338,4 +343,91 @@ fn type_rules_agree_with_corpus() {
         );
     }
     assert_eq!(TYPE_RULES.len(), seen.len() + CD3_ONLY.len());
+}
+
+/// JSON paths (dotted members, `[i]` indexes) of every Embedded secret object
+/// in `value`, computed here independently of the production scanner.
+fn embedded_paths(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("Embedded")
+                && map.get("data").is_some_and(|d| d.is_object())
+            {
+                out.push(path.to_string());
+                return;
+            }
+            for (k, v) in map {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                embedded_paths(v, &child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                embedded_paths(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 21-08 (DRND-07): each of the ten Embedded-bearing corpus resources is
+/// refused by path as `embedded_secret`, and the sanitizer's `SANITIZED`
+/// marker (which stands in for the real ciphertext) never reaches the error.
+#[test]
+fn corpus_embedded_files_are_refused_by_path() {
+    let tree = read_tree(Path::new(CORPUS));
+    let dirs = embedded_dirs(&tree);
+    assert_eq!(dirs.len(), 10, "ten Embedded-bearing corpus resources");
+    for dir in &dirs {
+        let mut parts = dir.split('/');
+        let ty = format!("{}/{}", parts.next().unwrap(), parts.next().unwrap());
+        let members: Vec<&(String, Vec<u8>)> = tree
+            .iter()
+            .filter(|(p, _)| p.starts_with(dir.as_str()))
+            .collect();
+        let config = members
+            .iter()
+            .find(|(p, _)| *p == format!("{dir}config.json"))
+            .expect("config.json");
+        let mut expected = Vec::new();
+        let value: serde_json::Value = serde_json::from_slice(&config.1).expect("config parses");
+        embedded_paths(&value, "", &mut expected);
+        assert!(!expected.is_empty(), "{dir}: no Embedded path found");
+
+        let manifest = Manifest::parse(
+            "manifest.yaml",
+            format!("schema_version: 1\ntypes:\n  - {ty}\n").as_bytes(),
+        )
+        .expect("manifest");
+        let target = Target::parse("targets/dev.yaml", TARGET).expect("target");
+        let source = SourceTree::from_files(
+            members
+                .iter()
+                .map(|(p, b)| (format!("resources/{p}"), b.clone())),
+        )
+        .expect("source tree");
+        let err = render(&RenderInput {
+            gateway: "g",
+            env: "dev",
+            manifest: &manifest,
+            target: &target,
+            source: &source,
+        })
+        .expect_err("an Embedded secret is refused");
+        assert_eq!(err.code(), "embedded_secret", "{dir}");
+        let text = err.to_string();
+        for path in &expected {
+            let want = format!("gateways/g/resources/{dir}config.json: {path} (embedded)");
+            assert!(text.contains(&want), "{want} missing from: {text}");
+        }
+        assert!(!text.contains("SANITIZED"), "{dir}: {text}");
+        assert!(
+            !format!("{err:?}").contains("SANITIZED"),
+            "{dir}: Debug leaks the marker"
+        );
+    }
 }

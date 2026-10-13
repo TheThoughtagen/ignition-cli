@@ -356,6 +356,183 @@ pub fn type_rule(module: &str, ty: &str) -> Option<&'static TypeRule> {
         .map(|i| &TYPE_RULES[i])
 }
 
+/// The secret-typed config fields of one resource type, from the 8.3.6
+/// OpenAPI (`tests/fixtures/deploy/openapi-8.3.6-resource-types.json`,
+/// `secret_fields`; Phase 21, plan 21-01). Each path is dotted from the root
+/// of the type's `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretFields {
+    /// Module id.
+    pub module: &'static str,
+    /// Resource type.
+    pub ty: &'static str,
+    /// Dotted member paths whose value must be absent, null or Referenced.
+    pub paths: &'static [&'static str],
+}
+
+/// The ten resource types whose 8.3.6 schema has secret-typed fields, sorted
+/// by (module, type) bytes. `secret_fields_agree_with_openapi_extract` pins
+/// the table to the extract. The email-profile path is
+/// `settings.settings.password` (corrected from RESEARCH Pattern 7 in 21-01;
+/// the corpus `WH_Classic_SMTP/config.json` has the nested layout).
+pub const SECRET_FIELDS: &[SecretFields] = &[
+    SecretFields {
+        module: "com.inductiveautomation.alarm-notification",
+        ty: "alarm-notification-profile",
+        paths: &[
+            "settings.settings.password",
+            "settings.twoWayPop3.pop3Password",
+            "settings.voipGateway.password",
+        ],
+    },
+    SecretFields {
+        module: "com.inductiveautomation.opcua",
+        ty: "device",
+        paths: &["settings.advanced.password"],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "database-connection",
+        paths: &["password"],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "email-profile",
+        paths: &["settings.settings.password"],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "identity-provider",
+        paths: &["settings.clientSecret"],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "oauth2-client",
+        paths: &["clientSecret"],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "opc-connection",
+        paths: &[
+            "settings.authentication.password",
+            "settings.authentication.privateKeyPem",
+            "settings.security.keyStoreAliasPassword",
+        ],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "service-connector",
+        paths: &[
+            "settings.password",
+            "settings.ssl.keyPassword",
+            "settings.ssl.keystore.key",
+            "settings.ssl.keystore.password",
+            "settings.ssl.truststore.password",
+        ],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "system-properties",
+        paths: &["errorReportPassword"],
+    },
+    SecretFields {
+        module: "ignition",
+        ty: "user-source",
+        paths: &[
+            "settings.connectionPassword",
+            "settings.ldap.connectionPassword",
+        ],
+    },
+];
+
+/// The secret-typed paths of `module/ty`; empty when the type has none (or is
+/// not described by the OpenAPI at all).
+pub fn secret_paths(module: &str, ty: &str) -> &'static [&'static str] {
+    SECRET_FIELDS
+        .iter()
+        .find(|s| s.module == module && s.ty == ty)
+        .map_or(&[], |s| s.paths)
+}
+
+/// Every (module, type) pair the 8.3.6 OpenAPI describes, sorted by bytes.
+/// `openapi_types_equal_extract` pins it to the extract, so it cannot drift
+/// from the evidence. A type outside this list (for example the Cirrus Link
+/// MQTT types) has no schema, so secret detection there falls back to the
+/// generic Embedded scan and the key-name rule (21-08).
+pub const OPENAPI_TYPES: &[(&str, &str)] = &[
+    (
+        "com.inductiveautomation.alarm-notification",
+        "alarm-notification-profile",
+    ),
+    ("com.inductiveautomation.eam", "agent-group"),
+    ("com.inductiveautomation.eam", "agent-management"),
+    ("com.inductiveautomation.eam", "eam-tasks"),
+    ("com.inductiveautomation.eam", "event-thresholds"),
+    ("com.inductiveautomation.eam", "hw-license-management"),
+    ("com.inductiveautomation.eam", "leased-license-management"),
+    ("com.inductiveautomation.eam", "module-certificates"),
+    ("com.inductiveautomation.eam", "module-eulas"),
+    ("com.inductiveautomation.eam", "module-settings"),
+    ("com.inductiveautomation.eam", "remote-upgrade"),
+    ("com.inductiveautomation.historian", "historian-provider"),
+    ("com.inductiveautomation.opcua", "access-control"),
+    ("com.inductiveautomation.opcua", "device"),
+    ("com.inductiveautomation.opcua", "server-config"),
+    (
+        "com.inductiveautomation.opcua.drivers.bacnet",
+        "BacnetIpLocalDeviceConfig",
+    ),
+    ("com.inductiveautomation.perspective", "fonts"),
+    ("com.inductiveautomation.perspective", "icons"),
+    ("com.inductiveautomation.perspective", "themes"),
+    ("com.inductiveautomation.sfc", "chart-settings"),
+    (
+        "com.inductiveautomation.sip-notification",
+        "script-settings",
+    ),
+    ("ignition", "alarm-journal"),
+    ("ignition", "api-token"),
+    ("ignition", "audit-profile"),
+    ("ignition", "cobranding"),
+    ("ignition", "database-connection"),
+    ("ignition", "database-driver"),
+    ("ignition", "database-translator"),
+    ("ignition", "edge-system-properties"),
+    ("ignition", "email-profile"),
+    ("ignition", "gateway-network-incoming"),
+    ("ignition", "gateway-network-outgoing"),
+    ("ignition", "gateway-network-proxy-rules"),
+    ("ignition", "gateway-network-queue-settings"),
+    ("ignition", "gateway-network-settings"),
+    ("ignition", "general-alarm-settings"),
+    ("ignition", "holiday"),
+    ("ignition", "identity-provider"),
+    ("ignition", "keyboard_layout"),
+    ("ignition", "local-system-properties"),
+    ("ignition", "metrics-dashboard"),
+    ("ignition", "oauth2-client"),
+    ("ignition", "opc-connection"),
+    ("ignition", "quickstart"),
+    ("ignition", "roster-config"),
+    ("ignition", "schedule"),
+    ("ignition", "secret-provider"),
+    ("ignition", "security-levels"),
+    ("ignition", "security-properties"),
+    ("ignition", "security-zone"),
+    ("ignition", "service-connector"),
+    ("ignition", "store-and-forward-engine"),
+    ("ignition", "system-properties"),
+    ("ignition", "tag-provider"),
+    ("ignition", "translations"),
+    ("ignition", "user-source"),
+];
+
+/// Whether the 8.3.6 OpenAPI describes `module/ty`: the schema is
+/// authoritative for its secret-typed fields.
+pub fn openapi_describes(module: &str, ty: &str) -> bool {
+    OPENAPI_TYPES.binary_search(&(module, ty)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +626,70 @@ mod tests {
             );
         }
         assert!(compared > 25, "only {compared} rows were comparable");
+    }
+
+    #[test]
+    fn secret_fields_agree_with_openapi_extract() {
+        let doc: serde_json::Value = serde_json::from_str(OPENAPI).expect("extract parses");
+        let fields = doc["secret_fields"].as_array().expect("secret_fields");
+        assert_eq!(fields.len(), SECRET_FIELDS.len());
+        assert_eq!(SECRET_FIELDS.len(), 10);
+        for (row, want) in SECRET_FIELDS.iter().zip(fields) {
+            assert_eq!(row.module, want["module"].as_str().expect("module"));
+            assert_eq!(row.ty, want["type"].as_str().expect("type"));
+            let paths: Vec<&str> = want["paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .map(|p| p.as_str().expect("path"))
+                .collect();
+            assert_eq!(row.paths, paths.as_slice(), "{}/{}", row.module, row.ty);
+        }
+        for pair in SECRET_FIELDS.windows(2) {
+            assert!(
+                (pair[0].module.as_bytes(), pair[0].ty.as_bytes())
+                    < (pair[1].module.as_bytes(), pair[1].ty.as_bytes())
+            );
+        }
+        assert_eq!(
+            secret_paths("ignition", "email-profile"),
+            ["settings.settings.password"]
+        );
+        assert!(secret_paths("ignition", "schedule").is_empty());
+        assert!(secret_paths("no.such", "type").is_empty());
+        // every secret-bearing type is a described type
+        for row in SECRET_FIELDS {
+            assert!(openapi_describes(row.module, row.ty));
+        }
+    }
+
+    #[test]
+    fn openapi_types_equal_extract() {
+        let doc: serde_json::Value = serde_json::from_str(OPENAPI).expect("extract parses");
+        let mut want: Vec<(String, String)> = doc["types"]
+            .as_array()
+            .expect("types")
+            .iter()
+            .map(|t| {
+                (
+                    t["module"].as_str().expect("module").to_string(),
+                    t["type"].as_str().expect("type").to_string(),
+                )
+            })
+            .collect();
+        want.sort_by(|a, b| {
+            (a.0.as_bytes(), a.1.as_bytes()).cmp(&(b.0.as_bytes(), b.1.as_bytes()))
+        });
+        let got: Vec<(String, String)> = OPENAPI_TYPES
+            .iter()
+            .map(|(m, t)| ((*m).to_string(), (*t).to_string()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(OPENAPI_TYPES.len(), 56);
+        assert!(openapi_describes("ignition", "database-connection"));
+        assert!(!openapi_describes(
+            "com.cirruslink.mqtt.engine.gateway",
+            "server"
+        ));
     }
 }

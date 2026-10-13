@@ -19,7 +19,8 @@
 //!    `.json` member; findings name the source path; parsed nodes are kept
 //! 6. **uuid** (21-07): the rule-table checks of stage 4 (`enforce_rules`),
 //!    then per Named resource keep, inject or synthesize `attributes.uuid`
-//! 7. lints (21-08)
+//! 7. lints (21-08): secrets (Embedded, plaintext at schema paths, plaintext
+//!    by key name) over the parsed nodes, then the tree lints; one final raise
 //! 8. **finish**: build the [`RenderedTree`], resources and the digest
 //!
 //! Pure: no filesystem, no network, no clock, no randomness. Ordered
@@ -30,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use super::layout::{RelPath, ResourceKey, TAG_TYPES, collection_path, resource_key, tag_provider};
+use super::lint::{scan_embedded, scan_secrets};
 use super::manifest::Manifest;
 use super::node::{self, JsonClass, Node};
 use super::rules::{GATEWAY_OWNED_FILES, TypeRule, UuidRule, is_denied, type_rule};
@@ -97,10 +99,16 @@ pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     enforce_rules(input, &mapped, &mut findings);
     let mut json = classify_json(&mapped.files, &mapped.origins, &mut findings);
     let minted = assign_uuids(input.gateway, &mut mapped, &mut json, &mut findings);
+    let mut warnings = Vec::new();
+    let secret_paths = scan_all_secrets(&mapped, &json, &mut warnings);
+    // one raise: secret locations win, every other finding rides along
+    if !secret_paths.is_empty() {
+        return Err(CoreError::embedded_secret(secret_paths, findings));
+    }
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
-    Ok(finish(mapped, &json, minted))
+    Ok(finish(mapped, &json, minted, warnings))
 }
 
 /// One gateway-relative file after the overlay: its bytes and the repo path
@@ -690,8 +698,41 @@ fn assign_uuids(
     minted
 }
 
+/// Stage 7 (21-08, DRND-07), secret half: scan every parsed `.json` member.
+///
+/// Resource files get the full rule set for their type; tag-origin files
+/// (CD5) have no resource type and get the generic Embedded rule only.
+/// Returns the refused locations in (collection path, document) order; the
+/// scan output carries paths only, never a value. Warnings are appended to
+/// `warnings`.
+fn scan_all_secrets(mapped: &Mapped, json: &JsonTable, warnings: &mut Vec<String>) -> Vec<String> {
+    let mut refused = Vec::new();
+    for (path, (_, node)) in json {
+        let origin = mapped
+            .origins
+            .get(path)
+            .map_or_else(|| path.to_string(), |o| o.file.clone());
+        let scan = if mapped.tags.contains_key(path) {
+            scan_embedded(&origin, node)
+        } else {
+            let key = resource_key(path);
+            let skip = if key.name.is_some() { 3 } else { 2 };
+            let rest: Vec<&str> = path.components().skip(skip).collect();
+            scan_secrets(&origin, &key, &rest.join("/"), node)
+        };
+        refused.extend(scan.refused);
+        warnings.extend(scan.warnings);
+    }
+    refused
+}
+
 /// Stage 8: the rendered tree and its resource listing.
-fn finish(mapped: Mapped, json: &JsonTable, uuids_minted: Vec<String>) -> RenderOutcome {
+fn finish(
+    mapped: Mapped,
+    json: &JsonTable,
+    uuids_minted: Vec<String>,
+    mut warnings: Vec<String>,
+) -> RenderOutcome {
     let mut groups: BTreeMap<ResourceKey, Vec<String>> = BTreeMap::new();
     for path in mapped.files.keys() {
         let key = resource_key(path);
@@ -711,7 +752,6 @@ fn finish(mapped: Mapped, json: &JsonTable, uuids_minted: Vec<String>) -> Render
             }
         })
         .collect();
-    let mut warnings = Vec::new();
     if mapped.files.is_empty() {
         warnings.push("render produced no files".to_string());
     }

@@ -220,3 +220,147 @@ fn render_unlisted_type_is_refused() {
         "{message}"
     );
 }
+
+// ---- 21-08: the secret lint never prints a value --------------------------
+
+const CANARY_EMBEDDED: &str = "CANARY-EMBEDDED-21";
+const CANARY_PLAINTEXT: &str = "CANARY-PLAINTEXT-21";
+const CANARY_KEYNAME: &str = "CANARY-KEYNAME-21";
+const CANARY_WARN: &str = "CANARY-WARN-21";
+
+/// A tracer copy whose manifest also allows `extra_types`, plus the given
+/// resource config files (gateway-relative path under `resources/`).
+fn secret_repo(extra_types: &[&str], configs: &[(&str, String)]) -> (tempfile::TempDir, PathBuf) {
+    let (tmp, repo) = tracer_copy();
+    let gateway = repo.join("gateways/tracer-gw");
+    let mut manifest =
+        std::fs::read_to_string(gateway.join("manifest.yaml")).expect("read manifest");
+    for t in extra_types {
+        manifest.push_str(&format!("  - {t}\n"));
+    }
+    std::fs::write(gateway.join("manifest.yaml"), manifest).expect("write manifest");
+    for (rel, body) in configs {
+        let path = gateway.join("resources").join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write config");
+    }
+    (tmp, repo)
+}
+
+#[test]
+fn embedded_secret_names_path_not_value() {
+    let (_tmp, repo) = secret_repo(
+        &[
+            "ignition/database-connection",
+            "com.cirruslink.mqtt.engine.gateway/server",
+        ],
+        &[
+            (
+                "ignition/database-connection/Main/config.json",
+                format!(
+                    r#"{{"password":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_EMBEDDED}"}}}}}}"#
+                ),
+            ),
+            (
+                "ignition/database-connection/Plain/config.json",
+                format!(r#"{{"password":"{CANARY_PLAINTEXT}"}}"#),
+            ),
+            (
+                "com.cirruslink.mqtt.engine.gateway/server/Broker/config.json",
+                format!(r#"{{"settings":{{"clientSecret":"{CANARY_KEYNAME}"}}}}"#),
+            ),
+        ],
+    );
+    for json in [false, true] {
+        let (_cfg, mut cmd) = ign();
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd
+            .args(["deploy", "render", "--env", "dev", "--repo"])
+            .arg(&repo)
+            .output()
+            .expect("spawn ign");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(2), "json={json}: {stderr}");
+        assert!(stdout.is_empty(), "a refusal leaves stdout empty: {stdout}");
+        for canary in [
+            CANARY_EMBEDDED,
+            CANARY_PLAINTEXT,
+            CANARY_KEYNAME,
+            "SANITIZED",
+        ] {
+            assert!(
+                !stderr.contains(canary),
+                "json={json}: {canary} in {stderr}"
+            );
+            assert!(
+                !stdout.contains(canary),
+                "json={json}: {canary} in {stdout}"
+            );
+        }
+        let message = if json {
+            let err = stderr_json(&out);
+            assert_eq!(err["error"]["code"], "embedded_secret");
+            err["error"]["message"]
+                .as_str()
+                .expect("message")
+                .to_string()
+        } else {
+            assert!(
+                stderr.contains("embedded_secret")
+                    || stderr.contains("embedded or plaintext secret"),
+                "{stderr}"
+            );
+            stderr.clone()
+        };
+        for want in [
+            "ignition/database-connection/Main/config.json: password (embedded)",
+            "ignition/database-connection/Plain/config.json: password (plaintext)",
+            "server/Broker/config.json: settings.clientSecret (plaintext, by key name)",
+        ] {
+            assert!(
+                message.contains(want),
+                "json={json}: {want} missing from {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn possible_secret_warning_names_path_not_value() {
+    let (_tmp, repo) = secret_repo(
+        &["ignition/database-connection"],
+        &[(
+            "ignition/database-connection/Main/config.json",
+            format!(r#"{{"settings":{{"mqttPassword":"{CANARY_WARN}"}}}}"#),
+        )],
+    );
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "render", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!stdout.contains(CANARY_WARN), "{stdout}");
+    assert!(!stderr.contains(CANARY_WARN), "{stderr}");
+    let envelope: Value = serde_json::from_str(&stdout).expect("envelope");
+    let warnings = envelope["data"]["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .expect("string")
+            .contains("config.json: settings.mqttPassword;"),
+        "{warnings:?}"
+    );
+}

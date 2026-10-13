@@ -10,6 +10,7 @@
 //!   binary renders them.
 
 pub mod layout;
+pub mod lint;
 pub mod manifest;
 pub mod node;
 pub mod render;

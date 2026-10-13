@@ -2233,6 +2233,9 @@ Refused:
   under its type directory;
 - an invalid, or missing where required, `resource.json` or `attributes.uuid`
   (see Resource identity).
+- an Embedded secret, a plaintext value at a secret-typed schema path, or a
+  plaintext `password`/`secret` string in an undescribed module type (see
+  Secrets); this is `embedded_secret`, exit 2.
 
 #### Resource identity (attributes.uuid)
 
@@ -2286,6 +2289,71 @@ What render does for a **Named** resource:
 `types` entry or a directory in the tree: only types with corpus or capture
 evidence render. The four tag types follow the `tags/` layout instead and are
 not subject to these rules.
+
+#### Secrets
+
+Render never ships a secret. A secret field is accepted only when it is
+absent, `null`, or a **Referenced** secret, which points at a secret held by
+a gateway secret provider:
+
+```json
+{ "type": "Referenced", "data": { "providerName": "vault", "secretName": "db-pass" } }
+```
+
+A Referenced secret carries a provider and a secret *name*, not a value, so
+it is safe to commit (decision CD7). Everything else is refused as
+`embedded_secret` (exit 2), and the error names `<source file>: <json path>`
+and the kind of defect, never a value:
+
+- **Embedded anywhere.** Any JSON object with `"type": "Embedded"` and an
+  object `data`, at any depth of any `.json` member of any resource or tag
+  file, is refused. `Embedded` is how a gateway stores an encrypted secret
+  inline; the ciphertext is tied to one gateway and must not be committed.
+  The path reads `<file>: password (embedded)`.
+- **Plaintext at a schema path.** For the ten resource types whose 8.3.6
+  OpenAPI schema has secret-typed fields, `config.json` must hold absent,
+  `null` or Referenced at each path; a string (even an empty one) or any
+  other value is refused as `(plaintext)`:
+
+  | Type | Secret paths in `config.json` |
+  | --- | --- |
+  | `com.inductiveautomation.alarm-notification/alarm-notification-profile` | `settings.settings.password`, `settings.twoWayPop3.pop3Password`, `settings.voipGateway.password` |
+  | `com.inductiveautomation.opcua/device` | `settings.advanced.password` |
+  | `ignition/database-connection` | `password` |
+  | `ignition/email-profile` | `settings.settings.password` |
+  | `ignition/identity-provider` | `settings.clientSecret` |
+  | `ignition/oauth2-client` | `clientSecret` |
+  | `ignition/opc-connection` | `settings.authentication.password`, `settings.authentication.privateKeyPem`, `settings.security.keyStoreAliasPassword` |
+  | `ignition/service-connector` | `settings.password`, `settings.ssl.keyPassword`, `settings.ssl.keystore.key`, `settings.ssl.keystore.password`, `settings.ssl.truststore.password` |
+  | `ignition/system-properties` | `errorReportPassword` |
+  | `ignition/user-source` | `settings.connectionPassword`, `settings.ldap.connectionPassword` (a denied type; listed for completeness) |
+
+- **Plaintext by key name, in module types the OpenAPI does not describe.**
+  For a type outside the 8.3.6 OpenAPI (for example the Cirrus Link MQTT
+  types), a non-empty string under a key whose name contains `password` or
+  `secret` (ASCII, any case) in `config.json` is refused as
+  `(plaintext, by key name)`. The `secretName` of a Referenced object is a
+  name, not a secret, and is not checked. To fix a refusal, move the value
+  into the gateway's secret provider and reference it as above. An empty
+  string, `null`, a number and a boolean under such a key are fine.
+- **A warning, in described types.** In a type the OpenAPI does describe, the
+  schema is authoritative: its secret-typed fields are refused at their exact
+  paths, and a string under a secret-looking key elsewhere (a field that is
+  not secret-typed) only produces a warning naming the path. Render still
+  succeeds.
+
+The `--json` envelope, stderr, stdout and the warnings carry paths only. Tests
+plant canary values in each of these cases and assert they appear nowhere.
+
+**Residual risk (DRND-07).** Detection in an undescribed module type is by key
+name, so a plaintext secret under another name (`apiKey`, `token`,
+`privateKey`, `credentials`) is **not detected**. Conversely, a string field in
+such a type whose name merely contains `password` or `secret` is refused, and
+Phase 21 has no override: rename the field in the source only if the module
+allows it, or keep that resource out of the declared tree. The corpus has no
+such string value. When a secret and tree defects are found together, one
+`embedded_secret` error lists the secret paths and then the other findings.
+Tag files are scanned for Embedded objects only: they have no resource schema.
 
 ## Linting (`ign lint`)
 

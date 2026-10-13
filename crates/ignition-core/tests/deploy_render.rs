@@ -1498,3 +1498,229 @@ fn uuid_is_stable_across_envs_and_differs_across_gateways() {
     assert!(text.contains(&name_based_uuid("gw-a", "ignition", "schedule", "x")));
     assert_eq!(dev.uuids_minted, ["ignition/schedule/x"]);
 }
+
+// ---- 21-08 task 1: the secret lint ---------------------------------------
+
+const CANARY_EMBEDDED: &str = "CANARY-EMBEDDED-21";
+const CANARY_PLAINTEXT: &str = "CANARY-PLAINTEXT-21";
+const CANARY_KEYNAME: &str = "CANARY-KEYNAME-21";
+const CANARY_WARN: &str = "CANARY-WARN-21";
+
+const DB: &str = "resources/ignition/database-connection/Main/config.json";
+const MQTT: &str = "resources/com.cirruslink.mqtt.engine.gateway/server/Broker/config.json";
+const MQTT_TYPE: &str = "com.cirruslink.mqtt.engine.gateway/server";
+
+/// Render `files` allowing `types`; returns the result unchanged.
+fn secret_render(types: &[&str], files: &[(&str, &str)]) -> Result<RenderOutcome, CoreError> {
+    try_render("dev", types, &[], files)
+}
+
+/// No canary anywhere a human or agent can read it: error Display and Debug
+/// (which is also what `--json` serialises from), and every warning.
+fn assert_no_canary(result: &Result<RenderOutcome, CoreError>, canaries: &[&str]) {
+    let mut shown = String::new();
+    match result {
+        Ok(o) => shown.push_str(&o.warnings.join("\n")),
+        Err(e) => {
+            shown.push_str(&e.to_string());
+            shown.push_str(&format!("{e:?}"));
+        }
+    }
+    for canary in canaries {
+        assert!(!shown.contains(canary), "{canary} leaked into: {shown}");
+    }
+}
+
+#[test]
+fn embedded_secret_is_refused_by_path() {
+    let config = format!(
+        r#"{{"password":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_EMBEDDED}"}}}},"url":"jdbc:x"}}"#
+    );
+    let result = secret_render(&["ignition/database-connection"], &[(DB, &config)]);
+    assert_no_canary(&result, &[CANARY_EMBEDDED]);
+    let err = result.expect_err("embedded secret is refused");
+    assert_eq!(err.code(), "embedded_secret");
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "gateways/g/resources/ignition/database-connection/Main/config.json: password (embedded)"
+        ),
+        "{text}"
+    );
+    // reported once even though the path is also a schema path
+    assert_eq!(text.matches("password (").count(), 1, "{text}");
+}
+
+#[test]
+fn embedded_anywhere_is_refused() {
+    let config = format!(
+        r#"{{"a":{{"b":[{{"ok":1}},{{"c":{{"type":"Embedded","data":{{"x":"{CANARY_EMBEDDED}"}}}}}}]}}}}"#
+    );
+    let result = secret_render(
+        &["ignition/schedule"],
+        &[("resources/ignition/schedule/S/config.json", &config)],
+    );
+    assert_no_canary(&result, &[CANARY_EMBEDDED]);
+    let text = result.expect_err("refused").to_string();
+    assert!(text.contains("config.json: a.b[1].c (embedded)"), "{text}");
+}
+
+#[test]
+fn embedded_in_any_json_member_is_refused() {
+    let side = format!(r#"{{"k":{{"type":"Embedded","data":{{"x":"{CANARY_EMBEDDED}"}}}}}}"#);
+    let result = secret_render(
+        &["ignition/schedule"],
+        &[
+            ("resources/ignition/schedule/S/config.json", "{}"),
+            ("resources/ignition/schedule/S/extra.json", &side),
+        ],
+    );
+    assert_no_canary(&result, &[CANARY_EMBEDDED]);
+    let text = result.expect_err("refused").to_string();
+    assert!(text.contains("extra.json: k (embedded)"), "{text}");
+}
+
+#[test]
+fn plaintext_secret_at_schema_path_is_refused() {
+    let config = format!(r#"{{"password":"{CANARY_PLAINTEXT}","settings":{{"x":1}}}}"#);
+    let result = secret_render(&["ignition/database-connection"], &[(DB, &config)]);
+    assert_no_canary(&result, &[CANARY_PLAINTEXT]);
+    let err = result.expect_err("plaintext secret is refused");
+    assert_eq!(err.code(), "embedded_secret");
+    assert!(
+        err.to_string()
+            .contains("config.json: password (plaintext)"),
+        "{err}"
+    );
+
+    // a nested schema path, and a non-string, non-null value
+    let result = secret_render(
+        &["ignition/email-profile"],
+        &[(
+            "resources/ignition/email-profile/Mail/config.json",
+            &format!(r#"{{"settings":{{"settings":{{"password":"{CANARY_PLAINTEXT}"}}}}}}"#),
+        )],
+    );
+    assert_no_canary(&result, &[CANARY_PLAINTEXT]);
+    assert!(
+        result
+            .expect_err("refused")
+            .to_string()
+            .contains("Mail/config.json: settings.settings.password (plaintext)")
+    );
+    let result = secret_render(
+        &["ignition/database-connection"],
+        &[(DB, r#"{"password":123}"#)],
+    );
+    assert!(
+        result
+            .expect_err("refused")
+            .to_string()
+            .contains("password (plaintext)")
+    );
+}
+
+#[test]
+fn referenced_and_null_secrets_pass() {
+    let referenced = r#"{"password":{"data":{"providerName":"vault","secretName":"db-pass"},"type":"Referenced"}}"#;
+    for config in [referenced, r#"{"password":null}"#, r#"{"url":"x"}"#] {
+        let out = secret_render(&["ignition/database-connection"], &[(DB, config)])
+            .unwrap_or_else(|e| panic!("{config} refused: {e}"));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+}
+
+#[test]
+fn possible_plaintext_secret_warns_without_value() {
+    let config = format!(r#"{{"settings":{{"mqttPassword":"{CANARY_WARN}"}}}}"#);
+    let result = secret_render(&["ignition/database-connection"], &[(DB, &config)]);
+    assert_no_canary(&result, &[CANARY_WARN]);
+    let out = result.expect("a described type only warns");
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].starts_with("possible plaintext secret at gateways/g/"));
+    assert!(out.warnings[0].contains("config.json: settings.mqttPassword;"));
+}
+
+#[test]
+fn plaintext_by_key_name_in_undescribed_type_is_refused() {
+    let config = format!(
+        r#"{{"password":"{CANARY_KEYNAME}","settings":{{"clientSecret":"{CANARY_KEYNAME}"}},"url":"tcp://x"}}"#
+    );
+    let result = secret_render(&[MQTT_TYPE], &[(MQTT, &config)]);
+    assert_no_canary(&result, &[CANARY_KEYNAME]);
+    let err = result.expect_err("refused");
+    assert_eq!(err.code(), "embedded_secret");
+    let text = err.to_string();
+    assert!(
+        text.contains("Broker/config.json: password (plaintext, by key name)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Broker/config.json: settings.clientSecret (plaintext, by key name)"),
+        "{text}"
+    );
+    // an array of strings under a secret-looking key is caught too
+    let result = secret_render(
+        &[MQTT_TYPE],
+        &[(MQTT, &format!(r#"{{"passwords":["{CANARY_KEYNAME}"]}}"#))],
+    );
+    assert_no_canary(&result, &[CANARY_KEYNAME]);
+    assert!(
+        result
+            .expect_err("refused")
+            .to_string()
+            .contains("passwords[0] (plaintext, by key name)")
+    );
+}
+
+#[test]
+fn empty_or_referenced_key_name_values_pass_in_undescribed_type() {
+    let referenced = r#"{"password":{"data":{"providerName":"v","secretName":"mqtt-pass"},"type":"Referenced"},"settings":{"clientSecret":{"data":{"providerName":"v","secretName":"cs"},"type":"Referenced"}}}"#;
+    for config in [
+        r#"{"password":""}"#,
+        r#"{"password":null}"#,
+        r#"{"passwordMinLength":8,"secretCount":2,"requirePassword":true}"#,
+        referenced,
+    ] {
+        let out = secret_render(&[MQTT_TYPE], &[(MQTT, config)])
+            .unwrap_or_else(|e| panic!("{config} refused: {e}"));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+}
+
+#[test]
+fn key_name_rule_is_limited_to_config_json() {
+    // a sibling member is not config.json: only the Embedded rule applies
+    let out = secret_render(
+        &[MQTT_TYPE],
+        &[
+            (MQTT, "{}"),
+            (
+                "resources/com.cirruslink.mqtt.engine.gateway/server/Broker/extra.json",
+                r#"{"password":"x"}"#,
+            ),
+        ],
+    )
+    .expect("renders");
+    assert!(out.warnings.is_empty());
+}
+
+#[test]
+fn secret_findings_win_and_carry_other_findings() {
+    let config = format!(r#"{{"password":"{CANARY_PLAINTEXT}"}}"#);
+    let result = secret_render(
+        &["ignition/database-connection"],
+        &[
+            (DB, &config),
+            ("resources/other/unlisted/x/config.json", "{}"),
+        ],
+    );
+    assert_no_canary(&result, &[CANARY_PLAINTEXT]);
+    let err = result.expect_err("refused");
+    assert_eq!(err.code(), "embedded_secret");
+    let text = err.to_string();
+    assert!(text.contains("password (plaintext)"), "{text}");
+    assert!(text.contains("also"), "{text}");
+    assert!(text.contains("resources/other/unlisted/"), "{text}");
+}
