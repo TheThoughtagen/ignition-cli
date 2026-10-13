@@ -339,6 +339,58 @@ fn deploy_render_json_stdout_is_the_envelope_only() {
     );
 }
 
+/// 21-09: with `--out` the same holds: stdout is the envelope alone, and
+/// `data.out` is the path as given.
+#[test]
+fn deploy_render_out_json_stdout_is_the_envelope_only() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let out_dir = scratch.path().join("r");
+    let (_dir, mut cmd) = noisy_ign();
+    let output = cmd
+        .args([
+            "--json",
+            "deploy",
+            "render",
+            "--env",
+            "dev",
+            "--repo",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ignition-core/tests/fixtures/deploy/repos/tracer"
+            ),
+            "--out",
+        ])
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = &output.stdout;
+    assert!(
+        stdout.ends_with(b"\n") && !stdout.ends_with(b"\n\n"),
+        "exactly one trailing newline: {:?}",
+        String::from_utf8_lossy(stdout)
+    );
+    let mut stream = serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>();
+    let envelope = stream
+        .next()
+        .expect("one JSON value")
+        .expect("stdout parses as JSON");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["out"], out_dir.to_string_lossy().as_ref());
+    let value_end = stream.byte_offset();
+    assert!(
+        stream.next().is_none(),
+        "stdout holds exactly one JSON value"
+    );
+    assert_eq!(stdout[value_end..], *b"\n");
+    assert!(out_dir.join("render.json").is_file());
+}
+
 /// 21-04: a `deploy render` refusal (unknown `--env`) exits 2 with the
 /// error envelope on stderr and stdout byte-empty under max diagnostics.
 #[test]

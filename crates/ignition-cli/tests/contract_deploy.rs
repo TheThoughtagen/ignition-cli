@@ -147,6 +147,112 @@ fn render_human_summary() {
     );
 }
 
+/// 21-09: `--out` writes the rendered tree byte for byte plus `render.json`,
+/// and the human mode adds the `wrote <n> files to <dir>` line third.
+#[test]
+fn render_out_writes_tree_and_marker() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let out_dir = scratch.path().join("rendered");
+    let (_dir, mut cmd) = ign();
+    let out = cmd
+        .args([
+            "deploy",
+            "render",
+            "--env",
+            "dev",
+            "--repo",
+            TRACER_REPO,
+            "--out",
+        ])
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("rendered gateways/tracer-gw"),
+        "{stdout}"
+    );
+    assert_eq!(lines[1], format!("render_sha256 {RENDER_GOLDEN}"));
+    assert_eq!(
+        lines[2],
+        format!("wrote 4 files to {}", out_dir.display()),
+        "{stdout}"
+    );
+
+    // the files equal the tracer sources they were rendered from
+    let resources = Path::new(TRACER_REPO).join("gateways/tracer-gw/resources");
+    let marker: Value =
+        serde_json::from_slice(&std::fs::read(out_dir.join("render.json")).expect("marker"))
+            .expect("marker json");
+    assert_eq!(marker["schema_version"], 1);
+    assert_eq!(marker["gateway"], "tracer-gw");
+    assert_eq!(marker["env"], "dev");
+    assert_eq!(marker["mode"], "dev");
+    assert_eq!(marker["render_sha256"], RENDER_GOLDEN);
+    let files = marker["files"].as_array().expect("files");
+    assert_eq!(files.len(), 4);
+    for entry in files {
+        let rel = entry["path"].as_str().expect("path");
+        let written = std::fs::read(out_dir.join(rel)).expect("written file");
+        let source = std::fs::read(resources.join(rel)).expect("source file");
+        assert_eq!(written, source, "{rel}");
+        assert_eq!(entry["bytes"], written.len());
+    }
+}
+
+/// 21-09: a refused `--out` is `invalid_input` (exit 2) and leaves a
+/// non-empty unrelated directory exactly as it was.
+#[test]
+fn render_out_refusal_is_invalid_input() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let out_dir = scratch.path().join("mine");
+    std::fs::create_dir(&out_dir).expect("mkdir");
+    std::fs::write(out_dir.join("notes.txt"), b"keep").expect("write");
+
+    let (_dir, mut cmd) = ign();
+    let out = cmd
+        .args([
+            "--json",
+            "deploy",
+            "render",
+            "--env",
+            "dev",
+            "--repo",
+            TRACER_REPO,
+            "--out",
+        ])
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "a refusal leaves stdout empty");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("notes.txt")),
+        "{err}"
+    );
+    let names: Vec<_> = std::fs::read_dir(&out_dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, ["notes.txt"]);
+    assert_eq!(
+        std::fs::read(out_dir.join("notes.txt")).expect("read"),
+        b"keep"
+    );
+}
+
 #[test]
 fn render_missing_target_is_tree_invalid() {
     let (_dir, mut cmd) = ign();

@@ -340,7 +340,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace checkout <PROJECT> <TARGET> [--decode-scripts]` | Check a project's resources out to a local tree — mapped paths + the recorded `.ign-workspace.json` manifest + an idempotent `.gitignore` | read-only on the wire (one export GET, ZERO imports); an unrelated non-empty target refuses exit 2 (never clobbered — the pre-existing file is untouched), a corrupt or foreign-manifest target refuses naming what it found, a same-project re-checkout refreshes; `--decode-scripts` decodes embedded JSON scripts to editable `.py` sidecars (nvim-editable; the UNEDITED re-encode is byte-exact — see the workspace section and Script decode/encode below); profile NAME rides into the manifest; JSON data `{project, target, member_count, scripts_decoded}` |
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
-| `ign deploy render --env <ENV> [--repo DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (read-only, Decision D); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
+| `ign deploy render --env <ENV> [--repo DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -2056,10 +2056,12 @@ resource, and a type with no `<name>` level is a singleton (for example
 
 ### `deploy render`
 
-`ign deploy render --env <ENV> [--repo DIR]` is **offline**. It opens no
+`ign deploy render --env <ENV> [--repo DIR] [--out DIR]` is **offline**. It opens no
 network connection, resolves no profile and reads no credential, so the
-envelope carries `profile: null` and it needs no config file. It writes
-nothing to disk. `--repo` defaults to the current directory.
+envelope carries `profile: null` and it needs no config file. Without
+`--out` it writes nothing to disk; `--out DIR` writes the rendered tree (see
+[Writing the rendered tree](#writing-the-rendered-tree---out)). `--repo`
+defaults to the current directory.
 
 **`--env` resolution.** `--env dev` selects `targets/dev.yaml`; that file's
 `gateway` field names `gateways/<gateway>/`, whose `manifest.yaml` is read
@@ -2119,7 +2121,7 @@ runs and operating systems. An allowlist that matches no files renders
 and the warning `render produced no files`.
 
 **Data keys.** With `--json` the envelope's `data` carries, in this order,
-`env`, `gateway`, `mode`, `out` (null until `--out` lands), `files`,
+`env`, `gateway`, `mode`, `out` (the `--out` path as given, null without `--out`), `files`,
 `bytes`, `render_sha256`, `resources`, `tag_providers`, `uuids_minted`,
 `opaque_files` and `warnings`. `resources` is ordered by (module, type,
 name) bytes with singletons (name `null`) first, each entry
@@ -2127,12 +2129,68 @@ name) bytes with singletons (name `null`) first, each entry
 directory; the other arrays are in byte order, and `warnings` are in
 pipeline order. Keys are only ever added, never renamed. Human output is
 `rendered gateways/<name> for env <env> (mode <mode>): <n> files, <n> bytes`
-and `render_sha256 <hex>` on stdout, with each warning on stderr as
-`warning: …`. A refusal leaves stdout empty.
+and `render_sha256 <hex>` on stdout (plus `wrote <n> files to <dir>` as a
+third line with `--out`), with each warning on stderr as `warning: …`. A
+refusal leaves stdout empty.
 
 **Over MCP.** `deploy render` is in the `ign mcp serve` tool catalog as
-`deploy_render`. It is read-only, so it is not guarded and takes no
+`deploy_render`. It reads the repo and writes only through `--out`, whose
+ladder (next section) is the safety, so the tool is not guarded and takes no
 `confirm` argument.
+
+#### Writing the rendered tree (`--out`)
+
+`--out DIR` writes every rendered file under `DIR` at its collection path
+(`<module>/<type>/…`), byte for byte, plus a marker `DIR/render.json`. Nothing
+is written unless the whole render succeeded, so a refused render (policy,
+Gson gate, uuid, lint or secret) creates nothing: an absent `DIR` stays absent
+(no ancestor is created either) and an empty `DIR` stays empty.
+
+`DIR` is accepted only when it is one of:
+
+- **absent**: it and any missing parents are created;
+- **an empty directory**;
+- **exactly a previous render of the same gateway and environment**: every
+  regular file in it is listed in its `render.json` with an unchanged
+  SHA-256, every listed file is present, there is no directory without a
+  listed file, and the new render still produces every listed file. Listed
+  files are then replaced with the new bytes.
+
+Anything else is refused as `invalid_input` (exit 2) with the reason and the
+first offending path, and **nothing is written**: an unrelated non-empty
+directory, a directory without a `render.json` (including one left by an
+interrupted write), a marker of another gateway or environment or with an
+unknown `schema_version`, a file edited since it was rendered, an unlisted
+file, a listed file the new render dropped, a regular file at `DIR`, a
+symlink at `DIR` or anywhere under it, and any special file. Render never
+follows or creates links.
+
+Render **never deletes** a file, and it never overwrites a file that is not
+listed, unchanged, in a prior `render.json` of the same gateway and
+environment. New files are created exclusively (a second writer racing for the
+same new directory loses and is refused); replaced files and the marker are
+written to `<name>.ign-render-tmp` and renamed into place. The marker is
+written **last**, so an interrupted write leaves no valid marker, and the
+next render into that directory is refused until you remove it or choose
+another. This ladder is the safety for the unguarded MCP tool.
+
+`render.json` is ign's own file, not a gateway file, and is not part of
+`render_sha256`. It is pretty-printed JSON with one trailing LF:
+
+```json
+{
+  "schema_version": 1,
+  "gateway": "<gateway directory name>",
+  "env": "<--env>",
+  "mode": "<target mode>",
+  "render_sha256": "<same value as the envelope>",
+  "files": [{ "path": "<collection path>", "sha256": "<hex>", "bytes": 123 }]
+}
+```
+
+`files` is sorted by path bytes. Later `deploy` verbs read this marker, so
+unknown fields are refused and its shape is versioned by `schema_version`.
+With `--json`, `data.out` holds the path exactly as given.
 
 #### Byte fidelity
 
