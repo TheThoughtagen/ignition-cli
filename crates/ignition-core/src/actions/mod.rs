@@ -8,6 +8,7 @@ pub mod adopt;
 pub mod apicall;
 pub mod backup;
 pub mod connections;
+pub mod deploy;
 pub mod diagnostics;
 pub mod doctor;
 pub mod e2e;

@@ -283,6 +283,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::JvmJfrStop(result) => render_jvm_jfr_stop_human(result),
         ActionOutput::TestingRun(result) => render_testing_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
+        ActionOutput::DeployRender(result) => render_deploy_render_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1392,6 +1393,19 @@ fn render_eam_task_delete_human(result: &EamDeleteResult) {
 /// summary — issue count + child exit, the parsed report's summary
 /// object (compact), then the child's stderr diagnostics passthrough
 /// (preview). JSON mode carries the full shape.
+/// `ign deploy render` human form: the summary and digest on stdout,
+/// each warning on stderr.
+fn render_deploy_render_human(result: &ignition_core::actions::deploy::DeployRenderResult) {
+    println!(
+        "rendered gateways/{} for env {} (mode {}): {} files, {} bytes",
+        result.gateway, result.env, result.mode, result.files, result.bytes
+    );
+    println!("render_sha256 {}", result.render_sha256);
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
 fn render_lint_human(result: &LintResult) {
     println!(
         "lint: {} issue(s), child exit {}",

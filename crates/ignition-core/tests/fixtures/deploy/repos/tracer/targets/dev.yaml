@@ -1,0 +1,6 @@
+schema_version: 1
+gateway: tracer-gw
+mode: dev
+nodes:
+  master:
+    profile: dev

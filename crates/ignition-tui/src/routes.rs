@@ -475,6 +475,14 @@ pub fn routes() -> &'static [CliRoute] {
             path: "workspace push",
             mapping: Mapping::Screen(Screen::Projects),
         },
+        // 21-04: the deploy family (render now; plan, pull, verify,
+        // apply, rollback, projects in Phases 22-25) — registry-only
+        // rows on the Projects screen like the workspace family. Rows
+        // land in the SAME task as their clap commands (Pitfall 5).
+        CliRoute {
+            path: "deploy render",
+            mapping: Mapping::Screen(Screen::Projects),
+        },
         CliRoute {
             path: "resource list",
             mapping: Mapping::Screen(Screen::Projects),

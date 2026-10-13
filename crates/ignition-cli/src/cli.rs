@@ -187,6 +187,13 @@ pub enum Commands {
     #[command(arg_required_else_help = true)]
     Workspace(WorkspaceArgs),
 
+    /// Declared gateway deploy: `render` turns a repo's
+    /// `gateways/<name>/` tree into the bytes the gateway holds on
+    /// disk for one environment — offline (no profile, no network, no
+    /// credentials), deterministic, with a `render_sha256` digest
+    #[command(arg_required_else_help = true)]
+    Deploy(DeployArgs),
+
     /// Fetch a gateway resource, edit it in $EDITOR, push back
     /// (guarded) — the kubectl-edit loop over ONE resource:
     /// unchanged saves are clean no-ops (nothing pushed, never
@@ -601,6 +608,30 @@ pub enum WorkspaceCommand {
         /// reported, skipped)
         #[arg(long)]
         delete: bool,
+    },
+}
+
+/// `ign deploy` args (21-04): the declared gateway deploy family.
+#[derive(Debug, clap::Args)]
+pub struct DeployArgs {
+    #[command(subcommand)]
+    pub command: DeployCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeployCommand {
+    /// Render `gateways/<name>/` for one environment into the bytes
+    /// the gateway holds on disk — offline (no profile, no network,
+    /// no credentials). Reports file and byte counts and the
+    /// `render_sha256` digest; refuses an invalid tree with
+    /// `deploy_tree_invalid`
+    Render {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
     },
 }
 

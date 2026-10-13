@@ -38,14 +38,14 @@ use ignition_core::session::Session;
 use crate::render::{RenderMode, render_error, render_log_entry_line, render_ok};
 use ignition_cli::cli;
 use ignition_cli::cli::{
-    ApiArgs, ApiCommand, BackupArgs, BackupCommand, BundleCommand, Cli, Commands, DiagnosticsArgs,
-    DiagnosticsCommand, EamArgs, EamCommand, EamTaskCommand, EditArgs, GanArgs, GanCommand,
-    LicenseArgs, LicenseCommand, LintArgs, LogLevel, LoggersCmd, LogsArgs, LogsCmd, ProfileArgs,
-    ProfileCmd, ProjectArgs, ProjectCommand, RedundancyArgs, RedundancyCommand, ResourceArgs,
-    ResourceCommand, RigArgs, RigCommand, ScheduleMode, ScriptArgs, ScriptCommand, SessionsArgs,
-    SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand, TagsConfigCommand, TagsHistoryCommand,
-    TagsProviderCommand, TagsUdtCommand, TestingArgs, TestingCommand, WaitArgs, WaitCmd,
-    WebdevArgs, WebdevCommand, WorkspaceArgs, WorkspaceCommand,
+    ApiArgs, ApiCommand, BackupArgs, BackupCommand, BundleCommand, Cli, Commands, DeployArgs,
+    DeployCommand, DiagnosticsArgs, DiagnosticsCommand, EamArgs, EamCommand, EamTaskCommand,
+    EditArgs, GanArgs, GanCommand, LicenseArgs, LicenseCommand, LintArgs, LogLevel, LoggersCmd,
+    LogsArgs, LogsCmd, ProfileArgs, ProfileCmd, ProjectArgs, ProjectCommand, RedundancyArgs,
+    RedundancyCommand, ResourceArgs, ResourceCommand, RigArgs, RigCommand, ScheduleMode,
+    ScriptArgs, ScriptCommand, SessionsArgs, SessionsCmd, TagsAlarmsCommand, TagsArgs, TagsCommand,
+    TagsConfigCommand, TagsHistoryCommand, TagsProviderCommand, TagsUdtCommand, TestingArgs,
+    TestingCommand, WaitArgs, WaitCmd, WebdevArgs, WebdevCommand, WorkspaceArgs, WorkspaceCommand,
 };
 use ignition_cli::cli::{JfrSettingsArg, JvmArgs, JvmCommand, JvmJfrArgs, JvmJfrCommand};
 
@@ -226,6 +226,10 @@ enum ActionOutput {
     /// parsed report as data (`--strict`'s passthrough is decided
     /// in `main` AFTER the envelope renders).
     Lint(actions::lint::LintResult),
+    /// `ign deploy render` — the offline render summary (ALL keys
+    /// always): `env, gateway, mode, out, files, bytes, render_sha256,
+    /// resources, tag_providers, uuids_minted, opaque_files, warnings`.
+    DeployRender(actions::deploy::DeployRenderResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -403,6 +407,7 @@ impl ActionOutput {
             ActionOutput::JvmJfrStop(result) => render_success(profile, result, compact),
             ActionOutput::TestingRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
+            ActionOutput::DeployRender(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -3075,6 +3080,16 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 }
                 let result = actions::e2e::e2e_init(&env, &opts).await;
                 (profile, result.map(ActionOutput::E2eInit))
+            }
+        },
+        // `ign deploy render` (21-04): OFFLINE — no `Session::resolve`,
+        // no profile, no network, no credential read. Envelope profile
+        // is null (the `ign lint` precedent).
+        Commands::Deploy(DeployArgs { command }) => match command {
+            DeployCommand::Render { env, repo } => {
+                let result =
+                    actions::deploy::deploy_render(&repo, &env).map(ActionOutput::DeployRender);
+                (None, result)
             }
         },
         Commands::Lint(LintArgs {
