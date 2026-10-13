@@ -577,6 +577,33 @@ mod tests {
         assert_eq!(s, SecretScan::default());
     }
 
+    #[test]
+    fn referenced_with_extra_data_member_at_schema_path_is_plaintext() {
+        let s = scan(
+            "ignition",
+            "database-connection",
+            r#"{"password":{"type":"Referenced","data":{"providerName":"p","secretName":"s","password":"hunter2"}}}"#,
+        );
+        assert_eq!(s.refused, ["f/config.json: password (plaintext)"]);
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    }
+
+    #[test]
+    fn key_name_rule_applies_inside_malformed_referenced() {
+        let s = scan(
+            "com.cirruslink.mqtt.engine.gateway",
+            "server",
+            r#"{"settings":{"cred":{"type":"Referenced","data":{"providerName":"p","secretName":"s","password":"hunter2"}}}}"#,
+        );
+        assert_eq!(
+            s.refused,
+            [
+                "f/config.json: settings.cred.data.secretName (plaintext, by key name)",
+                "f/config.json: settings.cred.data.password (plaintext, by key name)",
+            ]
+        );
+    }
+
     // ---- Windows safety, budget and CR ----------------------------------
 
     use proptest::prelude::*;

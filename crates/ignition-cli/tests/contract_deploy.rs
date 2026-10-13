@@ -333,6 +333,7 @@ const CANARY_EMBEDDED: &str = "CANARY-EMBEDDED-21";
 const CANARY_PLAINTEXT: &str = "CANARY-PLAINTEXT-21";
 const CANARY_KEYNAME: &str = "CANARY-KEYNAME-21";
 const CANARY_WARN: &str = "CANARY-WARN-21";
+const CANARY_REFERENCED: &str = "CANARY-REFERENCED-WR02";
 
 /// A tracer copy whose manifest also allows `extra_types`, plus the given
 /// resource config files (gateway-relative path under `resources/`).
@@ -425,6 +426,77 @@ fn embedded_secret_names_path_not_value() {
             "ignition/database-connection/Main/config.json: password (embedded)",
             "ignition/database-connection/Plain/config.json: password (plaintext)",
             "server/Broker/config.json: settings.clientSecret (plaintext, by key name)",
+        ] {
+            assert!(
+                message.contains(want),
+                "json={json}: {want} missing from {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_referenced_secret_names_path_not_value() {
+    let (_tmp, repo) = secret_repo(
+        &[
+            "ignition/database-connection",
+            "com.cirruslink.mqtt.engine.gateway/server",
+        ],
+        &[
+            (
+                "ignition/database-connection/Main/config.json",
+                format!(
+                    r#"{{"password":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","password":"{CANARY_REFERENCED}"}}}}}}"#
+                ),
+            ),
+            (
+                "com.cirruslink.mqtt.engine.gateway/server/Broker/config.json",
+                format!(
+                    r#"{{"settings":{{"cred":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","password":"{CANARY_REFERENCED}"}}}}}}}}"#
+                ),
+            ),
+        ],
+    );
+    for json in [false, true] {
+        let (_cfg, mut cmd) = ign();
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd
+            .args(["deploy", "render", "--env", "dev", "--repo"])
+            .arg(&repo)
+            .output()
+            .expect("spawn ign");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(2), "json={json}: {stderr}");
+        assert!(stdout.is_empty(), "a refusal leaves stdout empty: {stdout}");
+        assert!(
+            !stderr.contains(CANARY_REFERENCED),
+            "json={json}: canary in {stderr}"
+        );
+        assert!(
+            !stdout.contains(CANARY_REFERENCED),
+            "json={json}: canary in {stdout}"
+        );
+        let message = if json {
+            let err = stderr_json(&out);
+            assert_eq!(err["error"]["code"], "embedded_secret");
+            err["error"]["message"]
+                .as_str()
+                .expect("message")
+                .to_string()
+        } else {
+            assert!(
+                stderr.contains("embedded_secret")
+                    || stderr.contains("embedded or plaintext secret"),
+                "{stderr}"
+            );
+            stderr.clone()
+        };
+        for want in [
+            "ignition/database-connection/Main/config.json: password (plaintext)",
+            "server/Broker/config.json: settings.cred.data.password (plaintext, by key name)",
         ] {
             assert!(
                 message.contains(want),

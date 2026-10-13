@@ -1507,6 +1507,7 @@ const CANARY_EMBEDDED: &str = "CANARY-EMBEDDED-21";
 const CANARY_PLAINTEXT: &str = "CANARY-PLAINTEXT-21";
 const CANARY_KEYNAME: &str = "CANARY-KEYNAME-21";
 const CANARY_WARN: &str = "CANARY-WARN-21";
+const CANARY_REFERENCED: &str = "CANARY-REFERENCED-WR02";
 
 const DB: &str = "resources/ignition/database-connection/Main/config.json";
 const MQTT: &str = "resources/com.cirruslink.mqtt.engine.gateway/server/Broker/config.json";
@@ -1631,6 +1632,39 @@ fn referenced_and_null_secrets_pass() {
             .unwrap_or_else(|e| panic!("{config} refused: {e}"));
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
+}
+
+#[test]
+fn malformed_referenced_secret_is_refused_by_path() {
+    // WR-02: a plaintext value hidden in a Referenced-looking wrapper
+    let config = format!(
+        r#"{{"password":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","password":"{CANARY_REFERENCED}"}}}}}}"#
+    );
+    let result = secret_render(&["ignition/database-connection"], &[(DB, &config)]);
+    assert_no_canary(&result, &[CANARY_REFERENCED]);
+    let err = result.expect_err("malformed Referenced is refused");
+    assert_eq!(err.code(), "embedded_secret");
+    assert_eq!(err.exit_code(), 2);
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "gateways/g/resources/ignition/database-connection/Main/config.json: password (plaintext)"
+        ),
+        "{text}"
+    );
+    assert_eq!(text.matches("password (").count(), 1, "{text}");
+
+    // an undescribed type: the key-name rule is live inside the wrapper
+    let config = format!(
+        r#"{{"settings":{{"cred":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","password":"{CANARY_REFERENCED}"}}}}}}}}"#
+    );
+    let result = secret_render(&[MQTT_TYPE], &[(MQTT, &config)]);
+    assert_no_canary(&result, &[CANARY_REFERENCED]);
+    let text = result.expect_err("refused").to_string();
+    assert!(
+        text.contains("Broker/config.json: settings.cred.data.password (plaintext, by key name)"),
+        "{text}"
+    );
 }
 
 #[test]
