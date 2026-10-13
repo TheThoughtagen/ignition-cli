@@ -2226,7 +2226,66 @@ Refused:
   and tag types placed under `resources/ignition/`;
 - two source files that map to one collection path;
 - symlinks, special files and non-UTF-8 names anywhere in the walked tree;
-- unparseable JSON (see Byte fidelity).
+- unparseable JSON (see Byte fidelity);
+- a resource type with no render rule, in the manifest `types` or in the tree
+  (see Resource identity): only types backed by evidence render;
+- a singleton type with a name directory, or a named type with a file directly
+  under its type directory;
+- an invalid, or missing where required, `resource.json` or `attributes.uuid`
+  (see Resource identity).
+
+#### Resource identity (attributes.uuid)
+
+A named resource whose `resource.json` has no `attributes.uuid` is silently
+never loaded by the gateway, so render gives every new named resource one.
+The uuid is deterministic (RFC 9562 version 8, built on SHA-256):
+
+```text
+SHA-256( "ign-deploy:uuid:v1" NUL <gateway> NUL <module> "/" <type> "/" <name> )
+```
+
+Take the first 16 bytes, set the version nibble to `8` and the two top bits of
+the variant byte to `10`, and print lowercase `8-4-4-4-12` hex. `NUL` is the
+byte `0x00`; `<gateway>` is the `gateways/<name>` directory name. The inputs
+are the exact UTF-8 bytes of each name: no normalization and no case folding,
+so `Pump` and `pump`, or NFC and NFD spellings, get different uuids. The
+**environment is not an input**, so one resource keeps one identity across a
+gateway's environments; the **gateway is**, so two gateway trees never share
+ids. An existing uuid is never recomputed. The derivation was checked against
+a live Ignition 8.3.6 gateway, which loaded a hand-written resource carrying
+the uuid this formula gives (decision CD1 in
+`.planning/phases/21-deploy-render/21-LIVE-CAPTURES.md`).
+
+Every rendered resource type has one of three rules, taken from the sanitized
+gateway corpus and from resources created on an 8.3.6 gateway:
+
+| Rule | Layout | `attributes.uuid` |
+| --- | --- | --- |
+| Singleton | files directly under `<module>/<type>/` | none; a `resource.json` that carries one, or is missing, is refused |
+| Named | one directory per resource | kept if present; derived and inserted if absent |
+| Named, no uuid (`ignition/store-and-forward-engine`, `com.inductiveautomation.perspective/themes`) | one directory per resource | never derived or inserted; a `resource.json` is required; an existing valid uuid is kept |
+
+What render does for a **Named** resource:
+
+- `resource.json` present with a valid `attributes.uuid`: kept byte for byte.
+  An empty, `null`, non-string or non-8-4-4-4-12 value is refused naming the
+  file; it is never replaced.
+- `resource.json` present without one, in the gateway's writer format: the uuid
+  is inserted into `attributes` right after `lastModification` (and `legacyId`
+  when present) and the rest of the file is unchanged. A `resource.json` that
+  is not in the gateway's writer format (see Byte fidelity) is refused instead
+  of rewritten; add the uuid yourself or re-pull the resource.
+- no `resource.json`: one is written in the gateway's own shape, with `scope`
+  from the type's rule, `version` 1, `restricted` false, `overridable` true,
+  `files` listing the resource's files in byte order, and `attributes`
+  holding the uuid and `enabled: true`. The gateway loads such a file without
+  `lastModification` or a signature (decision CD2). The data key
+  `uuids_minted` lists these resources as `module/type/name`, in byte order.
+
+**Fail-closed.** A type with no rule is refused, whether it is a manifest
+`types` entry or a directory in the tree: only types with corpus or capture
+evidence render. The four tag types follow the `tags/` layout instead and are
+not subject to these rules.
 
 ## Linting (`ign lint`)
 

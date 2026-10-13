@@ -17,7 +17,8 @@
 //!    types under `resources/` (21-06)
 //! 5. **JSON classification**, the Gson gate (21-05): `node::classify` on every
 //!    `.json` member; findings name the source path; parsed nodes are kept
-//! 6. uuid (21-07)
+//! 6. **uuid** (21-07): the rule-table checks of stage 4 (`enforce_rules`),
+//!    then per Named resource keep, inject or synthesize `attributes.uuid`
 //! 7. lints (21-08)
 //! 8. **finish**: build the [`RenderedTree`], resources and the digest
 //!
@@ -31,9 +32,10 @@ use serde::Serialize;
 use super::layout::{RelPath, ResourceKey, TAG_TYPES, collection_path, resource_key, tag_provider};
 use super::manifest::Manifest;
 use super::node::{self, JsonClass, Node};
-use super::rules::{GATEWAY_OWNED_FILES, is_denied};
+use super::rules::{GATEWAY_OWNED_FILES, TypeRule, UuidRule, is_denied, type_rule};
 use super::target::Target;
 use super::tree::{RenderedTree, SourceTree};
+use super::uuid::{is_canonical_uuid, name_based_uuid};
 use crate::error::{CoreError, DeployFinding};
 
 /// Everything render needs.
@@ -74,8 +76,8 @@ pub struct RenderOutcome {
     pub resources: Vec<RenderedResource>,
     /// Tag providers that rendered at least one file, byte-ordered.
     pub tag_providers: Vec<String>,
-    /// Collection paths of files that received a minted uuid (none until
-    /// 21-07), byte-ordered.
+    /// Ids (`module/type/name`) of resources that received a minted uuid,
+    /// byte-ordered.
     pub uuids_minted: Vec<String>,
     /// Collection paths of `.json` files that are not in the gateway's writer
     /// format and so pass through untouched, byte-ordered.
@@ -90,13 +92,15 @@ pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     let mut findings = Vec::new();
     let effective = overlay(input, &mut findings);
     let effective = screen_names(effective, &mut findings);
-    let mapped = map_to_collection(effective, &mut findings);
+    let mut mapped = map_to_collection(effective, &mut findings);
     enforce_policy(input, &mapped, &mut findings);
-    let json = classify_json(&mapped.files, &mapped.origins, &mut findings);
+    enforce_rules(input, &mapped, &mut findings);
+    let mut json = classify_json(&mapped.files, &mapped.origins, &mut findings);
+    let minted = assign_uuids(input.gateway, &mut mapped, &mut json, &mut findings);
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
-    Ok(finish(mapped, &json))
+    Ok(finish(mapped, &json, minted))
 }
 
 /// One gateway-relative file after the overlay: its bytes and the repo path
@@ -130,8 +134,8 @@ struct Mapped {
     tags: BTreeMap<RelPath, String>,
 }
 
-/// Parsed JSON members keyed by collection path, with their class. Stages 6
-/// (uuid, 21-07) and 7 (lints, 21-08) read this table.
+/// Parsed JSON members keyed by collection path, with their class. Stage 6
+/// (uuid, 21-07) updates it for files it writes; stage 7 (lints, 21-08) reads it.
 type JsonTable = BTreeMap<RelPath, (JsonClass, Node)>;
 
 /// Stage 2: apply `modes/<env>/` over the base.
@@ -379,8 +383,315 @@ fn classify_json(
     table
 }
 
+/// Stage 4 (21-07 share): the per-type rule table, fail-closed.
+///
+/// - a manifest `types` entry, or a rendered resource type, with no
+///   [`type_rule`] row is a finding (only evidence-backed types render);
+/// - a Singleton type with a name directory, or a Named / NamedNoUuid type
+///   with a file directly under the type directory, is a finding naming the
+///   path.
+///
+/// Denied types, tag types and types that are not allowlisted already have
+/// their own findings from [`enforce_policy`] and are skipped here, so one
+/// defect yields one finding. Tag-origin files follow the `tags/` layout
+/// (CD5) and are not subject to the table.
+fn enforce_rules(input: &RenderInput<'_>, mapped: &Mapped, findings: &mut Vec<DeployFinding>) {
+    let is_tag_type = |module: &str, ty: &str| module == "ignition" && TAG_TYPES.contains(&ty);
+    let mut finding = |file: String, message: String| {
+        findings.push(DeployFinding {
+            file,
+            line: None,
+            column: None,
+            message,
+        });
+    };
+    for entry in &input.manifest.types {
+        if let Some((module, ty)) = entry.split_once('/')
+            && !is_denied(module, ty)
+            && !is_tag_type(module, ty)
+            && type_rule(module, ty).is_none()
+        {
+            finding(
+                format!("gateways/{}/manifest.yaml", input.gateway),
+                format!(
+                    "no render rule for {module}/{ty}; only evidence-backed types render (types entry `{entry}`)"
+                ),
+            );
+        }
+    }
+    let mut no_rule: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut singleton_dirs: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for (path, origin) in &mapped.origins {
+        if mapped.tags.contains_key(path) {
+            continue;
+        }
+        let key = resource_key(path);
+        let (module, ty) = (key.module.as_str(), key.ty.as_str());
+        if is_denied(module, ty)
+            || is_tag_type(module, ty)
+            || !input.manifest.allows_type(module, ty)
+        {
+            continue;
+        }
+        let Some(rule) = type_rule(module, ty) else {
+            if no_rule.insert((key.module.clone(), key.ty.clone())) {
+                finding(
+                    format!("{}resources/{module}/{ty}/", origin.prefix),
+                    format!("no render rule for {module}/{ty}; only evidence-backed types render"),
+                );
+            }
+            continue;
+        };
+        match (rule.uuid, &key.name) {
+            (UuidRule::Singleton, Some(name)) => {
+                if singleton_dirs.insert((key.module.clone(), key.ty.clone(), name.clone())) {
+                    finding(
+                        format!("{}resources/{module}/{ty}/{name}/", origin.prefix),
+                        format!(
+                            "{module}/{ty} is a singleton type: its files sit directly under the type directory, not in a name directory"
+                        ),
+                    );
+                }
+            }
+            (UuidRule::Named | UuidRule::NamedNoUuid, None) => finding(
+                origin.file.clone(),
+                format!(
+                    "{module}/{ty} is a named type: a resource sits in a name directory, not directly under the type directory"
+                ),
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// `module/type/name`: the id `uuids_minted` carries.
+fn resource_id(module: &str, ty: &str, name: &str) -> String {
+    format!("{module}/{ty}/{name}")
+}
+
+/// What `resource.json`'s `attributes.uuid` holds.
+enum UuidState {
+    Absent,
+    Valid,
+    /// Unusable; the message names the defect, never the value.
+    Invalid(&'static str),
+}
+
+/// Inspect `attributes.uuid` of a parsed `resource.json`.
+fn uuid_state(node: &Node) -> UuidState {
+    if !matches!(node, Node::Obj(_)) {
+        return UuidState::Invalid("resource.json is not a JSON object");
+    }
+    let attributes = match node.get("attributes") {
+        None => return UuidState::Absent,
+        Some(a @ Node::Obj(_)) => a,
+        Some(_) => return UuidState::Invalid("attributes is not a JSON object"),
+    };
+    match attributes.get("uuid") {
+        None => UuidState::Absent,
+        Some(Node::Str(s)) if s.is_empty() => UuidState::Invalid("attributes.uuid is empty"),
+        Some(Node::Str(s)) if is_canonical_uuid(s) => UuidState::Valid,
+        Some(Node::Str(_)) => {
+            UuidState::Invalid("attributes.uuid is not an 8-4-4-4-12 hexadecimal uuid")
+        }
+        Some(Node::Lit(l)) if l == "null" => UuidState::Invalid("attributes.uuid is null"),
+        Some(_) => UuidState::Invalid("attributes.uuid is not a string"),
+    }
+}
+
+/// Insert `"uuid": <uuid>` into `node`'s `attributes`, immediately after
+/// `lastModification` and `legacyId` when present (otherwise first); append an
+/// `attributes` holding only the uuid when there is none. The caller checked
+/// [`uuid_state`] is `Absent`.
+fn inject_uuid(node: &mut Node, uuid: &str) {
+    let Node::Obj(members) = node else { return };
+    let uuid = ("uuid".to_string(), Node::Str(uuid.to_string()));
+    match members.iter_mut().find(|(k, _)| k == "attributes") {
+        Some((_, Node::Obj(attrs))) => {
+            let at = attrs
+                .iter()
+                .rposition(|(k, _)| k == "lastModification" || k == "legacyId")
+                .map_or(0, |i| i + 1);
+            attrs.insert(at, uuid);
+        }
+        Some(_) => {}
+        None => members.push(("attributes".to_string(), Node::Obj(vec![uuid]))),
+    }
+}
+
+/// The `resource.json` render writes for a new Named resource: the shape the
+/// gateway writes for a resource created through its API (CD3), without
+/// `lastModification` or `lastModificationSignature`, which an 8.3.6 gateway
+/// loads without (CD2).
+fn synthesized_resource_json(rule: &TypeRule, members: &[String], uuid: &str) -> Node {
+    Node::Obj(vec![
+        ("scope".to_string(), Node::Str(rule.scope.to_string())),
+        ("version".to_string(), Node::Lit("1".to_string())),
+        ("restricted".to_string(), Node::Lit("false".to_string())),
+        ("overridable".to_string(), Node::Lit("true".to_string())),
+        (
+            "files".to_string(),
+            Node::Arr(members.iter().map(|m| Node::Str(m.clone())).collect()),
+        ),
+        (
+            "attributes".to_string(),
+            Node::Obj(vec![
+                ("uuid".to_string(), Node::Str(uuid.to_string())),
+                ("enabled".to_string(), Node::Lit("true".to_string())),
+            ]),
+        ),
+    ])
+}
+
+/// Stage 6 (21-07, DRND-06): resource identity.
+///
+/// Per resource of a type with a rule (tag-origin files follow CD5 and are
+/// skipped; a resource whose `resource.json` failed stage 5 was already
+/// reported):
+///
+/// - **Named**: an existing valid `attributes.uuid` is kept byte-for-byte; an
+///   invalid one (empty, null, not a string, not 8-4-4-4-12 hex) is a finding
+///   and is never replaced; a gateway-format `resource.json` without one gets
+///   the derived uuid inserted (an opaque one is refused, never rewritten); no
+///   `resource.json` at all gets a synthesized one, written by the Gson writer.
+/// - **NamedNoUuid**: never synthesized or injected; a missing `resource.json`
+///   is a finding, an existing uuid is kept (a gateway writes one for
+///   `store-and-forward-engine`, CD3), an invalid one is a finding.
+/// - **Singleton**: `resource.json` must exist and must carry no uuid.
+///
+/// Returns the ids (`module/type/name`) that received a uuid, byte-sorted.
+fn assign_uuids(
+    gateway: &str,
+    mapped: &mut Mapped,
+    json: &mut JsonTable,
+    findings: &mut Vec<DeployFinding>,
+) -> Vec<String> {
+    // (module, type, name) -> member paths; a singleton's name is empty
+    let mut groups: BTreeMap<(String, String, String), Vec<RelPath>> = BTreeMap::new();
+    for path in mapped.files.keys() {
+        if mapped.tags.contains_key(path) {
+            continue;
+        }
+        let key = resource_key(path);
+        let Some(rule) = type_rule(&key.module, &key.ty) else {
+            continue;
+        };
+        let name = match (rule.uuid, key.name) {
+            (UuidRule::Singleton, None) => String::new(),
+            (UuidRule::Named | UuidRule::NamedNoUuid, Some(name)) => name,
+            _ => continue, // wrong structure, reported by enforce_rules
+        };
+        groups
+            .entry((key.module, key.ty, name))
+            .or_default()
+            .push(path.clone());
+    }
+
+    let mut minted = Vec::new();
+    let mut synthesized: Vec<(RelPath, Vec<u8>, Node, Origin)> = Vec::new();
+    for ((module, ty, name), members) in &groups {
+        let rule = type_rule(module, ty).expect("grouped by a rule");
+        let dir = if name.is_empty() {
+            format!("{module}/{ty}")
+        } else {
+            format!("{module}/{ty}/{name}")
+        };
+        let rj_path = RelPath::new(&format!("{dir}/resource.json")).expect("valid path");
+        let first = &mapped.origins[&members[0]];
+        let rj_label = format!("{}resources/{rj_path}", first.prefix);
+        let mut finding = |file: String, message: String| {
+            findings.push(DeployFinding {
+                file,
+                line: None,
+                column: None,
+                message,
+            });
+        };
+
+        if mapped.files.contains_key(&rj_path) {
+            // unparseable: stage 5 reported it
+            let Some((class, node)) = json.get_mut(&rj_path) else {
+                continue;
+            };
+            let file = mapped.origins[&rj_path].file.clone();
+            match rule.uuid {
+                UuidRule::Singleton => {
+                    let has_key = node
+                        .get("attributes")
+                        .is_some_and(|a| a.get("uuid").is_some());
+                    if has_key {
+                        finding(
+                            file,
+                            format!(
+                                "{module}/{ty} is a singleton type; its resource.json must not carry attributes.uuid"
+                            ),
+                        );
+                    } else if let UuidState::Invalid(why) = uuid_state(node) {
+                        finding(file, why.to_string());
+                    }
+                }
+                UuidRule::NamedNoUuid => {
+                    if let UuidState::Invalid(why) = uuid_state(node) {
+                        finding(file, why.to_string());
+                    }
+                }
+                UuidRule::Named => match uuid_state(node) {
+                    UuidState::Valid => {}
+                    UuidState::Invalid(why) => finding(file, why.to_string()),
+                    UuidState::Absent if *class == JsonClass::Opaque => finding(
+                        file,
+                        "resource.json is not in gateway format; render will not rewrite it; add attributes.uuid or re-pull it".to_string(),
+                    ),
+                    UuidState::Absent => {
+                        inject_uuid(node, &name_based_uuid(gateway, module, ty, name));
+                        mapped
+                            .files
+                            .insert(rj_path.clone(), node::write(node).into_bytes());
+                        minted.push(resource_id(module, ty, name));
+                    }
+                },
+            }
+            continue;
+        }
+
+        match rule.uuid {
+            UuidRule::Singleton | UuidRule::NamedNoUuid => finding(
+                rj_label,
+                format!(
+                    "{module}/{ty} has no resource.json; render only synthesizes one for types whose resources carry a uuid"
+                ),
+            ),
+            UuidRule::Named => {
+                // CD2: a hand-written resource.json without lastModification
+                // or lastModificationSignature loads and is not rewritten.
+                let dir_prefix = format!("{dir}/");
+                let names: Vec<String> = members
+                    .iter()
+                    .map(|p| p.as_str()[dir_prefix.len()..].to_string())
+                    .collect();
+                let uuid = name_based_uuid(gateway, module, ty, name);
+                let node = synthesized_resource_json(rule, &names, &uuid);
+                let bytes = node::write(&node).into_bytes();
+                let origin = Origin {
+                    file: rj_label,
+                    prefix: first.prefix.clone(),
+                };
+                synthesized.push((rj_path, bytes, node, origin));
+                minted.push(resource_id(module, ty, name));
+            }
+        }
+    }
+    for (path, bytes, node, origin) in synthesized {
+        mapped.files.insert(path.clone(), bytes);
+        mapped.origins.insert(path.clone(), origin);
+        json.insert(path, (JsonClass::GatewayFormat, node));
+    }
+    minted.sort();
+    minted
+}
+
 /// Stage 8: the rendered tree and its resource listing.
-fn finish(mapped: Mapped, json: &JsonTable) -> RenderOutcome {
+fn finish(mapped: Mapped, json: &JsonTable, uuids_minted: Vec<String>) -> RenderOutcome {
     let mut groups: BTreeMap<ResourceKey, Vec<String>> = BTreeMap::new();
     for path in mapped.files.keys() {
         let key = resource_key(path);
@@ -416,7 +727,7 @@ fn finish(mapped: Mapped, json: &JsonTable) -> RenderOutcome {
             files: mapped.files,
         },
         resources,
-        uuids_minted: Vec::new(),
+        uuids_minted,
         opaque_files: json
             .iter()
             .filter(|(_, (class, _))| *class == JsonClass::Opaque)
@@ -476,27 +787,45 @@ mod tests {
 
     #[test]
     fn empty_tree_warns() {
-        let out = run("  - m/a\n", &[]).unwrap();
+        let out = run("  - ignition/schedule\n", &[]).unwrap();
         assert_eq!(out.warnings, ["render produced no files"]);
         assert!(out.resources.is_empty());
     }
 
+    const NAMED_RJ: &str = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"uuid\": \"4a14d749-bb78-47c7-847a-cafa17da4da8\",\n    \"enabled\": true\n  }\n}";
+    const SINGLETON_RJ: &str = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"enabled\": true\n  }\n}";
+
     #[test]
-    fn singletons_sort_first_and_files_are_resource_relative() {
+    fn named_resources_sort_by_name_bytes_and_singletons_follow_their_type() {
         let out = run(
-            "  - m/a\n",
+            "  - ignition/schedule\n  - ignition/system-properties\n",
             &[
-                ("resources/m/a/Z/config.json", "{}"),
-                ("resources/m/a/B/sub/x.txt", "{}"),
-                ("resources/m/a/config.json", "{}"),
+                ("resources/ignition/schedule/Z/config.json", "{}"),
+                ("resources/ignition/schedule/Z/resource.json", NAMED_RJ),
+                ("resources/ignition/schedule/B/sub/x.txt", "{}"),
+                ("resources/ignition/schedule/B/resource.json", NAMED_RJ),
+                ("resources/ignition/system-properties/config.json", "{}"),
+                (
+                    "resources/ignition/system-properties/resource.json",
+                    SINGLETON_RJ,
+                ),
             ],
+        )
+        .unwrap();
+        let names: Vec<(&str, Option<&str>)> = out
+            .resources
+            .iter()
+            .map(|r| (r.ty.as_str(), r.name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("schedule", Some("B")),
+                ("schedule", Some("Z")),
+                ("system-properties", None)
+            ]
         );
-        // singleton `config.json` and named resources of the same type are
-        // distinct keys; the singleton orders first
-        let out = out.unwrap();
-        let names: Vec<Option<&str>> = out.resources.iter().map(|r| r.name.as_deref()).collect();
-        assert_eq!(names, [None, Some("B"), Some("Z")]);
-        assert_eq!(out.resources[1].files, ["sub/x.txt"]);
-        assert_eq!(out.resources[0].files, ["config.json"]);
+        assert_eq!(out.resources[0].files, ["resource.json", "sub/x.txt"]);
+        assert_eq!(out.resources[2].files, ["config.json", "resource.json"]);
     }
 }

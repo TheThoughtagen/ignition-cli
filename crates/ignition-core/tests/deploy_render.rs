@@ -21,6 +21,19 @@ const TRACER_REPO: &str = concat!(
 const TARGET: &[u8] =
     b"schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n";
 
+/// Gateway-format `resource.json` of a Named type, with a uuid (as the
+/// gateway writes it; Gson pretty, no trailing newline).
+const NAMED_RJ: &str = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"uuid\": \"4a14d749-bb78-47c7-847a-cafa17da4da8\",\n    \"enabled\": true\n  }\n}";
+
+/// The same with `enabled` flipped: a different file, still valid.
+const NAMED_RJ_DISABLED: &str = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"uuid\": \"4a14d749-bb78-47c7-847a-cafa17da4da8\",\n    \"enabled\": false\n  }\n}";
+
+/// Gateway-format `resource.json` of a Singleton type (no uuid).
+const SINGLETON_RJ: &str = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"enabled\": true\n  }\n}";
+
+/// Gateway-format `resource.json` of a NamedNoUuid type (themes shape).
+const NO_UUID_RJ: &str = "{\n  \"scope\": \"G\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {\n    \"enabled\": true\n  }\n}";
+
 fn render_files(types: &[&str], files: &[(&str, &[u8])]) -> RenderOutcome {
     let mut yaml = String::from("schema_version: 1\ntypes:\n");
     for t in types {
@@ -89,19 +102,31 @@ fn copy_dir(from: &Path, to: &Path) {
 #[test]
 fn determinism_is_read_order_independent() {
     let files: Vec<(&str, &[u8])> = vec![
-        ("resources/m/a/x/config.json", b"{\"a\":1}"),
-        ("resources/m/a/x/resource.json", b"{\"b\":2}"),
-        ("resources/m/a/config.json", b"{}"),
-        ("resources/n/b/y/config.json", b"[]"),
+        ("resources/ignition/schedule/x/config.json", b"{\"a\":1}"),
+        (
+            "resources/ignition/schedule/x/resource.json",
+            NAMED_RJ.as_bytes(),
+        ),
+        ("resources/ignition/system-properties/config.json", b"{}"),
+        (
+            "resources/ignition/system-properties/resource.json",
+            SINGLETON_RJ.as_bytes(),
+        ),
+        ("resources/ignition/email-profile/y/config.json", b"[]"),
+    ];
+    const TYPES: [&str; 3] = [
+        "ignition/schedule",
+        "ignition/system-properties",
+        "ignition/email-profile",
     ];
     let mut reversed = files.clone();
     reversed.reverse();
     let mut rotated = files.clone();
     rotated.rotate_left(2);
 
-    let first = render_files(&["m/a", "n/b"], &files);
+    let first = render_files(&TYPES, &files);
     for order in [&reversed, &rotated] {
-        let again = render_files(&["m/a", "n/b"], order);
+        let again = render_files(&TYPES, order);
         assert_eq!(first, again, "outcome must not depend on input order");
         assert_eq!(first.tree.render_sha256(), again.tree.render_sha256());
     }
@@ -120,7 +145,7 @@ fn determinism_is_read_order_independent() {
 #[test]
 fn empty_render_digest_is_sha256_of_empty_listing() {
     // an allowlist that matches zero files
-    let outcome = render_files(&["m/a"], &[]);
+    let outcome = render_files(&["ignition/schedule"], &[]);
     assert_eq!(outcome.tree.files.len(), 0);
     assert_eq!(outcome.tree.render_sha256(), EMPTY_RENDER_SHA256);
     assert_eq!(sha256_hex(b""), EMPTY_RENDER_SHA256);
@@ -189,47 +214,65 @@ fn rendered_bytes_equal_source_bytes() {
 
 #[test]
 fn listing_format_is_pinned() {
-    // 3-byte valid JSON bodies: render parses every .json member (21-05)
+    // a 3-byte valid JSON body: render parses every .json member (21-05)
     let files: [(&str, &[u8]); 2] = [
-        ("resources/m/a/config.json", b"[1]"),
-        ("resources/m/a/x/config.json", b"[2]"),
+        ("resources/ignition/system-properties/config.json", b"[1]"),
+        (
+            "resources/ignition/system-properties/resource.json",
+            SINGLETON_RJ.as_bytes(),
+        ),
     ];
-    let outcome = render_files(&["m/a"], &files);
-    let expected = listing_digest(&[("m/a/config.json", b"[1]"), ("m/a/x/config.json", b"[2]")]);
+    let outcome = render_files(&["ignition/system-properties"], &files);
+    let expected = listing_digest(&[
+        ("ignition/system-properties/config.json", b"[1]"),
+        (
+            "ignition/system-properties/resource.json",
+            SINGLETON_RJ.as_bytes(),
+        ),
+    ]);
     assert_eq!(outcome.tree.render_sha256(), expected);
 
     // and the literal shape: path NUL hex LF, hand-assembled
     let mut literal = Vec::new();
-    literal.extend_from_slice(b"m/a/config.json\0");
+    literal.extend_from_slice(b"ignition/system-properties/config.json\0");
     literal.extend_from_slice(sha256_hex(b"[1]").as_bytes());
     literal.push(b'\n');
-    literal.extend_from_slice(b"m/a/x/config.json\0");
-    literal.extend_from_slice(sha256_hex(b"[2]").as_bytes());
+    literal.extend_from_slice(b"ignition/system-properties/resource.json\0");
+    literal.extend_from_slice(sha256_hex(SINGLETON_RJ.as_bytes()).as_bytes());
     literal.push(b'\n');
     assert_eq!(outcome.tree.render_sha256(), sha256_hex(&literal));
-    assert_eq!(outcome.tree.bytes(), 6);
+    assert_eq!(outcome.tree.bytes(), 3 + SINGLETON_RJ.len());
 }
 
 #[test]
 fn paths_sort_by_utf8_bytes() {
     // 'B' 0x42 < 'Z' 0x5a < 'a' 0x61 < 'é' 0xc3 0xa9; no case folding and
-    // no Unicode normalization
+    // no Unicode normalization. The resource.json of each is synthesized.
     let names = ["a", "é", "Z", "B"];
     let files: Vec<(String, &[u8])> = names
         .iter()
-        .map(|n| (format!("resources/m/t/{n}/config.json"), &b"{}"[..]))
+        .map(|n| {
+            (
+                format!("resources/ignition/schedule/{n}/config.json"),
+                &b"{}"[..],
+            )
+        })
         .collect();
     let borrowed: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (p.as_str(), *b)).collect();
-    let outcome = render_files(&["m/t"], &borrowed);
+    let outcome = render_files(&["ignition/schedule"], &borrowed);
 
     let paths: Vec<&str> = outcome.tree.files.keys().map(|p| p.as_str()).collect();
     assert_eq!(
         paths,
         [
-            "m/t/B/config.json",
-            "m/t/Z/config.json",
-            "m/t/a/config.json",
-            "m/t/é/config.json",
+            "ignition/schedule/B/config.json",
+            "ignition/schedule/B/resource.json",
+            "ignition/schedule/Z/config.json",
+            "ignition/schedule/Z/resource.json",
+            "ignition/schedule/a/config.json",
+            "ignition/schedule/a/resource.json",
+            "ignition/schedule/é/config.json",
+            "ignition/schedule/é/resource.json",
         ]
     );
     let resource_names: Vec<&str> = outcome
@@ -238,32 +281,75 @@ fn paths_sort_by_utf8_bytes() {
         .map(|r| r.name.as_deref().expect("named"))
         .collect();
     assert_eq!(resource_names, ["B", "Z", "a", "é"]);
+    assert_eq!(
+        outcome.uuids_minted,
+        [
+            "ignition/schedule/B",
+            "ignition/schedule/Z",
+            "ignition/schedule/a",
+            "ignition/schedule/é",
+        ]
+    );
 
     // the digest follows the same byte order
-    let entries: Vec<(&str, &[u8])> = paths.iter().map(|p| (*p, &b"{}"[..])).collect();
+    let entries: Vec<(&str, &[u8])> = outcome
+        .tree
+        .files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
     assert_eq!(outcome.tree.render_sha256(), listing_digest(&entries));
 
-    // composed and decomposed forms are different bytes and stay distinct
-    let composed = "resources/m/t/\u{e9}/config.json";
-    let decomposed = "resources/m/t/e\u{301}/config.json";
+    // composed and decomposed forms are different bytes and stay distinct,
+    // down to their uuids
+    let composed = "resources/ignition/schedule/\u{e9}/config.json";
+    let decomposed = "resources/ignition/schedule/e\u{301}/config.json";
     let both = render_files(
-        &["m/t"],
+        &["ignition/schedule"],
         &[(composed, b"{}".as_slice()), (decomposed, b"{}".as_slice())],
     );
-    assert_eq!(both.tree.files.len(), 2, "no normalization");
+    assert_eq!(both.tree.files.len(), 4, "no normalization");
+    let uuids: std::collections::BTreeSet<&[u8]> = both
+        .tree
+        .files
+        .iter()
+        .filter(|(p, _)| p.as_str().ends_with("resource.json"))
+        .map(|(_, b)| b.as_slice())
+        .collect();
+    assert_eq!(uuids.len(), 2, "NFC and NFD get different uuids");
 }
 
 #[test]
 fn envelope_arrays_are_ordered() {
-    let files: [(&str, &[u8]); 6] = [
-        ("resources/n/b/y/config.json", b"{}"),
-        ("resources/m/b/config.json", b"{}"),
-        ("resources/m/a/z/config.json", b"{}"),
-        ("resources/m/a/config.json", b"{}"),
-        ("resources/m/a/a/config.json", b"{}"),
-        ("resources/m/a/a/resource.json", b"{}"),
+    let files: [(&str, &[u8]); 7] = [
+        (
+            "resources/com.inductiveautomation.historian/historian-provider/y/config.json",
+            b"{}",
+        ),
+        ("resources/ignition/system-properties/config.json", b"{}"),
+        (
+            "resources/ignition/system-properties/resource.json",
+            SINGLETON_RJ.as_bytes(),
+        ),
+        ("resources/ignition/schedule/z/config.json", b"{}"),
+        ("resources/ignition/schedule/a/config.json", b"{}"),
+        (
+            "resources/ignition/schedule/a/resource.json",
+            NAMED_RJ.as_bytes(),
+        ),
+        (
+            "resources/ignition/schedule/z/resource.json",
+            NAMED_RJ.as_bytes(),
+        ),
     ];
-    let outcome = render_files(&["m/a", "m/b", "n/b"], &files);
+    let outcome = render_files(
+        &[
+            "ignition/schedule",
+            "ignition/system-properties",
+            "com.inductiveautomation.historian/historian-provider",
+        ],
+        &files,
+    );
     let keys: Vec<(String, String, Option<String>)> = outcome
         .resources
         .iter()
@@ -273,13 +359,16 @@ fn envelope_arrays_are_ordered() {
     assert_eq!(
         keys,
         [
-            s("m", "a", None),
-            s("m", "a", Some("a")),
-            s("m", "a", Some("z")),
-            s("m", "b", None),
-            s("n", "b", Some("y")),
+            s(
+                "com.inductiveautomation.historian",
+                "historian-provider",
+                Some("y")
+            ),
+            s("ignition", "schedule", Some("a")),
+            s("ignition", "schedule", Some("z")),
+            s("ignition", "system-properties", None),
         ],
-        "(module, type, name) bytes, singleton first"
+        "(module, type, name) bytes"
     );
     assert_eq!(
         outcome.resources[1].files,
@@ -372,17 +461,26 @@ fn bytes_at<'a>(o: &'a RenderOutcome, path: &str) -> &'a [u8] {
 fn overlay_replaces_whole_file() {
     let out = try_render(
         "dev",
-        &["m/a"],
+        &["ignition/schedule"],
         &[],
         &[
-            ("resources/m/a/x/config.json", "{\"base\": 1}"),
-            ("resources/m/a/x/resource.json", "{\"keep\": 1}"),
-            ("modes/dev/resources/m/a/x/config.json", "{\"over\": 2}"),
+            ("resources/ignition/schedule/x/config.json", "{\"base\": 1}"),
+            ("resources/ignition/schedule/x/resource.json", NAMED_RJ),
+            (
+                "modes/dev/resources/ignition/schedule/x/config.json",
+                "{\"over\": 2}",
+            ),
         ],
     )
     .unwrap();
-    assert_eq!(bytes_at(&out, "m/a/x/config.json"), b"{\"over\": 2}");
-    assert_eq!(bytes_at(&out, "m/a/x/resource.json"), b"{\"keep\": 1}");
+    assert_eq!(
+        bytes_at(&out, "ignition/schedule/x/config.json"),
+        b"{\"over\": 2}"
+    );
+    assert_eq!(
+        bytes_at(&out, "ignition/schedule/x/resource.json"),
+        NAMED_RJ.as_bytes()
+    );
     assert_eq!(
         out.tree.files.len(),
         2,
@@ -394,37 +492,53 @@ fn overlay_replaces_whole_file() {
 fn overlay_adds_new_file() {
     let out = try_render(
         "dev",
-        &["m/a"],
+        &["ignition/schedule"],
         &[],
         &[
-            ("resources/m/a/x/config.json", "{}"),
-            ("modes/dev/resources/m/a/y/config.json", "{\"new\": true}"),
+            ("resources/ignition/schedule/x/config.json", "{}"),
+            ("resources/ignition/schedule/x/resource.json", NAMED_RJ),
+            (
+                "modes/dev/resources/ignition/schedule/y/config.json",
+                "{\"new\": true}",
+            ),
+            (
+                "modes/dev/resources/ignition/schedule/y/resource.json",
+                NAMED_RJ,
+            ),
         ],
     )
     .unwrap();
-    assert_eq!(bytes_at(&out, "m/a/x/config.json"), b"{}");
-    assert_eq!(bytes_at(&out, "m/a/y/config.json"), b"{\"new\": true}");
+    assert_eq!(bytes_at(&out, "ignition/schedule/x/config.json"), b"{}");
+    assert_eq!(
+        bytes_at(&out, "ignition/schedule/y/config.json"),
+        b"{\"new\": true}"
+    );
     // an overlay cannot remove a base file (SF-7): without a counterpart the
     // base file is unchanged
-    assert_eq!(out.tree.files.len(), 2);
+    assert_eq!(out.tree.files.len(), 4);
+    assert!(out.uuids_minted.is_empty());
 }
 
 #[test]
 fn other_env_overlays_are_never_read() {
     // in memory: nothing under modes/staging reaches a dev render
     let files = [
-        ("resources/m/a/x/config.json", "{}"),
+        ("resources/ignition/schedule/x/config.json", "{}"),
+        ("resources/ignition/schedule/x/resource.json", NAMED_RJ),
         (
-            "modes/staging/resources/m/a/x/config.json",
+            "modes/staging/resources/ignition/schedule/x/config.json",
             "not json at all",
         ),
         ("modes/staging/resources/zzz/denied/x/config.json", "{}"),
         ("modes/staging/.hidden/x", "{}"),
-        ("modes/dev2/resources/m/a/x/config.json", "[9]"),
+        (
+            "modes/dev2/resources/ignition/schedule/x/config.json",
+            "[9]",
+        ),
     ];
-    let out = try_render("dev", &["m/a"], &[], &files).unwrap();
-    assert_eq!(bytes_at(&out, "m/a/x/config.json"), b"{}");
-    assert_eq!(out.tree.files.len(), 1);
+    let out = try_render("dev", &["ignition/schedule"], &[], &files).unwrap();
+    assert_eq!(bytes_at(&out, "ignition/schedule/x/config.json"), b"{}");
+    assert_eq!(out.tree.files.len(), 2);
 
     // on disk: an invalid tree for another environment does not matter
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -649,7 +763,7 @@ fn overlay_repo(root: &Path) -> PathBuf {
     for (rel, body) in [
         (
             "modes/dev/resources/ignition/database-translator/POSTGRES/resource.json",
-            "{\"o\": 1}",
+            NAMED_RJ_DISABLED,
         ),
         ("modes/dev/tags/default/tag-provider/config.json", "{}"),
         ("tags/default/tag-provider/resource.json", "{}"),
@@ -724,16 +838,16 @@ fn each_denied_type_is_refused_even_when_allowlisted() {
         text.contains("gateways/g/modes/dev/resources/ignition/user-source/"),
         "{text}"
     );
-    // a type merely next to a denied one is untouched
-    assert!(
-        try_render(
-            "dev",
-            &["ignition/user-source-x"],
-            &[],
-            &[("resources/ignition/user-source-x/u/config.json", "{}")]
-        )
-        .is_ok()
-    );
+    // a type merely next to a denied one is not treated as denied: it is
+    // refused only for having no render rule (21-07)
+    let text = refused(try_render(
+        "dev",
+        &["ignition/user-source-x"],
+        &[],
+        &[("resources/ignition/user-source-x/u/config.json", "{}")],
+    ));
+    assert!(text.contains("no render rule"), "{text}");
+    assert!(!text.contains("denied type"), "{text}");
 }
 
 #[test]
@@ -814,46 +928,55 @@ fn dot_names_are_refused_but_gitkeep_is_skipped() {
     // in memory: .gitkeep is dropped, never rendered, never listed
     let out = try_render(
         "dev",
-        &["m/a"],
+        &["ignition/schedule"],
         &[],
         &[
-            ("resources/m/a/x/config.json", "{}"),
-            ("resources/m/a/x/.gitkeep", ""),
+            ("resources/ignition/schedule/x/config.json", "{}"),
+            ("resources/ignition/schedule/x/resource.json", NAMED_RJ),
+            ("resources/ignition/schedule/x/.gitkeep", ""),
             ("resources/.gitkeep", ""),
-            ("modes/dev/resources/m/a/.gitkeep", ""),
+            ("modes/dev/resources/ignition/schedule/.gitkeep", ""),
         ],
     )
     .unwrap();
-    assert_eq!(out.tree.files.len(), 1);
-    assert!(out.resources.iter().all(|r| r.files == ["config.json"]));
+    assert_eq!(out.tree.files.len(), 2);
+    assert!(
+        out.resources
+            .iter()
+            .all(|r| r.files == ["config.json", "resource.json"])
+    );
 
     let text = refused(try_render(
         "dev",
-        &["m/a"],
+        &["ignition/schedule"],
         &[],
         &[
-            ("resources/m/a/x/config.json", "{}"),
-            ("resources/m/a/x/.DS_Store", "x"),
-            ("resources/m/a/.hidden/y/config.json", "{}"),
-            ("resources/m/a/.hidden/z/config.json", "{}"),
-            ("modes/dev/resources/m/a/.env", "x"),
-            ("resources/m/a/.gitkeep/inner", "x"),
+            ("resources/ignition/schedule/x/config.json", "{}"),
+            ("resources/ignition/schedule/x/.DS_Store", "x"),
+            ("resources/ignition/schedule/.hidden/y/config.json", "{}"),
+            ("resources/ignition/schedule/.hidden/z/config.json", "{}"),
+            ("modes/dev/resources/ignition/schedule/.env", "x"),
+            ("resources/ignition/schedule/.gitkeep/inner", "x"),
         ],
     ));
     assert!(
-        text.contains("gateways/g/resources/m/a/x/.DS_Store"),
+        text.contains("gateways/g/resources/ignition/schedule/x/.DS_Store"),
         "{text}"
     );
     assert_eq!(
-        text.matches("gateways/g/resources/m/a/.hidden").count(),
+        text.matches("gateways/g/resources/ignition/schedule/.hidden")
+            .count(),
         1,
         "a dot-named directory is reported once: {text}"
     );
     assert!(
-        text.contains("gateways/g/modes/dev/resources/m/a/.env"),
+        text.contains("gateways/g/modes/dev/resources/ignition/schedule/.env"),
         "{text}"
     );
-    assert!(text.contains("gateways/g/resources/m/a/.gitkeep"), "{text}");
+    assert!(
+        text.contains("gateways/g/resources/ignition/schedule/.gitkeep"),
+        "{text}"
+    );
 
     // on disk: the reader skips .gitkeep at every depth, and the digest is
     // the one a tree without them gives
@@ -894,10 +1017,16 @@ fn dotted_module_names_are_not_dot_names() {
         "dev",
         &["com.inductiveautomation.perspective/themes"],
         &[],
-        &[(
-            "resources/com.inductiveautomation.perspective/themes/Dark.Mode/config.json",
-            "{}",
-        )],
+        &[
+            (
+                "resources/com.inductiveautomation.perspective/themes/Dark.Mode/config.json",
+                "{}",
+            ),
+            (
+                "resources/com.inductiveautomation.perspective/themes/Dark.Mode/resource.json",
+                NO_UUID_RJ,
+            ),
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -906,7 +1035,10 @@ fn dotted_module_names_are_not_dot_names() {
             .keys()
             .map(|p| p.as_str())
             .collect::<Vec<_>>(),
-        ["com.inductiveautomation.perspective/themes/Dark.Mode/config.json"]
+        [
+            "com.inductiveautomation.perspective/themes/Dark.Mode/config.json",
+            "com.inductiveautomation.perspective/themes/Dark.Mode/resource.json"
+        ]
     );
     // on disk too
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -916,6 +1048,7 @@ fn dotted_module_names_are_not_dot_names() {
     let theme = gw.join("resources/com.inductiveautomation.perspective/themes/Dark.Mode");
     std::fs::create_dir_all(&theme).expect("mkdir");
     std::fs::write(theme.join("config.json"), b"{}").expect("write");
+    std::fs::write(theme.join("resource.json"), NO_UUID_RJ).expect("write");
     let mut manifest = std::fs::read_to_string(gw.join("manifest.yaml")).expect("manifest");
     manifest = manifest.replace(
         "types:\n",
@@ -923,7 +1056,7 @@ fn dotted_module_names_are_not_dot_names() {
     );
     std::fs::write(gw.join("manifest.yaml"), manifest).expect("write");
     let result = deploy_render(&repo, "dev").expect("render");
-    assert_eq!(result.files, 5);
+    assert_eq!(result.files, 6);
 }
 
 #[test]
@@ -966,4 +1099,402 @@ fn policy_findings_are_collected() {
     ] {
         assert!(text.contains(needle), "missing {needle}: {text}");
     }
+}
+
+// ---- 21-07: resource identity (attributes.uuid, DRND-06) -------------------
+
+use ignition_core::deploy::uuid::name_based_uuid;
+
+fn text_at(o: &RenderOutcome, path: &str) -> String {
+    String::from_utf8(bytes_at(o, path).to_vec()).expect("UTF-8")
+}
+
+/// A real gateway-format `resource.json` (Gson pretty, no trailing newline)
+/// with the attribute lines between `{` and `}` given by `attributes`.
+fn rj_with_attributes(attributes: &str) -> String {
+    format!(
+        "{{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {{\n{attributes}\n  }}\n}}"
+    )
+}
+
+fn one_named(rj: &str) -> Result<RenderOutcome, CoreError> {
+    try_render(
+        "dev",
+        &["ignition/schedule"],
+        &[],
+        &[
+            ("resources/ignition/schedule/x/config.json", "{}"),
+            ("resources/ignition/schedule/x/resource.json", rj),
+        ],
+    )
+}
+
+#[test]
+fn new_named_resource_gets_resource_json_with_uuid() {
+    let files = [
+        ("resources/ignition/schedule/x/config.json", "{}"),
+        ("resources/ignition/schedule/x/index.css", "a {}"),
+        ("resources/ignition/schedule/x/sub/z.css", "b {}"),
+    ];
+    let out = try_render("dev", &["ignition/schedule"], &[], &files).unwrap();
+    let uuid = name_based_uuid("g", "ignition", "schedule", "x");
+    let expected = format!(
+        "{{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\",\n    \"index.css\",\n    \"sub/z.css\"\n  ],\n  \"attributes\": {{\n    \"uuid\": \"{uuid}\",\n    \"enabled\": true\n  }}\n}}"
+    );
+    assert_eq!(text_at(&out, "ignition/schedule/x/resource.json"), expected);
+    assert!(!expected.ends_with('\n'), "no trailing newline");
+    assert_eq!(out.uuids_minted, ["ignition/schedule/x"]);
+    assert_eq!(out.resources.len(), 1);
+    assert_eq!(
+        out.resources[0].files,
+        ["config.json", "index.css", "resource.json", "sub/z.css"]
+    );
+    assert!(out.opaque_files.is_empty(), "the Gson writer's own output");
+    // the member files are untouched
+    assert_eq!(bytes_at(&out, "ignition/schedule/x/index.css"), b"a {}");
+    // and repeatable
+    let again = try_render("dev", &["ignition/schedule"], &[], &files).unwrap();
+    assert_eq!(out, again);
+}
+
+#[test]
+fn missing_uuid_is_injected_in_gateway_format_resource_json() {
+    let uuid = name_based_uuid("g", "ignition", "schedule", "x");
+    let line = format!("    \"uuid\": \"{uuid}\",\n");
+    let last_mod = "    \"lastModification\": {\n      \"actor\": \"a\",\n      \"timestamp\": \"2026-03-01T18:14:26Z\"\n    },\n";
+    let sig = "    \"lastModificationSignature\": \"4de66e8b\",\n";
+    let cases = [
+        // after lastModification, before the signature
+        (
+            format!("{last_mod}{sig}    \"enabled\": true"),
+            format!("{last_mod}{line}{sig}    \"enabled\": true"),
+        ),
+        // after legacyId when present
+        (
+            format!("{last_mod}    \"legacyId\": 3,\n{sig}    \"enabled\": true"),
+            format!("{last_mod}    \"legacyId\": 3,\n{line}{sig}    \"enabled\": true"),
+        ),
+        // neither: first attribute
+        (
+            "    \"enabled\": true".to_string(),
+            format!("{line}    \"enabled\": true"),
+        ),
+    ];
+    for (before, after) in cases {
+        let original = rj_with_attributes(&before);
+        let out = one_named(&original).unwrap();
+        assert_eq!(
+            text_at(&out, "ignition/schedule/x/resource.json"),
+            rj_with_attributes(&after),
+            "inserted only the uuid line"
+        );
+        assert_eq!(out.uuids_minted, ["ignition/schedule/x"]);
+        assert!(out.opaque_files.is_empty());
+    }
+
+    // an empty attributes object
+    let original = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ],\n  \"attributes\": {}\n}";
+    let out = one_named(original).unwrap();
+    assert_eq!(
+        text_at(&out, "ignition/schedule/x/resource.json"),
+        original.replace(
+            "\"attributes\": {}",
+            &format!("\"attributes\": {{\n    \"uuid\": \"{uuid}\"\n  }}")
+        )
+    );
+
+    // no attributes at all: an attributes object is appended last
+    let original = "{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"restricted\": false,\n  \"overridable\": true,\n  \"files\": [\n    \"config.json\"\n  ]\n}";
+    let out = one_named(original).unwrap();
+    assert_eq!(
+        text_at(&out, "ignition/schedule/x/resource.json"),
+        original.replace(
+            "\n  ]\n}",
+            &format!("\n  ],\n  \"attributes\": {{\n    \"uuid\": \"{uuid}\"\n  }}\n}}")
+        )
+    );
+}
+
+#[test]
+fn opaque_resource_json_without_uuid_is_refused() {
+    // compact, so not in the gateway's writer format
+    let text = refused(one_named(
+        "{\"scope\":\"A\",\"version\":1,\"attributes\":{\"enabled\":true}}",
+    ));
+    assert!(
+        text.contains("gateways/g/resources/ignition/schedule/x/resource.json"),
+        "{text}"
+    );
+    assert!(text.contains("not in gateway format"), "{text}");
+    assert!(text.contains("will not rewrite"), "{text}");
+}
+
+#[test]
+fn existing_uuid_is_kept_byte_for_byte() {
+    // upper-case hex is a valid 8-4-4-4-12 uuid and is not normalized
+    let pretty = rj_with_attributes(
+        "    \"uuid\": \"4A14D749-BB78-47C7-847A-CAFA17DA4DA8\",\n    \"enabled\": true",
+    );
+    let out = one_named(&pretty).unwrap();
+    assert_eq!(
+        bytes_at(&out, "ignition/schedule/x/resource.json"),
+        pretty.as_bytes()
+    );
+    assert!(out.uuids_minted.is_empty());
+
+    // an opaque (compact) file with a valid uuid passes through untouched
+    let compact =
+        "{\"scope\":\"A\",\"attributes\":{\"uuid\":\"4a14d749-bb78-47c7-847a-cafa17da4da8\"}}";
+    let out = one_named(compact).unwrap();
+    assert_eq!(
+        bytes_at(&out, "ignition/schedule/x/resource.json"),
+        compact.as_bytes()
+    );
+    assert!(out.uuids_minted.is_empty());
+    assert_eq!(
+        out.opaque_files,
+        ["ignition/schedule/x/resource.json"],
+        "reported as opaque, not rewritten"
+    );
+}
+
+#[test]
+fn invalid_existing_uuid_is_refused() {
+    let bad = [
+        ("\"\"", "is empty"),
+        ("null", "is null"),
+        ("42", "not a string"),
+        ("[\"x\"]", "not a string"),
+        ("\"not-a-uuid-at-all\"", "8-4-4-4-12"),
+        ("\"4a14d749bb7847c7847acafa17da4da8\"", "8-4-4-4-12"),
+        ("\"4a14d749-bb78-47c7-847a-cafa17da4daZ\"", "8-4-4-4-12"),
+    ];
+    for (value, why) in bad {
+        let rj = rj_with_attributes(&format!("    \"uuid\": {value},\n    \"enabled\": true"));
+        let text = refused(one_named(&rj));
+        assert!(
+            text.contains("gateways/g/resources/ignition/schedule/x/resource.json"),
+            "{value}: {text}"
+        );
+        assert!(text.contains(why), "{value}: {text}");
+        assert!(
+            !text.contains("not-a-uuid-at-all") && !text.contains("4a14d749bb78"),
+            "never echoes the value: {text}"
+        );
+    }
+    // the same defect in an opaque file is refused too, never replaced
+    let text = refused(one_named("{\"attributes\":{\"uuid\":\"\"}}"));
+    assert!(text.contains("is empty"), "{text}");
+    // attributes of the wrong kind, and a non-object document
+    let text = refused(one_named(
+        "{\n  \"scope\": \"A\",\n  \"attributes\": null\n}",
+    ));
+    assert!(text.contains("attributes is not a JSON object"), "{text}");
+    let text = refused(one_named("[1]"));
+    assert!(text.contains("not a JSON object"), "{text}");
+}
+
+#[test]
+fn singleton_and_named_no_uuid_get_none() {
+    let singleton =
+        |files: &[(&str, &str)]| try_render("dev", &["ignition/system-properties"], &[], files);
+    let sp = "resources/ignition/system-properties";
+    let cfg = format!("{sp}/config.json");
+    let rj = format!("{sp}/resource.json");
+
+    // a valid singleton renders with no uuid and nothing minted
+    let out = singleton(&[(cfg.as_str(), "{}"), (rj.as_str(), SINGLETON_RJ)]).unwrap();
+    assert_eq!(
+        bytes_at(&out, "ignition/system-properties/resource.json"),
+        SINGLETON_RJ.as_bytes()
+    );
+    assert!(out.uuids_minted.is_empty());
+
+    // no resource.json: refused, not synthesized
+    let text = refused(singleton(&[(cfg.as_str(), "{}")]));
+    assert!(text.contains("ignition/system-properties"), "{text}");
+    assert!(text.contains("no resource.json"), "{text}");
+
+    // a uuid on a singleton is a shape change
+    let with_uuid = rj_with_attributes(
+        "    \"uuid\": \"4a14d749-bb78-47c7-847a-cafa17da4da8\",\n    \"enabled\": true",
+    );
+    let text = refused(singleton(&[
+        (cfg.as_str(), "{}"),
+        (rj.as_str(), with_uuid.as_str()),
+    ]));
+    assert!(text.contains("gateways/g/resources/ignition/system-properties/resource.json"));
+    assert!(text.contains("singleton"), "{text}");
+
+    // NamedNoUuid: themes and store-and-forward-engine
+    for (module, ty) in [
+        ("com.inductiveautomation.perspective", "themes"),
+        ("ignition", "store-and-forward-engine"),
+    ] {
+        let entry = format!("{module}/{ty}");
+        let dir = format!("resources/{module}/{ty}/x");
+        let cfg = format!("{dir}/config.json");
+        let rj = format!("{dir}/resource.json");
+        let render = |files: &[(&str, &str)]| try_render("dev", &[entry.as_str()], &[], files);
+
+        // never synthesized
+        let text = refused(render(&[(cfg.as_str(), "{}")]));
+        assert!(
+            text.contains(&format!("gateways/g/{dir}/resource.json")),
+            "{text}"
+        );
+        assert!(text.contains("no resource.json"), "{text}");
+
+        // an existing one without a uuid is left exactly as it is
+        let out = render(&[(cfg.as_str(), "{}"), (rj.as_str(), NO_UUID_RJ)]).unwrap();
+        assert_eq!(
+            bytes_at(&out, &format!("{module}/{ty}/x/resource.json")),
+            NO_UUID_RJ.as_bytes()
+        );
+        assert!(out.uuids_minted.is_empty(), "{entry}");
+
+        // a gateway-written uuid (CD3: store-and-forward-engine carries one on
+        // 8.3.6) is kept, not refused and not recomputed
+        let out = render(&[(cfg.as_str(), "{}"), (rj.as_str(), NAMED_RJ)]).unwrap();
+        assert_eq!(
+            bytes_at(&out, &format!("{module}/{ty}/x/resource.json")),
+            NAMED_RJ.as_bytes()
+        );
+        assert!(out.uuids_minted.is_empty());
+
+        // but a malformed one is still refused
+        let bad = rj_with_attributes("    \"uuid\": \"\",\n    \"enabled\": true");
+        let text = refused(render(&[(cfg.as_str(), "{}"), (rj.as_str(), bad.as_str())]));
+        assert!(text.contains("is empty"), "{text}");
+    }
+}
+
+#[test]
+fn type_without_rule_is_refused() {
+    // an allowlisted type with no evidence, with files
+    let text = refused(try_render(
+        "dev",
+        &["ignition/made-up-type"],
+        &[],
+        &[
+            ("resources/ignition/made-up-type/a/config.json", "{}"),
+            ("resources/ignition/made-up-type/b/config.json", "{}"),
+        ],
+    ));
+    assert!(text.contains("gateways/g/manifest.yaml"), "{text}");
+    assert!(
+        text.contains("no render rule for ignition/made-up-type"),
+        "{text}"
+    );
+    assert!(
+        text.contains("gateways/g/resources/ignition/made-up-type/"),
+        "{text}"
+    );
+    assert!(text.contains("only evidence-backed types render"), "{text}");
+
+    // an allowlisted type with no files is refused on the manifest entry alone
+    let text = refused(try_render("dev", &["m/never-seen"], &[], &[]));
+    assert!(text.contains("gateways/g/manifest.yaml"), "{text}");
+    assert!(text.contains("no render rule for m/never-seen"), "{text}");
+
+    // a type that is not allowlisted keeps its single D-02 finding
+    let text = refused(try_render(
+        "dev",
+        &["ignition/schedule"],
+        &[],
+        &[("resources/ignition/made-up-type/a/config.json", "{}")],
+    ));
+    assert!(text.contains("type not in manifest.yaml types"), "{text}");
+    assert!(!text.contains("no render rule"), "{text}");
+
+    // denied and tag types are reported once, as what they are
+    let text = refused(try_render(
+        "dev",
+        &["ignition/security-levels"],
+        &[],
+        &[("resources/ignition/security-levels/config.json", "{}")],
+    ));
+    assert!(text.contains("denied type"), "{text}");
+    assert!(!text.contains("no render rule"), "{text}");
+}
+
+#[test]
+fn rule_structure_mismatch_is_refused() {
+    // a singleton type with a name directory, a named type with a loose file
+    let text = refused(try_render(
+        "dev",
+        &["ignition/system-properties", "ignition/schedule"],
+        &[],
+        &[
+            ("resources/ignition/system-properties/x/config.json", "{}"),
+            ("resources/ignition/system-properties/x/other.json", "{}"),
+            ("resources/ignition/schedule/loose.json", "{}"),
+            ("resources/ignition/schedule/ok/config.json", "{}"),
+        ],
+    ));
+    assert_eq!(
+        text.matches("gateways/g/resources/ignition/system-properties/x/")
+            .count(),
+        1,
+        "one finding per name directory: {text}"
+    );
+    assert!(text.contains("is a singleton type"), "{text}");
+    assert!(
+        text.contains("gateways/g/resources/ignition/schedule/loose.json"),
+        "{text}"
+    );
+    assert!(text.contains("is a named type"), "{text}");
+    assert!(!text.contains("schedule/ok"), "{text}");
+
+    // an overlay path is named as the overlay
+    let text = refused(try_render(
+        "dev",
+        &["ignition/schedule"],
+        &[],
+        &[("modes/dev/resources/ignition/schedule/loose.json", "{}")],
+    ));
+    assert!(
+        text.contains("gateways/g/modes/dev/resources/ignition/schedule/loose.json"),
+        "{text}"
+    );
+}
+
+#[test]
+fn uuid_is_stable_across_envs_and_differs_across_gateways() {
+    let manifest = Manifest::parse(
+        "manifest.yaml",
+        b"schema_version: 1\ntypes:\n  - ignition/schedule\n",
+    )
+    .expect("manifest");
+    let target = Target::parse("targets/dev.yaml", TARGET).expect("target");
+    let source = SourceTree::from_files([("resources/ignition/schedule/x/config.json", "{}")])
+        .expect("tree");
+    let render_for = |gateway: &str, env: &str| {
+        render(&RenderInput {
+            gateway,
+            env,
+            manifest: &manifest,
+            target: &target,
+            source: &source,
+        })
+        .expect("render")
+    };
+    let dev = render_for("gw-a", "dev");
+    let staging = render_for("gw-a", "staging");
+    let other_gateway = render_for("gw-b", "dev");
+
+    let rj = "ignition/schedule/x/resource.json";
+    assert_eq!(
+        bytes_at(&dev, rj),
+        bytes_at(&staging, rj),
+        "env is not an input"
+    );
+    assert_ne!(
+        bytes_at(&dev, rj),
+        bytes_at(&other_gateway, rj),
+        "the gateway is an input"
+    );
+    let text = text_at(&dev, rj);
+    assert!(text.contains(&name_based_uuid("gw-a", "ignition", "schedule", "x")));
+    assert_eq!(dev.uuids_minted, ["ignition/schedule/x"]);
 }
