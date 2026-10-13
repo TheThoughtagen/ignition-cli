@@ -2134,6 +2134,27 @@ and `render_sha256 <hex>` on stdout, with each warning on stderr as
 `deploy_render`. It is read-only, so it is not guarded and takes no
 `confirm` argument.
 
+#### Byte fidelity
+
+Files pass through byte for byte. Render rewrites a `.json` file only when
+`write(parse(bytes)) == bytes`, where the writer is the gateway's own format:
+members in **source order** (never sorted), 2-space indent, `": "` between
+key and value, `{}` and `[]` for empty containers, no trailing newline, the
+HTML-safe escapes `<` `>` `&` `=` `'` as `<` `>` `&` `=`
+`'`, U+2028 and U+2029 escaped, other non-ASCII as raw UTF-8, and every
+number kept exactly as written (`2.50`, `1.0E10` and integers beyond 2^53
+survive). A `.json` file that parses but is not in that format (a trailing
+newline, a compact one-liner, other indentation) is **opaque**: it is listed
+in `opaque_files` and render never mutates it.
+
+JSON that render cannot parse is refused, not copied blind, because render
+must inspect it for secrets: exit 2 `deploy_tree_invalid` naming each
+`gateways/<name>/…` source path, with all such files reported together.
+Refused are invalid UTF-8, a byte-order mark, a syntax error, nesting deeper
+than 128 levels, a key repeated within one object, and a file over the
+16 MiB (16,777,216 bytes) per-JSON cap. The message carries positions and
+key names, never values.
+
 ## Linting (`ign lint`)
 
 `ign lint PATH... [--strict] [-- <extra ignition-lint args>]` delegates

@@ -189,21 +189,22 @@ fn rendered_bytes_equal_source_bytes() {
 
 #[test]
 fn listing_format_is_pinned() {
+    // 3-byte valid JSON bodies: render parses every .json member (21-05)
     let files: [(&str, &[u8]); 2] = [
-        ("resources/m/a/config.json", b"one"),
-        ("resources/m/a/x/config.json", b"two"),
+        ("resources/m/a/config.json", b"[1]"),
+        ("resources/m/a/x/config.json", b"[2]"),
     ];
     let outcome = render_files(&["m/a"], &files);
-    let expected = listing_digest(&[("m/a/config.json", b"one"), ("m/a/x/config.json", b"two")]);
+    let expected = listing_digest(&[("m/a/config.json", b"[1]"), ("m/a/x/config.json", b"[2]")]);
     assert_eq!(outcome.tree.render_sha256(), expected);
 
     // and the literal shape: path NUL hex LF, hand-assembled
     let mut literal = Vec::new();
     literal.extend_from_slice(b"m/a/config.json\0");
-    literal.extend_from_slice(sha256_hex(b"one").as_bytes());
+    literal.extend_from_slice(sha256_hex(b"[1]").as_bytes());
     literal.push(b'\n');
     literal.extend_from_slice(b"m/a/x/config.json\0");
-    literal.extend_from_slice(sha256_hex(b"two").as_bytes());
+    literal.extend_from_slice(sha256_hex(b"[2]").as_bytes());
     literal.push(b'\n');
     assert_eq!(outcome.tree.render_sha256(), sha256_hex(&literal));
     assert_eq!(outcome.tree.bytes(), 6);

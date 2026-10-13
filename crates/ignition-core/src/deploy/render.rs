@@ -10,7 +10,8 @@
 //! 3. **map** repo paths to collection paths (tags in 21-06)
 //! 4. **policy**: the manifest type allowlist and its D-02 refusal (21-04);
 //!    deny list, gateway-owned, dot-names and tag providers (21-06)
-//! 5. JSON classification, the Gson gate (21-05)
+//! 5. **JSON classification**, the Gson gate (21-05): `node::classify` on every
+//!    `.json` member; findings name the source path; parsed nodes are kept
 //! 6. uuid (21-07)
 //! 7. lints (21-08)
 //! 8. **finish**: build the [`RenderedTree`], resources and the digest
@@ -24,6 +25,7 @@ use serde::Serialize;
 
 use super::layout::{RelPath, ResourceKey, collection_path, resource_key};
 use super::manifest::Manifest;
+use super::node::{self, JsonClass, Node};
 use super::target::Target;
 use super::tree::{RenderedTree, SourceTree};
 use crate::error::{CoreError, DeployFinding};
@@ -69,8 +71,8 @@ pub struct RenderOutcome {
     /// Collection paths of files that received a minted uuid (none until
     /// 21-07), byte-ordered.
     pub uuids_minted: Vec<String>,
-    /// Collection paths passed through as opaque bytes (none until 21-05),
-    /// byte-ordered.
+    /// Collection paths of `.json` files that are not in the gateway's writer
+    /// format and so pass through untouched, byte-ordered.
     pub opaque_files: Vec<String>,
     /// Warnings in pipeline order.
     pub warnings: Vec<String>,
@@ -80,23 +82,37 @@ pub struct RenderOutcome {
 /// `deploy_tree_invalid`.
 pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     let mut findings = Vec::new();
-    let mapped = map_to_collection(input, &mut findings);
+    let (mapped, origins) = map_to_collection(input, &mut findings);
     enforce_allowlist(input, &mapped, &mut findings);
+    let json = classify_json(&mapped, &origins, &mut findings);
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
-    Ok(finish(mapped))
+    Ok(finish(mapped, &json))
 }
+
+/// Collection path to the repo-relative source path (`gateways/<g>/<origin>`)
+/// it came from, so every later finding names a file the operator can open.
+type Origins = BTreeMap<RelPath, String>;
+
+/// Parsed JSON members keyed by collection path, with their class. Stages 6
+/// (uuid, 21-07) and 7 (lints, 21-08) read this table.
+type JsonTable = BTreeMap<RelPath, (JsonClass, Node)>;
 
 /// Stage 3: gateway-relative paths to collection paths.
 fn map_to_collection(
     input: &RenderInput<'_>,
     findings: &mut Vec<DeployFinding>,
-) -> BTreeMap<RelPath, Vec<u8>> {
+) -> (BTreeMap<RelPath, Vec<u8>>, Origins) {
     let mut mapped = BTreeMap::new();
+    let mut origins = Origins::new();
     for (path, bytes) in &input.source.files {
         match collection_path(path) {
             Ok(collection) => {
+                origins.insert(
+                    collection.clone(),
+                    format!("gateways/{}/{path}", input.gateway),
+                );
                 mapped.insert(collection, bytes.clone());
             }
             Err(why) => findings.push(DeployFinding {
@@ -107,7 +123,7 @@ fn map_to_collection(
             }),
         }
     }
-    mapped
+    (mapped, origins)
 }
 
 /// Stage 4 (21-04 share): one finding per type directory that is not on the
@@ -134,8 +150,44 @@ fn enforce_allowlist(
     }
 }
 
+/// Stage 5 (21-05): classify every `.json` member through the Gson gate.
+///
+/// A member that cannot be inspected (too large, not UTF-8, a BOM, a syntax
+/// error, too deep, a repeated key) is a finding naming its source path;
+/// the secret lint (21-08) needs the parsed tree, so JSON render cannot
+/// parse is refused rather than copied blind. Bytes are never changed here.
+/// Non-`.json` members are not parsed. Findings carry the parser's message,
+/// which names positions and keys, never values.
+fn classify_json(
+    mapped: &BTreeMap<RelPath, Vec<u8>>,
+    origins: &Origins,
+    findings: &mut Vec<DeployFinding>,
+) -> JsonTable {
+    let mut table = JsonTable::new();
+    for (path, bytes) in mapped {
+        if !path.as_str().to_ascii_lowercase().ends_with(".json") {
+            continue;
+        }
+        match node::classify(bytes) {
+            Ok(classified) => {
+                table.insert(path.clone(), classified);
+            }
+            Err(message) => findings.push(DeployFinding {
+                file: origins
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| path.to_string()),
+                line: None,
+                column: None,
+                message,
+            }),
+        }
+    }
+    table
+}
+
 /// Stage 8: the rendered tree and its resource listing.
-fn finish(mapped: BTreeMap<RelPath, Vec<u8>>) -> RenderOutcome {
+fn finish(mapped: BTreeMap<RelPath, Vec<u8>>, json: &JsonTable) -> RenderOutcome {
     let mut groups: BTreeMap<ResourceKey, Vec<String>> = BTreeMap::new();
     for path in mapped.keys() {
         let key = resource_key(path);
@@ -164,7 +216,11 @@ fn finish(mapped: BTreeMap<RelPath, Vec<u8>>) -> RenderOutcome {
         resources,
         tag_providers: Vec::new(),
         uuids_minted: Vec::new(),
-        opaque_files: Vec::new(),
+        opaque_files: json
+            .iter()
+            .filter(|(_, (class, _))| *class == JsonClass::Opaque)
+            .map(|(path, _)| path.to_string())
+            .collect(),
         warnings,
     }
 }
