@@ -236,12 +236,10 @@ fn entra_walk(value: &Value, path: &str, findings: &mut Vec<String>) {
                 entra_walk(item, path, findings);
             }
         }
-        Value::String(s) => {
-            if s.contains("login.microsoftonline.com/") {
-                for g in find_guids(s) {
-                    if !g.starts_with(FAKE_GUID_PREFIX) {
-                        findings.push(format!("{path}: non-fake GUID in an Entra login URL"));
-                    }
+        Value::String(s) if s.contains("login.microsoftonline.com/") => {
+            for g in find_guids(s) {
+                if !g.starts_with(FAKE_GUID_PREFIX) {
+                    findings.push(format!("{path}: non-fake GUID in an Entra login URL"));
                 }
             }
         }
