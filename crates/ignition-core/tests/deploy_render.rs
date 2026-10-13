@@ -677,3 +677,293 @@ fn overlay_render_is_read_only_and_repeatable() {
     let base = deploy_render(Path::new(TRACER_REPO), "dev").expect("baseline");
     assert_ne!(first.render_sha256, base.render_sha256);
 }
+
+// ---- 21-06 task 2: policy refusals ----------------------------------------
+
+const OPENAPI_TYPES: &str = include_str!("fixtures/deploy/openapi-8.3.6-resource-types.json");
+
+const DENIED: [&str; 4] = [
+    "security-properties",
+    "security-levels",
+    "api-token",
+    "user-source",
+];
+
+#[test]
+fn each_denied_type_is_refused_even_when_allowlisted() {
+    for ty in DENIED {
+        let entry = format!("ignition/{ty}");
+        let file = format!("resources/ignition/{ty}/config.json");
+        let named = format!("resources/ignition/{ty}/Some Name/config.json");
+        for path in [file, named] {
+            let text = refused(try_render(
+                "dev",
+                &[entry.as_str()],
+                &[],
+                &[(path.as_str(), "{}")],
+            ));
+            assert!(text.contains("gateways/g/manifest.yaml"), "{ty}: {text}");
+            assert!(text.contains(&format!("`{entry}`")), "{ty}: {text}");
+            assert!(
+                text.contains(&format!("gateways/g/resources/ignition/{ty}/")),
+                "{ty}: {text}"
+            );
+        }
+    }
+    // the same type under an overlay names the overlay directory
+    let text = refused(try_render(
+        "dev",
+        &["ignition/user-source"],
+        &[],
+        &[(
+            "modes/dev/resources/ignition/user-source/u/config.json",
+            "{}",
+        )],
+    ));
+    assert!(
+        text.contains("gateways/g/modes/dev/resources/ignition/user-source/"),
+        "{text}"
+    );
+    // a type merely next to a denied one is untouched
+    assert!(
+        try_render(
+            "dev",
+            &["ignition/user-source-x"],
+            &[],
+            &[("resources/ignition/user-source-x/u/config.json", "{}")]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn denied_types_exist_in_openapi_extract() {
+    let extract: serde_json::Value = serde_json::from_str(OPENAPI_TYPES).expect("extract");
+    let types = extract["types"].as_array().expect("types array");
+    for pair in ignition_core::deploy::rules::DENIED_TYPES {
+        assert!(
+            types
+                .iter()
+                .any(|t| t["module"] == pair.0 && t["type"] == pair.1),
+            "{pair:?} is not a type id in the 8.3.6 OpenAPI extract"
+        );
+    }
+    for ty in DENIED {
+        assert!(ignition_core::deploy::rules::is_denied("ignition", ty));
+    }
+    assert_eq!(ignition_core::deploy::rules::DENIED_TYPES.len(), 4);
+}
+
+#[test]
+fn config_mode_json_is_refused_anywhere() {
+    for (path, shown) in [
+        (
+            "resources/m/a/x/config-mode.json",
+            "gateways/g/resources/m/a/x/config-mode.json",
+        ),
+        (
+            "resources/m/a/config-mode.json",
+            "gateways/g/resources/m/a/config-mode.json",
+        ),
+        (
+            "modes/dev/resources/m/a/x/config-mode.json",
+            "gateways/g/modes/dev/resources/m/a/x/config-mode.json",
+        ),
+        (
+            "tags/P/tag-definition/F/config-mode.json",
+            "gateways/g/tags/P/tag-definition/F/config-mode.json",
+        ),
+    ] {
+        let text = refused(try_render(
+            "dev",
+            &["m/a"],
+            &["P"],
+            &[("resources/m/a/ok/config.json", "{}"), (path, "{}")],
+        ));
+        assert!(text.contains(shown), "{path}: {text}");
+        assert!(text.contains("written by the gateway"), "{text}");
+    }
+}
+
+/// A copy of the tracer repo with `.gitkeep` files at every directory level
+/// the reader walks.
+fn gitkeep_repo(root: &Path) -> PathBuf {
+    let repo = overlay_repo(root);
+    let gw = repo.join("gateways/tracer-gw");
+    for dir in [
+        "",
+        "resources",
+        "resources/ignition",
+        "resources/ignition/database-translator/POSTGRES",
+        "tags",
+        "tags/default/tag-definition/F",
+        "modes",
+        "modes/dev",
+        "modes/dev/resources",
+        "modes/staging",
+    ] {
+        let path = gw.join(dir);
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::write(path.join(".gitkeep"), b"").expect("write");
+    }
+    repo
+}
+
+#[test]
+fn dot_names_are_refused_but_gitkeep_is_skipped() {
+    // in memory: .gitkeep is dropped, never rendered, never listed
+    let out = try_render(
+        "dev",
+        &["m/a"],
+        &[],
+        &[
+            ("resources/m/a/x/config.json", "{}"),
+            ("resources/m/a/x/.gitkeep", ""),
+            ("resources/.gitkeep", ""),
+            ("modes/dev/resources/m/a/.gitkeep", ""),
+        ],
+    )
+    .unwrap();
+    assert_eq!(out.tree.files.len(), 1);
+    assert!(out.resources.iter().all(|r| r.files == ["config.json"]));
+
+    let text = refused(try_render(
+        "dev",
+        &["m/a"],
+        &[],
+        &[
+            ("resources/m/a/x/config.json", "{}"),
+            ("resources/m/a/x/.DS_Store", "x"),
+            ("resources/m/a/.hidden/y/config.json", "{}"),
+            ("resources/m/a/.hidden/z/config.json", "{}"),
+            ("modes/dev/resources/m/a/.env", "x"),
+            ("resources/m/a/.gitkeep/inner", "x"),
+        ],
+    ));
+    assert!(
+        text.contains("gateways/g/resources/m/a/x/.DS_Store"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("gateways/g/resources/m/a/.hidden").count(),
+        1,
+        "a dot-named directory is reported once: {text}"
+    );
+    assert!(
+        text.contains("gateways/g/modes/dev/resources/m/a/.env"),
+        "{text}"
+    );
+    assert!(text.contains("gateways/g/resources/m/a/.gitkeep"), "{text}");
+
+    // on disk: the reader skips .gitkeep at every depth, and the digest is
+    // the one a tree without them gives
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plain = overlay_repo(&tmp.path().join("plain"));
+    let kept = gitkeep_repo(&tmp.path().join("kept"));
+    let a = deploy_render(&plain, "dev").expect("plain");
+    let b = deploy_render(&kept, "dev").expect("with .gitkeep files");
+    assert_eq!(a.render_sha256, b.render_sha256);
+    assert_eq!(a.files, b.files);
+
+    // on disk: other dot-names are refused, a dot-named directory is not
+    // walked, and every finding is reported together
+    let gw = kept.join("gateways/tracer-gw");
+    std::fs::write(gw.join("resources/.DS_Store"), b"x").expect("write");
+    std::fs::create_dir_all(gw.join("tags/.hidden")).expect("mkdir");
+    std::fs::write(gw.join("tags/.hidden/tags.json"), b"{ broken").expect("write");
+    std::fs::write(gw.join("modes/dev/.DS_Store"), b"x").expect("write");
+    let err = deploy_render(&kept, "dev").unwrap_err().to_string();
+    assert!(
+        err.contains("gateways/tracer-gw/resources/.DS_Store"),
+        "{err}"
+    );
+    assert!(err.contains("gateways/tracer-gw/tags/.hidden"), "{err}");
+    assert!(
+        err.contains("gateways/tracer-gw/modes/dev/.DS_Store"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("broken"),
+        "dot-named directories are not walked: {err}"
+    );
+}
+
+#[test]
+fn dotted_module_names_are_not_dot_names() {
+    let out = try_render(
+        "dev",
+        &["com.inductiveautomation.perspective/themes"],
+        &[],
+        &[(
+            "resources/com.inductiveautomation.perspective/themes/Dark.Mode/config.json",
+            "{}",
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        out.tree
+            .files
+            .keys()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>(),
+        ["com.inductiveautomation.perspective/themes/Dark.Mode/config.json"]
+    );
+    // on disk too
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    copy_dir(Path::new(TRACER_REPO), &repo);
+    let gw = repo.join("gateways/tracer-gw");
+    let theme = gw.join("resources/com.inductiveautomation.perspective/themes/Dark.Mode");
+    std::fs::create_dir_all(&theme).expect("mkdir");
+    std::fs::write(theme.join("config.json"), b"{}").expect("write");
+    let mut manifest = std::fs::read_to_string(gw.join("manifest.yaml")).expect("manifest");
+    manifest = manifest.replace(
+        "types:\n",
+        "types:\n  - com.inductiveautomation.perspective/themes\n",
+    );
+    std::fs::write(gw.join("manifest.yaml"), manifest).expect("write");
+    let result = deploy_render(&repo, "dev").expect("render");
+    assert_eq!(result.files, 5);
+}
+
+#[test]
+fn policy_findings_are_collected() {
+    let text = refused(try_render(
+        "dev",
+        &["ignition/user-source", "m/a"],
+        &["default"],
+        &[
+            // not allowlisted (D-02)
+            ("resources/m/unlisted/x/config.json", "{}"),
+            // denied, allowlisted
+            ("resources/ignition/user-source/u/config.json", "{}"),
+            // gateway-owned
+            ("resources/m/a/x/config-mode.json", "{}"),
+            // dot-name
+            ("resources/m/a/.hidden/config.json", "{}"),
+            // undeclared provider and unknown tag type
+            ("tags/rogue/tag-provider/config.json", "{}"),
+            ("tags/default/tag-widget/config.json", "{}"),
+            // tag type under resources
+            ("resources/ignition/tag-group/P/Default/config.json", "{}"),
+            // unparseable JSON (stage 5 joins the same error)
+            ("resources/m/a/y/config.json", "{ broken"),
+            // overlay finding
+            ("modes/dev/resources/m/a/z/config.json", "{ broken"),
+        ],
+    ));
+    for needle in [
+        "gateways/g/resources/m/unlisted/",
+        "gateways/g/resources/ignition/user-source/",
+        "gateways/g/manifest.yaml",
+        "gateways/g/resources/m/a/x/config-mode.json",
+        "gateways/g/resources/m/a/.hidden",
+        "gateways/g/tags/rogue/",
+        "gateways/g/tags/default/tag-widget/config.json",
+        "gateways/g/resources/ignition/tag-group/",
+        "gateways/g/resources/m/a/y/config.json",
+        "gateways/g/modes/dev/resources/m/a/z/config.json",
+    ] {
+        assert!(text.contains(needle), "missing {needle}: {text}");
+    }
+}

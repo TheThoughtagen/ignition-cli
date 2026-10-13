@@ -2201,6 +2201,33 @@ Three layouts were not exercised by the capture and so stay refused: a
 `tag-type-definition`, and a non-default collection. Two source files that map
 to the same collection path are refused, naming both.
 
+#### What render refuses
+
+Render is fail-closed: a defect is a refusal (exit 2 `deploy_tree_invalid`),
+never a skip, and every defect found in one render is reported together, each
+naming the repo path to open (an overlay path when the overlay supplied it).
+Refused:
+
+- a type directory under `resources/` that is not in the manifest `types`
+  (D-02);
+- **the security types `ignition/security-properties`,
+  `ignition/security-levels`, `ignition/api-token` and `ignition/user-source`,
+  even when the manifest lists them**: rendering them can lock an
+  administrator out of the gateway, so they stay gateway-owned. A manifest
+  `types` entry for one of them is refused too, naming `manifest.yaml`;
+- `config-mode.json` at any depth, in the base or an overlay: the gateway
+  writes it itself;
+- any path component that starts with `.` (`.DS_Store`, `.hidden/`, `.env`).
+  A file named `.gitkeep` is the one exception: it is skipped at any depth and
+  never rendered or listed. Only the first character decides, so a module
+  directory such as `com.inductiveautomation.perspective` is fine;
+- a tag provider directory not listed in the manifest `tag_providers`, a
+  directory under `tags/<provider>/` that is not one of the four tag types,
+  and tag types placed under `resources/ignition/`;
+- two source files that map to one collection path;
+- symlinks, special files and non-UTF-8 names anywhere in the walked tree;
+- unparseable JSON (see Byte fidelity).
+
 ## Linting (`ign lint`)
 
 `ign lint PATH... [--strict] [-- <extra ignition-lint args>]` delegates

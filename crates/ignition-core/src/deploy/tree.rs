@@ -178,8 +178,11 @@ impl Reader {
 
     fn read_root(&mut self, dir: &Path) {
         for (name, path) in self.sorted_entries(dir, "") {
+            if self.dot_entry(&path, &name, &name) {
+                continue;
+            }
             match name.as_str() {
-                "manifest.yaml" | ".gitkeep" => {
+                "manifest.yaml" => {
                     self.check_regular(&path, &name);
                 }
                 "resources" | "tags" => self.walk(&path, &name),
@@ -200,6 +203,10 @@ impl Reader {
         }
         for (name, path) in self.sorted_entries(dir, rel) {
             let child = join(rel, &name);
+            if name == ".gitkeep" {
+                self.dot_entry(&path, &child, &name);
+                continue;
+            }
             if name == self.env {
                 self.read_env(&path, &child);
                 continue;
@@ -223,6 +230,9 @@ impl Reader {
         }
         for (name, path) in self.sorted_entries(dir, rel) {
             let child = join(rel, &name);
+            if self.dot_entry(&path, &child, &name) {
+                continue;
+            }
             match name.as_str() {
                 "resources" | "tags" => self.walk(&path, &child),
                 _ => self.finding(
@@ -271,6 +281,28 @@ impl Reader {
         }
     }
 
+    /// Handle a dot-named entry: a regular file named `.gitkeep` is skipped
+    /// at any depth, everything else that starts with `.` is a finding and is
+    /// neither read nor walked. Only the first character decides, so
+    /// `com.inductiveautomation.perspective` is not a dot-name. Returns
+    /// whether `name` was a dot-name (and so is handled).
+    fn dot_entry(&mut self, path: &Path, rel: &str, name: &str) -> bool {
+        if !name.starts_with('.') {
+            return false;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if name == ".gitkeep" && meta.file_type().is_file() => {}
+            Ok(meta) if meta.file_type().is_symlink() => {
+                self.finding(rel, "is a symlink; symlinks are refused");
+            }
+            _ => self.finding(
+                rel,
+                "name starts with `.`; dot-named entries are refused (only a `.gitkeep` file is skipped)",
+            ),
+        }
+        true
+    }
+
     /// Walk directory `dir` (repo-gateway-relative `rel`), collecting files.
     fn walk(&mut self, dir: &Path, rel: &str) {
         if !self.require_dir(dir, rel) {
@@ -278,6 +310,9 @@ impl Reader {
         }
         for (name, path) in self.sorted_entries(dir, rel) {
             let child = join(rel, &name);
+            if self.dot_entry(&path, &child, &name) {
+                continue;
+            }
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(e) => {
