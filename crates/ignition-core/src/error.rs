@@ -8,7 +8,7 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01) (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
 //! | 5    | auth           | `auth_rejected`
@@ -790,6 +790,119 @@ pub enum CoreError {
         /// URL of the refused request, when known.
         endpoint: Option<String>,
     },
+
+    /// A declared gateway tree failed render validation (21-03): one or
+    /// more findings, each naming its file and, for YAML syntax and
+    /// schema defects, a line and column. Exit 2 — usage class: the
+    /// CALLER authored the tree and must fix it. Render is offline, so
+    /// there is no endpoint. Boxed to keep `CoreError` under clippy's
+    /// `result_large_err` threshold.
+    #[error("deploy tree invalid: {0}")]
+    DeployTreeInvalid(Box<DeployTreeInvalidDetails>),
+
+    /// A declared tree carries an Embedded or plaintext secret (21-03).
+    /// Exit 2 — usage class. The payload holds JSON paths and other
+    /// findings only: no field exists that could carry a secret value.
+    #[error("refusing to render an embedded or plaintext secret: {0}")]
+    EmbeddedSecret(Box<EmbeddedSecretDetails>),
+}
+
+/// Findings shown inline by the deploy error Displays; the rest collapse
+/// into `and {m} more`.
+pub const DEPLOY_FINDINGS_SHOWN: usize = 20;
+
+/// One defect in a declared deploy tree (21-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployFinding {
+    /// Collection-relative file the finding is about.
+    pub file: String,
+    /// 1-based line, when the defect has a source position.
+    pub line: Option<usize>,
+    /// 1-based column, when the defect has a source position.
+    pub column: Option<usize>,
+    /// What is wrong. Never contains a value read from the tree.
+    pub message: String,
+}
+
+impl std::fmt::Display for DeployFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.line, self.column) {
+            (Some(line), Some(column)) => {
+                write!(f, "{}:{line}:{column}: {}", self.file, self.message)
+            }
+            _ => write!(f, "{}: {}", self.file, self.message),
+        }
+    }
+}
+
+/// Payload of [`CoreError::DeployTreeInvalid`], boxed to keep
+/// `CoreError` under clippy's `result_large_err` threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployTreeInvalidDetails {
+    /// Every finding, in discovery order.
+    pub findings: Vec<DeployFinding>,
+}
+
+impl std::fmt::Display for DeployTreeInvalidDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let [only] = self.findings.as_slice() {
+            return write!(f, "{only}");
+        }
+        write!(f, "{} findings: ", self.findings.len())?;
+        write_findings(f, &self.findings, DEPLOY_FINDINGS_SHOWN)
+    }
+}
+
+/// Write `findings` joined by `; `, at most `shown` of them, then
+/// `; and {m} more` when truncated.
+fn write_findings(
+    f: &mut std::fmt::Formatter<'_>,
+    findings: &[DeployFinding],
+    shown: usize,
+) -> std::fmt::Result {
+    for (i, finding) in findings.iter().take(shown).enumerate() {
+        if i > 0 {
+            f.write_str("; ")?;
+        }
+        write!(f, "{finding}")?;
+    }
+    if findings.len() > shown {
+        write!(f, "; and {} more", findings.len() - shown)?;
+    }
+    Ok(())
+}
+
+/// Payload of [`CoreError::EmbeddedSecret`], boxed to keep `CoreError`
+/// under clippy's `result_large_err` threshold. Carries locations only:
+/// there is deliberately no field that can hold a secret value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedSecretDetails {
+    /// Each entry is `<collection-relative file>: <dotted json path>`.
+    pub paths: Vec<String>,
+    /// Non-secret tree findings discovered in the same render.
+    pub other_findings: Vec<DeployFinding>,
+}
+
+impl std::fmt::Display for EmbeddedSecretDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "embedded secret at {} path(s): ", self.paths.len())?;
+        let shown_paths = self.paths.len().min(DEPLOY_FINDINGS_SHOWN);
+        f.write_str(&self.paths[..shown_paths].join("; "))?;
+        if self.paths.len() > shown_paths {
+            write!(f, "; and {} more", self.paths.len() - shown_paths)?;
+        }
+        if !self.other_findings.is_empty() {
+            write!(
+                f,
+                "; also {} other tree finding(s): ",
+                self.other_findings.len()
+            )?;
+            // The combined list stays within DEPLOY_FINDINGS_SHOWN entries.
+            let room = DEPLOY_FINDINGS_SHOWN.saturating_sub(shown_paths);
+            write_findings(f, &self.other_findings, room)?;
+        }
+        Ok(())
+    }
 }
 
 /// Why a resource write's signature was refused
@@ -921,6 +1034,8 @@ impl CoreError {
             Self::ResourceSignatureRejected { .. } => "resource_signature_rejected",
             Self::ResourceExists { .. } => "resource_exists",
             Self::ModeExists { .. } => "mode_exists",
+            Self::DeployTreeInvalid(..) => "deploy_tree_invalid",
+            Self::EmbeddedSecret(..) => "embedded_secret",
         }
     }
 
@@ -932,7 +1047,9 @@ impl CoreError {
             | Self::ProfilingRiskNotAccepted { .. }
             | Self::InvalidImportFile { .. }
             | Self::InvalidInput { .. }
-            | Self::GatewayClientError { .. } => 2,
+            | Self::GatewayClientError { .. }
+            | Self::DeployTreeInvalid(..)
+            | Self::EmbeddedSecret(..) => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -1342,6 +1459,17 @@ impl CoreError {
                  skip the create"
                     .to_string(),
             ),
+            Self::DeployTreeInvalid(..) => Some(
+                "fix each file named above in the declared gateway tree; render \
+                 refuses until every finding is resolved"
+                    .to_string(),
+            ),
+            Self::EmbeddedSecret(..) => Some(
+                "store the value in the gateway's secret provider and reference it \
+                 as {\"type\":\"Referenced\",\"data\":{\"providerName\":\"…\",\
+                 \"secretName\":\"…\"}}; never commit an Embedded or plaintext secret"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1382,6 +1510,53 @@ impl CoreError {
             Self::ModuleDigestMismatch(d) => Some(d.url.clone()),
             _ => None,
         }
+    }
+
+    /// The deploy slugs (21-03), in the order the README row lists them.
+    pub const DEPLOY_SLUGS: &'static [&'static str] = &["deploy_tree_invalid", "embedded_secret"];
+
+    /// A single positioned (or file-only, when `line`/`column` are
+    /// `None`) tree finding as a [`Self::DeployTreeInvalid`].
+    pub fn deploy_tree_invalid(
+        file: impl Into<String>,
+        line: Option<usize>,
+        column: Option<usize>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::deploy_findings(vec![DeployFinding {
+            file: file.into(),
+            line,
+            column,
+            message: message.into(),
+        }])
+    }
+
+    /// Several tree findings as one [`Self::DeployTreeInvalid`]. An empty
+    /// vector is a programming error: debug builds assert, release builds
+    /// still return one generic finding so the error is never empty.
+    pub fn deploy_findings(findings: Vec<DeployFinding>) -> Self {
+        debug_assert!(!findings.is_empty(), "deploy_findings needs a finding");
+        let findings = if findings.is_empty() {
+            vec![DeployFinding {
+                file: String::new(),
+                line: None,
+                column: None,
+                message: "the declared tree is invalid".to_string(),
+            }]
+        } else {
+            findings
+        };
+        Self::DeployTreeInvalid(Box::new(DeployTreeInvalidDetails { findings }))
+    }
+
+    /// An embedded or plaintext secret at each of `paths` (locations
+    /// only, never values), plus any non-secret findings from the same
+    /// render.
+    pub fn embedded_secret(paths: Vec<String>, other_findings: Vec<DeployFinding>) -> Self {
+        Self::EmbeddedSecret(Box::new(EmbeddedSecretDetails {
+            paths,
+            other_findings,
+        }))
     }
 
     /// The `ign tui` TTY refusal (06-07): InvalidInput carrying the
@@ -1450,7 +1625,7 @@ pub struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreError, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
+        CoreError, DeployFinding, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
         ModuleDigestChangedDetails, ModuleDigestMismatchDetails, SignatureReason,
         TESTING_ROUTE_PREFIX, truncate_api_body,
@@ -1879,6 +2054,16 @@ mod tests {
                 6,
                 "mode_exists",
             ),
+            (
+                CoreError::deploy_tree_invalid("manifest.yaml", Some(2), Some(1), "unknown field"),
+                2,
+                "deploy_tree_invalid",
+            ),
+            (
+                CoreError::embedded_secret(vec!["a.json: settings.password".into()], vec![]),
+                2,
+                "embedded_secret",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -1901,6 +2086,8 @@ mod tests {
         (2, "invalid_import_file"),
         (2, "invalid_input"),
         (2, "gateway_client_error"),
+        (2, "deploy_tree_invalid"),
+        (2, "embedded_secret"),
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
@@ -2574,5 +2761,97 @@ mod tests {
              the gateway, then retry",
             "the generic branch is byte-identical to its pre-QUICK-p0g text"
         );
+    }
+
+    fn finding(file: &str, line: Option<usize>, column: Option<usize>, msg: &str) -> DeployFinding {
+        DeployFinding {
+            file: file.into(),
+            line,
+            column,
+            message: msg.into(),
+        }
+    }
+
+    #[test]
+    fn deploy_finding_display_names_file_line_column() {
+        let positioned = finding("targets/prod.yaml", Some(3), Some(1), "unknown field `x`");
+        assert_eq!(
+            positioned.to_string(),
+            "targets/prod.yaml:3:1: unknown field `x`"
+        );
+        let bare = finding("targets/prod.yaml", None, None, "missing field `gateway`");
+        assert_eq!(
+            bare.to_string(),
+            "targets/prod.yaml: missing field `gateway`"
+        );
+        // A half-positioned finding never claims a position.
+        let half = finding("m.yaml", Some(3), None, "m");
+        assert_eq!(half.to_string(), "m.yaml: m");
+    }
+
+    #[test]
+    fn deploy_findings_cap_at_twenty() {
+        let many: Vec<DeployFinding> = (0..25)
+            .map(|i| finding("manifest.yaml", None, None, &format!("problem {i}")))
+            .collect();
+        let shown = CoreError::deploy_findings(many).to_string();
+        assert!(shown.contains("25 findings: "), "{shown}");
+        assert!(shown.contains("problem 19"), "{shown}");
+        assert!(!shown.contains("problem 20"), "{shown}");
+        assert!(shown.ends_with("; and 5 more"), "{shown}");
+
+        let single = CoreError::deploy_tree_invalid("m.yaml", Some(2), Some(1), "bad");
+        assert_eq!(single.to_string(), "deploy tree invalid: m.yaml:2:1: bad");
+    }
+
+    #[test]
+    fn embedded_secret_display_lists_paths_only() {
+        let err = CoreError::embedded_secret(
+            vec![
+                "ignition/database-connection/A/config.json: settings.password".into(),
+                "ignition/database-connection/B/config.json: settings.password".into(),
+            ],
+            vec![finding("manifest.yaml", None, None, "duplicate type")],
+        );
+        let shown = err.to_string();
+        assert!(shown.contains("2 path(s)"), "{shown}");
+        assert!(
+            shown.contains("A/config.json: settings.password"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("B/config.json: settings.password"),
+            "{shown}"
+        );
+        assert!(shown.contains("also 1 other tree finding(s)"), "{shown}");
+        assert!(shown.contains("manifest.yaml: duplicate type"), "{shown}");
+
+        // The combined list stays within the cap.
+        let paths: Vec<String> = (0..25).map(|i| format!("f{i}.json: a.b")).collect();
+        let shown =
+            CoreError::embedded_secret(paths, vec![finding("m.yaml", None, None, "x")]).to_string();
+        assert!(shown.contains("25 path(s)"), "{shown}");
+        assert!(shown.contains("and 5 more"), "{shown}");
+        assert!(shown.contains("f19.json: a.b"), "{shown}");
+        assert!(!shown.contains("f20.json: a.b"), "{shown}");
+    }
+
+    #[test]
+    fn deploy_slugs_are_exit_two() {
+        let errs = [
+            CoreError::deploy_tree_invalid("m.yaml", None, None, "bad"),
+            CoreError::embedded_secret(vec!["a.json: p".into()], vec![]),
+        ];
+        let codes: Vec<&str> = errs.iter().map(CoreError::code).collect();
+        assert_eq!(codes, CoreError::DEPLOY_SLUGS);
+        for err in &errs {
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert_eq!(err.endpoint(), None, "render is offline: {err}");
+            let hint = err.hint().expect("hint required");
+            assert!(
+                !hint.contains("`ign ") && !hint.contains("ign "),
+                "hint must not name an ign subcommand: {hint}"
+            );
+        }
     }
 }

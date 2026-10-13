@@ -105,7 +105,7 @@ guarded verbs: schema-required would invite agents to auto-fill
 |------|---------------|----------------------------------------------------|-----------------------------------------------|
 | 0    | ok            | success                                            | —
 | 1    | internal      | unexpected failure — report as a bug               | `internal`
-| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, or a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim) | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9)
+| 2    | usage         | usage error (rendered by clap), destructive op without `--yes`, JVM profiling without `--i-accept-the-risk`, an invalid import file, an unreadable command input, a raw api call the gateway rejected with an unclassified 4xx (body carried verbatim), or a declared deploy tree that fails render validation or carries an embedded secret | `confirmation_required`, `profiling_risk_not_accepted`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (P9), `deploy_tree_invalid`, `embedded_secret`
 | 3    | config        | local configuration problem                        | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `password_unavailable`, `config_invalid`, `poll_interval_too_small`, `module_not_registered`
 | 4    | network       | gateway, or a module release feed, unreachable / timeout / TLS | `network_error`, `module_feed_unreachable`
 | 5    | auth          | gateway rejected credentials                       | `auth_rejected`
