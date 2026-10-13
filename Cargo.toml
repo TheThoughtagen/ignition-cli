@@ -23,6 +23,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 futures-util = { version = "0.3", default-features = false, features = ["std"] } # StreamExt over the export chunk stream (arrives transitively with reqwest's stream feature; declared direct so the import is legal)
 async-trait = "0.1" # GatewayApi: dyn-compatible today, ubiquitous (research Open Question 2, resolved)
 toml = "1.1"
+# Phase 21 (21-03): roadmap-locked strict YAML for manifest.yaml / targets/<env>.yaml
+# (deny_unknown_fields + line/column errors). YAML-org continuation of serde_yaml;
+# brings exactly one transitive crate (libyaml-rs). serde-saphyr rejected: MSRV 1.89
+# is above the 1.88 floor.
+yaml_serde = "0.10"
 directories = "6.0"
 keyring = "4.1"
 getrandom = "0.2" # CSPRNG for the webdev deploy secret — 0.2 pinned to ring's in-tree version (zero new edges); see webdev.rs generate_secret

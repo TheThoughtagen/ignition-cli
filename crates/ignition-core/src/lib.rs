@@ -19,11 +19,13 @@
 //! engine — runner seam, discovery, pre-flight), `actions` (the shared
 //! verb layer), `webdev` (the embedded route bundle `ign webdev deploy`
 //! zips — pure data, no I/O), and `module` (the pinned third-party
-//! `.modl` artifact registry, fetch, and cache-verify seam — Phase 15).
+//! `.modl` artifact registry, fetch, and cache-verify seam — Phase 15), and
+//! `deploy` (offline render of declared gateway trees — Phase 21).
 
 pub mod actions;
 pub mod client;
 pub mod config;
+pub mod deploy;
 pub mod e2e;
 pub mod error;
 pub mod module;

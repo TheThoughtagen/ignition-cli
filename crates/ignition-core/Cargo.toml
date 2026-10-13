@@ -11,6 +11,7 @@ repository.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+yaml_serde = { workspace = true } # 21-03: strict manifest/target YAML (deploy::yamlio) — the ONLY new dependency, plus its transitive libyaml-rs
 directories = { workspace = true }
 keyring = { workspace = true }
 thiserror = { workspace = true }
