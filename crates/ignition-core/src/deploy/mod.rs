@@ -9,6 +9,8 @@
 //! - **Core never prints.** Findings ride [`crate::error::CoreError`]; the
 //!   binary renders them.
 
+pub mod manifest;
+pub mod target;
 pub mod yamlio;
 
 /// Why `name` is not a safe single path component, or `None` when it is.
