@@ -134,7 +134,7 @@ fn determinism_is_read_order_independent() {
     // the real tree, read from disk repeatedly, gives one digest
     let digests: Vec<String> = (0..3)
         .map(|_| {
-            deploy_render(Path::new(TRACER_REPO), "dev")
+            deploy_render(Path::new(TRACER_REPO), "dev", None)
                 .expect("render")
                 .render_sha256
         })
@@ -162,7 +162,7 @@ fn render_is_read_only() {
     let before = snapshot(&repo);
     assert!(!before.is_empty());
 
-    let result = deploy_render(&repo, "dev").expect("render");
+    let result = deploy_render(&repo, "dev", None).expect("render");
     assert_eq!(result.files, 4);
 
     let after = snapshot(&repo);
@@ -377,7 +377,7 @@ fn envelope_arrays_are_ordered() {
     );
 
     // the action's envelope carries the same ordering
-    let result = deploy_render(Path::new(TRACER_REPO), "dev").expect("render");
+    let result = deploy_render(Path::new(TRACER_REPO), "dev", None).expect("render");
     let tracer: Vec<(&str, &str, Option<&str>)> = result
         .resources
         .iter()
@@ -544,7 +544,9 @@ fn other_env_overlays_are_never_read() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     copy_dir(Path::new(TRACER_REPO), &repo);
-    let before = deploy_render(&repo, "dev").expect("baseline").render_sha256;
+    let before = deploy_render(&repo, "dev", None)
+        .expect("baseline")
+        .render_sha256;
     let other = repo.join("gateways/tracer-gw/modes/staging");
     std::fs::create_dir_all(other.join("resources/ignition/database-translator/POSTGRES"))
         .expect("mkdir");
@@ -557,7 +559,7 @@ fn other_env_overlays_are_never_read() {
     std::fs::create_dir_all(other.join(".hidden")).expect("mkdir");
     #[cfg(unix)]
     std::os::unix::fs::symlink("/etc", other.join("resources/link")).expect("symlink");
-    let after = deploy_render(&repo, "dev").expect("staging content is never read");
+    let after = deploy_render(&repo, "dev", None).expect("staging content is never read");
     assert_eq!(before, after.render_sha256);
 }
 
@@ -781,14 +783,14 @@ fn overlay_render_is_read_only_and_repeatable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = overlay_repo(tmp.path());
     let before = snapshot(&repo);
-    let first = deploy_render(&repo, "dev").expect("render");
-    let second = deploy_render(&repo, "dev").expect("render again");
+    let first = deploy_render(&repo, "dev", None).expect("render");
+    let second = deploy_render(&repo, "dev", None).expect("render again");
     assert_eq!(first.render_sha256, second.render_sha256);
     assert_eq!(first.tag_providers, ["default"]);
     assert_eq!(first, second);
     assert_eq!(before, snapshot(&repo), "render must not write anything");
     // the overlay is part of the dev digest and absent from another env
-    let base = deploy_render(Path::new(TRACER_REPO), "dev").expect("baseline");
+    let base = deploy_render(Path::new(TRACER_REPO), "dev", None).expect("baseline");
     assert_ne!(first.render_sha256, base.render_sha256);
 }
 
@@ -983,8 +985,8 @@ fn dot_names_are_refused_but_gitkeep_is_skipped() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let plain = overlay_repo(&tmp.path().join("plain"));
     let kept = gitkeep_repo(&tmp.path().join("kept"));
-    let a = deploy_render(&plain, "dev").expect("plain");
-    let b = deploy_render(&kept, "dev").expect("with .gitkeep files");
+    let a = deploy_render(&plain, "dev", None).expect("plain");
+    let b = deploy_render(&kept, "dev", None).expect("with .gitkeep files");
     assert_eq!(a.render_sha256, b.render_sha256);
     assert_eq!(a.files, b.files);
 
@@ -995,7 +997,7 @@ fn dot_names_are_refused_but_gitkeep_is_skipped() {
     std::fs::create_dir_all(gw.join("tags/.hidden")).expect("mkdir");
     std::fs::write(gw.join("tags/.hidden/tags.json"), b"{ broken").expect("write");
     std::fs::write(gw.join("modes/dev/.DS_Store"), b"x").expect("write");
-    let err = deploy_render(&kept, "dev").unwrap_err().to_string();
+    let err = deploy_render(&kept, "dev", None).unwrap_err().to_string();
     assert!(
         err.contains("gateways/tracer-gw/resources/.DS_Store"),
         "{err}"
@@ -1055,7 +1057,7 @@ fn dotted_module_names_are_not_dot_names() {
         "types:\n  - com.inductiveautomation.perspective/themes\n",
     );
     std::fs::write(gw.join("manifest.yaml"), manifest).expect("write");
-    let result = deploy_render(&repo, "dev").expect("render");
+    let result = deploy_render(&repo, "dev", None).expect("render");
     assert_eq!(result.files, 6);
 }
 
@@ -1915,4 +1917,429 @@ fn windows_node_data_dir_lowers_the_render_budget() {
     assert!(at_limit(linux, 175).is_err(), "175 is refused");
     assert!(at_limit(windows.as_bytes(), 162).is_ok());
     assert!(at_limit(windows.as_bytes(), 163).is_err());
+}
+
+// ---- 21-09 task 1: --out and the clobber ladder ---------------------------
+
+use ignition_core::deploy::tree::{RENDER_MARKER, RenderMarker};
+
+/// A scratch copy of the tracer repo plus a second, empty scratch area for
+/// `--out` targets. Tempdirs only: nothing here touches the real fixtures.
+fn out_fixture() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    copy_dir(Path::new(TRACER_REPO), &repo);
+    (tmp, repo)
+}
+
+const ALARM_CONFIG: &str =
+    "gateways/tracer-gw/resources/ignition/general-alarm-settings/config.json";
+
+/// Every file under `out` (relative, `/`-separated), marker included.
+fn out_files(out: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, root: &Path, acc: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, root, acc);
+            } else {
+                let rel = path.strip_prefix(root).expect("prefix");
+                acc.insert(
+                    rel.to_string_lossy().replace('\\', "/"),
+                    std::fs::read(&path).expect("read"),
+                );
+            }
+        }
+    }
+    let mut acc = BTreeMap::new();
+    walk(out, out, &mut acc);
+    acc
+}
+
+fn read_marker(out: &Path) -> RenderMarker {
+    serde_json::from_slice(&std::fs::read(out.join(RENDER_MARKER)).expect("marker")).expect("json")
+}
+
+fn invalid_input(err: &ignition_core::error::CoreError) -> String {
+    assert_eq!(err.code(), "invalid_input", "{err}");
+    assert_eq!(err.exit_code(), 2);
+    err.to_string()
+}
+
+#[test]
+fn out_absent_is_created_and_matches_render() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("deep/er/rendered");
+    let result = deploy_render(&repo, "dev", Some(&out)).expect("render");
+    assert_eq!(result.out.as_deref(), Some(out.to_string_lossy().as_ref()));
+
+    let marker = read_marker(&out);
+    assert_eq!(marker.schema_version, 1);
+    assert_eq!(marker.gateway, "tracer-gw");
+    assert_eq!(marker.env, "dev");
+    assert_eq!(marker.mode, "dev");
+    assert_eq!(marker.render_sha256, result.render_sha256);
+    assert_eq!(marker.files.len(), result.files);
+
+    // every listed file is on disk byte-for-byte as listed, and the marker
+    // lists exactly the files on disk
+    let on_disk = out_files(&out);
+    let listed: Vec<&str> = marker.files.iter().map(|f| f.path.as_str()).collect();
+    let mut sorted = listed.clone();
+    sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(listed, sorted, "marker files are byte-sorted");
+    for f in &marker.files {
+        let bytes = &on_disk[&f.path];
+        assert_eq!(sha256_hex(bytes), f.sha256);
+        assert_eq!(bytes.len() as u64, f.bytes);
+    }
+    let mut expected = listed.clone();
+    expected.push(RENDER_MARKER);
+    expected.sort_unstable();
+    assert_eq!(
+        on_disk.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+
+    // the digest of what landed on disk is the reported digest, computed
+    // from scratch (never via the production digest function)
+    let entries: Vec<(&str, &[u8])> = marker
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), on_disk[&f.path].as_slice()))
+        .collect();
+    assert_eq!(listing_digest(&entries), result.render_sha256);
+
+    // the marker ends with exactly one LF
+    let raw = std::fs::read(out.join(RENDER_MARKER)).expect("marker");
+    assert!(raw.ends_with(b"}\n") && !raw.ends_with(b"\n\n"));
+}
+
+#[test]
+fn out_empty_dir_is_used() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("empty");
+    std::fs::create_dir(&out).expect("mkdir");
+    let result = deploy_render(&repo, "dev", Some(&out)).expect("render");
+    assert_eq!(out_files(&out).len(), result.files + 1);
+}
+
+#[test]
+fn out_refresh_of_same_gateway_env_overwrites_listed_files() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("out");
+    let first = deploy_render(&repo, "dev", Some(&out)).expect("first");
+
+    let cfg = repo.join(ALARM_CONFIG);
+    let text = std::fs::read_to_string(&cfg).expect("config");
+    assert!(text.contains("\"liveEventLimit\": 5"));
+    std::fs::write(
+        &cfg,
+        text.replace("\"liveEventLimit\": 5", "\"liveEventLimit\": 6"),
+    )
+    .expect("write");
+
+    let second = deploy_render(&repo, "dev", Some(&out)).expect("refresh");
+    assert_ne!(first.render_sha256, second.render_sha256);
+    assert_eq!(read_marker(&out).render_sha256, second.render_sha256);
+    let landed = std::fs::read_to_string(out.join("ignition/general-alarm-settings/config.json"))
+        .expect("file");
+    assert!(landed.contains("\"liveEventLimit\": 6"));
+    // no temporary file is left behind
+    assert!(
+        out_files(&out)
+            .keys()
+            .all(|k| !k.ends_with(".ign-render-tmp"))
+    );
+
+    // an identical refresh is accepted too
+    deploy_render(&repo, "dev", Some(&out)).expect("idempotent");
+}
+
+#[test]
+fn out_refresh_refuses_when_new_render_drops_a_file() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("out");
+    deploy_render(&repo, "dev", Some(&out)).expect("first");
+    let before = snapshot(&out);
+
+    let manifest = repo.join("gateways/tracer-gw/manifest.yaml");
+    let text = std::fs::read_to_string(&manifest).expect("manifest");
+    std::fs::write(
+        &manifest,
+        text.replace("  - ignition/general-alarm-settings\n", ""),
+    )
+    .expect("write");
+    std::fs::remove_dir_all(
+        repo.join("gateways/tracer-gw/resources/ignition/general-alarm-settings"),
+    )
+    .expect("rm source dir");
+
+    let err = deploy_render(&repo, "dev", Some(&out)).expect_err("dropped file");
+    let reason = invalid_input(&err);
+    assert!(
+        reason.contains("ignition/general-alarm-settings/"),
+        "{reason}"
+    );
+    assert!(reason.contains("no longer produces"), "{reason}");
+    assert_eq!(before, snapshot(&out), "the directory is byte-unchanged");
+}
+
+#[test]
+fn out_refuses_unrelated_non_empty_dir() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("notes");
+    std::fs::create_dir(&out).expect("mkdir");
+    std::fs::write(out.join("notes.txt"), b"mine").expect("write");
+    let before = snapshot(&out);
+
+    let err = deploy_render(&repo, "dev", Some(&out)).expect_err("unrelated dir");
+    let reason = invalid_input(&err);
+    assert!(reason.contains("notes.txt"), "{reason}");
+    assert!(reason.contains(RENDER_MARKER), "{reason}");
+    assert_eq!(before, snapshot(&out));
+    assert_eq!(std::fs::read(out.join("notes.txt")).expect("read"), b"mine");
+}
+
+#[test]
+fn out_refuses_modified_prior_render() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("out");
+    deploy_render(&repo, "dev", Some(&out)).expect("first");
+    let edited = out.join("ignition/database-translator/POSTGRES/config.json");
+    let mut bytes = std::fs::read(&edited).expect("read");
+    bytes.extend_from_slice(b" ");
+    std::fs::write(&edited, &bytes).expect("edit");
+    let before = snapshot(&out);
+
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("modified"));
+    assert!(
+        reason.contains("ignition/database-translator/POSTGRES/config.json"),
+        "{reason}"
+    );
+    assert!(reason.contains("modified"), "{reason}");
+    assert_eq!(before, snapshot(&out));
+    assert_eq!(
+        std::fs::read(&edited).expect("read"),
+        bytes,
+        "the user's edit survives"
+    );
+}
+
+#[test]
+fn out_refuses_unlisted_extra_file_missing_file_and_empty_subdir() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("out");
+    deploy_render(&repo, "dev", Some(&out)).expect("first");
+
+    // an extra file the render never wrote
+    std::fs::write(out.join("ignition/extra.txt"), b"x").expect("write");
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("extra"));
+    assert!(reason.contains("ignition/extra.txt"), "{reason}");
+    std::fs::remove_file(out.join("ignition/extra.txt")).expect("cleanup");
+
+    // a directory that holds no listed file
+    std::fs::create_dir(out.join("stray")).expect("mkdir");
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("stray"));
+    assert!(reason.contains("stray/"), "{reason}");
+    std::fs::remove_dir(out.join("stray")).expect("cleanup");
+
+    // a listed file that was removed
+    std::fs::remove_file(out.join("ignition/general-alarm-settings/config.json")).expect("rm");
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("missing"));
+    assert!(
+        reason.contains("general-alarm-settings/config.json"),
+        "{reason}"
+    );
+    assert!(reason.contains("missing"), "{reason}");
+}
+
+#[test]
+fn out_refuses_other_gateway_or_env_marker() {
+    let (tmp, repo) = out_fixture();
+    // a second environment on the same gateway
+    std::fs::copy(repo.join("targets/dev.yaml"), repo.join("targets/stg.yaml")).expect("copy");
+    let out = tmp.path().join("out");
+    deploy_render(&repo, "dev", Some(&out)).expect("first");
+    let before = snapshot(&out);
+
+    let reason = invalid_input(&deploy_render(&repo, "stg", Some(&out)).expect_err("other env"));
+    assert!(reason.contains("env dev"), "{reason}");
+    assert_eq!(before, snapshot(&out));
+
+    // a marker that names another gateway
+    let marker_path = out.join(RENDER_MARKER);
+    let text = std::fs::read_to_string(&marker_path).expect("marker");
+    std::fs::write(&marker_path, text.replace("\"tracer-gw\"", "\"other-gw\"")).expect("write");
+    let before = snapshot(&out);
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("other gw"));
+    assert!(reason.contains("other-gw"), "{reason}");
+    assert_eq!(before, snapshot(&out));
+
+    // unreadable, wrong-version and unknown-field markers
+    for bad in [
+        "not json".to_string(),
+        text.replace("\"schema_version\": 1", "\"schema_version\": 2"),
+        text.replace("\"mode\"", "\"extra\": 1,\n  \"mode\""),
+    ] {
+        std::fs::write(&marker_path, bad).expect("write");
+        let before = snapshot(&out);
+        invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("bad marker"));
+        assert_eq!(before, snapshot(&out));
+    }
+}
+
+#[test]
+fn out_interrupted_write_is_refused_until_removed() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("out");
+    deploy_render(&repo, "dev", Some(&out)).expect("first");
+    // simulate a crash before the marker landed: files, no marker
+    std::fs::remove_file(out.join(RENDER_MARKER)).expect("rm marker");
+    let before = snapshot(&out);
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("no marker"));
+    assert!(reason.contains(RENDER_MARKER), "{reason}");
+    assert!(reason.contains("remove the directory"), "{reason}");
+    assert_eq!(before, snapshot(&out));
+}
+
+#[test]
+fn out_refuses_file_path() {
+    let (tmp, repo) = out_fixture();
+    let out = tmp.path().join("afile");
+    std::fs::write(&out, b"keep me").expect("write");
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("file"));
+    assert!(reason.contains("not a directory"), "{reason}");
+    assert_eq!(std::fs::read(&out).expect("read"), b"keep me");
+}
+
+#[cfg(unix)]
+#[test]
+fn out_refuses_symlink_out_and_symlinked_entries() {
+    use std::os::unix::fs::symlink;
+    let (tmp, repo) = out_fixture();
+
+    // the out path itself is a symlink to an empty directory
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).expect("mkdir");
+    let link = tmp.path().join("link");
+    symlink(&real, &link).expect("symlink");
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&link)).expect_err("symlink out"));
+    assert!(reason.contains("symlink"), "{reason}");
+    assert!(
+        std::fs::read_dir(&real).expect("read_dir").next().is_none(),
+        "target untouched"
+    );
+
+    // a dangling symlink at the out path is refused too, not created through
+    let dangling = tmp.path().join("dangling");
+    symlink(tmp.path().join("nowhere"), &dangling).expect("symlink");
+    invalid_input(&deploy_render(&repo, "dev", Some(&dangling)).expect_err("dangling"));
+    assert!(!tmp.path().join("nowhere").exists());
+
+    // a prior render that now holds a symlink entry
+    let out = tmp.path().join("out");
+    deploy_render(&repo, "dev", Some(&out)).expect("first");
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, b"outside").expect("write");
+    symlink(&outside, out.join("ignition/sneaky")).expect("symlink");
+    let before = snapshot(&out);
+    let reason = invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("entry"));
+    assert!(reason.contains("ignition/sneaky"), "{reason}");
+    assert_eq!(before, snapshot(&out));
+    assert_eq!(std::fs::read(&outside).expect("read"), b"outside");
+
+    // a listed file replaced by a symlink is not followed or overwritten
+    std::fs::remove_file(out.join("ignition/sneaky")).expect("rm");
+    let listed = out.join("ignition/general-alarm-settings/config.json");
+    std::fs::remove_file(&listed).expect("rm");
+    symlink(&outside, &listed).expect("symlink");
+    invalid_input(&deploy_render(&repo, "dev", Some(&out)).expect_err("listed link"));
+    assert_eq!(std::fs::read(&outside).expect("read"), b"outside");
+}
+
+#[test]
+fn refused_render_writes_nothing() {
+    let (tmp, repo) = out_fixture();
+    let gw = repo.join("gateways/tracer-gw");
+    let manifest = gw.join("manifest.yaml");
+    let base = std::fs::read_to_string(&manifest).expect("manifest");
+
+    // a secret refusal: a database connection with an embedded password
+    let db = gw.join("resources/ignition/database-connection/Main");
+    std::fs::create_dir_all(&db).expect("mkdir");
+    std::fs::write(
+        db.join("config.json"),
+        r#"{"password":{"type":"Embedded","data":{"ciphertext":"CANARY-OUT-21"}},"url":"jdbc:x"}"#,
+    )
+    .expect("write");
+    std::fs::write(db.join("resource.json"), NAMED_RJ).expect("write");
+    std::fs::write(
+        &manifest,
+        base.replace("types:\n", "types:\n  - ignition/database-connection\n"),
+    )
+    .expect("write");
+
+    let absent = tmp.path().join("absent");
+    let err = deploy_render(&repo, "dev", Some(&absent)).expect_err("secret");
+    assert_eq!(err.code(), "embedded_secret");
+    assert!(!absent.exists(), "an absent --out stays absent");
+
+    let deep = tmp.path().join("new-parent/out");
+    deploy_render(&repo, "dev", Some(&deep)).expect_err("secret");
+    assert!(
+        !tmp.path().join("new-parent").exists(),
+        "no ancestor was created"
+    );
+
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir(&empty).expect("mkdir");
+    deploy_render(&repo, "dev", Some(&empty)).expect_err("secret");
+    assert!(
+        std::fs::read_dir(&empty)
+            .expect("read_dir")
+            .next()
+            .is_none(),
+        "empty stays empty"
+    );
+
+    // a policy refusal: a denied type that the manifest lists
+    std::fs::remove_dir_all(&db).expect("rm");
+    let user = gw.join("resources/ignition/user-source/u");
+    std::fs::create_dir_all(&user).expect("mkdir");
+    std::fs::write(user.join("config.json"), "{}").expect("write");
+    std::fs::write(
+        &manifest,
+        base.replace("types:\n", "types:\n  - ignition/user-source\n"),
+    )
+    .expect("write");
+    let err = deploy_render(&repo, "dev", Some(&absent)).expect_err("policy");
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    assert!(!absent.exists());
+    deploy_render(&repo, "dev", Some(&empty)).expect_err("policy");
+    assert!(
+        std::fs::read_dir(&empty)
+            .expect("read_dir")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn out_second_writer_is_refused_and_nothing_is_replaced() {
+    use ignition_core::deploy::layout::RelPath;
+    use ignition_core::deploy::tree::{RenderedTree, write_out};
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("race");
+    let mut tree = RenderedTree::default();
+    tree.files
+        .insert(RelPath::new("a/b").expect("path"), b"one".to_vec());
+    let marker = RenderMarker::for_tree("g", "dev", "dev", &tree);
+
+    write_out(&tree, &out, &marker).expect("first writer");
+    // a competitor's output without our marker: refused, never replaced
+    std::fs::remove_file(out.join(RENDER_MARKER)).expect("rm marker");
+    std::fs::write(out.join("a/b"), b"theirs").expect("write");
+    invalid_input(&write_out(&tree, &out, &marker).expect_err("second writer"));
+    assert_eq!(std::fs::read(out.join("a/b")).expect("read"), b"theirs");
 }

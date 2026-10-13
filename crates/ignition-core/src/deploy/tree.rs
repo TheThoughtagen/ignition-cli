@@ -16,9 +16,11 @@
 //! The digest is the lowercase hex SHA-256 of the concatenated entries. An
 //! empty tree hashes the empty listing ([`EMPTY_RENDER_SHA256`]).
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::layout::RelPath;
@@ -119,6 +121,357 @@ impl SourceTree {
             Err(CoreError::deploy_findings(reader.findings))
         }
     }
+}
+
+/// File name of the marker `--out` writes at the root of a rendered tree.
+pub const RENDER_MARKER: &str = "render.json";
+
+/// Suffix of the temporary file a write goes through before its rename.
+const TMP_SUFFIX: &str = ".ign-render-tmp";
+
+/// `render.json`: ign's own record of a render written with `--out`. It is
+/// not a gateway file and is never part of `render_sha256`. Phase 22 reads
+/// it (`plan --base`), so its shape is versioned by `schema_version`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderMarker {
+    /// Marker schema version (1).
+    pub schema_version: u32,
+    /// Gateway directory name the render came from.
+    pub gateway: String,
+    /// Environment the render was made for.
+    pub env: String,
+    /// Deployment mode from the target.
+    pub mode: String,
+    /// The render's `render_sha256` (equals the envelope's).
+    pub render_sha256: String,
+    /// Every written file, byte-sorted by path.
+    pub files: Vec<MarkerFile>,
+}
+
+/// One file entry of [`RenderMarker`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerFile {
+    /// Collection path, relative to the `--out` directory.
+    pub path: String,
+    /// Lowercase hex SHA-256 of the file bytes.
+    pub sha256: String,
+    /// File size in bytes.
+    pub bytes: u64,
+}
+
+impl RenderMarker {
+    /// The marker for `tree` (files in byte-sorted path order).
+    pub fn for_tree(gateway: &str, env: &str, mode: &str, tree: &RenderedTree) -> RenderMarker {
+        RenderMarker {
+            schema_version: 1,
+            gateway: gateway.to_string(),
+            env: env.to_string(),
+            mode: mode.to_string(),
+            render_sha256: tree.render_sha256(),
+            files: tree
+                .files
+                .iter()
+                .map(|(path, bytes)| MarkerFile {
+                    path: path.as_str().to_string(),
+                    sha256: sha256_hex(bytes),
+                    bytes: bytes.len() as u64,
+                })
+                .collect(),
+        }
+    }
+
+    /// The marker as written: pretty JSON plus one LF.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CoreError> {
+        let mut text = serde_json::to_string_pretty(self)
+            .map_err(|e| CoreError::Internal(format!("cannot serialize {RENDER_MARKER}: {e}")))?;
+        text.push('\n');
+        Ok(text.into_bytes())
+    }
+}
+
+fn refuse(out: &Path, reason: impl std::fmt::Display) -> CoreError {
+    CoreError::InvalidInput {
+        reason: format!(
+            "--out {}: {reason}; remove the directory or choose an empty or absent one",
+            out.display()
+        ),
+    }
+}
+
+/// What the check phase found.
+enum OutPlan {
+    /// The path is absent: create it.
+    Create,
+    /// An existing empty directory.
+    Empty,
+    /// A prior render of the same gateway and environment: its listed
+    /// files (unchanged) may be replaced.
+    Refresh(BTreeSet<String>),
+}
+
+/// Inspect `out` without writing anything and decide whether the render may
+/// be written there.
+fn check_out(tree: &RenderedTree, out: &Path, marker: &RenderMarker) -> Result<OutPlan, CoreError> {
+    if tree.files.keys().any(|p| p.as_str() == RENDER_MARKER) {
+        return Err(refuse(
+            out,
+            format!("the render holds a file named {RENDER_MARKER}"),
+        ));
+    }
+    let meta = match std::fs::symlink_metadata(out) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OutPlan::Create),
+        Err(e) => return Err(refuse(out, format!("cannot inspect it ({})", e.kind()))),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(refuse(out, "is a symlink; symlinks are refused"));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(refuse(out, "exists and is not a directory"));
+    }
+
+    let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    walk_out(out, "", &mut files, &mut dirs).map_err(|why| refuse(out, why))?;
+    if files.is_empty() && dirs.is_empty() {
+        return Ok(OutPlan::Empty);
+    }
+
+    let marker_path = match files.get(RENDER_MARKER) {
+        Some(path) => path,
+        None => {
+            let first = files
+                .keys()
+                .next()
+                .cloned()
+                .or_else(|| dirs.iter().next().cloned())
+                .unwrap_or_default();
+            return Err(refuse(
+                out,
+                format!("is not empty and holds no {RENDER_MARKER} (first entry: {first})"),
+            ));
+        }
+    };
+    let prior: RenderMarker = std::fs::read(marker_path)
+        .map_err(|e| refuse(out, format!("cannot read {RENDER_MARKER} ({})", e.kind())))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|_| refuse(out, format!("{RENDER_MARKER} is not a valid render marker")))
+        })?;
+    if prior.schema_version != 1 {
+        return Err(refuse(
+            out,
+            format!(
+                "{RENDER_MARKER} has schema_version {}, expected 1",
+                prior.schema_version
+            ),
+        ));
+    }
+    if prior.gateway != marker.gateway || prior.env != marker.env {
+        return Err(refuse(
+            out,
+            format!(
+                "{RENDER_MARKER} belongs to gateway {} env {}, not gateway {} env {}",
+                prior.gateway, prior.env, marker.gateway, marker.env
+            ),
+        ));
+    }
+
+    let mut listed: BTreeSet<String> = BTreeSet::new();
+    for entry in &prior.files {
+        if !listed.insert(entry.path.clone()) {
+            return Err(refuse(
+                out,
+                format!("{RENDER_MARKER} lists {} twice", entry.path),
+            ));
+        }
+    }
+    // every regular file other than the marker is listed with its sha256
+    for (rel, path) in &files {
+        if rel == RENDER_MARKER {
+            continue;
+        }
+        let Some(entry) = prior.files.iter().find(|f| &f.path == rel) else {
+            return Err(refuse(
+                out,
+                format!("{rel} is not listed in {RENDER_MARKER}"),
+            ));
+        };
+        let bytes = std::fs::read(path)
+            .map_err(|e| refuse(out, format!("cannot read {rel} ({})", e.kind())))?;
+        if sha256_hex(&bytes) != entry.sha256 {
+            return Err(refuse(
+                out,
+                format!("{rel} was modified since it was rendered"),
+            ));
+        }
+    }
+    // every listed file is present, and still produced by the new render
+    for rel in &listed {
+        if !files.contains_key(rel) {
+            return Err(refuse(
+                out,
+                format!("{rel} is listed in {RENDER_MARKER} but missing"),
+            ));
+        }
+        if !tree.files.keys().any(|p| p.as_str() == rel) {
+            return Err(refuse(
+                out,
+                format!("{rel} was rendered before but this render no longer produces it"),
+            ));
+        }
+    }
+    // no directory that holds no listed file
+    for dir in &dirs {
+        let prefix = format!("{dir}/");
+        if !listed.iter().any(|rel| rel.starts_with(&prefix)) {
+            return Err(refuse(out, format!("{dir}/ holds no rendered file")));
+        }
+    }
+    // a new path may not collide with an existing file or directory
+    for path in tree.files.keys() {
+        let rel = path.as_str();
+        if listed.contains(rel) {
+            continue;
+        }
+        if files.contains_key(rel) || dirs.contains(rel) {
+            return Err(refuse(out, format!("{rel} already exists")));
+        }
+        let mut at = 0;
+        while let Some(i) = rel[at..].find('/') {
+            at += i;
+            if files.contains_key(&rel[..at]) {
+                return Err(refuse(
+                    out,
+                    format!("{} is a file, not a directory", &rel[..at]),
+                ));
+            }
+            at += 1;
+        }
+    }
+    Ok(OutPlan::Refresh(listed))
+}
+
+/// Walk `dir` with `symlink_metadata`, entries sorted by name bytes.
+/// Symlinks, special files and non-UTF-8 names are errors naming the path.
+fn walk_out(
+    dir: &Path,
+    rel: &str,
+    files: &mut BTreeMap<String, PathBuf>,
+    dirs: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let read = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read directory {} ({})", join(rel, ""), e.kind()))?;
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|e| format!("cannot read a directory entry ({})", e.kind()))?;
+        let name = entry.file_name().into_string().map_err(|raw| {
+            format!(
+                "{} has a name that is not valid UTF-8",
+                join(rel, &raw.to_string_lossy())
+            )
+        })?;
+        entries.push((name, entry.path()));
+    }
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    for (name, path) in entries {
+        let child = join(rel, &name);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("cannot inspect {child} ({})", e.kind()))?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            return Err(format!("{child} is a symlink; symlinks are refused"));
+        } else if kind.is_dir() {
+            dirs.insert(child.clone());
+            walk_out(&path, &child, files, dirs)?;
+        } else if kind.is_file() {
+            files.insert(child, path);
+        } else {
+            return Err(format!("{child} is not a regular file or directory"));
+        }
+    }
+    Ok(())
+}
+
+fn io_failure(what: &str, path: &Path, e: &std::io::Error) -> CoreError {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        return CoreError::InvalidInput {
+            reason: format!(
+                "--out: {} already exists (another writer won the race); nothing was replaced",
+                path.display()
+            ),
+        };
+    }
+    CoreError::Internal(format!("cannot {what} {}: {e}", path.display()))
+}
+
+/// Write `bytes` to `<path>.ign-render-tmp` (created new) and rename it
+/// over `path`.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(TMP_SUFFIX);
+    let tmp = PathBuf::from(tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| io_failure("create", &tmp, &e))?;
+    file.write_all(bytes)
+        .map_err(|e| io_failure("write", &tmp, &e))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| io_failure("replace", path, &e))
+}
+
+/// Write `tree` and its `marker` under `out`, in two phases.
+///
+/// Check phase (no writes): `out` must be absent, an empty directory, or a
+/// directory that is exactly a previous render of the same gateway and
+/// environment (see the README `--out` section); anything else is
+/// `invalid_input` naming the reason and the first offending path. Symlinks
+/// and special files anywhere under `out` are refused.
+///
+/// Write phase: new paths are opened with `create_new`, listed paths are
+/// replaced through a temporary file and a rename, and `render.json` goes
+/// last the same way. Nothing is ever removed.
+pub fn write_out(tree: &RenderedTree, out: &Path, marker: &RenderMarker) -> Result<(), CoreError> {
+    let plan = check_out(tree, out, marker)?;
+    let marker_bytes = marker.to_bytes()?;
+
+    match &plan {
+        OutPlan::Create => {
+            if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| io_failure("create", parent, &e))?;
+            }
+            std::fs::create_dir(out).map_err(|e| io_failure("create", out, &e))?;
+        }
+        OutPlan::Empty | OutPlan::Refresh(_) => {}
+    }
+    let listed = match &plan {
+        OutPlan::Refresh(listed) => Some(listed),
+        _ => None,
+    };
+
+    for (path, bytes) in &tree.files {
+        let rel = path.as_str();
+        let dest = rel.split('/').fold(out.to_path_buf(), |acc, c| acc.join(c));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_failure("create", parent, &e))?;
+        }
+        if listed.is_some_and(|l| l.contains(rel)) {
+            write_replacing(&dest, bytes)?;
+        } else {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map_err(|e| io_failure("create", &dest, &e))?;
+            file.write_all(bytes)
+                .map_err(|e| io_failure("write", &dest, &e))?;
+        }
+    }
+    write_replacing(&out.join(RENDER_MARKER), &marker_bytes)
 }
 
 struct Reader {

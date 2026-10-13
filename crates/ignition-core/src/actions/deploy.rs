@@ -2,14 +2,16 @@
 //!
 //! An OFFLINE verb: it reads a declared repo from disk and returns a model.
 //! There is no `Session`, no profile resolution, no network connection and
-//! no credential read; the envelope's `profile` is null. Render makes no
-//! filesystem write in this plan.
+//! no credential read; the envelope's `profile` is null. Render reads the
+//! repo and writes nothing, except into the optional `--out` directory, and
+//! only after the whole render succeeded: a refused render leaves `--out`
+//! untouched. The write goes through [`write_out`]'s clobber ladder, which
+//! never deletes and only replaces its own unmodified prior output.
 //!
 //! The `data` keys, in order: `env, gateway, mode, out, files, bytes,
 //! render_sha256, resources, tag_providers, uuids_minted, opaque_files,
 //! warnings`. Later plans add keys additively (the `workspace.rs`
-//! discipline); `out` is always present and serializes as null until
-//! `--out` lands.
+//! discipline); `out` is always present and is null without `--out`.
 //!
 //! Errors never echo file contents: findings name repo-relative paths and
 //! key names only.
@@ -22,7 +24,7 @@ use crate::deploy::component_problem;
 use crate::deploy::manifest::Manifest;
 use crate::deploy::render::{RenderInput, RenderedResource, render};
 use crate::deploy::target::Target;
-use crate::deploy::tree::SourceTree;
+use crate::deploy::tree::{RenderMarker, SourceTree, write_out};
 use crate::error::CoreError;
 
 /// The `ign deploy render` result (the envelope's `data`).
@@ -34,7 +36,7 @@ pub struct DeployRenderResult {
     pub gateway: String,
     /// Deployment mode from the target.
     pub mode: String,
-    /// Output directory; null until `--out` lands.
+    /// The `--out` directory as given; null without `--out`.
     pub out: Option<String>,
     /// Number of rendered files.
     pub files: usize,
@@ -54,8 +56,13 @@ pub struct DeployRenderResult {
     pub warnings: Vec<String>,
 }
 
-/// Render the declared tree of `env` under `repo`.
-pub fn deploy_render(repo: &Path, env: &str) -> Result<DeployRenderResult, CoreError> {
+/// Render the declared tree of `env` under `repo`, optionally writing it
+/// (and `render.json`) to `out`.
+pub fn deploy_render(
+    repo: &Path,
+    env: &str,
+    out: Option<&Path>,
+) -> Result<DeployRenderResult, CoreError> {
     if let Some(problem) = component_problem(env) {
         return Err(CoreError::InvalidInput {
             reason: format!("--env {env}: {problem}"),
@@ -88,11 +95,17 @@ pub fn deploy_render(repo: &Path, env: &str) -> Result<DeployRenderResult, CoreE
         source: &source,
     })?;
 
+    // Only a successful render reaches the filesystem.
+    if let Some(out) = out {
+        let marker = RenderMarker::for_tree(&target.gateway, env, &target.mode, &outcome.tree);
+        write_out(&outcome.tree, out, &marker)?;
+    }
+
     Ok(DeployRenderResult {
         env: env.to_string(),
         gateway: target.gateway.clone(),
         mode: target.mode.clone(),
-        out: None,
+        out: out.map(|p| p.to_string_lossy().into_owned()),
         files: outcome.tree.files.len(),
         bytes: outcome.tree.bytes(),
         render_sha256: outcome.tree.render_sha256(),

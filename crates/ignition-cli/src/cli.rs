@@ -632,6 +632,12 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// Also write the rendered tree and a `render.json` marker to
+        /// this directory: absent, empty, or a previous render of the
+        /// same gateway and environment. Never deletes; anything else
+        /// is refused (`invalid_input`) before any write
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
     },
 }
 

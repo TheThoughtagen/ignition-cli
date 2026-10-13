@@ -3086,9 +3086,9 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
         // no profile, no network, no credential read. Envelope profile
         // is null (the `ign lint` precedent).
         Commands::Deploy(DeployArgs { command }) => match command {
-            DeployCommand::Render { env, repo } => {
-                let result =
-                    actions::deploy::deploy_render(&repo, &env).map(ActionOutput::DeployRender);
+            DeployCommand::Render { env, repo, out } => {
+                let result = actions::deploy::deploy_render(&repo, &env, out.as_deref())
+                    .map(ActionOutput::DeployRender);
                 (None, result)
             }
         },

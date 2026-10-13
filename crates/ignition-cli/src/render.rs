@@ -1401,6 +1401,9 @@ fn render_deploy_render_human(result: &ignition_core::actions::deploy::DeployRen
         result.gateway, result.env, result.mode, result.files, result.bytes
     );
     println!("render_sha256 {}", result.render_sha256);
+    if let Some(out) = &result.out {
+        println!("wrote {} files to {}", result.files, out);
+    }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }
