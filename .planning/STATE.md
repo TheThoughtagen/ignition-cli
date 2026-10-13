@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 21
 current_phase_name: deploy-render
 status: executing
-stopped_at: Completed 21-06-PLAN.md
-last_updated: "2026-10-13T14:26:07.174Z"
+stopped_at: Completed 21-07-PLAN.md
+last_updated: "2026-10-13T14:51:06.380Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 15
-  completed_plans: 12
+  completed_plans: 13
   percent: 17
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 21 (deploy-render) — EXECUTING
-Plan: 7 of 9
+Plan: 8 of 9
 Status: Ready to execute
 Last activity: 2026-10-13 — Phase 21 execution started
 
-Progress: [████████░░] 80%
+Progress: [█████████░] 87%
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 21 P04 | 60min | 2 tasks | 22 files |
 | Phase 21 P05 | 40min | 2 tasks | 6 files |
 | Phase 21 P06 | 45min | 2 tasks | 7 files |
+| Phase 21 P07 | 75min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -87,8 +88,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-13T14:26:07.161Z
-**Stopped At:** Completed 21-06-PLAN.md
+**Last session:** 2026-10-13T14:51:06.310Z
+**Stopped At:** Completed 21-07-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -116,3 +117,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 21]: 21-04: deploy_render exposed over MCP by clap derivation, unguarded, no confirm (Decision D)
 - [Phase ?]: 21-05: JSON nesting capped at 128 by an own linear scan (serde_json RawValue validation accepted 200-deep); stage 5 collects JSON findings with allowlist findings
 - [Phase ?]: 21-06: CD5 mapping ignition/<type>/<P>/<rest> adopted; unexercised tag layouts (root-level tags, nested type-definition folders) stay refused
+- [Phase ?]: 21-07: NamedNoUuid types keep an existing valid uuid (CD3: gateway writes one for store-and-forward-engine); never synthesized
+- [Phase ?]: 21-07: tag types (CD5) are exempt from TYPE_RULES and stage 6; TYPE_RULES has 50 rows (19 singleton, 29 named, 2 named-no-uuid)

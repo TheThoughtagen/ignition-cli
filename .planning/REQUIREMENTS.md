@@ -34,7 +34,7 @@ Numbering: new categories. **47 requirements.**
 - [x] **DRND-03**: Files under `modes/<env>/` override the base tree by path, whole-file
 - [x] **DRND-04**: Only manifest-allowlisted resource types are rendered; security singletons (security-properties, security-levels, API tokens, user sources) are refused
 - [ ] **DRND-05**: Gateway-written files pass through byte-for-byte; files `ign` synthesizes use a Gson-compatible, order-preserving writer, proven by the gateway corpus round-tripping byte-identical on Linux, macOS and Windows
-- [ ] **DRND-06**: New named resources get a deterministic name-based `attributes.uuid` from a per-type rule table; singleton types get none; existing uuids are kept
+- [x] **DRND-06**: New named resources get a deterministic name-based `attributes.uuid` from a per-type rule table; singleton types get none; existing uuids are kept
 - [ ] **DRND-07**: Render refuses an embedded secret (an `Embedded` secret value or a plaintext secret field), naming the path and never the value
 - [ ] **DRND-08**: Render refuses case-fold collisions, Windows-illegal names, paths over the Windows length budget, and CR bytes in the tree
 
@@ -128,7 +128,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DRND-03 | Phase 21 | Complete |
 | DRND-04 | Phase 21 | Complete |
 | DRND-05 | Phase 21 | Pending |
-| DRND-06 | Phase 21 | Pending |
+| DRND-06 | Phase 21 | Complete |
 | DRND-07 | Phase 21 | Pending |
 | DRND-08 | Phase 21 | Pending |
 | DPLN-01 | Phase 22 | Pending |
