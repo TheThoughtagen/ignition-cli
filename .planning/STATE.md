@@ -4,17 +4,17 @@ milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 21
 current_phase_name: deploy-render
-status: executing
-stopped_at: Completed 21-08-PLAN.md
-last_updated: "2026-10-13T15:15:42.272Z"
+status: verifying
+stopped_at: Completed 21-09-PLAN.md
+last_updated: "2026-10-13T15:38:29.205Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 15
-  completed_plans: 14
-  percent: 17
+  completed_plans: 15
+  percent: 33
 ---
 
 # Project State
@@ -30,10 +30,10 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 
 Phase: 21 (deploy-render) — EXECUTING
 Plan: 9 of 9
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-10-13 — Phase 21 execution started
 
-Progress: [█████████░] 93%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 21 P06 | 45min | 2 tasks | 7 files |
 | Phase 21 P07 | 75min | 2 tasks | 7 files |
 | Phase 21 P08 | 55min | 2 tasks | 8 files |
+| Phase 21 P09 | 75min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 ### Blockers
 
 - [Before Phase 23 planning] Decision B (staging location / svc-ignition-deploy write scope) is OPEN. Resolve in Phase 22 from capture C6 and record it; Phase 23 also needs the OQ5 measured hold budget.
+- Phase 21 SC3 / DRND-05: cross-OS byte identity unproven until a green three-leg CI run (ubuntu, macos, windows) of a commit carrying deploy_corpus.rs is recorded; not pushed (cross-OS: pending CI)
 
 ### Quick Tasks Completed
 
@@ -89,8 +91,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-13T15:15:42.261Z
-**Stopped At:** Completed 21-08-PLAN.md
+**Last session:** 2026-10-13T15:38:23.668Z
+**Stopped At:** Completed 21-09-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -122,3 +124,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 21-07: tag types (CD5) are exempt from TYPE_RULES and stage 6; TYPE_RULES has 50 rows (19 singleton, 29 named, 2 named-no-uuid)
 - [Phase 21]: 21-08: tag-origin files get the Embedded scan only; schema-path and key-name secret rules apply to resource config.json (no resource type for tags)
 - [Phase 21]: 21-08: empty string at an OpenAPI secret path is refused as plaintext; empty string under a key-name hit passes; DRND-07 residual (other key names in undescribed types) flagged
+- [Phase ?]: 21-09: render.json marker schema_version 1 {gateway, env, mode, render_sha256, files[{path,sha256,bytes}]} is read by Phase 22; --out clobber ladder never deletes and refuses before any write
