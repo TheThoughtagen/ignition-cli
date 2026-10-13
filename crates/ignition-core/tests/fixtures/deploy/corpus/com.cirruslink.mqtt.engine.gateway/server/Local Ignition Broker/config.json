@@ -1,0 +1,11 @@
+{
+  "cleanSession": true,
+  "enableLegacyStateMessages": false,
+  "enablePrimaryHostSubscriptions": false,
+  "hostnameVerification": true,
+  "includeSparkplugDataTypes": true,
+  "keepAlive": 30,
+  "legacyStateHostnameVerification": true,
+  "serverSet": "Default Set",
+  "url": "tcp://mqtt-broker:1883"
+}

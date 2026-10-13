@@ -2,3 +2,8 @@
 # 11-03: the loss-scan fixture IS a captured gateway artifact (11-01, sha 11ed1528…) —
 # same core.autocrlf=input CRLF-normalization trap as the planning artifacts above
 crates/ignition-core/tests/fixtures/*.xml -text
+# 21-01: deploy fixtures (sanitized gateway corpus, stand-in jars, OpenAPI extract) are
+# byte-identity oracles — git for Windows would CRLF-convert them at checkout and break
+# the round-trip gates on windows-latest
+crates/ignition-core/tests/fixtures/deploy/** -text
+*.jar binary

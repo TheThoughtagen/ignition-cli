@@ -1,0 +1,5 @@
+{
+  "auditProfile": null,
+  "enableTransmission": true,
+  "redundancyTransitionActiveDelay": 3000
+}

@@ -1,0 +1,22 @@
+{
+  "cleanSession": true,
+  "enableLegacyStateMessages": false,
+  "enablePrimaryHostSubscriptions": false,
+  "hostnameVerification": true,
+  "includeSparkplugDataTypes": true,
+  "keepAlive": 30,
+  "legacyStateHostnameVerification": true,
+  "password": {
+    "data": {
+      "ciphertext": "SANITIZEDAAAAA",
+      "encrypted_key": "SANITIZEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "iv": "SANITIZEDAAAAAAA",
+      "protected": "SANITIZEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "tag": "SANITIZEDAAAAAAAAAAAAA"
+    },
+    "type": "Embedded"
+  },
+  "serverSet": "Default Set",
+  "url": "tcp://localhost:1883",
+  "username": "admin"
+}

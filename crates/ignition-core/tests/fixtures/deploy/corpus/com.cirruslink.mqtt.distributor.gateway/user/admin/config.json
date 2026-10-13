@@ -1,0 +1,14 @@
+{
+  "ACLs": "RW #",
+  "password": {
+    "data": {
+      "ciphertext": "SANITIZEDAAAAA",
+      "encrypted_key": "SANITIZEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "iv": "SANITIZEDAAAAAAA",
+      "protected": "SANITIZEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "tag": "SANITIZEDAAAAAAAAAAAAA"
+    },
+    "type": "Embedded"
+  },
+  "username": "admin"
+}

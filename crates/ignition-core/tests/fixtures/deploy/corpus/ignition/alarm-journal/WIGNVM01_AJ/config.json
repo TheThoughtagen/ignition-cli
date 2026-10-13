@@ -1,0 +1,35 @@
+{
+  "profile": {
+    "queryOnly": false,
+    "type": "DATASOURCE"
+  },
+  "settings": {
+    "advanced": {
+      "dataTableName": "alarm_event_data",
+      "tableName": "alarm_events",
+      "useStoreAndForward": true
+    },
+    "dataFilters": {
+      "displayPath": null,
+      "displayPathOrSource": null,
+      "source": null
+    },
+    "datasource": "WHK01_PG_IGNITION",
+    "eventData": {
+      "dynamicAssociatedData": true,
+      "dynamicConfig": true,
+      "staticAssociatedData": true,
+      "staticConfig": false
+    },
+    "events": {
+      "minPriority": "Low",
+      "storeFromEnabledChange": false,
+      "storeShelvedEvents": false
+    },
+    "pruning": {
+      "age": 1,
+      "ageUnits": "YEAR",
+      "enabled": false
+    }
+  }
+}

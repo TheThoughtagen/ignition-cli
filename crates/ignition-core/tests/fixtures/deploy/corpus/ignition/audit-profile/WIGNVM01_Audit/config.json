@@ -1,0 +1,22 @@
+{
+  "profile": {
+    "retentionDays": 90,
+    "type": "database"
+  },
+  "settings": {
+    "actionColumn": "ACTION",
+    "actionTargetColumn": "ACTION_TARGET",
+    "actionValueColumn": "ACTION_VALUE",
+    "actorColumn": "ACTOR",
+    "actorHostColumn": "ACTOR_HOST",
+    "autoCreate": true,
+    "databaseName": "WHK01_PG_IGNITION",
+    "keyColumn": "AUDIT_EVENTS_ID",
+    "originatingContextColumn": "ORIGINATING_CONTEXT",
+    "originatingSystemColumn": "ORIGINATING_SYSTEM",
+    "pruneEnabled": true,
+    "statusCodeColumn": "STATUS_CODE",
+    "tableName": "AUDIT_EVENTS",
+    "timestampColumn": "EVENT_TIMESTAMP"
+  }
+}

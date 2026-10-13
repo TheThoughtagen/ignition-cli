@@ -1,0 +1,6 @@
+{
+  "autoReconnectRpcClient": false,
+  "primaryHostId": null,
+  "randomizeServerConnections": false,
+  "rpcClientEnabled": false
+}

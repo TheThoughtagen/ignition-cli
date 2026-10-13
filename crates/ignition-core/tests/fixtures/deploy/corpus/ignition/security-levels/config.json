@@ -1,0 +1,99 @@
+{
+  "securityLevels": [
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "name": "Default"
+                    }
+                  ],
+                  "description": "Represents the security zones that a user has.",
+                  "name": "SecurityZones"
+                }
+              ],
+              "name": "Administrator"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "name": "Default"
+                    }
+                  ],
+                  "description": "Represents the security zones that a user has.",
+                  "name": "SecurityZones"
+                }
+              ],
+              "name": "PID_Control"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "name": "Default"
+                    }
+                  ],
+                  "description": "Represents the security zones that a user has.",
+                  "name": "SecurityZones"
+                }
+              ],
+              "name": "controls.qsi"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "name": "Default"
+                    }
+                  ],
+                  "description": "Represents the security zones that a user has.",
+                  "name": "SecurityZones"
+                }
+              ],
+              "name": "operations.distillery.supervisor"
+            }
+          ],
+          "description": "Represents the roles that a user has.",
+          "name": "Roles"
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "name": "admin"
+            }
+          ],
+          "name": "it"
+        },
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [],
+                  "name": "supervisor"
+                }
+              ],
+              "name": "distillery"
+            }
+          ],
+          "name": "operations"
+        }
+      ],
+      "description": "Represents a user who has been authenticated by the system.",
+      "name": "Authenticated"
+    }
+  ]
+}

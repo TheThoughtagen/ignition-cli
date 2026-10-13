@@ -1,0 +1,34 @@
+{
+  "caCertFile": null,
+  "clientCertFile": null,
+  "clientId": null,
+  "clientPrivateKeyFile": null,
+  "dataFormatTypeWrapper": "Sparkplug_B_v1_0_Protobuf",
+  "hostnameVerification": true,
+  "keepAlive": 30,
+  "mqttServerConnectionEnabled": true,
+  "password": {
+    "data": {
+      "ciphertext": "SANITIZEDAAAAA",
+      "encrypted_key": "SANITIZEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "iv": "SANITIZEDAAAAAAA",
+      "protected": "SANITIZEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "tag": "SANITIZEDAAAAAAAAAAAAA"
+    },
+    "type": "Embedded"
+  },
+  "randomStartupDelay": null,
+  "reconnectDelay": 1000,
+  "rpcCaCertFile": null,
+  "rpcClientCertFile": null,
+  "rpcClientId": null,
+  "rpcClientPrivateKeyFile": null,
+  "rpcHostnameVerification": true,
+  "rpcTlsAlpnExtensions": null,
+  "rpcUsername": null,
+  "serverSet": "Default",
+  "subscribeToLegacyStateTopic": true,
+  "tlsAlpnExtensions": null,
+  "url": "tcp://localhost:1883",
+  "username": "admin"
+}

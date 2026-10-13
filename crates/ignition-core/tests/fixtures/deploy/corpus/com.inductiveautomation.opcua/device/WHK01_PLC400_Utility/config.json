@@ -1,0 +1,22 @@
+{
+  "profile": {
+    "type": "LogixDriver"
+  },
+  "settings": {
+    "advanced": {
+      "automaticRebrowseEnabled": true,
+      "cipConnectionSize": 500,
+      "cipConnectionTimeout": 16000,
+      "concurrentRequests": 2,
+      "identityRequestFrequency": 5000,
+      "slotNumber": 3
+    },
+    "connectivity": {
+      "connectionPath": null,
+      "hostname": "192.0.2.28",
+      "localAddress": null,
+      "port": 44818,
+      "timeout": 2000
+    }
+  }
+}
