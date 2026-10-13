@@ -194,6 +194,12 @@ mod tests {
         assert_eq!(f.line, Some(10));
         assert!(f.column.is_some());
         assert!(f.message.contains("unknown variant"), "{}", f.message);
+        assert!(!f.message.contains("macos"), "{}", f.message);
+        assert!(
+            f.message.contains("expected `windows` or `linux`"),
+            "{}",
+            f.message
+        );
     }
 
     #[test]

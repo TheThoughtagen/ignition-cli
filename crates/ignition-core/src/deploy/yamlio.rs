@@ -147,10 +147,44 @@ fn strip_position(msg: &str) -> &str {
     }
 }
 
-/// Remove the offending value from `invalid type: <kind> <value>` and
-/// `invalid value: <kind> <value>` messages (T-21-10): a wrong-typed
-/// credential must never reach an error, an envelope, or a log.
+/// Remove every user-supplied scalar value serde or yaml_serde would echo
+/// (T-21-10): a wrong-typed credential must never reach an error, an
+/// envelope, or a log. Audited sources of an echoed value:
+/// - `invalid type: <kind> <value>` and `invalid value: <kind> <value>`
+///   (string, integer, floating point, boolean, character);
+/// - `unknown variant `<value>`, expected ...` (any enum field);
+/// - `deserializing nested enum in ...::<tag>`, which echoes a YAML tag.
+///
+/// Not echoed, so left alone: `unknown field `<key>`` (a key, kept so the
+/// message is actionable), `missing field`, `duplicate field`,
+/// `invalid length N`, and every libyaml scanner/parser message (static
+/// text plus a position).
 fn scrub_values(msg: &str) -> String {
+    scrub_invalid(&scrub_variant(msg))
+}
+
+/// `unknown variant `<value>`, expected ...` becomes
+/// `unknown variant, expected ...`. The value is raw (not escaped), so it
+/// may itself contain a backtick or `, expected `; the real list is the
+/// LAST `, expected ` because variant names are static.
+fn scrub_variant(msg: &str) -> String {
+    const LEAD: &str = "unknown variant ";
+    if msg.contains("deserializing nested enum in ") {
+        return "deserializing nested enum from YAML is not supported".to_string();
+    }
+    let Some(at) = msg.find(LEAD) else {
+        return msg.to_string();
+    };
+    let head = &msg[..at + LEAD.len() - 1]; // keep "unknown variant", drop the space
+    match msg.rfind(", expected ") {
+        Some(end) if end >= at + LEAD.len() => format!("{head}{}", &msg[end..]),
+        _ => head.to_string(),
+    }
+}
+
+/// Remove the value from `invalid type: <kind> <value>` and
+/// `invalid value: <kind> <value>` messages.
+fn scrub_invalid(msg: &str) -> String {
     const LEADS: [&str; 2] = ["invalid type: ", "invalid value: "];
     const KINDS: [&str; 5] = [
         "string ",
@@ -274,6 +308,47 @@ mod tests {
         // Numeric and out-of-range values are scrubbed as well.
         let shown = err("m.yaml", "schema_version: 1\nport: 99999\n");
         assert!(!shown.contains("99999"), "{shown}");
+    }
+
+    #[test]
+    fn enum_canary_is_scrubbed_but_variants_are_kept() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "lowercase")]
+        enum Kind {
+            Windows,
+            Linux,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WithEnum {
+            #[allow(dead_code)]
+            schema_version: SchemaVersion,
+            #[allow(dead_code)]
+            kind: Kind,
+        }
+        let run = |yaml: &str| {
+            let e = strict_parse::<WithEnum>("t.yaml", yaml.as_bytes()).expect_err("bad variant");
+            (e.to_string(), finding(e))
+        };
+
+        let (shown, f) = run("schema_version: 1\nkind: s3cr3t-canary\n");
+        assert!(!shown.contains("s3cr3t-canary"), "{shown}");
+        assert_eq!(f.line, Some(2));
+        assert!(shown.contains("unknown variant"), "{shown}");
+        assert!(shown.contains("expected `windows` or `linux`"), "{shown}");
+
+        // A value that imitates the message structure cannot leak a tail.
+        let (shown, _) = run("schema_version: 1\nkind: 'evil`, expected `windows`-canary3 `x'\n");
+        assert!(!shown.contains("canary3"), "{shown}");
+        assert!(shown.contains("expected `windows` or `linux`"), "{shown}");
+
+        // A tagged value's tag name is not echoed either.
+        let (shown, _) = run("schema_version: 1\nkind: !tagcanary4 {a: 1}\n");
+        assert!(!shown.contains("tagcanary4"), "{shown}");
+
+        // Booleans and numbers in an enum slot are scrubbed too.
+        let (shown, _) = run("schema_version: 1\nkind: 8675309\n");
+        assert!(!shown.contains("8675309"), "{shown}");
     }
 
     #[test]
