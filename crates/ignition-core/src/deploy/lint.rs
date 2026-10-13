@@ -14,9 +14,14 @@
 //! that can hold a JSON string, so a secret cannot reach an error, a warning,
 //! the `--json` envelope or a log through this module (T-21-33).
 
-use super::layout::ResourceKey;
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::layout::{RelPath, ResourceKey};
 use super::node::Node;
 use super::rules::{openapi_describes, secret_paths};
+use super::target::{Target, TargetOs};
+use super::tree::RenderedTree;
+use crate::error::DeployFinding;
 
 /// What a secret scan of one parsed file found. Locations only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -198,6 +203,274 @@ pub fn scan_secrets(origin: &str, key: &ResourceKey, file_name: &str, node: &Nod
     walker.scan
 }
 
+// ---- Windows safety, path budget and line endings (21-08 task 2) ----------
+
+/// A full Windows path must be shorter than this many UTF-16 code units
+/// (DRND-08): 260 (`MAX_PATH`) less 12, the room Windows keeps for an 8.3
+/// file name when it creates a directory. A total of 247 passes, 248 is
+/// refused.
+pub const WINDOWS_MAX_PATH: usize = 248;
+
+/// The longest a single Windows path component may be, in UTF-16 code units.
+pub const WINDOWS_MAX_COMPONENT: usize = 255;
+
+/// The default Ignition data directory on Windows (51 characters). A Windows
+/// node's `ssh.data_dir` replaces it in the budget when longer.
+pub const DEFAULT_WINDOWS_DATA_DIR: &str = r"C:\Program Files\Inductive Automation\Ignition\data";
+
+/// What sits between the data directory and the mode directory on a gateway
+/// host: `\config\resources\` (18 characters).
+pub const COLLECTION_SEGMENT: &str = r"\config\resources\";
+
+/// Device names Windows reserves, whatever the extension (compared against the
+/// ASCII-uppercased stem before the first `.`).
+pub const RESERVED_STEMS: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Extensions (ASCII case-insensitive) that are always text members for the CR
+/// lint, whatever their bytes (D-01).
+pub const TEXT_EXTENSIONS: [&str; 13] = [
+    "json",
+    "css",
+    "yaml",
+    "yml",
+    "txt",
+    "md",
+    "xml",
+    "py",
+    "csv",
+    "properties",
+    "html",
+    "js",
+    "svg",
+];
+
+/// UTF-16 length: the unit Windows limits are counted in.
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// The length of the Windows path before the relative path: the longest of
+/// [`DEFAULT_WINDOWS_DATA_DIR`] and every Windows node's `ssh.data_dir`
+/// (trailing separators trimmed), plus [`COLLECTION_SEGMENT`], plus
+/// `target.mode`, in UTF-16 code units. The default always counts, even for a
+/// Linux-only target, because `resources/` is shared between environments.
+pub fn windows_prefix_len(target: &Target) -> usize {
+    let nodes = std::iter::once(&target.nodes.master).chain(target.nodes.backup.as_ref());
+    let data_dir = nodes
+        .filter_map(|n| n.ssh.as_ref())
+        .filter(|ssh| ssh.os == TargetOs::Windows)
+        .map(|ssh| utf16_len(ssh.data_dir.trim_end_matches(['\\', '/'])))
+        .fold(utf16_len(DEFAULT_WINDOWS_DATA_DIR), usize::max);
+    data_dir + utf16_len(COLLECTION_SEGMENT) + utf16_len(&target.mode)
+}
+
+/// Whether the CR lint treats a member as text: its extension is one of
+/// [`TEXT_EXTENSIONS`], or its bytes are valid UTF-8 without a NUL byte. A
+/// jar, whose bytes are not text, is therefore exempt (D-01).
+pub fn is_text_member(path: &str, bytes: &[u8]) -> bool {
+    let ext = path.rsplit_once('.').map(|(_, e)| e);
+    if let Some(ext) = ext
+        && !ext.contains('/')
+        && TEXT_EXTENSIONS.iter().any(|t| t.eq_ignore_ascii_case(ext))
+    {
+        return true;
+    }
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// Why `name` is not a name Windows accepts for one path component. The rules
+/// are an approximation of NTFS made fail-closed on purpose (D-04): real NTFS
+/// behaviour is captured in Phase 22 (assumption A4), and the Linux encoding
+/// of hostile names is decision CD6.
+fn windows_problems(name: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let Some(c) = name
+        .chars()
+        .find(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control())
+    {
+        let shown = if c.is_control() {
+            format!("the control character U+{:04X}", c as u32)
+        } else {
+            format!("`{c}`")
+        };
+        problems.push(format!(
+            "contains {shown}, which Windows does not allow in a name"
+        ));
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        problems.push("ends in a `.` or a space, which Windows strips".to_string());
+    }
+    let units = utf16_len(name);
+    if units > WINDOWS_MAX_COMPONENT {
+        problems.push(format!(
+            "is {units} UTF-16 code units long; a Windows name component may be at most {WINDOWS_MAX_COMPONENT}"
+        ));
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if RESERVED_STEMS.contains(&stem.as_str()) {
+        problems.push(format!(
+            "is the reserved Windows device name `{stem}` (reserved with any extension)"
+        ));
+    }
+    problems
+}
+
+/// The 1-based (line, column) of the first CR byte in `bytes`, if any. The
+/// column counts bytes from the start of its line.
+fn first_cr(bytes: &[u8]) -> Option<(usize, usize)> {
+    let at = bytes.iter().position(|&b| b == b'\r')?;
+    let before = &bytes[..at];
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let line_start = before
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    Some((line, at - line_start + 1))
+}
+
+/// Lint a rendered tree (see [`lint_files`]).
+pub fn lint_tree(
+    tree: &RenderedTree,
+    target: &Target,
+    env: &str,
+    label: &dyn Fn(&RelPath) -> String,
+) -> Vec<DeployFinding> {
+    lint_files(&tree.files, target, env, label)
+}
+
+/// The fail-closed tree lints, all collected in one pass (DRND-08, D-01,
+/// D-04). They apply to every environment, because `resources/` is shared.
+///
+/// - per path component (once per distinct component path): characters
+///   Windows rejects, a trailing `.` or space, more than
+///   [`WINDOWS_MAX_COMPONENT`] UTF-16 units, a reserved device stem;
+/// - per parent directory: sibling names (files and directories) that differ
+///   only by case under `str::to_lowercase`, naming every colliding sibling;
+/// - per file: [`windows_prefix_len`] + 1 + the UTF-16 length of the
+///   collection path must be below [`WINDOWS_MAX_PATH`];
+/// - per text member ([`is_text_member`]): the first CR byte, with its line
+///   and column (D-01; binary members such as jars are exempt);
+/// - `target.mode`, held to the component rules (finding on
+///   `targets/<env>.yaml`).
+///
+/// `label` names the source file a finding should carry for a collection path.
+/// The Windows rules approximate NTFS and are fail-closed; the real NTFS
+/// capture is Phase 22 (A4, D-04). CD6 records how an 8.3.6 gateway on Linux
+/// encodes hostile names.
+pub fn lint_files(
+    files: &BTreeMap<RelPath, Vec<u8>>,
+    target: &Target,
+    env: &str,
+    label: &dyn Fn(&RelPath) -> String,
+) -> Vec<DeployFinding> {
+    let mut findings = Vec::new();
+    let finding = |file: String, line: Option<(usize, usize)>, message: String| DeployFinding {
+        file,
+        line: line.map(|l| l.0),
+        column: line.map(|l| l.1),
+        message,
+    };
+
+    for problem in windows_problems(&target.mode) {
+        findings.push(finding(
+            format!("targets/{env}.yaml"),
+            None,
+            format!("mode `{}` {problem}", target.mode),
+        ));
+    }
+
+    let prefix = windows_prefix_len(target);
+    // distinct component paths already checked, and the sibling groups
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    // parent -> lowercased name -> name -> label of the first file under it
+    let mut siblings: BTreeMap<&str, BTreeMap<String, BTreeMap<&str, String>>> = BTreeMap::new();
+
+    for (path, bytes) in files {
+        let full = path.as_str();
+        let source = label(path);
+
+        let mut end = 0;
+        for name in path.components() {
+            let start = end;
+            end += name.len();
+            let upto = &full[..end];
+            if end < full.len() {
+                end += 1; // the `/` after this component
+            }
+            if !seen.insert(upto) {
+                continue;
+            }
+            let parent = if start == 0 { "" } else { &full[..start - 1] };
+            siblings
+                .entry(parent)
+                .or_default()
+                .entry(name.to_lowercase())
+                .or_default()
+                .entry(name)
+                .or_insert_with(|| source.clone());
+            for problem in windows_problems(name) {
+                findings.push(finding(
+                    source.clone(),
+                    None,
+                    format!("path component `{name}` {problem}"),
+                ));
+            }
+        }
+
+        let total = prefix + 1 + utf16_len(full);
+        if total >= WINDOWS_MAX_PATH {
+            findings.push(finding(
+                source.clone(),
+                None,
+                format!(
+                    "the path would be {total} UTF-16 code units long on Windows (data directory, `{}`, the mode and `{full}`); it must be shorter than {WINDOWS_MAX_PATH}",
+                    COLLECTION_SEGMENT.trim_matches('\\')
+                ),
+            ));
+        }
+
+        if is_text_member(full, bytes)
+            && let Some((line, column)) = first_cr(bytes)
+        {
+            findings.push(finding(
+                source,
+                Some((line, column)),
+                format!(
+                    "carriage return (0x0D) at line {line} of a text file; render refuses CR so no tool can convert line endings (use LF)"
+                ),
+            ));
+        }
+    }
+
+    for (parent, groups) in &siblings {
+        for names in groups.values().filter(|names| names.len() > 1) {
+            let shown: Vec<String> = names
+                .keys()
+                .map(|n| {
+                    if parent.is_empty() {
+                        format!("`{n}`")
+                    } else {
+                        format!("`{parent}/{n}`")
+                    }
+                })
+                .collect();
+            let first = names.values().next().cloned().unwrap_or_default();
+            findings.push(finding(
+                first,
+                None,
+                format!(
+                    "sibling names collide when case is folded ({}); a case-insensitive filesystem keeps only one",
+                    shown.join(", ")
+                ),
+            ));
+        }
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +575,307 @@ mod tests {
             r#"{"password":{"type":"Referenced","data":{"providerName":"p","secretName":"s"}}}"#,
         );
         assert_eq!(s, SecretScan::default());
+    }
+
+    // ---- Windows safety, budget and CR ----------------------------------
+
+    use proptest::prelude::*;
+
+    fn target(mode: &str, extra_nodes: &str) -> Target {
+        let yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: {mode}\nnodes:\n  master:\n    profile: p\n{extra_nodes}"
+        );
+        Target::parse("t.yaml", yaml.as_bytes()).unwrap()
+    }
+
+    fn files(entries: &[(&str, &[u8])]) -> BTreeMap<RelPath, Vec<u8>> {
+        entries
+            .iter()
+            .map(|(p, b)| (RelPath::new(p).unwrap(), b.to_vec()))
+            .collect()
+    }
+
+    fn lint(entries: &[(&str, &[u8])], t: &Target) -> Vec<DeployFinding> {
+        lint_files(&files(entries), t, "dev", &|p| format!("src/{p}"))
+    }
+
+    fn texts(findings: &[DeployFinding]) -> String {
+        findings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn case_fold_collision_names_both() {
+        let t = target("dev", "");
+        let found = lint(
+            &[
+                ("ignition/schedule/Pump/config.json", b"{}"),
+                ("ignition/schedule/pump/config.json", b"{}"),
+                ("ignition/schedule/Other/config.json", b"{}"),
+            ],
+            &t,
+        );
+        assert_eq!(found.len(), 1, "{}", texts(&found));
+        let text = texts(&found);
+        assert!(text.contains("`ignition/schedule/Pump`"), "{text}");
+        assert!(text.contains("`ignition/schedule/pump`"), "{text}");
+        assert!(!text.contains("Other"), "{text}");
+
+        // files collide as well as directories, and three-way groups name all
+        let found = lint(&[("a/b/X", b""), ("a/b/x", b""), ("a/b/X.", b"")], &t);
+        let text = texts(&found);
+        assert!(
+            text.contains("`a/b/X`") && text.contains("`a/b/x`"),
+            "{text}"
+        );
+        // whole names fold, not a prefix
+        assert!(lint(&[("a/b/x", b""), ("a/b/xy", b"")], &t).is_empty());
+        // non-ASCII folds with to_lowercase
+        assert_eq!(lint(&[("a/b/É", b""), ("a/b/é", b"")], &t).len(), 1);
+    }
+
+    #[test]
+    fn illegal_characters_are_refused() {
+        let t = target("dev", "");
+        for bad in [
+            "a<b", "a>b", "a:b", "a\"b", "a|b", "a?b", "a*b", "a\u{1}b", "a\u{1f}b", "a\u{7f}b",
+        ] {
+            let found = lint(&[(&format!("m/t/{bad}/config.json"), b"{}")], &t);
+            assert_eq!(found.len(), 1, "{bad:?}: {}", texts(&found));
+            assert!(
+                found[0].message.contains("does not allow in a name"),
+                "{bad:?}: {}",
+                texts(&found)
+            );
+        }
+        // each distinct component is reported once, however many files sit below
+        let found = lint(&[("m/t/a:b/x.json", b"{}"), ("m/t/a:b/y.json", b"{}")], &t);
+        assert_eq!(found.len(), 1, "{}", texts(&found));
+        // legal punctuation passes
+        assert!(lint(&[("m/t/a b-c_d.e%3ab/x.json", b"{}")], &t).is_empty());
+    }
+
+    #[test]
+    fn trailing_dot_and_space_are_refused() {
+        let t = target("dev", "");
+        for bad in ["trail.", "trail ", "a b ", "dots.."] {
+            let found = lint(&[(&format!("m/t/{bad}/x.json"), b"{}")], &t);
+            assert_eq!(found.len(), 1, "{bad:?}: {}", texts(&found));
+            assert!(found[0].message.contains("ends in"), "{}", texts(&found));
+        }
+        assert!(lint(&[("m/t/inner .dot/x.json", b"{}")], &t).is_empty());
+    }
+
+    #[test]
+    fn reserved_names_are_refused() {
+        let t = target("dev", "");
+        for stem in RESERVED_STEMS {
+            for name in [stem.to_string(), stem.to_lowercase(), format!("{stem}.txt")] {
+                let found = lint(&[(&format!("m/t/{name}/x.json"), b"{}")], &t);
+                assert_eq!(found.len(), 1, "{name}: {}", texts(&found));
+                assert!(found[0].message.contains("reserved"), "{}", texts(&found));
+            }
+        }
+        // the stem is what precedes the first dot, compared whole
+        for ok in [
+            "CON1", "COM0", "COM10", "xcon", "CONSOLE", "LPT", "a.CON", "COMM",
+        ] {
+            assert!(
+                lint(&[(&format!("m/t/{ok}/x.json"), b"{}")], &t).is_empty(),
+                "{ok}"
+            );
+        }
+        // a file name is a component too
+        assert_eq!(lint(&[("m/t/n/nul.json", b"{}")], &t).len(), 1);
+    }
+
+    #[test]
+    fn component_length_boundary() {
+        let t = target("d", "");
+        // only the component rule is under test here, not the path budget
+        let component = |path: &str| texts(&lint(&[(path, b"")], &t)).contains("name component");
+        let long = |n: usize| format!("m/t/{}/x", "a".repeat(n));
+        assert!(!component(&long(255)));
+        assert!(component(&long(256)));
+        assert!(texts(&lint(&[(&long(256), b"")], &t)).contains("256 UTF-16 code units"));
+        // a non-BMP character is two UTF-16 units
+        assert!(!component(&format!("m/t/{}a/x", "\u{1F600}".repeat(127))));
+        assert!(component(&format!("m/t/{}/x", "\u{1F600}".repeat(128))));
+        // 255 UTF-16 units but 510 bytes: bytes do not decide
+        assert!(!component(&format!("m/t/{}/x", "\u{e9}".repeat(255))));
+    }
+
+    /// A relative path of exactly `total` UTF-16 units made of short parts.
+    fn path_of(total: usize) -> String {
+        let mut path = String::from("m/t/n/");
+        path.push_str(&"a".repeat(total - path.len()));
+        path
+    }
+
+    #[test]
+    fn path_budget_boundary() {
+        // 51 (default data dir) + 18 (collection segment) + 10 (mode) = 79,
+        // plus 1 separator before the relative path
+        let t = target("production", "");
+        assert_eq!(windows_prefix_len(&t), 79);
+        let ok = path_of(167);
+        assert!(lint(&[(&ok, b"")], &t).is_empty(), "247 passes");
+        let bad = path_of(168);
+        let found = lint(&[(&bad, b"")], &t);
+        assert_eq!(found.len(), 1, "{}", texts(&found));
+        assert!(
+            found[0].message.contains("248 UTF-16 code units"),
+            "{}",
+            texts(&found)
+        );
+
+        // a longer Windows data_dir (63 characters, 12 more) lowers the
+        // allowed relative length by 12
+        let dir = format!("D:\\{}", "d".repeat(60));
+        let windows = format!(
+            "    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: '{dir}'\n"
+        );
+        let t2 = target("production", &windows);
+        assert_eq!(windows_prefix_len(&t2), 79 + 12);
+        assert!(lint(&[(&path_of(167 - 12), b"")], &t2).is_empty());
+        assert_eq!(lint(&[(&path_of(168 - 12), b"")], &t2).len(), 1);
+
+        // a trailing separator is trimmed and the backup node counts
+        let backup = "  backup:\n    profile: b\n    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: 'C:\\Program Files\\Inductive Automation\\Ignition\\data\\ab\\'\n";
+        assert_eq!(windows_prefix_len(&target("production", backup)), 79 + 3);
+
+        // a Linux node never lowers the budget
+        let linux = format!(
+            "    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /{}\n",
+            "l".repeat(100)
+        );
+        assert_eq!(windows_prefix_len(&target("production", &linux)), 79);
+    }
+
+    #[test]
+    fn mode_is_held_to_the_component_rules() {
+        let t = target("prod.", "");
+        let found = lint(&[], &t);
+        assert_eq!(found.len(), 1, "{}", texts(&found));
+        assert_eq!(found[0].file, "targets/dev.yaml");
+        assert!(found[0].message.contains("mode `prod.`"));
+        assert_eq!(lint(&[], &target("CON", "")).len(), 1);
+    }
+
+    #[test]
+    fn cr_in_text_member_is_refused_with_line() {
+        let t = target("dev", "");
+        let found = lint(
+            &[("m/t/n/config.json", b"{\n  \"a\": 1,\r\n  \"b\": 2\n}")],
+            &t,
+        );
+        assert_eq!(found.len(), 1, "{}", texts(&found));
+        assert_eq!((found[0].line, found[0].column), (Some(2), Some(10)));
+        assert_eq!(found[0].file, "src/m/t/n/config.json");
+        assert!(
+            found[0]
+                .to_string()
+                .starts_with("src/m/t/n/config.json:2:10: "),
+            "{}",
+            found[0]
+        );
+        // the first CR wins; a lone CR counts as well
+        let found = lint(&[("m/t/n/a.txt", b"x\ry\r\n")], &t);
+        assert_eq!(found[0].line, Some(1));
+    }
+
+    #[test]
+    fn cr_in_jar_is_not_refused() {
+        let t = target("dev", "");
+        // NUL bytes: not text
+        assert!(lint(&[("m/t/n/driver.jar", b"PK\r\n\x00\x01")], &t).is_empty());
+        // invalid UTF-8: not text
+        assert!(lint(&[("m/t/n/driver.bin", b"\xff\xfe\r\n")], &t).is_empty());
+    }
+
+    #[test]
+    fn cr_in_unknown_text_extension_is_refused() {
+        let t = target("dev", "");
+        for ext in [
+            "json",
+            "css",
+            "yaml",
+            "yml",
+            "txt",
+            "md",
+            "xml",
+            "py",
+            "csv",
+            "properties",
+            "html",
+            "js",
+            "svg",
+            "JSON",
+            "Xml",
+            "weird",
+            "noext",
+        ] {
+            let name = if ext == "noext" {
+                "m/t/n/LICENSE".to_string()
+            } else {
+                format!("m/t/n/f.{ext}")
+            };
+            let found = lint(&[(&name, b"a\r\nb")], &t);
+            assert_eq!(found.len(), 1, "{name}: {}", texts(&found));
+        }
+        // a known text extension is text whatever its bytes
+        assert!(is_text_member("a.json", b"\x00\xff"));
+        assert!(!is_text_member("a.jar", b"\x00PK"));
+        assert!(is_text_member("a.jar", b"plain"));
+        // a dot in a directory name is not an extension
+        assert!(!is_text_member("dir.json/blob", b"\x00"));
+    }
+
+    #[test]
+    fn empty_inputs_pass() {
+        let t = target("dev", "");
+        assert!(lint(&[], &t).is_empty());
+        assert!(lint(&[("m/t/n/empty.txt", b""), ("m/t/n/empty.bin", b"")], &t).is_empty());
+    }
+
+    fn reserved(name: &str) -> bool {
+        RESERVED_STEMS.contains(
+            &name
+                .split('.')
+                .next()
+                .unwrap()
+                .to_ascii_uppercase()
+                .as_str(),
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn prop_illegal_char_names_refused(
+            base in "[A-Za-z0-9_-]{1,20}",
+            at in 0usize..=20,
+            bad in prop::sample::select(vec!['<', '>', ':', '"', '|', '?', '*', '\u{1}', '\u{8}', '\u{1f}']),
+        ) {
+            let mut name = base.clone();
+            name.insert(at.min(base.len()), bad);
+            let found = lint(
+                &[(&format!("m/t/{name}/x.json"), b"{}")],
+                &target("dev", ""),
+            );
+            prop_assert!(!found.is_empty(), "{name:?} passed");
+        }
+
+        #[test]
+        fn prop_legal_names_pass(name in "[A-Za-z0-9_-]([A-Za-z0-9_ .-]{0,30}[A-Za-z0-9_-])?") {
+            prop_assume!(!reserved(&name));
+            let found = lint(
+                &[(&format!("m/t/{name}/x.json"), b"{}")],
+                &target("dev", ""),
+            );
+            prop_assert!(found.is_empty(), "{name:?}: {}", texts(&found));
+        }
     }
 }

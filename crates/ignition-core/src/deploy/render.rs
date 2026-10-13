@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use super::layout::{RelPath, ResourceKey, TAG_TYPES, collection_path, resource_key, tag_provider};
-use super::lint::{scan_embedded, scan_secrets};
+use super::lint::{lint_files, scan_embedded, scan_secrets};
 use super::manifest::Manifest;
 use super::node::{self, JsonClass, Node};
 use super::rules::{GATEWAY_OWNED_FILES, TypeRule, UuidRule, is_denied, type_rule};
@@ -101,6 +101,17 @@ pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     let minted = assign_uuids(input.gateway, &mut mapped, &mut json, &mut findings);
     let mut warnings = Vec::new();
     let secret_paths = scan_all_secrets(&mapped, &json, &mut warnings);
+    findings.extend(lint_files(
+        &mapped.files,
+        input.target,
+        input.env,
+        &|path| {
+            mapped
+                .origins
+                .get(path)
+                .map_or_else(|| path.to_string(), |o| o.file.clone())
+        },
+    ));
     // one raise: secret locations win, every other finding rides along
     if !secret_paths.is_empty() {
         return Err(CoreError::embedded_secret(secret_paths, findings));

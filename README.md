@@ -2236,6 +2236,9 @@ Refused:
 - an Embedded secret, a plaintext value at a secret-typed schema path, or a
   plaintext `password`/`secret` string in an undescribed module type (see
   Secrets); this is `embedded_secret`, exit 2.
+- a Windows-illegal name, two siblings that differ only by case, a path over
+  the Windows budget, or a carriage return in a text member (see Windows
+  safety and line endings).
 
 #### Resource identity (attributes.uuid)
 
@@ -2354,6 +2357,52 @@ allows it, or keep that resource out of the declared tree. The corpus has no
 such string value. When a secret and tree defects are found together, one
 `embedded_secret` error lists the secret paths and then the other findings.
 Tag files are scanned for Embedded objects only: they have no resource schema.
+
+#### Windows safety and line endings
+
+`resources/` is shared by every environment, so a tree committed for a Linux
+dev rig can later be deployed to a Windows production host. Render therefore
+applies the Windows rules to **every** environment and refuses what NTFS would
+reject at deploy time (D-04: fail-closed now; the real NTFS behaviour is
+captured in Phase 22, so these rules are an approximation made deliberately
+strict). The error names the offending component or file. Refused:
+
+- a path component (a directory or a file name) containing `<` `>` `:` `"`
+  `|` `?` `*` or a control character, ending in `.` or a space, longer than 255
+  UTF-16 code units, or whose stem (the part before the first `.`) is `CON`,
+  `PRN`, `AUX`, `NUL`, `COM1`-`COM9` or `LPT1`-`LPT9` in any case. The
+  `mode` in `targets/<env>.yaml` is held to the same rules.
+  An 8.3.6 gateway on Linux writes such a name encoded (`a:b` as `a%3ab`,
+  decision CD6); a name already encoded that way is legal and passes;
+- two siblings (files or directories) whose names are equal once lower-cased,
+  such as `Pump` and `pump`; every colliding sibling is named. Whole names are
+  compared with `str::to_lowercase`;
+- a file whose Windows path is too long. A full path must be shorter than 248
+  UTF-16 code units, counted as:
+
+  ```text
+  data directory + \config\resources\ + mode + \ + path under resources/
+  ```
+
+  The data directory is the longest of the default
+  `C:\Program Files\Inductive Automation\Ignition\data` (51 characters) and
+  the `ssh.data_dir` of every Windows node in the target (a trailing separator
+  is ignored; a Linux node never counts). `\config\resources\` is 18
+  characters. With the default directory and the mode `production`, a path
+  under `resources/` of 167 units passes (total 247) and 168 is refused (248);
+- a carriage return (0x0D) in a **text member**, naming the file, line and
+  column. A text member has the extension `.json .css .yaml .yml .txt .md .xml
+  .py .csv .properties .html .js .svg`, or is any file whose bytes are valid
+  UTF-8 with no NUL byte. Git and editors silently convert line endings, which
+  would change the bytes the gateway receives, so render refuses CR instead of
+  guessing. **Binary members are exempt** (D-01): a JDBC driver jar containing
+  0x0D bytes renders byte for byte.
+
+Lengths count UTF-16 code units (a character outside the Basic Multilingual
+Plane counts as 2), not bytes or characters. Reserved names compare the
+ASCII-uppercased stem. A zero-byte non-JSON member renders as a zero-byte
+file; an empty directory contributes no file and no resource entry. These
+checks also apply to tag files, which use their mapped collection paths.
 
 ## Linting (`ign lint`)
 

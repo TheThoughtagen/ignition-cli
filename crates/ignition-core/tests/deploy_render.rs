@@ -1724,3 +1724,195 @@ fn secret_findings_win_and_carry_other_findings() {
     assert!(text.contains("also"), "{text}");
     assert!(text.contains("resources/other/unlisted/"), "{text}");
 }
+
+// ---- 21-08 task 2: Windows names, case folds, path budget, CR ------------
+
+/// Render byte members against an explicit target document.
+fn try_render_bytes(
+    target_yaml: &[u8],
+    types: &[&str],
+    files: &[(&str, &[u8])],
+) -> Result<RenderOutcome, CoreError> {
+    let mut yaml = String::from("schema_version: 1\ntypes:\n");
+    for t in types {
+        yaml.push_str(&format!("  - {t}\n"));
+    }
+    let manifest = Manifest::parse("manifest.yaml", yaml.as_bytes()).expect("manifest");
+    let target = Target::parse("targets/dev.yaml", target_yaml).expect("target");
+    let source = SourceTree::from_files(files.iter().copied()).expect("tree");
+    render(&RenderInput {
+        gateway: "g",
+        env: "dev",
+        manifest: &manifest,
+        target: &target,
+        source: &source,
+    })
+}
+
+#[test]
+fn cr_in_jar_is_not_refused() {
+    // the corpus stand-in jar contains 0x0D bytes and a NUL, like a real
+    // binary; the driver's JSON files carry no CR
+    let jar = include_bytes!(
+        "fixtures/deploy/corpus/ignition/database-driver/MariaDB/mariadb-java-client-3.3.3.jar"
+    );
+    let config =
+        include_bytes!("fixtures/deploy/corpus/ignition/database-driver/MariaDB/config.json");
+    let resource =
+        include_bytes!("fixtures/deploy/corpus/ignition/database-driver/MariaDB/resource.json");
+    assert!(jar.contains(&b'\r'), "the stand-in jar must contain CR");
+    let out = try_render_bytes(
+        TARGET,
+        &["ignition/database-driver"],
+        &[
+            (
+                "resources/ignition/database-driver/MariaDB/mariadb-java-client-3.3.3.jar",
+                jar,
+            ),
+            (
+                "resources/ignition/database-driver/MariaDB/config.json",
+                config,
+            ),
+            (
+                "resources/ignition/database-driver/MariaDB/resource.json",
+                resource,
+            ),
+        ],
+    )
+    .expect("a jar with CR bytes renders");
+    assert_eq!(
+        bytes_at(
+            &out,
+            "ignition/database-driver/MariaDB/mariadb-java-client-3.3.3.jar"
+        ),
+        jar.as_slice()
+    );
+}
+
+#[test]
+fn cr_in_text_member_is_refused_through_render() {
+    let result = try_render_bytes(
+        TARGET,
+        &["ignition/schedule"],
+        &[
+            ("resources/ignition/schedule/S/config.json", b"{}"),
+            ("resources/ignition/schedule/S/notes.txt", b"one\r\ntwo\n"),
+        ],
+    );
+    let err = result.expect_err("CR in a text member is refused");
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    let text = err.to_string();
+    assert!(
+        text.contains("gateways/g/resources/ignition/schedule/S/notes.txt:1:4: carriage return"),
+        "{text}"
+    );
+}
+
+#[test]
+fn empty_member_and_empty_tree_edges() {
+    // a zero-byte non-JSON member renders as a zero-byte file and passes the CR lint
+    let out = try_render_bytes(
+        TARGET,
+        &["ignition/schedule"],
+        &[
+            ("resources/ignition/schedule/S/config.json", b"{}"),
+            ("resources/ignition/schedule/S/empty.txt", b""),
+        ],
+    )
+    .expect("renders");
+    assert_eq!(bytes_at(&out, "ignition/schedule/S/empty.txt"), b"");
+    // an empty source contributes no file and no resource entry
+    let out = try_render_bytes(TARGET, &["ignition/schedule"], &[]).expect("renders");
+    assert!(out.tree.files.is_empty() && out.resources.is_empty());
+}
+
+#[test]
+fn lints_apply_to_tag_files_and_every_environment() {
+    // the name rules cover tag-origin paths too (mapped to ignition/<type>/<P>/...)
+    let result = try_render(
+        "dev",
+        &["ignition/schedule"],
+        &["default"],
+        &[("tags/default/tag-definition/Fo:lder/tags.json", "{}")],
+    );
+    let text = refused(result);
+    assert!(text.contains("path component `Fo:lder`"), "{text}");
+}
+
+#[test]
+fn all_lint_findings_reported_together() {
+    let long_name = "x".repeat(200);
+    let long_path = format!("resources/ignition/schedule/{long_name}/config.json");
+    let files: Vec<(&str, &[u8])> = vec![
+        ("resources/ignition/schedule/a:b/config.json", b"{}"),
+        ("resources/ignition/schedule/Pump/config.json", b"{}"),
+        ("resources/ignition/schedule/pump/config.json", b"{}"),
+        ("resources/ignition/schedule/NUL/config.json", b"{}"),
+        ("resources/ignition/schedule/trail./config.json", b"{}"),
+        ("resources/ignition/schedule/S/notes.txt", b"a\r\nb"),
+        (long_path.as_str(), b"{}"),
+    ];
+    let err = try_render_bytes(TARGET, &["ignition/schedule"], &files).expect_err("refused");
+    assert_eq!(err.code(), "deploy_tree_invalid");
+    let text = err.to_string();
+    for want in [
+        "path component `a:b`",
+        "sibling names collide when case is folded",
+        "`ignition/schedule/Pump`",
+        "`ignition/schedule/pump`",
+        "path component `NUL`",
+        "path component `trail.`",
+        "notes.txt:1:2: carriage return",
+        "UTF-16 code units long on Windows",
+    ] {
+        assert!(text.contains(want), "{want} missing from: {text}");
+    }
+
+    // with a secret too, one embedded_secret lists the secret path and the rest
+    let mut with_secret = files.clone();
+    let secret = br#"{"password":{"type":"Embedded","data":{"c":"CANARY-EMBEDDED-21"}}}"#;
+    with_secret.push(("resources/ignition/schedule/Sec/config.json", secret));
+    let err = try_render_bytes(TARGET, &["ignition/schedule"], &with_secret).expect_err("refused");
+    assert_eq!(err.code(), "embedded_secret");
+    let text = err.to_string();
+    assert!(
+        text.contains("Sec/config.json: password (embedded)"),
+        "{text}"
+    );
+    assert!(text.contains("also"), "{text}");
+    assert!(text.contains("path component `a:b`"), "{text}");
+    assert!(!text.contains("CANARY-EMBEDDED-21"), "{text}");
+}
+
+#[test]
+fn windows_node_data_dir_lowers_the_render_budget() {
+    // default prefix 51 + 18 + 3 (`dev`) + 1 = 73: the longest relative path
+    // that passes is 174 units; with a 12-unit-longer Windows data_dir it is 162
+    let relative = |units: usize| {
+        let prefix = "ignition/schedule/S/";
+        format!("resources/{prefix}{}", "a".repeat(units - prefix.len()))
+    };
+    let linux = TARGET;
+    let windows = format!(
+        "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: 'D:\\{}'\n",
+        "d".repeat(60)
+    );
+    let at_limit = |target: &[u8], units: usize| {
+        let path = relative(units);
+        try_render_bytes(
+            target,
+            &["ignition/schedule"],
+            &[
+                ("resources/ignition/schedule/S/config.json", b"{}"),
+                (path.as_str(), b"x"),
+            ],
+        )
+    };
+    assert!(
+        at_limit(linux, 174).is_ok(),
+        "174 passes with the default prefix"
+    );
+    assert!(at_limit(linux, 175).is_err(), "175 is refused");
+    assert!(at_limit(windows.as_bytes(), 162).is_ok());
+    assert!(at_limit(windows.as_bytes(), 163).is_err());
+}
