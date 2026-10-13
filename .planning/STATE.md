@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 21
 current_phase_name: deploy-render
 status: executing
-stopped_at: Completed 21-02-PLAN.md
-last_updated: "2026-10-13T12:10:16.193Z"
+stopped_at: Completed 21-03-PLAN.md
+last_updated: "2026-10-13T12:27:29.194Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 15
-  completed_plans: 8
+  completed_plans: 9
   percent: 17
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 21 (deploy-render) — EXECUTING
-Plan: 3 of 9
+Plan: 4 of 9
 Status: Ready to execute
 Last activity: 2026-10-13 — Phase 21 execution started
 
-Progress: [█████░░░░░] 53%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
@@ -54,6 +54,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 20 P06 | 35min | 2 tasks | 3 files |
 | Phase 21 P01 | ~15min | 2 tasks | 200 files |
 | Phase 21 P02 | 25min | 2 tasks | 14 files |
+| Phase 21 P03 | 45min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -83,8 +84,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-13T12:10:16.183Z
-**Stopped At:** Completed 21-02-PLAN.md
+**Last session:** 2026-10-13T12:27:29.183Z
+**Stopped At:** Completed 21-03-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -105,3 +106,6 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [21-01] OpenAPI resource taxonomy is 56 types (39 named, 17 singleton), not 87/49
 - [Phase ?]: 21-02 CD1: v8 sha2 uuid loads on 8.3.6 (4516ad9c-d6b0-8d86-89b9-802c96e33a9e for CAP21_V8); D-03 can be frozen
 - [Phase ?]: 21-02 CD3/CD5/CD6: new named types are scope A with uuid; tags/P/type maps to ignition/type/P; gateway encodes colon as %3a and refuses other hostile tag names (NTFS deferred to Phase 22)
+- [Phase ?]: 21-03: yaml_serde location is 1-based; custom value errors position at mapping start so schema_version error is relocated to its own line
+- [Phase ?]: 21-03: no alias guard needed; yaml_serde repetition limit refuses alias bombs. libyaml-rs and yaml_serde have no build.rs
+- [Phase ?]: 21-03: YAML error messages scrub echoed values (invalid type/value, unknown variant, enum tag); unknown field keys kept
