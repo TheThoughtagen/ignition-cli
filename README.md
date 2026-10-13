@@ -2364,7 +2364,19 @@ a gateway secret provider:
 A Referenced secret carries a provider and a secret *name*, not a value, so
 it is safe to commit (decision CD7). Everything else is refused as
 `embedded_secret` (exit 2), and the error names `<source file>: <json path>`
-and the kind of defect, never a value:
+and the kind of defect, never a value.
+
+The accepted shape is exact. A Referenced secret is an object with exactly two
+members: `type`, the string `"Referenced"`, and `data`. `data` holds exactly
+the two string members `providerName` and `secretName`. Member order does not
+matter; the gateway writes `data` then `type` (CD7). Any other shape is
+not a Referenced secret: an extra member inside `data` or beside it, a
+missing member, a wrong-case name or a non-string name. Such a value is
+refused as `(plaintext)` at a schema path. Elsewhere it is scanned like any other object,
+so the key-name rule (or its warning, in a described type) applies to its
+members.
+
+The checks, in the order they apply:
 
 - **Embedded anywhere.** Any JSON object with `"type": "Embedded"` and an
   object `data`, at any depth of any `.json` member of any resource or tag
@@ -2373,8 +2385,8 @@ and the kind of defect, never a value:
   The path reads `<file>: password (embedded)`.
 - **Plaintext at a schema path.** For the ten resource types whose 8.3.6
   OpenAPI schema has secret-typed fields, `config.json` must hold absent,
-  `null` or Referenced at each path; a string (even an empty one) or any
-  other value is refused as `(plaintext)`:
+  `null` or a well-formed Referenced at each path; a string (even an empty
+  one) or any other value is refused as `(plaintext)`:
 
   | Type | Secret paths in `config.json` |
   | --- | --- |
@@ -2393,7 +2405,7 @@ and the kind of defect, never a value:
   For a type outside the 8.3.6 OpenAPI (for example the Cirrus Link MQTT
   types), a non-empty string under a key whose name contains `password` or
   `secret` (ASCII, any case) in `config.json` is refused as
-  `(plaintext, by key name)`. The `secretName` of a Referenced object is a
+  `(plaintext, by key name)`. The `secretName` of a well-formed Referenced object is a
   name, not a secret, and is not checked. To fix a refusal, move the value
   into the gateway's secret provider and reference it as above. An empty
   string, `null`, a number and a boolean under such a key are fine.
