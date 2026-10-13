@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 21
-current_phase_name: Deploy Render
+current_phase_name: deploy-render
 status: executing
-stopped_at: Completed 20-06-PLAN.md
-last_updated: "2026-10-13T03:06:41.338Z"
-last_activity: 2026-10-12
-last_activity_desc: Phase 20 complete, transitioned to Phase 21
+stopped_at: Completed 21-01-PLAN.md
+last_updated: "2026-10-13T11:46:06.025Z"
+last_activity: 2026-10-13
+last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 15
-  completed_plans: 6
+  completed_plans: 7
   percent: 17
 ---
 
@@ -24,16 +24,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-10)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 20 — config-api-client
+**Current focus:** Phase 21 — deploy-render
 
 ## Current Position
 
-Phase: 21 — Deploy Render
-Plan: Not started
+Phase: 21 (deploy-render) — EXECUTING
+Plan: 2 of 9
 Status: Ready to execute
-Last activity: 2026-10-12 — Phase 20 complete, transitioned to Phase 21
+Last activity: 2026-10-13 — Phase 21 execution started
 
-Progress: [██████████] 100%
+Progress: [█████░░░░░] 47%
 
 ## Performance Metrics
 
@@ -52,6 +52,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 20 P04 | 55min | 2 tasks | 5 files |
 | Phase 20 P05 | 70min | 2 tasks | 7 files |
 | Phase 20 P06 | 35min | 2 tasks | 3 files |
+| Phase 21 P01 | ~15min | 2 tasks | 200 files |
 
 ## Accumulated Context
 
@@ -81,8 +82,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-12T16:37:10.632Z
-**Stopped At:** Completed 20-06-PLAN.md
+**Last session:** 2026-10-13T11:46:06.014Z
+**Stopped At:** Completed 21-01-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -99,3 +100,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [20-05] deployment_mode() returns Option<String>; null, empty, absent, blank all read as no mode (D5); GatewayInfo untouched via private GatewayModeProbe
 - [Phase ?]: [20-05] mode_create is confirmed by a follow-up modes() read; duplicate (409) and illegal name (400) are internal via classify fallback; FakeDeploy reuses lock_verdict/scan_complete/normalize_deployment_mode/validate_segment
 - [Phase ?]: 20-06: live gate booted with plain compose.yml; no wire drift, fake trace equals live trace
+- [Phase ?]: [21-01] email-profile secret path is settings.settings.password (RESEARCH typo corrected)
+- [Phase ?]: [21-01] OpenAPI resource taxonomy is 56 types (39 named, 17 singleton), not 87/49
