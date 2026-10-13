@@ -3,7 +3,8 @@
 //!
 //! - **Secrets** ([`scan_embedded`], [`scan_secrets`]): an `Embedded` secret
 //!   object anywhere in a `.json` member; a non-null, non-Referenced value at
-//!   an OpenAPI secret-typed path ([`secret_paths`]); and, in a module type
+//!   an OpenAPI secret-typed path (Referenced means the exact shape of
+//!   [`is_referenced`], nothing looser) ([`secret_paths`]); and, in a module type
 //!   the 8.3.6 OpenAPI does not describe, a non-empty string under a key whose
 //!   name contains `password` or `secret`.
 //! - **Windows safety** (`lint_tree`): illegal names, case-fold collisions
@@ -43,11 +44,28 @@ fn is_embedded(node: &Node) -> bool {
         && matches!(node.get("data"), Some(Node::Obj(_)))
 }
 
-/// Whether `node` is a `Referenced` secret object: `"type": "Referenced"`
-/// with an object `data` (CD7: `data {providerName, secretName}`).
+/// Whether `node` is a well-formed `Referenced` secret object (CD7): exactly
+/// the members `type` (the string `Referenced`) and `data`, where `data` is
+/// exactly the string members `providerName` and `secretName`. Member order
+/// does not matter; the parser refuses duplicate keys, so the length checks
+/// plus named lookups are an exact shape test. Any other shape (an extra,
+/// missing or wrong-case member, a non-string name, a sibling beside
+/// `type`/`data`) is not Referenced and is scanned as ordinary content.
 fn is_referenced(node: &Node) -> bool {
-    matches!(node.get("type"), Some(Node::Str(t)) if t == "Referenced")
-        && matches!(node.get("data"), Some(Node::Obj(_)))
+    let Node::Obj(members) = node else {
+        return false;
+    };
+    if members.len() != 2 || !matches!(node.get("type"), Some(Node::Str(t)) if t == "Referenced") {
+        return false;
+    }
+    match node.get("data") {
+        Some(data @ Node::Obj(inner)) => {
+            inner.len() == 2
+                && matches!(data.get("providerName"), Some(Node::Str(_)))
+                && matches!(data.get("secretName"), Some(Node::Str(_)))
+        }
+        _ => false,
+    }
 }
 
 /// Whether a member named `key` looks like it holds a secret: its name
@@ -91,17 +109,20 @@ impl Walker<'_> {
     }
 
     /// Visit `node` at `path`. `key_hit` is true when `node` is a string (or
-    /// an array of them) held by a secret-looking key; `in_ref_data` is true
-    /// inside the `data` of a Referenced object, where `secretName` is a name,
-    /// not a secret.
-    fn walk(&mut self, node: &Node, path: &str, key_hit: bool, in_ref_data: bool) {
+    /// an array of them) held by a secret-looking key. A well-formed
+    /// Referenced object is skipped whole; no flag turns the key-name rule off
+    /// for any subtree.
+    fn walk(&mut self, node: &Node, path: &str, key_hit: bool) {
         match node {
             Node::Obj(members) => {
                 if is_embedded(node) {
                     self.refuse(path, "embedded");
                     return;
                 }
-                let referenced = is_referenced(node);
+                if is_referenced(node) {
+                    // names only: no value, no nested object that could be Embedded
+                    return;
+                }
                 for (key, value) in members {
                     let child = member_path(path, key);
                     let at_schema = self
@@ -109,19 +130,17 @@ impl Walker<'_> {
                         .as_ref()
                         .is_some_and(|r| r.schema.contains(&child.as_str()));
                     if at_schema {
-                        self.schema_value(value, &child, in_ref_data);
+                        self.schema_value(value, &child);
                         continue;
                     }
-                    let hit = self.rules.as_ref().is_some_and(|r| r.key_names)
-                        && !in_ref_data
-                        && key_looks_secret(key);
-                    let skip = in_ref_data || (referenced && key == "data");
-                    self.walk(value, &child, hit, skip);
+                    let hit =
+                        self.rules.as_ref().is_some_and(|r| r.key_names) && key_looks_secret(key);
+                    self.walk(value, &child, hit);
                 }
             }
             Node::Arr(items) => {
                 for (i, item) in items.iter().enumerate() {
-                    self.walk(item, &format!("{path}[{i}]"), key_hit, in_ref_data);
+                    self.walk(item, &format!("{path}[{i}]"), key_hit);
                 }
             }
             Node::Str(s) => {
@@ -133,13 +152,14 @@ impl Walker<'_> {
         }
     }
 
-    /// A value at an OpenAPI secret-typed path: null and Referenced pass, an
-    /// Embedded object is refused as embedded, anything else is plaintext.
-    fn schema_value(&mut self, value: &Node, path: &str, in_ref_data: bool) {
+    /// A value at an OpenAPI secret-typed path: null and a well-formed
+    /// Referenced pass, an Embedded object is refused as embedded, anything
+    /// else is plaintext.
+    fn schema_value(&mut self, value: &Node, path: &str) {
         match value {
             Node::Lit(l) if l == "null" => {}
             Node::Obj(_) if is_embedded(value) => self.refuse(path, "embedded"),
-            Node::Obj(_) if is_referenced(value) => self.walk(value, path, false, in_ref_data),
+            Node::Obj(_) if is_referenced(value) => {}
             _ => self.refuse(path, "plaintext"),
         }
     }
@@ -167,7 +187,7 @@ pub fn scan_embedded(origin: &str, node: &Node) -> SecretScan {
         rules: None,
         scan: SecretScan::default(),
     };
-    walker.walk(node, "", false, false);
+    walker.walk(node, "", false);
     walker.scan
 }
 
@@ -180,7 +200,7 @@ pub fn scan_embedded(origin: &str, node: &Node) -> SecretScan {
 ///   Embedded object there is reported once, as embedded; a string or any
 ///   other value is plaintext;
 /// - a non-empty string under a key containing `password` or `secret`
-///   (outside the schema paths and outside a Referenced object's `data`) is
+///   (outside the schema paths and outside a well-formed Referenced object) is
 ///   refused as plaintext by key name when the 8.3.6 OpenAPI does not
 ///   describe the type, and only warned about when it does (the schema is
 ///   authoritative there).
@@ -199,7 +219,7 @@ pub fn scan_secrets(origin: &str, key: &ResourceKey, file_name: &str, node: &Nod
         }),
         scan: SecretScan::default(),
     };
-    walker.walk(node, "", false, false);
+    walker.walk(node, "", false);
     walker.scan
 }
 
