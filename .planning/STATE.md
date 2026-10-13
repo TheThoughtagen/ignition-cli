@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 21
 current_phase_name: deploy-render
 status: executing
-stopped_at: Completed 21-05-PLAN.md
-last_updated: "2026-10-13T13:56:25.152Z"
+stopped_at: Completed 21-06-PLAN.md
+last_updated: "2026-10-13T14:26:07.174Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 15
-  completed_plans: 11
+  completed_plans: 12
   percent: 17
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 21 (deploy-render) — EXECUTING
-Plan: 6 of 9
+Plan: 7 of 9
 Status: Ready to execute
 Last activity: 2026-10-13 — Phase 21 execution started
 
-Progress: [███████░░░] 73%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 21 P03 | 45min | 3 tasks | 10 files |
 | Phase 21 P04 | 60min | 2 tasks | 22 files |
 | Phase 21 P05 | 40min | 2 tasks | 6 files |
+| Phase 21 P06 | 45min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -86,8 +87,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-13T13:56:25.135Z
-**Stopped At:** Completed 21-05-PLAN.md
+**Last session:** 2026-10-13T14:26:07.161Z
+**Stopped At:** Completed 21-06-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -114,3 +115,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 21]: 21-04: render_sha256 listing is path NUL hex-sha256 LF in UTF-8 byte order; consumed by Phase 22, change means re-goldening
 - [Phase 21]: 21-04: deploy_render exposed over MCP by clap derivation, unguarded, no confirm (Decision D)
 - [Phase ?]: 21-05: JSON nesting capped at 128 by an own linear scan (serde_json RawValue validation accepted 200-deep); stage 5 collects JSON findings with allowlist findings
+- [Phase ?]: 21-06: CD5 mapping ignition/<type>/<P>/<rest> adopted; unexercised tag layouts (root-level tags, nested type-definition folders) stay refused

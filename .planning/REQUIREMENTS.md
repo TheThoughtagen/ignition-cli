@@ -31,8 +31,8 @@ Numbering: new categories. **47 requirements.**
 
 - [ ] **DRND-01**: User can run `ign deploy render` on a `gateways/<name>/` tree for an environment and get a rendered tree whose `render_sha256` is identical for identical inputs
 - [x] **DRND-02**: `manifest.yaml` and `targets/<env>.yaml` parse strictly — unknown fields and a wrong `schema_version` fail with file, line and column
-- [ ] **DRND-03**: Files under `modes/<env>/` override the base tree by path, whole-file
-- [ ] **DRND-04**: Only manifest-allowlisted resource types are rendered; security singletons (security-properties, security-levels, API tokens, user sources) are refused
+- [x] **DRND-03**: Files under `modes/<env>/` override the base tree by path, whole-file
+- [x] **DRND-04**: Only manifest-allowlisted resource types are rendered; security singletons (security-properties, security-levels, API tokens, user sources) are refused
 - [ ] **DRND-05**: Gateway-written files pass through byte-for-byte; files `ign` synthesizes use a Gson-compatible, order-preserving writer, proven by the gateway corpus round-tripping byte-identical on Linux, macOS and Windows
 - [ ] **DRND-06**: New named resources get a deterministic name-based `attributes.uuid` from a per-type rule table; singleton types get none; existing uuids are kept
 - [ ] **DRND-07**: Render refuses an embedded secret (an `Embedded` secret value or a plaintext secret field), naming the path and never the value
@@ -125,8 +125,8 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DAPI-07 | Phase 20 | Complete — library level (`scan_lock_held`, `active_node`); `ign redundancy status` CLI wiring tracked in Phase 24 |
 | DRND-01 | Phase 21 | Pending |
 | DRND-02 | Phase 21 | Complete |
-| DRND-03 | Phase 21 | Pending |
-| DRND-04 | Phase 21 | Pending |
+| DRND-03 | Phase 21 | Complete |
+| DRND-04 | Phase 21 | Complete |
 | DRND-05 | Phase 21 | Pending |
 | DRND-06 | Phase 21 | Pending |
 | DRND-07 | Phase 21 | Pending |
