@@ -1668,6 +1668,24 @@ fn malformed_referenced_secret_is_refused_by_path() {
 }
 
 #[test]
+fn malformed_referenced_in_described_type_warns_without_value() {
+    let config = format!(
+        r#"{{"settings":{{"cred":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","password":"{CANARY_REFERENCED}"}}}}}}}}"#
+    );
+    let result = secret_render(&["ignition/database-connection"], &[(DB, &config)]);
+    assert_no_canary(&result, &[CANARY_REFERENCED]);
+    let out = result.expect("a described type only warns");
+    assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("config.json: settings.cred.data.password;")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+#[test]
 fn possible_plaintext_secret_warns_without_value() {
     let config = format!(r#"{{"settings":{{"mqttPassword":"{CANARY_WARN}"}}}}"#);
     let result = secret_render(&["ignition/database-connection"], &[(DB, &config)]);

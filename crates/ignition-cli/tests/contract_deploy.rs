@@ -507,6 +507,57 @@ fn malformed_referenced_secret_names_path_not_value() {
 }
 
 #[test]
+fn malformed_referenced_warning_names_path_not_value() {
+    let (_tmp, repo) = secret_repo(
+        &["ignition/database-connection"],
+        &[(
+            "ignition/database-connection/Main/config.json",
+            format!(
+                r#"{{"settings":{{"cred":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","password":"{CANARY_REFERENCED}"}}}}}}}}"#
+            ),
+        )],
+    );
+    for json in [false, true] {
+        let (_cfg, mut cmd) = ign();
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd
+            .args(["deploy", "render", "--env", "dev", "--repo"])
+            .arg(&repo)
+            .output()
+            .expect("spawn ign");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "json={json}: {stderr}");
+        assert!(
+            !stdout.contains(CANARY_REFERENCED),
+            "json={json}: canary in {stdout}"
+        );
+        assert!(
+            !stderr.contains(CANARY_REFERENCED),
+            "json={json}: canary in {stderr}"
+        );
+        if json {
+            let envelope: Value = serde_json::from_str(&stdout).expect("envelope");
+            let warnings = envelope["data"]["warnings"].as_array().expect("warnings");
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(
+                warnings.iter().any(|w| w
+                    .as_str()
+                    .is_some_and(|w| w.contains("config.json: settings.cred.data.password;"))),
+                "{warnings:?}"
+            );
+        } else {
+            assert!(
+                format!("{stdout}{stderr}").contains("settings.cred.data.password"),
+                "stdout={stdout} stderr={stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn possible_secret_warning_names_path_not_value() {
     let (_tmp, repo) = secret_repo(
         &["ignition/database-connection"],

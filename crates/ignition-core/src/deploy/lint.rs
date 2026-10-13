@@ -624,6 +624,87 @@ mod tests {
         );
     }
 
+    /// A Referenced-shaped object at the database-connection `password` path,
+    /// each deviating from the CD7 shape in one way.
+    const MALFORMED_REFERENCED: [&str; 14] = [
+        r#"{"type":"Referenced","data":{"providerName":"p","secretName":"s","password":"x"}}"#,
+        r#"{"type":"Referenced","data":{"providerName":"p"}}"#,
+        r#"{"type":"Referenced","data":{"secretName":"s"}}"#,
+        r#"{"type":"Referenced","data":{}}"#,
+        r#"{"type":"Referenced","data":{"providerName":1,"secretName":"s"}}"#,
+        r#"{"type":"Referenced","data":{"providerName":"p","secretName":null}}"#,
+        r#"{"type":"Referenced","data":{"providerName":"p","secretName":{"v":"x"}}}"#,
+        r#"{"type":"Referenced","data":"x"}"#,
+        r#"{"type":"Referenced","data":[]}"#,
+        r#"{"type":"Referenced","data":{"providerName":"p","secretName":"s"},"value":"x"}"#,
+        r#"{"type":"referenced","data":{"providerName":"p","secretName":"s"}}"#,
+        r#"{"type":1,"data":{"providerName":"p","secretName":"s"}}"#,
+        r#"{"data":{"providerName":"p","secretName":"s"}}"#,
+        r#"{"type":"Referenced","data":{"providername":"p","secretName":"s"}}"#,
+    ];
+
+    #[test]
+    fn malformed_referenced_variants_are_plaintext_at_schema_path() {
+        for (i, variant) in MALFORMED_REFERENCED.iter().enumerate() {
+            let s = scan(
+                "ignition",
+                "database-connection",
+                &format!(r#"{{"password":{variant}}}"#),
+            );
+            assert_eq!(
+                s.refused,
+                ["f/config.json: password (plaintext)"],
+                "variant {i}"
+            );
+            assert!(s.warnings.is_empty(), "variant {i}: {:?}", s.warnings);
+        }
+    }
+
+    #[test]
+    fn well_formed_referenced_passes_in_either_key_order() {
+        for referenced in [
+            r#"{"data":{"providerName":"p","secretName":"s"},"type":"Referenced"}"#,
+            r#"{"type":"Referenced","data":{"secretName":"s","providerName":"p"}}"#,
+        ] {
+            let s = scan(
+                "ignition",
+                "database-connection",
+                &format!(r#"{{"password":{referenced}}}"#),
+            );
+            assert_eq!(s, SecretScan::default(), "{referenced}");
+            let s = scan(
+                "com.cirruslink.mqtt.engine.gateway",
+                "server",
+                &format!(
+                    r#"{{"password":{referenced},"settings":{{"clientSecret":{referenced}}}}}"#
+                ),
+            );
+            assert_eq!(s, SecretScan::default(), "{referenced}");
+        }
+    }
+
+    #[test]
+    fn malformed_referenced_outside_schema_path_warns_in_described_type() {
+        let s = scan(
+            "ignition",
+            "database-connection",
+            r#"{"settings":{"cred":{"type":"Referenced","data":{"providerName":"p","secretName":"s","password":"hunter2"}}}}"#,
+        );
+        assert!(s.refused.is_empty(), "{:?}", s.refused);
+        assert_eq!(s.warnings.len(), 2, "{:?}", s.warnings);
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.contains("settings.cred.data.secretName;"))
+        );
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.contains("settings.cred.data.password;"))
+        );
+        assert!(s.warnings.iter().all(|w| !w.contains("hunter2")));
+    }
+
     // ---- Windows safety, budget and CR ----------------------------------
 
     use proptest::prelude::*;
@@ -900,6 +981,22 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn prop_extra_data_member_is_refused_without_value(
+            key in "[A-Za-z][A-Za-z0-9]{0,12}",
+            value in "CANARY-[A-Za-z0-9]{6,12}",
+        ) {
+            prop_assume!(key != "providerName" && key != "secretName");
+            let json = format!(
+                r#"{{"password":{{"type":"Referenced","data":{{"providerName":"p","secretName":"s","{key}":"{value}"}}}}}}"#
+            );
+            let s = scan("ignition", "database-connection", &json);
+            prop_assert_eq!(&s.refused, &["f/config.json: password (plaintext)".to_string()]);
+            for text in s.refused.iter().chain(s.warnings.iter()) {
+                prop_assert!(!text.contains(&value), "value leaked: {text}");
+            }
+        }
+
         #[test]
         fn prop_illegal_char_names_refused(
             base in "[A-Za-z0-9_-]{1,20}",
