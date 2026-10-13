@@ -7,6 +7,14 @@
 # Subcommands: c1 | cnull [LABEL] | cmode | c3a | clist | wait
 #   cnull LABEL is the heading suffix, e.g. "(no mode)" or "(mode production)".
 #
+# Phase 21 (21-02) subcommands, always run with
+#   CAPTURE_OUT=$REPO/.planning/phases/21-deploy-render/21-LIVE-CAPTURES.md:
+#   up21 | setup21 | header21 | hdrrow KEY VALUE | uuid8 | c3b | c4 | oq8 | oq1 | oq4 | c5
+#   check21 [--decisions] [ID ...] | shcap LABEL CMD [ARG ...] | v8uuid GATEWAY MODULE TYPE NAME
+#   Every byte inside a `## C21-<ID>` section is appended by `cap` (HTTP) or `shcap`
+#   (any other command), stamped with the exact command and a script-taken UTC time.
+#   `check21` reads the file and sends no request.
+#
 # LOCALHOST ONLY. assert_local runs before anything else (before the output
 # file is touched and before any request) and exits 2 unless BASE's host is
 # localhost or 127.0.0.1. Tokens come from tokens.env (0600, outside the repo),
@@ -284,6 +292,493 @@ clist_extra2() {
   cap 'GET list?limit=-1&name[eq]=<c3a name> (control)' IGN_TOKEN_CAP_A GET "$RES/list/$DBT?limit=-1&name[eq]=$name"
 }
 
+# ---------------------------------------------------------------------------
+# Phase 21 (21-02): live captures for deploy render. Run every one of these
+# with CAPTURE_OUT=$REPO/.planning/phases/21-deploy-render/21-LIVE-CAPTURES.md
+# (check21 defaults to that file, never to the Phase 20 default OUT).
+# ---------------------------------------------------------------------------
+P21OUT=$REPO/.planning/phases/21-deploy-render/21-LIVE-CAPTURES.md
+BIND21=${IGN_DEPLOY_RIG_RESOURCES:-$HOME/.cache/ign-deploy-rig/resources-21}
+export IGN_DEPLOY_RIG_RESOURCES=$BIND21
+# Exported so `bash -c '... "$IGN21_DIR/x" ...'` command lines stay free of local paths.
+export IGN21_DIR=$STATE
+export IGN21_BIND=$BIND21
+export IGNITION_CLI_CONFIG=$STATE/ign21.toml
+CRES=/usr/local/bin/ignition/data/config/resources
+GWC=ign-deploy-rig-gw-1
+GATEWAY=ign-deploy-rig
+
+dc() { ( cd "$HERE" && docker compose -p ign-deploy-rig -f compose.yml -f compose.bind.yml "$@" ); }
+
+# sect ID TEXT: the `## C21-<ID>` heading of one capture id.
+sect() {
+  case "${1:-}" in
+    UUID8 | C3b | C4 | OQ8 | OQ1 | OQ4 | C5) ;;
+    *) echo "sect: unknown capture id '${1:-}'" >&2; exit 64 ;;
+  esac
+  h "C21-$1 — ${2:-}"
+}
+
+# shcap LABEL CMD [ARG ...]: one verbatim command block. The fence opens with
+# `$ <args rendered with printf %q> @ <UTC taken just before the run>`, then the
+# combined stdout+stderr (CR removed), then `[exit N]`. The command runs with the
+# bind directory as cwd so paths stay relative. Refuses (exit 2) when an argument
+# or the output contains a token value; nothing is appended in that case.
+shcap() {
+  local label=${1:?shcap LABEL CMD [ARG ...]}; shift
+  [ $# -gt 0 ] || { echo "shcap: no command given" >&2; exit 2; }
+  local a v val key
+  for a in "$@"; do
+    for v in IGN_TOKEN_CAP_A IGN_TOKEN_CAP_B; do
+      val=${!v:-}
+      if [ -n "$val" ]; then
+        key=${val#*:}
+        case "$a" in
+          *"$val"* | *"$key"*) echo "REFUSING: a shcap argument contains the value of $v" >&2; exit 2 ;;
+        esac
+      fi
+    done
+  done
+  local out=$TMPD/shcap.out rc=0 started
+  started=$(utc)
+  ( cd "$BIND21" 2>/dev/null || true; "$@" ) > "$out" 2>&1 || rc=$?
+  tr -d '\r' < "$out" > "$out.nocr"
+  for v in IGN_TOKEN_CAP_A IGN_TOKEN_CAP_B; do
+    val=${!v:-}
+    if [ -n "$val" ]; then
+      key=${val#*:}
+      if grep -qF -- "$key" "$out.nocr"; then
+        echo "REFUSING: command output contains the value of $v; nothing appended" >&2
+        exit 2
+      fi
+    fi
+  done
+  {
+    printf '\n### %s\n\n~~~\n$ ' "$label"
+    printf '%q ' "$@"
+    printf '@ %s\n' "$started"
+    cat "$out.nocr"
+    if [ -s "$out.nocr" ] && [ "$(tail -c1 "$out.nocr" | wc -l | tr -d ' ')" = 0 ]; then
+      printf '\n[output did not end with a newline]\n'
+    fi
+    printf '[exit %s]\n~~~\n' "$rc"
+  } >> "$OUT"
+}
+
+# v8uuid GATEWAY MODULE TYPE NAME: the D-03 derivation 21-07 implements in Rust.
+v8uuid() {
+  [ $# -eq 4 ] || { echo "usage: v8uuid GATEWAY MODULE TYPE NAME" >&2; exit 64; }
+  python3 -I -c '
+import hashlib, sys
+g, m, t, n = sys.argv[1:5]
+d = hashlib.sha256(b"ign-deploy:uuid:v1\0" + g.encode() + b"\0" + (m + "/" + t + "/" + n).encode()).digest()[:16]
+b = bytearray(d)
+b[6] = (b[6] & 0x0F) | 0x80
+b[8] = (b[8] & 0x3F) | 0x80
+x = b.hex()
+print("-".join([x[:8], x[8:12], x[12:16], x[16:20], x[20:]]))
+' "$@"
+}
+
+# bind_write REL SRC: copy a host file to $BIND21/REL (mkdir -p) and give the
+# gateway user ownership of the whole collection directory (D11 pattern).
+bind_write() {
+  local rel=${1:?REL} src=${2:?SRC} coll
+  mkdir -p "$BIND21/$(dirname "$rel")"
+  cp "$src" "$BIND21/$rel"
+  coll=${rel%%/*}
+  dc exec -T -u root gw chown -R 2003:2003 "$CRES/$coll"
+}
+
+# scan21: wait out any active scan, POST scan/config, poll until scanActive is
+# false and lastScanTimestamp advanced (Phase 20 D4), then log the final GET.
+scan_state() { curl -sS -m 10 -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE$SCAN" || true; }
+scan21() {
+  local body ts0 ts t0
+  t0=$(date +%s)
+  while :; do
+    body=$(scan_state)
+    [ "$(jq -r '.scanActive' <<<"$body" 2>/dev/null || echo ?)" = false ] && break
+    [ $(( $(date +%s) - t0 )) -lt 60 ] || { echo "scan stayed active for 60 s before the request" >&2; return 1; }
+    sleep 0.5
+  done
+  ts0=$(jq -r '.lastScanTimestamp // 0' <<<"$body")
+  cap 'POST scan/config' IGN_TOKEN_CAP_A POST $SCAN
+  t0=$(date +%s)
+  while :; do
+    body=$(scan_state)
+    ts=$(jq -r '.lastScanTimestamp // 0' <<<"$body" 2>/dev/null || echo 0)
+    if [ "$(jq -r '.scanActive' <<<"$body" 2>/dev/null || echo ?)" = false ] && [ "$ts" -gt "$ts0" ] 2>/dev/null; then break; fi
+    [ $(( $(date +%s) - t0 )) -lt 120 ] || { echo "scan did not complete within 120 s" >&2; return 1; }
+    sleep 0.5
+  done
+  cap 'GET scan/config (after completion)' IGN_TOKEN_CAP_A GET $SCAN
+}
+
+# glog PATTERN: gateway log lines matching an extended regex.
+glog() {
+  shcap "gateway log lines matching: $1" bash -c 'docker logs "$1" 2>&1 | grep -E -- "$2" || true' _ "$GWC" "$1"
+}
+
+# up21: fresh bind dir (outside the repo), compose up with the bind override,
+# wait RUNNING. The start time is taken when `up -d` is issued.
+up21() {
+  case "$BIND21" in
+    "$HOME/.cache/ign-deploy-rig/"?*) ;;
+    *) echo "REFUSING: bind dir '$BIND21' is not under \$HOME/.cache/ign-deploy-rig/" >&2; exit 2 ;;
+  esac
+  [ -e "$BIND21" ] && /bin/rm -rf "$BIND21"
+  mkdir -p "$BIND21" "$STATE"
+  utc > "$STATE/start-utc-21"
+  dc up -d
+  wait_running
+}
+
+# setup21: mint tokens, then put the gateway into production mode (Phase 20
+# C-mode procedure) and confirm deploymentMode. No capture block is written.
+setup21() {
+  bash "$HERE/mint-token.sh" > /dev/null
+  # shellcheck disable=SC1091
+  . "$STATE/tokens.env"
+  sleep 20
+  wait_running
+  local st
+  st=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -X POST -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "${JSON[@]}" \
+    --data '{"name":"production","title":"Production","description":"ign-deploy-rig"}' "$BASE/data/api/v1/mode")
+  [ "$st" = 200 ] || { echo "POST /mode production answered $st" >&2; exit 1; }
+  IGN_DEPLOY_RIG_MODE_ARG=-Dignition.config.mode=production dc up -d
+  sleep 10
+  wait_running
+  local t0 m; t0=$(date +%s)
+  while :; do
+    m=$(curl -sS -m 10 -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE/data/api/v1/gateway-info" 2>/dev/null | jq -r '.deploymentMode' 2>/dev/null || true)
+    [ "$m" = production ] && break
+    [ $(( $(date +%s) - t0 )) -lt 120 ] || { echo "deploymentMode is '$m', not production" >&2; exit 1; }
+    sleep 3
+  done
+  echo "RUNNING, deploymentMode production"
+}
+
+# header21: write the header table (creates the file; refuses if it exists).
+# Only after RUNNING and production are both confirmed live.
+header21() {
+  [ -f "$STATE/start-utc-21" ] || { echo "no start-utc-21: run up21 first" >&2; exit 1; }
+  [ ! -e "$OUT" ] || { echo "REFUSING: $OUT already exists" >&2; exit 1; }
+  curl -s -m 5 "$BASE/StatusPing" | grep -q RUNNING || { echo "gateway is not RUNNING" >&2; exit 1; }
+  local mode image cid
+  mode=$(curl -sS -m 10 -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE/data/api/v1/gateway-info" | jq -r '.deploymentMode')
+  [ "$mode" = production ] || { echo "deploymentMode is '$mode', not production" >&2; exit 1; }
+  cid=$(docker ps -q --filter "label=com.docker.compose.project=ign-deploy-rig" --filter "label=com.docker.compose.service=gw")
+  image=$(docker inspect -f '{{.Config.Image}}' "$cid")
+  {
+    printf '# Phase 21 — Live Captures (8.3.6)\n\n| Field | Value |\n| --- | --- |\n'
+    printf '| Image | %s |\n' "$image"
+    printf '| Compose variant | bind (compose.yml + compose.bind.yml) |\n'
+    # shellcheck disable=SC2016
+    printf '| Bind path (outside repo) | %s |\n' "${BIND21/#$HOME/\$HOME}"
+    printf '| Gateway name | %s |\n' "$GATEWAY"
+    printf '| deploymentMode | %s |\n' "$mode"
+    printf '| Started (UTC) | %s |\n' "$(cat "$STATE/start-utc-21")"
+    printf '| ign --version | %s |\n' "$(ign --version)"
+  } > "$OUT"
+}
+
+# hdrrow KEY VALUE: add a row to the header table (script-written, not typed).
+hdrrow() {
+  python3 -I - "$OUT" "$1" "$2" <<'PY'
+import sys
+p, k, v = sys.argv[1:4]
+lines = open(p, encoding="utf-8").read().split("\n")
+last = max(i for i, l in enumerate(lines[:20]) if l.startswith("|"))
+lines.insert(last + 1, "| %s | %s |" % (k, v))
+open(p, "w", encoding="utf-8").write("\n".join(lines))
+PY
+}
+
+# check21 [--decisions] [ID ...]: structural evidence check; sends no request,
+# prints PASS/FAIL lines and never block content. Reads CAPTURE_OUT, else the
+# Phase 21 file.
+check21() {
+  local f=${CAPTURE_OUT:-$P21OUT}
+  python3 -I - "$f" "$@" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+args = sys.argv[2:]
+decisions = False
+ids = []
+for a in args:
+    if a == "--decisions":
+        decisions = True
+    else:
+        ids.append(a)
+ALL = ["UUID8", "C3b", "C4", "OQ8", "OQ1", "OQ4", "C5"]
+if not ids:
+    ids = ALL
+
+TS = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+HTTP_FIRST = re.compile(r"(?:GET|POST|PUT|PATCH|DELETE) \S+ @ (" + TS + r")")
+SH_FIRST = re.compile(r"\$ .+ @ (" + TS + r")")
+STARTED = re.compile(r"\|\s*Started \(UTC\)\s*\|\s*(" + TS + r")\s*\|")
+
+try:
+    lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+except OSError as e:
+    print("FAIL file cannot-read %s" % e.__class__.__name__)
+    sys.exit(1)
+
+fails = 0
+
+
+def out(ok, who, rule):
+    global fails
+    if not ok:
+        fails += 1
+    print("%s %s %s" % ("PASS" if ok else "FAIL", who, rule))
+
+
+started = None
+sections = []
+cur = None
+curblock = None
+infence = False
+decs_present = False
+cds = []
+curcd = None
+for l in lines:
+    if not infence:
+        if started is None:
+            m = STARTED.match(l)
+            if m:
+                started = m.group(1)
+        if l.startswith("## "):
+            fields = l.split()
+            curblock = None
+            curcd = None
+            if len(fields) > 1 and fields[1].startswith("C21-"):
+                cur = {"kind": "c21", "id": fields[1][4:], "blocks": []}
+                sections.append(cur)
+            elif len(fields) > 1 and fields[1] == "Decisions":
+                cur = {"kind": "dec"}
+                decs_present = True
+            else:
+                cur = {"kind": "other"}
+        elif l.startswith("### ") and cur is not None and cur["kind"] == "dec":
+            m = re.match(r"### CD(\d+)\b", l)
+            if m:
+                curcd = {"n": int(m.group(1)), "text": []}
+                cds.append(curcd)
+            else:
+                curcd = None
+        if l.startswith("~~~"):
+            infence = True
+            curblock = {"first": None, "seen": False}
+            if cur is not None and cur["kind"] == "c21":
+                cur["blocks"].append(curblock)
+            if curcd is not None:
+                curcd["text"].append(l)
+            continue
+        if curcd is not None:
+            curcd["text"].append(l)
+    else:
+        if l.startswith("~~~"):
+            infence = False
+        elif curblock is not None and not curblock["seen"]:
+            curblock["first"] = l
+            curblock["seen"] = True
+        if curcd is not None:
+            curcd["text"].append(l)
+
+out(started is not None, "header", "started-utc")
+
+bad = {}
+counts = {}
+prev = started
+for s in sections:
+    i = s["id"]
+    counts.setdefault(i, [0, 0])
+    counts[i][0] += 1
+    rules = bad.setdefault(i, [])
+    if not s["blocks"]:
+        rules.append("section-has-no-fenced-block")
+    for b in s["blocks"]:
+        counts[i][1] += 1
+        f = b["first"] or ""
+        m = HTTP_FIRST.fullmatch(f) or SH_FIRST.fullmatch(f)
+        if not m:
+            rules.append("block-first-line-not-command-at-utc")
+            continue
+        ts = m.group(1)
+        if started is not None and ts < started:
+            rules.append("timestamp-before-started")
+        if prev is not None and ts < prev:
+            rules.append("timestamp-decreases")
+        prev = ts if prev is None or ts > prev else prev
+
+passed = set()
+reported = set()
+for i in ids + [i for i in bad if i not in ids]:
+    if i in reported:
+        continue
+    reported.add(i)
+    if i not in counts:
+        out(False, i, "section-present")
+        continue
+    rules = sorted(set(bad[i]))
+    if rules:
+        for r in rules:
+            out(False, i, r)
+    else:
+        passed.add(i)
+        out(True, i, "sections=%d blocks=%d" % tuple(counts[i]))
+
+if decs_present:
+    for cd in cds:
+        cited = set(re.findall(r"C21-([A-Za-z0-9]+)", "\n".join(cd["text"])))
+        out(bool(cited & passed), "CD%d" % cd["n"], "cites-passing-block")
+
+if decisions:
+    nums = sorted(cd["n"] for cd in cds)
+    out(decs_present and nums == list(range(1, 8)), "Decisions", "CD1-CD7-exactly-once")
+
+sys.exit(1 if fails else 0)
+PY
+}
+
+CORPUS=$REPO/crates/ignition-core/tests/fixtures/deploy/corpus
+DT=ignition/database-translator
+
+# coll_of: the collection a create answered with (from $LAST_BODY).
+coll_of() { jq -r '.changes[0].collection // "core"' <<<"$LAST_BODY" 2>/dev/null || echo core; }
+
+# hand_resource_json OUT UUID [STALE]: the RESEARCH Pattern 4 synthesized
+# resource.json, 2-space indent, no trailing newline. STALE adds a
+# lastModification object and an all-zero lastModificationSignature (C3b).
+hand_resource_json() {
+  python3 -I - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+out, uuid, stale = sys.argv[1:4]
+attrs = {}
+if stale:
+    attrs["lastModification"] = {"actor": "cap21", "timestamp": "2026-01-01T00:00:00Z"}
+attrs["uuid"] = uuid
+if stale:
+    attrs["lastModificationSignature"] = "0" * 64
+attrs["enabled"] = True
+doc = {"scope": "A", "version": 1, "restricted": False, "overridable": True,
+       "files": ["config.json"], "attributes": attrs}
+open(out, "w", encoding="utf-8").write(json.dumps(doc, indent=2, ensure_ascii=False))
+PY
+}
+
+# uuid8 (C21-UUID8, D-03): does 8.3.6 load a sha2-derived version-8 uuid?
+uuid8() {
+  local coll v8 body
+  sect UUID8 'D-03 live check: a hand-written resource carrying a sha2-derived version-8 uuid'
+  body=$(jq -c '[{name: "CAP21_API", config: .}]' "$CORPUS/$DT/POSTGRES/config.json")
+  cap 'POST create database-translator CAP21_API through the config API (no collection)' IGN_TOKEN_CAP_A POST $RES/$DT "${JSON[@]}" --data "$body"
+  coll=$(coll_of)
+  shcap 'CAP21_API config.json as the gateway wrote it' cat "$coll/$DT/CAP21_API/config.json"
+  shcap 'CAP21_API resource.json as the gateway wrote it' cat "$coll/$DT/CAP21_API/resource.json"
+  shcap 'CAP21_API files with sha256' bash -c 'find . -path "*/database-translator/CAP21_API/*" -type f -exec shasum -a 256 {} + | sort -k2'
+  v8=$(v8uuid "$GATEWAY" ignition database-translator CAP21_V8)
+  shcap 'v8 uuid for CAP21_V8 (D-03 derivation)' v8uuid "$GATEWAY" ignition database-translator CAP21_V8
+  cp "$BIND21/$coll/$DT/CAP21_API/config.json" "$TMPD/v8.config.json"
+  hand_resource_json "$TMPD/v8.resource.json" "$v8"
+  bind_write "production/$DT/CAP21_V8/config.json" "$TMPD/v8.config.json"
+  bind_write "production/$DT/CAP21_V8/resource.json" "$TMPD/v8.resource.json"
+  shcap 'CAP21_V8 resource.json (hand-written, before scan)' cat "production/$DT/CAP21_V8/resource.json"
+  shcap 'CAP21_V8 sha256 (before scan)' shasum -a 256 "production/$DT/CAP21_V8/config.json" "production/$DT/CAP21_V8/resource.json"
+  scan21
+  cap 'GET find CAP21_V8 (collection=production)' IGN_TOKEN_CAP_A GET "$RES/find/$DT/CAP21_V8?collection=production"
+  cap 'GET names (database-translator)' IGN_TOKEN_CAP_A GET "$RES/names/$DT"
+  shcap 'CAP21_V8 sha256 (after scan)' shasum -a 256 "production/$DT/CAP21_V8/config.json" "production/$DT/CAP21_V8/resource.json"
+  glog 'CAP21_V8|will not be loaded|CAP21_API'
+}
+
+# c3b (C21-C3b): omitted and stale signatures on hand-written resources.
+c3b() {
+  local v8 stale r1 r2
+  sect C3b 'omitted vs stale lastModificationSignature on hand-written resource.json, and whether the gateway rewrites it'
+  v8=$(v8uuid "$GATEWAY" ignition database-translator CAP21_STALE)
+  shcap 'v8 uuid for CAP21_STALE' v8uuid "$GATEWAY" ignition database-translator CAP21_STALE
+  cp "$BIND21/production/$DT/CAP21_V8/config.json" "$TMPD/stale.config.json"
+  hand_resource_json "$TMPD/stale.resource.json" "$v8" stale
+  bind_write "production/$DT/CAP21_STALE/config.json" "$TMPD/stale.config.json"
+  bind_write "production/$DT/CAP21_STALE/resource.json" "$TMPD/stale.resource.json"
+  r1=production/$DT/CAP21_V8/resource.json
+  r2=production/$DT/CAP21_STALE/resource.json
+  shcap 'CAP21_STALE resource.json (hand-written: stale lastModificationSignature)' cat "$r2"
+  shcap 'sha256 of both hand-written resource.json (before scan)' shasum -a 256 "$r1" "$r2"
+  scan21
+  cap 'GET find CAP21_V8 (after scan 1)' IGN_TOKEN_CAP_A GET "$RES/find/$DT/CAP21_V8?collection=production"
+  cap 'GET find CAP21_STALE (after scan 1)' IGN_TOKEN_CAP_A GET "$RES/find/$DT/CAP21_STALE?collection=production"
+  shcap 'sha256 of both hand-written resource.json (after scan 1)' shasum -a 256 "$r1" "$r2"
+  sleep 60
+  scan21
+  shcap 'sha256 of both hand-written resource.json (after scan 2, 60 s later)' shasum -a 256 "$r1" "$r2"
+  shcap 'resource.json bytes after scan 2: CAP21_V8' cat "$r1"
+  shcap 'resource.json bytes after scan 2: CAP21_STALE' cat "$r2"
+  glog 'CAP21_V8|CAP21_STALE|will not be loaded|signature'
+}
+
+# c4_one MODULE TYPE NAME CONFIGJSON: create, then show what the gateway wrote.
+c4_one() {
+  local m=$1 t=$2 n=$3 cfg=$4 body coll
+  body=$(jq -c --arg n "$n" --argjson c "$cfg" '[{name: $n, config: $c}]' <<<'null')
+  cap "POST create $m/$t $n (minimal config, no secret values)" IGN_TOKEN_CAP_A POST "$RES/$m/$t" "${JSON[@]}" --data "$body"
+  if [ "$(jq -r '.success // false' <<<"$LAST_BODY" 2>/dev/null)" = true ]; then
+    coll=$(coll_of)
+    shcap "$n files as the gateway wrote them" bash -c 'find . -path "*/$1/$2/*" -type f -exec shasum -a 256 {} + | sort -k2' _ "$t" "$n"
+    shcap "$n resource.json as the gateway wrote it" cat "$coll/$m/$t/$n/resource.json"
+  fi
+}
+
+# c4 (C21-C4): types the corpus and OpenAPI census do not cover.
+c4() {
+  sect C4 'uuid/scope census for types absent from the corpus: oauth2-client, alarm-notification-profile, roster-config, holiday, service-connector'
+  c4_one ignition oauth2-client CAP21_OAUTH \
+    '{"clientId":"cap21-client","clientSecret":null,"tokenUrl":"http://localhost/token","httpVersion":"HTTP_1_1","httpConnectTimeout":10000,"httpRequestTimeout":10000}'
+  c4_one com.inductiveautomation.alarm-notification alarm-notification-profile CAP21_ANP \
+    '{"profile":{"type":"OneWayNotificationProfileType"},"settings":{}}'
+  c4_one ignition roster-config CAP21_ROSTER '{"users":[]}'
+  c4_one ignition holiday CAP21_HOLIDAY '{"date":"2026-12-25","repeatAnnually":true}'
+  c4_one ignition service-connector CAP21_SVC \
+    '{"profile":{"type":"kafka"},"settings":{"bootstrapServers":["localhost:9092"],"saslMechanism":"PLAIN","securityProtocol":"PLAINTEXT"}}'
+}
+
+# c4b (C21-C4, second section): oauth2-client again, now with a Referenced
+# clientSecret (run after oq8; the null form was refused with "Missing required
+# property 'clientSecret'").
+c4b() {
+  sect C4 'oauth2-client retried with a Referenced clientSecret (no secret value)'
+  c4_one ignition oauth2-client CAP21_OAUTH \
+    '{"clientId":"cap21-client","clientSecret":{"type":"Referenced","data":{"providerName":"CAP21_SP_FILE","secretName":"cap21-secret"}},"tokenUrl":"http://localhost/token","httpVersion":"HTTP_1_1","httpConnectTimeout":10000,"httpRequestTimeout":10000}'
+}
+
+# oq8 (C21-OQ8): the gateway's own key order for a Referenced secret.
+oq8() {
+  local ref body coll
+  sect OQ8 'Referenced secret: the gateway-written key order of {type, data{providerName, secretName}}'
+  shcap 'throwaway secret value generated now, piped into a file inside the disposable rig container (value never printed or stored on the host)' \
+    bash -c 'openssl rand -hex 16 | docker exec -i -u root "$1" sh -c "cat > /tmp/cap21-secret && chown 2003:2003 /tmp/cap21-secret && chmod 600 /tmp/cap21-secret"' _ "$GWC"
+  cap 'POST create secret-provider CAP21_SP_INT (internal, no secrets)' IGN_TOKEN_CAP_A POST "$RES/ignition/secret-provider" "${JSON[@]}" \
+    --data '[{"name":"CAP21_SP_INT","config":{"profile":{"type":"internal"},"settings":{"secrets":{}}}}]'
+  cap 'POST create secret-provider CAP21_SP_FILE (file provider holding cap21-secret)' IGN_TOKEN_CAP_A POST "$RES/ignition/secret-provider" "${JSON[@]}" \
+    --data '[{"name":"CAP21_SP_FILE","config":{"profile":{"type":"file"},"settings":{"files":{"cap21-secret":{"filePath":"/tmp/cap21-secret","fileType":"CLEARTEXT"}}}}}]'
+  cap 'GET secret names of CAP21_SP_FILE' IGN_TOKEN_CAP_A GET /data/api/v1/secret-providers/CAP21_SP_FILE/secrets
+  # Referenced, sent with type first and data{secretName, providerName} (reverse alphabetical).
+  body=$(jq -c '[{name: "CAP21_REF", config: (. + {password: {type: "Referenced", data: {secretName: "cap21-secret", providerName: "CAP21_SP_FILE"}}})}]' "$DBCFG")
+  cap 'POST create database-connection CAP21_REF (Referenced password; type first, secretName before providerName)' IGN_TOKEN_CAP_A POST "$RES/$DBT" "${JSON[@]}" --data "$body"
+  coll=$(coll_of)
+  shcap 'CAP21_REF config.json as the gateway wrote it' cat "$coll/$DBT/CAP21_REF/config.json"
+  # Same reference sent with data first and providerName before secretName.
+  body=$(jq -c '[{name: "CAP21_REF2", config: (. + {password: {data: {providerName: "CAP21_SP_FILE", secretName: "cap21-secret"}, type: "Referenced"}})}]' "$DBCFG")
+  cap 'POST create database-connection CAP21_REF2 (Referenced password; data first, providerName before secretName)' IGN_TOKEN_CAP_A POST "$RES/$DBT" "${JSON[@]}" --data "$body"
+  coll=$(coll_of)
+  shcap 'CAP21_REF2 config.json as the gateway wrote it' cat "$coll/$DBT/CAP21_REF2/config.json"
+}
+
 case "${1:-}" in
   c1) c1 ;;
   clist_extra2) clist_extra2 ;;
@@ -293,5 +788,18 @@ case "${1:-}" in
   c3a) c3a ;;
   clist) clist ;;
   wait) wait_running ;;
-  *) echo "usage: capture.sh c1|cnull [LABEL]|cmode|c3a|clist|wait" >&2; exit 64 ;;
+  up21) up21 ;;
+  setup21) setup21 ;;
+  header21) header21 ;;
+  hdrrow) hdrrow "${2:?KEY}" "${3:?VALUE}" ;;
+  sect) sect "${2:?ID}" "${3:-}" ;;
+  shcap) shift; shcap "$@" ;;
+  v8uuid) shift; v8uuid "$@" ;;
+  check21) shift; check21 "$@" ;;
+  uuid8) uuid8 ;;
+  c3b) c3b ;;
+  c4) c4 ;;
+  c4b) c4b ;;
+  oq8) oq8 ;;
+  *) echo "usage: capture.sh c1|cnull [LABEL]|cmode|c3a|clist|wait|up21|setup21|header21|hdrrow|shcap|v8uuid|check21|uuid8|c3b|c4|c4b|oq8" >&2; exit 64 ;;
 esac
