@@ -286,3 +286,84 @@ fn workspace_push_and_checkout_refusals_keep_stdout_byte_empty() {
     assert_ne!(output.status.code(), Some(0), "a dead port must refuse");
     assert_stdout_bytes(&output.stdout, b"", "checkout network refusal");
 }
+
+/// 21-04: `deploy render` is an offline envelope verb; with `--json` stdout
+/// is exactly one JSON value and its single trailing newline, even under
+/// max diagnostics (unknown-key warnings + `IGNITION_LOG=trace`).
+#[test]
+fn deploy_render_json_stdout_is_the_envelope_only() {
+    let (_dir, mut cmd) = noisy_ign();
+    let output = cmd
+        .args([
+            "--json",
+            "deploy",
+            "render",
+            "--env",
+            "dev",
+            "--repo",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ignition-core/tests/fixtures/deploy/repos/tracer"
+            ),
+        ])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = &output.stdout;
+    assert!(
+        stdout.ends_with(b"\n") && !stdout.ends_with(b"\n\n"),
+        "exactly one trailing newline: {:?}",
+        String::from_utf8_lossy(stdout)
+    );
+    let mut stream = serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>();
+    let envelope = stream
+        .next()
+        .expect("one JSON value")
+        .expect("stdout parses as JSON");
+    assert_eq!(envelope["ok"], true);
+    // capture the offset BEFORE polling again: the next poll skips whitespace
+    let value_end = stream.byte_offset();
+    assert!(
+        stream.next().is_none(),
+        "stdout holds exactly one JSON value"
+    );
+    assert_eq!(
+        stdout[value_end..],
+        *b"\n",
+        "nothing but the newline follows the envelope"
+    );
+}
+
+/// 21-04: a `deploy render` refusal (unknown `--env`) exits 2 with the
+/// error envelope on stderr and stdout byte-empty under max diagnostics.
+#[test]
+fn deploy_render_refusal_keeps_stdout_byte_empty() {
+    let (_dir, mut cmd) = noisy_ign();
+    let output = cmd
+        .args([
+            "--json",
+            "deploy",
+            "render",
+            "--env",
+            "nope",
+            "--repo",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ignition-core/tests/fixtures/deploy/repos/tracer"
+            ),
+        ])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(output.status.code(), Some(2));
+    assert_stdout_bytes(&output.stdout, b"", "deploy render refusal");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deploy_tree_invalid"),
+        "expected the slug on stderr: {stderr}"
+    );
+}

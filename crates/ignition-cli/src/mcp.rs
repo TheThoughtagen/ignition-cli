@@ -858,6 +858,31 @@ mod tests {
         }
     }
 
+    /// 21-04 (DSURF-01, Decision D): `deploy render` is derived into the
+    /// catalog by the clap walk like any leaf, is read-only (no
+    /// `GUARDED_OPS` entry), and therefore advertises no `confirm`.
+    #[test]
+    fn deploy_render_is_an_unguarded_catalog_tool() {
+        let catalog = build_catalog();
+        let entry = catalog
+            .iter()
+            .find(|e| e.name == "deploy_render")
+            .expect("deploy_render derives from the clap tree");
+        assert_eq!(entry.path, "deploy render");
+        assert!(
+            !GUARDED_OPS.iter().any(|(path, _)| *path == "deploy render"),
+            "deploy render is read-only and must not be guarded"
+        );
+        assert!(
+            entry
+                .schema
+                .get("properties")
+                .and_then(|props| props.get("confirm"))
+                .is_none(),
+            "deploy_render advertises no confirm property"
+        );
+    }
+
     /// The catalog's name encoding is injective over the leaf paths —
     /// two distinct leaves mapping to one tool name would let
     /// tools/call dispatch the WRONG verb.

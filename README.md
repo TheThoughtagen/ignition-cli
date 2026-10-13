@@ -2033,6 +2033,107 @@ stacks). In the TUI the watch stops the moment you leave the mode or
 switch profiles: continuous instrumentation never outlives the
 surface showing it.
 
+## Declared gateway deploy (`ign deploy`)
+
+`ign deploy` operates on a **declared repo**: a git tree that says what a
+gateway should hold, kept separate from any live gateway. Phase 21 ships
+the first verb, `render`, which turns the declared tree into the exact
+bytes the gateway keeps on disk. Later verbs (`plan`, `pull`, `verify`,
+`apply`, `rollback`, `projects`) append their own subsections below.
+
+The repo layout:
+
+```text
+targets/<env>.yaml                      # where an environment deploys
+gateways/<name>/manifest.yaml           # what the gateway tree may contain
+gateways/<name>/resources/<module>/<type>[/<name>]/…   # the resource files
+```
+
+`<module>/<type>` is the gateway's own resource collection (for example
+`ignition/database-translator`); a `<name>` directory is one named
+resource, and a type with no `<name>` level is a singleton (for example
+`ignition/general-alarm-settings`).
+
+### `deploy render`
+
+`ign deploy render --env <ENV> [--repo DIR]` is **offline**. It opens no
+network connection, resolves no profile and reads no credential, so the
+envelope carries `profile: null` and it needs no config file. It writes
+nothing to disk. `--repo` defaults to the current directory.
+
+**`--env` resolution.** `--env dev` selects `targets/dev.yaml`; that file's
+`gateway` field names `gateways/<gateway>/`, whose `manifest.yaml` is read
+next. `--env` must be a safe single path component (not empty, no `/` or
+`\`, not `.`/`..`, not dot-leading); anything else exits 2 `invalid_input`
+before any path is built. A missing `targets/<env>.yaml`, a missing gateway
+directory or manifest, or a symlink anywhere in the tree read exits 2
+`deploy_tree_invalid` naming the repo-relative path. Symlinks are never
+followed.
+
+**`manifest.yaml`** (`schema_version: 1`; unknown fields are refused with
+`file:line:column`, missing or duplicate fields name the file only):
+
+| Field | Meaning |
+|-------|---------|
+| `schema_version` | required, always `1` |
+| `standards_version` | optional free-form label; informational |
+| `types` | required list of allowed `module/type` resource types |
+| `tag_providers` | optional list of tag provider directory names |
+| `projects` | optional list of pinned project artifacts (`name`, `version`, `sha256`, `artifact`) |
+| `verify.tag_probes` | optional list of tag paths read back after a deploy |
+
+**`targets/<env>.yaml`** (`schema_version: 1`, same strictness):
+
+| Field | Meaning |
+|-------|---------|
+| `schema_version` | required, always `1` |
+| `gateway` | required directory name under `gateways/` |
+| `mode` | required deployment mode name |
+| `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block |
+| `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir` |
+
+**The allowlist (D-02).** Only the `module/type` directories listed in the
+manifest `types` are rendered. A type directory that is not listed is
+**refused, not skipped**: exit 2 `deploy_tree_invalid` naming
+`gateways/<name>/resources/<module>/<type>/`, with every such directory
+reported together. A file directly under `resources/` or
+`resources/<module>/` is refused the same way.
+
+**Rendered bytes.** Every file the render does not need to change is
+rendered byte for byte. Paths are ordered by the UTF-8 bytes of the
+`/`-joined collection path (`<module>/<type>/…`, the repo path with
+`gateways/<name>/resources/` removed), and file contents are compared as raw
+bytes; no Unicode normalization or case folding is applied to either.
+
+**`render_sha256`** is the lowercase hex SHA-256 of a listing with one entry
+per rendered file, in byte-sorted collection-path order:
+
+```text
+<collection path> NUL <lowercase hex sha256 of the file bytes> LF
+```
+
+`NUL` is the byte `0x00` and `LF` is `0x0a`. The digest is stable across
+runs and operating systems. An allowlist that matches no files renders
+`files: 0` with the digest of the empty listing,
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, exit 0,
+and the warning `render produced no files`.
+
+**Data keys.** With `--json` the envelope's `data` carries, in this order,
+`env`, `gateway`, `mode`, `out` (null until `--out` lands), `files`,
+`bytes`, `render_sha256`, `resources`, `tag_providers`, `uuids_minted`,
+`opaque_files` and `warnings`. `resources` is ordered by (module, type,
+name) bytes with singletons (name `null`) first, each entry
+`{module, type, name, files}` with `files` relative to the resource
+directory; the other arrays are in byte order, and `warnings` are in
+pipeline order. Keys are only ever added, never renamed. Human output is
+`rendered gateways/<name> for env <env> (mode <mode>): <n> files, <n> bytes`
+and `render_sha256 <hex>` on stdout, with each warning on stderr as
+`warning: …`. A refusal leaves stdout empty.
+
+**Over MCP.** `deploy render` is in the `ign mcp serve` tool catalog as
+`deploy_render`. It is read-only, so it is not guarded and takes no
+`confirm` argument.
+
 ## Linting (`ign lint`)
 
 `ign lint PATH... [--strict] [-- <extra ignition-lint args>]` delegates
