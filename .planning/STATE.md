@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 21
 current_phase_name: deploy-render
 status: executing
-stopped_at: Completed 21-01-PLAN.md
-last_updated: "2026-10-13T11:46:06.025Z"
+stopped_at: Completed 21-02-PLAN.md
+last_updated: "2026-10-13T12:10:16.193Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 15
-  completed_plans: 7
+  completed_plans: 8
   percent: 17
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 21 (deploy-render) — EXECUTING
-Plan: 2 of 9
+Plan: 3 of 9
 Status: Ready to execute
 Last activity: 2026-10-13 — Phase 21 execution started
 
-Progress: [█████░░░░░] 47%
+Progress: [█████░░░░░] 53%
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 20 P05 | 70min | 2 tasks | 7 files |
 | Phase 20 P06 | 35min | 2 tasks | 3 files |
 | Phase 21 P01 | ~15min | 2 tasks | 200 files |
+| Phase 21 P02 | 25min | 2 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -82,8 +83,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-13T11:46:06.014Z
-**Stopped At:** Completed 21-01-PLAN.md
+**Last session:** 2026-10-13T12:10:16.183Z
+**Stopped At:** Completed 21-02-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -102,3 +103,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 20-06: live gate booted with plain compose.yml; no wire drift, fake trace equals live trace
 - [Phase ?]: [21-01] email-profile secret path is settings.settings.password (RESEARCH typo corrected)
 - [Phase ?]: [21-01] OpenAPI resource taxonomy is 56 types (39 named, 17 singleton), not 87/49
+- [Phase ?]: 21-02 CD1: v8 sha2 uuid loads on 8.3.6 (4516ad9c-d6b0-8d86-89b9-802c96e33a9e for CAP21_V8); D-03 can be frozen
+- [Phase ?]: 21-02 CD3/CD5/CD6: new named types are scope A with uuid; tags/P/type maps to ignition/type/P; gateway encodes colon as %3a and refuses other hostile tag names (NTFS deferred to Phase 22)
