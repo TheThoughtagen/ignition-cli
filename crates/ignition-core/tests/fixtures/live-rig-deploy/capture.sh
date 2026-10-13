@@ -779,6 +779,141 @@ oq8() {
   shcap 'CAP21_REF2 config.json as the gateway wrote it' cat "$coll/$DBT/CAP21_REF2/config.json"
 }
 
+export IGN21_CAPTURED=$HERE/../deploy/captured
+TAGKINDS=(tag-provider tag-group tag-type-definition tag-definition)
+
+# tagfiles PROVIDER: every gateway-written file for PROVIDER under the four
+# tag directories of the core collection, as bind-relative paths, sorted.
+tagfiles() {
+  local k
+  for k in "${TAGKINDS[@]}"; do
+    [ -d "$BIND21/core/ignition/$k/$1" ] && (cd "$BIND21" && find "core/ignition/$k/$1" -type f)
+  done | LC_ALL=C sort
+}
+
+# oq1 (C21-OQ1): gateway-written tag-file bytes. Copies them (cp -R, no
+# re-serialization) into fixtures/deploy/captured/ under collection-relative paths.
+oq1() {
+  local f k
+  sect OQ1 'gateway-written bytes of tag-provider, tag-group, tag-type-definition and tag-definition files for provider CAP21'
+  cat > "$STATE/oq1-import.json" <<'JSON'
+[
+  {"name": "_types_", "tagType": "Folder", "tags": [
+    {"name": "CAP21_Type", "tagType": "UdtType", "tags": [
+      {"name": "M1", "tagType": "AtomicTag", "dataType": "Int4", "valueSource": "memory", "value": 1}
+    ]}
+  ]},
+  {"name": "FolderA", "tagType": "Folder", "tags": [
+    {"name": "F1", "tagType": "AtomicTag", "dataType": "Float8", "valueSource": "memory", "value": 1.5},
+    {"name": "F2", "tagType": "AtomicTag", "dataType": "Float8", "valueSource": "memory", "value": 10000000000.0},
+    {"name": "BigInt", "tagType": "AtomicTag", "dataType": "Int8", "valueSource": "memory", "value": 9007199254740993},
+    {"name": "Unicode", "tagType": "AtomicTag", "dataType": "String", "valueSource": "memory", "value": "Température ✓"},
+    {"name": "Expr", "tagType": "AtomicTag", "dataType": "Boolean", "valueSource": "expr", "expression": "1 < 2 && 3 > 2 && 'a' = 'a'"},
+    {"name": "Inst1", "tagType": "UdtInstance", "typeId": "CAP21_Type"}
+  ]}
+]
+JSON
+  shcap 'import file for provider CAP21 (script-written input)' bash -c 'cat "$IGN21_DIR/oq1-import.json"'
+  shcap 'ign tags provider create CAP21' ign tags provider create CAP21 --profile rig21 --json
+  shcap 'ign tags import into CAP21' bash -c 'ign tags import --profile rig21 --provider CAP21 --file "$IGN21_DIR/oq1-import.json" --json'
+  sleep 15
+  shcap 'file list for CAP21 with sizes (bytes)' bash -c 'find core/ignition/tag-provider/CAP21 core/ignition/tag-group/CAP21 core/ignition/tag-type-definition/CAP21 core/ignition/tag-definition/CAP21 -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do printf "%s %s\n" "$(wc -c < "$f" | tr -d " ")" "$f"; done'
+  shcap 'file list for CAP21 with sha256' bash -c 'find core/ignition/tag-provider/CAP21 core/ignition/tag-group/CAP21 core/ignition/tag-type-definition/CAP21 core/ignition/tag-definition/CAP21 -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done'
+  while IFS= read -r f; do
+    shcap "bytes of $f" cat "$f"
+  done < <(tagfiles CAP21)
+  mkdir -p "$IGN21_CAPTURED"
+  for k in "${TAGKINDS[@]}"; do
+    [ -d "$BIND21/core/ignition/$k/CAP21" ] || continue
+    shcap "copy gateway-written $k/CAP21 into fixtures/deploy/captured (cp -R, bytes unchanged)" \
+      bash -c 'mkdir -p "$IGN21_CAPTURED/ignition/$1" && cp -R "core/ignition/$1/CAP21" "$IGN21_CAPTURED/ignition/$1/"' _ "$k"
+  done
+}
+
+# oq4 (C21-OQ4): where the gateway put every CAP21 path.
+oq4() {
+  sect OQ4 'sorted find listing of every path the gateway wrote for provider CAP21 (repo-path to collection-path mapping)'
+  shcap 'find listing, whole bind directory, paths naming CAP21 as a provider directory' \
+    bash -c 'find . \( -path "*/tag-*/CAP21" -o -path "*/tag-*/CAP21/*" \) | LC_ALL=C sort'
+  shcap 'tag-related directories of the core collection (one level)' bash -c 'ls -1 core/ignition | grep -E "^tag-" | LC_ALL=C sort'
+  shcap 'ign tags provider list (provider names and tag counts)' ign tags provider list --profile rig21 --json
+}
+
+# c5_import NAME: one single-folder import into CAP21H, name given inline so the
+# JSON is visible in the block's command line.
+c5_import() {
+  local json
+  json=$(jq -cn --arg n "$1" '[{name: $n, tagType: "Folder", tags: [{name: "T1", tagType: "AtomicTag", dataType: "Int4", valueSource: "memory", value: 1}]}]')
+  shcap "ign tags import folder named '$1' into CAP21H" \
+    bash -c 'printf "%s" "$1" | ign tags import --profile rig21 --provider CAP21H --file - --json' _ "$json"
+}
+
+# c5_list: byte-faithful on-disk names of every CAP21H tag directory entry.
+c5_list() {
+  shcap "${1:-on-disk names under every CAP21H tag directory, repr() of each entry}" python3 -I -c '
+import os
+out = []
+for kind in ("tag-provider", "tag-group", "tag-type-definition", "tag-definition"):
+    base = os.path.join("core/ignition", kind, "CAP21H")
+    for root, dirs, files in os.walk(base):
+        for n in dirs + files:
+            out.append(os.path.relpath(os.path.join(root, n), "core/ignition"))
+for p in sorted(out):
+    print(repr(p))
+'
+}
+
+# c5 (C21-C5): hostile directory names on the Linux rig. Nothing under CAP21H
+# is copied into the repository.
+c5() {
+  local name json
+  sect C5 'hostile names (colon, question mark, trailing dot, space, comma, Case/case) imported into provider CAP21H; on-disk names on Linux'
+  shcap 'ign tags provider create CAP21H' ign tags provider create CAP21H --profile rig21 --json
+  for name in 'a:b' 'q?' 'trail.' 'has space' 'com,ma'; do
+    c5_import "$name"
+  done
+  json=$(jq -cn '[{name: "Case", tagType: "Folder", tags: [{name: "T1", tagType: "AtomicTag", dataType: "Int4", valueSource: "memory", value: 1}]}, {name: "case", tagType: "Folder", tags: [{name: "T2", tagType: "AtomicTag", dataType: "Int4", valueSource: "memory", value: 2}]}]')
+  shcap "ign tags import sibling folders 'Case' and 'case' into CAP21H (one import)" \
+    bash -c 'printf "%s" "$1" | ign tags import --profile rig21 --provider CAP21H --file - --json' _ "$json"
+  sleep 15
+  c5_list
+}
+
+# c5log (C21-C5, second section): the import calls above answered success for every
+# name; the gateway's own verdict is in its log, and the listing is repeated after
+# the asynchronous flush has had longer to run.
+c5log() {
+  sect C5 'gateway verdicts for the CAP21H imports (log) and the on-disk names again after a longer wait'
+  sleep 20
+  c5_list 'on-disk names under every CAP21H tag directory, repr() of each entry (second look)'
+  glog "CAP21H.*(Error processing edit|not a valid tag name|already exists)|Error processing edit for tag path '\\[CAP21H\\]"
+  shcap 'bytes of core/ignition/tag-definition/CAP21H/Case/tags.json' cat core/ignition/tag-definition/CAP21H/Case/tags.json
+  shcap 'bytes of core/ignition/tag-definition/CAP21H/a%3ab/tags.json' cat 'core/ignition/tag-definition/CAP21H/a%3ab/tags.json'
+}
+
+# c5x (C21-C5, third section): further Windows-illegal characters and a literal
+# name that collides with the percent-encoded colon, to see what the gateway does.
+c5x() {
+  local name
+  sect C5 'extra probes in CAP21H: Windows-illegal characters (* | " < >) and a literal a%3ab beside the encoded a:b'
+  for name in 'a*b' 'a|b' 'a"b' 'a<b' 'a>b' 'a%3ab'; do
+    c5_import "$name"
+  done
+  sleep 25
+  c5_list 'on-disk names under every CAP21H tag directory, repr() of each entry (after the extra probes)'
+  glog "Error processing edit for tag path '\\[CAP21H\\]"
+}
+
+# c4c (C21-C4, third section): the store-and-forward-engine resource the gateway
+# created as a side effect of the database-connection creates in oq8 (Phase 20 D10);
+# the one named type in the corpus census that carries scope G and no uuid.
+c4c() {
+  sect C4 'side effect of creating a database-connection: the gateway-written store-and-forward-engine resource (scope G, no uuid in the corpus)'
+  shcap 'store-and-forward-engine files written for CAP21_REF' bash -c 'find . -path "*/store-and-forward-engine/CAP21_REF/*" -type f | LC_ALL=C sort'
+  shcap 'bytes of core/ignition/store-and-forward-engine/CAP21_REF/resource.json' cat core/ignition/store-and-forward-engine/CAP21_REF/resource.json
+  shcap 'bytes of core/ignition/store-and-forward-engine/CAP21_REF/config.json' cat core/ignition/store-and-forward-engine/CAP21_REF/config.json
+}
+
 case "${1:-}" in
   c1) c1 ;;
   clist_extra2) clist_extra2 ;;
@@ -800,6 +935,12 @@ case "${1:-}" in
   c3b) c3b ;;
   c4) c4 ;;
   c4b) c4b ;;
+  c4c) c4c ;;
   oq8) oq8 ;;
-  *) echo "usage: capture.sh c1|cnull [LABEL]|cmode|c3a|clist|wait|up21|setup21|header21|hdrrow|shcap|v8uuid|check21|uuid8|c3b|c4|c4b|oq8" >&2; exit 64 ;;
+  oq1) oq1 ;;
+  oq4) oq4 ;;
+  c5) c5 ;;
+  c5log) c5log ;;
+  c5x) c5x ;;
+  *) echo "usage: capture.sh c1|cnull [LABEL]|cmode|c3a|clist|wait|up21|setup21|header21|hdrrow|shcap|v8uuid|check21|uuid8|c3b|c4|c4b|c4c|oq8|oq1|oq4|c5|c5log|c5x" >&2; exit 64 ;;
 esac

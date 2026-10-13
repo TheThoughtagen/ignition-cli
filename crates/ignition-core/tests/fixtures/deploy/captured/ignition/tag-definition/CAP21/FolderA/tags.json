@@ -1,0 +1,37 @@
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int8",
+    "name": "BigInt",
+    "defaultValue": 9007199254740993,
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "memory",
+    "dataType": "String",
+    "name": "Unicode",
+    "defaultValue": "Température ✓",
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "expr",
+    "expression": "1 \u003c 2 \u0026\u0026 3 \u003e 2 \u0026\u0026 \u0027a\u0027 \u003d \u0027a\u0027",
+    "dataType": "Boolean",
+    "name": "Expr",
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "memory",
+    "dataType": "Float8",
+    "name": "F1",
+    "defaultValue": 1.5,
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "memory",
+    "dataType": "Float8",
+    "name": "F2",
+    "defaultValue": 1.0E10,
+    "tagType": "AtomicTag"
+  }
+]

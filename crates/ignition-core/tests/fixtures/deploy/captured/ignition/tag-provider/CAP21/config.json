@@ -1,0 +1,15 @@
+{
+  "profile": {
+    "allowBackfill": false,
+    "enableTagReferenceStore": false,
+    "type": "STANDARD"
+  },
+  "settings": {
+    "defaultDatasourceName": null,
+    "editPermissions": null,
+    "readOnly": false,
+    "readPermissions": null,
+    "valuePersistence": null,
+    "writePermissions": null
+  }
+}

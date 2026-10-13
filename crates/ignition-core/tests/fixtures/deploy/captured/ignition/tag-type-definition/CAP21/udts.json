@@ -1,0 +1,15 @@
+[
+  {
+    "name": "CAP21_Type",
+    "tagType": "UdtType",
+    "tags": [
+      {
+        "valueSource": "memory",
+        "dataType": "Int4",
+        "name": "M1",
+        "value": 1,
+        "tagType": "AtomicTag"
+      }
+    ]
+  }
+]

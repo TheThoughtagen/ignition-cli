@@ -9,6 +9,7 @@
 | deploymentMode | production |
 | Started (UTC) | 2026-10-13T11:50:17Z |
 | ign --version | ign 1.5.0 |
+| WebDev routes (ign webdev deploy) | deployed to rig21 with `ign webdev deploy --yes`; first import left the `tags` route unregistered (`ign webdev status`: absent), a second deploy registered all four routes |
 
 ## C21-UUID8 — D-03 live check: a hand-written resource carrying a sha2-derived version-8 uuid
 
@@ -1147,3 +1148,1068 @@ $ cat core/ignition/oauth2-client/CAP21_OAUTH/resource.json @ 2026-10-13T11:59:2
 [output did not end with a newline]
 [exit 0]
 ~~~
+
+## C21-OQ1 — gateway-written bytes of tag-provider, tag-group, tag-type-definition and tag-definition files for provider CAP21
+
+### import file for provider CAP21 (script-written input)
+
+~~~
+$ bash -c cat\ \"\$IGN21_DIR/oq1-import.json\" @ 2026-10-13T12:04:15Z
+[
+  {"name": "_types_", "tagType": "Folder", "tags": [
+    {"name": "CAP21_Type", "tagType": "UdtType", "tags": [
+      {"name": "M1", "tagType": "AtomicTag", "dataType": "Int4", "valueSource": "memory", "value": 1}
+    ]}
+  ]},
+  {"name": "FolderA", "tagType": "Folder", "tags": [
+    {"name": "F1", "tagType": "AtomicTag", "dataType": "Float8", "valueSource": "memory", "value": 1.5},
+    {"name": "F2", "tagType": "AtomicTag", "dataType": "Float8", "valueSource": "memory", "value": 10000000000.0},
+    {"name": "BigInt", "tagType": "AtomicTag", "dataType": "Int8", "valueSource": "memory", "value": 9007199254740993},
+    {"name": "Unicode", "tagType": "AtomicTag", "dataType": "String", "valueSource": "memory", "value": "Température ✓"},
+    {"name": "Expr", "tagType": "AtomicTag", "dataType": "Boolean", "valueSource": "expr", "expression": "1 < 2 && 3 > 2 && 'a' = 'a'"},
+    {"name": "Inst1", "tagType": "UdtInstance", "typeId": "CAP21_Type"}
+  ]}
+]
+[exit 0]
+~~~
+
+### ign tags provider create CAP21
+
+~~~
+$ ign tags provider create CAP21 --profile rig21 --json @ 2026-10-13T12:04:15Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "name": "CAP21"
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import into CAP21
+
+~~~
+$ bash -c ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21\ --file\ \"\$IGN21_DIR/oq1-import.json\"\ --json @ 2026-10-13T12:04:15Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21",
+    "collision_policy": "abort",
+    "imported": 2,
+    "format": "json",
+    "top_level_names": [
+      "_types_",
+      "FolderA"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### file list for CAP21 with sizes (bytes)
+
+~~~
+$ bash -c find\ core/ignition/tag-provider/CAP21\ core/ignition/tag-group/CAP21\ core/ignition/tag-type-definition/CAP21\ core/ignition/tag-definition/CAP21\ -type\ f\ 2\>/dev/null\ \|\ LC_ALL=C\ sort\ \|\ while\ IFS=\ read\ -r\ f\;\ do\ printf\ \"%s\ %s\\n\"\ \"\$\(wc\ -c\ \<\ \"\$f\"\ \|\ tr\ -d\ \"\ \"\)\"\ \"\$f\"\;\ done @ 2026-10-13T12:04:30Z
+790 core/ignition/tag-definition/CAP21/FolderA/tags.json
+89 core/ignition/tag-definition/CAP21/FolderA/udts.json
+171 core/ignition/tag-definition/CAP21/FolderA/unary-resource.json
+135 core/ignition/tag-definition/CAP21/unary-resource.json
+199 core/ignition/tag-group/CAP21/Default Historical/config.json
+136 core/ignition/tag-group/CAP21/Default Historical/resource.json
+198 core/ignition/tag-group/CAP21/Default/config.json
+136 core/ignition/tag-group/CAP21/Default/resource.json
+307 core/ignition/tag-provider/CAP21/config.json
+211 core/ignition/tag-provider/CAP21/resource.json
+233 core/ignition/tag-type-definition/CAP21/udts.json
+154 core/ignition/tag-type-definition/CAP21/unary-resource.json
+[exit 0]
+~~~
+
+### file list for CAP21 with sha256
+
+~~~
+$ bash -c find\ core/ignition/tag-provider/CAP21\ core/ignition/tag-group/CAP21\ core/ignition/tag-type-definition/CAP21\ core/ignition/tag-definition/CAP21\ -type\ f\ 2\>/dev/null\ \|\ LC_ALL=C\ sort\ \|\ while\ IFS=\ read\ -r\ f\;\ do\ shasum\ -a\ 256\ \"\$f\"\;\ done @ 2026-10-13T12:04:30Z
+69b77cfab736e4d83c0471f295ec014b7fa6df60b47949ca29776b527cf4a8d4  core/ignition/tag-definition/CAP21/FolderA/tags.json
+9c4aea4975b04d2147e902a34b96bb4bdca3c5fc825673f3dd5d6c359f5e1cfe  core/ignition/tag-definition/CAP21/FolderA/udts.json
+e6ca38f4553c5c6f6a292cf6df3541ddce4036550056ae611738cc12d56c4e97  core/ignition/tag-definition/CAP21/FolderA/unary-resource.json
+4e76fe7dd0d0ee1da9fe7be0fb8a8dca8027f4430bbfec579b8f478556a0cf20  core/ignition/tag-definition/CAP21/unary-resource.json
+3681179aa816d7860708c77fb0c8364e648fc7c203ed637117b71384ff677c41  core/ignition/tag-group/CAP21/Default Historical/config.json
+6171900ae01a3a5d8fa7dda5fdc07283a260008caaec82f475d12147e593ba64  core/ignition/tag-group/CAP21/Default Historical/resource.json
+2cbb0ed18730c5572182dd61952a0dbe271908f9aaef4779d54f6ab2b3409b4b  core/ignition/tag-group/CAP21/Default/config.json
+6171900ae01a3a5d8fa7dda5fdc07283a260008caaec82f475d12147e593ba64  core/ignition/tag-group/CAP21/Default/resource.json
+302f76fcbc0cf1f1f3f00cf5f1eed4a8acfd188f84286f0b754340be17243e55  core/ignition/tag-provider/CAP21/config.json
+79650d22b461bb8f654f7ea9b9e882e548367d8b627ba774735e3f095bb38b31  core/ignition/tag-provider/CAP21/resource.json
+70ad0242e32f2dbea3a9c9311943a9af1fb217934eb98a24208b48b6ba0b5657  core/ignition/tag-type-definition/CAP21/udts.json
+16d0f629e68eb94a5114668d97d16337320175ac606f9ed01260808ef90d483e  core/ignition/tag-type-definition/CAP21/unary-resource.json
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-definition/CAP21/FolderA/tags.json
+
+~~~
+$ cat core/ignition/tag-definition/CAP21/FolderA/tags.json @ 2026-10-13T12:04:31Z
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int8",
+    "name": "BigInt",
+    "defaultValue": 9007199254740993,
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "memory",
+    "dataType": "String",
+    "name": "Unicode",
+    "defaultValue": "Température ✓",
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "expr",
+    "expression": "1 \u003c 2 \u0026\u0026 3 \u003e 2 \u0026\u0026 \u0027a\u0027 \u003d \u0027a\u0027",
+    "dataType": "Boolean",
+    "name": "Expr",
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "memory",
+    "dataType": "Float8",
+    "name": "F1",
+    "defaultValue": 1.5,
+    "tagType": "AtomicTag"
+  },
+  {
+    "valueSource": "memory",
+    "dataType": "Float8",
+    "name": "F2",
+    "defaultValue": 1.0E10,
+    "tagType": "AtomicTag"
+  }
+]
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-definition/CAP21/FolderA/udts.json
+
+~~~
+$ cat core/ignition/tag-definition/CAP21/FolderA/udts.json @ 2026-10-13T12:04:31Z
+[
+  {
+    "name": "Inst1",
+    "typeId": "CAP21_Type",
+    "tagType": "UdtInstance"
+  }
+]
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-definition/CAP21/FolderA/unary-resource.json
+
+~~~
+$ cat core/ignition/tag-definition/CAP21/FolderA/unary-resource.json @ 2026-10-13T12:04:31Z
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "tags.json",
+    "udts.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-definition/CAP21/unary-resource.json
+
+~~~
+$ cat core/ignition/tag-definition/CAP21/unary-resource.json @ 2026-10-13T12:04:31Z
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [],
+  "attributes": {
+    "config": {}
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-group/CAP21/Default Historical/config.json
+
+~~~
+$ cat core/ignition/tag-group/CAP21/Default\ Historical/config.json @ 2026-10-13T12:04:31Z
+{
+  "config": {
+    "mode": "Direct",
+    "oneShot": false,
+    "opcDataMode": "Subscribed",
+    "optWriteTimeout": 60000,
+    "optWrites": false,
+    "rate": 10000,
+    "readAfterWrite": false
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-group/CAP21/Default Historical/resource.json
+
+~~~
+$ cat core/ignition/tag-group/CAP21/Default\ Historical/resource.json @ 2026-10-13T12:04:31Z
+{
+  "scope": "A",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "config.json"
+  ],
+  "attributes": {}
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-group/CAP21/Default/config.json
+
+~~~
+$ cat core/ignition/tag-group/CAP21/Default/config.json @ 2026-10-13T12:04:31Z
+{
+  "config": {
+    "mode": "Direct",
+    "oneShot": false,
+    "opcDataMode": "Subscribed",
+    "optWriteTimeout": 60000,
+    "optWrites": false,
+    "rate": 1000,
+    "readAfterWrite": false
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-group/CAP21/Default/resource.json
+
+~~~
+$ cat core/ignition/tag-group/CAP21/Default/resource.json @ 2026-10-13T12:04:31Z
+{
+  "scope": "A",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "config.json"
+  ],
+  "attributes": {}
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-provider/CAP21/config.json
+
+~~~
+$ cat core/ignition/tag-provider/CAP21/config.json @ 2026-10-13T12:04:31Z
+{
+  "profile": {
+    "allowBackfill": false,
+    "enableTagReferenceStore": false,
+    "type": "STANDARD"
+  },
+  "settings": {
+    "defaultDatasourceName": null,
+    "editPermissions": null,
+    "readOnly": false,
+    "readPermissions": null,
+    "valuePersistence": null,
+    "writePermissions": null
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-provider/CAP21/resource.json
+
+~~~
+$ cat core/ignition/tag-provider/CAP21/resource.json @ 2026-10-13T12:04:31Z
+{
+  "scope": "A",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "config.json"
+  ],
+  "attributes": {
+    "uuid": "c6e25805-b786-4d44-ae77-6fe6685410fb",
+    "enabled": true
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-type-definition/CAP21/udts.json
+
+~~~
+$ cat core/ignition/tag-type-definition/CAP21/udts.json @ 2026-10-13T12:04:31Z
+[
+  {
+    "name": "CAP21_Type",
+    "tagType": "UdtType",
+    "tags": [
+      {
+        "valueSource": "memory",
+        "dataType": "Int4",
+        "name": "M1",
+        "value": 1,
+        "tagType": "AtomicTag"
+      }
+    ]
+  }
+]
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-type-definition/CAP21/unary-resource.json
+
+~~~
+$ cat core/ignition/tag-type-definition/CAP21/unary-resource.json @ 2026-10-13T12:04:31Z
+{
+  "scope": "G",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "udts.json"
+  ],
+  "attributes": {
+    "config": {}
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### copy gateway-written tag-provider/CAP21 into fixtures/deploy/captured (cp -R, bytes unchanged)
+
+~~~
+$ bash -c mkdir\ -p\ \"\$IGN21_CAPTURED/ignition/\$1\"\ \&\&\ cp\ -R\ \"core/ignition/\$1/CAP21\"\ \"\$IGN21_CAPTURED/ignition/\$1/\" _ tag-provider @ 2026-10-13T12:04:31Z
+[exit 0]
+~~~
+
+### copy gateway-written tag-group/CAP21 into fixtures/deploy/captured (cp -R, bytes unchanged)
+
+~~~
+$ bash -c mkdir\ -p\ \"\$IGN21_CAPTURED/ignition/\$1\"\ \&\&\ cp\ -R\ \"core/ignition/\$1/CAP21\"\ \"\$IGN21_CAPTURED/ignition/\$1/\" _ tag-group @ 2026-10-13T12:04:31Z
+[exit 0]
+~~~
+
+### copy gateway-written tag-type-definition/CAP21 into fixtures/deploy/captured (cp -R, bytes unchanged)
+
+~~~
+$ bash -c mkdir\ -p\ \"\$IGN21_CAPTURED/ignition/\$1\"\ \&\&\ cp\ -R\ \"core/ignition/\$1/CAP21\"\ \"\$IGN21_CAPTURED/ignition/\$1/\" _ tag-type-definition @ 2026-10-13T12:04:31Z
+[exit 0]
+~~~
+
+### copy gateway-written tag-definition/CAP21 into fixtures/deploy/captured (cp -R, bytes unchanged)
+
+~~~
+$ bash -c mkdir\ -p\ \"\$IGN21_CAPTURED/ignition/\$1\"\ \&\&\ cp\ -R\ \"core/ignition/\$1/CAP21\"\ \"\$IGN21_CAPTURED/ignition/\$1/\" _ tag-definition @ 2026-10-13T12:04:31Z
+[exit 0]
+~~~
+
+## C21-OQ4 — sorted find listing of every path the gateway wrote for provider CAP21 (repo-path to collection-path mapping)
+
+### find listing, whole bind directory, paths naming CAP21 as a provider directory
+
+~~~
+$ bash -c find\ .\ \\\(\ -path\ \"\*/tag-\*/CAP21\"\ -o\ -path\ \"\*/tag-\*/CAP21/\*\"\ \\\)\ \|\ LC_ALL=C\ sort @ 2026-10-13T12:04:36Z
+./core/ignition/tag-definition/CAP21
+./core/ignition/tag-definition/CAP21/FolderA
+./core/ignition/tag-definition/CAP21/FolderA/tags.json
+./core/ignition/tag-definition/CAP21/FolderA/udts.json
+./core/ignition/tag-definition/CAP21/FolderA/unary-resource.json
+./core/ignition/tag-definition/CAP21/unary-resource.json
+./core/ignition/tag-group/CAP21
+./core/ignition/tag-group/CAP21/Default
+./core/ignition/tag-group/CAP21/Default Historical
+./core/ignition/tag-group/CAP21/Default Historical/config.json
+./core/ignition/tag-group/CAP21/Default Historical/resource.json
+./core/ignition/tag-group/CAP21/Default/config.json
+./core/ignition/tag-group/CAP21/Default/resource.json
+./core/ignition/tag-provider/CAP21
+./core/ignition/tag-provider/CAP21/config.json
+./core/ignition/tag-provider/CAP21/resource.json
+./core/ignition/tag-type-definition/CAP21
+./core/ignition/tag-type-definition/CAP21/udts.json
+./core/ignition/tag-type-definition/CAP21/unary-resource.json
+[exit 0]
+~~~
+
+### tag-related directories of the core collection (one level)
+
+~~~
+$ bash -c ls\ -1\ core/ignition\ \|\ grep\ -E\ \"\^tag-\"\ \|\ LC_ALL=C\ sort @ 2026-10-13T12:04:36Z
+tag-definition
+tag-group
+tag-provider
+tag-type-definition
+[exit 0]
+~~~
+
+### ign tags provider list (provider names and tag counts)
+
+~~~
+$ ign tags provider list --profile rig21 --json @ 2026-10-13T12:04:36Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "providers": [
+      {
+        "name": "CAP21",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": false
+      },
+      {
+        "name": "System",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": true
+      },
+      {
+        "name": "default",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": false
+      }
+    ]
+  }
+}
+[exit 0]
+~~~
+
+## C21-C5 — hostile names (colon, question mark, trailing dot, space, comma, Case/case) imported into provider CAP21H; on-disk names on Linux
+
+### ign tags provider create CAP21H
+
+~~~
+$ ign tags provider create CAP21H --profile rig21 --json @ 2026-10-13T12:04:36Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "name": "CAP21H"
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'a:b' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a:b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:04:36Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a:b"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'q?' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"q\?\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:04:36Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "q?"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'trail.' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"trail.\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:04:36Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "trail."
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'has space' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"has\ space\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:04:37Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "has space"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'com,ma' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"com\,ma\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:04:37Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "com,ma"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import sibling folders 'Case' and 'case' into CAP21H (one import)
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"Case\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\,\{\"name\":\"case\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T2\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":2\}\]\}\] @ 2026-10-13T12:04:37Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 2,
+    "format": "json",
+    "top_level_names": [
+      "Case",
+      "case"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### on-disk names under every CAP21H tag directory, repr() of each entry
+
+~~~
+$ python3 -I -c $'\nimport os\nout = []\nfor kind in ("tag-provider", "tag-group", "tag-type-definition", "tag-definition"):\n    base = os.path.join("core/ignition", kind, "CAP21H")\n    for root, dirs, files in os.walk(base):\n        for n in dirs + files:\n            out.append(os.path.relpath(os.path.join(root, n), "core/ignition"))\nfor p in sorted(out):\n    print(repr(p))\n' @ 2026-10-13T12:04:52Z
+'tag-definition/CAP21H/Case'
+'tag-definition/CAP21H/Case/tags.json'
+'tag-definition/CAP21H/Case/unary-resource.json'
+'tag-definition/CAP21H/a%3ab'
+'tag-definition/CAP21H/a%3ab/tags.json'
+'tag-definition/CAP21H/a%3ab/unary-resource.json'
+'tag-definition/CAP21H/has space'
+'tag-definition/CAP21H/has space/tags.json'
+'tag-definition/CAP21H/has space/unary-resource.json'
+'tag-definition/CAP21H/unary-resource.json'
+'tag-group/CAP21H/Default'
+'tag-group/CAP21H/Default Historical'
+'tag-group/CAP21H/Default Historical/config.json'
+'tag-group/CAP21H/Default Historical/resource.json'
+'tag-group/CAP21H/Default/config.json'
+'tag-group/CAP21H/Default/resource.json'
+'tag-provider/CAP21H/config.json'
+'tag-provider/CAP21H/resource.json'
+'tag-type-definition/CAP21H/unary-resource.json'
+[exit 0]
+~~~
+
+## C21-C5 — gateway verdicts for the CAP21H imports (log) and the on-disk names again after a longer wait
+
+### on-disk names under every CAP21H tag directory, repr() of each entry (second look)
+
+~~~
+$ python3 -I -c $'\nimport os\nout = []\nfor kind in ("tag-provider", "tag-group", "tag-type-definition", "tag-definition"):\n    base = os.path.join("core/ignition", kind, "CAP21H")\n    for root, dirs, files in os.walk(base):\n        for n in dirs + files:\n            out.append(os.path.relpath(os.path.join(root, n), "core/ignition"))\nfor p in sorted(out):\n    print(repr(p))\n' @ 2026-10-13T12:06:05Z
+'tag-definition/CAP21H/Case'
+'tag-definition/CAP21H/Case/tags.json'
+'tag-definition/CAP21H/Case/unary-resource.json'
+'tag-definition/CAP21H/a%3ab'
+'tag-definition/CAP21H/a%3ab/tags.json'
+'tag-definition/CAP21H/a%3ab/unary-resource.json'
+'tag-definition/CAP21H/has space'
+'tag-definition/CAP21H/has space/tags.json'
+'tag-definition/CAP21H/has space/unary-resource.json'
+'tag-definition/CAP21H/unary-resource.json'
+'tag-group/CAP21H/Default'
+'tag-group/CAP21H/Default Historical'
+'tag-group/CAP21H/Default Historical/config.json'
+'tag-group/CAP21H/Default Historical/resource.json'
+'tag-group/CAP21H/Default/config.json'
+'tag-group/CAP21H/Default/resource.json'
+'tag-provider/CAP21H/config.json'
+'tag-provider/CAP21H/resource.json'
+'tag-type-definition/CAP21H/unary-resource.json'
+[exit 0]
+~~~
+
+### gateway log lines matching: CAP21H.*(Error processing edit|not a valid tag name|already exists)|Error processing edit for tag path '\[CAP21H\]
+
+~~~
+$ bash -c docker\ logs\ \"\$1\"\ 2\>\&1\ \|\ grep\ -E\ --\ \"\$2\"\ \|\|\ true _ ign-deploy-rig-gw-1 CAP21H.\*\(Error\ processing\ edit\|not\ a\ valid\ tag\ name\|already\ exists\)\|Error\ processing\ edit\ for\ tag\ path\ \'\\\[CAP21H\\\] @ 2026-10-13T12:06:05Z
+jvm 1    | 2026/10/13 12:04:36 | E [t.m.provider                  ] [12:04:36.968]: Error processing edit for tag path '[CAP21H]q?': Error_Configuration("The name 'q?' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:04:37 | E [t.m.provider                  ] [12:04:37.028]: Error processing edit for tag path '[CAP21H]trail.': Error_Configuration("The name 'trail.' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:04:37 | E [t.m.provider                  ] [12:04:37.147]: Error processing edit for tag path '[CAP21H]com,ma': Error_Configuration("The name 'com,ma' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:04:37 | E [t.m.provider                  ] [12:04:37.217]: Error processing edit for tag path '[CAP21H]case': Bad_Failure("Tag '[CAP21H]case' already exists, and 'abort' collision policy has been specified") 
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-definition/CAP21H/Case/tags.json
+
+~~~
+$ cat core/ignition/tag-definition/CAP21H/Case/tags.json @ 2026-10-13T12:06:05Z
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int4",
+    "name": "T1",
+    "defaultValue": 1,
+    "tagType": "AtomicTag"
+  }
+]
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/tag-definition/CAP21H/a%3ab/tags.json
+
+~~~
+$ cat core/ignition/tag-definition/CAP21H/a%3ab/tags.json @ 2026-10-13T12:06:05Z
+[
+  {
+    "valueSource": "memory",
+    "dataType": "Int4",
+    "name": "T1",
+    "defaultValue": 1,
+    "tagType": "AtomicTag"
+  }
+]
+[output did not end with a newline]
+[exit 0]
+~~~
+
+## C21-C5 — extra probes in CAP21H: Windows-illegal characters (* | " < >) and a literal a%3ab beside the encoded a:b
+
+### ign tags import folder named 'a*b' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a\*b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:06:05Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a*b"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'a|b' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a\|b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:06:05Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a|b"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'a"b' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a\\\"b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:06:05Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a\"b"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'a<b' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a\<b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:06:05Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a<b"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'a>b' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a\>b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:06:05Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a>b"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### ign tags import folder named 'a%3ab' into CAP21H
+
+~~~
+$ bash -c printf\ \"%s\"\ \"\$1\"\ \|\ ign\ tags\ import\ --profile\ rig21\ --provider\ CAP21H\ --file\ -\ --json _ \[\{\"name\":\"a%3ab\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\] @ 2026-10-13T12:06:05Z
+{
+  "ok": true,
+  "profile": "rig21",
+  "data": {
+    "project": "ign-cli",
+    "provider": "CAP21H",
+    "collision_policy": "abort",
+    "imported": 1,
+    "format": "json",
+    "top_level_names": [
+      "a%3ab"
+    ],
+    "loss_facts": [],
+    "failed": []
+  }
+}
+[exit 0]
+~~~
+
+### on-disk names under every CAP21H tag directory, repr() of each entry (after the extra probes)
+
+~~~
+$ python3 -I -c $'\nimport os\nout = []\nfor kind in ("tag-provider", "tag-group", "tag-type-definition", "tag-definition"):\n    base = os.path.join("core/ignition", kind, "CAP21H")\n    for root, dirs, files in os.walk(base):\n        for n in dirs + files:\n            out.append(os.path.relpath(os.path.join(root, n), "core/ignition"))\nfor p in sorted(out):\n    print(repr(p))\n' @ 2026-10-13T12:06:30Z
+'tag-definition/CAP21H/Case'
+'tag-definition/CAP21H/Case/tags.json'
+'tag-definition/CAP21H/Case/unary-resource.json'
+'tag-definition/CAP21H/a%3ab'
+'tag-definition/CAP21H/a%3ab/tags.json'
+'tag-definition/CAP21H/a%3ab/unary-resource.json'
+'tag-definition/CAP21H/has space'
+'tag-definition/CAP21H/has space/tags.json'
+'tag-definition/CAP21H/has space/unary-resource.json'
+'tag-definition/CAP21H/unary-resource.json'
+'tag-group/CAP21H/Default'
+'tag-group/CAP21H/Default Historical'
+'tag-group/CAP21H/Default Historical/config.json'
+'tag-group/CAP21H/Default Historical/resource.json'
+'tag-group/CAP21H/Default/config.json'
+'tag-group/CAP21H/Default/resource.json'
+'tag-provider/CAP21H/config.json'
+'tag-provider/CAP21H/resource.json'
+'tag-type-definition/CAP21H/unary-resource.json'
+[exit 0]
+~~~
+
+### gateway log lines matching: Error processing edit for tag path '\[CAP21H\]
+
+~~~
+$ bash -c docker\ logs\ \"\$1\"\ 2\>\&1\ \|\ grep\ -E\ --\ \"\$2\"\ \|\|\ true _ ign-deploy-rig-gw-1 Error\ processing\ edit\ for\ tag\ path\ \'\\\[CAP21H\\\] @ 2026-10-13T12:06:31Z
+jvm 1    | 2026/10/13 12:04:36 | E [t.m.provider                  ] [12:04:36.968]: Error processing edit for tag path '[CAP21H]q?': Error_Configuration("The name 'q?' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:04:37 | E [t.m.provider                  ] [12:04:37.028]: Error processing edit for tag path '[CAP21H]trail.': Error_Configuration("The name 'trail.' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:04:37 | E [t.m.provider                  ] [12:04:37.147]: Error processing edit for tag path '[CAP21H]com,ma': Error_Configuration("The name 'com,ma' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:04:37 | E [t.m.provider                  ] [12:04:37.217]: Error processing edit for tag path '[CAP21H]case': Bad_Failure("Tag '[CAP21H]case' already exists, and 'abort' collision policy has been specified") 
+jvm 1    | 2026/10/13 12:06:05 | E [t.m.provider                  ] [12:06:05.428]: Error processing edit for tag path '[CAP21H]a*b': Error_Configuration("The name 'a*b' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:06:05 | E [t.m.provider                  ] [12:06:05.527]: Error processing edit for tag path '[CAP21H]a|b': Error_Configuration("The name 'a|b' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:06:05 | E [t.m.provider                  ] [12:06:05.589]: Error processing edit for tag path '[CAP21H]a"b': Error_Configuration("The name 'a"b' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:06:05 | E [t.m.provider                  ] [12:06:05.656]: Error processing edit for tag path '[CAP21H]a<b': Error_Configuration("The name 'a<b' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:06:05 | E [t.m.provider                  ] [12:06:05.792]: Error processing edit for tag path '[CAP21H]a>b': Error_Configuration("The name 'a>b' is not a valid tag name") provider=CAP21H
+jvm 1    | 2026/10/13 12:06:05 | E [t.m.provider                  ] [12:06:05.952]: Error processing edit for tag path '[CAP21H]a%3ab': Error_Configuration("The name 'a%3ab' is not a valid tag name") provider=CAP21H
+[exit 0]
+~~~
+
+## C21-C4 — side effect of creating a database-connection: the gateway-written store-and-forward-engine resource (scope G, no uuid in the corpus)
+
+### store-and-forward-engine files written for CAP21_REF
+
+~~~
+$ bash -c find\ .\ -path\ \"\*/store-and-forward-engine/CAP21_REF/\*\"\ -type\ f\ \|\ LC_ALL=C\ sort @ 2026-10-13T12:07:21Z
+./core/ignition/store-and-forward-engine/CAP21_REF/config.json
+./core/ignition/store-and-forward-engine/CAP21_REF/resource.json
+[exit 0]
+~~~
+
+### bytes of core/ignition/store-and-forward-engine/CAP21_REF/resource.json
+
+~~~
+$ cat core/ignition/store-and-forward-engine/CAP21_REF/resource.json @ 2026-10-13T12:07:21Z
+{
+  "scope": "A",
+  "version": 1,
+  "restricted": false,
+  "overridable": true,
+  "files": [
+    "config.json"
+  ],
+  "attributes": {
+    "lastModification": {
+      "actor": "unknown",
+      "timestamp": "2026-10-13T11:59:19Z"
+    },
+    "uuid": "5f2894fc-2d20-48c0-bab1-388e81f9595e",
+    "lastModificationSignature": "9b67360fee0f7f617db70fdfa3bcd1a6f129d7be4d8d9e99c51724bedb34d68b"
+  }
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+### bytes of core/ignition/store-and-forward-engine/CAP21_REF/config.json
+
+~~~
+$ cat core/ignition/store-and-forward-engine/CAP21_REF/config.json @ 2026-10-13T12:07:21Z
+{
+  "batchSize": 10000,
+  "dataThreshold": 10000,
+  "forwardRateMs": 1000,
+  "forwardingPolicy": "ALL",
+  "isThirdParty": false,
+  "primaryMaintenancePolicy": {
+    "action": "PREVENT_NEW_DATA",
+    "limit": {
+      "limitType": "COUNT",
+      "value": 0
+    }
+  },
+  "scanRateMs": 100,
+  "secondaryMaintenancePolicy": {
+    "action": "PREVENT_NEW_DATA",
+    "limit": {
+      "limitType": "COUNT",
+      "value": 0
+    }
+  },
+  "timeThresholdMs": 30000
+}
+[output did not end with a newline]
+[exit 0]
+~~~
+
+## Decisions
+
+Written only after `capture.sh check21` exited 0 for all seven ids (UUID8, C3b, C4, OQ8, OQ1, OQ4, C5). Every Decision cites the capture sections it rests on and states where a capture contradicts 21-RESEARCH; 21-05, 21-06, 21-07 and 21-08 follow the capture. Nothing below was taken from research, inference or a previous phase.
+
+### CD1 — A sha2-derived version-8 uuid loads on 8.3.6 (D-03 frozen as researched)
+
+Rests on `C21-UUID8` (blocks "v8 uuid for CAP21_V8 (D-03 derivation)", "CAP21_V8 resource.json (hand-written, before scan)", "GET find CAP21_V8 (collection=production)", "GET names (database-translator)", "CAP21_V8 sha256 (after scan)", and the gateway log block).
+
+- The D-03 derivation for gateway `ign-deploy-rig`, module `ignition`, type `database-translator`, name `CAP21_V8` is **`4516ad9c-d6b0-8d86-89b9-802c96e33a9e`** (the version nibble is `8`, the variant nibble is `8`). This is the literal 21-07 pins in `name_based_uuid_matches_live_vector`.
+- Loaded: yes. After one scan the `find?collection=production` read-back answered 200 with `"collection":"production"`, `"enabled":true` and `"attributes":{"uuid":"4516ad9c-d6b0-8d86-89b9-802c96e33a9e","enabled":true}`, and `names` listed `CAP21_V8` with `"modes":["production"]`.
+- The gateway log held no line naming `CAP21_V8` and none saying "will not be loaded" (the grep block ends with only `[exit 0]`).
+- The hand-written `resource.json` was not rewritten: sha256 `912be19e176ff6a34838796882c578872b4df1712873f35423145d99930c13ee` before and after the scan.
+- Confirms RESEARCH assumption A1 (v8 uuid loads); no fallback to `sha1`/UUIDv5 is needed. `21-07` may freeze the derivation. For comparison, the gateway's own API-created resources carry random version-4 uuids (`CAP21_API`: `be605da6-baa2-44f3-b292-4739baf58421`); only the one v8 id was tried, and it loaded.
+
+### CD2 — Omitted `lastModification`/`lastModificationSignature` loads; a stale signature loads too and is not flagged or rewritten
+
+Rests on `C21-C3b` (all blocks) and `C21-UUID8` (for the omitted case).
+
+- Omitted (`CAP21_V8`, `attributes` = `uuid`, `enabled` only): loads (find 200), the API view carries no `lastModification` either, and the file sha256 is `912be19e...13ee` before the scan, after scan 1 and after scan 2 (60 s later). The gateway does not rewrite it.
+- Stale (`CAP21_STALE`: `lastModification` {actor `cap21`, timestamp `2026-01-01T00:00:00Z`} and a `lastModificationSignature` of 64 zeros): loads (find 200, `"enabled":true`). The find read-back shows a gateway-computed view, not the file's values: `lastModification` {actor `external`, timestamp `2026-10-13T11:58:00Z`} and `lastModificationSignature` `07012e7b0680489721a7bc757617f1fb2a27506dbed2a874826ed33d5158a9e8`. The signature in the file is neither validated nor flagged.
+- The stale file is not rewritten either: sha256 `bb5d201ecabd705c90573e3b49bd65ee3571fccb6cbb50b42ec4f2c1e9c2de31` at all three points, and the file bytes after scan 2 still show the zeros and the `cap21` actor.
+- No gateway log line named either resource (the final log block holds only `[exit 0]`).
+- Consequence for 21-07: a synthesized `resource.json` needs no `lastModification` or `lastModificationSignature`, and render may keep an existing signature verbatim without recomputing it. Confirms RESEARCH A1 (absent `lastModification` accepted).
+
+### CD3 — Rule-table facts per type attempted in C4 (every new named type is scope `A` with a uuid; the store-and-forward side effect contradicts the corpus)
+
+Rests on `C21-C4` (three sections: the five creates, the oauth2-client retry, and the store-and-forward side effect) and `C21-UUID8` (database-translator).
+
+All gateway-written `resource.json` files below have the same shape and key order: `scope`, `version` (1), `restricted` (false), `overridable` (true), `files` (`["config.json"]`), `attributes`; no `description`; created through the config API with no `collection`, so they landed in `core`.
+
+| Type (module/type) | Outcome | scope | uuid | `attributes` key order |
+| --- | --- | --- | --- | --- |
+| `ignition/database-translator` (`CAP21_API`) | created | `A` | present, version 4 | `uuid`, `enabled` |
+| `ignition/oauth2-client` (`CAP21_OAUTH`) | `clientSecret: null` refused 422 `Missing required property 'clientSecret'`; created with a Referenced `clientSecret` | `A` | present, version 4 | `uuid`, `enabled` |
+| `com.inductiveautomation.alarm-notification/alarm-notification-profile` (`CAP21_ANP`) | created (`OneWayNotificationProfileType`, empty `settings`) | `A` | present, version 4 | `uuid`, `enabled` |
+| `ignition/roster-config` (`CAP21_ROSTER`) | created (`users: []`) | `A` | present, version 4 | `uuid`, `enabled` |
+| `ignition/holiday` (`CAP21_HOLIDAY`) | created | `A` | present, version 4 | `uuid`, `enabled` |
+| `ignition/service-connector` (`CAP21_SVC`) | created (kafka profile, PLAINTEXT) | `A` | present, version 4 | `uuid`, `enabled` |
+| `ignition/store-and-forward-engine` (`CAP21_REF`, created by the gateway as a side effect of a `database-connection` create) | written by the gateway | `A` | present, version 4 | `lastModification` {actor `unknown`}, `uuid`, `lastModificationSignature` (no `enabled`) |
+
+- None of the five types the research left open is a singleton: each took a name and got a uuid, so each gets a "named, with uuid" row.
+- For `oauth2-client` a `null` secret-typed field is refused at create time (422) while a Referenced value is accepted; a render that blanked a required secret to `null` would be refused by the gateway for that type.
+- The tag types are not named-resource rows in the same sense; their `scope`/`attributes` are in CD5.
+- Contradicts RESEARCH Pattern 4 on one point: the corpus census says `store-and-forward-engine` carries scope `G` and no uuid (0 of 5), but the gateway-written resource on 8.3.6 carries scope `A`, a uuid and a `lastModification`. The corpus files come from a gateway that predates this layout, so `21-07` must not infer "named store-and-forward never has a uuid" from the gateway; the corpus-derived `NamedNoUuid` row stays valid only as "do not synthesize one". Whether a gateway loads a store-and-forward or themes resource with no uuid at all was not tested (CD2 omitted only `lastModification` and the signature, on a `database-translator` that kept its uuid).
+- Confirms RESEARCH A2 only partly: `A` goes with a uuid on every newly created named type here, while `G` appears on the unary tag resources (CD5).
+
+### CD4 — Gateway-written tag file format (Gson pretty print, no trailing newline, HTML-safe escapes) and the identity-gate expectation for 21-05
+
+Rests on `C21-OQ1` (the block "bytes of ..." for each of the twelve files, the sizes and sha256 lists, and the import file) and `C21-C5` (the second-section `Case`/`a%3ab` bytes).
+
+- Pretty-printed with a 2-space indent, `": "` between key and value, one array element per line, `[]` and `{}` for empty array and object, JSON `null` kept (`tag-provider/CAP21/config.json` writes `"defaultDatasourceName": null`).
+- No trailing newline in any captured file: every `bytes of ...` block carries the `[output did not end with a newline]` marker.
+- Non-ASCII is written raw UTF-8: `"defaultValue": "Température ✓"` in `FolderA/tags.json`.
+- HTML-safe escapes are applied to string values: the expression `1 < 2 && 3 > 2 && 'a' = 'a'` is written `1 < 2 && 3 > 2 && 'a' = 'a'` (`<`, `&`, `>`, `'`, `=` all escaped as lowercase `\u00xx`). A writer that does not mirror Gson's HTML-safe mode will not be byte-identical.
+- Numbers: `1.5` stays `1.5`; the input lexeme `10000000000.0` is written `1.0E10`; the integer `9007199254740993` (above 2^53) is written exactly as `9007199254740993`. So the float lexeme is not preserved from input, it is Gson's `Double.toString` form, and big integers are not rounded.
+- Key order inside a tag is not alphabetical and not the input order: `valueSource`, `dataType`, `name`, then `defaultValue` (or `expression`), then `tagType`; an atomic tag's input `value` was written as `defaultValue` in `tags.json`, while a UDT-type member kept `value` (`tag-type-definition/CAP21/udts.json`). The order of tags inside one `tags.json` also differs from the input order (`BigInt`, `Unicode`, `Expr`, `F1`, `F2` for an input of `F1`, `F2`, `BigInt`, `Unicode`, `Expr`), so render must treat tag-file member order as source data, not sort it.
+- UDT instances are not in `tags.json`: `Inst1` is written to `FolderA/udts.json` beside it.
+- Expectation for 21-05: all twelve captured files are Gson-identity candidates and none needs the opaque path. The discriminating file is `tag-definition/CAP21/FolderA/tags.json` (`1.0E10`, the `\u00xx` escapes, raw non-ASCII, an integer above 2^53). The `resource.json` and `unary-resource.json` files and the tag-group configs use the same writer and are plain identity cases.
+- The gateway flushes tag files asynchronously: they appeared between 5 and 15 s after the import answered success, so any capture or test that reads them must wait or poll.
+
+### CD5 — Repo-path to collection-path mapping for the four tag types (confirms RESEARCH A5)
+
+Rests on `C21-OQ4` (the sorted `find` listing) and `C21-OQ1` (the per-file bytes).
+
+For provider `CAP21` the gateway wrote, all under `core/` (no collection was passed), and mapped to the collection-relative path by dropping `core/`:
+
+| Type | Collection path | Files |
+| --- | --- | --- |
+| `tag-provider` | `ignition/tag-provider/<P>/` | `config.json`, `resource.json` (scope `A`, `uuid` + `enabled`) |
+| `tag-group` | `ignition/tag-group/<P>/<GroupName>/` | `config.json`, `resource.json` per group (scope `A`, `attributes` is `{}`); `Default` and `Default Historical` exist for every new provider |
+| `tag-type-definition` | `ignition/tag-type-definition/<P>/` | `udts.json`, `unary-resource.json` (scope `G`, `files: ["udts.json"]`, `attributes: {"config": {}}`); the `_types_` folder of the import does not appear as a directory |
+| `tag-definition` | `ignition/tag-definition/<P>/` and `<P>/<Folder>/…` | provider root: `unary-resource.json` only (`files: []`) when there are no root-level tags; each folder is a directory holding `tags.json` (its atomic tags), `udts.json` (its UDT instances, only when present) and `unary-resource.json` (scope `G`, `files` listing those) |
+
+- The repo layout `tags/<P>/<type>/<rest>` therefore maps to `ignition/<type>/<P>/<rest>`: the type and provider segments swap, exactly as RESEARCH Pattern 3 and assumption A5 guessed, now confirmed for `tag-group` and `tag-type-definition` too.
+- Folder nesting is directory nesting (`FolderA/` under `tag-definition/CAP21/`); atomic tags do not get their own directory, they are members of the folder's `tags.json`.
+- Contradicts the research's implicit uniformity on one point: `tag-group` entries are named resources with their own `resource.json` (scope `A`), while `tag-type-definition` and `tag-definition` use `unary-resource.json` (scope `G`) with the data in `udts.json`/`tags.json`; 21-06 must map both file-name families.
+- Not exercised, so 21-06 stays fail-closed on them: root-level tags (a `tags.json` at the provider root), UDT types nested in sub-folders of `_types_`, and a non-`core` collection.
+
+### CD6 — Linux on-disk names for hostile tag names; NTFS deferred to Phase 22 (D-04)
+
+Rests on `C21-C5` (all three sections: the plan's names, the gateway log and second listing, and the extra probes).
+
+- `a:b` is accepted and its directory is **`a%3ab`** (the colon percent-encoded, lowercase hex).
+- `has space` is accepted and written raw (`has space/`).
+- `Case` is accepted and written raw; `case` is refused by the gateway as a collision (`Tag '[CAP21H]case' already exists`), so tag names are case-insensitive and only one of the pair exists on disk.
+- `q?`, `trail.` and `com,ma` are refused by the gateway (`The name '…' is not a valid tag name`) after the import call itself answered success with `failed: []`, so no directory exists for them. The extra probes show the same refusal for `a*b`, `a|b`, `a"b`, `a<b`, `a>b` and the literal `a%3ab`. The gateway's own log is the only place the refusal shows; the CLI import envelope does not report it.
+- Net effect: a gateway-written tag directory never contains `< > : " | ? *`; the colon is encoded and every other Windows-illegal character is refused as a tag name. Render stays fail-closed on Windows-illegal names (hand-authored trees can still contain them), and NTFS behaviour (reserved names, trailing space, path length) is **deferred to Phase 22 (D-04)**. No hostile-named file was copied into the repository.
+- Resolves RESEARCH A7 (encoding unknown): the gateway encodes the colon and rejects the other hostile characters, rather than writing them raw.
+
+### CD7 — `Referenced` secret key order: `data` before `type`, `providerName` before `secretName`, gateway-determined
+
+Rests on `C21-OQ8` (blocks "CAP21_REF config.json as the gateway wrote it" and "CAP21_REF2 config.json as the gateway wrote it") and `C21-C4` (the oauth2-client retry).
+
+- Two creates sent the same reference in opposite key orders (`CAP21_REF`: `type` first, `secretName` before `providerName`; `CAP21_REF2`: `data` first, `providerName` before `secretName`). Both were written identically: `"password": {"data": {"providerName": …, "secretName": …}, "type": "Referenced"}`. The order is therefore the gateway's own (alphabetical), not preserved from the request.
+- This matches the Embedded form in the corpus (`data` first, `type` after) and RESEARCH Pattern 7. The render lint stays order-insensitive, as planned, but anything that rewrites a `Referenced` object must emit `data` then `type`.
+- An internal secret provider with `secrets: {}` was created (200), but an internal secret cannot be created through the REST API without JWE ciphertext. The Referenced name was resolved through a file secret provider (`CAP21_SP_FILE`, secret `cap21-secret`); `GET secret-providers/CAP21_SP_FILE/secrets` listed the name. The throwaway value was written only inside the disposable rig container and is gone with the volume; it never reached the host or the repository. This differs from the plan's wording (an internal provider holding the secret) for that reason.
+- The gateway accepted a Referenced `clientSecret` on `oauth2-client` where `null` was refused (CD3).
