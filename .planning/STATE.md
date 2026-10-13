@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 Phase: 21 (deploy-render) — EXECUTING
 Plan: 9 of 9
 Status: Phase complete — ready for verification
-Last activity: 2026-10-13 — Phase 21 execution started
+Last activity: 2026-10-13 - Completed quick task 261013-neg: fix WR-02 Referenced secret fail-open
 
 Progress: [██████████] 100%
 
@@ -88,6 +88,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 260920-iti | Fix credential precedence: profile auth (keyring / named token_env / basic) wins over bare IGNITION_TOKEN and IGNITION_USER/PASSWORD | 2026-09-20 | 3df005a | [260920-iti-fix-credential-precedence-a-profile-with](./quick/260920-iti-fix-credential-precedence-a-profile-with/) |
 | 260921-96c | Register workspace push in GUARDED_OPS so it is confirmable over MCP (confirm: true → --yes; rig down stays unguarded by design) | 2026-09-21 | 7800ba6 | [260921-96c-register-workspace-push-in-guarded-ops-s](./quick/260921-96c-register-workspace-push-in-guarded-ops-s/) |
 | 5 | fix(tui): watch/alarm workers race in-flight polls against shutdown (Windows CI flake root cause) | 2026-09-22 | d64280c | — |
+| 261013-neg | Fix 21-REVIEW WR-02: strict Referenced secret shape, no key-name exemption | 2026-10-13 | ae0338a | [261013-neg-fix-wr-02-referenced-wrapper-secret-fail](./quick/261013-neg-fix-wr-02-referenced-wrapper-secret-fail/) |
 
 ## Session Continuity
 
