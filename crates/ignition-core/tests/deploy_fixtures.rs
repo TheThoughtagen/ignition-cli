@@ -111,16 +111,14 @@ fn embedded_walk(value: &Value, path: &str, findings: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             let is_embedded = map.get("type").and_then(Value::as_str) == Some("Embedded");
-            if is_embedded {
-                if let Some(Value::Object(data)) = map.get("data") {
-                    for (key, member) in data {
-                        if let Value::String(s) = member {
-                            if !s.starts_with(MARKER) {
-                                findings.push(format!(
-                                    "{path}: Embedded secret member `{key}` lacks the {MARKER} marker"
-                                ));
-                            }
-                        }
+            if is_embedded && let Some(Value::Object(data)) = map.get("data") {
+                for (key, member) in data {
+                    if let Value::String(s) = member
+                        && !s.starts_with(MARKER)
+                    {
+                        findings.push(format!(
+                            "{path}: Embedded secret member `{key}` lacks the {MARKER} marker"
+                        ));
                     }
                 }
             }
@@ -221,12 +219,12 @@ fn entra_walk(value: &Value, path: &str, findings: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, member) in map {
-                if key == "clientId" || key == "tenantId" {
-                    if let Value::String(s) = member {
-                        for g in find_guids(s) {
-                            if !g.starts_with(FAKE_GUID_PREFIX) {
-                                findings.push(format!("{path}: non-fake GUID in `{key}`"));
-                            }
+                if (key == "clientId" || key == "tenantId")
+                    && let Value::String(s) = member
+                {
+                    for g in find_guids(s) {
+                        if !g.starts_with(FAKE_GUID_PREFIX) {
+                            findings.push(format!("{path}: non-fake GUID in `{key}`"));
                         }
                     }
                 }
@@ -280,7 +278,11 @@ fn strings_of(value: &Value, out: &mut Vec<String>) {
 }
 
 fn assert_clean(findings: Vec<String>) {
-    assert!(findings.is_empty(), "fixture findings:\n{}", findings.join("\n"));
+    assert!(
+        findings.is_empty(),
+        "fixture findings:\n{}",
+        findings.join("\n")
+    );
 }
 
 // ---- Tests ----
@@ -329,10 +331,9 @@ fn scanners_flag_synthetic_leaks() {
     let real_client: Value =
         serde_json::from_str(r#"{"settings":{"clientId":"1f456c2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b"}}"#)
             .unwrap();
-    let fake_client: Value = serde_json::from_str(
-        r#"{"settings":{"clientId":"00000000-0000-4000-8000-000000000002"}}"#,
-    )
-    .unwrap();
+    let fake_client: Value =
+        serde_json::from_str(r#"{"settings":{"clientId":"00000000-0000-4000-8000-000000000002"}}"#)
+            .unwrap();
     assert!(!scan_entra_guids(&real_client, "synthetic").is_empty());
     assert!(scan_entra_guids(&fake_client, "synthetic").is_empty());
 
@@ -361,8 +362,8 @@ fn ipv4_literals_are_reserved_ranges_only() {
         .iter()
         .filter(|p| is_text(p))
         .flat_map(|p| {
-            let text = String::from_utf8_lossy(&std::fs::read(p).expect("read fixture"))
-                .into_owned();
+            let text =
+                String::from_utf8_lossy(&std::fs::read(p).expect("read fixture")).into_owned();
             scan_ipv4(&text, &rel(p))
         })
         .collect();
@@ -417,8 +418,14 @@ fn corpus_inventory_matches_source_census() {
         let bytes = std::fs::read(jar).expect("read stand-in jar");
         let name = rel(jar);
         assert!(bytes.len() <= 64, "{name}: stand-in jar over 64 bytes");
-        assert!(bytes.contains(&0x00), "{name}: stand-in jar lacks a 0x00 byte");
-        assert!(bytes.contains(&0x0D), "{name}: stand-in jar lacks a 0x0D byte");
+        assert!(
+            bytes.contains(&0x00),
+            "{name}: stand-in jar lacks a 0x00 byte"
+        );
+        assert!(
+            bytes.contains(&0x0D),
+            "{name}: stand-in jar lacks a 0x0D byte"
+        );
     }
 }
 
@@ -430,5 +437,148 @@ fn gitattributes_marks_deploy_fixtures_non_text() {
         has("crates/ignition-core/tests/fixtures/deploy/** -text"),
         ".gitattributes must mark fixtures/deploy/** as -text"
     );
-    assert!(has("*.jar binary"), ".gitattributes must mark *.jar as binary");
+    assert!(
+        has("*.jar binary"),
+        ".gitattributes must mark *.jar as binary"
+    );
+}
+
+const OPENAPI_EXTRACT: &str = include_str!("fixtures/deploy/openapi-8.3.6-resource-types.json");
+
+/// The secret-typed field paths per resource type, as the live 8.3.6 OpenAPI
+/// describes them (RESEARCH Pattern 7). `ignition/email-profile` is
+/// `settings.settings.password`: the schema nests the classic-SMTP `settings`
+/// object inside the profile `settings` oneOf, and the gateway-written
+/// `ignition/email-profile/*/config.json` in the corpus has the same
+/// `settings.settings.*` layout.
+const EXPECTED_SECRET_FIELDS: &[(&str, &str, &[&str])] = &[
+    (
+        "com.inductiveautomation.alarm-notification",
+        "alarm-notification-profile",
+        &[
+            "settings.settings.password",
+            "settings.twoWayPop3.pop3Password",
+            "settings.voipGateway.password",
+        ],
+    ),
+    (
+        "com.inductiveautomation.opcua",
+        "device",
+        &["settings.advanced.password"],
+    ),
+    ("ignition", "database-connection", &["password"]),
+    ("ignition", "email-profile", &["settings.settings.password"]),
+    ("ignition", "identity-provider", &["settings.clientSecret"]),
+    ("ignition", "oauth2-client", &["clientSecret"]),
+    (
+        "ignition",
+        "opc-connection",
+        &[
+            "settings.authentication.password",
+            "settings.authentication.privateKeyPem",
+            "settings.security.keyStoreAliasPassword",
+        ],
+    ),
+    (
+        "ignition",
+        "service-connector",
+        &[
+            "settings.password",
+            "settings.ssl.keyPassword",
+            "settings.ssl.keystore.key",
+            "settings.ssl.keystore.password",
+            "settings.ssl.truststore.password",
+        ],
+    ),
+    ("ignition", "system-properties", &["errorReportPassword"]),
+    (
+        "ignition",
+        "user-source",
+        &[
+            "settings.connectionPassword",
+            "settings.ldap.connectionPassword",
+        ],
+    ),
+];
+
+#[test]
+fn openapi_extract_shape() {
+    let doc: Value = serde_json::from_str(OPENAPI_EXTRACT).expect("extract parses as JSON");
+
+    let types = doc["types"].as_array().expect("types is an array");
+    assert!(!types.is_empty(), "types must not be empty");
+    let mut keys = Vec::new();
+    for entry in types {
+        let module = entry["module"]
+            .as_str()
+            .expect("types[].module is a string");
+        let ty = entry["type"].as_str().expect("types[].type is a string");
+        assert!(
+            entry["named"].is_boolean(),
+            "{module}/{ty}: named is a bool"
+        );
+        keys.push((module.to_string(), ty.to_string()));
+    }
+    let mut sorted = keys.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        keys, sorted,
+        "types must be sorted by module then type, without duplicates"
+    );
+
+    let named = |m: &str, t: &str| {
+        types
+            .iter()
+            .find(|e| e["module"] == m && e["type"] == t)
+            .unwrap_or_else(|| panic!("{m}/{t} missing from the extract"))["named"]
+            .as_bool()
+            .unwrap()
+    };
+    // The deny-table spelling check in 21-06 depends on these three.
+    assert!(!named("ignition", "security-properties"));
+    assert!(!named("ignition", "security-levels"));
+    assert!(named("ignition", "user-source"));
+
+    let secrets = doc["secret_fields"]
+        .as_array()
+        .expect("secret_fields is an array");
+    assert_eq!(
+        secrets.len(),
+        10,
+        "exactly 10 resource types carry secret fields"
+    );
+    let actual: Vec<(String, String, Vec<String>)> = secrets
+        .iter()
+        .map(|e| {
+            let paths: Vec<String> = e["paths"]
+                .as_array()
+                .expect("secret_fields[].paths is an array")
+                .iter()
+                .map(|p| p.as_str().expect("path is a string").to_string())
+                .collect();
+            (
+                e["module"].as_str().expect("module").to_string(),
+                e["type"].as_str().expect("type").to_string(),
+                paths,
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String, Vec<String>)> = EXPECTED_SECRET_FIELDS
+        .iter()
+        .map(|(m, t, p)| {
+            (
+                m.to_string(),
+                t.to_string(),
+                p.iter().map(|s| s.to_string()).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected, "secret field table");
+
+    let db = secrets
+        .iter()
+        .find(|e| e["module"] == "ignition" && e["type"] == "database-connection")
+        .expect("database-connection entry");
+    assert_eq!(db["paths"], serde_json::json!(["password"]));
 }
