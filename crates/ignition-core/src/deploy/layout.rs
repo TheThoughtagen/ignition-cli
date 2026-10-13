@@ -75,21 +75,84 @@ pub struct ResourceKey {
     pub name: Option<String>,
 }
 
-/// `resources/<m>/<t>/...` to `<m>/<t>/...`.
+/// The four tag types the gateway writes under `ignition/` for a tag
+/// provider, in the order a provider is built (21-02 capture, decision CD5).
+pub const TAG_TYPES: [&str; 4] = [
+    "tag-provider",
+    "tag-group",
+    "tag-type-definition",
+    "tag-definition",
+];
+
+/// Gateway-relative path to collection path.
 ///
-/// Refuses a path that does not start with `resources/` and one with fewer
-/// than three remaining components (a file directly under `resources/` or
-/// `resources/<module>/` is not a resource file).
+/// Two layouts are accepted:
+///
+/// - `resources/<m>/<t>/...` to `<m>/<t>/...`. Refuses a path with fewer than
+///   three remaining components (a file directly under `resources/` or
+///   `resources/<module>/` is not a resource file).
+/// - `tags/<P>/<type>/<rest>` to `ignition/<type>/<P>/<rest>` for the four
+///   [`TAG_TYPES`]. This is decision **CD5** of `21-LIVE-CAPTURES.md`,
+///   captured on an 8.3.6 gateway: the type and provider segments swap
+///   (confirming RESEARCH assumption A5, so CD5 and the research guess
+///   agree). Folders nest as directories; `tag-group` entries are named
+///   resources (`<P>/<Group>/{config,resource}.json`) while
+///   `tag-type-definition` and `tag-definition` carry `udts.json`,
+///   `tags.json` and `unary-resource.json`.
+///
+/// CD5 lists three layouts the capture did not exercise, which stay
+/// fail-closed here: a `tags.json` or `udts.json` directly at the provider
+/// root of `tag-definition` (root-level tags), nested folders under
+/// `tag-type-definition` (UDT types below `_types_`), and any collection
+/// other than the default one (this mapping has no collection concept).
 pub fn collection_path(repo_rel: &RelPath) -> Result<RelPath, String> {
+    if let Some(rest) = repo_rel.strip_prefix("tags") {
+        return tag_collection_path(&rest);
+    }
     let rest = repo_rel
         .strip_prefix("resources")
-        .ok_or_else(|| "not under `resources/`".to_string())?;
+        .ok_or_else(|| "not under `resources/` or `tags/`".to_string())?;
     if rest.components().count() < 3 {
         return Err(
             "a resource file must sit at `resources/<module>/<type>/<file>` or deeper".to_string(),
         );
     }
     Ok(rest)
+}
+
+/// `<P>/<type>/<rest>` (the part after `tags/`) to `ignition/<type>/<P>/<rest>`.
+fn tag_collection_path(rest: &RelPath) -> Result<RelPath, String> {
+    let parts: Vec<&str> = rest.components().collect();
+    if parts.len() < 3 {
+        return Err("a tag file must sit at `tags/<provider>/<type>/<file>` or deeper".to_string());
+    }
+    let (provider, ty, tail) = (parts[0], parts[1], &parts[2..]);
+    if !TAG_TYPES.contains(&ty) {
+        return Err(format!(
+            "`{ty}` is not a tag type (expected one of: {})",
+            TAG_TYPES.join(", ")
+        ));
+    }
+    if ty == "tag-definition" && tail.len() == 1 && matches!(tail[0], "tags.json" | "udts.json") {
+        return Err(
+            "root-level tags (a tags.json or udts.json at the provider root) were not captured against a gateway (CD5) and are refused; put tags in a folder".to_string(),
+        );
+    }
+    if ty == "tag-type-definition" && tail.len() > 1 {
+        return Err(
+            "nested folders under tag-type-definition were not captured against a gateway (CD5) and are refused".to_string(),
+        );
+    }
+    RelPath::new(&format!("ignition/{ty}/{provider}/{}", tail.join("/")))
+}
+
+/// The tag provider directory a gateway-relative `tags/<P>/...` path sits in.
+pub fn tag_provider(repo_rel: &RelPath) -> Option<&str> {
+    let mut parts = repo_rel.components();
+    if parts.next() != Some("tags") {
+        return None;
+    }
+    parts.next()
 }
 
 /// The resource a collection path belongs to: module and type from
@@ -159,6 +222,51 @@ mod tests {
         assert!(collection_path(&rp("resources/config.json")).is_err());
         assert!(collection_path(&rp("resources/ignition/config.json")).is_err());
         assert!(collection_path(&rp("other/ignition/x/y")).is_err());
+    }
+
+    #[test]
+    fn tags_map_per_cd5() {
+        let cases = [
+            (
+                "tags/P/tag-provider/config.json",
+                "ignition/tag-provider/P/config.json",
+            ),
+            (
+                "tags/P/tag-group/Default/resource.json",
+                "ignition/tag-group/P/Default/resource.json",
+            ),
+            (
+                "tags/P/tag-type-definition/udts.json",
+                "ignition/tag-type-definition/P/udts.json",
+            ),
+            (
+                "tags/P/tag-definition/unary-resource.json",
+                "ignition/tag-definition/P/unary-resource.json",
+            ),
+            (
+                "tags/P/tag-definition/FolderA/Sub/tags.json",
+                "ignition/tag-definition/P/FolderA/Sub/tags.json",
+            ),
+        ];
+        for (from, to) in cases {
+            assert_eq!(collection_path(&rp(from)).unwrap(), rp(to), "{from}");
+        }
+        assert_eq!(tag_provider(&rp("tags/P/tag-group/x")), Some("P"));
+        assert_eq!(tag_provider(&rp("resources/a/b/c")), None);
+    }
+
+    #[test]
+    fn unexercised_tag_layouts_stay_fail_closed() {
+        for bad in [
+            "tags/P/other/x.json",
+            "tags/P/x.json",
+            "tags/x.json",
+            "tags/P/tag-definition/tags.json",
+            "tags/P/tag-definition/udts.json",
+            "tags/P/tag-type-definition/_types_/udts.json",
+        ] {
+            assert!(collection_path(&rp(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

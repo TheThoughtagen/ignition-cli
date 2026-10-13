@@ -13,6 +13,7 @@ pub mod layout;
 pub mod manifest;
 pub mod node;
 pub mod render;
+pub mod rules;
 pub mod target;
 pub mod tree;
 pub mod yamlio;

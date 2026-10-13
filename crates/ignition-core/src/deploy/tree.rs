@@ -84,26 +84,29 @@ impl SourceTree {
         Ok(SourceTree { files: map })
     }
 
-    /// Read `resources/` of one gateway directory.
+    /// Read `resources/`, `tags/` and `modes/<env>/` of one gateway directory.
     ///
     /// Every entry is inspected with `symlink_metadata` and never followed;
     /// each directory's entries are sorted by name bytes before recursing.
     /// At the gateway root `manifest.yaml` (not collected, the action reads
-    /// it), `resources/` (walked) and `.gitkeep` (skipped) are accepted; any
-    /// other root entry is a finding (21-06 adds `tags/` and `modes/`).
+    /// it), `resources/`, `tags/` (walked), `modes/` and `.gitkeep` (skipped)
+    /// are accepted; any other root entry is a finding. Under `modes/` only
+    /// the directory named exactly `env` is opened; other entries that are
+    /// directories belong to other environments and are skipped unopened, so
+    /// their content can never fail or change this render. Under
+    /// `modes/<env>/` only `resources/` and `tags/` are accepted. Overlay
+    /// files are keyed by their full gateway-relative path
+    /// (`modes/<env>/resources/...`); render's overlay stage resolves them.
     /// Symlinks, non-regular files and unusable names are findings. All
     /// findings are raised together as one `deploy_tree_invalid`.
-    ///
-    /// `env` is accepted for the 21-06 `modes/<env>` overlay and unused
-    /// until then.
     pub fn read_gateway(gateway_dir: &Path, env: &str) -> Result<SourceTree, CoreError> {
-        let _ = env; // reserved for the modes/<env> overlay (21-06)
         let gateway = gateway_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut reader = Reader {
             prefix: format!("gateways/{gateway}"),
+            env: env.to_string(),
             files: BTreeMap::new(),
             findings: Vec::new(),
         };
@@ -121,6 +124,8 @@ impl SourceTree {
 struct Reader {
     /// `gateways/<name>`, the repo-relative prefix used in findings.
     prefix: String,
+    /// The environment whose `modes/<env>/` overlay is read.
+    env: String,
     files: BTreeMap<RelPath, Vec<u8>>,
     findings: Vec<DeployFinding>,
 }
@@ -177,11 +182,72 @@ impl Reader {
                 "manifest.yaml" | ".gitkeep" => {
                     self.check_regular(&path, &name);
                 }
-                "resources" => self.walk(&path, &name),
+                "resources" | "tags" => self.walk(&path, &name),
+                "modes" => self.read_modes(&path, &name),
                 _ => self.finding(
                     &name,
-                    "unexpected entry at the gateway root (expected: manifest.yaml, resources/)",
+                    "unexpected entry at the gateway root (expected: manifest.yaml, resources/, tags/, modes/)",
                 ),
+            }
+        }
+    }
+
+    /// `modes/`: open only the directory named for this render's
+    /// environment.
+    fn read_modes(&mut self, dir: &Path, rel: &str) {
+        if !self.require_dir(dir, rel) {
+            return;
+        }
+        for (name, path) in self.sorted_entries(dir, rel) {
+            let child = join(rel, &name);
+            if name == self.env {
+                self.read_env(&path, &child);
+                continue;
+            }
+            match std::fs::symlink_metadata(&path) {
+                // another environment's tree: skipped without being opened
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Ok(_) => self.finding(
+                    &child,
+                    "unexpected entry under modes/ (expected one directory per environment)",
+                ),
+                Err(e) => self.finding(&child, format!("cannot inspect ({})", e.kind())),
+            }
+        }
+    }
+
+    /// `modes/<env>/`: `resources/` and `tags/` only.
+    fn read_env(&mut self, dir: &Path, rel: &str) {
+        if !self.require_dir(dir, rel) {
+            return;
+        }
+        for (name, path) in self.sorted_entries(dir, rel) {
+            let child = join(rel, &name);
+            match name.as_str() {
+                "resources" | "tags" => self.walk(&path, &child),
+                _ => self.finding(
+                    &child,
+                    "unexpected entry under modes/<env>/ (expected: resources/, tags/)",
+                ),
+            }
+        }
+    }
+
+    /// Whether `dir` is a real directory (not a symlink); findings otherwise.
+    fn require_dir(&mut self, dir: &Path, rel: &str) -> bool {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                self.finding(rel, "is a symlink; symlinks are refused");
+                false
+            }
+            Ok(meta) if meta.file_type().is_dir() => true,
+            Ok(_) => {
+                self.finding(rel, "must be a directory");
+                false
+            }
+            Err(e) => {
+                self.finding(rel, format!("cannot inspect ({})", e.kind()));
+                false
             }
         }
     }
@@ -207,20 +273,8 @@ impl Reader {
 
     /// Walk directory `dir` (repo-gateway-relative `rel`), collecting files.
     fn walk(&mut self, dir: &Path, rel: &str) {
-        match std::fs::symlink_metadata(dir) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                self.finding(rel, "is a symlink; symlinks are refused");
-                return;
-            }
-            Ok(meta) if meta.file_type().is_dir() => {}
-            Ok(_) => {
-                self.finding(rel, "must be a directory");
-                return;
-            }
-            Err(e) => {
-                self.finding(rel, format!("cannot inspect ({})", e.kind()));
-                return;
-            }
+        if !self.require_dir(dir, rel) {
+            return;
         }
         for (name, path) in self.sorted_entries(dir, rel) {
             let child = join(rel, &name);

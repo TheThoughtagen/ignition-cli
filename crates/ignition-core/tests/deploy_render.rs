@@ -311,3 +311,369 @@ fn envelope_arrays_are_ordered() {
         assert_eq!(list, &sorted, "byte order");
     }
 }
+
+// ---- 21-06 task 1: overlays and the tags layout --------------------------
+
+use ignition_core::error::CoreError;
+
+/// Render with a manifest that declares `types` and `providers`, for a given
+/// environment; returns the error as text when the render is refused.
+fn try_render(
+    env: &str,
+    types: &[&str],
+    providers: &[&str],
+    files: &[(&str, &str)],
+) -> Result<RenderOutcome, CoreError> {
+    let mut yaml = String::from("schema_version: 1\ntypes:\n");
+    for t in types {
+        yaml.push_str(&format!("  - {t}\n"));
+    }
+    if types.is_empty() {
+        yaml = String::from("schema_version: 1\ntypes: []\n");
+    }
+    if !providers.is_empty() {
+        yaml.push_str(&format!("tag_providers: [{}]\n", providers.join(", ")));
+    }
+    let manifest = Manifest::parse("manifest.yaml", yaml.as_bytes()).expect("manifest");
+    let target = Target::parse("targets/dev.yaml", TARGET).expect("target");
+    let source =
+        SourceTree::from_files(files.iter().map(|(p, b)| (*p, b.as_bytes()))).expect("tree");
+    render(&RenderInput {
+        gateway: "g",
+        env,
+        manifest: &manifest,
+        target: &target,
+        source: &source,
+    })
+}
+
+fn refused(r: Result<RenderOutcome, CoreError>) -> String {
+    match r {
+        Ok(o) => panic!("expected a refusal, rendered {} files", o.tree.files.len()),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn bytes_at<'a>(o: &'a RenderOutcome, path: &str) -> &'a [u8] {
+    o.tree
+        .files
+        .iter()
+        .find(|(p, _)| p.as_str() == path)
+        .unwrap_or_else(|| {
+            panic!(
+                "{path} not rendered: {:?}",
+                o.tree.files.keys().collect::<Vec<_>>()
+            )
+        })
+        .1
+}
+
+#[test]
+fn overlay_replaces_whole_file() {
+    let out = try_render(
+        "dev",
+        &["m/a"],
+        &[],
+        &[
+            ("resources/m/a/x/config.json", "{\"base\": 1}"),
+            ("resources/m/a/x/resource.json", "{\"keep\": 1}"),
+            ("modes/dev/resources/m/a/x/config.json", "{\"over\": 2}"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(bytes_at(&out, "m/a/x/config.json"), b"{\"over\": 2}");
+    assert_eq!(bytes_at(&out, "m/a/x/resource.json"), b"{\"keep\": 1}");
+    assert_eq!(
+        out.tree.files.len(),
+        2,
+        "no modes/ path leaks into the output"
+    );
+}
+
+#[test]
+fn overlay_adds_new_file() {
+    let out = try_render(
+        "dev",
+        &["m/a"],
+        &[],
+        &[
+            ("resources/m/a/x/config.json", "{}"),
+            ("modes/dev/resources/m/a/y/config.json", "{\"new\": true}"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(bytes_at(&out, "m/a/x/config.json"), b"{}");
+    assert_eq!(bytes_at(&out, "m/a/y/config.json"), b"{\"new\": true}");
+    // an overlay cannot remove a base file (SF-7): without a counterpart the
+    // base file is unchanged
+    assert_eq!(out.tree.files.len(), 2);
+}
+
+#[test]
+fn other_env_overlays_are_never_read() {
+    // in memory: nothing under modes/staging reaches a dev render
+    let files = [
+        ("resources/m/a/x/config.json", "{}"),
+        (
+            "modes/staging/resources/m/a/x/config.json",
+            "not json at all",
+        ),
+        ("modes/staging/resources/zzz/denied/x/config.json", "{}"),
+        ("modes/staging/.hidden/x", "{}"),
+        ("modes/dev2/resources/m/a/x/config.json", "[9]"),
+    ];
+    let out = try_render("dev", &["m/a"], &[], &files).unwrap();
+    assert_eq!(bytes_at(&out, "m/a/x/config.json"), b"{}");
+    assert_eq!(out.tree.files.len(), 1);
+
+    // on disk: an invalid tree for another environment does not matter
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    copy_dir(Path::new(TRACER_REPO), &repo);
+    let before = deploy_render(&repo, "dev").expect("baseline").render_sha256;
+    let other = repo.join("gateways/tracer-gw/modes/staging");
+    std::fs::create_dir_all(other.join("resources/ignition/database-translator/POSTGRES"))
+        .expect("mkdir");
+    std::fs::write(
+        other.join("resources/ignition/database-translator/POSTGRES/config.json"),
+        b"{ broken",
+    )
+    .expect("write");
+    std::fs::write(other.join(".DS_Store"), b"x").expect("write");
+    std::fs::create_dir_all(other.join(".hidden")).expect("mkdir");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc", other.join("resources/link")).expect("symlink");
+    let after = deploy_render(&repo, "dev").expect("staging content is never read");
+    assert_eq!(before, after.render_sha256);
+}
+
+#[test]
+fn overlay_findings_name_overlay_path() {
+    let text = refused(try_render(
+        "dev",
+        &["m/a"],
+        &[],
+        &[
+            ("resources/m/a/x/config.json", "{}"),
+            ("modes/dev/resources/m/a/x/resource.json", "{ broken"),
+            ("modes/dev/resources/m/other/x/config.json", "{}"),
+        ],
+    ));
+    assert!(
+        text.contains("gateways/g/modes/dev/resources/m/a/x/resource.json"),
+        "{text}"
+    );
+    assert!(
+        text.contains("gateways/g/modes/dev/resources/m/other/"),
+        "{text}"
+    );
+}
+
+#[test]
+fn tags_map_to_collection_paths() {
+    let out = try_render(
+        "dev",
+        &[],
+        &["default"],
+        &[
+            ("tags/default/tag-provider/config.json", "{}"),
+            ("tags/default/tag-provider/resource.json", "{}"),
+            ("tags/default/tag-group/Default/config.json", "{}"),
+            ("tags/default/tag-group/Default/resource.json", "{}"),
+            ("tags/default/tag-type-definition/udts.json", "{}"),
+            ("tags/default/tag-type-definition/unary-resource.json", "{}"),
+            ("tags/default/tag-definition/unary-resource.json", "{}"),
+            ("tags/default/tag-definition/FolderA/tags.json", "{}"),
+            ("tags/default/tag-definition/FolderA/Sub/udts.json", "{}"),
+        ],
+    )
+    .unwrap();
+    let paths: Vec<&str> = out.tree.files.keys().map(|p| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "ignition/tag-definition/default/FolderA/Sub/udts.json",
+            "ignition/tag-definition/default/FolderA/tags.json",
+            "ignition/tag-definition/default/unary-resource.json",
+            "ignition/tag-group/default/Default/config.json",
+            "ignition/tag-group/default/Default/resource.json",
+            "ignition/tag-provider/default/config.json",
+            "ignition/tag-provider/default/resource.json",
+            "ignition/tag-type-definition/default/udts.json",
+            "ignition/tag-type-definition/default/unary-resource.json",
+        ]
+    );
+    assert_eq!(out.tag_providers, ["default"]);
+    // the tag types are named resources keyed by provider
+    let provider = out
+        .resources
+        .iter()
+        .find(|r| r.ty == "tag-provider")
+        .expect("provider resource");
+    assert_eq!(provider.module, "ignition");
+    assert_eq!(provider.name.as_deref(), Some("default"));
+    assert_eq!(provider.files, ["config.json", "resource.json"]);
+    let group = out
+        .resources
+        .iter()
+        .find(|r| r.ty == "tag-group")
+        .expect("group resource");
+    assert_eq!(
+        group.files,
+        ["Default/config.json", "Default/resource.json"]
+    );
+
+    // a tags/ overlay replaces the base tag file
+    let over = try_render(
+        "dev",
+        &[],
+        &["default"],
+        &[
+            ("tags/default/tag-definition/F/tags.json", "[1]"),
+            ("modes/dev/tags/default/tag-definition/F/tags.json", "[2]"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        bytes_at(&over, "ignition/tag-definition/default/F/tags.json"),
+        b"[2]"
+    );
+}
+
+#[test]
+fn tag_provider_not_in_manifest_is_refused() {
+    let text = refused(try_render(
+        "dev",
+        &[],
+        &["default"],
+        &[
+            ("tags/default/tag-provider/config.json", "{}"),
+            ("tags/rogue/tag-provider/config.json", "{}"),
+            ("tags/rogue/tag-group/Default/config.json", "{}"),
+            ("modes/dev/tags/other/tag-provider/config.json", "{}"),
+        ],
+    ));
+    assert!(text.contains("gateways/g/tags/rogue/"), "{text}");
+    assert!(text.contains("gateways/g/modes/dev/tags/other/"), "{text}");
+    assert_eq!(
+        text.matches("tags/rogue/").count(),
+        1,
+        "one finding per provider: {text}"
+    );
+    assert!(!text.contains("tags/default/"), "{text}");
+}
+
+#[test]
+fn unknown_tag_type_is_refused() {
+    let text = refused(try_render(
+        "dev",
+        &[],
+        &["default"],
+        &[
+            ("tags/default/tag-provider/config.json", "{}"),
+            ("tags/default/tag-widget/config.json", "{}"),
+            ("tags/default/loose.json", "{}"),
+        ],
+    ));
+    assert!(
+        text.contains("gateways/g/tags/default/tag-widget/config.json"),
+        "{text}"
+    );
+    assert!(text.contains("is not a tag type"), "{text}");
+    assert!(
+        text.contains("gateways/g/tags/default/loose.json"),
+        "{text}"
+    );
+}
+
+#[test]
+fn tag_types_under_resources_are_refused() {
+    let text = refused(try_render(
+        "dev",
+        &["ignition/tag-group", "ignition/tag-definition"],
+        &[],
+        &[
+            ("resources/ignition/tag-group/P/Default/config.json", "{}"),
+            ("resources/ignition/tag-group/P/Other/config.json", "{}"),
+            (
+                "resources/ignition/tag-definition/P/unary-resource.json",
+                "{}",
+            ),
+        ],
+    ));
+    assert_eq!(
+        text.matches("gateways/g/resources/ignition/tag-group/")
+            .count(),
+        1,
+        "one finding per type directory: {text}"
+    );
+    assert!(
+        text.contains("gateways/g/resources/ignition/tag-definition/"),
+        "{text}"
+    );
+    assert!(text.contains("tags/"), "{text}");
+}
+
+#[test]
+fn colliding_sources_are_refused() {
+    let text = refused(try_render(
+        "dev",
+        &["ignition/tag-group"],
+        &["P"],
+        &[
+            ("tags/P/tag-group/Default/config.json", "{}"),
+            ("resources/ignition/tag-group/P/Default/config.json", "{}"),
+        ],
+    ));
+    assert!(
+        text.contains("gateways/g/resources/ignition/tag-group/P/Default/config.json"),
+        "{text}"
+    );
+    assert!(
+        text.contains("gateways/g/tags/P/tag-group/Default/config.json"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ignition/tag-group/P/Default/config.json"),
+        "{text}"
+    );
+}
+
+fn overlay_repo(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    copy_dir(Path::new(TRACER_REPO), &repo);
+    let gw = repo.join("gateways/tracer-gw");
+    let mut manifest = std::fs::read_to_string(gw.join("manifest.yaml")).expect("manifest");
+    manifest.push_str("tag_providers: [default]\n");
+    std::fs::write(gw.join("manifest.yaml"), manifest).expect("write");
+    for (rel, body) in [
+        (
+            "modes/dev/resources/ignition/database-translator/POSTGRES/resource.json",
+            "{\"o\": 1}",
+        ),
+        ("modes/dev/tags/default/tag-provider/config.json", "{}"),
+        ("tags/default/tag-provider/resource.json", "{}"),
+        ("tags/default/tag-definition/F/tags.json", "{}"),
+    ] {
+        let path = gw.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    }
+    repo
+}
+
+#[test]
+fn overlay_render_is_read_only_and_repeatable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = overlay_repo(tmp.path());
+    let before = snapshot(&repo);
+    let first = deploy_render(&repo, "dev").expect("render");
+    let second = deploy_render(&repo, "dev").expect("render again");
+    assert_eq!(first.render_sha256, second.render_sha256);
+    assert_eq!(first.tag_providers, ["default"]);
+    assert_eq!(first, second);
+    assert_eq!(before, snapshot(&repo), "render must not write anything");
+    // the overlay is part of the dev digest and absent from another env
+    let base = deploy_render(Path::new(TRACER_REPO), "dev").expect("baseline");
+    assert_ne!(first.render_sha256, base.render_sha256);
+}

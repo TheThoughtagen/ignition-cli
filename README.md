@@ -2155,6 +2155,52 @@ than 128 levels, a key repeated within one object, and a file over the
 16 MiB (16,777,216 bytes) per-JSON cap. The message carries positions and
 key names, never values.
 
+#### Environments and overlays
+
+`gateways/<name>/modes/<env>/` is the overlay for environment `<env>`. It
+mirrors the base layout: `modes/<env>/resources/<module>/<type>/…` and
+`modes/<env>/tags/<provider>/<tag type>/…` (anything else directly under
+`modes/<env>/` is refused). A file in the overlay **replaces the base file at
+the same path whole** (there is no merging of keys inside a file), or is
+**added** when the base has no file there; a base file with no overlay
+counterpart is rendered unchanged. Only the directory named for the `--env`
+being rendered is opened: another environment's `modes/<other>/` tree is never
+read, so content in it (including content that would be refused) cannot affect
+this render. A finding on an overlay file names the overlay path
+(`gateways/<name>/modes/<env>/…`).
+
+Overlays can only add or replace. A base resource **cannot be removed for one
+environment**; keep a resource that differs per environment out of the base
+tree and add it from each `modes/<env>/` instead. This is a documented
+limitation (SF-7), not an oversight.
+
+#### Tags layout
+
+Tags live under `gateways/<name>/tags/<provider>/<tag type>/…`, where `<tag
+type>` is one of `tag-provider`, `tag-group`, `tag-type-definition` or
+`tag-definition`. Render maps each file to the collection path the gateway
+holds on disk, as captured against an 8.3.6 gateway (decision CD5):
+
+```text
+tags/<provider>/<type>/<rest>  ->  ignition/<type>/<provider>/<rest>
+```
+
+For example `tags/default/tag-group/Default/config.json` renders as
+`ignition/tag-group/default/Default/config.json`, and a folder of tags
+`tags/default/tag-definition/Plant/tags.json` as
+`ignition/tag-definition/default/Plant/tags.json`. Folders nest as directories.
+Every provider directory must be listed in the manifest `tag_providers`;
+a provider that is not listed is refused (naming `tags/<provider>/`), and the
+`tag_providers` data key lists the providers that rendered at least one file.
+Tag types are not declared under `resources/` (and do not need a manifest
+`types` entry); `resources/ignition/<tag type>/…` is refused.
+
+Three layouts were not exercised by the capture and so stay refused: a
+`tags.json` or `udts.json` directly at the root of `tag-definition`
+(root-level tags; put tags in a folder), folders nested under
+`tag-type-definition`, and a non-default collection. Two source files that map
+to the same collection path are refused, naming both.
+
 ## Linting (`ign lint`)
 
 `ign lint PATH... [--strict] [-- <extra ignition-lint args>]` delegates

@@ -6,10 +6,15 @@
 //!
 //! 1. **collect** the source tree ([`super::tree::SourceTree`]) - done by the
 //!    caller and handed in as [`RenderInput::source`]
-//! 2. overlay `modes/<env>` (21-06)
-//! 3. **map** repo paths to collection paths (tags in 21-06)
-//! 4. **policy**: the manifest type allowlist and its D-02 refusal (21-04);
-//!    deny list, gateway-owned, dot-names and tag providers (21-06)
+//! 2. **overlay** `modes/<env>/` onto the base: a file replaces the base file
+//!    at the same path whole, or is added (SF-7: there is no removal). Only
+//!    the selected environment is applied.
+//! 3. **map** repo paths to collection paths: `resources/...` drops its
+//!    prefix, `tags/<P>/<type>/<rest>` becomes `ignition/<type>/<P>/<rest>`
+//!    (CD5); two sources on one collection path are refused
+//! 4. **policy**: the manifest type allowlist and its D-02 refusal, the deny
+//!    list, gateway-owned files, dot-names, undeclared tag providers and tag
+//!    types under `resources/` (21-06)
 //! 5. **JSON classification**, the Gson gate (21-05): `node::classify` on every
 //!    `.json` member; findings name the source path; parsed nodes are kept
 //! 6. uuid (21-07)
@@ -23,9 +28,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use super::layout::{RelPath, ResourceKey, collection_path, resource_key};
+use super::layout::{RelPath, ResourceKey, TAG_TYPES, collection_path, resource_key, tag_provider};
 use super::manifest::Manifest;
 use super::node::{self, JsonClass, Node};
+use super::rules::{GATEWAY_OWNED_FILES, is_denied};
 use super::target::Target;
 use super::tree::{RenderedTree, SourceTree};
 use crate::error::{CoreError, DeployFinding};
@@ -66,7 +72,7 @@ pub struct RenderOutcome {
     pub tree: RenderedTree,
     /// Resources ordered by (module, type, name) bytes, singletons first.
     pub resources: Vec<RenderedResource>,
-    /// Tag providers rendered (none until 21-06), byte-ordered.
+    /// Tag providers that rendered at least one file, byte-ordered.
     pub tag_providers: Vec<String>,
     /// Collection paths of files that received a minted uuid (none until
     /// 21-07), byte-ordered.
@@ -82,71 +88,258 @@ pub struct RenderOutcome {
 /// `deploy_tree_invalid`.
 pub fn render(input: &RenderInput<'_>) -> Result<RenderOutcome, CoreError> {
     let mut findings = Vec::new();
-    let (mapped, origins) = map_to_collection(input, &mut findings);
-    enforce_allowlist(input, &mapped, &mut findings);
-    let json = classify_json(&mapped, &origins, &mut findings);
+    let effective = overlay(input, &mut findings);
+    let effective = screen_names(effective, &mut findings);
+    let mapped = map_to_collection(effective, &mut findings);
+    enforce_policy(input, &mapped, &mut findings);
+    let json = classify_json(&mapped.files, &mapped.origins, &mut findings);
     if !findings.is_empty() {
         return Err(CoreError::deploy_findings(findings));
     }
     Ok(finish(mapped, &json))
 }
 
-/// Collection path to the repo-relative source path (`gateways/<g>/<origin>`)
-/// it came from, so every later finding names a file the operator can open.
-type Origins = BTreeMap<RelPath, String>;
+/// One gateway-relative file after the overlay: its bytes and the repo path
+/// prefix (`gateways/<g>/` or `gateways/<g>/modes/<env>/`) it came from, so a
+/// finding can name the file the operator should open.
+struct Entry {
+    bytes: Vec<u8>,
+    prefix: String,
+}
+
+/// Gateway-relative path (`resources/...` or `tags/...`) to its entry.
+type Effective = BTreeMap<RelPath, Entry>;
+
+/// Where a collection path came from.
+struct Origin {
+    /// Full repo-relative source path.
+    file: String,
+    /// The prefix of `file` before the gateway-relative path.
+    prefix: String,
+}
+
+/// Collection path to its origin, so every later finding names a file the
+/// operator can open.
+type Origins = BTreeMap<RelPath, Origin>;
+
+/// The mapped tree (stage 3 output).
+struct Mapped {
+    files: BTreeMap<RelPath, Vec<u8>>,
+    origins: Origins,
+    /// Collection paths that came from `tags/`, with their provider.
+    tags: BTreeMap<RelPath, String>,
+}
 
 /// Parsed JSON members keyed by collection path, with their class. Stages 6
 /// (uuid, 21-07) and 7 (lints, 21-08) read this table.
 type JsonTable = BTreeMap<RelPath, (JsonClass, Node)>;
 
-/// Stage 3: gateway-relative paths to collection paths.
-fn map_to_collection(
-    input: &RenderInput<'_>,
-    findings: &mut Vec<DeployFinding>,
-) -> (BTreeMap<RelPath, Vec<u8>>, Origins) {
-    let mut mapped = BTreeMap::new();
-    let mut origins = Origins::new();
+/// Stage 2: apply `modes/<env>/` over the base.
+///
+/// An overlay file replaces the base file at the same path or is added; a
+/// base file with no overlay counterpart is unchanged. Keys under
+/// `modes/<other>/` are not this environment's and are ignored (the reader
+/// never opens them either).
+fn overlay(input: &RenderInput<'_>, findings: &mut Vec<DeployFinding>) -> Effective {
+    let base_prefix = format!("gateways/{}/", input.gateway);
+    let env_dir = format!("modes/{}", input.env);
+    let overlay_prefix = format!("{base_prefix}{env_dir}/");
+    let mut effective = Effective::new();
+    let mut overlaid = Vec::new();
     for (path, bytes) in &input.source.files {
-        match collection_path(path) {
+        if path.components().next() == Some("modes") {
+            if let Some(rest) = path.strip_prefix(&env_dir) {
+                overlaid.push((rest, bytes));
+            }
+        } else {
+            effective.insert(
+                path.clone(),
+                Entry {
+                    bytes: bytes.clone(),
+                    prefix: base_prefix.clone(),
+                },
+            );
+        }
+    }
+    for (rest, bytes) in overlaid {
+        let top = rest.components().next();
+        if !matches!(top, Some("resources" | "tags")) && rest.as_str() != ".gitkeep" {
+            findings.push(DeployFinding {
+                file: format!("{overlay_prefix}{rest}"),
+                line: None,
+                column: None,
+                message: "unexpected entry under modes/<env>/ (expected: resources/, tags/)"
+                    .to_string(),
+            });
+            continue;
+        }
+        effective.insert(
+            rest,
+            Entry {
+                bytes: bytes.clone(),
+                prefix: overlay_prefix.clone(),
+            },
+        );
+    }
+    effective
+}
+
+/// Stage 4 (21-06 share, name screening): a path component that starts with
+/// `.` is refused, except a file named `.gitkeep`, which is dropped; a file
+/// whose name is gateway-owned is refused. Offending entries are dropped
+/// after being reported, so later stages do not repeat the finding.
+fn screen_names(effective: Effective, findings: &mut Vec<DeployFinding>) -> Effective {
+    let mut kept = Effective::new();
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    for (path, entry) in effective {
+        let parts: Vec<&str> = path.components().collect();
+        let last = parts.len() - 1;
+        let dot = parts.iter().position(|c| c.starts_with('.'));
+        match dot {
+            Some(i) if i == last && parts[i] == ".gitkeep" => continue,
+            Some(i) => {
+                let at = format!("{}{}", entry.prefix, parts[..=i].join("/"));
+                if reported.insert(at.clone()) {
+                    findings.push(DeployFinding {
+                        file: at,
+                        line: None,
+                        column: None,
+                        message: "name starts with `.`; dot-named entries are refused (only a `.gitkeep` file is skipped)".to_string(),
+                    });
+                }
+                continue;
+            }
+            None => {}
+        }
+        if GATEWAY_OWNED_FILES.contains(&parts[last]) {
+            findings.push(DeployFinding {
+                file: format!("{}{path}", entry.prefix),
+                line: None,
+                column: None,
+                message: format!(
+                    "`{}` is written by the gateway itself and is not deployed; remove it from the tree",
+                    parts[last]
+                ),
+            });
+            continue;
+        }
+        kept.insert(path, entry);
+    }
+    kept
+}
+
+/// Stage 3: gateway-relative paths to collection paths. The mapping must be
+/// injective: a second source on a collection path is a finding naming both.
+fn map_to_collection(effective: Effective, findings: &mut Vec<DeployFinding>) -> Mapped {
+    let mut mapped = Mapped {
+        files: BTreeMap::new(),
+        origins: Origins::new(),
+        tags: BTreeMap::new(),
+    };
+    for (path, entry) in effective {
+        let file = format!("{}{path}", entry.prefix);
+        match collection_path(&path) {
             Ok(collection) => {
-                origins.insert(
+                if let Some(first) = mapped.origins.get(&collection) {
+                    findings.push(DeployFinding {
+                        file,
+                        line: None,
+                        column: None,
+                        message: format!(
+                            "maps to collection path `{collection}`, which `{}` already produces",
+                            first.file
+                        ),
+                    });
+                    continue;
+                }
+                if let Some(provider) = tag_provider(&path) {
+                    mapped.tags.insert(collection.clone(), provider.to_string());
+                }
+                mapped.origins.insert(
                     collection.clone(),
-                    format!("gateways/{}/{path}", input.gateway),
+                    Origin {
+                        file,
+                        prefix: entry.prefix,
+                    },
                 );
-                mapped.insert(collection, bytes.clone());
+                mapped.files.insert(collection, entry.bytes);
             }
             Err(why) => findings.push(DeployFinding {
-                file: format!("gateways/{}/{path}", input.gateway),
+                file,
                 line: None,
                 column: None,
                 message: why,
             }),
         }
     }
-    (mapped, origins)
+    mapped
 }
 
-/// Stage 4 (21-04 share): one finding per type directory that is not on the
-/// manifest allowlist (D-02: refused, never skipped).
-fn enforce_allowlist(
-    input: &RenderInput<'_>,
-    mapped: &BTreeMap<RelPath, Vec<u8>>,
-    findings: &mut Vec<DeployFinding>,
-) {
-    let mut refused: BTreeSet<(String, String)> = BTreeSet::new();
-    for path in mapped.keys() {
-        let key = resource_key(path);
-        if !input.manifest.allows_type(&key.module, &key.ty) {
-            refused.insert((key.module, key.ty));
+/// Stage 4: the manifest allowlist (D-02), the deny list, tag types under
+/// `resources/`, and undeclared tag providers.
+///
+/// Findings are one per type directory or provider, naming the first source
+/// in byte order (an overlay path when the overlay supplied it).
+fn enforce_policy(input: &RenderInput<'_>, mapped: &Mapped, findings: &mut Vec<DeployFinding>) {
+    // the first origin prefix of each resource-side type directory
+    let mut types: BTreeMap<(String, String), &str> = BTreeMap::new();
+    let mut providers: BTreeMap<&str, &str> = BTreeMap::new();
+    for path in mapped.files.keys() {
+        let origin = &mapped.origins[path];
+        if let Some(provider) = mapped.tags.get(path) {
+            providers.entry(provider).or_insert(&origin.prefix);
+        } else {
+            let key = resource_key(path);
+            types.entry((key.module, key.ty)).or_insert(&origin.prefix);
         }
     }
-    for (module, ty) in refused {
-        findings.push(DeployFinding {
-            file: format!("gateways/{}/resources/{module}/{ty}/", input.gateway),
-            line: None,
-            column: None,
-            message: "type not in manifest.yaml types (D-02: un-allowlisted type directories are refused, not skipped)".to_string(),
-        });
+    let dir = |prefix: &str, module: &str, ty: &str| format!("{prefix}resources/{module}/{ty}/");
+    let finding = |file: String, message: String| DeployFinding {
+        file,
+        line: None,
+        column: None,
+        message,
+    };
+
+    for ((module, ty), prefix) in &types {
+        if !input.manifest.allows_type(module, ty) {
+            findings.push(finding(
+                dir(prefix, module, ty),
+                "type not in manifest.yaml types (D-02: un-allowlisted type directories are refused, not skipped)".to_string(),
+            ));
+        }
+        if module == "ignition" && TAG_TYPES.contains(&ty.as_str()) {
+            findings.push(finding(
+                dir(prefix, module, ty),
+                "tag types are declared under tags/<provider>/, not resources/".to_string(),
+            ));
+        }
+        if is_denied(module, ty) {
+            findings.push(finding(
+                dir(prefix, module, ty),
+                "denied type: rendering it can lock an administrator out of the gateway, so it stays gateway-owned even when allowlisted".to_string(),
+            ));
+        }
+    }
+    for entry in &input.manifest.types {
+        if let Some((module, ty)) = entry.split_once('/')
+            && is_denied(module, ty)
+        {
+            findings.push(finding(
+                format!("gateways/{}/manifest.yaml", input.gateway),
+                format!(
+                    "types entry `{entry}` is a denied type and is refused even though it is allowlisted (rendering it can lock an administrator out of the gateway)"
+                ),
+            ));
+        }
+    }
+    for (provider, prefix) in &providers {
+        if !input.manifest.tag_providers.iter().any(|p| p == provider) {
+            findings.push(finding(
+                format!("{prefix}tags/{provider}/"),
+                "tag provider not in manifest.yaml tag_providers (D-02: undeclared providers are refused)".to_string(),
+            ));
+        }
     }
 }
 
@@ -175,7 +368,7 @@ fn classify_json(
             Err(message) => findings.push(DeployFinding {
                 file: origins
                     .get(path)
-                    .cloned()
+                    .map(|o| o.file.clone())
                     .unwrap_or_else(|| path.to_string()),
                 line: None,
                 column: None,
@@ -187,9 +380,9 @@ fn classify_json(
 }
 
 /// Stage 8: the rendered tree and its resource listing.
-fn finish(mapped: BTreeMap<RelPath, Vec<u8>>, json: &JsonTable) -> RenderOutcome {
+fn finish(mapped: Mapped, json: &JsonTable) -> RenderOutcome {
     let mut groups: BTreeMap<ResourceKey, Vec<String>> = BTreeMap::new();
-    for path in mapped.keys() {
+    for path in mapped.files.keys() {
         let key = resource_key(path);
         let skip = if key.name.is_some() { 3 } else { 2 };
         let rest: Vec<&str> = path.components().skip(skip).collect();
@@ -208,13 +401,21 @@ fn finish(mapped: BTreeMap<RelPath, Vec<u8>>, json: &JsonTable) -> RenderOutcome
         })
         .collect();
     let mut warnings = Vec::new();
-    if mapped.is_empty() {
+    if mapped.files.is_empty() {
         warnings.push("render produced no files".to_string());
     }
     RenderOutcome {
-        tree: RenderedTree { files: mapped },
+        tag_providers: mapped
+            .tags
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        tree: RenderedTree {
+            files: mapped.files,
+        },
         resources,
-        tag_providers: Vec::new(),
         uuids_minted: Vec::new(),
         opaque_files: json
             .iter()
