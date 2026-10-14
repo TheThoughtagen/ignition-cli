@@ -31,6 +31,13 @@
 //! | `removed` | produced from the delete set (22-03 on) |
 //! | `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted, never counted in `has_changes` (D-06) |
 //!
+//! `core` relates the `core` collection's copy of the unit to the rendered
+//! unit: `none` (no core copy), `identical` (same files, byte-equal),
+//! `differs`, or `hidden` (a tag-definition or tag-type-definition folder
+//! defined in the mode collection whose core copy holds files the rendered
+//! unit lacks: the gateway overrides these by folder, so those core files
+//! are invisible). `shadows_removal` is produced from 22-03 on.
+//!
 //! Comparison is byte-exact per file: a whitespace-only or key-order change
 //! is `changed`.
 //!
@@ -228,6 +235,21 @@ fn blob_digest(blob: &FileBlob) -> String {
     blob.sha256.clone()
 }
 
+/// Whether `key` is a tag-definition or tag-type-definition unit below a
+/// provider (`ignition/<type>/<provider>[/...]`). The gateway overrides these
+/// by folder, so a mode-collection copy hides `core` files it does not hold.
+fn is_tag_folder(key: &str) -> bool {
+    let mut parts = key.split('/');
+    parts.next() == Some("ignition")
+        && matches!(parts.next(), Some("tag-definition" | "tag-type-definition"))
+        && parts.next().is_some()
+}
+
+/// Whether the `core` copy holds a file the rendered unit lacks.
+fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -> bool {
+    core.keys().any(|path| !rendered.contains_key(path))
+}
+
 /// Compare `rendered` with `observed`.
 pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
     let desired = group(&rendered.files, |bytes: &Vec<u8>| sha256_hex(bytes));
@@ -262,9 +284,13 @@ pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
             (Some(_), Some(_)) => PlanStatus::Changed,
             (None, _) => PlanStatus::Unmanaged,
         };
+        let rendered_files = wanted.unwrap_or(&empty);
         let core_relation = match core_copy {
             None => CoreRelation::None,
-            Some(c) if c == wanted.unwrap_or(&empty) => CoreRelation::Identical,
+            Some(c) if is_tag_folder(key) && mode_copy.is_some() && hides(c, rendered_files) => {
+                CoreRelation::Hidden
+            }
+            Some(c) if c == rendered_files => CoreRelation::Identical,
             Some(_) => CoreRelation::Differs,
         };
 

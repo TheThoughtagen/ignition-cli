@@ -821,6 +821,22 @@ mod tests {
     }
 
     #[test]
+    fn walk_capped_stops_at_the_entry_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), b"x").expect("write");
+        }
+        let (mut files, mut dirs) = (BTreeMap::new(), BTreeSet::new());
+        walk_capped(dir.path(), "root", &mut files, &mut dirs, 3).expect("three fit");
+        assert_eq!(files.len(), 3);
+
+        let (mut files, mut dirs) = (BTreeMap::new(), BTreeSet::new());
+        let why = walk_capped(dir.path(), "root", &mut files, &mut dirs, 2)
+            .expect_err("three entries exceed a cap of two");
+        assert!(why.contains("more than 2 entries"), "{why}");
+    }
+
+    #[test]
     fn from_files_rejects_hostile_paths() {
         assert!(SourceTree::from_files([("../x", "a")]).is_err());
         assert!(SourceTree::from_files([("resources/a/b/c", "a")]).is_ok());
