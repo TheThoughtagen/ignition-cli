@@ -667,6 +667,23 @@ pub enum DeployCommand {
         #[arg(long)]
         diff: bool,
     },
+    /// Bootstrap `gateways/<name>/` from the master node's live tree.
+    /// Read-only against the gateway: it reads the host through the
+    /// master's `ssh` or `local` block and writes only the local repo.
+    /// `core` files go to `resources/` and `tags/`, the target mode
+    /// collection's files to `modes/<ENV>/`. Units that hold a secret or
+    /// that render would not reproduce byte for byte are skipped and listed
+    /// with a reason; the next `plan` reports them as unmanaged. Replacing a
+    /// non-empty `resources/`, `tags/` or `modes/<ENV>/` needs the global
+    /// `--yes`; `manifest.yaml` and other environments are never touched
+    Pull {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 /// `ign edit` args (13-08): the kubectl-edit loop over ONE resource.

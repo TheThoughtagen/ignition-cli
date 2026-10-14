@@ -187,7 +187,10 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
     // the master node, and the documented first human line is the plan
     // summary, so the CORE-01 header is not printed for it.
     if let Some(name) = profile
-        && !matches!(out, ActionOutput::DeployPlan(_))
+        && !matches!(
+            out,
+            ActionOutput::DeployPlan(_) | ActionOutput::DeployPull(_)
+        )
     {
         println!("[profile: {name}]");
     }
@@ -290,6 +293,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::DeployRender(result) => render_deploy_render_human(result),
         ActionOutput::DeployPlan(result) => render_deploy_plan_human(result),
+        ActionOutput::DeployPull(result) => render_deploy_pull_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1462,6 +1466,27 @@ fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanR
         println!("delete {path}");
     }
     println!("plan_sha256 {}", result.plan_sha256);
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `ign deploy pull` human form: a summary line, one line per skipped unit
+/// or type with its reason, then the digest of the render of the pulled tree.
+/// Paths and reasons only; no file bytes.
+fn render_deploy_pull_human(result: &ignition_core::actions::deploy::DeployPullResult) {
+    println!(
+        "pulled {} files into {}/ from nodes.master via {} ({} skipped, manifest {})",
+        result.files_written,
+        result.out,
+        result.transport,
+        result.skipped.len(),
+        result.manifest
+    );
+    for skipped in &result.skipped {
+        println!("skipped {}: {}", skipped.path, skipped.reason);
+    }
+    println!("render_sha256 {}", result.render_sha256);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }

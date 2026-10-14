@@ -342,6 +342,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
 | `ign deploy render --env <ENV> [--repo DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
 | `ign deploy plan --env <ENV> [--repo DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
+| `ign deploy pull --env <ENV> [--repo DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings}` |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -2722,6 +2723,85 @@ printed in the plan, its diff, stderr or the debug form of the result.
 **Over MCP.** `deploy plan` is in the `ign mcp serve` tool catalog as
 `deploy_plan`. It is read-only, so the tool is not guarded and takes no
 `confirm` argument.
+
+### `deploy pull`
+
+`ign deploy pull --env <ENV> [--repo DIR]` bootstraps `gateways/<name>/` from
+the live tree of `nodes.master`. It is a **bootstrap**, not a sync: pull once,
+review the result in git, and compare later pulls with `git diff`. It is
+**read-only against the gateway**: the host is read through the same reader as
+`deploy plan` (`nodes.master.local` or `nodes.master.ssh`), no gateway session
+is resolved, no REST request is sent, and nothing is written to the host.
+The envelope `profile` is the master node's profile name, used as a label
+only. It writes only the local repo, under `gateways/<name>/`, and never
+follows or creates a symlink there.
+
+**Layering (D-12).** Pull mirrors the layering `render` applies. Files of the
+`core` collection go to the base tree (`resources/`, `tags/`); files of the
+target's mode collection go to the `modes/<ENV>/` overlay. A unit that is in
+both lands in both, so `render` reproduces what the gateway runs. An absent
+mode collection writes no `modes/<ENV>/` directory. Bytes are kept exactly as
+read (no newline conversion, re-encoding or JSON reformatting), and a
+bootstrapped resource keeps the gateway's own `attributes.uuid`.
+
+**The manifest (D-10).** An existing `gateways/<name>/manifest.yaml` is used
+and kept (`data.manifest` is `kept`). Otherwise one is generated
+(`generated`) from the live types of `core` and the mode collection: every
+type that has a render rule, byte-sorted, minus the types that stay
+gateway-owned (security singletons, security levels, API tokens, user
+sources) and minus the four tag types, which are carried by `tag_providers`.
+`tag_providers` lists the provider names found under `ignition/tag-provider/`.
+Types left out are listed in `data.skipped[]` with the reason
+`type_without_rule` or `denied_type`.
+
+**What is skipped, and why.** Pull writes only units it can reproduce. It
+renders its own tree and repeats, dropping units, until a round drops nothing
+(at most 8 rounds), then checks that every kept unit renders to exactly its
+effective live files. Every live unit not written appears in `data.skipped[]`
+as `{path, reason}`, byte-sorted by `path` (the same unit key `plan` uses),
+with one of:
+
+| Reason | Meaning |
+|--------|---------|
+| `embedded_secret` | the unit holds an `Embedded` secret or a plaintext secret location; nothing of it is written |
+| `not_round_trippable` | `render` would change the unit (for example it mints a `uuid`, drops a `.gitkeep`, or a `core` file is hidden by the mode copy), so the written tree would not plan as `same` |
+| `render_refused: <finding>` | `render` refuses the unit (for example a Windows-illegal name or a case-fold collision); the finding names paths and keys, never a value |
+| `type_without_rule` | a live type with no render rule (generated manifest only) |
+| `denied_type` | a live type on the deny list (generated manifest only) |
+
+No reason carries a value, and a secret is never written to the repo, the
+envelope or stderr. A skipped unit stays on the gateway: the next `plan`
+reports it as `unmanaged`. After a pull, `render` then `plan` against the same
+gateway reports `has_changes: false`: every written unit is `same` and every
+skipped unit is `unmanaged`. A render defect that names no unit (for example a
+manifest that allowlists a type with no render rule) is returned as
+`deploy_tree_invalid` instead.
+
+**Overwriting (D-11, `--yes`).** If `resources/`, `tags/` or `modes/<ENV>/`
+already hold files, pull refuses with exit 2 `confirmation_required` unless
+the global `--yes` is given. The refusal is raised before the gateway is read
+and before any write, and its message names the number of existing files and
+the first five paths that would be replaced. With `--yes` only those three
+subtrees are replaced; `manifest.yaml`, other environments' overlays and
+`targets/` are never touched. A symlink anywhere in the subtrees to be
+replaced is refused (`deploy_tree_invalid`) and nothing is removed. A pull into
+an absent or empty `gateways/<name>/` (or one holding only a manifest and other
+overlays) needs no `--yes`.
+
+**Data keys.** With `--json`, `data` carries, in this order: `env`, `gateway`,
+`mode`, `node`, `transport` (`local` or `ssh`), `out` (`gateways/<name>`),
+`files_written` (source files under `resources/`, `tags/` and `modes/<ENV>/`;
+the manifest is not counted), `manifest` (`kept` or `generated`),
+`render_sha256` (what `deploy render` produces from the pulled tree), `skipped`
+and `warnings`. Human output is `pulled <n> files into gateways/<name>/ from
+nodes.master via <transport> (<k> skipped, manifest <kept|generated>)`, one
+`skipped <path>: <reason>` line per skipped unit, then `render_sha256 <hex>`.
+
+**Over MCP.** `deploy pull` is in the `ign mcp serve` catalog as `deploy_pull`
+and, being guarded, advertises the synthetic optional `confirm`. A pull into an
+absent or empty `gateways/<name>/` runs without `confirm`, because D-11 guards
+only a non-empty overwrite; the write is confined to `gateways/<name>/` of the
+caller's own `--repo`.
 
 ## Linting (`ign lint`)
 

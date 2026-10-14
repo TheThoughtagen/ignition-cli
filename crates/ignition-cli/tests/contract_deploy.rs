@@ -1103,3 +1103,254 @@ fn plan_base_cli_marks_drift_and_refuses_a_tampered_base() {
     assert!(out.stdout.is_empty());
     assert_eq!(stderr_json(&out)["error"]["code"], "invalid_input");
 }
+
+// ---------------------------------------------------------------------
+// `ign deploy pull` (22-08, DPLN-06)
+// ---------------------------------------------------------------------
+
+/// Canary seeded into live Embedded ciphertext that pull must never write.
+const CANARY_PULL: &str = "IGN-CANARY-22-08-CIPHERTEXT";
+
+/// Every file below `dir`, relative path to bytes.
+fn read_tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, rel: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if entry.path().is_dir() {
+                walk(&entry.path(), &child, out);
+            } else {
+                out.insert(child, std::fs::read(entry.path()).expect("read"));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, "", &mut out);
+    out
+}
+
+/// A local tracer whose live mode collection also holds an Embedded-secret
+/// unit; the declared gateway directory is removed so the pull starts from
+/// an empty repo.
+fn pull_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (scratch, repo, data) = local_tracer();
+    let secret = data.join("config/resources/dev/ignition/database-translator/SECRET");
+    std::fs::create_dir_all(&secret).expect("secret dir");
+    std::fs::write(
+        secret.join("resource.json"),
+        br#"{"scope":"A","version":1,"restricted":false,"overridable":true,"files":["config.json"],"attributes":{"uuid":"7c2e1f90-3b4a-4d5e-8f6a-1b2c3d4e5f60","enabled":true}}"#,
+    )
+    .expect("seed resource.json");
+    std::fs::write(
+        secret.join("config.json"),
+        format!(r#"{{"password":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_PULL}"}}}}}}"#),
+    )
+    .expect("seed secret");
+    std::fs::remove_dir_all(repo.join("gateways/tracer-gw")).expect("empty the repo");
+    (scratch, repo, data)
+}
+
+#[test]
+fn pull_never_writes_secret() {
+    let (_scratch, repo, data) = pull_fixture();
+    let live_before = read_tree(&data);
+
+    // --json
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "pull", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains(CANARY_PULL), "canary in json {name}");
+        assert!(!text.contains("ciphertext"), "ciphertext in json {name}");
+    }
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["profile"], "dev");
+    let data_obj = envelope["data"].as_object().expect("data object");
+    let mut keys: Vec<&str> = data_obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut expected = vec![
+        "env",
+        "gateway",
+        "mode",
+        "node",
+        "transport",
+        "out",
+        "files_written",
+        "manifest",
+        "render_sha256",
+        "skipped",
+        "warnings",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
+    assert_eq!(data_obj["out"], "gateways/tracer-gw");
+    assert_eq!(data_obj["manifest"], "generated");
+    assert_eq!(data_obj["transport"], "local");
+    let skipped = data_obj["skipped"].as_array().expect("skipped");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(
+        skipped[0],
+        serde_json::json!({
+            "path": "ignition/database-translator/SECRET",
+            "reason": "embedded_secret"
+        })
+    );
+
+    // not one written file holds the ciphertext or the unit
+    let written = read_tree(&repo.join("gateways/tracer-gw"));
+    assert!(written.len() >= 5, "{:?}", written.keys());
+    for (path, bytes) in &written {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(CANARY_PULL),
+            "{path} holds the ciphertext"
+        );
+        assert!(!path.contains("SECRET"), "{path}");
+    }
+    // read-only against the host
+    assert_eq!(read_tree(&data), live_before);
+
+    // pull, render, plan: nothing to do, the secret unit is unmanaged
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(out.status.code(), Some(0));
+    let plan: Value = serde_json::from_slice(&out.stdout).expect("plan envelope");
+    assert_eq!(plan["data"]["summary"]["has_changes"], false);
+    let unmanaged: Vec<&str> = plan["data"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|e| e["status"] == "unmanaged")
+        .map(|e| e["key"].as_str().expect("key"))
+        .collect();
+    assert_eq!(unmanaged, ["ignition/database-translator/SECRET"]);
+
+    // human mode, second pull over the now non-empty tree (needs --yes; the
+    // manifest the first pull generated is now kept)
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--yes", "deploy", "pull", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains(CANARY_PULL), "canary in human {name}");
+        assert!(!text.contains("ciphertext"), "ciphertext in human {name}");
+    }
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let first = stdout.lines().next().expect("first line");
+    assert!(
+        first.starts_with("pulled ")
+            && first.contains(
+                "into gateways/tracer-gw/ from nodes.master via local (1 skipped, manifest kept)"
+            ),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "skipped ignition/database-translator/SECRET: embedded_secret"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .expect("last")
+            .starts_with("render_sha256 "),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn pull_cli_overwrite_needs_yes() {
+    let (_scratch, repo, _data) = local_tracer();
+    let before = read_tree(&repo);
+
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "pull", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("deploy pull would replace gateways/tracer-gw/resources, tags and modes/dev")
+            && message.contains("(4 existing files, e.g. resources/ignition/database-translator/POSTGRES/config.json"),
+        "{message}"
+    );
+    assert_eq!(read_tree(&repo), before, "nothing written");
+
+    // with --yes the live tree replaces it, and the manifest is kept
+    let manifest = std::fs::read(repo.join("gateways/tracer-gw/manifest.yaml")).expect("manifest");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args([
+            "--json", "--yes", "deploy", "pull", "--env", "dev", "--repo",
+        ])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["manifest"], "kept");
+    assert_eq!(
+        std::fs::read(repo.join("gateways/tracer-gw/manifest.yaml")).expect("manifest"),
+        manifest
+    );
+    // the base resources/ are gone (the live tree is all in the mode collection)
+    assert!(!repo.join("gateways/tracer-gw/resources").exists());
+    assert!(repo
+        .join("gateways/tracer-gw/modes/dev/resources/ignition/database-translator/POSTGRES/config.json")
+        .is_file());
+}
+
+#[test]
+fn pull_cli_master_without_host_access_exits_2() {
+    let (_scratch, repo) = tracer_with_master("");
+    std::fs::remove_dir_all(repo.join("gateways/tracer-gw")).expect("empty the repo");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "pull", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(stderr_json(&out)["error"]["code"], "deploy_tree_invalid");
+    assert!(!repo.join("gateways/tracer-gw").exists(), "nothing written");
+}

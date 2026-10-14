@@ -486,3 +486,553 @@ fn empty_live_tree() {
     assert!(outcome.skipped.is_empty());
     assert_eq!(outcome.rendered.tree.render_sha256(), EMPTY_RENDER_SHA256);
 }
+
+// ---------------------------------------------------------------------
+// The action: `deploy_pull_preview`, `deploy_pull` and the round trip.
+// ---------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use common::plan_fixture::PlanFixture;
+use ignition_core::actions::deploy::{
+    PlanOptions, deploy_plan, deploy_pull, deploy_pull_preview, load_declared, load_target,
+};
+use ignition_core::deploy::plan::PlanStatus;
+use ignition_core::deploy::transport::{self, Scope, TreeReader};
+
+/// Counts every call a verb makes to the reader.
+struct Counting {
+    inner: Box<dyn TreeReader>,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl TreeReader for Counting {
+    async fn list_types(&self, collection: &str) -> Result<Vec<(String, String)>, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_types(collection).await
+    }
+    async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.read(scope).await
+    }
+    async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_ledger(gateway, mode).await
+    }
+}
+
+fn reader_for(repo: &Path, env: &str) -> Counting {
+    let (target_file, target) = load_target(repo, env).expect("target");
+    Counting {
+        inner: transport::for_node(repo, &target_file, "nodes.master", &target.nodes.master)
+            .expect("master has host access"),
+        calls: AtomicUsize::new(0),
+    }
+}
+
+/// Every file (bytes) and symlink (target) below `dir`, keyed by relative path.
+fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, rel: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let meta = std::fs::symlink_metadata(entry.path()).expect("meta");
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(entry.path()).expect("link");
+                out.insert(child, format!("-> {}", target.display()).into_bytes());
+            } else if meta.is_dir() {
+                out.insert(format!("{child}/"), Vec::new());
+                walk(&entry.path(), &child, out);
+            } else {
+                out.insert(child, std::fs::read(entry.path()).expect("read"));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, "", &mut out);
+    out
+}
+
+fn put(repo: &Path, rel: &str, bytes: &str) {
+    let dest = rel
+        .split('/')
+        .fold(repo.to_path_buf(), |acc, c| acc.join(c));
+    std::fs::create_dir_all(dest.parent().expect("parent")).expect("dirs");
+    std::fs::write(dest, bytes).expect("write");
+}
+
+/// The tracer repo copy with `gateways/tracer-gw` removed entirely.
+fn empty_repo(fx: &PlanFixture) -> PathBuf {
+    let repo = fx.repo("dev");
+    std::fs::remove_dir_all(repo.join("gateways").join("tracer-gw")).expect("remove gateway dir");
+    repo
+}
+
+/// A live gateway: a core-only resource, a singleton with a mode override, a
+/// mode-only resource, a tag provider with a folder, an Embedded-secret unit
+/// and a uuid-less named resource, plus a denied and a rule-less type.
+fn populate_live(fx: &PlanFixture) {
+    let cfg = |n: u32| format!("{{\n  \"x\": {n}\n}}");
+    fx.core(
+        "ignition/database-translator/CORE/resource.json",
+        resource(UUID_A).as_bytes(),
+    );
+    fx.core(
+        "ignition/database-translator/CORE/config.json",
+        cfg(1).as_bytes(),
+    );
+    fx.core(
+        "ignition/general-alarm-settings/resource.json",
+        b"{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"files\": [\n    \"config.json\"\n  ]\n}",
+    );
+    fx.core(
+        "ignition/general-alarm-settings/config.json",
+        cfg(2).as_bytes(),
+    );
+    fx.mode(
+        "ignition/general-alarm-settings/resource.json",
+        b"{\n  \"scope\": \"A\",\n  \"version\": 1,\n  \"files\": [\n    \"config.json\"\n  ]\n}",
+    );
+    fx.mode(
+        "ignition/general-alarm-settings/config.json",
+        cfg(3).as_bytes(),
+    );
+    fx.mode(
+        "ignition/database-translator/MODE/resource.json",
+        resource(UUID_B).as_bytes(),
+    );
+    fx.mode(
+        "ignition/database-translator/MODE/config.json",
+        cfg(4).as_bytes(),
+    );
+    fx.core(
+        "ignition/tag-provider/default/config.json",
+        b"{\"name\": \"default\"}",
+    );
+    fx.core(
+        "ignition/tag-provider/default/resource.json",
+        b"{\"scope\": \"A\", \"version\": 1}",
+    );
+    fx.core(
+        "ignition/tag-definition/default/Folder/tags.json",
+        b"{\"name\": \"Folder\"}",
+    );
+    fx.core(
+        "ignition/tag-definition/default/Folder/unary-resource.json",
+        b"{\"scope\": \"A\", \"version\": 1}",
+    );
+    fx.core(
+        "ignition/database-translator/SECRET/resource.json",
+        resource(UUID_C).as_bytes(),
+    );
+    fx.core(
+        "ignition/database-translator/SECRET/config.json",
+        format!(
+            "{{\"password\": {{\"type\": \"Embedded\", \"data\": {{\"ciphertext\": \"{CANARY}\"}}}}}}"
+        )
+        .as_bytes(),
+    );
+    fx.core(
+        "ignition/database-translator/NOUUID/resource.json",
+        resource_without_uuid().as_bytes(),
+    );
+    fx.core(
+        "ignition/database-translator/NOUUID/config.json",
+        cfg(5).as_bytes(),
+    );
+    // types a generated manifest leaves out
+    fx.core("ignition/api-token/tok/config.json", b"{}");
+    fx.core("com.example.unknown/thing/A/config.json", b"{}");
+}
+
+#[tokio::test]
+async fn pull_render_plan_round_trip() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = empty_repo(&fx);
+    let reader = reader_for(&repo, "dev");
+    let live_before = snapshot(fx.data_dir());
+
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull into an empty repo");
+    assert_eq!(
+        (
+            result.env.as_str(),
+            result.gateway.as_str(),
+            result.mode.as_str()
+        ),
+        ("dev", "tracer-gw", "dev")
+    );
+    assert_eq!(
+        (result.node.as_str(), result.transport.as_str()),
+        ("master", "local")
+    );
+    assert_eq!(result.out, "gateways/tracer-gw");
+    assert_eq!(result.manifest, "generated");
+
+    // the skip reasons seen: units and types, byte-sorted, no values
+    let skipped: Vec<(&str, &str)> = result
+        .skipped
+        .iter()
+        .map(|s| (s.path.as_str(), s.reason.as_str()))
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            ("com.example.unknown/thing", "type_without_rule"),
+            ("ignition/api-token", "denied_type"),
+            ("ignition/database-translator/NOUUID", "not_round_trippable"),
+            ("ignition/database-translator/SECRET", "embedded_secret"),
+        ]
+    );
+
+    // pull never writes to the gateway host
+    assert_eq!(snapshot(fx.data_dir()), live_before);
+
+    // render then plan against the same live tree is empty
+    let declared = load_declared(&repo, "dev").expect("the pulled tree renders");
+    assert_eq!(declared.outcome.tree.render_sha256(), result.render_sha256);
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(!planned.summary.has_changes, "{:?}", planned.summary);
+    let mut same = Vec::new();
+    let mut unmanaged = Vec::new();
+    for entry in &planned.entries {
+        match entry.status {
+            PlanStatus::Same => same.push(entry.key.as_str()),
+            PlanStatus::Unmanaged => unmanaged.push(entry.key.as_str()),
+            other => panic!("{} is {other:?}", entry.key),
+        }
+    }
+    assert_eq!(
+        unmanaged,
+        [
+            "ignition/database-translator/NOUUID",
+            "ignition/database-translator/SECRET"
+        ]
+    );
+    assert_eq!(
+        same,
+        [
+            "ignition/database-translator/CORE",
+            "ignition/database-translator/MODE",
+            "ignition/general-alarm-settings",
+            "ignition/tag-definition/default/Folder",
+            "ignition/tag-provider/default",
+        ]
+    );
+    assert_eq!(result.files_written, declared_source_files(&repo));
+
+    // the layering: core-only in the base, the override in the overlay
+    let written = snapshot(&repo.join("gateways").join("tracer-gw"));
+    for path in [
+        "manifest.yaml",
+        "resources/ignition/database-translator/CORE/config.json",
+        "resources/ignition/general-alarm-settings/config.json",
+        "modes/dev/resources/ignition/general-alarm-settings/config.json",
+        "modes/dev/resources/ignition/database-translator/MODE/config.json",
+        "tags/default/tag-definition/Folder/tags.json",
+        "tags/default/tag-provider/config.json",
+    ] {
+        assert!(written.contains_key(path), "{path} not written");
+    }
+    // the gateway's own bytes, uuid included
+    assert_eq!(
+        written["resources/ignition/database-translator/CORE/resource.json"],
+        resource(UUID_A).as_bytes()
+    );
+    // no secret anywhere
+    for (path, bytes) in &written {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(CANARY),
+            "{path} holds the ciphertext"
+        );
+        assert!(!path.contains("SECRET"), "{path}");
+    }
+    assert!(!format!("{result:?}").contains(CANARY));
+}
+
+/// Number of regular files under `resources/`, `tags/` and `modes/` of the
+/// pulled gateway directory.
+fn declared_source_files(repo: &Path) -> usize {
+    snapshot(&repo.join("gateways").join("tracer-gw"))
+        .iter()
+        .filter(|(path, _)| !path.ends_with('/') && *path != "manifest.yaml")
+        .count()
+}
+
+#[tokio::test]
+async fn pull_into_absent_and_empty_dirs_needs_no_yes() {
+    // gateways/ absent
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = fx.repo("dev");
+    std::fs::remove_dir_all(repo.join("gateways")).expect("remove gateways");
+    assert_eq!(deploy_pull_preview(&repo, "dev").unwrap(), None);
+    let reader = reader_for(&repo, "dev");
+    deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("absent gateways/");
+    assert!(repo.join("gateways/tracer-gw/manifest.yaml").is_file());
+
+    // an empty gateway directory
+    let repo = empty_repo(&fx);
+    std::fs::create_dir(repo.join("gateways").join("tracer-gw")).expect("empty dir");
+    assert_eq!(deploy_pull_preview(&repo, "dev").unwrap(), None);
+    let reader = reader_for(&repo, "dev");
+    deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("empty gateway dir");
+
+    // only a manifest and another environment's overlay: nothing is replaced
+    let repo = empty_repo(&fx);
+    put(
+        &repo,
+        "gateways/tracer-gw/manifest.yaml",
+        "schema_version: 1\ntypes:\n  - ignition/database-translator\n",
+    );
+    put(
+        &repo,
+        "gateways/tracer-gw/modes/prod/resources/ignition/database-translator/P/config.json",
+        "{}",
+    );
+    assert_eq!(deploy_pull_preview(&repo, "dev").unwrap(), None);
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("nothing to replace");
+    assert_eq!(result.manifest, "kept");
+}
+
+#[tokio::test]
+async fn pull_refuses_non_empty_without_yes() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = fx.repo("dev");
+    // 7 existing files across the three subtrees; the tracer repo has 4
+    put(
+        &repo,
+        "gateways/tracer-gw/tags/default/tag-definition/F/tags.json",
+        "{}",
+    );
+    put(
+        &repo,
+        "gateways/tracer-gw/modes/dev/resources/ignition/database-translator/M/config.json",
+        "{}",
+    );
+    put(
+        &repo,
+        "gateways/tracer-gw/modes/prod/resources/ignition/database-translator/P/config.json",
+        "{}",
+    );
+    let before = snapshot(&repo);
+
+    let prose = deploy_pull_preview(&repo, "dev")
+        .expect("preview")
+        .expect("something would be replaced");
+    assert!(prose.starts_with("deploy pull would replace gateways/tracer-gw/resources, tags and modes/dev with the live tree of nodes.master (6 existing files, e.g. "), "{prose}");
+    assert!(prose.ends_with(", ...)"), "{prose}");
+
+    let reader = reader_for(&repo, "dev");
+    let err = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), "confirmation_required");
+    assert_eq!(err.exit_code(), 2);
+    let message = err.to_string();
+    // the first five paths, in resources, tags, modes order
+    for shown in [
+        "resources/ignition/database-translator/POSTGRES/config.json",
+        "resources/ignition/database-translator/POSTGRES/resource.json",
+        "resources/ignition/general-alarm-settings/config.json",
+        "resources/ignition/general-alarm-settings/resource.json",
+        "tags/default/tag-definition/F/tags.json",
+    ] {
+        assert!(message.contains(shown), "{shown} missing from: {message}");
+    }
+    assert!(
+        !message.contains("modes/dev/resources/ignition/database-translator/M/config.json"),
+        "only five paths are named: {message}"
+    );
+    // refused before the gateway is read and before any write
+    assert_eq!(reader.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(snapshot(&repo), before);
+}
+
+#[tokio::test]
+async fn pull_yes_replaces_only_its_subtrees() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = fx.repo("dev");
+    put(
+        &repo,
+        "gateways/tracer-gw/resources/ignition/database-translator/STALE/config.json",
+        "{}",
+    );
+    put(
+        &repo,
+        "gateways/tracer-gw/tags/stale/tag-definition/F/tags.json",
+        "{}",
+    );
+    put(
+        &repo,
+        "gateways/tracer-gw/modes/dev/resources/ignition/database-translator/STALE2/config.json",
+        "{}",
+    );
+    put(
+        &repo,
+        "gateways/tracer-gw/modes/prod/resources/ignition/database-translator/P/config.json",
+        "{\"prod\": true}",
+    );
+    let manifest_before = std::fs::read(repo.join("gateways/tracer-gw/manifest.yaml")).unwrap();
+    let prod_before = snapshot(&repo.join("gateways/tracer-gw/modes/prod"));
+    let targets_before = snapshot(&repo.join("targets"));
+
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect("--yes replaces");
+    assert_eq!(result.manifest, "kept");
+
+    let gw = repo.join("gateways/tracer-gw");
+    let written = snapshot(&gw);
+    for stale in [
+        "resources/ignition/database-translator/STALE/config.json",
+        "resources/ignition/database-translator/POSTGRES/config.json",
+        "tags/stale/tag-definition/F/tags.json",
+        "modes/dev/resources/ignition/database-translator/STALE2/config.json",
+    ] {
+        assert!(!written.contains_key(stale), "{stale} survived");
+    }
+    assert!(!written.contains_key("tags/stale/"), "{written:?}");
+    assert!(
+        written.contains_key("resources/ignition/database-translator/CORE/config.json"),
+        "the live tree was written"
+    );
+    // the kept manifest and the other environment are byte-identical
+    assert_eq!(
+        std::fs::read(gw.join("manifest.yaml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(snapshot(&gw.join("modes/prod")), prod_before);
+    assert_eq!(snapshot(&repo.join("targets")), targets_before);
+
+    // a second pull of an unchanged gateway needs --yes and changes nothing
+    let again = snapshot(&gw);
+    let reader = reader_for(&repo, "dev");
+    deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect("re-pull");
+    assert_eq!(snapshot(&gw), again);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pull_refuses_symlink_in_replaced_subtree() {
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let outside = tempfile::TempDir::new().expect("outside");
+    std::fs::write(outside.path().join("keep.txt"), "keep").unwrap();
+
+    // a symlink below resources/
+    let repo = fx.repo("dev");
+    std::os::unix::fs::symlink(
+        outside.path(),
+        repo.join("gateways/tracer-gw/resources/ignition/link"),
+    )
+    .expect("symlink");
+    let before = snapshot(&repo);
+    let outside_before = snapshot(outside.path());
+    let reader = reader_for(&repo, "dev");
+    for yes in [false, true] {
+        let err = deploy_pull(&repo, "dev", &reader, yes)
+            .await
+            .expect_err("symlink refused");
+        assert_eq!(err.code(), "deploy_tree_invalid", "yes={yes}: {err}");
+    }
+    assert!(deploy_pull_preview(&repo, "dev").is_err());
+    assert_eq!(snapshot(&repo), before, "nothing removed");
+    assert_eq!(snapshot(outside.path()), outside_before);
+    assert_eq!(reader.calls.load(Ordering::SeqCst), 0);
+
+    // a symlinked subtree root
+    let repo = fx.repo("dev");
+    let gw = repo.join("gateways/tracer-gw");
+    std::fs::remove_dir_all(gw.join("resources")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), gw.join("resources")).expect("symlink");
+    let reader = reader_for(&repo, "dev");
+    let err = deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect_err("symlinked resources/ refused");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    assert_eq!(snapshot(outside.path()), outside_before);
+
+    // a symlinked gateway directory
+    let repo = fx.repo("dev");
+    std::fs::remove_dir_all(repo.join("gateways/tracer-gw")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.join("gateways/tracer-gw")).expect("symlink");
+    let reader = reader_for(&repo, "dev");
+    let err = deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect_err("symlinked gateway dir refused");
+    assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+    assert_eq!(snapshot(outside.path()), outside_before);
+}
+
+#[tokio::test]
+async fn pull_empty_live_tree() {
+    let fx = PlanFixture::new();
+    let repo = empty_repo(&fx);
+    let reader = reader_for(&repo, "dev");
+    let result = deploy_pull(&repo, "dev", &reader, false)
+        .await
+        .expect("pull");
+    assert_eq!(result.files_written, 0);
+    assert_eq!(result.manifest, "generated");
+    assert!(result.skipped.is_empty());
+    assert_eq!(result.render_sha256, EMPTY_RENDER_SHA256);
+
+    let gw = repo.join("gateways/tracer-gw");
+    assert!(gw.join("manifest.yaml").is_file());
+    // no resource files and no modes/<env>/ for an absent mode collection
+    assert_eq!(snapshot(&gw).keys().collect::<Vec<_>>(), ["manifest.yaml"]);
+
+    let declared = load_declared(&repo, "dev").expect("renders");
+    assert_eq!(declared.outcome.tree.render_sha256(), EMPTY_RENDER_SHA256);
+    let live = reader_for(&repo, "dev");
+    let planned = deploy_plan(&declared, &live, &PlanOptions::default())
+        .await
+        .expect("plan");
+    assert!(planned.entries.is_empty());
+    assert!(!planned.summary.has_changes);
+}
+
+#[tokio::test]
+async fn pull_is_read_only_on_a_failed_read() {
+    // an unreadable host fails the pull before anything is written
+    let fx = PlanFixture::new();
+    let repo = empty_repo(&fx);
+    std::fs::remove_dir_all(fx.data_dir().join("config")).unwrap();
+    let reader = reader_for(&repo, "dev");
+    let err = deploy_pull(&repo, "dev", &reader, true)
+        .await
+        .expect_err("transport failure");
+    assert_eq!(err.code(), "transport_failed");
+    assert!(
+        !repo.join("gateways/tracer-gw").exists(),
+        "a failed read writes nothing"
+    );
+}

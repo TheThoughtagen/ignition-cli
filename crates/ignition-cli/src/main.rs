@@ -234,6 +234,7 @@ enum ActionOutput {
     /// against the master node's host. Exit 0 whether or not anything
     /// changed (SF-2); `profile` is the master's profile name.
     DeployPlan(actions::deploy::DeployPlanResult),
+    DeployPull(actions::deploy::DeployPullResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -413,6 +414,7 @@ impl ActionOutput {
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::DeployRender(result) => render_success(profile, result, compact),
             ActionOutput::DeployPlan(result) => render_success(profile, result, compact),
+            ActionOutput::DeployPull(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -3126,6 +3128,39 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     .map(ActionOutput::DeployPlan);
                 (profile, result)
             }
+            // `ign deploy pull` (22-08): read-only against the gateway (the
+            // TreeReader read path only; no session, no REST). It writes the
+            // local repo, so replacing a non-empty tree is guarded (D-11).
+            DeployCommand::Pull { env, repo } => {
+                let (target_file, target) = match actions::deploy::load_target(&repo, &env) {
+                    Ok(loaded) => loaded,
+                    Err(err) => return (None, Err(err)),
+                };
+                let profile = Some(target.nodes.master.profile.clone());
+                let prose = match actions::deploy::deploy_pull_preview(&repo, &env) {
+                    Ok(prose) => prose,
+                    Err(err) => return (profile, Err(err)),
+                };
+                if let Some(prose) = prose {
+                    // guarded:deploy pull
+                    if let Err(err) = require_confirmation(cli.yes, &prose) {
+                        return (profile, Err(err));
+                    }
+                }
+                let reader = match ignition_core::deploy::transport::for_node(
+                    &repo,
+                    &target_file,
+                    "nodes.master",
+                    &target.nodes.master,
+                ) {
+                    Ok(reader) => reader,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let result = actions::deploy::deploy_pull(&repo, &env, reader.as_ref(), cli.yes)
+                    .await
+                    .map(ActionOutput::DeployPull);
+                (profile, result)
+            }
         },
         Commands::Lint(LintArgs {
             paths,
@@ -3947,6 +3982,14 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     (
         "e2e init",
         "e2e init <target, member list with statuses, and the npm/npx command lines>",
+    ),
+    // 22-08: pull overwrites a non-empty declared tree (D-11). A DYNAMIC-prose
+    // site: the refusal message IS `deploy_pull_preview`'s text (the replaced
+    // subtrees, the file count and the first five paths), so the prose below
+    // is representative. The gate also lives in `deploy_pull` itself.
+    (
+        "deploy pull",
+        "deploy pull would replace gateways/<name>/resources, tags and modes/<env> with the live tree of nodes.master (<n> existing files, e.g. ...)",
     ),
 ];
 

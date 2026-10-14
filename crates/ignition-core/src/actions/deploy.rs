@@ -31,7 +31,25 @@
 //! node, transport, render_sha256, plan_sha256, summary, entries,
 //! delete_set, base, warnings`. Later plans add keys additively.
 //! Entries carry paths and sha256 only, never file bytes.
+//!
+//! ## `deploy pull` (22-08, DPLN-06)
+//!
+//! [`deploy_pull`] bootstraps `gateways/<name>/` from the live master through
+//! the same read-only [`TreeReader`]: it reads, builds a tree that renders
+//! back to the live effective view ([`crate::deploy::pull`]), and only then
+//! writes the local repo. It never writes to the gateway host or the gateway
+//! and resolves no session. Replacing a non-empty `resources/`, `tags/` or
+//! `modes/<env>/` needs `yes` ([`deploy_pull_preview`] names what would be
+//! replaced); `manifest.yaml` and other environments' overlays are never
+//! touched. On unix every removal and write goes through descriptor-relative
+//! calls rooted at the repo (`tree::dirfd`): a directory swapped for a
+//! symlink mid-run is refused, never followed.
+//!
+//! The [`DeployPullResult`] `data` keys, in order: `env, gateway, mode, node,
+//! transport, out, files_written, manifest, render_sha256, skipped,
+//! warnings`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -40,10 +58,13 @@ use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
+use crate::deploy::pull::{PullInput, Skipped, generate_manifest, pull};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
-use crate::deploy::target::Target;
-use crate::deploy::transport::{DeleteSet, Scope, TreeReader};
-use crate::deploy::tree::{RenderMarker, SourceTree, read_repo_file, require_repo_dir, write_out};
+use crate::deploy::target::{NodeTarget, Target};
+use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Scope, TreeReader};
+use crate::deploy::tree::{
+    RenderMarker, SourceTree, read_repo_file, require_repo_dir, walk_capped, write_out,
+};
 use crate::error::CoreError;
 
 /// The `ign deploy render` result (the envelope's `data`).
@@ -298,4 +319,409 @@ pub async fn deploy_plan(
         }),
         warnings,
     })
+}
+
+/// The `ign deploy pull` result (the envelope's `data`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeployPullResult {
+    /// The `--env` value.
+    pub env: String,
+    /// Gateway directory name from the target.
+    pub gateway: String,
+    /// Deployment mode from the target; its collection is the overlay.
+    pub mode: String,
+    /// The node that was read: always `master` in this phase.
+    pub node: String,
+    /// How the node's host was read: `local` or `ssh`.
+    pub transport: String,
+    /// The directory written, repo-relative: `gateways/<name>`.
+    pub out: String,
+    /// Source files written under `resources/`, `tags/` and `modes/<env>/`
+    /// (the manifest is not counted).
+    pub files_written: usize,
+    /// `kept` when `manifest.yaml` already existed, `generated` otherwise.
+    pub manifest: String,
+    /// Lowercase hex SHA-256 of what `deploy render` produces from the
+    /// pulled tree.
+    pub render_sha256: String,
+    /// Every live unit (or type) not written, byte-sorted by path, each with
+    /// a reason. Never a value.
+    pub skipped: Vec<Skipped>,
+    /// Render warnings of the pulled tree, then pull warnings.
+    pub warnings: Vec<String>,
+}
+
+/// What an existing `gateways/<name>/` holds in the three subtrees a pull
+/// replaces. Gateway-relative paths, files in `resources`, `tags`,
+/// `modes/<env>` order and byte order within each.
+struct Existing {
+    files: Vec<String>,
+    /// Every directory below and including each subtree root.
+    dirs: BTreeSet<String>,
+}
+
+/// Whether `repo/rel` exists, without following a symlink.
+fn repo_entry_exists(repo: &Path, rel: &str) -> Result<bool, CoreError> {
+    match std::fs::symlink_metadata(repo.join(rel)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            format!("cannot inspect ({})", e.kind()),
+        )),
+    }
+}
+
+/// Inspect the subtrees `deploy pull` would replace. A symlink at any level
+/// of them, or anywhere under them, is `deploy_tree_invalid` and nothing is
+/// changed. `None` when `gateways/<gateway>/` does not exist.
+fn scan_existing(repo: &Path, gateway: &str, env: &str) -> Result<Option<Existing>, CoreError> {
+    let gateway_rel = format!("gateways/{gateway}");
+    for rel in ["gateways", gateway_rel.as_str()] {
+        if !repo_entry_exists(repo, rel)? {
+            return Ok(None);
+        }
+        require_repo_dir(repo, rel)?;
+    }
+    let mut existing = Existing {
+        files: Vec::new(),
+        dirs: BTreeSet::new(),
+    };
+    for sub in [
+        "resources".to_string(),
+        "tags".to_string(),
+        format!("modes/{env}"),
+    ] {
+        if sub.starts_with("modes/") {
+            let modes = format!("{gateway_rel}/modes");
+            if !repo_entry_exists(repo, &modes)? {
+                continue;
+            }
+            require_repo_dir(repo, &modes)?;
+        }
+        let rel = format!("{gateway_rel}/{sub}");
+        if !repo_entry_exists(repo, &rel)? {
+            continue;
+        }
+        require_repo_dir(repo, &rel)?;
+        let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        walk_capped(
+            &repo.join(&rel),
+            &sub,
+            &mut files,
+            &mut dirs,
+            READ_MAX_ENTRIES,
+        )
+        .map_err(|why| CoreError::deploy_tree_invalid(&rel, None, None, why))?;
+        existing.dirs.insert(sub.clone());
+        existing.dirs.extend(dirs);
+        existing.files.extend(files.into_keys());
+    }
+    Ok(Some(existing))
+}
+
+/// The refusal prose of a pull that would replace `existing`.
+fn pull_prose(gateway: &str, env: &str, existing: &Existing) -> String {
+    let shown: Vec<&str> = existing.files.iter().take(5).map(String::as_str).collect();
+    let more = if existing.files.len() > shown.len() {
+        ", ..."
+    } else {
+        ""
+    };
+    format!(
+        "deploy pull would replace gateways/{gateway}/resources, tags and modes/{env} with the live tree of nodes.master ({} existing files, e.g. {}{more})",
+        existing.files.len(),
+        shown.join(", ")
+    )
+}
+
+/// What `deploy pull` would replace: `Some(prose)` when the gateway
+/// directory holds files in `resources/`, `tags/` or `modes/<env>/` (the
+/// text the `--yes` guard refuses with), `None` when it is absent or holds
+/// nothing there. Reads the local repo only: no gateway is contacted.
+pub fn deploy_pull_preview(repo: &Path, env: &str) -> Result<Option<String>, CoreError> {
+    let (_, target) = load_target(repo, env)?;
+    Ok(scan_existing(repo, &target.gateway, env)?
+        .filter(|existing| !existing.files.is_empty())
+        .map(|existing| pull_prose(&target.gateway, env, &existing)))
+}
+
+fn transport_label(node: &NodeTarget) -> &'static str {
+    match (&node.ssh, &node.local) {
+        (Some(_), _) => "ssh",
+        (None, Some(_)) => "local",
+        (None, None) => "none",
+    }
+}
+
+/// The tag provider names under `ignition/tag-provider/` in `observed`.
+fn live_providers(observed: &crate::deploy::transport::ObservedFiles) -> Vec<String> {
+    let names: BTreeSet<String> = observed
+        .core
+        .keys()
+        .chain(observed.mode.keys())
+        .filter_map(|path| {
+            let parts: Vec<&str> = path.components().collect();
+            // a provider is a directory: `ignition/tag-provider/<name>/<file>`
+            (parts.len() >= 4 && parts[0] == "ignition" && parts[1] == "tag-provider")
+                .then(|| parts[2].to_string())
+        })
+        .collect();
+    names.into_iter().collect()
+}
+
+/// Bootstrap `gateways/<gateway>/` from the live master. See the module doc.
+///
+/// `yes` confirms replacing existing `resources/`, `tags/` and `modes/<env>/`
+/// files; without it a non-empty tree is refused as `confirmation_required`
+/// before the gateway is read and before any write.
+pub async fn deploy_pull(
+    repo: &Path,
+    env: &str,
+    reader: &dyn TreeReader,
+    yes: bool,
+) -> Result<DeployPullResult, CoreError> {
+    let (_, target) = load_target(repo, env)?;
+    let gateway = target.gateway.clone();
+    let existing = scan_existing(repo, &gateway, env)?;
+    if let Some(existing) = existing.as_ref().filter(|e| !e.files.is_empty())
+        && !yes
+    {
+        return Err(CoreError::ConfirmationRequired {
+            operation: pull_prose(&gateway, env, existing),
+        });
+    }
+
+    // The manifest: an existing one is used and kept (D-10); otherwise one is
+    // generated from the live types and tag providers.
+    let manifest_rel = format!("gateways/{gateway}/manifest.yaml");
+    let mut left_out: Vec<Skipped> = Vec::new();
+    let (manifest, generated) = if repo_entry_exists(repo, &manifest_rel)? {
+        let bytes = read_repo_file(repo, &manifest_rel, None)?;
+        (Manifest::parse(&manifest_rel, &bytes)?, None)
+    } else {
+        let mut live_types = reader.list_types(CORE_COLLECTION).await?;
+        live_types.extend(reader.list_types(&target.mode).await?);
+        let discovery = Scope {
+            mode: target.mode.clone(),
+            types: vec![("ignition".to_string(), "tag-provider".to_string())],
+            tag_providers: Vec::new(),
+        };
+        let providers = live_providers(&reader.read(&discovery).await?);
+        let (yaml, skipped) = generate_manifest(&live_types, &providers);
+        left_out = skipped;
+        let manifest = Manifest::parse(&manifest_rel, yaml.as_bytes())?;
+        (manifest, Some(yaml))
+    };
+
+    let scope = Scope::from_manifest(&manifest, &target.mode);
+    let observed = reader.read(&scope).await?;
+    let outcome = pull(&PullInput {
+        gateway: &gateway,
+        env,
+        target: &target,
+        manifest: &manifest,
+        observed: &observed,
+    })?;
+
+    write_pulled(
+        repo,
+        &gateway,
+        existing.as_ref(),
+        &outcome.source,
+        generated.as_deref(),
+    )?;
+
+    left_out.extend(outcome.skipped);
+    left_out.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    let mut warnings = outcome.rendered.warnings.clone();
+    warnings.extend(observed.local_units.iter().map(|unit| {
+        format!(
+            "{unit} also exists in the `local` collection, which the gateway loads over the mode collection; pull did not read the `local` copy"
+        )
+    }));
+    Ok(DeployPullResult {
+        env: env.to_string(),
+        gateway: gateway.clone(),
+        mode: target.mode.clone(),
+        node: "master".to_string(),
+        transport: transport_label(&target.nodes.master).to_string(),
+        out: format!("gateways/{gateway}"),
+        files_written: outcome.source.files.len(),
+        manifest: if generated.is_some() {
+            "generated"
+        } else {
+            "kept"
+        }
+        .to_string(),
+        render_sha256: outcome.rendered.tree.render_sha256(),
+        skipped: left_out,
+        warnings,
+    })
+}
+
+/// A name that reaches the repo from the gateway is checked once more here:
+/// render already refused unsafe names, so this only fails closed.
+fn safe_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && !name.chars().any(char::is_control)
+}
+
+/// Remove what a pull replaces, then write the pulled tree and, when one was
+/// generated, the manifest. Unix: every step is descriptor-relative and
+/// rooted at the repo, so no component can be redirected by a symlink.
+#[cfg(unix)]
+fn write_pulled(
+    repo: &Path,
+    gateway: &str,
+    existing: Option<&Existing>,
+    source: &SourceTree,
+    manifest: Option<&str>,
+) -> Result<(), CoreError> {
+    use crate::deploy::tree::dirfd::{self, FdError, Kind};
+    use std::io::Write;
+
+    let fail = |what: &str, e: FdError| match e {
+        FdError::Changed => CoreError::deploy_tree_invalid(
+            what,
+            None,
+            None,
+            "changed while it was written (a symlink or a non-directory appeared); refused, nothing outside the gateway directory was touched",
+        ),
+        FdError::Io(io) => CoreError::Internal(format!("cannot write {what}: {io}")),
+        other => CoreError::Internal(format!("cannot write {what}: {other:?}")),
+    };
+
+    let root = dirfd::open_root(repo).map_err(|e| fail("the repo", e))?;
+    let gateways = dirfd::ensure_dir(&root, "gateways").map_err(|e| fail("gateways", e))?;
+    let gw_label = format!("gateways/{gateway}");
+    let gw = dirfd::ensure_dir(&gateways, gateway).map_err(|e| fail(&gw_label, e))?;
+
+    if let Some(existing) = existing {
+        for file in &existing.files {
+            let parts: Vec<&str> = file.split('/').collect();
+            let (name, parents) = parts.split_last().ok_or_else(|| {
+                CoreError::Internal("an existing file has an empty path".to_string())
+            })?;
+            let label = format!("{gw_label}/{file}");
+            let dir = dirfd::walk(&gw, parents).map_err(|e| fail(&label, e))?;
+            match dirfd::kind_at(&dir, name).map_err(|e| fail(&label, e))? {
+                Kind::File => dirfd::unlink_at(&dir, name).map_err(|e| fail(&label, e))?,
+                Kind::Missing => {}
+                _ => return Err(fail(&label, FdError::Changed)),
+            }
+        }
+        // children before parents: a child path sorts after its parent
+        for dir_path in existing.dirs.iter().rev() {
+            let parts: Vec<&str> = dir_path.split('/').collect();
+            let Some((name, parents)) = parts.split_last() else {
+                continue;
+            };
+            let label = format!("{gw_label}/{dir_path}");
+            let parent = dirfd::walk(&gw, parents).map_err(|e| fail(&label, e))?;
+            match dirfd::rmdir_at(&parent, name) {
+                Ok(()) | Err(FdError::Missing) => {}
+                Err(FdError::NotEmpty) => {
+                    return Err(CoreError::deploy_tree_invalid(
+                        label,
+                        None,
+                        None,
+                        "is not empty after the pull removed its files (something wrote into it); nothing more was changed",
+                    ));
+                }
+                Err(e) => return Err(fail(&label, e)),
+            }
+        }
+    }
+
+    if let Some(text) = manifest {
+        let label = format!("{gw_label}/manifest.yaml");
+        let mut file = dirfd::create_new(&gw, "manifest.yaml").map_err(|e| fail(&label, e))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| CoreError::Internal(format!("cannot write {label}: {e}")))?;
+    }
+    for (path, bytes) in &source.files {
+        let label = format!("{gw_label}/{path}");
+        let parts: Vec<&str> = path.components().collect();
+        if parts.iter().any(|c| !safe_component(c)) {
+            return Err(CoreError::deploy_tree_invalid(
+                label,
+                None,
+                None,
+                "has an unsafe path component; refused",
+            ));
+        }
+        let (name, parents) = parts
+            .split_last()
+            .ok_or_else(|| CoreError::Internal("a pulled file has an empty path".to_string()))?;
+        let dir = dirfd::ensure_walk(&gw, parents).map_err(|e| fail(&label, e))?;
+        let mut file = dirfd::create_new(&dir, name).map_err(|e| fail(&label, e))?;
+        file.write_all(bytes)
+            .map_err(|e| CoreError::Internal(format!("cannot write {label}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Non-unix: std has no descriptor-relative primitives, so the replaced
+/// subtrees were checked for symlinks by [`scan_existing`] just before and
+/// the operations are path-based (the 22-01 residual for Windows).
+#[cfg(not(unix))]
+fn write_pulled(
+    repo: &Path,
+    gateway: &str,
+    existing: Option<&Existing>,
+    source: &SourceTree,
+    manifest: Option<&str>,
+) -> Result<(), CoreError> {
+    use std::io::Write;
+
+    let io = |what: &Path, e: std::io::Error| {
+        CoreError::Internal(format!("cannot write {}: {e}", what.display()))
+    };
+    let gw = repo.join("gateways").join(gateway);
+    std::fs::create_dir_all(&gw).map_err(|e| io(&gw, e))?;
+    if let Some(existing) = existing {
+        for file in &existing.files {
+            let path = file.split('/').fold(gw.clone(), |acc, c| acc.join(c));
+            std::fs::remove_file(&path).map_err(|e| io(&path, e))?;
+        }
+        for dir_path in existing.dirs.iter().rev() {
+            let path = dir_path.split('/').fold(gw.clone(), |acc, c| acc.join(c));
+            std::fs::remove_dir(&path).map_err(|e| io(&path, e))?;
+        }
+    }
+    let create = |path: &Path, bytes: &[u8]| -> Result<(), CoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| io(path, e))?;
+        file.write_all(bytes).map_err(|e| io(path, e))
+    };
+    if let Some(text) = manifest {
+        create(&gw.join("manifest.yaml"), text.as_bytes())?;
+    }
+    for (path, bytes) in &source.files {
+        let parts: Vec<&str> = path.components().collect();
+        if parts.iter().any(|c| !safe_component(c)) {
+            return Err(CoreError::deploy_tree_invalid(
+                format!("gateways/{gateway}/{path}"),
+                None,
+                None,
+                "has an unsafe path component; refused",
+            ));
+        }
+        let dest = parts.iter().fold(gw.clone(), |acc, c| acc.join(c));
+        create(&dest, bytes)?;
+    }
+    Ok(())
 }

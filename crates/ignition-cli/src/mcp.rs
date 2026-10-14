@@ -908,6 +908,42 @@ mod tests {
         );
     }
 
+    /// 22-08 (DPLN-06, D-11, Decision D): `deploy pull` replaces a
+    /// non-empty declared tree in the caller's repo, so it is registered in
+    /// `GUARDED_OPS` and the derived tool `deploy_pull` advertises the
+    /// synthetic `confirm`, optional like every guarded leaf.
+    #[test]
+    fn deploy_pull_is_a_guarded_catalog_tool() {
+        let catalog = build_catalog();
+        let entry = catalog
+            .iter()
+            .find(|e| e.name == "deploy_pull")
+            .expect("deploy_pull derives from the clap tree");
+        assert_eq!(entry.path, "deploy pull");
+        assert!(
+            GUARDED_OPS.iter().any(|(path, _)| *path == "deploy pull"),
+            "deploy pull overwrites a non-empty tree and must be guarded"
+        );
+        assert!(
+            entry
+                .schema
+                .get("properties")
+                .and_then(|props| props.get("confirm"))
+                .is_some(),
+            "deploy_pull advertises the confirm property"
+        );
+        let required = entry
+            .schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !required.iter().any(|v| v == "confirm"),
+            "confirm must be optional on deploy_pull: {required:?}"
+        );
+    }
+
     /// The catalog's name encoding is injective over the leaf paths —
     /// two distinct leaves mapping to one tool name would let
     /// tools/call dispatch the WRONG verb.
