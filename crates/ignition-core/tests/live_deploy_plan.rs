@@ -1,6 +1,7 @@
-//! Phase 22's rig gate (22-09): "pull, render, plan is empty" against a real
-//! Ignition 8.3.6 gateway whose `config/resources` is bind-mounted, and a
-//! check that `plan` takes no scan-lock.
+//! Phase 22's rig gates against a real Ignition 8.3.6 gateway whose
+//! `config/resources` is bind-mounted: "pull, render, plan is empty" and a
+//! check that `plan` takes no scan-lock (22-09), and `deploy verify` green
+//! then red (22-10).
 //!
 //! `deploy_pull` reads the live master through `LocalFsTransport` (the same
 //! `TreeReader` `plan` uses) into a temp repo, `load_declared` renders that
@@ -27,21 +28,30 @@
 //! `source $IGN_DEPLOY_RIG_STATE/tokens.env`; tear down with
 //! `docker compose -p ign-deploy-rig down -v`.
 //!
+//! `verify_green_then_red_live` writes a rendered tree into the mode collection
+//! by plain file writes, triggers a config scan as test code (no verb does
+//! that in this phase), and runs `deploy_verify` through the rig session and a
+//! `LocalFsTransport`. It then adds a declared `database-connection` whose
+//! live copy has no `uuid` (the gateway logs `will not be loaded`, CV1),
+//! scans, and expects a red verdict with exit 6. It removes what it wrote.
+//!
 //! Safety: the URL guard refuses a non-loopback host before a request is made,
 //! and a name guard refuses any gateway whose `gateway-info` name is not
 //! `ign-deploy-rig`. Output carries counts and unit keys only, never a token
 //! or a file's bytes.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ignition_core::actions::deploy::{
-    PlanOptions, deploy_plan, deploy_pull, load_declared, load_target,
+    PlanOptions, VerifyOptions, deploy_plan, deploy_pull, deploy_verify, load_declared, load_target,
 };
-use ignition_core::client::scan::{LockObservation, ScanKind};
+use ignition_core::client::scan::{LockObservation, ScanKind, scan_complete};
 use ignition_core::client::{DeployApi, GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{Credential, Secret};
 use ignition_core::deploy::plan::PlanStatus;
 use ignition_core::deploy::transport::{self, TreeReader};
+use ignition_core::deploy::verify::{CheckStatus, VERIFY_FAILED_SLUG};
 
 /// The only gateway this gate may talk to.
 const RIG_GATEWAY_NAME: &str = "ign-deploy-rig";
@@ -274,4 +284,216 @@ async fn plan_takes_no_lock_live() {
             LockObservation::Held(_) => "held (not by the test token)",
         }
     );
+}
+
+// ---- verify (22-10) ----------------------------------------------------------------
+
+const VERIFY_GATEWAY_DIR: &str = "rig-gw";
+const NOUUID_DB: &str = "ignition/database-connection/VERIFY_NOUUID";
+const DB_CONFIG: &str = include_str!("fixtures/live-rig-deploy/db-connection-config.json");
+const TRACER_GATEWAY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/deploy/repos/tracer/gateways/tracer-gw"
+);
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).expect("copy file");
+        }
+    }
+}
+
+/// A repo whose gateway directory is the tracer's two resources, declared for
+/// the rig's mode. `with_db` adds the `database-connection` the red run needs.
+fn verify_repo(rig: &Rig, with_db: bool) -> tempfile::TempDir {
+    let repo = empty_repo(rig);
+    let gw = repo.path().join("gateways").join(GATEWAY_DIR);
+    copy_dir(
+        &Path::new(TRACER_GATEWAY).join("resources"),
+        &gw.join("resources"),
+    );
+    let mut manifest =
+        "schema_version: 1\ntypes:\n  - ignition/database-translator\n  - ignition/general-alarm-settings\n"
+            .to_string();
+    if with_db {
+        manifest.push_str("  - ignition/database-connection\n");
+        let dir = gw.join("resources").join(NOUUID_DB);
+        std::fs::create_dir_all(&dir).expect("db dir");
+        std::fs::write(dir.join("config.json"), DB_CONFIG).expect("db config");
+    }
+    std::fs::write(gw.join("manifest.yaml"), manifest).expect("manifest");
+    repo
+}
+
+/// Removes what a verify run wrote into the rig's mode collection, even when
+/// an assertion fails.
+struct Written(Vec<PathBuf>);
+
+impl Drop for Written {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Write the rendered files of `declared` into the rig's mode collection by
+/// plain file writes, the way a deploy would put them there.
+fn place_render(rig: &Rig, declared: &ignition_core::actions::deploy::Declared, strip_uuid: &str) {
+    let root = rig
+        .data_dir
+        .join("config")
+        .join("resources")
+        .join(&rig.mode);
+    for (path, bytes) in &declared.outcome.tree.files {
+        let dest = path.components().fold(root.clone(), |acc, c| acc.join(c));
+        std::fs::create_dir_all(dest.parent().expect("parent")).expect("create dirs");
+        let is_marker = path.as_str() == format!("{strip_uuid}/resource.json");
+        if is_marker {
+            // The live copy has no `attributes.uuid`: the gateway refuses to
+            // load a named resource of this type without one (CV1).
+            let mut json: serde_json::Value = serde_json::from_slice(bytes).expect("resource.json");
+            json["attributes"]
+                .as_object_mut()
+                .expect("attributes")
+                .remove("uuid");
+            std::fs::write(&dest, serde_json::to_vec_pretty(&json).expect("json")).expect("write");
+        } else {
+            std::fs::write(&dest, bytes).expect("write rendered file");
+        }
+    }
+}
+
+/// Trigger a config scan and wait for it to complete (test code, not a verb).
+async fn scan_and_wait(api: &ReqwestGatewayApi) {
+    let before = api
+        .scan_status(ScanKind::Config)
+        .await
+        .expect("scan status");
+    api.scan_request(ScanKind::Config)
+        .await
+        .expect("scan request");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let now = api
+            .scan_status(ScanKind::Config)
+            .await
+            .expect("scan status");
+        if scan_complete(&before, &now) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the scan did not complete in 120 s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn print_verdict(label: &str, result: &ignition_core::actions::deploy::DeployVerifyResult) {
+    eprintln!(
+        "{label}: ok {} slug {:?} exit {:?} resources_checked {}",
+        result.ok,
+        result.slug,
+        result.failure_exit_code(),
+        result.resources_checked
+    );
+    for check in &result.checks {
+        let codes: Vec<String> = check
+            .findings
+            .iter()
+            .map(|f| format!("{}:{} ({})", f.code, f.subject, f.detail))
+            .collect();
+        eprintln!("  {:?} {:?} [{}]", check.id, check.status, codes.join(", "));
+    }
+    for warning in &result.warnings {
+        eprintln!("  warning: {warning}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: needs the ign-deploy-rig fixture and IGNITION_LIVE_DEPLOY=1"]
+async fn verify_green_then_red_live() {
+    let Some(rig) = rig().await else { return };
+    let mode_root = rig
+        .data_dir
+        .join("config")
+        .join("resources")
+        .join(&rig.mode);
+    let _cleanup = Written(vec![
+        mode_root.join("ignition/database-translator/POSTGRES"),
+        mode_root.join("ignition/general-alarm-settings"),
+        mode_root.join(NOUUID_DB),
+    ]);
+    let opts = VerifyOptions::default();
+
+    // Green: the tracer render placed in the mode collection and scanned.
+    let repo = verify_repo(&rig, false);
+    let reader = reader(repo.path());
+    let declared = load_declared(repo.path(), ENV).expect("render");
+    assert_eq!(declared.target.gateway, VERIFY_GATEWAY_DIR);
+    place_render(&rig, &declared, "");
+    scan_and_wait(&rig.api).await;
+    let green = deploy_verify(
+        &declared,
+        "ign-cli",
+        &rig.api,
+        &rig.api,
+        reader.as_ref(),
+        &opts,
+    )
+    .await
+    .expect("verdict on the rig");
+    print_verdict("green", &green);
+    assert!(green.ok, "a scanned tree must verify green: {green:#?}");
+    assert_eq!(green.slug, None);
+    assert_eq!(green.failure_exit_code(), None);
+    assert_eq!(green.resources_checked, 2);
+    assert!(green.checks.iter().all(|c| c.status != CheckStatus::Fail));
+
+    // Red: a declared database-connection whose live copy has no uuid.
+    let repo = verify_repo(&rig, true);
+    let reader = self::reader(repo.path());
+    let declared = load_declared(repo.path(), ENV).expect("render with the connection");
+    assert!(
+        declared.outcome.tree.files.contains_key(
+            &ignition_core::deploy::layout::RelPath::new(&format!("{NOUUID_DB}/resource.json"))
+                .unwrap()
+        ),
+        "the render must carry the connection's resource.json"
+    );
+    place_render(&rig, &declared, NOUUID_DB);
+    scan_and_wait(&rig.api).await;
+    let red = deploy_verify(
+        &declared,
+        "ign-cli",
+        &rig.api,
+        &rig.api,
+        reader.as_ref(),
+        &opts,
+    )
+    .await
+    .expect("verdict on the rig");
+    print_verdict("red", &red);
+    assert!(!red.ok, "a resource the gateway will not load must be red");
+    assert_eq!(red.slug, Some(VERIFY_FAILED_SLUG));
+    assert_eq!(red.failure_exit_code(), Some(6));
+    let codes: Vec<&str> = red
+        .checks
+        .iter()
+        .flat_map(|c| c.findings.iter())
+        .filter(|f| f.subject == NOUUID_DB)
+        .map(|f| f.code)
+        .collect();
+    assert!(
+        codes.contains(&"unloaded_resource") || codes.contains(&"resource_missing"),
+        "expected unloaded_resource or resource_missing for {NOUUID_DB}, got {codes:?}"
+    );
+    eprintln!("PASS verify_green_then_red_live");
 }
