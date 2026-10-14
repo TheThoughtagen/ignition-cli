@@ -15,6 +15,7 @@ pub mod lint;
 pub mod manifest;
 pub mod node;
 pub mod plan;
+pub mod pull;
 pub mod render;
 pub mod rules;
 pub mod target;
