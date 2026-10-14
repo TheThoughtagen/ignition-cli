@@ -133,3 +133,29 @@ DPLN-05 is delivered in full by this plan and is marked complete. DPLN-02 was al
 
 - Commits `4ae8e2c`, `3c1942e`, `5025892`, `d4d253e` present in `git log`.
 - Modified files present; README, Cargo.toml, cli.rs greps return the expected counts.
+
+## Post-review security fixes
+
+### F4: `--diff` printed plaintext secrets from LIVE files (commit `a5656ef`)
+
+**Finding.** The render lints were designed for the desired (repo) side. The live side is written by the gateway and never linted. For any member other than `config.json`, and for tag files, `file_diff` ran only the Embedded-object scan (`scan_embedded`) with no key-name check, so `{"password": "x"}` in a live non-config `.json` or tag file was printed verbatim in the text diff. This corrects the "Residual" paragraph in the threat-flags section above: the "same rule the render applies" argument did not hold, because render never sees the live side. The Residual note is superseded.
+
+**Fix** (`crates/ignition-core/src/deploy/plan.rs`). A diff-only check, `sensitive_key_hits`, runs over every parsed `.json` member on BOTH sides, in `file_diff`, in addition to `secret_locations`:
+
+- It counts one hit for each non-empty string and each non-null scalar (`true`, `false`, numbers) at or beneath an object key whose ASCII-lowercased name contains `password`, `passwd`, `secret`, `token`, `apikey`, `api_key`, `credential`, `privatekey` or `private_key`. Empty strings and `null` do not count. A secret-named key holding an object or array counts every scalar leaf under it.
+- It applies regardless of file name, OpenAPI description or tag-file status.
+- Hits are added to the location count `<n>`, so the member is withheld with `DIFF_WITHHELD`. Counts only: neither the value nor the key path is kept.
+- `lint.rs`, the render path and `plan_sha256` are untouched. `PLAN_GOLDEN` and `PLAN_GOLDEN_LEDGER` did not change (the diff is not hashed). `--diff` is now deliberately stricter than render.
+- README `#### The diff (--diff)` and the `render_diffs` doc comment updated.
+
+**Behaviour note.** The check is a key-name substring match, so a benign value under a key like `tokenType` or `passwordPolicy` is withheld as well. That fails closed to the hash-only line, which still carries both sha256 values.
+
+**Tests** (`crates/ignition-core/tests/deploy_plan.rs`, 5 added; red first, the canary printed verbatim before the fix):
+
+- `diff_withholds_live_non_config_json_with_a_secret_key`: live `resource.json` (`password`), a live-only `extra.json` (nested `apiKey`) and a live-only `token.json` (`Token` inside an array), all withheld; no canary in JSON, pretty JSON, `Debug` or the diff text (the human form prints only `entry.diff`).
+- `diff_withholds_live_tag_file_with_a_secret_key`: a live tag file with `password`, `token` and `authToken` keys, withheld.
+- `diff_secret_key_check_covers_the_desired_side_and_the_key_list`: nine key spellings and cases, on the desired side.
+- `diff_secret_key_check_ignores_empty_and_null_values_and_benign_keys`: a benign member still diffs; an empty `password` and a `null` `token` are not hits.
+- `diff_secret_key_check_leaves_the_plan_hash_alone`: `plan_sha256` is equal with and without `--diff`.
+
+**Not covered.** The check does not look at string values for secret-shaped content (a secret stored under an innocuous key such as `value` or `data` still diffs as text), and it does not cover non-`.json` members, which were already hash-only. No live-gateway capture.

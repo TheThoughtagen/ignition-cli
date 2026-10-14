@@ -158,3 +158,47 @@ None beyond the plan's register. T-22-17 (option injection: target schema plus `
 - Files: `process.rs`, `remote.rs`, `tests/deploy_transport.rs` present; `grep -c 'kill_on_drop(true)'` in `process.rs` is 1; `grep -n 'pub known_hosts: String'` in `target.rs` prints one line; `grep -c known_hosts README.md` is 3 or more.
 - Commits `249c0d5`, `427ad24`, `72e65cc`, `5dcfcc2` present in `git log`.
 - No `unwrap`, TODO or placeholder patterns in the new non-test code; `.planning/config.json` and `.planning/research/.cache/` untouched.
+
+## Post-review security fixes
+
+### F5: unvalidated remote command API (commit `c5c8a9d`)
+
+**Finding.** `ssh_argv(Option<&str>)` sent an arbitrary string to the remote login shell, and `sftp_batch(&[String])` accepted any line. In sftp batch mode a line starting with `!` runs a LOCAL shell command, and a leading `-` or `@` changes error handling. The only protection was a convention that callers use `safe_remote_path`, plus a line-break check. The "Notes for 22-06" bullet above that calls `sftp_batch(&lines)` is superseded by the typed API below.
+
+**Fix** (`crates/ignition-core/src/deploy/transport/remote.rs`):
+
+- `RemoteCommand(String)` with a private inner string and a read-only `as_str()`. `ssh_argv` now takes `Option<&RemoteCommand>`. Two constructors only:
+  - `powershell_encoded(script)` gives `powershell -NoProfile -NonInteractive -EncodedCommand <base64 of UTF-16LE script>`. It reuses `base64 0.22`, which is already a direct dependency of `ignition-core`, so no crate was added.
+  - `posix(argv)` single-quotes every argument with `'` written `'\''`, and refuses an empty argv, NUL and any control character.
+- `SftpOp` replaces raw lines. `sftp_batch` takes `&[SftpOp]` and renders every op before anything spawns, so one bad path refuses the whole batch. Remote paths pass `safe_remote_path`. Local paths pass the new `safe_local_path` (empty, control characters, `"`, `\`, glob characters). Both also refuse a leading `-`: the sftp client strips quotes before parsing, so `get "-R" "x"` would otherwise be read as a flag. Only the two listing ops carry the `@` quiet prefix (matching the 22-05 tests); no op starts with `-`, so errors are never suppressed.
+- The line-break guard is kept as a second layer (`check_batch_line`) and now also refuses a line whose first non-whitespace, non-`@`, non-`-` character is `!`. A raw-line runner `sftp_batch_raw` exists under `#[cfg(test)]` only, never `pub`.
+- `ssh_argv` and `sftp_batch` have no callers outside `remote.rs` and `tests/deploy_transport.rs` yet, so nothing else changed.
+
+**Final `SftpOp` set** (confirmed against the 22-06, 22-07, 22-12 and 22-13 plans: `ls -1`, `ls -l`, `get`, `get -R`, `put`, `rename`, `rm`, `mkdir`, `rmdir`; nothing was missing):
+
+| Variant | Line |
+|---|---|
+| `Ls { path }` | `@ls -1 "<path>"` |
+| `LsLong { path }` | `@ls -l "<path>"` |
+| `Get { remote, local }` | `get "<remote>" "<local>"` |
+| `GetRecursive { remote, local }` | `get -R "<remote>" "<local>"` |
+| `Put { local, remote }` | `put "<local>" "<remote>"` |
+| `Rename { from, to }` | `rename "<from>" "<to>"` |
+| `Rm { path }` | `rm "<path>"` |
+| `Mkdir { path }` | `mkdir "<path>"` |
+| `Rmdir { path }` | `rmdir "<path>"` |
+
+**Tests** (red first: the module did not compile against the new API). 10 unit tests in `remote.rs` and 1 integration test, plus the existing `deploy_transport.rs` tests moved to the constructors (`posix(&["uname", "-a"])`, `posix(&["true"])`, `SftpOp::Ls`):
+
+- Posix quoting exact strings; refusal of NUL, newline, CR, tab, ESC, DEL, C1 and an empty argv; a round trip through a local `/bin/sh -c` of twelve hostile arguments (`'`, `;`, `$(..)`, backtick, `!rm -rf /`, `&&`, `"`, `\`, glob and brace text), where the printed argv equals the input and no marker file is created.
+- The encoded command is base64-safe and decodes (UTF-16LE) back to the script, including non-ASCII, a hostile script and an empty one; a known vector (`hi` gives `aABpAA==`).
+- Exact line rendering for all nine ops; a table of refused remote and local paths (line breaks, `"`, `\`, glob characters, empty, leading `-`, NUL, ESC) across every op position; `!rm -rf`, `;`, `$(..)`, backtick, `'` kept inertly inside the quotes.
+- `check_batch_line` refuses line breaks and `!`, `@!`, `-!`, `-@!`, `  !`; `sftp_batch` with a recording runner sends the expected stdin and spawns nothing on a bad op or a bad raw line.
+- `local_sftp_server_keeps_hostile_path_text_inert` (real `sftp-server` via `-D`, unix): lists a directory named with a quote, `$(touch ..)`, backticks and `;`, and mkdir/rmdir of a directory named `!touch IGN_PWNED_MARKER`; no marker file appears.
+
+**Not covered.**
+
+- `RemoteCommand::posix` is for POSIX hosts. A Windows host's default shell (`cmd` or PowerShell) is not POSIX, so Windows commands must use `powershell_encoded`; 22-13's planned `encoded_command` / `exec_powershell` should build on it rather than add a second encoder.
+- sftp's own tilde and `$` handling of paths on the server side is not modelled; remote paths are expected to be absolute (`posix_root`).
+- The 22-06 and 22-07 PLAN.md files still describe `sftp_batch(&self, lines: &[String])` and raw `@ls -1 "` lines; the implementer of those plans must use `SftpOp` instead. Those plan files were not edited.
+- Windows-runner behaviour of `safe_local_path` (backslash normalisation) is compiled but not run here.
