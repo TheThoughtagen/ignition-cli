@@ -99,6 +99,35 @@ input schema correspondingly keeps `confirm` OUT of `required` for
 guarded verbs: schema-required would invite agents to auto-fill
 `confirm:true`, so omission is legal and answered by the refusal.
 
+### The `deploy verify` verdict exception (2026-10-14)
+
+`ign deploy verify` is the THIRD documented success-path exit exception (after
+`ign lint --strict` and `ign testing run`), and the first in the `deploy`
+family: `deploy apply` and the redundant-pair checks of later phases will
+reuse the same envelope. A **red verdict** is not an error. The command prints
+the frozen success envelope, then ends with **exit 6** (target state):
+
+- stdout: `{"ok": true, "profile": "<master profile>", "data": {..., "ok": false, "slug": "deploy_verify_failed", "checks": [...]}}`.
+  The envelope's own `ok: true` stays (the command ran and produced a verdict);
+  the verdict is `data.ok`. The findings are in `data.checks[].findings[]`. There
+  is no `error` member.
+- exit 6, set after the envelope is rendered.
+- A **green verdict** has `data.ok: true`, `data.slug: null` and exits 0.
+
+`deploy_verify_failed` lives only in `data.slug`. It is not a `CoreError` slug
+and is never a row of the `## Exit codes` table; an agent that wants the
+verdict reads `data.ok`, and one that only looks at the exit code sees 6. The
+rule exists because the error envelope has no `data` field, and a verdict is
+only useful with its findings.
+
+Failures **before** a verdict exists stay ordinary error envelopes on stderr
+with their own exit codes and an empty stdout: an unreachable gateway
+(`network_error`, exit 4), an unknown or secretless profile (exit 3), an
+unreadable host (`transport_failed`, exit 4), a refused tree (exit 2), and a
+gateway that refuses the scan, mode or resource reads. Over MCP the same
+envelope is returned with `isError` false, because the envelope's `ok` is
+`true`.
+
 ## Exit codes
 
 | Code | Class         | Meaning                                            | Stable slugs
