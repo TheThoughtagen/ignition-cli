@@ -18,6 +18,11 @@
 //! - **Bounded in time (D-04).** `ConnectTimeout` plus `ServerAlive*` inside
 //!   ssh, and a per-call timeout with kill in the process runner.
 //! - **One temp dir per shell**, so two shells never share a file.
+//! - **Typed remote input.** The remote shell only receives a
+//!   [`RemoteCommand`] (every constructor yields an injection-safe string) and
+//!   sftp only receives [`SftpOp`] values (every path checked and
+//!   double-quoted), never a caller-built string. A raw-line runner exists
+//!   under `cfg(test)` only.
 //!
 //! The exact `-o` order is [`hardened_options`]; `ssh -G` on the generated
 //! argv is pinned by `tests/deploy_transport.rs`.
@@ -27,6 +32,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+use base64::Engine as _;
 
 use super::process::{ProcessOutput, ProcessRunner};
 use crate::deploy::target::{DEFAULT_CONNECT_TIMEOUT_S, DEFAULT_OP_TIMEOUT_S, Ssh};
@@ -54,8 +61,14 @@ const DETAIL_MAX_BYTES: usize = 1024;
 ///
 /// Spaces, commas and other printable characters pass.
 pub fn safe_remote_path(path: &str) -> Result<(), String> {
+    refuse_unsafe_path("remote", path)
+}
+
+/// The shared character check behind [`safe_remote_path`] and
+/// [`safe_local_path`]; `kind` names the side in the error.
+fn refuse_unsafe_path(kind: &str, path: &str) -> Result<(), String> {
     if path.is_empty() {
-        return Err("remote path must not be empty".to_string());
+        return Err(format!("{kind} path must not be empty"));
     }
     for c in path.chars() {
         let why = match c {
@@ -66,7 +79,27 @@ pub fn safe_remote_path(path: &str) -> Result<(), String> {
             _ => continue,
         };
         return Err(format!(
-            "remote path {path:?} contains {why} ({c:?}), which cannot be placed safely in an sftp batch line"
+            "{kind} path {path:?} contains {why} ({c:?}), which cannot be placed safely in an sftp batch line"
+        ));
+    }
+    Ok(())
+}
+
+/// [`safe_remote_path`] for a path on the machine running `ign`, as it
+/// appears in an sftp `get` or `put`: the same refusals (empty, control
+/// characters, `"`, `\`, glob characters, because the sftp client globs local
+/// paths too), plus a leading `-`, which the sftp client would read as an
+/// option (`get "-R" "x"`) even though it was quoted. On a Windows runner
+/// backslashes are normalised to `/` by the caller before this check.
+pub fn safe_local_path(path: &str) -> Result<(), String> {
+    refuse_unsafe_path("local", path)?;
+    refuse_leading_dash("local", path)
+}
+
+fn refuse_leading_dash(kind: &str, path: &str) -> Result<(), String> {
+    if path.starts_with('-') {
+        return Err(format!(
+            "{kind} path {path:?} starts with '-', which the sftp client would read as an option"
         ));
     }
     Ok(())
@@ -287,6 +320,151 @@ fn restrict_to_owner(file: &Path, label: &str) -> Result<(), CoreError> {
     }
 }
 
+/// A command string for the remote shell whose only constructors produce
+/// injection-safe text. `ssh` hands its trailing argument to the remote login
+/// shell, so a caller-built string would be a shell-injection sink; this type
+/// is the only thing [`RemoteShell::ssh_argv`] accepts. The inner string is
+/// private.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCommand(String);
+
+impl RemoteCommand {
+    /// `powershell -NoProfile -NonInteractive -EncodedCommand <base64>`, where
+    /// the payload is `script` as UTF-16LE. Base64 (`A-Za-z0-9+/=`) has no
+    /// character any shell, `cmd.exe` or PowerShell treats specially, so the
+    /// script cannot break out whatever the host's default shell is.
+    pub fn powershell_encoded(script: &str) -> RemoteCommand {
+        let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16le);
+        RemoteCommand(format!(
+            "powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
+        ))
+    }
+
+    /// A POSIX `sh` command line for `argv`: each argument single-quoted with
+    /// every `'` written `'\''`, joined by spaces. Inside single quotes a POSIX
+    /// shell interprets nothing, so `$(..)`, backticks, `;`, `!`, `*` and
+    /// the rest reach the program as literal text. Refused: an empty `argv`,
+    /// and NUL or any other control character in any argument (a newline or
+    /// tab would otherwise survive quoting and still be a hazard to every log
+    /// and terminal it reaches).
+    pub fn posix(argv: &[&str]) -> Result<RemoteCommand, String> {
+        if argv.is_empty() {
+            return Err("a remote command needs at least a program".to_string());
+        }
+        let mut quoted = Vec::with_capacity(argv.len());
+        for arg in argv {
+            if let Some(bad) = arg.chars().find(|c| c.is_control()) {
+                return Err(format!(
+                    "remote command argument {arg:?} contains the control character {bad:?}"
+                ));
+            }
+            quoted.push(format!("'{}'", arg.replace('\'', "'\\''")));
+        }
+        Ok(RemoteCommand(quoted.join(" ")))
+    }
+
+    /// The command text, exactly as it is sent.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One sftp batch command. [`RemoteShell::sftp_batch`] accepts only these, so
+/// a caller cannot hand sftp a raw line: in batch mode a leading `!` runs a
+/// LOCAL shell command and a leading `-` or `@` changes error handling.
+///
+/// Each op renders to `<command> "<path>"…` with every remote path through
+/// [`safe_remote_path`] and every local path through [`safe_local_path`]
+/// (both also refuse a leading `-`). Only the two listing ops carry the `@`
+/// quiet prefix, which hides the echoed command so stdout is the listing; no
+/// op ever starts with `-`, so a failure is never suppressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SftpOp {
+    /// `@ls -1 "<path>"`: names only, one per line.
+    Ls { path: String },
+    /// `@ls -l "<path>"`: the long listing.
+    LsLong { path: String },
+    /// `get "<remote>" "<local>"`.
+    Get { remote: String, local: PathBuf },
+    /// `get -R "<remote>" "<local>"`: a directory tree; symlinks are skipped
+    /// by the client.
+    GetRecursive { remote: String, local: PathBuf },
+    /// `put "<local>" "<remote>"`.
+    Put { local: PathBuf, remote: String },
+    /// `rename "<from>" "<to>"`.
+    Rename { from: String, to: String },
+    /// `rm "<path>"`.
+    Rm { path: String },
+    /// `mkdir "<path>"`.
+    Mkdir { path: String },
+    /// `rmdir "<path>"`.
+    Rmdir { path: String },
+}
+
+impl SftpOp {
+    /// The batch line for this op, or why a path cannot be placed in one.
+    pub fn render(&self) -> Result<String, String> {
+        let remote = |path: &str| -> Result<String, String> {
+            safe_remote_path(path)?;
+            refuse_leading_dash("remote", path)?;
+            Ok(format!("\"{path}\""))
+        };
+        let local = |path: &Path| -> Result<String, String> {
+            let text = path
+                .to_str()
+                .ok_or_else(|| "a local path that is not valid UTF-8 cannot be used".to_string())?;
+            let text = if cfg!(windows) {
+                text.replace('\\', "/")
+            } else {
+                text.to_string()
+            };
+            safe_local_path(&text)?;
+            Ok(format!("\"{text}\""))
+        };
+        Ok(match self {
+            SftpOp::Ls { path } => format!("@ls -1 {}", remote(path)?),
+            SftpOp::LsLong { path } => format!("@ls -l {}", remote(path)?),
+            SftpOp::Get {
+                remote: r,
+                local: l,
+            } => format!("get {} {}", remote(r)?, local(l)?),
+            SftpOp::GetRecursive {
+                remote: r,
+                local: l,
+            } => {
+                format!("get -R {} {}", remote(r)?, local(l)?)
+            }
+            SftpOp::Put {
+                local: l,
+                remote: r,
+            } => format!("put {} {}", local(l)?, remote(r)?),
+            SftpOp::Rename { from, to } => format!("rename {} {}", remote(from)?, remote(to)?),
+            SftpOp::Rm { path } => format!("rm {}", remote(path)?),
+            SftpOp::Mkdir { path } => format!("mkdir {}", remote(path)?),
+            SftpOp::Rmdir { path } => format!("rmdir {}", remote(path)?),
+        })
+    }
+}
+
+/// The second layer behind [`SftpOp`]: a rendered batch line must hold no line
+/// break (it would start another command) and must not begin, after optional
+/// whitespace and `@` / `-` prefixes, with `!` (a local shell escape).
+fn check_batch_line(line: &str) -> Result<(), String> {
+    if line.contains(['\n', '\r']) {
+        return Err(format!(
+            "refused a batch line holding a line break: {line:?}"
+        ));
+    }
+    let head = line.trim_start_matches(|c: char| c.is_whitespace() || c == '@' || c == '-');
+    if head.starts_with('!') {
+        return Err(format!(
+            "refused a batch line starting with '!' (a local shell escape): {line:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// How one node's ssh and sftp invocations are built and run.
 pub struct RemoteShell {
     runner: Arc<dyn ProcessRunner>,
@@ -500,9 +678,9 @@ impl RemoteShell {
     }
 
     /// `ssh` argv: `-T -p <port> [-i <key>] -o k=v… -- user@host [command]`.
-    /// `remote_command` is sent to the remote shell as one argument; the
-    /// caller must have built it only from validated values.
-    pub fn ssh_argv(&self, remote_command: Option<&str>) -> Vec<OsString> {
+    /// `remote_command` is sent to the remote shell as one argument; a
+    /// [`RemoteCommand`] can only be built injection-safe.
+    pub fn ssh_argv(&self, remote_command: Option<&RemoteCommand>) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("-T"),
             OsString::from("-p"),
@@ -516,7 +694,7 @@ impl RemoteShell {
         args.push(OsString::from("--"));
         args.push(self.destination());
         if let Some(command) = remote_command {
-            args.push(OsString::from(command));
+            args.push(OsString::from(command.as_str()));
         }
         args
     }
@@ -541,17 +719,37 @@ impl RemoteShell {
         args
     }
 
-    /// Run `sftp` with `lines` as the batch on stdin, then close stdin.
-    /// Every line must already have been built from [`safe_remote_path`]
-    /// inputs; a line holding a line break is refused here as a second
-    /// guard, because it would start another command.
-    pub async fn sftp_batch(&self, lines: &[String]) -> Result<ProcessOutput, CoreError> {
-        if let Some(bad) = lines.iter().find(|l| l.contains(['\n', '\r'])) {
-            return Err(CoreError::TransportFailed {
-                operation: "sftp".to_string(),
-                node: self.label.clone(),
-                detail: format!("refused a batch line holding a line break: {bad:?}"),
-            });
+    /// Run `sftp` with `ops` as the batch on stdin, then close stdin. Every
+    /// op is rendered first, so one op with an unsafe path refuses the whole
+    /// batch before anything spawns.
+    pub async fn sftp_batch(&self, ops: &[SftpOp]) -> Result<ProcessOutput, CoreError> {
+        let mut lines = Vec::with_capacity(ops.len());
+        for op in ops {
+            lines.push(op.render().map_err(|why| self.refused_batch(why))?);
+        }
+        self.send_batch(&lines).await
+    }
+
+    /// Test-only: run raw batch lines, to exercise the line guard that backs
+    /// up [`SftpOp`]. Not compiled outside tests, never `pub`.
+    #[cfg(test)]
+    async fn sftp_batch_raw(&self, lines: &[String]) -> Result<ProcessOutput, CoreError> {
+        self.send_batch(lines).await
+    }
+
+    fn refused_batch(&self, detail: String) -> CoreError {
+        CoreError::TransportFailed {
+            operation: "sftp".to_string(),
+            node: self.label.clone(),
+            detail,
+        }
+    }
+
+    /// The second layer: each line passes [`check_batch_line`], then the
+    /// batch goes to sftp's stdin.
+    async fn send_batch(&self, lines: &[String]) -> Result<ProcessOutput, CoreError> {
+        for line in lines {
+            check_batch_line(line).map_err(|why| self.refused_batch(why))?;
         }
         let mut batch = lines.join("\n");
         batch.push('\n');
@@ -691,5 +889,377 @@ mod tests {
         let with = keys(Some(Path::new("/t/key")));
         assert_eq!(with.len(), 21);
         assert_eq!(with[10], "IdentitiesOnly");
+    }
+
+    // ---- RemoteCommand (22-05 review, F5a) --------------------------------
+
+    const HOSTILE_ARGS: [&str; 12] = [
+        "plain",
+        "with space",
+        "it's",
+        "'",
+        "a;b",
+        "$(touch IGN_PWNED)",
+        "`touch IGN_PWNED`",
+        "!rm -rf /",
+        "a && b | c > d",
+        "\"quoted\"",
+        "back\\slash",
+        "*.json ~ {a,b} $HOME",
+    ];
+
+    #[test]
+    fn posix_command_single_quotes_every_argument() {
+        let cmd = RemoteCommand::posix(&["echo", "it's", "a b"]).expect("posix");
+        assert_eq!(cmd.as_str(), r"'echo' 'it'\''s' 'a b'");
+        let cmd = RemoteCommand::posix(&["true"]).expect("posix");
+        assert_eq!(cmd.as_str(), "'true'");
+    }
+
+    #[test]
+    fn posix_command_refuses_nul_control_characters_and_empty_argv() {
+        for bad in [
+            "a\0b", "a\nb", "a\rb", "a\tb", "\x1b[31m", "a\x7fb", "\u{85}", "\u{9f}",
+        ] {
+            assert!(
+                RemoteCommand::posix(&["echo", bad]).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert!(
+                RemoteCommand::posix(&[bad]).is_err(),
+                "{bad:?} must be refused as the program"
+            );
+        }
+        assert!(RemoteCommand::posix(&[]).is_err(), "empty argv");
+        assert!(
+            RemoteCommand::posix(&[""]).is_ok(),
+            "an empty arg is quoted"
+        );
+        assert_eq!(RemoteCommand::posix(&[""]).unwrap().as_str(), "''");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_command_round_trips_through_a_local_sh() {
+        let dir = tempfile::tempdir().expect("dir");
+        // printf prints each argument NUL-terminated, so the output is the
+        // argv exactly as the shell tokenised it
+        let mut argv: Vec<&str> = vec!["printf", "%s\\0"];
+        argv.extend(HOSTILE_ARGS);
+        let cmd = RemoteCommand::posix(&argv).expect("posix");
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd.as_str())
+            .current_dir(dir.path())
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let printed: Vec<&[u8]> = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .collect();
+        let expected: Vec<&[u8]> = HOSTILE_ARGS.iter().map(|a| a.as_bytes()).collect();
+        assert_eq!(printed, expected, "the shell saw the argv unchanged");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read")
+                .next()
+                .is_none(),
+            "no hostile argument ran as a command"
+        );
+    }
+
+    #[test]
+    fn powershell_command_decodes_back_to_the_script() {
+        for script in [
+            "Get-ChildItem 'C:\\Program Files'",
+            "Write-Output \"caf\u{e9} \u{20ac} \u{1f600}\"; $x = $(whoami); `n",
+            "'; Remove-Item -Recurse C:\\ ; '",
+            "",
+        ] {
+            let cmd = RemoteCommand::powershell_encoded(script);
+            let prefix = "powershell -NoProfile -NonInteractive -EncodedCommand ";
+            let b64 = cmd
+                .as_str()
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("prefix: {}", cmd.as_str()));
+            assert!(
+                b64.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+                "base64 is a safe charset: {b64}"
+            );
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("base64");
+            assert_eq!(bytes.len() % 2, 0);
+            let units: Vec<u16> = bytes
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(String::from_utf16(&units).expect("utf16"), script);
+        }
+        // a known vector: "Write-Output hi" in UTF-16LE base64
+        assert_eq!(
+            RemoteCommand::powershell_encoded("hi").as_str(),
+            "powershell -NoProfile -NonInteractive -EncodedCommand aABpAA=="
+        );
+    }
+
+    // ---- SftpOp (22-05 review, F5b) ---------------------------------------
+
+    fn render_all(ops: &[SftpOp]) -> Vec<String> {
+        ops.iter().map(|op| op.render().expect("render")).collect()
+    }
+
+    #[test]
+    fn sftp_ops_render_exact_lines() {
+        let ops = [
+            SftpOp::Ls {
+                path: "/d/a b".into(),
+            },
+            SftpOp::LsLong { path: "/d".into() },
+            SftpOp::Get {
+                remote: "/r/f".into(),
+                local: PathBuf::from("/l/f"),
+            },
+            SftpOp::GetRecursive {
+                remote: "/r/dir".into(),
+                local: PathBuf::from("/l/mirror/"),
+            },
+            SftpOp::Put {
+                local: PathBuf::from("/l/f"),
+                remote: "/r/f".into(),
+            },
+            SftpOp::Rename {
+                from: "/r/a".into(),
+                to: "/r/b".into(),
+            },
+            SftpOp::Rm {
+                path: "/r/f".into(),
+            },
+            SftpOp::Mkdir {
+                path: "/r/d".into(),
+            },
+            SftpOp::Rmdir {
+                path: "/r/d".into(),
+            },
+        ];
+        assert_eq!(
+            render_all(&ops),
+            [
+                "@ls -1 \"/d/a b\"",
+                "@ls -l \"/d\"",
+                "get \"/r/f\" \"/l/f\"",
+                "get -R \"/r/dir\" \"/l/mirror/\"",
+                "put \"/l/f\" \"/r/f\"",
+                "rename \"/r/a\" \"/r/b\"",
+                "rm \"/r/f\"",
+                "mkdir \"/r/d\"",
+                "rmdir \"/r/d\"",
+            ]
+        );
+        for line in render_all(&ops) {
+            assert!(
+                line.starts_with(|c: char| c.is_ascii_lowercase() || c == '@'),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_ops_refuse_hostile_remote_and_local_paths() {
+        let refused = [
+            "a\nrm \"/x\"",
+            "a\rb",
+            "a\"; rm \"/x",
+            "a\\b",
+            "a*b",
+            "a?b",
+            "a[1]",
+            "a{b}",
+            "",
+            "-R",
+            "-rf",
+            "a\0b",
+            "a\x1bb",
+        ];
+        for bad in refused {
+            let remote_ops = [
+                SftpOp::Ls { path: bad.into() },
+                SftpOp::LsLong { path: bad.into() },
+                SftpOp::Get {
+                    remote: bad.into(),
+                    local: PathBuf::from("/l"),
+                },
+                SftpOp::GetRecursive {
+                    remote: bad.into(),
+                    local: PathBuf::from("/l"),
+                },
+                SftpOp::Put {
+                    local: PathBuf::from("/l"),
+                    remote: bad.into(),
+                },
+                SftpOp::Rename {
+                    from: bad.into(),
+                    to: "/r/b".into(),
+                },
+                SftpOp::Rename {
+                    from: "/r/a".into(),
+                    to: bad.into(),
+                },
+                SftpOp::Rm { path: bad.into() },
+                SftpOp::Mkdir { path: bad.into() },
+                SftpOp::Rmdir { path: bad.into() },
+            ];
+            for op in &remote_ops {
+                assert!(op.render().is_err(), "{op:?} must be refused");
+            }
+            let local_ops = [
+                SftpOp::Get {
+                    remote: "/r".into(),
+                    local: PathBuf::from(bad),
+                },
+                SftpOp::GetRecursive {
+                    remote: "/r".into(),
+                    local: PathBuf::from(bad),
+                },
+                SftpOp::Put {
+                    local: PathBuf::from(bad),
+                    remote: "/r".into(),
+                },
+            ];
+            for op in &local_ops {
+                assert!(op.render().is_err(), "{op:?} must be refused");
+            }
+        }
+    }
+
+    #[test]
+    fn sftp_ops_keep_other_hostile_text_inertly_inside_the_quotes() {
+        // each of these is a path character sftp's double quotes make inert;
+        // none can start a line, so none can be a command or a `!` shell escape
+        for inert in [
+            "!rm -rf /x",
+            "/d/a;b",
+            "/d/$(touch IGN_PWNED)",
+            "/d/`touch IGN_PWNED`",
+            "/d/it's",
+            "/d/a&b|c>d",
+            "/d/~tilde",
+        ] {
+            let line = SftpOp::Rm { path: inert.into() }.render().expect("render");
+            assert_eq!(line, format!("rm \"{inert}\""));
+            assert!(line.starts_with("rm \""), "{line}");
+        }
+    }
+
+    #[test]
+    fn local_path_check_table() {
+        for bad in [
+            "", "a\"b", "a\\b", "a*b", "a?b", "a[b", "a]b", "a{b", "a}b", "a\nb", "a\tb", "-x",
+        ] {
+            assert!(safe_local_path(bad).is_err(), "{bad:?} must be refused");
+        }
+        for ok in [
+            "/tmp/ign-ssh-AbC/mirror/",
+            "/tmp/a b,c/d",
+            "rel/dir/file.json",
+            "/tmp/it's",
+        ] {
+            assert_eq!(safe_local_path(ok), Ok(()), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn batch_line_guard_refuses_line_breaks_and_a_leading_bang() {
+        for line in [
+            "!rm -rf /",
+            "@!rm -rf /",
+            "-!rm -rf /",
+            "  !id",
+            "-@!id",
+            "ls \"/d\"\nrm \"/x\"",
+            "ls \"/d\"\rrm \"/x\"",
+        ] {
+            assert!(check_batch_line(line).is_err(), "{line:?} must be refused");
+        }
+        for line in ["@ls -1 \"/d\"", "get \"/r\" \"/l\"", "rm \"!x\""] {
+            assert_eq!(check_batch_line(line), Ok(()), "{line:?}");
+        }
+    }
+
+    #[derive(Default)]
+    struct Recording {
+        calls: std::sync::Mutex<Vec<Option<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Recording {
+        async fn run(
+            &self,
+            _program: &OsStr,
+            _args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            _timeout: Duration,
+        ) -> ProcessOutput {
+            self.calls.lock().expect("calls").push(stdin);
+            ProcessOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                code: 0,
+                timed_out: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_batch_sends_typed_lines_and_refuses_bad_ops_before_spawning() {
+        let recording = Arc::new(Recording::default());
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused"),
+            recording.clone(),
+            Duration::from_secs(1),
+        );
+        shell
+            .sftp_batch(&[
+                SftpOp::Ls { path: "/d".into() },
+                SftpOp::Rm {
+                    path: "/d/x".into(),
+                },
+            ])
+            .await
+            .expect("batch");
+        assert_eq!(
+            recording.calls.lock().expect("calls")[0].as_deref(),
+            Some(b"@ls -1 \"/d\"\nrm \"/d/x\"\n".as_slice())
+        );
+
+        // one bad op refuses the whole batch before anything spawns
+        let err = shell
+            .sftp_batch(&[
+                SftpOp::Ls { path: "/d".into() },
+                SftpOp::Rm {
+                    path: "/d\nrm \"/x\"".into(),
+                },
+            ])
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, CoreError::TransportFailed { .. }));
+        assert_eq!(recording.calls.lock().expect("calls").len(), 1);
+
+        // the raw runner is the second layer: line break and leading `!`
+        for line in ["ls \"/d\"\nrm \"/x\"", "!rm -rf /", "@!id"] {
+            let err = shell
+                .sftp_batch_raw(&[line.to_string()])
+                .await
+                .expect_err("raw line refused");
+            assert!(matches!(err, CoreError::TransportFailed { .. }), "{line:?}");
+        }
+        assert_eq!(recording.calls.lock().expect("calls").len(), 1);
     }
 }

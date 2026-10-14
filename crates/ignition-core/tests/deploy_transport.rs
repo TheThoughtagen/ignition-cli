@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use ignition_core::deploy::target::{Ssh, TargetOs};
 use ignition_core::deploy::transport::process::{ProcessOutput, ProcessRunner, TokioProcessRunner};
-use ignition_core::deploy::transport::remote::{RemoteShell, hardened_options};
+use ignition_core::deploy::transport::remote::{
+    RemoteCommand, RemoteShell, SftpOp, hardened_options,
+};
 use ignition_core::error::CoreError;
 
 const KEY_CANARY: &str = "KEYCANARY-b3a1c0de-do-not-leak";
@@ -221,10 +223,11 @@ fn sftp_argv_shape() {
     assert_eq!(&sftp[sftp.len() - 2..], ["--", "svc@gw.example.test"]);
     assert_eq!(&ssh[ssh.len() - 2..], ["--", "svc@gw.example.test"]);
     // a remote command comes after the destination, never before `--`
-    let with_command = argv_strings(&shell.ssh_argv(Some("uname -a")));
+    let uname = RemoteCommand::posix(&["uname", "-a"]).expect("posix command");
+    let with_command = argv_strings(&shell.ssh_argv(Some(&uname)));
     assert_eq!(
         &with_command[with_command.len() - 3..],
-        ["--", "svc@gw.example.test", "uname -a"]
+        ["--", "svc@gw.example.test", "'uname' '-a'"]
     );
     // default port
     let mut ssh_default = ssh_block();
@@ -384,7 +387,8 @@ fn key_never_echoed() {
         (name == "PROD_KEY").then(|| key_text.clone())
     });
     assert!(!format!("{shell:?}").contains(KEY_CANARY));
-    for argv in [shell.ssh_argv(Some("true")), shell.sftp_argv()] {
+    let true_cmd = RemoteCommand::posix(&["true"]).expect("posix command");
+    for argv in [shell.ssh_argv(Some(&true_cmd)), shell.sftp_argv()] {
         for arg in argv_strings(&argv) {
             assert!(!arg.contains(KEY_CANARY), "argv leaks the key: {arg}");
             assert!(!arg.contains("PRIVATE KEY"), "argv leaks the key: {arg}");
@@ -546,7 +550,14 @@ async fn sftp_batch_feeds_stdin_with_the_op_timeout() {
     )
     .expect("shell");
     let out = shell
-        .sftp_batch(&["@ls -1 \"/d\"".to_string(), "@ls -1 \"/e\"".to_string()])
+        .sftp_batch(&[
+            SftpOp::Ls {
+                path: "/d".to_string(),
+            },
+            SftpOp::Ls {
+                path: "/e".to_string(),
+            },
+        ])
         .await
         .expect("batch");
     assert_eq!(out.stdout, b"ok");
@@ -563,9 +574,11 @@ async fn sftp_batch_feeds_stdin_with_the_op_timeout() {
         assert_eq!(*timeout, Duration::from_secs(7));
     }
 
-    // a line break inside a line would start a second command: refused
+    // a line break inside a path would start a second command: refused
     let err = shell
-        .sftp_batch(&["ls \"/d\"\nrm \"/x\"".to_string()])
+        .sftp_batch(&[SftpOp::Ls {
+            path: "/d\"\nrm \"/x".to_string(),
+        }])
         .await
         .expect_err("injected line break");
     assert!(matches!(err, CoreError::TransportFailed { .. }));
@@ -638,7 +651,9 @@ async fn local_sftp_server_seam_runs_a_batch() {
     std::fs::write(dir.path().join("alpha"), b"1").expect("alpha");
     let shell = RemoteShell::local_sftp_server(&sftp_server(), runner(), Duration::from_secs(30));
     assert_eq!(argv_strings(&shell.sftp_argv())[..3], ["-q", "-b", "-"]);
-    let batch = format!("@ls -1 \"{}\"", dir.path().display());
+    let batch = SftpOp::Ls {
+        path: dir.path().display().to_string(),
+    };
     let out = shell
         .require_success("ls", shell.sftp_batch(&[batch]).await.expect("run"))
         .expect("listing");
@@ -669,6 +684,60 @@ fn windows_key_acl() {
         assert!(
             !listing.contains(other),
             "{other} still has access:\n{listing}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_sftp_server_keeps_hostile_path_text_inert() {
+    // a directory whose name carries quote, command-substitution, backtick and
+    // `;` text, listed, then a directory named like a local-shell escape made
+    // and removed: sftp's double quotes keep all of it a name
+    let root = tempfile::tempdir().expect("dir");
+    let hostile = root
+        .path()
+        .join("it's $(touch IGN_PWNED_MARKER) `id`; echo");
+    std::fs::create_dir(&hostile).expect("hostile dir");
+    std::fs::write(hostile.join("inner"), b"1").expect("inner");
+    let shell = RemoteShell::local_sftp_server(&sftp_server(), runner(), Duration::from_secs(30));
+
+    let out = shell
+        .require_success(
+            "ls",
+            shell
+                .sftp_batch(&[SftpOp::Ls {
+                    path: hostile.display().to_string(),
+                }])
+                .await
+                .expect("run"),
+        )
+        .expect("listing");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("inner"));
+
+    let bang = root.path().join("!touch IGN_PWNED_MARKER");
+    for op in [
+        SftpOp::Mkdir {
+            path: bang.display().to_string(),
+        },
+        SftpOp::Rmdir {
+            path: bang.display().to_string(),
+        },
+    ] {
+        let made = bang.exists();
+        shell
+            .require_success("op", shell.sftp_batch(&[op]).await.expect("run"))
+            .expect("op succeeded");
+        assert_ne!(
+            made,
+            bang.exists(),
+            "mkdir then rmdir toggled the directory"
+        );
+    }
+    for dir in [root.path(), Path::new(".")] {
+        assert!(
+            !dir.join("IGN_PWNED_MARKER").exists(),
+            "a hostile path text ran as a command"
         );
     }
 }
