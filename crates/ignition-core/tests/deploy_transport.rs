@@ -2259,6 +2259,159 @@ mod sftp_mirror {
         assert_eq!(snapshot(&sc.resources()), before);
     }
 
+    /// No batch line of a tampered run renames anything or removes anything in
+    /// the collection; the only `rm` allowed is the cleanup of the staged
+    /// copies inside the staging root.
+    fn assert_no_collection_mutation(tap: &Tap, sc: &Scratch) {
+        let stage = format!("\"{}/", sc.stage_root.display());
+        for line in tap.lines().iter().flatten() {
+            assert!(!line.starts_with("rename "), "a rename ran: {line}");
+            assert!(!line.starts_with("rmdir "), "an rmdir ran: {line}");
+            if let Some(rest) = line.strip_prefix("rm ") {
+                assert!(
+                    rest.starts_with(&stage),
+                    "an rm left the staging root: {line}"
+                );
+            }
+        }
+    }
+
+    const NEW_HONEST: &[u8] = b"{\"new\":1}";
+    const NEW_EVIL: &[u8] = b"{\"new\":9}";
+
+    /// F6: a staged copy replaced on the host by one of the SAME size but
+    /// different bytes is refused before any rename or delete.
+    #[tokio::test]
+    async fn sftp_mirror_same_size_tampered_staged_copy_is_refused() {
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let m = sftp_mirror(&sc, sc.separate(), tap.clone());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
+        let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
+        assert_eq!(std::fs::read(&victim).unwrap(), NEW_HONEST);
+        assert_eq!(NEW_HONEST.len(), NEW_EVIL.len());
+        std::fs::write(&victim, NEW_EVIL).expect("tamper");
+
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("same-size tamper");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("SHA-256"), "{text}");
+        assert!(text.contains("NEW/config.json"), "{text}");
+        assert_eq!(snapshot(&sc.resources()), before, "nothing was committed");
+        assert_no_collection_mutation(&tap, &sc);
+        // the staged copies were discarded, and the report says so
+        assert!(text.contains("removed"), "{text}");
+        assert!(
+            !snapshot(&sc.stage_root).values().any(Option::is_some),
+            "staged copies left in the staging root"
+        );
+
+        // an untampered stage commits
+        let staged = m.stage(&scenario_tree()).await.expect("restage");
+        m.commit(&staged, &scenario_deletes())
+            .await
+            .expect("an untampered copy commits");
+        assert_eq!(
+            std::fs::read(sc.collection().join(format!("{DT}/NEW/config.json"))).unwrap(),
+            NEW_HONEST
+        );
+    }
+
+    /// F6: the swap lands AFTER the size survey, just before the read-back.
+    #[tokio::test]
+    async fn sftp_mirror_tamper_after_the_size_survey_is_refused() {
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
+        let hook_victim = victim.clone();
+        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
+            if batch.contains("get \"") {
+                std::fs::write(&hook_victim, NEW_EVIL).expect("swap");
+            }
+        }));
+        let m = sftp_mirror(&sc, sc.separate(), tap.clone());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("swapped after the survey");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("SHA-256"), "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
+        assert_no_collection_mutation(&tap, &sc);
+    }
+
+    /// F6: a staged copy swapped for a far larger file is bounded by the same
+    /// listing-sized watchdog and caps as the read side and is refused.
+    #[tokio::test]
+    async fn sftp_mirror_oversize_swap_is_refused_before_any_rename() {
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
+        let hook_victim = victim.clone();
+        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
+            if batch.contains("get \"") {
+                std::fs::write(&hook_victim, vec![b'x'; 24 * 1024 * 1024]).expect("swap");
+            }
+        }));
+        let m = sftp_mirror(&sc, sc.separate(), tap.clone());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("oversize swap");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
+        assert_no_collection_mutation(&tap, &sc);
+    }
+
+    /// F6: InPlace writes the final path directly, so the read-back is after
+    /// the write; a mismatch stops before any delete and is reported honestly.
+    #[tokio::test]
+    async fn sftp_mirror_inplace_verifies_after_the_write_and_stops_before_deletes() {
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let target = sc.collection().join(format!("{DT}/NEW/resource.json"));
+        let hook_target = target.clone();
+        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
+            if batch.contains("get \"") {
+                std::fs::write(&hook_target, NEW_EVIL).expect("swap");
+            }
+        }));
+        let m = sftp_mirror(&sc, StagingMode::InPlace, tap.clone());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("written file differs");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("SHA-256"), "{text}");
+        assert!(text.contains("NEW/resource.json"), "{text}");
+        assert!(text.contains("not rolled back"), "{text}");
+        assert!(text.contains("no delete"), "{text}");
+        for gone in ["OLD/config.json", "OLD/resource.json"] {
+            assert!(
+                sc.collection().join(format!("{DT}/{gone}")).is_file(),
+                "{gone} was deleted after a failed verification"
+            );
+        }
+        for line in tap.lines().iter().flatten() {
+            assert!(!line.starts_with("rm "), "a delete ran: {line}");
+        }
+
+        // an honest InPlace commit reads back and still passes
+        let sc = Scratch::new();
+        let m = sftp_mirror(&sc, StagingMode::InPlace, Arc::new(TokioProcessRunner));
+        run_scenario(&m, &sc).await;
+    }
+
     #[tokio::test]
     async fn sftp_mirror_hostile_but_legal_names_are_inert() {
         let sc = Scratch::new();

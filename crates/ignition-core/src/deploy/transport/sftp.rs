@@ -614,7 +614,13 @@ impl SftpTransport {
     /// that sends more is aborted mid-transfer (the dropped batch future kills
     /// the sftp child) instead of filling the runner's disk; the caller's
     /// temp dir is then removed on drop.
-    async fn run_download(&self, ops: &[SftpOp], dir: &Path, limit: u64) -> Result<(), CoreError> {
+    async fn run_download(
+        &self,
+        op: &str,
+        ops: &[SftpOp],
+        dir: &Path,
+        limit: u64,
+    ) -> Result<(), CoreError> {
         self.sessions.fetch_add(1, Ordering::Relaxed);
         let batch = self.shell.sftp_batch(ops);
         let watch = async {
@@ -634,10 +640,10 @@ impl SftpTransport {
         tokio::select! {
             out = &mut batch => {
                 let out = out?;
-                self.shell.require_success("read", out)?;
+                self.shell.require_success(op, out)?;
                 Ok(())
             }
-            used = &mut watch => Err(self.fail(format!(
+            used = &mut watch => Err(self.mirror_fail(op, format!(
                 "the download wrote {used} bytes, more than the {limit} bytes the listing allowed; it was aborted"
             ))),
         }
@@ -685,7 +691,7 @@ impl SftpTransport {
                 next += 1;
             }
             let limit = downloaded + chunk_listed + DOWNLOAD_SLACK_BYTES;
-            self.run_download(&ops, tmp, limit).await?;
+            self.run_download("read", &ops, tmp, limit).await?;
             downloaded += self.check_chunk(&files[start..next], tmp)?;
         }
         Ok(())
@@ -729,14 +735,16 @@ impl SftpTransport {
 
     /// A fresh private directory for downloads, inside the shell's own temp
     /// dir when it has one. Deleted when dropped.
-    fn download_dir(&self) -> Result<tempfile::TempDir, CoreError> {
+    fn download_dir(&self, op: &str) -> Result<tempfile::TempDir, CoreError> {
         let mut builder = tempfile::Builder::new();
         builder.prefix("ign-read-");
         let made = match self.shell.temp_dir() {
             Some(parent) => builder.tempdir_in(parent),
             None => builder.tempdir(),
         };
-        made.map_err(|e| self.fail(format!("cannot create a download dir ({:?})", e.kind())))
+        made.map_err(|e| {
+            self.mirror_fail(op, format!("cannot create a download dir ({:?})", e.kind()))
+        })
     }
 }
 
@@ -1008,7 +1016,7 @@ impl TreeReader for SftpTransport {
             // One `get` per listed file, never `get -R`: the server decides
             // what a recursive get delivers, so a recursive get would bypass
             // every per-file check made on the listing.
-            let tmp = self.download_dir()?;
+            let tmp = self.download_dir("read")?;
             let fetch: Vec<&FoundFile> = found
                 .files
                 .iter()
@@ -1073,8 +1081,9 @@ impl TreeReader for SftpTransport {
                 entry.size
             )));
         }
-        let tmp = self.download_dir()?;
+        let tmp = self.download_dir("read")?;
         self.run_download(
+            "read",
             &[SftpOp::Get {
                 remote,
                 local: tmp.path().join("ledger"),
@@ -1114,6 +1123,14 @@ impl TreeReader for SftpTransport {
 // ---------------------------------------------------------------------------
 // The write half (22-07)
 // ---------------------------------------------------------------------------
+//
+// Integrity: a listing size says nothing about content, so before the first
+// rename (`Separate`) every staged copy on the host is fetched back with a
+// typed `get` into a per-operation temp dir and hashed HERE against the
+// SHA-256 the stage recorded (no remote hash command). `InPlace` has no
+// staged copy on the host: it writes the final path and reads it back before
+// the first delete. The read-back uses the read side's watchdog and caps and
+// `open_regular_file`. A mismatch is `transport_failed`.
 
 /// What the write half needs: the mode collection and the staging mode (the
 /// staging root normalised to an absolute POSIX path).
@@ -1131,6 +1148,17 @@ enum Seen {
     File(u64),
 }
 
+/// A file on the host to read back and compare with its staged SHA-256.
+struct RemoteCopy {
+    rel: RelPath,
+    remote: String,
+    sha: String,
+    size: u64,
+}
+
+/// At most this many mismatches are named in an error.
+const MISMATCH_NAMED: usize = 8;
+
 /// `base` plus `chain`, joined with `/`.
 fn join_abs(base: &str, chain: &[String]) -> String {
     let mut path = base.to_string();
@@ -1139,6 +1167,20 @@ fn join_abs(base: &str, chain: &[String]) -> String {
         path.push_str(part);
     }
     path
+}
+
+/// The first [`MISMATCH_NAMED`] entries of `items`, joined for an error.
+fn named(items: &[String]) -> String {
+    let mut text = items
+        .iter()
+        .take(MISMATCH_NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > MISMATCH_NAMED {
+        text.push_str(&format!(" and {} more", items.len() - MISMATCH_NAMED));
+    }
+    text
 }
 
 fn chain_of(parts: &[&str]) -> Vec<String> {
@@ -1344,6 +1386,174 @@ impl SftpTransport {
             }
         }
         missing
+    }
+
+    /// Read every file of `copies` back from the host with typed `get` ops
+    /// into a private per-operation temp dir and hash it here (never with a
+    /// remote command). Downloads are chunked, the running total is checked
+    /// before each chunk and the temp dir is measured while sftp runs, as on
+    /// the read side; each downloaded file is re-read through
+    /// [`open_regular_file`] with the byte caps.
+    ///
+    /// Returns the files whose size or SHA-256 differs from what was expected
+    /// (empty when every copy is intact). A transfer or cap failure is an
+    /// `Err`.
+    async fn verify_remote_copies(
+        &self,
+        op: &str,
+        copies: &[RemoteCopy],
+    ) -> Result<Vec<String>, CoreError> {
+        if copies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tmp = self.download_dir(op)?;
+        let mut downloaded = 0u64;
+        let mut next = 0usize;
+        while next < copies.len() {
+            let mut ops = Vec::new();
+            let mut chunk = 0u64;
+            while next < copies.len() && ops.len() < DOWNLOAD_CHUNK_FILES {
+                let copy = &copies[next];
+                if !ops.is_empty() && chunk + copy.size > DOWNLOAD_CHUNK_BYTES {
+                    break;
+                }
+                if downloaded + chunk + copy.size > READ_MAX_TOTAL_BYTES {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!(
+                            "reading the files back would exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {})",
+                            copy.rel
+                        ),
+                    ));
+                }
+                let local = copy
+                    .rel
+                    .components()
+                    .fold(tmp.path().to_path_buf(), |p, c| p.join(c));
+                if let Some(parent) = local.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        self.mirror_fail(
+                            op,
+                            format!("cannot create a download dir ({:?})", e.kind()),
+                        )
+                    })?;
+                }
+                ops.push(SftpOp::Get {
+                    remote: copy.remote.clone(),
+                    local,
+                });
+                chunk += copy.size;
+                next += 1;
+            }
+            let limit = downloaded + chunk + DOWNLOAD_SLACK_BYTES;
+            self.run_download(op, &ops, tmp.path(), limit).await?;
+            let root = tmp.path().to_path_buf();
+            downloaded = tokio::task::spawn_blocking(move || dir_bytes(&root))
+                .await
+                .map_err(|e| CoreError::Internal(format!("sftp verify task failed: {e}")))?;
+        }
+
+        let root = tmp.path().to_path_buf();
+        let wanted: Vec<(RelPath, String, u64)> = copies
+            .iter()
+            .map(|c| (c.rel.clone(), c.sha.clone(), c.size))
+            .collect();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+            let mut bad = Vec::new();
+            for (rel, sha, size) in &wanted {
+                match read_downloaded(&root, Path::new(rel.as_str()), *size, READ_MAX_FILE_BYTES)
+                {
+                    Ok(bytes) => {
+                        if sha256_hex(&bytes) != *sha {
+                            bad.push(format!("{rel} (SHA-256 differs)"));
+                        }
+                    }
+                    Err(Readback::SizeMismatch { listed, actual }) => {
+                        bad.push(format!(
+                            "{rel} (SHA-256 not matched: {actual} bytes, expected {listed})"
+                        ));
+                    }
+                    Err(Readback::Io(kind)) => {
+                        return Err(format!("cannot read {rel} back ({kind:?})"));
+                    }
+                    Err(Readback::Changed) => {
+                        return Err(format!("{rel} changed while it was read back"));
+                    }
+                    Err(Readback::Capped(len)) => {
+                        return Err(format!(
+                            "{rel} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
+                        ));
+                    }
+                    Err(Readback::Grew) => {
+                        return Err(format!(
+                            "{rel} grew past the {READ_MAX_FILE_BYTES} byte file cap while it was read back"
+                        ));
+                    }
+                }
+            }
+            Ok(bad)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("sftp verify task failed: {e}")))?
+        .map_err(|why| self.mirror_fail(op, why))?;
+        Ok(outcome)
+    }
+
+    /// After a staged copy failed verification: remove the staged files from
+    /// the staging root, but only after a fresh listing shows each one is
+    /// still a regular file with no symlink above it (an `rm` follows
+    /// directory symlinks). Never touches the collection. Returns a sentence
+    /// saying what was removed and what was left.
+    async fn discard_staged(&self, op: &str, root: &str, files: &[(RelPath, String)]) -> String {
+        let Ok(parts) = absolute_components(root) else {
+            return format!("The staged copies were left under {root}.");
+        };
+        let base = format!("/{}", parts[0]);
+        let rest: Vec<String> = parts[1..].to_vec();
+        let chains: Vec<Vec<String>> = files
+            .iter()
+            .map(|(path, _)| {
+                let mut chain = rest.clone();
+                chain.extend(path.components().map(str::to_string));
+                chain
+            })
+            .collect();
+        let mut budget = Budget::default();
+        let seen = match self.survey(op, &base, &chains, &mut budget).await {
+            Ok(seen) => seen,
+            Err(_) => {
+                return format!(
+                    "The staging root {root} could not be re-checked as a plain directory tree, so the staged copies were left in place under it."
+                );
+            }
+        };
+        let mut rms = Vec::new();
+        let mut kept = Vec::new();
+        for ((path, _), chain) in files.iter().zip(&chains) {
+            if matches!(seen.get(chain), Some(Seen::File(_))) {
+                rms.push((
+                    SftpOp::Rm {
+                        path: format!("{root}/{path}"),
+                    },
+                    0,
+                ));
+            } else if !matches!(seen.get(chain), Some(Seen::Missing) | None) {
+                kept.push(path.to_string());
+            }
+        }
+        let count = rms.len();
+        match self.run_chunked(op, rms).await {
+            Ok(()) if kept.is_empty() => format!(
+                "{count} staged copies were removed from {root} (empty directories remain)."
+            ),
+            Ok(()) => format!(
+                "{count} staged copies were removed from {root}; left in place: {}.",
+                kept.join(", ")
+            ),
+            Err(_) => {
+                format!("Removing the staged copies from {root} failed part-way; some may remain.")
+            }
+        }
     }
 
     /// Sessions of at most [`DOWNLOAD_CHUNK_FILES`] lines and, for `bytes`
@@ -1590,6 +1800,29 @@ impl SftpTransport {
                     }
                 }
             }
+            // The size survey cannot tell same-size different bytes apart: read
+            // every staged copy back and hash it here before the first rename.
+            let copies: Vec<RemoteCopy> = files
+                .iter()
+                .zip(&sizes)
+                .map(|((path, sha), size)| RemoteCopy {
+                    rel: path.clone(),
+                    remote: format!("{root}/{path}"),
+                    sha: sha.clone(),
+                    size: *size,
+                })
+                .collect();
+            let bad = self.verify_remote_copies(OP, &copies).await?;
+            if !bad.is_empty() {
+                let cleanup = self.discard_staged(OP, root, files).await;
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "the staged copy on the host does not match its SHA-256 for {}; nothing was changed. {cleanup}",
+                        named(&bad)
+                    ),
+                ));
+            }
         }
 
         // ---- writes
@@ -1614,6 +1847,34 @@ impl SftpTransport {
             moves.push((op, *size));
         }
         self.run_chunked(OP, moves).await?;
+        if remote_root.is_none() {
+            // InPlace wrote the final paths directly, so the read-back can only
+            // come after the write. A mismatch cannot be undone here; it stops
+            // before the first delete and says what was left.
+            let copies: Vec<RemoteCopy> = files
+                .iter()
+                .zip(&staged_chains)
+                .zip(&sizes)
+                .map(|(((path, sha), chain), size)| RemoteCopy {
+                    rel: path.clone(),
+                    remote: join_abs(&self.data_dir, chain),
+                    sha: sha.clone(),
+                    size: *size,
+                })
+                .collect();
+            let bad = self.verify_remote_copies(OP, &copies).await?;
+            if !bad.is_empty() {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "after the write, the {} collection holds content that does not match the staged SHA-256 for {}; the {} written files were not rolled back and no delete was run",
+                        setup.mode,
+                        named(&bad),
+                        files.len()
+                    ),
+                ));
+            }
+        }
         let written: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
 
         // ---- deletes
