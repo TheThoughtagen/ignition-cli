@@ -20,7 +20,10 @@
 //! - **A spawn failure is data**, code 127 with the reason, never a panic.
 
 use std::ffi::{OsStr, OsString};
+use std::process::Stdio;
 use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Stdout above this many bytes is a failure (32 MiB). File content never
 /// travels on stdout (it is downloaded to a temp dir), only listings.
@@ -76,18 +79,141 @@ impl ProcessRunner for TokioProcessRunner {
     }
 }
 
-pub(crate) async fn run_capped(
-    _program: &OsStr,
-    _args: &[OsString],
-    _stdin: Option<Vec<u8>>,
-    _timeout: Duration,
-    _stdout_cap: usize,
-) -> ProcessOutput {
+/// Stdout went over its cap.
+struct Overflow;
+
+/// Read `reader` to EOF, failing as soon as more than `cap` bytes arrive.
+async fn read_capped<R>(reader: Option<R>, cap: usize) -> Result<Vec<u8>, Overflow>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return Ok(out),
+            Ok(n) => {
+                if out.len() + n > cap {
+                    return Err(Overflow);
+                }
+                out.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
+}
+
+/// Read `reader` to EOF keeping only the last `cap` bytes.
+async fn read_tail<R>(reader: Option<R>, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Vec::new();
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return out,
+            Ok(n) => {
+                out.extend_from_slice(&chunk[..n]);
+                if out.len() > cap {
+                    let excess = out.len() - cap;
+                    out.drain(..excess);
+                }
+            }
+        }
+    }
+}
+
+fn failed(code: i32, timed_out: bool, note: String) -> ProcessOutput {
     ProcessOutput {
         stdout: Vec::new(),
-        stderr: Vec::new(),
-        code: -99,
-        timed_out: false,
+        stderr: note.into_bytes(),
+        code,
+        timed_out,
+    }
+}
+
+pub(crate) async fn run_capped(
+    program: &OsStr,
+    args: &[OsString],
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    stdout_cap: usize,
+) -> ProcessOutput {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return failed(
+                SPAWN_FAILED_CODE,
+                false,
+                format!(
+                    "failed to spawn {}: {:?}",
+                    program.to_string_lossy(),
+                    err.kind()
+                ),
+            );
+        }
+    };
+    let stdin_handle = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let io = async {
+        let write = async {
+            if let Some(mut handle) = stdin_handle {
+                if let Some(bytes) = &stdin {
+                    // A child that exits early closes the pipe; that is its
+                    // exit status's business, not a write error to report.
+                    let _ = handle.write_all(bytes).await;
+                }
+                let _ = handle.shutdown().await;
+                // Dropping the handle closes the pipe: the child sees EOF.
+            }
+            Ok::<(), Overflow>(())
+        };
+        let err = async { Ok::<Vec<u8>, Overflow>(read_tail(stderr, STDERR_CAP_BYTES).await) };
+        let ((), out, err) = tokio::try_join!(write, read_capped(stdout, stdout_cap), err)?;
+        let status = child.wait().await;
+        Ok::<_, Overflow>((out, err, status))
+    };
+
+    match tokio::time::timeout(timeout, io).await {
+        Ok(Ok((stdout, stderr, status))) => ProcessOutput {
+            stdout,
+            stderr,
+            code: status.ok().and_then(|s| s.code()).unwrap_or(-1),
+            timed_out: false,
+        },
+        Ok(Err(Overflow)) => {
+            // Kill and reap so nothing is left running.
+            let _ = child.kill().await;
+            failed(
+                OVERFLOW_CODE,
+                false,
+                format!("stdout exceeded {stdout_cap} bytes; the child was killed"),
+            )
+        }
+        Err(_elapsed) => {
+            let _ = child.kill().await;
+            ProcessOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                code: -1,
+                timed_out: true,
+            }
+        }
     }
 }
 
