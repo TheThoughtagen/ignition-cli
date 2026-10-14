@@ -168,3 +168,7 @@ None beyond the plan's register. T-22-07 to T-22-12 are mitigated and tested: st
 ## Self-Check: PASSED
 
 - `ledger.rs`, `plan.rs`, `local.rs` present; commits `cc2ce8a`, `f91b995`, `5b12e6f` present in `git log`.
+
+## Deviation confirmation
+
+- 2026-10-14: User confirmed `lockout_risk` excludes `unmanaged` entries (Deviation 1 kept as implemented).
