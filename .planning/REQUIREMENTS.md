@@ -46,9 +46,9 @@ Numbering: new categories. **47 requirements.**
 - [x] **DPLN-04**: The plan states the exact delete set — previously declared names minus rendered names — which never includes `config-mode.json` or an undeclared resource
 - [x] **DPLN-05**: User can pass `--base <previous render>` to mark entries the live gateway changed outside the pipeline as drift
 - [ ] **DPLN-06**: User can run `ign deploy pull` to bootstrap a `gateways/<name>/` tree from a live gateway read-only, such that `render` then `plan` against that gateway is empty
-- [ ] **DPLN-07**: User can run `ign deploy verify` against the master: scan complete, `deploymentMode` equals the target, every declared resource reads back equal in the effective view, and the gateway log has no "will not be loaded" entry for a declared resource
-- [ ] **DPLN-08**: `verify` reads the manifest's `verify.tag_probes[]` and fails when a probed tag is not Good; an absent probe list is a warning, never a pass
-- [ ] **DPLN-09**: A red `verify` returns the frozen envelope with findings in `data` and exit 6
+- [x] **DPLN-07**: User can run `ign deploy verify` against the master: scan complete, `deploymentMode` equals the target, every declared resource reads back equal in the effective view, and the gateway log has no "will not be loaded" entry for a declared resource
+- [x] **DPLN-08**: `verify` reads the manifest's `verify.tag_probes[]` and fails when a probed tag is not Good; an absent probe list is a warning, never a pass
+- [x] **DPLN-09**: A red `verify` returns the frozen envelope with findings in `data` and exit 6
 
 ### Apply and Rollback (single gateway)
 
@@ -83,7 +83,7 @@ Numbering: new categories. **47 requirements.**
 - [x] **DSURF-01**: Each deploy verb lands with its TUI route row, README entry and exit-table rows in the same phase; every new error follows the four-place rule
 - [ ] **DSURF-02**: `apply`, `rollback` and `projects` are registered in `GUARDED_OPS` and are not exposed as MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are
 - [ ] **DSURF-03**: A secret canary test proves no secret value appears in plan, apply or verify output, `--json`, run-directory files or events
-- [ ] **DSURF-04**: The verdict envelope (`ok:true`, `data.ok=false`, exit 6) is documented as a dated README contract exception
+- [x] **DSURF-04**: The verdict envelope (`ok:true`, `data.ok=false`, exit 6) is documented as a dated README contract exception
 
 ## Future Requirements (deferred)
 
@@ -137,9 +137,9 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DPLN-04 | Phase 22 | Complete |
 | DPLN-05 | Phase 22 | Complete |
 | DPLN-06 | Phase 22 | Pending |
-| DPLN-07 | Phase 22 | Pending |
-| DPLN-08 | Phase 22 | Pending |
-| DPLN-09 | Phase 22 | Pending |
+| DPLN-07 | Phase 22 | Complete |
+| DPLN-08 | Phase 22 | Complete |
+| DPLN-09 | Phase 22 | Complete |
 | DAPL-01 | Phase 23 | Pending |
 | DAPL-02 | Phase 23 | Pending |
 | DAPL-03 | Phase 23 | Pending |
@@ -162,7 +162,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DSURF-01 | Phase 21 | Complete |
 | DSURF-02 | Phase 23 | Pending |
 | DSURF-03 | Phase 23 | Pending |
-| DSURF-04 | Phase 22 | Pending |
+| DSURF-04 | Phase 22 | Complete |
 
 **Coverage:** 47 v1.6 requirements, 47 mapped, 0 unmapped, 0 mapped twice.
 

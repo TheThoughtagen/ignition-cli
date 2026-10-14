@@ -5,14 +5,14 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-10-PLAN.md
-last_updated: "2026-10-14T21:33:00.536Z"
+stopped_at: Completed 22-11-PLAN.md
+last_updated: "2026-10-14T22:11:06.142Z"
 last_activity: 2026-10-14
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 25
+  completed_plans: 26
   percent: 33
 ---
 
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 11 of 14
+Plan: 12 of 14
 Status: Ready to execute
 Last activity: 2026-10-14
 
-Progress: [█████████░] 86%
+Progress: [█████████░] 90%
 
 ## Performance Metrics
 
@@ -70,6 +70,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P08 | 190min | 2 tasks | 12 files |
 | Phase 22 P09 | 95min | 2 tasks | 3 files |
 | Phase 22 P10 | 70min | 3 tasks | 7 files |
+| Phase 22 P11 | 60min | 2 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -102,8 +103,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T21:33:00.355Z
-**Stopped At:** Completed 22-10-PLAN.md
+**Last session:** 2026-10-14T22:11:06.123Z
+**Stopped At:** Completed 22-11-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -152,3 +153,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-09 CV3: a scan does not rewrite plain-file-write resource files; post-scan bytes equal rendered bytes
 - [Phase ?]: 22-10: LOG_WINDOW_SLACK_MS = 1000 and LOG_SETTLE_MS = 5000 per CV1; loaded answers warn while a scan runs and states in its detail that a clean log covers the last scan only
 - [Phase ?]: 22-10: deploy_verify_failed stays a constant in verify.rs (not a CoreError, not in DEPLOY_SLUGS); an unreachable gateway or transport is a CoreError, a refused log or tag source is the check's unavailable input carrying only the slug
+- [Phase ?]: 22-11: deploy verify keeps the CORE-01 profile header; README must not repeat the literal '## Exit codes' before the real section (readme_exit_table_agreement splits on it)
