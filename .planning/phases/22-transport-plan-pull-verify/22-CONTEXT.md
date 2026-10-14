@@ -39,6 +39,9 @@ Already locked by ROADMAP.md / REQUIREMENTS.md and not re-decided here: Decision
 - **D-15:** C7a is captured on WFLWVM01 only (wh-win was offered and declined). SC-1's "proven against a real Windows OpenSSH host" closes only on WFLWVM01.
 - **D-16:** The OQ5 payload is a tree produced by Phase 22 `pull` from a real prod-like gateway (or the 183-file corpus scaled up if none is reachable), so timings reflect real file counts and sizes.
 
+### Plan comparison basis (from research OQ1, decided 2026-10-14)
+- **D-17:** `plan` compares the rendered tree against the live **effective view** (core merged with the mode collection), not the mode collection alone. Each entry carries an additive `live_in: ["core","mode"]` field naming where the live copy sits, so Phase 23 can see what has not yet moved into the mode collection. SC-3 ("render then plan reports no changes") holds against the effective view, including while allowlisted config still lives in `core`. — **Reversibility:** one-way — `live_in` joins the `--json` plan entry contract.
+
 ### Claude's Discretion
 - The `plan --diff` human format, the verify log-scrape window (since the scan timestamp), the tag-probe Good/timeout semantics within SF-8, the internal `ObservedState` shape, and whether plan reads files through the transport, the config API, or both for each check.
 - The canonical serialization feeding `plan_sha256`, as long as D-08 holds.
