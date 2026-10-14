@@ -2700,6 +2700,17 @@ desired sha256 differ, in path order:
   a secret-typed path, a possible secret by key name) is printed as
   `<path>: withheld: contains secret-bearing locations (<n>); live <sha256 or
   ->, desired <sha256 or ->`, with no content;
+- a `.json` member (any file, tag files included) where either side holds a
+  non-empty string or a non-null scalar at or beneath an object key whose
+  ASCII-lowercased name contains `password`, `passwd`, `secret`, `token`,
+  `apikey`, `api_key`, `credential`, `privatekey` or `private_key` is withheld
+  the same way. This diff-only check is stricter than the render lints on
+  purpose: the render lints were built for the desired (repo) side, but the
+  live side is written by the gateway and never linted, so a plaintext
+  `"password": "x"` in a live non-config `.json` would otherwise print in the
+  diff. It runs regardless of file name or OpenAPI description, adds to the
+  `(<n>)` count, and keeps only the count, never the key path or the value.
+  Render behaviour is unchanged;
 - any other member, and a `.json` member that does not parse, is printed as
   `<path>: differs (live <sha256 or ->, desired <sha256 or ->)`.
 

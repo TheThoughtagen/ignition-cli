@@ -1798,3 +1798,189 @@ async fn canary_never_leaves_plan() {
         );
     }
 }
+
+// ---- `--diff` withholds plaintext secrets on the LIVE side (22-04 review) ---
+//
+// The render lints were built for the desired (repo) side. The live side is
+// gateway-written and never linted, so `--diff` runs one stricter,
+// diff-only key-name check over both sides of every parsed `.json` member.
+
+const DIFF_CANARY: &str = "IGN-CANARY-DIFF";
+
+/// The three renderings of a result a canary must stay out of: JSON, pretty
+/// JSON and `Debug`. The human form prints only `entry.diff`, so the diff
+/// text itself is checked by each test.
+fn assert_no_canary(result: &DeployPlanResult) {
+    let json = serde_json::to_string(result).expect("json");
+    let pretty = serde_json::to_string_pretty(result).expect("json");
+    let debug = format!("{result:?}");
+    for (name, text) in [("json", &json), ("pretty", &pretty), ("debug", &debug)] {
+        assert!(
+            !text.contains(DIFF_CANARY),
+            "canary leaked into {name}: {text}"
+        );
+    }
+    for entry in &result.entries {
+        if let Some(diff) = &entry.diff {
+            assert!(
+                !diff.contains(DIFF_CANARY),
+                "canary in the human diff text: {diff}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn diff_withholds_live_non_config_json_with_a_secret_key() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let extra = "ignition/database-translator/POSTGRES/extra.json";
+    let token = "ignition/database-translator/POSTGRES/token.json";
+    // a differing non-config member of a resource, and two live-only members
+    let live_resource = format!("{{\"password\":\"{DIFF_CANARY}\"}}");
+    let live_extra = format!("{{\"nested\":{{\"apiKey\":\"{DIFF_CANARY}\"}}}}");
+    let live_token = format!("{{\"list\":[{{\"Token\":\"{DIFF_CANARY}\"}}]}}");
+    fx.mode(DB_RESOURCE, live_resource.as_bytes());
+    fx.mode(extra, live_extra.as_bytes());
+    fx.mode(token, live_token.as_bytes());
+
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+    let diff = diff_of(&result, DB_KEY).expect("diff");
+    for path in [DB_RESOURCE, extra, token] {
+        assert!(
+            diff.contains(&format!("{path}: {DIFF_WITHHELD} (1); live ")),
+            "{path} must be withheld: {diff}"
+        );
+    }
+    assert!(!diff.contains("@@"), "no text diff survives: {diff}");
+    assert_no_canary(&result);
+}
+
+#[tokio::test]
+async fn diff_withholds_live_tag_file_with_a_secret_key() {
+    let tags = "ignition/tag-definition/P/F/tags.json";
+    let marker = "ignition/tag-definition/P/F/unary-resource.json";
+    let rendered = RenderedTree {
+        files: BTreeMap::from([
+            (RelPath::new(tags).unwrap(), b"[]\n".to_vec()),
+            (RelPath::new(marker).unwrap(), b"{}\n".to_vec()),
+        ]),
+    };
+    for (key, secret) in [
+        ("password", "IGN-CANARY-DIFF"),
+        ("token", "IGN-CANARY-DIFF"),
+        ("authToken", "IGN-CANARY-DIFF"),
+    ] {
+        let live_tags = format!("[{{\"name\":\"t\",\"parameters\":{{\"{key}\":\"{secret}\"}}}}]");
+        let live_tags = live_tags.into_bytes();
+        let blob = |bytes: &[u8]| FileBlob {
+            sha256: sha256_hex(bytes),
+            bytes: bytes.to_vec(),
+        };
+        let observed = ObservedFiles {
+            core: BTreeMap::new(),
+            mode: BTreeMap::from([
+                (RelPath::new(tags).unwrap(), blob(&live_tags)),
+                (RelPath::new(marker).unwrap(), blob(b"{}\n")),
+            ]),
+            local_units: Vec::new(),
+        };
+        let mut p = plan_with_ledger(&rendered, &observed, None, &scope());
+        ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
+        let entry = p
+            .entries
+            .iter()
+            .find(|e| e.key == "ignition/tag-definition/P/F")
+            .expect("tag folder entry");
+        let diff = entry.diff.as_deref().expect("diff");
+        assert!(
+            diff.contains(&format!("{tags}: {DIFF_WITHHELD} (1); live ")),
+            "{key}: {diff}"
+        );
+        assert!(!diff.contains(DIFF_CANARY), "{key}: {diff}");
+        assert!(!format!("{p:?}").contains(DIFF_CANARY), "{key}: debug");
+    }
+}
+
+#[tokio::test]
+async fn diff_secret_key_check_covers_the_desired_side_and_the_key_list() {
+    // every key-name stem, case-insensitively, on the desired side of a
+    // member that exists on both sides
+    for key in [
+        "password",
+        "PASSWD",
+        "dbSecret",
+        "accessToken",
+        "apikey",
+        "API_KEY",
+        "credentials",
+        "privateKey",
+        "private_key",
+    ] {
+        let path = RelPath::new("ignition/database-translator/X/extra.json").unwrap();
+        let desired = format!("{{\"{key}\":\"{DIFF_CANARY}\"}}\n").into_bytes();
+        let live = b"{\"a\":1}\n".to_vec();
+        let rendered = RenderedTree {
+            files: BTreeMap::from([(path.clone(), desired)]),
+        };
+        let observed = ObservedFiles {
+            core: BTreeMap::new(),
+            mode: BTreeMap::from([(
+                path,
+                FileBlob {
+                    sha256: sha256_hex(&live),
+                    bytes: live,
+                },
+            )]),
+            local_units: Vec::new(),
+        };
+        let mut p = plan_with_ledger(&rendered, &observed, None, &scope());
+        ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
+        let diff = p.entries[0].diff.as_deref().expect("diff");
+        assert!(diff.contains(DIFF_WITHHELD), "{key}: {diff}");
+        assert!(!diff.contains(DIFF_CANARY), "{key}: {diff}");
+    }
+}
+
+#[tokio::test]
+async fn diff_secret_key_check_ignores_empty_and_null_values_and_benign_keys() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let extra = "ignition/database-translator/POSTGRES/extra.json";
+    let benign = "ignition/database-translator/POSTGRES/benign.json";
+    // an empty secret-named string and a null are not secrets
+    fx.mode(extra, b"{\n  \"password\": \"\",\n  \"token\": null\n}\n");
+    fx.mode(benign, b"{\n  \"label\": \"visible-benign-value\"\n}\n");
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+    let diff = diff_of(&result, DB_KEY).expect("diff");
+    assert!(
+        diff.contains("+  \"label\"") || diff.contains("-  \"label\""),
+        "{diff}"
+    );
+    assert!(
+        diff.contains("visible-benign-value"),
+        "benign member still diffs: {diff}"
+    );
+    assert!(
+        diff.contains("\"password\": \"\""),
+        "empty value diffs: {diff}"
+    );
+    assert!(!diff.contains(DIFF_WITHHELD), "{diff}");
+}
+
+#[tokio::test]
+async fn diff_secret_key_check_leaves_the_plan_hash_alone() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.mode(
+        DB_RESOURCE,
+        format!("{{\"password\":\"{DIFF_CANARY}\"}}").as_bytes(),
+    );
+    let without = plan_with(&fx, &PlanOptions::default()).await.expect("plan");
+    let with = plan_with(&fx, &diff_opts()).await.expect("plan");
+    assert_eq!(without.plan_sha256, with.plan_sha256);
+    assert_no_canary(&with);
+}

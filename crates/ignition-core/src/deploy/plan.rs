@@ -893,15 +893,23 @@ pub const DIFF_WITHHELD: &str = "withheld: contains secret-bearing locations";
 ///   `desired/<path>`; an absent side is empty);
 /// - a `.json` member where [`scan_secrets`] (`config.json`) or
 ///   [`scan_embedded`] (every other `.json`, and tag files) reports any
-///   refused location or warning on either side is
+///   refused location or warning on either side, or where the diff-only key
+///   check ([`sensitive_key_hits`]) finds a non-empty string or non-null
+///   scalar at or beneath an object key named like `password`, `passwd`,
+///   `secret`, `token`, `apikey`, `api_key`, `credential`, `privatekey` or
+///   `private_key` (ASCII case-insensitive substring, any file, with or
+///   without an OpenAPI description) on either side, is
 ///   `<path>: withheld: contains secret-bearing locations (<n>); live <sha|->,
 ///   desired <sha|->`, where `<n>` counts locations only;
 /// - any other member, and a `.json` member that does not parse, is
 ///   `<path>: differs (live <sha|->, desired <sha|->)`.
 ///
 /// The text diff is the only place file bytes reach the plan, and only after
-/// both sides passed the scan, so Embedded ciphertext and plaintext secrets
-/// never leave it. An entry's text is capped at [`DIFF_MAX_BYTES`] and then
+/// both sides passed the scan and the key check, so Embedded ciphertext and
+/// plaintext secrets never leave it. The key check exists because the render
+/// lints cover the desired (repo) side: the live side is gateway-written and
+/// never linted, so `--diff` is deliberately stricter than render. It does
+/// not touch the render lints or what render accepts. An entry's text is capped at [`DIFF_MAX_BYTES`] and then
 /// ends with a truncation marker. The live side of an entry is its effective
 /// copy (the mode collection when the unit exists there, else `core`), the
 /// same basis the digests use.
@@ -962,7 +970,7 @@ fn file_diff(
         let Ok((_, node)) = classify(bytes) else {
             return hash_only();
         };
-        locations += secret_locations(path, &node);
+        locations += secret_locations(path, &node) + sensitive_key_hits(&node);
     }
     if locations > 0 {
         return format!("{path}: {DIFF_WITHHELD} ({locations}); {shas}\n");
@@ -1000,6 +1008,55 @@ fn secret_locations(path: &RelPath, node: &Node) -> usize {
         scan_secrets(origin, &key, &rest.join("/"), node)
     };
     scan.refused.len() + scan.warnings.len()
+}
+
+/// Lowercase key-name fragments that mark a value as a secret for `--diff`.
+const SENSITIVE_KEY_FRAGMENTS: [&str; 9] = [
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "credential",
+    "privatekey",
+    "private_key",
+];
+
+/// Diff-only secret check, stricter than the render lints. The render lints
+/// were designed for the desired (repo) side; the live side is gateway-written
+/// and never linted, so a plaintext `"password": "x"` in a live non-config
+/// `.json` or tag file would otherwise print verbatim in a text diff.
+///
+/// Walks every object in a parsed member and counts each non-empty string or
+/// non-null scalar at or beneath an object key whose ASCII-lowercased name
+/// contains one of [`SENSITIVE_KEY_FRAGMENTS`]. It applies whatever the file
+/// name or the OpenAPI description says. Counts only: neither the value nor
+/// the key path is kept.
+fn sensitive_key_hits(node: &Node) -> usize {
+    sensitive_walk(node, false)
+}
+
+fn sensitive_walk(node: &Node, under_secret_key: bool) -> usize {
+    match node {
+        Node::Obj(members) => members
+            .iter()
+            .map(|(key, value)| {
+                let lowered = key.to_ascii_lowercase();
+                let secret = under_secret_key
+                    || SENSITIVE_KEY_FRAGMENTS
+                        .iter()
+                        .any(|fragment| lowered.contains(fragment));
+                sensitive_walk(value, secret)
+            })
+            .sum(),
+        Node::Arr(items) => items
+            .iter()
+            .map(|item| sensitive_walk(item, under_secret_key))
+            .sum(),
+        Node::Str(text) => usize::from(under_secret_key && !text.is_empty()),
+        Node::Lit(lexeme) => usize::from(under_secret_key && lexeme != "null"),
+    }
 }
 
 /// Cap an entry's diff at [`DIFF_MAX_BYTES`], ending a longer one with the
