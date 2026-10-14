@@ -22,6 +22,7 @@ pub mod target;
 pub mod transport;
 pub mod tree;
 pub mod uuid;
+pub mod verify;
 pub mod yamlio;
 
 /// Why `name` is not a safe single path component, or `None` when it is.
