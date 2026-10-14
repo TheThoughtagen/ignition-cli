@@ -1354,3 +1354,349 @@ fn pull_cli_master_without_host_access_exits_2() {
     assert_eq!(stderr_json(&out)["error"]["code"], "deploy_tree_invalid");
     assert!(!repo.join("gateways/tracer-gw").exists(), "nothing written");
 }
+
+// ---- 22-11: `ign deploy verify` (DPLN-07, DPLN-09, DSURF-04) -----------------
+
+const VERIFY_CANARY: &str = "CANARY-VERIFY-LOG-22";
+const NAMED_TRANSLATOR: &str = "ignition/database-translator/POSTGRES";
+
+/// The rendered `config.json` of `key` from the live tree, with JSON null
+/// members removed, as the gateway's REST view reports it (CV2 N1).
+fn rest_config(data: &Path, key: &str) -> Value {
+    fn strip(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| (k.clone(), strip(v)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let path = data
+        .join("config/resources/dev")
+        .join(key)
+        .join("config.json");
+    strip(&serde_json::from_slice(&std::fs::read(path).expect("live config")).expect("json"))
+}
+
+/// A mock gateway that agrees with the live tree. `omit_translator` leaves
+/// the declared database-translator out of the REST list (a red read_back);
+/// `log_items` are the WARN lines the gateway returns.
+async fn mount_verify_gateway(
+    server: &wiremock::MockServer,
+    data: &Path,
+    omit_translator: bool,
+    log_items: Vec<Value>,
+) {
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/scan/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "scanActive": false,
+            "lastScanTimestamp": 1_792_000_000_000_i64,
+            "lastScanDuration": 300
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/gateway-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deploymentMode": "dev"})))
+        .mount(server)
+        .await;
+    let items = if omit_translator {
+        json!([])
+    } else {
+        json!([{
+            "type": "ignition/database-translator",
+            "name": "POSTGRES",
+            "collection": "dev",
+            "config": rest_config(data, NAMED_TRANSLATOR)
+        }])
+    };
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-translator",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": items,
+            "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/singleton/ignition/general-alarm-settings",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "ignition/general-alarm-settings",
+            "collection": "dev",
+            "config": rest_config(data, "ignition/general-alarm-settings")
+        })))
+        .mount(server)
+        .await;
+    // The cheap "has the gateway logged since the scan?" probe finds a line,
+    // so the log settle wait is skipped.
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"timestamp": 1_792_999_999_999_i64, "loggerName": "x", "level": "INFO", "message": "m"}],
+            "metadata": {"total": 1, "matching": 1, "limit": 1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": log_items,
+            "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// An isolated config whose `[profiles.dev]` points at `url`, and `ign` with
+/// the mock token in the environment.
+fn verify_ign(url: &str) -> (tempfile::TempDir, Command) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "active = \"dev\"\n\n[profiles.dev]\nurl = \"{url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
+        ),
+    )
+    .expect("write config");
+    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    cmd.env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", "mock:name-key");
+    for var in ["IGNITION_URL", "IGNITION_PROFILE", "IGNITION_JSON"] {
+        cmd.env_remove(var);
+    }
+    (dir, cmd)
+}
+
+fn verify_args<'a>(repo: &'a Path, json: bool) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if json {
+        args.push("--json".into());
+    }
+    for a in ["deploy", "verify", "--env", "dev", "--repo"] {
+        args.push(a.into());
+    }
+    args.push(repo.as_os_str().to_owned());
+    args
+}
+
+/// Red: the declared translator is not in the REST list. The success
+/// envelope carries the verdict and the process exits 6.
+#[tokio::test]
+async fn verify_cli_red_exits_6() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, true, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope on stdout");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["profile"], "dev");
+    assert!(
+        envelope.get("error").is_none(),
+        "no error member: {envelope}"
+    );
+    let data = &envelope["data"];
+    assert_eq!(data["ok"], false);
+    assert_eq!(data["slug"], "deploy_verify_failed");
+    assert_eq!(data["node"], "master");
+    assert_eq!(data["project"], "ign-cli");
+    let checks = data["checks"].as_array().expect("checks");
+    let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        ["scan", "mode", "read_back", "files", "loaded", "probes"]
+    );
+    let read_back = &checks[2];
+    assert_eq!(read_back["status"], "fail");
+    assert_eq!(read_back["findings"][0]["code"], "resource_missing");
+    assert_eq!(read_back["findings"][0]["subject"], NAMED_TRANSLATOR);
+    // nothing on stderr but (possibly) diagnostics; never a JSON error envelope
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("\"ok\":false") && !stderr.contains("\"ok\": false"),
+        "{stderr}"
+    );
+}
+
+/// Green: every check agrees. `data.ok` true, `data.slug` null, exit 0.
+#[tokio::test]
+async fn verify_cli_green_exits_0() {
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    let data = &envelope["data"];
+    assert_eq!(data["ok"], true);
+    assert!(data["slug"].is_null());
+    assert_eq!(data["resources_checked"], 2);
+    assert!(
+        envelope.get("error").is_none(),
+        "no error member: {envelope}"
+    );
+}
+
+/// A gateway that cannot be reached is an ordinary error envelope with the
+/// network exit code, never a verdict and never exit 6.
+#[test]
+fn verify_cli_unreachable_gateway_is_an_error_envelope() {
+    let (_scratch, repo, _data) = local_tracer();
+    // port 1 is closed on any sane host
+    let (_cfg, mut cmd) = verify_ign("http://127.0.0.1:1");
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "an error leaves stdout empty");
+    let err = stderr_json(&out);
+    assert_eq!(err["ok"], false);
+    assert_eq!(err["error"]["code"], "network_error");
+    assert_ne!(err["error"]["code"], "deploy_verify_failed");
+}
+
+/// An unknown profile named by the target resolves through the normal chain:
+/// `profile_not_found`, exit 3.
+#[test]
+fn verify_cli_unknown_target_profile_is_profile_not_found() {
+    let (_scratch, repo, _data) = local_tracer();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "active = \"other\"\n\n[profiles.other]\nurl = \"http://127.0.0.1:1\"\nauth = { token_env = \"IGNITION_TOKEN\" }\n",
+    )
+    .expect("config");
+    let mut cmd = Command::cargo_bin("ign").expect("binary");
+    cmd.env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", "mock:name-key");
+    for var in ["IGNITION_URL", "IGNITION_PROFILE", "IGNITION_JSON"] {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stderr_json(&out)["error"]["code"], "profile_not_found");
+}
+
+/// Human mode: the verdict line, six check lines in fixed order and an
+/// indented finding line. A log line that names a declared resource and
+/// carries a canary in its message is reported by code, never by text.
+#[tokio::test]
+async fn verify_cli_human_lines() {
+    use serde_json::json;
+    let (_scratch, repo, data) = local_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(
+        &server,
+        &data,
+        true,
+        vec![json!({
+            "timestamp": 1_792_000_000_050_i64,
+            "loggerName": "NamedResourceHandler-ignition/database-translator",
+            "level": "WARN",
+            "message": format!(
+                "Resource {NAMED_TRANSLATOR} does not have required UUID attribute, will not be loaded {VERIFY_CANARY}"
+            ),
+        })],
+    )
+    .await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, false))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains(VERIFY_CANARY) && !stderr.contains(VERIFY_CANARY));
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "verify tracer-gw (dev, mode dev): FAIL",
+        "{stdout}"
+    );
+    let check_ids: Vec<&str> = lines[1..]
+        .iter()
+        .filter(|l| !l.starts_with(' '))
+        .map(|l| l.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        check_ids,
+        ["scan", "mode", "read_back", "files", "loaded", "probes"],
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("scan: pass ")),
+        "{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("read_back: fail ")),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("  resource_missing ignition/database-translator/POSTGRES ")),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("  unloaded_resource ignition/database-translator/POSTGRES ")),
+        "{stdout}"
+    );
+}
