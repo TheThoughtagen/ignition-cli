@@ -13,11 +13,13 @@
 //!
 //! The reader reads lazily at `deploy_plan` time, so layers can be written
 //! after `load`. `live_render` writes the ACTUAL render (it may mint a uuid),
-//! never a hand-copied one. 22-03 adds `ledger(...)`.
+//! never a hand-copied one. `ledger(...)` writes a valid declared-names ledger
+//! (22-03).
 
 use std::path::{Path, PathBuf};
 
 use ignition_core::actions::deploy::{Declared, load_declared};
+use ignition_core::deploy::ledger::{Ledger, ledger_location};
 use ignition_core::deploy::transport::{self, TreeReader};
 use tempfile::TempDir;
 
@@ -28,6 +30,9 @@ const TRACER_REPO: &str = concat!(
 
 /// The mode named by the tracer target; the mode collection is `dev`.
 pub const MODE: &str = "dev";
+
+/// The gateway named by the tracer target.
+pub const GATEWAY: &str = "tracer-gw";
 
 pub struct PlanFixture {
     data: TempDir,
@@ -89,6 +94,33 @@ impl PlanFixture {
         }
     }
 
+    /// Write a valid declared-names ledger for `gateway` and `mode` listing
+    /// `files` (sorted and de-duplicated here) at its ledger location below
+    /// the data directory.
+    pub fn ledger(&self, gateway: &str, mode: &str, files: &[&str]) {
+        let mut files: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+        files.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        files.dedup();
+        let ledger = Ledger {
+            schema_version: 1,
+            gateway: gateway.to_string(),
+            mode: mode.to_string(),
+            render_sha256: "0".repeat(64),
+            run_id: "fixture-run".to_string(),
+            files,
+        };
+        self.ledger_bytes(gateway, mode, &ledger.to_bytes());
+    }
+
+    /// Write raw `bytes` at the ledger location (for corrupt-ledger tests).
+    pub fn ledger_bytes(&self, gateway: &str, mode: &str, bytes: &[u8]) {
+        let dest = ledger_location(gateway, mode)
+            .split('/')
+            .fold(self.data.path().to_path_buf(), |acc, c| acc.join(c));
+        std::fs::create_dir_all(dest.parent().expect("parent")).expect("create dirs");
+        std::fs::write(dest, bytes).expect("write ledger");
+    }
+
     /// Read back a collection-relative file.
     pub fn read(&self, collection: &str, path: &str) -> Vec<u8> {
         let src = path
@@ -124,7 +156,7 @@ impl PlanFixture {
     /// four spaces; may be empty).
     pub fn repo_with_master(&self, env: &str, master_extra: &str) -> PathBuf {
         let yaml = format!(
-            "schema_version: 1\ngateway: tracer-gw\nmode: {MODE}\nnodes:\n  master:\n    profile: dev\n{master_extra}"
+            "schema_version: 1\ngateway: {GATEWAY}\nmode: {MODE}\nnodes:\n  master:\n    profile: dev\n{master_extra}"
         );
         let targets = self.repo.path().join("targets");
         std::fs::create_dir_all(&targets).expect("targets dir");

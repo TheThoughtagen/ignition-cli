@@ -26,6 +26,8 @@ pub mod local;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::Serialize;
+
 use super::layout::{RelPath, TAG_TYPES};
 use super::manifest::Manifest;
 use super::target::NodeTarget;
@@ -102,6 +104,16 @@ pub struct ObservedFiles {
     pub local_units: Vec<String>,
 }
 
+/// The files plan proposes to delete from the mode collection: the
+/// declared-names ledger's files minus the rendered files (D-05, 22-03).
+/// Collection-relative paths, byte-sorted and unique. Serialized as
+/// `{"files": [...]}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DeleteSet {
+    /// The paths, byte-sorted.
+    pub files: Vec<RelPath>,
+}
+
 /// The read half of a transport.
 #[async_trait::async_trait]
 pub trait TreeReader: Send + Sync {
@@ -112,6 +124,16 @@ pub trait TreeReader: Send + Sync {
     /// Read the `core` and mode collections within `scope`, and list the
     /// `local` units in scope. Fails closed on any error.
     async fn read(&self, scope: &Scope) -> Result<ObservedFiles, CoreError>;
+
+    /// The declared-names ledger bytes of `gateway` and `mode` at
+    /// [`ledger_location`](super::ledger::ledger_location) below the node's
+    /// data directory. `None` means the ledger is absent (a first deploy). A
+    /// ledger that exists but cannot be read (a symlink, a non-regular file,
+    /// over [`LEDGER_MAX_BYTES`](super::ledger::LEDGER_MAX_BYTES), a read
+    /// error) is [`CoreError::DeployLedgerInvalid`], never `None` (D-07). The
+    /// bytes are not validated here; see
+    /// [`Ledger::parse`](super::ledger::Ledger::parse).
+    async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
 }
 
 /// The reader for `node`, from its target block.

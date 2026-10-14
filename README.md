@@ -2557,6 +2557,44 @@ mode collection. The plan does not model it: when a unit also exists in
 `config/resources/local/`, the plan adds a warning that it does not describe
 what the gateway runs for that unit.
 
+#### The declared-names ledger
+
+The ledger is an on-box record of the mode-collection files the last apply
+wrote for one gateway and mode. Plan reads it to learn which names this tool
+previously declared; it never writes it (only an apply does, Phase 23). Format
+v1 is one strict JSON object:
+
+```json
+{
+  "schema_version": 1,
+  "gateway": "<target gateway>",
+  "mode": "<target mode>",
+  "render_sha256": "<64 lowercase hex>",
+  "run_id": "<[A-Za-z0-9._-]{1,128}>",
+  "files": ["<module>/<type>/..."]
+}
+```
+
+- **Location:** `ign-deploy/<gateway>/<mode>/ledger.json` below the node's
+  data directory, outside `config/resources/` so the gateway never scans it.
+- **Size and encoding:** at most 8 MiB (8388608 bytes), strict UTF-8, never
+  empty (a 0-byte file is refused). Unknown fields and repeated keys are
+  refused; nesting is bounded.
+- **`files`:** collection-relative paths, byte-sorted and unique, with no
+  per-file hashes (it is a name list, not a drift base). `"files": []` is
+  valid. Each path has at least three components, no dot-named component, is
+  not `config-mode.json`, is not a case-variant of another entry, and sits
+  under a type the gateway describes (an OpenAPI resource type, or one of the
+  four tag types under `ignition`).
+- **Absent means first deploy:** no ledger gives an empty delete set.
+- **Refusals:** a ledger that exists but is unreadable (a symlink, not a
+  regular file, a read error), empty, over the cap, not strict JSON, of
+  another `schema_version`, naming a different `gateway` or `mode` than the
+  target, unsorted or duplicated, or listing any path the rules above refuse,
+  exits 6 `deploy_ledger_invalid`, naming the ledger location and the problem.
+  Plan never falls back to an empty delete set. The problem text names fields
+  and listed paths only, never other file content.
+
 **Over MCP.** `deploy plan` is in the `ign mcp serve` tool catalog as
 `deploy_plan`. It is read-only, so the tool is not guarded and takes no
 `confirm` argument.

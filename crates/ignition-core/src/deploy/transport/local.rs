@@ -18,7 +18,9 @@ use super::{
     CORE_COLLECTION, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
     READ_MAX_TOTAL_BYTES, Scope, TreeReader,
 };
+use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
+use crate::deploy::ledger::{LEDGER_MAX_BYTES, ledger_location};
 use crate::deploy::plan::unit_key;
 use crate::deploy::tree::{OpenError, open_regular_file, sha256_hex, walk_capped};
 use crate::error::CoreError;
@@ -58,9 +60,8 @@ impl LocalFsTransport {
         }
     }
 
-    /// `<data_dir>/config/resources`, after requiring `data_dir` and it to be
-    /// real directories.
-    fn resources_root(&self) -> Result<PathBuf, CoreError> {
+    /// Require `data_dir` to be a real directory (not a symlink).
+    fn require_data_dir(&self) -> Result<(), CoreError> {
         let meta = std::fs::symlink_metadata(&self.data_dir).map_err(|e| {
             self.fail(format!(
                 "data_dir {} cannot be read ({})",
@@ -74,6 +75,13 @@ impl LocalFsTransport {
                 self.data_dir.display()
             )));
         }
+        Ok(())
+    }
+
+    /// `<data_dir>/config/resources`, after requiring `data_dir` and it to be
+    /// real directories.
+    fn resources_root(&self) -> Result<PathBuf, CoreError> {
+        self.require_data_dir()?;
         let root = self.data_dir.join("config").join("resources");
         match std::fs::symlink_metadata(&root) {
             Ok(meta) if meta.file_type().is_dir() => Ok(root),
@@ -252,6 +260,83 @@ impl LocalFsTransport {
         })
     }
 
+    /// The ledger bytes, or `None` when any level of its location is absent.
+    /// Every level is inspected with `symlink_metadata` and a symlink or a
+    /// non-regular file is refused; the bytes are read through
+    /// [`open_regular_file`], descriptor-relative from `data_dir`, at most
+    /// [`LEDGER_MAX_BYTES`] of them.
+    fn read_ledger_blocking(
+        &self,
+        gateway: &str,
+        mode: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = ledger_location(gateway, mode);
+        let bad = |problem: String| CoreError::DeployLedgerInvalid {
+            location: location.clone(),
+            problem,
+        };
+        for (what, value) in [("gateway", gateway), ("mode", mode)] {
+            if let Some(why) = component_problem(value) {
+                return Err(bad(format!("the target {what} {why}")));
+            }
+        }
+        // An unreadable host is not an absent ledger.
+        self.require_data_dir()?;
+
+        let parts: Vec<&str> = location.split('/').collect();
+        let mut path = self.data_dir.clone();
+        let mut meta = None;
+        for (index, part) in parts.iter().enumerate() {
+            path.push(part);
+            let last = index + 1 == parts.len();
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(bad(
+                        "a path component is a symlink; symlinks are refused".to_string()
+                    ));
+                }
+                Ok(m) if last && !m.file_type().is_file() => {
+                    return Err(bad("the ledger is not a regular file".to_string()));
+                }
+                Ok(m) if !last && !m.file_type().is_dir() => {
+                    return Err(bad("a path component is not a directory".to_string()));
+                }
+                Ok(m) => meta = Some(m),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(bad(format!("cannot be inspected ({})", e.kind()))),
+            }
+        }
+        let Some(before) = meta else {
+            return Ok(None);
+        };
+        let (file, held) = match open_regular_file(&self.data_dir, Path::new(&location), &before) {
+            Ok(opened) => opened,
+            Err(OpenError::Changed) => {
+                return Err(bad(
+                    "changed while it was read; symlinks are refused".to_string()
+                ));
+            }
+            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(OpenError::Io(e)) => return Err(bad(format!("cannot be read ({})", e.kind()))),
+        };
+        if held.len() > LEDGER_MAX_BYTES as u64 {
+            return Err(bad(format!(
+                "the file is {} bytes, over the {LEDGER_MAX_BYTES} byte cap",
+                held.len()
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take(LEDGER_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| bad(format!("cannot be read ({})", e.kind())))?;
+        if bytes.len() > LEDGER_MAX_BYTES {
+            return Err(bad(format!(
+                "the file grew past the {LEDGER_MAX_BYTES} byte cap while it was read"
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
     fn list_types_blocking(&self, collection: &str) -> Result<Vec<(String, String)>, CoreError> {
         let resources = self.resources_root()?;
         let base_rel = "config/resources";
@@ -329,6 +414,14 @@ impl TreeReader for LocalFsTransport {
         let this = self.clone();
         let scope = scope.clone();
         tokio::task::spawn_blocking(move || this.read_blocking(&scope))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        let (gateway, mode) = (gateway.to_string(), mode.to_string());
+        tokio::task::spawn_blocking(move || this.read_ledger_blocking(&gateway, &mode))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
@@ -439,5 +532,126 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("outside-secret"), "{text}");
+    }
+
+    fn ledger_dir(root: &Path) -> PathBuf {
+        root.join("ign-deploy").join("gw").join("dev")
+    }
+
+    #[test]
+    fn read_ledger_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let read = || transport.read_ledger_blocking("gw", "dev");
+
+        // absent at every level
+        assert_eq!(read().expect("no ign-deploy dir"), None);
+        std::fs::create_dir(dir.path().join("ign-deploy")).expect("mkdir");
+        assert_eq!(read().expect("no gateway dir"), None);
+        std::fs::create_dir_all(ledger_dir(dir.path())).expect("mkdir");
+        assert_eq!(read().expect("no ledger file"), None);
+
+        // present: the bytes, unvalidated
+        std::fs::write(ledger_dir(dir.path()).join("ledger.json"), b"anything").expect("write");
+        assert_eq!(read().expect("present"), Some(b"anything".to_vec()));
+
+        // an empty file is returned as empty bytes (the parser refuses it)
+        std::fs::write(ledger_dir(dir.path()).join("ledger.json"), b"").expect("write");
+        assert_eq!(read().expect("empty is present"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn read_ledger_refuses_a_directory_at_the_ledger_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ledger_dir(dir.path()).join("ledger.json")).expect("mkdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let err = transport
+            .read_ledger_blocking("gw", "dev")
+            .expect_err("a directory is not a ledger");
+        assert_eq!(err.code(), "deploy_ledger_invalid");
+        assert!(
+            err.to_string().contains("ign-deploy/gw/dev/ledger.json"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn read_ledger_refuses_an_oversized_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ledger_dir(dir.path())).expect("mkdir");
+        let file = std::fs::File::create(ledger_dir(dir.path()).join("ledger.json")).expect("file");
+        file.set_len(LEDGER_MAX_BYTES as u64 + 1).expect("sparse");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let err = transport
+            .read_ledger_blocking("gw", "dev")
+            .expect_err("over the cap");
+        assert_eq!(err.code(), "deploy_ledger_invalid");
+        assert!(err.to_string().contains("8388608"), "{err}");
+    }
+
+    #[test]
+    fn read_ledger_with_an_unreadable_host_is_transport_failed_not_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().join("missing"), "nodes.master");
+        let err = transport
+            .read_ledger_blocking("gw", "dev")
+            .expect_err("a missing data_dir is not an absent ledger");
+        assert_eq!(err.code(), "transport_failed");
+    }
+
+    #[test]
+    fn read_ledger_refuses_unsafe_target_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        for (gateway, mode) in [("..", "dev"), ("gw", "a/b"), ("", "dev"), (".x", "dev")] {
+            let err = transport
+                .read_ledger_blocking(gateway, mode)
+                .expect_err("a name that is not one safe component");
+            assert_eq!(err.code(), "deploy_ledger_invalid", "{gateway:?} {mode:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ledger_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("ledger.json"), b"outside-secret").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+
+        // a symlinked ledger file
+        std::fs::create_dir_all(ledger_dir(dir.path())).expect("mkdir");
+        std::os::unix::fs::symlink(
+            outside.path().join("ledger.json"),
+            ledger_dir(dir.path()).join("ledger.json"),
+        )
+        .expect("symlink");
+        let err = transport
+            .read_ledger_blocking("gw", "dev")
+            .expect_err("a symlinked ledger");
+        assert_eq!(err.code(), "deploy_ledger_invalid");
+        assert!(!err.to_string().contains("outside-secret"), "{err}");
+
+        // a symlinked directory on the way
+        std::fs::remove_dir_all(dir.path().join("ign-deploy")).expect("remove");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("ign-deploy")).expect("symlink");
+        let err = transport
+            .read_ledger_blocking("gw", "dev")
+            .expect_err("a symlinked directory");
+        assert_eq!(err.code(), "deploy_ledger_invalid");
+    }
+
+    #[tokio::test]
+    async fn read_ledger_through_the_trait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ledger_dir(dir.path())).expect("mkdir");
+        std::fs::write(ledger_dir(dir.path()).join("ledger.json"), b"x").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let reader: &dyn TreeReader = &transport;
+        assert_eq!(
+            reader.read_ledger("gw", "dev").await.expect("read"),
+            Some(b"x".to_vec())
+        );
+        assert_eq!(reader.read_ledger("gw", "prod").await.expect("read"), None);
     }
 }

@@ -12,7 +12,7 @@
 /// The constructor is the only way to build one, so every `RelPath` is free
 /// of a leading `/`, backslashes, NUL bytes and empty, `.` or `..`
 /// components. `Ord` is the inner `String`'s byte order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct RelPath(String);
 
 impl RelPath {

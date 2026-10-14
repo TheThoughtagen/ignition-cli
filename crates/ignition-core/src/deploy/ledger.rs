@@ -1,16 +1,82 @@
 //! The declared-names ledger, format v1 (Phase 22, D-05, D-07).
 //!
-//! RED-phase skeleton: the reader is implemented in the next commit.
+//! The ledger is an on-box record of the mode-collection files the last
+//! apply wrote for one gateway and mode. `deploy plan` reads it to learn which
+//! names this tool previously declared: the delete set is exactly the
+//! ledger's files minus the files being rendered, so a resource the tool
+//! never wrote is never proposed for deletion. Nothing in Phase 22 writes a
+//! ledger; [`Ledger::to_bytes`] is the writer Phase 23 and the tests use.
+//!
+//! ## Format v1
+//!
+//! One JSON object, strict: unknown fields, duplicate keys and nesting beyond
+//! the shared depth cap are refused, and the file is at most
+//! [`LEDGER_MAX_BYTES`] (8 MiB), strict UTF-8, never empty.
+//!
+//! ```json
+//! {
+//!   "schema_version": 1,
+//!   "gateway": "<target gateway>",
+//!   "mode": "<target mode>",
+//!   "render_sha256": "<64 lowercase hex>",
+//!   "run_id": "<[A-Za-z0-9._-]{1,128}>",
+//!   "files": ["<module>/<type>/..."]
+//! }
+//! ```
+//!
+//! `files` holds collection-relative paths, byte-sorted and unique, with no
+//! per-file hashes (the ledger is a name list, not a drift base). Every path
+//! has at least three components, no dot-named component, is not
+//! `config-mode.json`, is not a case-variant of another entry (a
+//! case-insensitive host would treat the two as one file), and sits under a
+//! type the gateway describes (the OpenAPI resource types, or the four tag
+//! types under `ignition`).
+//!
+//! ## Location
+//!
+//! [`ledger_location`]: `ign-deploy/<gateway>/<mode>/ledger.json`, relative
+//! to the node's data directory. It is never inside `config/resources/` (the
+//! gateway scans that tree) and never dot-named. Decision B of plan 22-12
+//! confirms or moves it; nothing writes a ledger before Phase 23, so moving
+//! it costs this one function.
+//!
+//! ## Refusals
+//!
+//! A ledger that exists but cannot be trusted is `deploy_ledger_invalid`
+//! (exit 6); plan never falls back to an empty delete set (D-07). The problem
+//! text names fields and listed paths only, never other file content and never
+//! the foreign gateway or mode a copied ledger names.
+
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::layout::{RelPath, TAG_TYPES};
+use super::node::{self, Node};
+use super::rules::{GATEWAY_OWNED_FILES, openapi_describes};
 use crate::error::CoreError;
 
 /// File name of the ledger.
 pub const LEDGER_FILE: &str = "ledger.json";
 
-/// The largest ledger accepted (8 MiB).
+/// The largest ledger accepted (8 MiB), checked before any parse.
 pub const LEDGER_MAX_BYTES: usize = 8_388_608;
+
+/// The only schema version this build reads and writes.
+const SCHEMA_VERSION: u32 = 1;
+
+/// The longest `run_id` accepted.
+const RUN_ID_MAX: usize = 128;
+
+/// The ledger's top-level keys, in write order.
+const FIELDS: [&str; 6] = [
+    "schema_version",
+    "gateway",
+    "mode",
+    "render_sha256",
+    "run_id",
+    "files",
+];
 
 /// The declared-names ledger.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -18,41 +84,186 @@ pub const LEDGER_MAX_BYTES: usize = 8_388_608;
 pub struct Ledger {
     /// Always 1.
     pub schema_version: u32,
-    /// Gateway the ledger belongs to.
+    /// The gateway directory name the ledger belongs to (the target's
+    /// `gateway`).
     pub gateway: String,
-    /// Deployment mode the ledger belongs to.
+    /// The deployment mode the ledger belongs to (the target's `mode`).
     pub mode: String,
-    /// Render hash of the apply that wrote it.
+    /// `render_sha256` of the render the writing apply deployed: 64
+    /// lowercase hex digits.
     pub render_sha256: String,
-    /// Run identifier of the apply that wrote it.
+    /// Identifier of the apply run that wrote it: `[A-Za-z0-9._-]{1,128}`.
     pub run_id: String,
-    /// Mode-collection paths the apply wrote, byte-sorted and unique.
+    /// The mode-collection files that apply wrote, byte-sorted and unique.
     pub files: Vec<String>,
 }
 
-/// The ledger location relative to the node's data directory.
+/// The ledger location relative to the node's data directory (module doc).
 pub fn ledger_location(gateway: &str, mode: &str) -> String {
     format!("ign-deploy/{gateway}/{mode}/{LEDGER_FILE}")
 }
 
+/// At most 64 printable characters of `text`, for a problem message.
+fn shown(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
 impl Ledger {
-    /// Parse and validate `bytes` read from `location`.
+    /// Parse and validate `bytes` read from `location`, for the target
+    /// `gateway` and `mode`. Every refusal is
+    /// [`CoreError::DeployLedgerInvalid`] naming `location`.
     pub fn parse(
         location: &str,
-        _bytes: &[u8],
-        _gateway: &str,
-        _mode: &str,
+        bytes: &[u8],
+        gateway: &str,
+        mode: &str,
     ) -> Result<Ledger, CoreError> {
-        Err(CoreError::DeployLedgerInvalid {
+        let bad = |problem: String| CoreError::DeployLedgerInvalid {
             location: location.to_string(),
-            problem: "not implemented".to_string(),
-        })
+            problem,
+        };
+        if bytes.is_empty() {
+            return Err(bad("the file is empty".to_string()));
+        }
+        if bytes.len() > LEDGER_MAX_BYTES {
+            return Err(bad(format!(
+                "the file is {} bytes, over the {LEDGER_MAX_BYTES} byte cap",
+                bytes.len()
+            )));
+        }
+        // Strict UTF-8, no BOM, no repeated key, bounded depth.
+        let (_, root) = node::classify(bytes).map_err(&bad)?;
+        let Node::Obj(members) = &root else {
+            return Err(bad("the top level is not a JSON object".to_string()));
+        };
+        for (key, _) in members {
+            if !FIELDS.contains(&key.as_str()) {
+                return Err(bad(format!("unknown field `{}`", shown(key))));
+            }
+        }
+        for field in FIELDS {
+            if root.get(field).is_none() {
+                return Err(bad(format!("missing field `{field}`")));
+            }
+        }
+        let ledger: Ledger = serde_json::from_slice(bytes).map_err(|e| {
+            bad(format!(
+                "a field has the wrong type (line {} column {})",
+                e.line(),
+                e.column()
+            ))
+        })?;
+
+        if ledger.schema_version != SCHEMA_VERSION {
+            return Err(bad(format!(
+                "schema_version is not {SCHEMA_VERSION}, the only version this build reads"
+            )));
+        }
+        if ledger.gateway != gateway {
+            return Err(bad(format!(
+                "gateway names a different gateway than the target (`{}`)",
+                shown(gateway)
+            )));
+        }
+        if ledger.mode != mode {
+            return Err(bad(format!(
+                "mode names a different mode than the target (`{}`)",
+                shown(mode)
+            )));
+        }
+        let hex = ledger.render_sha256.len() == 64
+            && ledger
+                .render_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !hex {
+            return Err(bad(
+                "render_sha256 is not 64 lowercase hex digits".to_string()
+            ));
+        }
+        let run_id_ok = (1..=RUN_ID_MAX).contains(&ledger.run_id.len())
+            && ledger
+                .run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !run_id_ok {
+            return Err(bad(format!(
+                "run_id is not 1 to {RUN_ID_MAX} characters of [A-Za-z0-9._-]"
+            )));
+        }
+        check_files(&ledger.files).map_err(bad)?;
+        Ok(ledger)
     }
 
-    /// Canonical bytes: pretty JSON plus one LF.
+    /// The canonical bytes: pretty JSON in field order plus one LF. The
+    /// writer Phase 23 and the tests use; `parse(to_bytes(l)) == l`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        Vec::new()
+        let mut bytes = serde_json::to_vec_pretty(self).unwrap_or_default();
+        bytes.push(b'\n');
+        bytes
     }
+}
+
+/// Whether `module/ty` is a declared resource type.
+fn declared_type(module: &str, ty: &str) -> bool {
+    openapi_describes(module, ty) || (module == "ignition" && TAG_TYPES.contains(&ty))
+}
+
+/// The `files` rules (module doc); the problem text on refusal.
+fn check_files(files: &[String]) -> Result<(), String> {
+    let mut folded: BTreeSet<String> = BTreeSet::new();
+    let mut previous: Option<&String> = None;
+    for (index, path) in files.iter().enumerate() {
+        let listed = shown(path);
+        if let Err(why) = RelPath::new(path) {
+            return Err(format!(
+                "files[{index}] `{listed}` is not a safe path ({why})"
+            ));
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        if let Some(owned) = parts.iter().find(|p| GATEWAY_OWNED_FILES.contains(*p)) {
+            return Err(format!(
+                "files[{index}] `{listed}` lists the gateway-owned file `{owned}`, which is never deleted"
+            ));
+        }
+        if parts.iter().any(|p| p.starts_with('.')) {
+            return Err(format!(
+                "files[{index}] `{listed}` has a dot-named component"
+            ));
+        }
+        if parts.len() < 3 {
+            return Err(format!(
+                "files[{index}] `{listed}` has fewer than three components"
+            ));
+        }
+        if !declared_type(parts[0], parts[1]) {
+            return Err(format!(
+                "files[{index}] `{listed}` is under type `{}/{}`, which is not a declared resource type",
+                shown(parts[0]),
+                shown(parts[1])
+            ));
+        }
+        if let Some(prev) = previous {
+            if path == prev {
+                return Err(format!(
+                    "files[{index}] `{listed}` is listed twice (duplicate)"
+                ));
+            }
+            if path.as_bytes() < prev.as_bytes() {
+                return Err(format!(
+                    "files is not byte-sorted: `{listed}` follows `{}`",
+                    shown(prev)
+                ));
+            }
+        }
+        if !folded.insert(path.to_ascii_lowercase()) {
+            return Err(format!(
+                "files[{index}] `{listed}` differs from another entry only by case, which a case-insensitive host treats as one file"
+            ));
+        }
+        previous = Some(path);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
