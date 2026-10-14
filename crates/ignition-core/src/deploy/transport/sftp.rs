@@ -18,9 +18,12 @@
 //! 3. Inside a scoped directory, one session per depth lists every directory
 //!    of that depth with `ls -la`, so every file, its size, and any symlink or
 //!    special file is known BEFORE a byte is downloaded.
-//! 4. One last session downloads each scoped directory with `get -R` into a
-//!    private temp dir, and the local walk must find exactly the listed files
-//!    with exactly the listed sizes.
+//! 4. Download sessions fetch each listed file with its own `get` (never
+//!    `get -R`, whose contents the server would decide) into a private temp
+//!    dir, in chunks; the running total is checked before each chunk, the
+//!    temp dir is measured while sftp runs and sftp is killed if it outgrows
+//!    what the listing allowed, and afterwards the local walk must find
+//!    exactly the listed files with exactly the listed sizes.
 //!
 //! Any non-zero sftp exit, any stderr byte or a timeout is `transport_failed`
 //! (see [`RemoteShell::require_success`]); a directory that is permission
@@ -39,8 +42,10 @@
 //! double quotes of a typed op. Symlinks and special files are refused (the
 //! sftp client's `get -R` would otherwise skip a symlink silently), the three
 //! `READ_MAX_*` caps are enforced from the listing before the download and
-//! again on the downloaded bytes, and the depth of the walk is bounded by
-//! [`READ_MAX_DEPTH`]. File hashes are computed here on the downloaded bytes,
+//! again on the downloaded bytes (entries while the listing is parsed), and
+//! the depth of the walk is bounded by
+//! [`READ_MAX_DEPTH`]. Entries are counted while a listing is parsed, so an
+//! oversized listing stops at the line that passes the cap. File hashes are computed here on the downloaded bytes,
 //! never by a remote tool, and the downloads live in a per-read temp dir that
 //! is deleted on drop.
 
@@ -72,6 +77,19 @@ const RESOURCES: [&str; 2] = ["config", "resources"];
 /// level costs one sftp session, so a hostile deep tree cannot drive an
 /// unbounded number of them.
 pub const READ_MAX_DEPTH: usize = 64;
+
+/// One download session carries at most this many listed bytes. The total cap
+/// is checked before each chunk, so a tree near [`READ_MAX_TOTAL_BYTES`] is
+/// fetched in several sessions, each verified before the next starts.
+const DOWNLOAD_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+/// One download session carries at most this many `get` lines.
+const DOWNLOAD_CHUNK_FILES: usize = 10_000;
+/// How far past the listed bytes the download dir may grow before the sftp
+/// process is killed (a server may legitimately differ by a rounding error,
+/// not by this much).
+const DOWNLOAD_SLACK_BYTES: u64 = 1024 * 1024;
+/// How often the download dir is measured while sftp runs.
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// What kind of filesystem object a listing line describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +149,33 @@ pub fn parse_ls_listing(dir: &str, stdout: &[u8]) -> Result<Vec<ListedEntry>, St
     Ok(all.pop().unwrap_or_default())
 }
 
+/// Why a listing was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListingError {
+    /// More entries than the budget allows. Raised while the output is being
+    /// parsed, so nothing after the offending line is looked at or stored.
+    TooMany,
+    /// A line, name or mode that cannot be trusted.
+    Bad(String),
+}
+
+impl std::fmt::Display for ListingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListingError::TooMany => write!(f, "more than {READ_MAX_ENTRIES} entries"),
+            ListingError::Bad(why) => f.write_str(why),
+        }
+    }
+}
+
+/// [`parse_batch_listing_capped`] with the whole [`READ_MAX_ENTRIES`] budget.
+pub fn parse_batch_listing(
+    dirs: &[String],
+    stdout: &[u8],
+) -> Result<Vec<Vec<ListedEntry>>, String> {
+    parse_batch_listing_capped(dirs, stdout, READ_MAX_ENTRIES).map_err(|e| e.to_string())
+}
+
 /// Parse the stdout of a batch that listed `dirs` in order, one
 /// `ls -la` each, into one entry list per directory (byte-sorted by name).
 ///
@@ -142,20 +187,36 @@ pub fn parse_ls_listing(dir: &str, stdout: &[u8]) -> Result<Vec<ListedEntry>, St
 /// name that fails [`safe_remote_path`], or a name listed twice is an error.
 /// `.` and `..` (present because the listing includes dot-named entries) are
 /// dropped.
-pub fn parse_batch_listing(
+///
+/// Entries are counted AS EACH LINE IS PARSED: the line that makes the count
+/// pass `max_entries` stops the parse with [`ListingError::TooMany`] before
+/// it is stored and before any later line is read, so a huge or endless
+/// listing is never materialised. The 32 MiB stdout cap of the process runner
+/// is a backstop, not this check.
+pub fn parse_batch_listing_capped(
     dirs: &[String],
     stdout: &[u8],
-) -> Result<Vec<Vec<ListedEntry>>, String> {
+    max_entries: usize,
+) -> Result<Vec<Vec<ListedEntry>>, ListingError> {
+    let bad = |why: String| ListingError::Bad(why);
     let text = std::str::from_utf8(stdout)
-        .map_err(|_| "the listing holds a name that is not valid UTF-8".to_string())?;
+        .map_err(|_| bad("the listing holds a name that is not valid UTF-8".to_string()))?;
     let prefixes: Vec<String> = dirs.iter().map(|d| format!("{d}/")).collect();
     let mut out: Vec<Vec<ListedEntry>> = vec![Vec::new(); dirs.len()];
+    // `.` and `..` of every directory are lines too
+    let max_lines = max_entries.saturating_add(dirs.len().saturating_mul(2));
+    let mut lines_seen = 0usize;
+    let mut entries_seen = 0usize;
     // Output follows the order of the listing commands, so a line belongs to
     // the current directory or a later one.
     let mut current = 0usize;
     for line in text.lines() {
+        lines_seen += 1;
+        if lines_seen > max_lines {
+            return Err(ListingError::TooMany);
+        }
         if line.is_empty() {
-            return Err("the listing holds an empty line".to_string());
+            return Err(bad("the listing holds an empty line".to_string()));
         }
         let mut hit = None;
         for (index, prefix) in prefixes.iter().enumerate().skip(current) {
@@ -170,18 +231,24 @@ pub fn parse_batch_listing(
             break;
         }
         let Some((index, at, name)) = hit else {
-            return Err(format!(
+            return Err(bad(format!(
                 "a listing line does not carry a listed directory prefix: {line:?}"
-            ));
+            )));
         };
         current = index;
+        if name != "." && name != ".." {
+            entries_seen += 1;
+            if entries_seen > max_entries {
+                return Err(ListingError::TooMany);
+            }
+        }
         let tokens: Vec<&str> = line[..at].split_whitespace().collect();
         if tokens.len() < 8 {
-            return Err(format!("a listing line has too few columns: {line:?}"));
+            return Err(bad(format!("a listing line has too few columns: {line:?}")));
         }
         let mode = tokens[0];
         if mode.len() < 10 || !mode.is_ascii() {
-            return Err(format!("a listing line has an unusable mode {mode:?}"));
+            return Err(bad(format!("a listing line has an unusable mode {mode:?}")));
         }
         let kind = match mode.as_bytes()[0] {
             b'-' => EntryKind::File,
@@ -190,16 +257,18 @@ pub fn parse_batch_listing(
             _ => EntryKind::Other,
         };
         let size_text = tokens[tokens.len() - 4];
-        let size: u64 = size_text
-            .parse()
-            .map_err(|_| format!("a listing line has a non-numeric size {size_text:?}"))?;
+        let size: u64 = size_text.parse().map_err(|_| {
+            bad(format!(
+                "a listing line has a non-numeric size {size_text:?}"
+            ))
+        })?;
         if name == "." || name == ".." {
             continue;
         }
         if name.is_empty() {
-            return Err("a listing line has an empty name".to_string());
+            return Err(bad("a listing line has an empty name".to_string()));
         }
-        safe_remote_path(name).map_err(|why| format!("the name {name:?} is unsafe: {why}"))?;
+        safe_remote_path(name).map_err(|why| bad(format!("the name {name:?} is unsafe: {why}")))?;
         out[index].push(ListedEntry {
             name: name.to_string(),
             kind,
@@ -209,7 +278,7 @@ pub fn parse_batch_listing(
     for entries in &mut out {
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         if let Some(pair) = entries.windows(2).find(|w| w[0].name == w[1].name) {
-            return Err(format!("the name {:?} is listed twice", pair[0].name));
+            return Err(bad(format!("the name {:?} is listed twice", pair[0].name)));
         }
     }
     Ok(out)
@@ -304,7 +373,15 @@ impl SftpTransport {
     }
 
     /// One sftp session: list every directory of `dirs` (`ls -la`).
-    async fn list_level(&self, dirs: &[String]) -> Result<Vec<Vec<ListedEntry>>, CoreError> {
+    ///
+    /// Every parsed entry counts against `budget`, which is shared by all
+    /// listings of one read, so [`READ_MAX_ENTRIES`] is cumulative across
+    /// directories, levels and collections.
+    async fn list_level(
+        &self,
+        dirs: &[String],
+        budget: &mut Budget,
+    ) -> Result<Vec<Vec<ListedEntry>>, CoreError> {
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
@@ -315,20 +392,44 @@ impl SftpTransport {
         self.sessions.fetch_add(1, Ordering::Relaxed);
         let out = self.shell.sftp_batch(&ops).await?;
         let out = self.shell.require_success("read", out)?;
-        parse_batch_listing(dirs, &out.stdout)
-            .map_err(|why| self.fail(format!("cannot use the sftp listing: {why}")))
+        let remaining = READ_MAX_ENTRIES.saturating_sub(budget.entries);
+        let listings =
+            parse_batch_listing_capped(dirs, &out.stdout, remaining).map_err(|e| match e {
+                ListingError::TooMany => self.fail(format!(
+                    "more than {READ_MAX_ENTRIES} entries under the data directory (at {})",
+                    self.shown(&dirs[0])
+                )),
+                ListingError::Bad(why) => self.fail(format!("cannot use the sftp listing: {why}")),
+            })?;
+        budget.entries += listings.iter().map(Vec::len).sum::<usize>();
+        Ok(listings)
+    }
+
+    /// `abs` relative to `data_dir`, for messages.
+    fn shown(&self, abs: &str) -> String {
+        abs.strip_prefix(&self.data_dir)
+            .map(|rest| rest.trim_start_matches('/'))
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(".")
+            .to_string()
     }
 
     /// Walk the fixed `components` below `data_dir`, one listing session per
     /// level. `Ok(None)` when a component is missing from its parent's
     /// listing; otherwise the absolute path and listing entry of the last
     /// component, whatever its kind (a symlink anywhere is refused).
-    async fn descend(&self, components: &[&str]) -> Result<Option<(String, ListedEntry)>, Descend> {
+    async fn descend(
+        &self,
+        components: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Option<(String, ListedEntry)>, Descend> {
         let mut current = self.data_dir.clone();
         let mut shown = String::new();
         for (index, component) in components.iter().enumerate() {
             let last = index + 1 == components.len();
-            let mut listed = self.list_level(std::slice::from_ref(&current)).await?;
+            let mut listed = self
+                .list_level(std::slice::from_ref(&current), budget)
+                .await?;
             let entries = listed.pop().unwrap_or_default();
             let Some(entry) = entries.into_iter().find(|e| e.name == *component) else {
                 return Ok(None);
@@ -415,7 +516,7 @@ impl SftpTransport {
         let mut frontier: Vec<Vec<String>> = vec![Vec::new()];
         while !frontier.is_empty() {
             let dirs: Vec<String> = frontier.iter().map(|c| self.abs(c)).collect();
-            let listings = self.list_level(&dirs).await?;
+            let listings = self.list_level(&dirs, budget).await?;
             let mut next: Vec<Vec<String>> = Vec::new();
             for (chain, entries) in frontier.iter().zip(listings) {
                 let inside = chains.iter().any(|t| chain.starts_with(t.as_slice()));
@@ -427,12 +528,6 @@ impl SftpTransport {
                     child.push(entry.name.clone());
                     let shown = child.join("/");
                     if inside {
-                        budget.entries += 1;
-                        if budget.entries > READ_MAX_ENTRIES {
-                            return Err(self.fail(format!(
-                                "more than {READ_MAX_ENTRIES} entries under config/resources"
-                            )));
-                        }
                         match entry.kind {
                             EntryKind::Dir => next.push(child),
                             EntryKind::File => {
@@ -481,6 +576,124 @@ impl SftpTransport {
         Ok(Found { roots, files })
     }
 
+    /// Run one download session and kill it if `dir` grows past `limit`
+    /// bytes. The listing said how much each `get` may deliver, so a server
+    /// that sends more is aborted mid-transfer (the dropped batch future kills
+    /// the sftp child) instead of filling the runner's disk; the caller's
+    /// temp dir is then removed on drop.
+    async fn run_download(&self, ops: &[SftpOp], dir: &Path, limit: u64) -> Result<(), CoreError> {
+        self.sessions.fetch_add(1, Ordering::Relaxed);
+        let batch = self.shell.sftp_batch(ops);
+        let watch = async {
+            loop {
+                tokio::time::sleep(WATCH_INTERVAL).await;
+                let target = dir.to_path_buf();
+                let used = tokio::task::spawn_blocking(move || dir_bytes(&target))
+                    .await
+                    .unwrap_or(u64::MAX);
+                if used > limit {
+                    return used;
+                }
+            }
+        };
+        tokio::pin!(batch);
+        tokio::pin!(watch);
+        tokio::select! {
+            out = &mut batch => {
+                let out = out?;
+                self.shell.require_success("read", out)?;
+                Ok(())
+            }
+            used = &mut watch => Err(self.fail(format!(
+                "the download wrote {used} bytes, more than the {limit} bytes the listing allowed; it was aborted"
+            ))),
+        }
+    }
+
+    /// Fetch the listed `files` into `tmp` with one `get` per file, in chunks.
+    /// Before each chunk the running total (actual bytes already on disk plus
+    /// the chunk's listed bytes) must fit [`READ_MAX_TOTAL_BYTES`]; after each
+    /// chunk every delivered file must be exactly its listed size.
+    async fn fetch_files(&self, files: &[&FoundFile], tmp: &Path) -> Result<(), CoreError> {
+        let mut downloaded = 0u64;
+        let mut next = 0usize;
+        while next < files.len() {
+            let start = next;
+            let mut ops = Vec::new();
+            let mut chunk_listed = 0u64;
+            while next < files.len() && ops.len() < DOWNLOAD_CHUNK_FILES {
+                let file = files[next];
+                if !ops.is_empty() && chunk_listed + file.size > DOWNLOAD_CHUNK_BYTES {
+                    break;
+                }
+                if downloaded + chunk_listed + file.size > READ_MAX_TOTAL_BYTES {
+                    return Err(self.fail(format!(
+                        "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at config/resources/{}/{})",
+                        file.collection, file.rel
+                    )));
+                }
+                let local = file
+                    .rel
+                    .split('/')
+                    .fold(tmp.join(&file.collection), |p, c| p.join(c));
+                if let Some(parent) = local.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        self.fail(format!("cannot create a download dir ({:?})", e.kind()))
+                    })?;
+                }
+                ops.push(SftpOp::Get {
+                    remote: format!(
+                        "{}/config/resources/{}/{}",
+                        self.data_dir, file.collection, file.rel
+                    ),
+                    local,
+                });
+                chunk_listed += file.size;
+                next += 1;
+            }
+            let limit = downloaded + chunk_listed + DOWNLOAD_SLACK_BYTES;
+            self.run_download(&ops, tmp, limit).await?;
+            downloaded += self.check_chunk(&files[start..next], tmp)?;
+        }
+        Ok(())
+    }
+
+    /// The delivered size of each file of a finished chunk must be exactly
+    /// the listed size (and within the per-file cap); returns the bytes.
+    fn check_chunk(&self, chunk: &[&FoundFile], tmp: &Path) -> Result<u64, CoreError> {
+        let mut bytes = 0u64;
+        for file in chunk {
+            let local = file
+                .rel
+                .split('/')
+                .fold(tmp.join(&file.collection), |p, c| p.join(c));
+            let shown = format!("config/resources/{}/{}", file.collection, file.rel);
+            let meta = match std::fs::symlink_metadata(&local) {
+                Ok(meta) => meta,
+                // reported with the other missing files by the final check
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(self.fail(format!("cannot inspect {shown} ({:?})", e.kind()))),
+            };
+            if !meta.file_type().is_file() {
+                return Err(self.fail(format!("{shown} was downloaded as a non-regular file")));
+            }
+            let len = meta.len();
+            if len > READ_MAX_FILE_BYTES {
+                return Err(self.fail(format!(
+                    "{shown} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
+                )));
+            }
+            if len != file.size {
+                return Err(self.fail(format!(
+                    "{shown} is {len} bytes but was listed as {}; it changed while it was read",
+                    file.size
+                )));
+            }
+            bytes += len;
+        }
+        Ok(bytes)
+    }
+
     /// A fresh private directory for downloads, inside the shell's own temp
     /// dir when it has one. Deleted when dropped.
     fn download_dir(&self) -> Result<tempfile::TempDir, CoreError> {
@@ -492,6 +705,35 @@ impl SftpTransport {
         };
         made.map_err(|e| self.fail(format!("cannot create a download dir ({:?})", e.kind())))
     }
+}
+
+/// Bytes held by regular files under `dir`, without following symlinks. A
+/// tree with more than [`READ_MAX_ENTRIES`] entries, or one that cannot be
+/// measured, counts as unbounded so the caller aborts.
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            entries += 1;
+            if entries > READ_MAX_ENTRIES {
+                return u64::MAX;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 /// Why reading a downloaded file back was refused.
@@ -557,9 +799,12 @@ fn verify_download(
                     "{shown} was downloaded as something other than a directory"
                 )));
             }
+            // nothing was fetched into it (an empty directory); a listed file
+            // that is missing is reported below
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(fail(format!(
-                    "{shown} was listed but is missing from the download ({:?}); it vanished or could not be read",
+                    "{shown} cannot be inspected after the download ({:?})",
                     e.kind()
                 )));
             }
@@ -587,6 +832,7 @@ fn verify_download(
         )));
     }
     let mut out: BTreeMap<String, BTreeMap<RelPath, FileBlob>> = BTreeMap::new();
+    let mut total = 0u64;
     for ((collection, rel), path) in actual {
         let shown = format!("config/resources/{collection}/{rel}");
         let key = RelPath::new(&rel)
@@ -611,6 +857,12 @@ fn verify_download(
                 ),
             })
         })?;
+        total += bytes.len() as u64;
+        if total > READ_MAX_TOTAL_BYTES {
+            return Err(fail(format!(
+                "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {shown})"
+            )));
+        }
         let sha256 = sha256_hex(&bytes);
         out.entry(collection)
             .or_default()
@@ -627,8 +879,9 @@ impl TreeReader for SftpTransport {
         }
         safe_remote_path(collection)
             .map_err(|why| self.fail(format!("the collection name is unsafe: {why}")))?;
+        let mut budget = Budget::default();
         let found = self
-            .descend(&[RESOURCES[0], RESOURCES[1], collection])
+            .descend(&[RESOURCES[0], RESOURCES[1], collection], &mut budget)
             .await
             .map_err(|p| self.read_problem(p))?;
         let Some((collection_dir, entry)) = found else {
@@ -637,33 +890,26 @@ impl TreeReader for SftpTransport {
         if entry.kind != EntryKind::Dir {
             return Err(self.fail(format!("config/resources/{collection} is not a directory")));
         }
-        let mut seen = 0usize;
-        let mut child_dirs =
-            |entries: Vec<ListedEntry>, rel: &str| -> Result<Vec<String>, CoreError> {
-                let mut names = Vec::new();
-                for entry in entries {
-                    seen += 1;
-                    if seen > READ_MAX_ENTRIES {
-                        return Err(
-                            self.fail(format!("more than {READ_MAX_ENTRIES} entries (at {rel})"))
-                        );
+        // every parsed entry already counted against the budget
+        let child_dirs = |entries: Vec<ListedEntry>, rel: &str| -> Result<Vec<String>, CoreError> {
+            let mut names = Vec::new();
+            for entry in entries {
+                match entry.kind {
+                    EntryKind::Symlink => {
+                        return Err(self.fail(format!(
+                            "{rel}/{} is a symlink; symlinks are refused",
+                            entry.name
+                        )));
                     }
-                    match entry.kind {
-                        EntryKind::Symlink => {
-                            return Err(self.fail(format!(
-                                "{rel}/{} is a symlink; symlinks are refused",
-                                entry.name
-                            )));
-                        }
-                        EntryKind::Dir => names.push(entry.name),
-                        _ => {}
-                    }
+                    EntryKind::Dir => names.push(entry.name),
+                    _ => {}
                 }
-                Ok(names)
-            };
+            }
+            Ok(names)
+        };
         let coll_rel = format!("config/resources/{collection}");
         let top = self
-            .list_level(std::slice::from_ref(&collection_dir))
+            .list_level(std::slice::from_ref(&collection_dir), &mut budget)
             .await?
             .pop()
             .unwrap_or_default();
@@ -672,7 +918,7 @@ impl TreeReader for SftpTransport {
             .iter()
             .map(|m| format!("{collection_dir}/{m}"))
             .collect();
-        let listings = self.list_level(&module_dirs).await?;
+        let listings = self.list_level(&module_dirs, &mut budget).await?;
         let mut pairs = Vec::new();
         for (module, entries) in modules.iter().zip(listings) {
             for ty in child_dirs(entries, &format!("{coll_rel}/{module}"))? {
@@ -726,25 +972,16 @@ impl TreeReader for SftpTransport {
             .collect();
         let mut by_collection: BTreeMap<String, BTreeMap<RelPath, FileBlob>> = BTreeMap::new();
         if !download_roots.is_empty() {
+            // One `get` per listed file, never `get -R`: the server decides
+            // what a recursive get delivers, so a recursive get would bypass
+            // every per-file check made on the listing.
             let tmp = self.download_dir()?;
-            let mut ops = Vec::with_capacity(download_roots.len());
-            for root in &download_roots {
-                let below: Vec<&String> = root.iter().skip(2).collect();
-                let parents = &below[..below.len().saturating_sub(1)];
-                let parent = parents
-                    .iter()
-                    .fold(tmp.path().to_path_buf(), |p, c| p.join(c.as_str()));
-                std::fs::create_dir_all(&parent).map_err(|e| {
-                    self.fail(format!("cannot create a download dir ({:?})", e.kind()))
-                })?;
-                ops.push(SftpOp::GetRecursive {
-                    remote: self.abs(root),
-                    local: parent,
-                });
-            }
-            self.sessions.fetch_add(1, Ordering::Relaxed);
-            let out = self.shell.sftp_batch(&ops).await?;
-            self.shell.require_success("read", out)?;
+            let fetch: Vec<&FoundFile> = found
+                .files
+                .iter()
+                .filter(|f| f.collection != LOCAL_COLLECTION)
+                .collect();
+            self.fetch_files(&fetch, tmp.path()).await?;
 
             let label = self.label.clone();
             by_collection = tokio::task::spawn_blocking(move || {
@@ -780,8 +1017,9 @@ impl TreeReader for SftpTransport {
             }
         }
         let parts: Vec<&str> = location.split('/').collect();
+        let mut budget = Budget::default();
         let found = self
-            .descend(&parts)
+            .descend(&parts, &mut budget)
             .await
             .map_err(|problem| match problem {
                 Descend::Failed(err) => err,
@@ -803,15 +1041,15 @@ impl TreeReader for SftpTransport {
             )));
         }
         let tmp = self.download_dir()?;
-        self.sessions.fetch_add(1, Ordering::Relaxed);
-        let out = self
-            .shell
-            .sftp_batch(&[SftpOp::Get {
+        self.run_download(
+            &[SftpOp::Get {
                 remote,
                 local: tmp.path().join("ledger"),
-            }])
-            .await?;
-        self.shell.require_success("read", out)?;
+            }],
+            tmp.path(),
+            entry.size + DOWNLOAD_SLACK_BYTES,
+        )
+        .await?;
         let size = entry.size;
         let root = tmp.path().to_path_buf();
         let read = tokio::task::spawn_blocking(move || {
@@ -1006,6 +1244,9 @@ mod tests {
         lie_size: Option<(String, u64)>,
         /// Remove this path from the tree once the first session ended.
         vanish_after_first_session: Option<String>,
+        /// A `get` of a path ending with `.0` writes a sparse file of `.1`
+        /// bytes regardless of the listing.
+        overshoot: Option<(String, u64)>,
     }
 
     struct FakeSftp {
@@ -1013,6 +1254,8 @@ mod tests {
         listed: Mutex<HashSet<String>>,
         sessions: Mutex<Vec<Vec<String>>>,
         knobs: Mutex<Knobs>,
+        /// Local files the server wrote.
+        downloads: Mutex<Vec<PathBuf>>,
     }
 
     impl FakeSftp {
@@ -1022,6 +1265,7 @@ mod tests {
                 listed: Mutex::new(HashSet::from([DATA.to_string()])),
                 sessions: Mutex::new(Vec::new()),
                 knobs: Mutex::new(Knobs::default()),
+                downloads: Mutex::new(Vec::new()),
             };
             fake.mkdirs(DATA);
             Arc::new(fake)
@@ -1069,29 +1313,6 @@ mod tests {
                     (!rest.contains('/')).then(|| (rest.to_string(), node.clone()))
                 })
                 .collect()
-        }
-
-        fn copy_tree(&self, src: &str, dst: &Path) {
-            std::fs::create_dir_all(dst).expect("mkdir");
-            let skip = self.knobs().skip_download.clone();
-            let extra = self.knobs().extra_download.clone();
-            for (name, node) in self.children(src) {
-                let child = format!("{src}/{name}");
-                match node {
-                    Node::Dir => self.copy_tree(&child, &dst.join(&name)),
-                    Node::File(bytes) => {
-                        if skip.as_deref().is_some_and(|s| child.ends_with(s)) {
-                            continue;
-                        }
-                        std::fs::write(dst.join(&name), bytes).expect("write");
-                    }
-                    // `get -R` silently skips symlinks and special files
-                    Node::Symlink | Node::Special => {}
-                }
-            }
-            if let Some(extra) = extra {
-                std::fs::write(dst.join(extra), b"surprise").expect("extra");
-            }
         }
     }
 
@@ -1168,28 +1389,40 @@ mod tests {
                         stdout.push_str(&format!("{}\n", line(mode, size, &child)));
                         newly_listed.push(child);
                     }
-                } else if l.starts_with("get -R \"") {
+                } else if l.starts_with("get \"") {
                     if self.knobs().fail_get {
                         stderr.push_str(&format!("remote open(\"{remote}\"): No such file\n"));
                         code = 1;
                         break;
                     }
                     let node = self.fs.lock().expect("fs").get(&remote).cloned();
-                    let Some(Node::Dir) = node else {
-                        stderr.push_str(&format!("File \"{remote}\" not found.\n"));
-                        code = 1;
-                        break;
-                    };
-                    let base = remote.rsplit('/').next().expect("base");
-                    self.copy_tree(&remote, &Path::new(&args[1]).join(base));
-                } else if l.starts_with("get \"") {
-                    let node = self.fs.lock().expect("fs").get(&remote).cloned();
                     let Some(Node::File(bytes)) = node else {
                         stderr.push_str(&format!("File \"{remote}\" not found.\n"));
                         code = 1;
                         break;
                     };
-                    std::fs::write(&args[1], bytes).expect("write");
+                    let skip = self.knobs().skip_download.clone();
+                    if skip.as_deref().is_some_and(|s| remote.ends_with(s)) {
+                        continue;
+                    }
+                    let dst = PathBuf::from(&args[1]);
+                    std::fs::write(&dst, bytes).expect("write");
+                    self.downloads.lock().expect("downloads").push(dst.clone());
+                    let extra = self.knobs().extra_download.clone();
+                    if let Some(extra) = extra {
+                        std::fs::write(dst.parent().expect("parent").join(extra), b"surprise")
+                            .expect("extra");
+                    }
+                    let overshoot = self.knobs().overshoot.clone();
+                    if let Some((path, len)) = overshoot
+                        && remote.ends_with(&path)
+                    {
+                        // a server that sends far more than it listed, then stalls
+                        let file = std::fs::File::create(&dst).expect("create");
+                        file.set_len(len).expect("sparse");
+                        drop(file);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
                 } else {
                     panic!("unexpected batch line {l}");
                 }
@@ -1325,8 +1558,8 @@ mod tests {
         assert!(!lines.is_empty());
         for l in &lines {
             assert!(
-                l.starts_with("@ls -la \"") || l.starts_with("get -R \""),
-                "{l}"
+                l.starts_with("@ls -la \"") || l.starts_with("get \""),
+                "only listings and single-file gets, never `get -R`: {l}"
             );
             assert!(!l.starts_with('-'), "{l}");
         }
@@ -1616,8 +1849,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downloaded_directory_missing_locally_is_transport_failed() {
-        // the sftp client exits 0 but wrote nothing for a listed directory
+    async fn downloaded_files_missing_locally_are_transport_failed() {
+        // the sftp client exits 0 but wrote nothing for the listed files
         struct Silent(Arc<FakeSftp>);
         #[async_trait::async_trait]
         impl ProcessRunner for Silent {
@@ -1630,7 +1863,7 @@ mod tests {
             ) -> ProcessOutput {
                 let batch =
                     String::from_utf8_lossy(stdin.as_deref().unwrap_or_default()).to_string();
-                if batch.contains("get -R") {
+                if batch.contains("get \"") {
                     return ProcessOutput {
                         stdout: Vec::new(),
                         stderr: Vec::new(),
@@ -1649,8 +1882,8 @@ mod tests {
             Duration::from_secs(30),
         );
         let t = SftpTransport::new(shell, DATA.to_string(), "nodes.master");
-        let why = detail(t.read(&scope()).await.expect_err("missing dir"));
-        assert!(why.contains("missing from the download"), "{why}");
+        let why = detail(t.read(&scope()).await.expect_err("missing files"));
+        assert!(why.contains("was listed but not downloaded"), "{why}");
     }
 
     #[tokio::test]
@@ -1833,5 +2066,239 @@ mod tests {
             .await
             .expect_err("stderr");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    // ---- resource caps (post-review) -------------------------------------------
+
+    /// Answers every `@ls -la` with a fixed directory chain and `filler`
+    /// extra regular files per directory, and counts the sessions it served.
+    struct FloodRunner {
+        filler: usize,
+        sessions: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for FloodRunner {
+        async fn run(
+            &self,
+            _program: &OsStr,
+            _args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            _timeout: Duration,
+        ) -> ProcessOutput {
+            *self.sessions.lock().expect("sessions") += 1;
+            let batch = String::from_utf8(stdin.expect("stdin")).expect("utf8");
+            let mut out = String::new();
+            for l in batch.lines() {
+                let dir = quoted(l).remove(0);
+                out.push_str(&format!("{}\n", line("drwxr-xr-x", 1, &format!("{dir}/."))));
+                let child = match dir.as_str() {
+                    DATA => Some("config"),
+                    d if d == format!("{DATA}/config") => Some("resources"),
+                    d if d == RES => Some("core"),
+                    _ => None,
+                };
+                if let Some(child) = child {
+                    out.push_str(&format!(
+                        "{}\n",
+                        line("drwxr-xr-x", 1, &format!("{dir}/{child}"))
+                    ));
+                }
+                for n in 0..self.filler {
+                    out.push_str(&format!(
+                        "{}\n",
+                        line("-rw-r--r--", 1, &format!("{dir}/f{n}"))
+                    ));
+                }
+            }
+            ProcessOutput {
+                stdout: out.into_bytes(),
+                stderr: Vec::new(),
+                code: 0,
+                timed_out: false,
+            }
+        }
+    }
+
+    fn flood_transport(filler: usize) -> (Arc<FloodRunner>, SftpTransport) {
+        let runner = Arc::new(FloodRunner {
+            filler,
+            sessions: Mutex::new(0),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        (
+            runner,
+            SftpTransport::new(shell, DATA.to_string(), "nodes.master"),
+        )
+    }
+
+    #[test]
+    fn entry_cap_stops_the_parse_at_the_offending_line() {
+        let dir = "/d".to_string();
+        let ok = |n: usize| -> String {
+            (0..n)
+                .map(|i| line("-rw-r--r--", 1, &format!("/d/f{i}")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // exactly at the cap is fine; one more is not
+        assert_eq!(
+            parse_batch_listing_capped(std::slice::from_ref(&dir), ok(5).as_bytes(), 5)
+                .expect("at the cap")[0]
+                .len(),
+            5
+        );
+        assert_eq!(
+            parse_batch_listing_capped(std::slice::from_ref(&dir), ok(6).as_bytes(), 5),
+            Err(ListingError::TooMany)
+        );
+        // the line that passes the cap ends the parse: a hostile line after it
+        // is never looked at (a TooMany, not a Bad)
+        let hostile = format!("{}\n{}", ok(6), "garbage that would be a parse error");
+        assert_eq!(
+            parse_batch_listing_capped(std::slice::from_ref(&dir), hostile.as_bytes(), 5),
+            Err(ListingError::TooMany)
+        );
+        // `.` and `..` do not count as entries
+        let dots = format!(
+            "{}\n{}\n{}",
+            line("drwxr-xr-x", 1, "/d/."),
+            line("drwxr-xr-x", 1, "/d/.."),
+            ok(5)
+        );
+        assert!(parse_batch_listing_capped(std::slice::from_ref(&dir), dots.as_bytes(), 5).is_ok());
+    }
+
+    #[tokio::test]
+    async fn entry_cap_rejects_one_huge_listing_in_its_first_session() {
+        let (runner, t) = flood_transport(READ_MAX_ENTRIES + 1);
+        let why = detail(t.read(&scope()).await.expect_err("flood"));
+        assert!(
+            why.contains(&format!("more than {READ_MAX_ENTRIES} entries")),
+            "{why}"
+        );
+        assert_eq!(*runner.sessions.lock().expect("sessions"), 1);
+    }
+
+    #[tokio::test]
+    async fn entry_cap_is_cumulative_across_levels() {
+        // each directory is far under the cap; three levels together are not
+        let (runner, t) = flood_transport(READ_MAX_ENTRIES / 3 + 100);
+        let why = detail(t.read(&scope()).await.expect_err("cumulative"));
+        assert!(
+            why.contains(&format!("more than {READ_MAX_ENTRIES} entries")),
+            "{why}"
+        );
+        assert_eq!(*runner.sessions.lock().expect("sessions"), 3, "{why}");
+
+        // list_types and the ledger walk keep their own cumulative budget
+        let (_, t) = flood_transport(READ_MAX_ENTRIES + 1);
+        assert!(t.list_types("core").await.is_err());
+        let (_, t) = flood_transport(READ_MAX_ENTRIES + 1);
+        assert!(t.read_ledger("gw", "production").await.is_err());
+    }
+
+    #[test]
+    fn file_cap_is_rechecked_through_the_handle() {
+        // an on-disk file over the cap is refused even if the listing agrees
+        let dir = tempfile::tempdir().expect("dir");
+        let file = std::fs::File::create(dir.path().join("big")).expect("create");
+        file.set_len(READ_MAX_FILE_BYTES + 1).expect("sparse");
+        drop(file);
+        assert!(matches!(
+            read_downloaded(
+                dir.path(),
+                Path::new("big"),
+                READ_MAX_FILE_BYTES + 1,
+                READ_MAX_FILE_BYTES
+            ),
+            Err(Readback::Capped(_))
+        ));
+        // a file that does not match its listing is refused
+        std::fs::write(dir.path().join("small"), b"12345").expect("write");
+        assert!(matches!(
+            read_downloaded(dir.path(), Path::new("small"), 3, READ_MAX_FILE_BYTES),
+            Err(Readback::SizeMismatch {
+                listed: 3,
+                actual: 5
+            })
+        ));
+        assert_eq!(
+            read_downloaded(dir.path(), Path::new("small"), 5, READ_MAX_FILE_BYTES)
+                .ok()
+                .as_deref(),
+            Some(&b"12345"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_download_is_aborted_and_cleaned_up() {
+        // the listing says 10 bytes; the server delivers far more
+        let fake = FakeSftp::new();
+        fake.file(
+            &format!("{RES}/production/ignition/database-connection/A/config.json"),
+            "0123456789",
+        );
+        fake.knobs().overshoot = Some(("A/config.json".to_string(), 8 * 1024 * 1024));
+        let t = transport(&fake);
+        let started = std::time::Instant::now();
+        let why = detail(t.read(&scope()).await.expect_err("overshoot"));
+        assert!(why.contains("it was aborted"), "{why}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stalled transfer was killed, not waited for"
+        );
+        let written = fake.downloads.lock().expect("downloads").clone();
+        assert!(!written.is_empty());
+        for path in written {
+            assert!(!path.exists(), "{} was cleaned up", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn total_cap_is_checked_before_each_chunk() {
+        // 8 files listed at 64 MiB: 512 MiB, under the total cap, so they are
+        // fetched in chunks of 256 MiB (4 files). The first chunk delivers the
+        // real (tiny) bytes, fails its size check, and the second never starts.
+        let fake = FakeSftp::new();
+        for n in 0..8 {
+            fake.file(
+                &format!("{RES}/production/ignition/database-connection/D{n}/config.json"),
+                "{}",
+            );
+        }
+        fake.knobs().lie_size = Some(("config.json".to_string(), READ_MAX_FILE_BYTES));
+        let why = detail(transport(&fake).read(&scope()).await.expect_err("chunk"));
+        assert!(why.contains("was listed as"), "{why}");
+        let get_sessions = fake
+            .session_lines()
+            .iter()
+            .filter(|lines| lines[0].starts_with("get \""))
+            .count();
+        assert_eq!(get_sessions, 1, "the second chunk never started");
+        let first = fake
+            .session_lines()
+            .into_iter()
+            .find(|lines| lines[0].starts_with("get \""))
+            .expect("get session");
+        assert_eq!(first.len(), 4, "a chunk is bounded by listed bytes");
+    }
+
+    #[tokio::test]
+    async fn recursive_get_is_never_issued() {
+        let fake = FakeSftp::new();
+        standard_tree(&fake);
+        transport(&fake).read(&scope()).await.expect("read");
+        transport(&fake)
+            .read_ledger("gw", "production")
+            .await
+            .expect("ledger");
+        let all: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+        assert!(all.iter().any(|l| l.starts_with("get \"")));
+        assert!(all.iter().all(|l| !l.contains("get -R")), "{all:?}");
     }
 }
