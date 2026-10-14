@@ -639,6 +639,19 @@ pub enum DeployCommand {
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
     },
+    /// Plan one environment: compare the rendered tree with the master
+    /// node's live `config/resources/` files and report each unit as
+    /// added, changed, removed, same or unmanaged. Read-only; exits 0
+    /// whether or not anything changed. Reads the host through the
+    /// master's `ssh` or `local` block; resolves no gateway session
+    Plan {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 /// `ign edit` args (13-08): the kubectl-edit loop over ONE resource.

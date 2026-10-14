@@ -230,6 +230,10 @@ enum ActionOutput {
     /// always): `env, gateway, mode, out, files, bytes, render_sha256,
     /// resources, tag_providers, uuids_minted, opaque_files, warnings`.
     DeployRender(actions::deploy::DeployRenderResult),
+    /// `ign deploy plan` (22-02): the read-only plan of one environment
+    /// against the master node's host. Exit 0 whether or not anything
+    /// changed (SF-2); `profile` is the master's profile name.
+    DeployPlan(actions::deploy::DeployPlanResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -408,6 +412,7 @@ impl ActionOutput {
             ActionOutput::TestingRun(result) => render_success(profile, result, compact),
             ActionOutput::Lint(result) => render_success(profile, result, compact),
             ActionOutput::DeployRender(result) => render_success(profile, result, compact),
+            ActionOutput::DeployPlan(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -3090,6 +3095,30 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let result = actions::deploy::deploy_render(&repo, &env, out.as_deref())
                     .map(ActionOutput::DeployRender);
                 (None, result)
+            }
+            // `ign deploy plan` (22-02): read-only. NO `Session::resolve`,
+            // no REST, no scan-lock: the master's profile NAME only labels
+            // the envelope, and the host is read through its ssh/local block.
+            DeployCommand::Plan { env, repo } => {
+                let declared = match actions::deploy::load_declared(&repo, &env) {
+                    Ok(declared) => declared,
+                    Err(err) => return (None, Err(err)),
+                };
+                let master = &declared.target.nodes.master;
+                let profile = Some(master.profile.clone());
+                let reader = match ignition_core::deploy::transport::for_node(
+                    &repo,
+                    &declared.target_file,
+                    "nodes.master",
+                    master,
+                ) {
+                    Ok(reader) => reader,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let result = actions::deploy::deploy_plan(&declared, reader.as_ref())
+                    .await
+                    .map(ActionOutput::DeployPlan);
+                (profile, result)
             }
         },
         Commands::Lint(LintArgs {

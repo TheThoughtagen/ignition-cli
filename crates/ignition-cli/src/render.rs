@@ -183,7 +183,12 @@ pub fn render_error(err: &CoreError, profile: Option<&str>, mode: RenderMode) {
 /// Human mode: active-profile header line first (CORE-01, Pattern 4), then
 /// plain lines per command — always here, never in core.
 fn render_human(out: &ActionOutput, profile: Option<&str>) {
-    if let Some(name) = profile {
+    // `deploy plan` resolves no session: its envelope `profile` only names
+    // the master node, and the documented first human line is the plan
+    // summary, so the CORE-01 header is not printed for it.
+    if let Some(name) = profile
+        && !matches!(out, ActionOutput::DeployPlan(_))
+    {
         println!("[profile: {name}]");
     }
     match out {
@@ -284,6 +289,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::TestingRun(result) => render_testing_run_human(result),
         ActionOutput::Lint(result) => render_lint_human(result),
         ActionOutput::DeployRender(result) => render_deploy_render_human(result),
+        ActionOutput::DeployPlan(result) => render_deploy_plan_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1404,6 +1410,40 @@ fn render_deploy_render_human(result: &ignition_core::actions::deploy::DeployRen
     if let Some(out) = &result.out {
         println!("wrote {} files to {}", result.files, out);
     }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `ign deploy plan` human form: a summary line, one line per unit that is
+/// not `same`, then the plan digest. Paths and hashes only; no file bytes.
+fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanResult) {
+    let summary = &result.summary;
+    println!(
+        "plan {} ({}, mode {}) via {}: {} added, {} changed, {} removed, {} same, {} unmanaged",
+        result.gateway,
+        result.env,
+        result.mode,
+        result.transport,
+        summary.added,
+        summary.changed,
+        summary.removed,
+        summary.same,
+        summary.unmanaged
+    );
+    for entry in &result.entries {
+        if entry.status == ignition_core::deploy::plan::PlanStatus::Same {
+            continue;
+        }
+        println!(
+            "{} {} core={} live_in={}",
+            entry.status.word(),
+            entry.key,
+            entry.core.word(),
+            entry.live_in.join(",")
+        );
+    }
+    println!("plan_sha256 {}", result.plan_sha256);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }

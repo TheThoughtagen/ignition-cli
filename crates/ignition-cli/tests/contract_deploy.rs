@@ -593,3 +593,251 @@ fn possible_secret_warning_names_path_not_value() {
         "{warnings:?}"
     );
 }
+
+// ---- 22-02: `deploy plan` -------------------------------------------------
+
+/// A tracer repo whose `targets/dev.yaml` master is `profile: dev` followed
+/// by `master_extra` (raw YAML lines, indented four spaces), plus a scratch
+/// directory. Written once; `local_tracer` builds on it. 22-03 reuses it.
+fn tracer_with_master(master_extra: &str) -> (tempfile::TempDir, PathBuf) {
+    let (tmp, repo) = tracer_copy();
+    let yaml = format!(
+        "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n{master_extra}"
+    );
+    std::fs::write(repo.join("targets/dev.yaml"), yaml).expect("target file");
+    (tmp, repo)
+}
+
+/// A `local:` tracer copy with a live data directory equal to the ACTUAL
+/// render (render may mint a uuid, so the live tree is built from
+/// `ign deploy render --out`, never from the source files). Returns
+/// `(scratch, repo, data_dir)`; the live mode collection is
+/// `<data_dir>/config/resources/dev/`.
+fn local_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    copy_dir(Path::new(TRACER_REPO), &repo);
+    let data = scratch.path().join("data");
+    let live = data.join("config").join("resources").join("dev");
+    std::fs::create_dir_all(&live).expect("live dir");
+    let yaml = format!(
+        "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+        data.display()
+    );
+    std::fs::write(repo.join("targets/dev.yaml"), yaml).expect("target file");
+
+    let out_dir = scratch.path().join("out");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "render", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    copy_dir(&out_dir, &live);
+    std::fs::remove_file(live.join("render.json")).expect("drop render.json");
+    (scratch, repo, data)
+}
+
+/// The first rendered file in the live mode collection, byte order.
+fn first_live_file(data: &Path) -> PathBuf {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&data.join("config/resources/dev"), &mut found);
+    found.sort();
+    found.into_iter().next().expect("a live file")
+}
+
+fn plan_json(repo: &Path, cmd: &mut Command) -> std::process::Output {
+    cmd.args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(repo)
+        .output()
+        .expect("spawn ign")
+}
+
+#[test]
+fn plan_cli_live_equal_to_render_exits_0() {
+    let (_scratch, repo, _data) = local_tracer();
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["profile"], "dev");
+    let data = envelope["data"].as_object().expect("data object");
+    // serde_json maps sort their keys; compare as sets.
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut expected = vec![
+        "env",
+        "gateway",
+        "mode",
+        "node",
+        "transport",
+        "render_sha256",
+        "plan_sha256",
+        "summary",
+        "entries",
+        "warnings",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
+    assert_eq!(data["node"], "master");
+    assert_eq!(data["transport"], "local");
+    assert_eq!(data["summary"]["has_changes"], false);
+    let entries = data["entries"].as_array().expect("entries");
+    assert!(!entries.is_empty());
+    for entry in entries {
+        assert_eq!(entry["status"], "same", "{entry}");
+    }
+}
+
+#[test]
+fn plan_cli_byte_change_still_exits_0() {
+    let (_scratch, repo, data) = local_tracer();
+    let file = first_live_file(&data);
+    let mut bytes = std::fs::read(&file).expect("read live file");
+    bytes.push(b' ');
+    std::fs::write(&file, bytes).expect("edit live file");
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "SF-2: a plan with changes still exits 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["summary"]["has_changes"], true);
+    assert_eq!(envelope["data"]["summary"]["changed"], 1);
+    let changed = envelope["data"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|e| e["status"] == "changed")
+        .count();
+    assert_eq!(changed, 1);
+}
+
+#[test]
+fn plan_cli_needs_no_secret() {
+    let (_scratch, repo, _data) = local_tracer();
+    let empty_cfg = tempfile::tempdir().expect("tempdir");
+    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    cmd.env("IGNITION_CLI_CONFIG", empty_cfg.path().join("absent.toml"));
+    for var in [
+        "IGNITION_URL",
+        "IGNITION_TOKEN",
+        "IGNITION_PROFILE",
+        "IGNITION_JSON",
+        "IGNITION_USER",
+        "IGNITION_PASSWORD",
+        "IGNITION_TOKEN_DEV",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn plan_cli_master_without_host_access_exits_2() {
+    let (_tmp, repo) = tracer_with_master("");
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "a refusal leaves stdout empty");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_tree_invalid");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("nodes.master"), "{message}");
+}
+
+#[test]
+fn plan_cli_unreadable_data_dir_exits_4() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let missing = scratch.path().join("no-such-data-dir");
+    let (_tmp, repo) = tracer_with_master(&format!(
+        "    local:\n      data_dir: '{}'\n",
+        missing.display()
+    ));
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "a refusal leaves stdout empty");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "transport_failed");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("nodes.master"), "{message}");
+}
+
+#[test]
+fn plan_cli_human_output_lines() {
+    let (_scratch, repo, data) = local_tracer();
+    let file = first_live_file(&data);
+    let mut bytes = std::fs::read(&file).expect("read live file");
+    bytes.push(b' ');
+    std::fs::write(&file, bytes).expect("edit live file");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[0].starts_with(
+            "plan tracer-gw (dev, mode dev) via local: 0 added, 1 changed, 0 removed, "
+        ),
+        "{stdout}"
+    );
+    assert!(lines[0].ends_with(" unmanaged"), "{stdout}");
+    let changed: Vec<&&str> = lines.iter().filter(|l| l.starts_with("changed ")).collect();
+    assert_eq!(changed.len(), 1, "{stdout}");
+    assert!(
+        changed[0].contains(" core=") && changed[0].contains(" live_in="),
+        "{stdout}"
+    );
+    let last = lines.last().expect("last line");
+    let hex = last.strip_prefix("plan_sha256 ").expect("plan_sha256 last");
+    assert_eq!(hex.len(), 64, "{last}");
+    assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{last}");
+}

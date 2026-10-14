@@ -91,7 +91,8 @@ pub enum PlanStatus {
 }
 
 impl PlanStatus {
-    fn word(self) -> &'static str {
+    /// The status word as serialized and printed.
+    pub fn word(self) -> &'static str {
         match self {
             PlanStatus::Added => "added",
             PlanStatus::Changed => "changed",
@@ -119,7 +120,8 @@ pub enum CoreRelation {
 }
 
 impl CoreRelation {
-    fn word(self) -> &'static str {
+    /// The relation word as serialized and printed.
+    pub fn word(self) -> &'static str {
         match self {
             CoreRelation::None => "none",
             CoreRelation::Identical => "identical",
