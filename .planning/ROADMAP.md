@@ -293,53 +293,61 @@ Plans:
 **Capture first**: C6 (can `svc-ignition-deploy` write a home-relative staging directory outside `data/config/`, and is that directory ever read as a collection; this decides Decision B); C7a (Win32-OpenSSH sftp path form `/C:/` vs `C:/`, quoting, key ACL, the stdin hang, CLIXML on stderr, sftp-server long paths; all INFERRED until captured); OQ5 (real-transport write and scan timings from WFLWVM01 with a prod-sized tree, setting the `holdTimeout` p95 and margin and the Defender-exclusion decision). All three block Phase 23 planning.
 **Exit gate before Phase 23 is planned**: Decision B is recorded from C6, and the hold budget measured under OQ5 (p95, floored, ceilinged) replaces the spec's 5 s figure, which came from a local `docker cp`.
 **Constraints**: Decision A governs the verify verdict (`ok:true`, `data.ok=false`, slug in `data`, exit 6; verdict slugs never appear in exit tables). `plan` always exits 0; no `--detailed-exitcode` (SF-2). `--base` is the three-way drift input (SF-4); the apply-side drift gate is Phase 23. `pull` is in scope; a core-strip command is not (SF-5). System `ssh`/`sftp` only, with no SSH library crate. One layered seam: `RemoteShell` under `FileTransport` (`SftpTransport`, `LocalFsTransport`). `robocopy /MIR` is rejected; deletes come only from the bounded list. Snapshots and staging never go inside `data/config/resources/`, and nothing dot-named is created there (Designer `NameInvalidException`).
-**Plans**: 12 plans (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06 ∥ 22-07, 7 = 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12)
+**Plans**: 14 plans (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14)
 
 Plans:
 **Wave 1**
 
-- [ ] 22-01-PLAN.md — Tracer: `ign deploy plan` end to end over a `local:` node (effective view + `live_in`, five statuses incl. `unmanaged`, `core` relations, golden `plan_sha256`), `transport_failed`, surface rows
+- [ ] 22-01-PLAN.md — Tracer: `deploy_plan` end to end at library level over a `local:` node (transport seam, `LocalFsTransport`, effective view + `live_in`, five statuses incl. `unmanaged`, `core` relations, golden `plan_sha256`), `transport_failed`
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 22-02-PLAN.md — Contract-vocabulary checkpoint; ledger v1 + strict reader + `deploy_ledger_invalid`; exact delete set, `removed`, `shadows_removal`, destructive/lockout flags
+- [ ] 22-02-PLAN.md — `ign deploy plan` verb surface: clap + `main.rs` dispatch (no session), human output, TUI route, MCP tool, stdout purity, README section + `nodes.*.local` row, REQUIREMENTS `unmanaged` note
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 22-03-PLAN.md — `--base` three-way drift on a re-hashed render (closes R-03), `--diff` with secret withholding, plan secret canary
+- [ ] 22-03-PLAN.md — Contract-vocabulary checkpoint; ledger v1 + strict reader + `deploy_ledger_invalid`; exact delete set, `removed`, `shadows_removal`, destructive/lockout flags
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 22-04-PLAN.md — `ProcessRunner` (timeouts, kill-on-drop) and `RemoteShell` (hardened argv via `ssh -G`, repo `known_hosts` pin, `key_env` temp key, timeouts); target ssh fields
+- [ ] 22-04-PLAN.md — `--base` three-way drift on a re-hashed render (closes R-03), `--diff` with secret withholding, plan secret canary
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 22-05-PLAN.md — `SftpTransport` read half (existence-first, client-side hashes) proven with `sftp -D`; plan parity with the local transport
+- [ ] 22-05-PLAN.md — `ProcessRunner` (timeouts, kill-on-drop) and `RemoteShell` (hardened argv via `ssh -G`, repo `known_hosts` pin, `key_env` temp key, timeouts); target ssh fields
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 22-06-PLAN.md — `TreeMirror` write half (stage/commit, explicit delete set, both staging modes) on scratch dirs; `write_half_unreachable`
-- [ ] 22-07-PLAN.md — `ign deploy pull` (core→base, mode→overlay, render fixpoint, Embedded skip, `--yes` guard, GUARDED_OPS + MCP confirm); pull→render→plan empty
+- [ ] 22-06-PLAN.md — `SftpTransport` read half (existence-first, client-side hashes) proven with `sftp -D`; plan parity with the local transport
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 22-08-PLAN.md — Rig captures CV1–CV3 (log shape/window, read-back equality, post-scan bytes); live pull→render→plan empty on 8.3.6
+- [ ] 22-07-PLAN.md — `TreeMirror` write half (stage/commit, explicit delete set, both staging modes) on scratch dirs; `write_half_unreachable`
+- [ ] 22-08-PLAN.md — `ign deploy pull` (core→base, mode→overlay, render fixpoint, Embedded skip, `--yes` guard, GUARDED_OPS + MCP confirm); pull→render→plan empty
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 22-09-PLAN.md — `ign deploy verify` (six checks, tag probes, verdict envelope exit 6, dated README exception), live rig verify, five CI gates
+- [ ] 22-09-PLAN.md — Rig captures CV1–CV3 (log shape/window, read-back equality, post-scan bytes); live pull→render→plan empty on 8.3.6
 
 **Wave 9** *(blocked on Wave 8 completion)*
 
-- [ ] 22-10-PLAN.md — WFLWVM01 provisioning (human), captures C7a, C6, C5-NTFS; Decision B checkpoint with the ledger location
+- [ ] 22-10-PLAN.md — Verify core: six-check engine, read-only `deploy_verify` gathering, `ForbidWrites`, verdict slug + `failure_exit_code` (exit 6), live rig verify green then red
 
 **Wave 10** *(blocked on Wave 9 completion)*
 
-- [ ] 22-11-PLAN.md — Windows transport code from C7a (path form, rename, PowerShell `-EncodedCommand`), Decision B ledger location; live proof on WFLWVM01 (SC-1)
+- [ ] 22-11-PLAN.md — `ign deploy verify` verb surface: profile resolution, `main.rs` exit-6 hook, TUI route, MCP tool, dated README verdict exception (DSURF-04), five CI gates + installed-binary smoke
 
 **Wave 11** *(blocked on Wave 10 completion)*
 
-- [ ] 22-12-PLAN.md — OQ5 timings with and without a Defender exclusion, hold budget, D-04 defaults revisited, exit gate recorded in STATE/ROADMAP
+- [ ] 22-12-PLAN.md — WFLWVM01 provisioning (human), captures C7a, C6, C5-NTFS; Decision B checkpoint with the ledger location
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
+- [ ] 22-13-PLAN.md — Windows transport code from C7a (path form, rename, PowerShell `-EncodedCommand`), Decision B ledger location; live proof on WFLWVM01 (SC-1)
+
+**Wave 13** *(blocked on Wave 12 completion)*
+
+- [ ] 22-14-PLAN.md — OQ5 timings with and without a Defender exclusion, hold budget, D-04 defaults revisited, exit gate recorded in STATE/ROADMAP
 
 ### Phase 23: Guarded Apply & Rollback
 
@@ -416,7 +424,7 @@ Plans:
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
-| 22. Transport, Plan, Pull & Verify | v1.6 | 0/12 | Planned | — |
+| 22. Transport, Plan, Pull & Verify | v1.6 | 0/14 | Planned | — |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
