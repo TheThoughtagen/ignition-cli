@@ -17,6 +17,7 @@
 pub mod deploy_scenario;
 pub mod fake_deploy;
 pub mod plan_fixture;
+pub mod sftp_server;
 
 /// Wraps a [`wiremock::MockServer`] with Ignition-shaped fixture builders.
 pub struct IgnitionMock {

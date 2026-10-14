@@ -5,6 +5,8 @@
 //! generated argv; it fails with a clear message when `ssh` is absent and is
 //! never skipped. `windows_key_acl` runs on the windows CI leg only.
 
+mod common;
+
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -632,16 +634,7 @@ fn require_success_maps_every_failure_shape() {
 
 #[cfg(unix)]
 fn sftp_server() -> PathBuf {
-    [
-        "/usr/libexec/sftp-server",
-        "/usr/lib/openssh/sftp-server",
-        "/usr/lib/ssh/sftp-server",
-        "/usr/libexec/openssh/sftp-server",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists())
-    .expect("an OpenSSH sftp-server binary is needed for the local sftp seam test")
+    common::sftp_server::sftp_server_path()
 }
 
 #[cfg(unix)]
@@ -738,6 +731,466 @@ async fn local_sftp_server_keeps_hostile_path_text_inert() {
         assert!(
             !dir.join("IGN_PWNED_MARKER").exists(),
             "a hostile path text ran as a command"
+        );
+    }
+}
+
+// ---- the ssh read half over a real sftp-server (22-06) ----------------------
+//
+// Every test below drives `sftp -D <sftp-server>`: the actual sftp protocol
+// against a local server process, no sshd. `sftp_server_path()` panics, never
+// skips, when no server binary is installed.
+
+#[cfg(unix)]
+mod sftp_read {
+    use super::*;
+    use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
+    use ignition_core::actions::deploy::{PlanOptions, deploy_plan, load_declared};
+    use ignition_core::deploy::transport::local::LocalFsTransport;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use ignition_core::deploy::transport::{self, ObservedFiles, Scope, TreeReader};
+
+    fn sftp_reader(data_dir: &Path) -> SftpTransport {
+        sftp_reader_with(data_dir, runner())
+    }
+
+    fn sftp_reader_with(data_dir: &Path, runner: Arc<dyn ProcessRunner>) -> SftpTransport {
+        let shell = RemoteShell::local_sftp_server(&sftp_server(), runner, Duration::from_secs(60));
+        let root = posix_root(&data_dir.display().to_string()).expect("posix data dir");
+        SftpTransport::new(shell, root, "nodes.master")
+    }
+
+    fn local_reader(data_dir: &Path) -> LocalFsTransport {
+        LocalFsTransport::new(data_dir.to_path_buf(), "nodes.master")
+    }
+
+    fn scope_of(fx: &PlanFixture) -> Scope {
+        let (declared, _) = fx.load("dev");
+        Scope::from_manifest(&declared.manifest, MODE)
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    fn failure_detail(err: CoreError) -> String {
+        match err {
+            CoreError::TransportFailed { detail, .. } => detail,
+            other => panic!("expected transport_failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_read_matches_local_read() {
+        let fx = PlanFixture::new();
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        fx.core(
+            "ignition/database-translator/POSTGRES/config.json",
+            b"{\"core\":true}",
+        );
+        fx.core("ignition/database-translator/POSTGRES/resource.json", b"{}");
+        fx.core("ignition/general-alarm-settings/config.json", b"{}");
+        fx.mode(
+            "ignition/database-translator/POSTGRES/.dotfile",
+            b"hidden but real",
+        );
+        fx.mode(
+            "ignition/database-translator/Empty Dir,1/nested/deeper/file.bin",
+            &[0u8, 255, 10, 13],
+        );
+        fx.local(
+            "ignition/database-translator/POSTGRES/config.json",
+            b"{\"local\":1}",
+        );
+        let scope = scope_of(&fx);
+
+        let want = local_reader(fx.data_dir())
+            .read(&scope)
+            .await
+            .expect("local read");
+        assert!(!want.core.is_empty() && !want.mode.is_empty() && !want.local_units.is_empty());
+        let reader = sftp_reader(fx.data_dir());
+        let got = reader.read(&scope).await.expect("sftp read");
+        assert_eq!(got, want);
+        println!("sftp sessions for one read: {}", reader.sessions());
+
+        for collection in ["core", MODE, "local", "nothing"] {
+            assert_eq!(
+                reader.list_types(collection).await.expect("sftp types"),
+                local_reader(fx.data_dir())
+                    .list_types(collection)
+                    .await
+                    .expect("local types"),
+                "{collection}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_plan_matches_local_plan() {
+        let fx = PlanFixture::new();
+        let (declared, local) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        fx.core(
+            "ignition/database-translator/POSTGRES/config.json",
+            b"{\"core\":true}",
+        );
+        fx.mode("ignition/database-translator/OLD/config.json", b"{}");
+        fx.mode("ignition/database-translator/OLD/resource.json", b"{}");
+        fx.mode(
+            "ignition/database-translator/POSTGRES/config.json",
+            b"{\"drifted\":1}",
+        );
+        fx.local("ignition/general-alarm-settings/config.json", b"{}");
+        fx.ledger(
+            GATEWAY,
+            MODE,
+            &[
+                "ignition/database-translator/OLD/config.json",
+                "ignition/database-translator/OLD/resource.json",
+            ],
+        );
+        let want = deploy_plan(&declared, local.as_ref(), &PlanOptions::default())
+            .await
+            .expect("local plan");
+        assert_eq!(want.delete_set.files.len(), 2, "{:?}", want.delete_set);
+        assert!(want.summary.has_changes);
+
+        let sftp = sftp_reader(fx.data_dir());
+        let got = deploy_plan(&declared, &sftp, &PlanOptions::default())
+            .await
+            .expect("sftp plan");
+        assert_eq!(got.plan_sha256, want.plan_sha256);
+        assert_eq!(got.delete_set, want.delete_set);
+        assert_eq!(
+            serde_json::to_string(&got).expect("json"),
+            serde_json::to_string(&want).expect("json"),
+            "same entries, delete set and hash"
+        );
+        // and the transport label is the only thing that differs once the
+        // node is an ssh node
+        let mut as_ssh = serde_json::to_value(&got).expect("json");
+        as_ssh["transport"] = serde_json::json!("ssh");
+        assert_eq!(as_ssh["plan_sha256"], serde_json::json!(want.plan_sha256));
+    }
+
+    #[tokio::test]
+    async fn sftp_spaces_and_commas() {
+        let root = tempfile::tempdir().expect("root");
+        let data = root.path().join("gw data, 1");
+        let res = data.join("config/resources");
+        write(
+            &res.join("dev/ignition/database-translator/My DB, the 1st/config.json"),
+            b"{\"a\":1}",
+        );
+        write(
+            &res.join("core/ignition/database-translator/Other, two/resource.json"),
+            b"{}",
+        );
+        let scope = Scope {
+            mode: "dev".to_string(),
+            types: vec![("ignition".to_string(), "database-translator".to_string())],
+            tag_providers: Vec::new(),
+        };
+        let got = sftp_reader(&data).read(&scope).await.expect("sftp read");
+        let want = local_reader(&data).read(&scope).await.expect("local read");
+        assert_eq!(got, want);
+        assert_eq!(got.mode.len(), 1);
+        assert_eq!(got.core.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sftp_hostile_but_legal_names_are_inert() {
+        let root = tempfile::tempdir().expect("root");
+        let data = root.path().join("data");
+        let res = data.join("config/resources");
+        let name = "it's $(touch IGN_PWNED_MARKER) `id`; echo !x";
+        write(
+            &res.join(format!(
+                "dev/ignition/database-translator/{name}/config.json"
+            )),
+            b"{}",
+        );
+        let scope = Scope {
+            mode: "dev".to_string(),
+            types: vec![("ignition".to_string(), "database-translator".to_string())],
+            tag_providers: Vec::new(),
+        };
+        let got = sftp_reader(&data).read(&scope).await.expect("sftp read");
+        assert_eq!(got, local_reader(&data).read(&scope).await.expect("local"));
+        assert_eq!(got.mode.len(), 1);
+        for dir in [root.path(), &data, Path::new(".")] {
+            assert!(!dir.join("IGN_PWNED_MARKER").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_unsafe_names_are_refused() {
+        for name in ["odd[1]", "back\\slash", "q\"uote", "g*lob"] {
+            let root = tempfile::tempdir().expect("root");
+            let data = root.path().join("data");
+            write(
+                &data.join(format!(
+                    "config/resources/dev/ignition/database-translator/{name}/config.json"
+                )),
+                b"{}",
+            );
+            let scope = Scope {
+                mode: "dev".to_string(),
+                types: vec![("ignition".to_string(), "database-translator".to_string())],
+                tag_providers: Vec::new(),
+            };
+            let why = failure_detail(sftp_reader(&data).read(&scope).await.expect_err(name));
+            assert!(why.contains("unsafe"), "{name}: {why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_absent_mode_collection_is_empty() {
+        let fx = PlanFixture::new();
+        // config/resources exists, no collection does
+        let scope = scope_of(&fx);
+        let got = sftp_reader(fx.data_dir()).read(&scope).await.expect("read");
+        assert_eq!(got, ObservedFiles::default());
+        // a core collection without the mode collection
+        fx.core("ignition/database-translator/POSTGRES/config.json", b"{}");
+        let got = sftp_reader(fx.data_dir()).read(&scope).await.expect("read");
+        assert_eq!(got.core.len(), 1);
+        assert!(got.mode.is_empty());
+        // a data dir without config/resources is a failure, not emptiness
+        let bare = tempfile::tempdir().expect("bare");
+        let why = failure_detail(
+            sftp_reader(bare.path())
+                .read(&scope)
+                .await
+                .expect_err("bare"),
+        );
+        assert!(why.contains("gateway data directory"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn sftp_absent_ledger_is_none() {
+        let fx = PlanFixture::new();
+        let reader = sftp_reader(fx.data_dir());
+        assert_eq!(reader.read_ledger(GATEWAY, MODE).await.expect("none"), None);
+        std::fs::create_dir_all(fx.data_dir().join("ign-deploy")).expect("dir");
+        assert_eq!(reader.read_ledger(GATEWAY, MODE).await.expect("none"), None);
+        std::fs::create_dir_all(fx.data_dir().join("ign-deploy").join(GATEWAY).join(MODE))
+            .expect("dir");
+        assert_eq!(reader.read_ledger(GATEWAY, MODE).await.expect("none"), None);
+        // an unreadable host is never an absent ledger
+        let missing = fx.data_dir().join("nowhere");
+        let err = sftp_reader(&missing)
+            .read_ledger(GATEWAY, MODE)
+            .await
+            .expect_err("missing data dir");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn sftp_ledger_present_round_trips() {
+        let fx = PlanFixture::new();
+        fx.ledger(
+            GATEWAY,
+            MODE,
+            &["ignition/database-translator/A/config.json"],
+        );
+        let want = local_reader(fx.data_dir())
+            .read_ledger(GATEWAY, MODE)
+            .await
+            .expect("local")
+            .expect("present");
+        let got = sftp_reader(fx.data_dir())
+            .read_ledger(GATEWAY, MODE)
+            .await
+            .expect("sftp")
+            .expect("present");
+        assert_eq!(got, want);
+        // a symlinked ledger is a deploy_ledger_invalid, as locally
+        let ledger = fx
+            .data_dir()
+            .join("ign-deploy")
+            .join(GATEWAY)
+            .join(MODE)
+            .join("ledger.json");
+        std::fs::rename(&ledger, ledger.with_file_name("real.json")).expect("rename");
+        std::os::unix::fs::symlink("real.json", &ledger).expect("symlink");
+        let err = sftp_reader(fx.data_dir())
+            .read_ledger(GATEWAY, MODE)
+            .await
+            .expect_err("symlink");
+        assert!(
+            matches!(err, CoreError::DeployLedgerInvalid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Restores permissions so the temp dir can be removed.
+    struct Chmod(PathBuf, u32);
+    impl Drop for Chmod {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_permission_denied_is_transport_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = PlanFixture::new();
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        let scope = scope_of(&fx);
+        let type_dir = fx.collection_dir(MODE).join("ignition/database-translator");
+        let file = type_dir.join("POSTGRES/config.json");
+
+        // a directory the server cannot open
+        let _restore_dir = Chmod(type_dir.clone(), 0o755);
+        std::fs::set_permissions(&type_dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read_dir(&type_dir).is_ok() {
+            println!("running with privileges that ignore mode bits; permission cases skipped");
+            return;
+        }
+        let why = failure_detail(
+            sftp_reader(fx.data_dir())
+                .read(&scope)
+                .await
+                .expect_err("denied dir"),
+        );
+        assert!(why.contains("exit code 1"), "{why}");
+        std::fs::set_permissions(&type_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // a file the server cannot read
+        let _restore_file = Chmod(file.clone(), 0o644);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let why = failure_detail(
+            sftp_reader(fx.data_dir())
+                .read(&scope)
+                .await
+                .expect_err("denied file"),
+        );
+        assert!(why.contains("exit code 1"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn sftp_glob_data_dir_refused_before_spawn() {
+        let recording = Arc::new(Recording::default());
+        let shell = RemoteShell::local_sftp_server(
+            &sftp_server(),
+            recording.clone(),
+            Duration::from_secs(60),
+        );
+        // posix_root refuses it, and a transport built without it still
+        // refuses before any process is spawned
+        assert!(posix_root("/tmp/da[ta]").is_err());
+        let reader = SftpTransport::new(shell, "/tmp/da[ta]".to_string(), "nodes.master");
+        let scope = Scope {
+            mode: "dev".to_string(),
+            types: vec![("ignition".to_string(), "database-translator".to_string())],
+            tag_providers: Vec::new(),
+        };
+        reader.read(&scope).await.expect_err("glob data dir");
+        reader.list_types("core").await.expect_err("glob data dir");
+        reader
+            .read_ledger("gw", "dev")
+            .await
+            .expect_err("glob data dir");
+        assert!(
+            recording.calls.lock().expect("calls").is_empty(),
+            "no process was spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_get_skips_symlinks_documented() {
+        // Pins the OpenSSH behaviour that makes the listing check necessary:
+        // `get -R` of a tree holding a symlink exits 0 and silently skips it.
+        // If this ever changes, the T-22-28 reasoning needs another look.
+        let remote = tempfile::tempdir().expect("remote");
+        let tree = remote.path().join("tree");
+        write(&tree.join("real.txt"), b"x");
+        std::os::unix::fs::symlink("real.txt", tree.join("link.txt")).expect("symlink");
+        let local = tempfile::tempdir().expect("local");
+        let shell =
+            RemoteShell::local_sftp_server(&sftp_server(), runner(), Duration::from_secs(60));
+        let out = shell
+            .sftp_batch(&[SftpOp::GetRecursive {
+                remote: tree.display().to_string(),
+                local: local.path().to_path_buf(),
+            }])
+            .await
+            .expect("batch");
+        shell.require_success("get", out).expect("exit 0");
+        assert!(local.path().join("tree/real.txt").exists());
+        assert!(!local.path().join("tree/link.txt").exists(), "skipped");
+    }
+
+    #[tokio::test]
+    async fn sftp_symlink_in_resource_is_refused() {
+        let fx = PlanFixture::new();
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        let scope = scope_of(&fx);
+        let unit = fx
+            .collection_dir(MODE)
+            .join("ignition/database-translator/POSTGRES");
+        std::os::unix::fs::symlink("config.json", unit.join("alias.json")).expect("symlink");
+        let why = failure_detail(
+            sftp_reader(fx.data_dir())
+                .read(&scope)
+                .await
+                .expect_err("symlink"),
+        );
+        assert!(why.contains("alias.json"), "{why}");
+        assert!(why.contains("is a symlink; symlinks are refused"), "{why}");
+        // the local transport refuses the same tree for the same reason
+        let local = failure_detail(
+            local_reader(fx.data_dir())
+                .read(&scope)
+                .await
+                .expect_err("symlink"),
+        );
+        assert!(local.contains("symlinks are refused"), "{local}");
+    }
+
+    #[tokio::test]
+    async fn for_node_builds_sftp_for_linux_and_refuses_windows() {
+        let fx = PlanFixture::new();
+        let ssh_yaml = |os: &str, data_dir: &str| {
+            format!(
+                "    ssh:\n      host: gw.example.test\n      user: svc\n      os: {os}\n      data_dir: '{data_dir}'\n      known_hosts: ssh/prod.known_hosts\n"
+            )
+        };
+        let load = |yaml: String| {
+            let repo = fx.repo_with_master("dev", &yaml);
+            std::fs::create_dir_all(repo.join("ssh")).expect("ssh dir");
+            std::fs::write(repo.join("ssh/prod.known_hosts"), KNOWN_HOSTS).expect("known_hosts");
+            let declared = load_declared(&repo, "dev").expect("declared");
+            let node = declared.target.nodes.master.clone();
+            (
+                transport::for_node(&repo, &declared.target_file, "nodes.master", &node),
+                declared.target_file,
+            )
+        };
+        let (linux, _) = load(ssh_yaml("linux", "/usr/local/bin/ignition/data"));
+        assert!(linux.is_ok(), "linux ssh node builds a reader");
+
+        let (windows, _) = load(ssh_yaml(
+            "windows",
+            "C:\\Program Files\\Inductive Automation\\Ignition\\data",
+        ));
+        let err = windows.err().expect("windows refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("nodes.master.ssh.os"), "{err}");
+
+        let (bad_dir, _) = load(ssh_yaml("linux", "relative/data"));
+        let err = bad_dir.err().expect("relative refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(
+            err.to_string().contains("nodes.master.ssh.data_dir"),
+            "{err}"
         );
     }
 }
