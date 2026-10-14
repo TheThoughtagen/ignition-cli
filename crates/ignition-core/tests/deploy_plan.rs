@@ -9,11 +9,12 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::plan_fixture::PlanFixture;
+use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
 use ignition_core::actions::deploy::{DeployPlanResult, deploy_plan, load_declared};
 use ignition_core::deploy::layout::RelPath;
-use ignition_core::deploy::plan::{CoreRelation, PlanStatus, plan as plan_units};
-use ignition_core::deploy::transport::{self, FileBlob, ObservedFiles, READ_MAX_FILE_BYTES};
+use ignition_core::deploy::ledger::Ledger;
+use ignition_core::deploy::plan::{CoreRelation, Plan, PlanStatus, plan as plan_with_ledger};
+use ignition_core::deploy::transport::{self, FileBlob, ObservedFiles, READ_MAX_FILE_BYTES, Scope};
 use ignition_core::deploy::tree::{EMPTY_RENDER_SHA256, RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
 use sha2::{Digest, Sha256};
@@ -244,6 +245,60 @@ fn layer(files: &[(&str, &str)]) -> BTreeMap<RelPath, FileBlob> {
             )
         })
         .collect()
+}
+
+/// The scope the pure-engine tests plan under: every type they use, and
+/// tag provider `P`.
+fn scope() -> Scope {
+    Scope {
+        mode: MODE.to_string(),
+        types: [
+            "database-translator",
+            "database-connection",
+            "opc-connection",
+            "identity-provider",
+            "security-zone",
+            "store-and-forward-engine",
+            "alarm-journal",
+        ]
+        .iter()
+        .map(|t| ("ignition".to_string(), (*t).to_string()))
+        .collect(),
+        tag_providers: vec!["P".to_string()],
+    }
+}
+
+/// The 22-01 plan call: no ledger.
+fn plan_units(tree: &RenderedTree, live: &ObservedFiles) -> Plan {
+    plan_with_ledger(tree, live, None, &scope())
+}
+
+fn ledger_of(files: &[&str]) -> Ledger {
+    let mut files: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+    files.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    Ledger {
+        schema_version: 1,
+        gateway: GATEWAY.to_string(),
+        mode: MODE.to_string(),
+        render_sha256: "0".repeat(64),
+        run_id: "test".to_string(),
+        files,
+    }
+}
+
+fn plan_ledger(tree: &RenderedTree, live: &ObservedFiles, files: &[&str]) -> Plan {
+    plan_with_ledger(tree, live, Some(&ledger_of(files)), &scope())
+}
+
+fn deleted(p: &Plan) -> Vec<&str> {
+    p.delete_set.files.iter().map(|f| f.as_str()).collect()
+}
+
+fn entry<'a>(p: &'a Plan, key: &str) -> &'a ignition_core::deploy::plan::PlanEntry {
+    p.entries
+        .iter()
+        .find(|e| e.key == key)
+        .unwrap_or_else(|| panic!("no entry {key}"))
 }
 
 fn observed(core: &[(&str, &str)], mode: &[(&str, &str)]) -> ObservedFiles {
@@ -522,6 +577,11 @@ fn recompute_plan_sha256(result: &DeployPlanResult) -> String {
             ));
         }
     }
+    let mut deletes: Vec<&str> = result.delete_set.files.iter().map(|f| f.as_str()).collect();
+    deletes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    for path in deletes {
+        text.push_str(&format!("D\0{path}\n"));
+    }
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
@@ -630,4 +690,442 @@ async fn caps_and_hostile_tree() {
         assert_eq!(err.code(), "transport_failed");
         assert!(err.to_string().contains("symlink"), "{err}");
     }
+}
+
+// ---------------------------------------------------------------------
+// 22-03: the declared-names ledger, the delete set, removed, flags
+// ---------------------------------------------------------------------
+
+const A_CFG: &str = "ignition/database-translator/A/config.json";
+const A_RES: &str = "ignition/database-translator/A/resource.json";
+const B_CFG: &str = "ignition/database-translator/B/config.json";
+const B_RES: &str = "ignition/database-translator/B/resource.json";
+
+#[test]
+fn delete_set_is_ledger_minus_rendered() {
+    let a = [(A_CFG, "{}"), (A_RES, "{}")];
+    let both = [(A_CFG, "{}"), (A_RES, "{}"), (B_CFG, "{}"), (B_RES, "{}")];
+    let p = plan_ledger(&rendered(&a), &observed(&[], &both), &both.map(|(p, _)| p));
+
+    // adjacency: A's paths are in the ledger and rendered, never deleted
+    assert_eq!(deleted(&p), [B_CFG, B_RES]);
+    let b = entry(&p, "ignition/database-translator/B");
+    assert_eq!(b.status, PlanStatus::Removed);
+    assert!(b.destructive);
+    assert_eq!(b.destructive_reason.as_deref(), Some("resource_removed"));
+    assert_eq!(b.core, CoreRelation::None);
+    assert_eq!(b.live_in, ["mode"]);
+    let a = entry(&p, "ignition/database-translator/A");
+    assert_eq!(a.status, PlanStatus::Same);
+    assert!(!a.destructive && a.destructive_reason.is_none() && !a.lockout_risk);
+    assert_eq!(p.summary.removed, 1);
+    assert!(p.summary.has_changes);
+
+    let mut sorted = deleted(&p);
+    sorted.sort_by(|x, y| x.as_bytes().cmp(y.as_bytes()));
+    assert_eq!(deleted(&p), sorted, "byte-sorted");
+}
+
+#[test]
+fn only_ledger_files_are_ever_deleted() {
+    // B is live and not rendered, but the ledger does not list it
+    let a = [(A_CFG, "{}"), (A_RES, "{}")];
+    let both = [(A_CFG, "{}"), (A_RES, "{}"), (B_CFG, "{}"), (B_RES, "{}")];
+    let p = plan_ledger(&rendered(&a), &observed(&[], &both), &[A_CFG, A_RES]);
+    assert!(p.delete_set.files.is_empty());
+    assert_eq!(
+        entry(&p, "ignition/database-translator/B").status,
+        PlanStatus::Unmanaged
+    );
+    assert!(!p.summary.has_changes);
+}
+
+#[test]
+fn partial_unit_delete_is_changed() {
+    let extra = "ignition/database-translator/A/extra.bin";
+    let want = [(A_CFG, "{}"), (A_RES, "{}")];
+    let live = [(A_CFG, "{}"), (A_RES, "{}"), (extra, "x")];
+    let p = plan_ledger(
+        &rendered(&want),
+        &observed(&[], &live),
+        &[A_CFG, A_RES, extra],
+    );
+
+    assert_eq!(deleted(&p), [extra]);
+    let a = entry(&p, "ignition/database-translator/A");
+    assert_eq!(a.status, PlanStatus::Changed, "not removed");
+    assert!(a.destructive);
+    assert_eq!(a.destructive_reason.as_deref(), Some("files_removed"));
+    assert_eq!(p.summary.removed, 0);
+    assert_eq!(p.summary.changed, 1);
+}
+
+#[test]
+fn shadows_removal() {
+    let core_only = "ignition/database-translator/B/core-only.json";
+    let core = [(B_CFG, "{}"), (core_only, "{}")];
+    let mode = [(B_CFG, "{}"), (B_RES, "{}")];
+    let p = plan_ledger(
+        &RenderedTree::default(),
+        &observed(&core, &mode),
+        &[B_CFG, B_RES, core_only],
+    );
+    // the core-only file is in the ledger but not in the mode collection
+    assert_eq!(deleted(&p), [B_CFG, B_RES]);
+    let b = entry(&p, "ignition/database-translator/B");
+    assert_eq!(b.status, PlanStatus::Removed);
+    assert_eq!(b.core, CoreRelation::ShadowsRemoval);
+    assert_eq!(b.live_in, ["core", "mode"]);
+    assert!(!deleted(&p).contains(&core_only));
+}
+
+#[test]
+fn no_longer_allowlisted_is_warned_not_deleted() {
+    let opc = "ignition/opc-connection/X/config.json";
+    let mut narrow = scope();
+    narrow.types.retain(|(_, t)| t != "opc-connection");
+    let live = [(opc, "{}"), (A_CFG, "{}")];
+    let ledger = ledger_of(&[A_CFG, opc]);
+    let p = plan_with_ledger(
+        &RenderedTree::default(),
+        &observed(&[], &live),
+        Some(&ledger),
+        &narrow,
+    );
+    assert_eq!(deleted(&p), [A_CFG], "only the still-allowed file");
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains(opc) && w.contains("no longer allows")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn undeclared_provider_is_warned_not_deleted() {
+    let tags = "ignition/tag-definition/Gone/tags.json";
+    let live = [(tags, "[]")];
+    let p = plan_ledger(&RenderedTree::default(), &observed(&[], &live), &[tags]);
+    assert!(p.delete_set.files.is_empty());
+    assert!(
+        p.warnings.iter().any(|w| w.contains(tags)),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn case_variant_is_excluded_with_warning() {
+    let rendered_cfg = "ignition/database-translator/x/config.json";
+    let rendered_res = "ignition/database-translator/x/resource.json";
+    let variant = "ignition/database-translator/X/config.json";
+    let want = [(rendered_cfg, "{}"), (rendered_res, "{}")];
+    let live = [(rendered_cfg, "{}"), (rendered_res, "{}"), (variant, "{}")];
+    let p = plan_ledger(&rendered(&want), &observed(&[], &live), &[variant]);
+    assert!(p.delete_set.files.is_empty());
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains(variant) && w.contains("case")),
+        "{:?}",
+        p.warnings
+    );
+
+    // exact UTF-8 bytes: only ASCII case folds, so a non-ASCII variant is
+    // a different path and is deleted
+    let upper = "ignition/database-translator/\u{c9}/config.json";
+    let lower = "ignition/database-translator/\u{e9}/config.json";
+    let live = [(upper, "{}"), (lower, "{}")];
+    let p = plan_ledger(&rendered(&[(lower, "{}")]), &observed(&[], &live), &[upper]);
+    assert_eq!(deleted(&p), [upper]);
+}
+
+#[test]
+fn gateway_owned_and_dot_named_ledger_paths_are_never_deleted() {
+    // a hand-built ledger (not through Ledger::parse) cannot widen the set
+    let cfg = "config-mode.json";
+    let dot = "ignition/database-translator/.hidden/config.json";
+    let live = [(cfg, "{}"), (dot, "{}")];
+    let p = plan_ledger(&RenderedTree::default(), &observed(&[], &live), &[cfg, dot]);
+    assert!(p.delete_set.files.is_empty());
+}
+
+#[test]
+fn destructive_reasons() {
+    let tag_unit = [
+        ("ignition/tag-definition/P/F/tags.json", "[]"),
+        ("ignition/tag-definition/P/F/unary-resource.json", "{}"),
+    ];
+    let one = |ty: &str, name: Option<&str>| -> Vec<(String, String)> {
+        let dir = match name {
+            Some(n) => format!("ignition/{ty}/{n}"),
+            None => format!("ignition/{ty}"),
+        };
+        vec![
+            (format!("{dir}/config.json"), "{}".to_string()),
+            (format!("{dir}/resource.json"), "{}".to_string()),
+        ]
+    };
+    let mut live: Vec<(String, String)> = tag_unit
+        .iter()
+        .map(|(p, b)| ((*p).to_string(), (*b).to_string()))
+        .collect();
+    live.extend(one("database-connection", Some("DB")));
+    live.extend(one("identity-provider", Some("IDP")));
+    live.extend(one("store-and-forward-engine", None));
+    live.extend(one("database-translator", Some("T")));
+    let live_refs: Vec<(&str, &str)> = live.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let paths: Vec<&str> = live_refs.iter().map(|(p, _)| *p).collect();
+
+    let p = plan_ledger(&RenderedTree::default(), &observed(&[], &live_refs), &paths);
+    let reason = |key: &str| {
+        let e = entry(&p, key);
+        assert_eq!(e.status, PlanStatus::Removed, "{key}");
+        assert!(e.destructive, "{key}");
+        e.destructive_reason.clone().expect("reason")
+    };
+    assert_eq!(reason("ignition/tag-definition/P/F"), "tag_data_loss");
+    assert_eq!(
+        reason("ignition/database-connection/DB"),
+        "connection_removed"
+    );
+    assert_eq!(
+        reason("ignition/identity-provider/IDP"),
+        "connection_removed"
+    );
+    assert_eq!(
+        reason("ignition/store-and-forward-engine"),
+        "storage_removed"
+    );
+    assert_eq!(reason("ignition/database-translator/T"), "resource_removed");
+    assert!(entry(&p, "ignition/identity-provider/IDP").lockout_risk);
+    assert!(!entry(&p, "ignition/database-connection/DB").lockout_risk);
+}
+
+#[test]
+fn lockout_risk_follows_status_and_type() {
+    let idp = |name: &str, body: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                format!("ignition/identity-provider/{name}/config.json"),
+                body.to_string(),
+            ),
+            (
+                format!("ignition/identity-provider/{name}/resource.json"),
+                "{}".to_string(),
+            ),
+        ]
+    };
+    let mut want = idp("CHANGED", "new");
+    want.extend(idp("SAME", "s"));
+    let mut live = idp("CHANGED", "old");
+    live.extend(idp("SAME", "s"));
+    live.extend(idp("UNMANAGED", "u"));
+    let want_refs: Vec<(&str, &str)> = want.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let live_refs: Vec<(&str, &str)> = live.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let p = plan_units(&rendered(&want_refs), &observed(&[], &live_refs));
+
+    assert!(entry(&p, "ignition/identity-provider/CHANGED").lockout_risk);
+    assert!(!entry(&p, "ignition/identity-provider/SAME").lockout_risk);
+    assert!(
+        !entry(&p, "ignition/identity-provider/UNMANAGED").lockout_risk,
+        "a live unit the plan never touches cannot lock anyone out"
+    );
+    // changed without delete-set files is not destructive
+    assert!(!entry(&p, "ignition/identity-provider/CHANGED").destructive);
+
+    // a changed security-zone is a lockout risk too
+    let zone = [("ignition/security-zone/Z/config.json", "{}")];
+    let zone_old = [("ignition/security-zone/Z/config.json", "{ }")];
+    let p = plan_units(&rendered(&zone), &observed(&[], &zone_old));
+    assert!(entry(&p, "ignition/security-zone/Z").lockout_risk);
+}
+
+#[test]
+fn no_ledger_no_removals() {
+    let live = [(B_CFG, "{}"), (B_RES, "{}")];
+    let p = plan_units(&RenderedTree::default(), &observed(&[], &live));
+    assert!(p.delete_set.files.is_empty());
+    assert_eq!(p.summary.removed, 0);
+    assert_eq!(p.summary.unmanaged, 1);
+    assert!(p.entries.iter().all(|e| !e.destructive && !e.lockout_risk));
+}
+
+#[test]
+fn empty_ledger_files_valid() {
+    let live = [(B_CFG, "{}"), (B_RES, "{}")];
+    let with_empty = plan_ledger(&RenderedTree::default(), &observed(&[], &live), &[]);
+    let without = plan_units(&RenderedTree::default(), &observed(&[], &live));
+    assert!(with_empty.delete_set.files.is_empty());
+    assert_eq!(with_empty.summary.removed, 0);
+    assert_eq!(
+        with_empty.plan_sha256, without.plan_sha256,
+        "an empty delete set adds no D lines"
+    );
+}
+
+#[tokio::test]
+async fn ledger_change_changes_hash() {
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.mode("ignition/database-translator/OLD/config.json", b"{}");
+    fx.mode("ignition/database-translator/OLD/resource.json", b"{}");
+
+    let none = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert!(none.delete_set.files.is_empty());
+
+    fx.ledger(GATEWAY, MODE, &[]);
+    let empty = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert_eq!(empty.plan_sha256, none.plan_sha256);
+
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &["ignition/database-translator/OLD/config.json"],
+    );
+    let one = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert_ne!(one.plan_sha256, none.plan_sha256, "D lines bind the set");
+    assert_eq!(one.delete_set.files.len(), 1);
+    assert_eq!(
+        one.plan_sha256,
+        recompute_plan_sha256(&one),
+        "documented text"
+    );
+
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            "ignition/database-translator/OLD/config.json",
+            "ignition/database-translator/OLD/resource.json",
+        ],
+    );
+    let two = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert_ne!(two.plan_sha256, one.plan_sha256);
+    assert_eq!(two.plan_sha256, recompute_plan_sha256(&two));
+    assert_eq!(two.summary.removed, 1);
+
+    // idempotent over unchanged inputs
+    let again = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert_eq!(
+        serde_json::to_string(&again).expect("json"),
+        serde_json::to_string(&two).expect("json")
+    );
+}
+
+/// Pinned `plan_sha256` of the golden scenario with a delete set (below).
+/// Changing the canonical text in `deploy/plan.rs` means re-goldening this
+/// value too. `PLAN_GOLDEN` (no ledger) stays as 22-01 pinned it.
+const PLAN_GOLDEN_LEDGER: &str = "5084afccdf21436e192a5e71b8da3b4ba5cafa49fa822552ab393ffdc963f87a";
+
+#[tokio::test]
+async fn plan_sha256_golden_with_ledger() {
+    // the PLAN_GOLDEN scenario plus a removed unit named by the ledger
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let mut bytes = fx.read("dev", DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    fx.remove("dev", "ignition/general-alarm-settings");
+    fx.mode("ignition/database-translator/OLD/config.json", b"{}");
+    fx.mode("ignition/database-translator/OLD/resource.json", b"{}");
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            "ignition/database-translator/OLD/config.json",
+            "ignition/database-translator/OLD/resource.json",
+        ],
+    );
+    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert_eq!(
+        (
+            result.summary.changed,
+            result.summary.added,
+            result.summary.removed
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(result.plan_sha256, recompute_plan_sha256(&result));
+    assert_eq!(
+        result.plan_sha256, PLAN_GOLDEN_LEDGER,
+        "re-golden on purpose only"
+    );
+    assert_ne!(result.plan_sha256, PLAN_GOLDEN);
+}
+
+#[tokio::test]
+async fn deploy_plan_refuses_corrupt_ledger() {
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.mode("ignition/database-translator/OLD/config.json", b"{}");
+
+    let good = ledger_of(&["ignition/database-translator/OLD/config.json"]);
+    let mut other_mode = good.clone();
+    other_mode.mode = "prod".to_string();
+    let mut other_gateway = good.clone();
+    other_gateway.gateway = "elsewhere".to_string();
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", Vec::new()),
+        ("garbage", b"not json".to_vec()),
+        ("other mode", other_mode.to_bytes()),
+        ("other gateway", other_gateway.to_bytes()),
+        (
+            "config-mode.json",
+            ledger_of(&["config-mode.json"]).to_bytes(),
+        ),
+    ];
+    for (name, bytes) in cases {
+        fx.ledger_bytes(GATEWAY, MODE, &bytes);
+        let err = deploy_plan(&declared, reader.as_ref())
+            .await
+            .expect_err(name);
+        assert_eq!(
+            (err.code(), err.exit_code()),
+            ("deploy_ledger_invalid", 6),
+            "{name}: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("ign-deploy/tracer-gw/dev/ledger.json"),
+            "{name}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn plan_never_writes_the_ledger() {
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &["ignition/database-translator/POSTGRES/config.json"],
+    );
+    let path = fx
+        .data_dir()
+        .join("ign-deploy")
+        .join(GATEWAY)
+        .join(MODE)
+        .join("ledger.json");
+    let before = std::fs::read(&path).expect("ledger");
+    let modified = std::fs::metadata(&path)
+        .expect("meta")
+        .modified()
+        .expect("mtime");
+    deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    assert_eq!(std::fs::read(&path).expect("ledger"), before);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("meta")
+            .modified()
+            .expect("mtime"),
+        modified
+    );
 }

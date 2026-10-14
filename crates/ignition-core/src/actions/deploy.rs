@@ -29,7 +29,7 @@
 //!
 //! The [`DeployPlanResult`] `data` keys, in order: `env, gateway, mode,
 //! node, transport, render_sha256, plan_sha256, summary, entries,
-//! warnings`. Later plans add keys additively (`delete_set`, `base`).
+//! delete_set, warnings`. Later plans add keys additively (`base`).
 //! Entries carry paths and sha256 only, never file bytes.
 
 use std::path::Path;
@@ -37,11 +37,12 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::deploy::component_problem;
+use crate::deploy::ledger::{Ledger, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::plan::{PlanEntry, PlanSummary, plan};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::Target;
-use crate::deploy::transport::{Scope, TreeReader};
+use crate::deploy::transport::{DeleteSet, Scope, TreeReader};
 use crate::deploy::tree::{RenderMarker, SourceTree, read_repo_file, require_repo_dir, write_out};
 use crate::error::CoreError;
 
@@ -192,6 +193,9 @@ pub struct DeployPlanResult {
     pub summary: PlanSummary,
     /// One entry per unit, in unit-key byte order.
     pub entries: Vec<PlanEntry>,
+    /// The files plan proposes to delete: the declared-names ledger's files
+    /// minus the rendered files (22-03). Empty without a ledger.
+    pub delete_set: DeleteSet,
     /// Render warnings, then plan warnings.
     pub warnings: Vec<String>,
 }
@@ -211,7 +215,20 @@ pub async fn deploy_plan(
     };
     let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
     let observed = reader.read(&scope).await?;
-    let planned = plan(&declared.outcome.tree, &observed);
+    let gateway = &declared.target.gateway;
+    let mode = &declared.target.mode;
+    // An absent ledger is a first deploy (empty delete set); one that exists
+    // but cannot be trusted is a refusal, never an empty delete set (D-07).
+    let ledger = match reader.read_ledger(gateway, mode).await? {
+        Some(bytes) => Some(Ledger::parse(
+            &ledger_location(gateway, mode),
+            &bytes,
+            gateway,
+            mode,
+        )?),
+        None => None,
+    };
+    let planned = plan(&declared.outcome.tree, &observed, ledger.as_ref(), &scope);
 
     let mut warnings = declared.outcome.warnings.clone();
     warnings.extend(planned.warnings);
@@ -225,6 +242,7 @@ pub async fn deploy_plan(
         plan_sha256: planned.plan_sha256,
         summary: planned.summary,
         entries: planned.entries,
+        delete_set: planned.delete_set,
         warnings,
     })
 }

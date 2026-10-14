@@ -341,7 +341,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
 | `ign deploy render --env <ENV> [--repo DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
-| `ign deploy plan --env <ENV> [--repo DIR]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, warnings}` |
+| `ign deploy plan --env <ENV> [--repo DIR]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, warnings}` |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -2508,7 +2508,7 @@ still visible. Comparison is byte-exact: a whitespace-only change is
 |--------|---------|
 | `added` | rendered, no effective live copy |
 | `changed` | rendered, the effective copy differs in file set or any byte |
-| `removed` | produced from the delete set (arrives with the ledger, plan 22-03) |
+| `removed` | not rendered, and the declared-names ledger lists a file of the unit that still exists in the mode collection (the delete set) |
 | `same` | rendered, the effective copy has the same files, byte-equal |
 | `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted and never counted in `has_changes` |
 
@@ -2517,21 +2517,26 @@ the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
 tag folder defined in the mode collection whose core copy holds files the
 rendered folder lacks; the gateway overrides these by folder, so those core
 files are invisible) or `shadows_removal` (status `removed` while a core copy
-exists; arrives with plan 22-03).
+exists: deleting from the mode collection will not take effect, because the
+gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 
 **Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
 `mode`, `node` (always `master`), `transport` (`local` or `ssh`),
 `render_sha256`, `plan_sha256`, `summary` (`added`, `changed`, `removed`,
-`same`, `unmanaged`, `has_changes`), `entries` and `warnings`. Each entry is
-`{key, module, type, name, status, live_in, core, files}` where `files` are
-`{path, live_sha256, desired_sha256}`; entries are in unit-key byte order.
+`same`, `unmanaged`, `has_changes`), `entries`, `delete_set` and `warnings`.
+Each entry is
+`{key, module, type, name, status, live_in, core, destructive, destructive_reason, lockout_risk, files}`
+where `files` are `{path, live_sha256, desired_sha256}`; entries are in
+unit-key byte order. `delete_set` is `{"files": [...]}`, byte-sorted.
 Keys are only ever added, never renamed. Entries carry paths and hashes,
 never file bytes.
 
 **Human output.** The first line is
 `plan <gateway> (<env>, mode <mode>) via <transport>: <a> added, <c> changed, <r> removed, <s> same, <u> unmanaged`,
 then one line per entry whose status is not `same`
-(`<status> <key> core=<core> live_in=<a,b>`), then `plan_sha256 <hex>`. Each
+(`<status> <key> core=<core> live_in=<a,b>`, followed by
+`destructive=<reason>` and `lockout_risk` when set), then one
+`delete <path>` line per delete-set file, then `plan_sha256 <hex>`. Each
 warning goes to stderr as `warning: ...`.
 
 **`plan_sha256` (D-08).** The lowercase hex SHA-256 of this UTF-8 text, byte
@@ -2547,10 +2552,35 @@ D NUL <collection path> LF
 
 One `E` line per entry that is not `unmanaged`, in unit-key byte order, each
 followed by its `F` lines in path byte order; then one `D` line per delete-set
-path in byte order (none until plan 22-03). `status` and `core` are the
+path in byte order (none without a ledger). `status` and `core` are the
 serialized words. Drift, diff text and warnings are excluded on purpose, as
 are `unmanaged` entries, so a review hash is reproducible and unrelated live
-resources never invalidate it.
+resources never invalidate it. Because the `D` lines carry the delete set, a
+ledger that changes after review changes `plan_sha256`, so Phase 23's
+`--plan-sha256` gate refuses the stale plan.
+
+**The delete set (DPLN-04).** `delete_set.files` is exactly the ledger's files
+minus the rendered files, restricted to files that exist in the mode
+collection. Plan reads the ledger once, never writes or rewrites it, and
+never puts into the delete set a file the ledger does not list, a
+`config-mode.json`, a dot-named path, a file under a type or tag provider the
+manifest no longer allows (reported in `warnings`, never deleted), or a ledger
+path that equals a rendered path under ASCII case folding (reported in
+`warnings`: a case-insensitive host would delete the rendered file). Paths
+compare as exact UTF-8 bytes otherwise. No ledger is a first deploy: an empty
+delete set and no `removed` entries. A rendered unit that loses only some of
+its ledger files is `changed` (those files are deleted, nothing else); a unit
+that is not rendered and has delete-set files is `removed`; a live unit with
+no delete-set file stays `unmanaged`.
+
+**Flags (DPLN-03).** They derive only from status, delete-set membership and
+type, so the same input gives the same flags.
+
+| Flag | Value |
+|------|-------|
+| `destructive` | true for every `removed` entry and every entry with delete-set files |
+| `destructive_reason` | null unless destructive: `tag_data_loss` (`ignition/tag-provider`, `tag-group`, `tag-type-definition`, `tag-definition`), `connection_removed` (`ignition/database-connection`, `opc-connection`, `identity-provider`), `storage_removed` (`ignition/store-and-forward-engine`, `alarm-journal`), otherwise `resource_removed` for `removed` and `files_removed` for `changed` |
+| `lockout_risk` | true for an `added`, `changed` or `removed` entry of `ignition/identity-provider` or `ignition/security-zone`; a `same` or `unmanaged` unit is never a lockout risk because the plan does not touch it |
 
 **The `local/` collection.** The gateway loads the `local` collection over the
 mode collection. The plan does not model it: when a unit also exists in

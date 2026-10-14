@@ -108,7 +108,7 @@ pub struct ObservedFiles {
 /// declared-names ledger's files minus the rendered files (D-05, 22-03).
 /// Collection-relative paths, byte-sorted and unique. Serialized as
 /// `{"files": [...]}`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct DeleteSet {
     /// The paths, byte-sorted.
     pub files: Vec<RelPath>,

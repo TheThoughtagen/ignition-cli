@@ -28,7 +28,7 @@
 //! | `added` | rendered, no effective live copy |
 //! | `changed` | rendered, effective copy differs in file set or any byte |
 //! | `same` | rendered, effective copy has the same files, byte-equal |
-//! | `removed` | produced from the delete set (22-03 on) |
+//! | `removed` | not rendered, and the declared-names ledger lists a file of the unit that still exists in the mode collection (the delete set) |
 //! | `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted, never counted in `has_changes` (D-06) |
 //!
 //! `core` relates the `core` collection's copy of the unit to the rendered
@@ -36,10 +36,48 @@
 //! `differs`, or `hidden` (a tag-definition or tag-type-definition folder
 //! defined in the mode collection whose core copy holds files the rendered
 //! unit lacks: the gateway overrides these by folder, so those core files
-//! are invisible). `shadows_removal` is produced from 22-03 on.
+//! are invisible), or `shadows_removal` (a `removed` unit that also has a
+//! `core` copy: deleting from the mode collection will not take effect, the
+//! gateway keeps running the `core` copy).
 //!
 //! Comparison is byte-exact per file: a whitespace-only or key-order change
 //! is `changed`.
+//!
+//! ## The delete set and `removed` (D-05, 22-03)
+//!
+//! The delete set is exactly the declared-names ledger's files minus the
+//! rendered files, restricted to files that exist in the mode collection. No
+//! ledger (a first deploy) gives an empty delete set; a ledger that exists
+//! but is unusable is refused before this function runs (the caller parses
+//! it with [`Ledger::parse`]). A ledger path is never in the delete set when
+//! it is:
+//!
+//! - rendered (byte-equal path), or equal to a rendered path under ASCII
+//!   case folding (a case-insensitive host would delete the rendered file;
+//!   this one is reported in `warnings`),
+//! - under a type or tag provider the manifest no longer allows (reported in
+//!   `warnings`, never deleted), or
+//! - `config-mode.json` or under a dot-named component.
+//!
+//! Paths compare as exact UTF-8 bytes. A rendered unit that loses only some
+//! of its ledger files is `changed` and deletes just those files; a unit that
+//! is not rendered and has delete-set files is `removed`; `unmanaged` is a
+//! live unit with no delete-set file. Plan never writes or rewrites the
+//! ledger.
+//!
+//! ## Flags (22-03)
+//!
+//! Derived only from status, delete-set membership and type, so the same
+//! input gives the same flags. `destructive` is true for `removed` entries
+//! and for any entry with delete-set files; `destructive_reason` is then
+//! `tag_data_loss` (`ignition/tag-provider`, `tag-group`,
+//! `tag-type-definition`, `tag-definition`), `connection_removed`
+//! (`ignition/database-connection`, `opc-connection`, `identity-provider`),
+//! `storage_removed` (`ignition/store-and-forward-engine`, `alarm-journal`),
+//! else `resource_removed` for `removed` and `files_removed` for `changed`.
+//! `lockout_risk` is true for every entry that is not `same` and not
+//! `unmanaged` (one the plan would touch) of `ignition/identity-provider` or
+//! `ignition/security-zone`.
 //!
 //! ## `plan_sha256` (D-08)
 //!
@@ -56,7 +94,7 @@
 //!
 //! One `E` line per entry that is not `unmanaged`, in unit-key byte order,
 //! each followed by its `F` lines in path byte order; then one `D` line per
-//! delete-set path in byte order (none until 22-03). `status` and `core` are
+//! delete-set path in byte order (none without a ledger). `status` and `core` are
 //! the serialized words (`added`, `identical`, ...). Drift, diff text and
 //! warnings are excluded on purpose, as are `unmanaged` entries, so a review
 //! hash is reproducible with or without `--base` and unrelated live
@@ -67,8 +105,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use super::layout::RelPath;
-use super::transport::{FileBlob, ObservedFiles};
+use super::layout::{RelPath, TAG_TYPES};
+use super::ledger::Ledger;
+use super::rules::GATEWAY_OWNED_FILES;
+use super::transport::{DeleteSet, FileBlob, ObservedFiles, Scope};
 use super::tree::{RenderedTree, sha256_hex};
 
 /// First line of the canonical `plan_sha256` text.
@@ -82,7 +122,7 @@ pub enum PlanStatus {
     Added,
     /// Rendered, effective copy differs.
     Changed,
-    /// Produced from the delete set (22-03 on).
+    /// Not rendered, with delete-set files in the mode collection.
     Removed,
     /// Rendered, effective copy byte-equal.
     Same,
@@ -115,7 +155,8 @@ pub enum CoreRelation {
     Differs,
     /// A tag folder defined in the mode collection hides `core`-only files.
     Hidden,
-    /// Status `removed` while a `core` copy exists (22-03 on).
+    /// Status `removed` while a `core` copy exists: deleting from the mode
+    /// collection will not take effect.
     ShadowsRemoval,
 }
 
@@ -161,6 +202,13 @@ pub struct PlanEntry {
     pub live_in: Vec<String>,
     /// The `core` copy's relation to the rendered unit.
     pub core: CoreRelation,
+    /// True for `removed` entries and entries with delete-set files.
+    pub destructive: bool,
+    /// Why the entry is destructive (module doc); null when it is not.
+    pub destructive_reason: Option<String>,
+    /// True when a unit of a security type that the plan touches could lock
+    /// the operator out of the gateway.
+    pub lockout_risk: bool,
     /// The unit's files, byte-sorted.
     pub files: Vec<PlanFile>,
 }
@@ -190,6 +238,8 @@ pub struct Plan {
     pub entries: Vec<PlanEntry>,
     /// Counts by status.
     pub summary: PlanSummary,
+    /// The files plan proposes to delete (module doc).
+    pub delete_set: DeleteSet,
     /// Lowercase hex SHA-256 of the canonical plan text (module doc).
     pub plan_sha256: String,
     /// Plan-level warnings.
@@ -252,11 +302,107 @@ fn hides(core: &BTreeMap<String, String>, rendered: &BTreeMap<String, String>) -
     core.keys().any(|path| !rendered.contains_key(path))
 }
 
-/// Compare `rendered` with `observed`.
-pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
+/// Whether the manifest's `scope` allows `path`: its `<module>/<type>` is a
+/// listed type, or it is under `ignition/<tag type>/<provider>` for a listed
+/// tag provider.
+fn in_scope(scope: &Scope, path: &RelPath) -> bool {
+    let parts: Vec<&str> = path.components().collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    let (module, ty) = (parts[0], parts[1]);
+    if scope.types.iter().any(|(m, t)| m == module && t == ty) {
+        return true;
+    }
+    module == "ignition"
+        && TAG_TYPES.contains(&ty)
+        && scope.tag_providers.iter().any(|p| p == parts[2])
+}
+
+/// The delete set (module doc) and the warnings it raised, both in path
+/// byte order.
+fn delete_set(
+    rendered: &RenderedTree,
+    observed: &ObservedFiles,
+    ledger: Option<&Ledger>,
+    scope: &Scope,
+) -> (Vec<RelPath>, Vec<String>) {
+    let Some(ledger) = ledger else {
+        return (Vec::new(), Vec::new());
+    };
+    let rendered_folded: BTreeSet<String> = rendered
+        .files
+        .keys()
+        .map(|p| p.as_str().to_ascii_lowercase())
+        .collect();
+    let mut listed: Vec<&String> = ledger.files.iter().collect();
+    listed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    listed.dedup();
+
+    let mut delete = Vec::new();
+    let mut warnings = Vec::new();
+    for raw in listed {
+        let Ok(path) = RelPath::new(raw) else {
+            continue;
+        };
+        if path
+            .components()
+            .any(|c| c.starts_with('.') || GATEWAY_OWNED_FILES.contains(&c))
+        {
+            continue;
+        }
+        if !in_scope(scope, &path) {
+            warnings.push(format!(
+                "ledger file {path} is under a type or tag provider the manifest no longer allows; it is not deleted"
+            ));
+            continue;
+        }
+        if rendered.files.contains_key(&path) || !observed.mode.contains_key(&path) {
+            continue;
+        }
+        if rendered_folded.contains(&path.as_str().to_ascii_lowercase()) {
+            warnings.push(format!(
+                "ledger file {path} differs from a rendered file only by case; it is not deleted because a case-insensitive host would delete the rendered file"
+            ));
+            continue;
+        }
+        delete.push(path);
+    }
+    (delete, warnings)
+}
+
+/// The `destructive_reason` of a destructive entry (module doc).
+fn destructive_reason(module: &str, ty: &str, status: PlanStatus) -> &'static str {
+    match (module, ty) {
+        ("ignition", "tag-provider" | "tag-group" | "tag-type-definition" | "tag-definition") => {
+            "tag_data_loss"
+        }
+        ("ignition", "database-connection" | "opc-connection" | "identity-provider") => {
+            "connection_removed"
+        }
+        ("ignition", "store-and-forward-engine" | "alarm-journal") => "storage_removed",
+        _ if status == PlanStatus::Removed => "resource_removed",
+        _ => "files_removed",
+    }
+}
+
+/// Compare `rendered` with `observed`. `ledger` is the parsed declared-names
+/// ledger, `None` for a first deploy; `scope` is the manifest's current
+/// allowlist (it bounds what the ledger may delete).
+pub fn plan(
+    rendered: &RenderedTree,
+    observed: &ObservedFiles,
+    ledger: Option<&Ledger>,
+    scope: &Scope,
+) -> Plan {
     let desired = group(&rendered.files, |bytes: &Vec<u8>| sha256_hex(bytes));
     let core = group(&observed.core, blob_digest);
     let mode = group(&observed.mode, blob_digest);
+    let (delete, ledger_warnings) = delete_set(rendered, observed, ledger, scope);
+    let mut deleted: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &delete {
+        *deleted.entry(unit_key(path, &observed.mode)).or_default() += 1;
+    }
 
     let keys: BTreeSet<&String> = desired
         .keys()
@@ -280,15 +426,18 @@ pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
             live_in.push("mode".to_string());
         }
 
+        let deleted_here = deleted.get(key).copied().unwrap_or(0);
         let status = match (wanted, effective) {
             (Some(_), None) => PlanStatus::Added,
-            (Some(w), Some(e)) if w == e => PlanStatus::Same,
+            (Some(w), Some(e)) if w == e && deleted_here == 0 => PlanStatus::Same,
             (Some(_), Some(_)) => PlanStatus::Changed,
+            (None, _) if deleted_here > 0 => PlanStatus::Removed,
             (None, _) => PlanStatus::Unmanaged,
         };
         let rendered_files = wanted.unwrap_or(&empty);
         let core_relation = match core_copy {
             None => CoreRelation::None,
+            Some(_) if status == PlanStatus::Removed => CoreRelation::ShadowsRemoval,
             Some(c) if is_tag_folder(key) && mode_copy.is_some() && hides(c, rendered_files) => {
                 CoreRelation::Hidden
             }
@@ -311,14 +460,26 @@ pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
             .collect();
 
         let parts: Vec<&str> = key.split('/').collect();
+        let module = parts.first().copied().unwrap_or_default();
+        let ty = parts.get(1).copied().unwrap_or_default();
+        let destructive = status == PlanStatus::Removed || deleted_here > 0;
+        let lockout_risk = matches!(
+            status,
+            PlanStatus::Added | PlanStatus::Changed | PlanStatus::Removed
+        ) && module == "ignition"
+            && matches!(ty, "identity-provider" | "security-zone");
         entries.push(PlanEntry {
             key: key.clone(),
-            module: parts.first().copied().unwrap_or_default().to_string(),
-            ty: parts.get(1).copied().unwrap_or_default().to_string(),
+            module: module.to_string(),
+            ty: ty.to_string(),
             name: (parts.len() >= 3).then(|| parts[2..].join("/")),
             status,
             live_in,
             core: core_relation,
+            destructive,
+            destructive_reason: destructive
+                .then(|| destructive_reason(module, ty, status).to_string()),
+            lockout_risk,
             files,
         });
     }
@@ -335,7 +496,7 @@ pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
     }
     summary.has_changes = summary.added + summary.changed + summary.removed > 0;
 
-    let warnings = observed
+    let mut warnings: Vec<String> = observed
         .local_units
         .iter()
         .map(|unit| {
@@ -344,18 +505,24 @@ pub fn plan(rendered: &RenderedTree, observed: &ObservedFiles) -> Plan {
             )
         })
         .collect();
+    warnings.extend(ledger_warnings);
 
-    let plan_sha256 = sha256_hex(&canonical_text(&rendered.render_sha256(), &entries, &[]));
+    let plan_sha256 = sha256_hex(&canonical_text(
+        &rendered.render_sha256(),
+        &entries,
+        &delete,
+    ));
     Plan {
         entries,
         summary,
+        delete_set: DeleteSet { files: delete },
         plan_sha256,
         warnings,
     }
 }
 
 /// The canonical text `plan_sha256` hashes (see the module doc).
-fn canonical_text(render_sha256: &str, entries: &[PlanEntry], delete_set: &[String]) -> Vec<u8> {
+fn canonical_text(render_sha256: &str, entries: &[PlanEntry], delete_set: &[RelPath]) -> Vec<u8> {
     let mut text: Vec<u8> = Vec::new();
     text.extend_from_slice(PLAN_HASH_HEADER.as_bytes());
     text.push(b'\n');
@@ -384,7 +551,7 @@ fn canonical_text(render_sha256: &str, entries: &[PlanEntry], delete_set: &[Stri
     }
     for path in delete_set {
         text.extend_from_slice(b"D\0");
-        text.extend_from_slice(path.as_bytes());
+        text.extend_from_slice(path.as_str().as_bytes());
         text.push(b'\n');
     }
     text
@@ -452,7 +619,17 @@ mod tests {
 
     #[test]
     fn empty_inputs_plan_empty() {
-        let p = plan(&RenderedTree::default(), &ObservedFiles::default());
+        let scope = Scope {
+            mode: "dev".to_string(),
+            types: Vec::new(),
+            tag_providers: Vec::new(),
+        };
+        let p = plan(
+            &RenderedTree::default(),
+            &ObservedFiles::default(),
+            None,
+            &scope,
+        );
         assert!(p.entries.is_empty());
         assert!(!p.summary.has_changes);
     }

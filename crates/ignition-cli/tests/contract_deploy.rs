@@ -699,6 +699,7 @@ fn plan_cli_live_equal_to_render_exits_0() {
         "plan_sha256",
         "summary",
         "entries",
+        "delete_set",
         "warnings",
     ];
     expected.sort_unstable();
@@ -840,4 +841,124 @@ fn plan_cli_human_output_lines() {
     let hex = last.strip_prefix("plan_sha256 ").expect("plan_sha256 last");
     assert_eq!(hex.len(), 64, "{last}");
     assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{last}");
+}
+
+/// Seed a live unit `OLD` and a declared-names ledger listing it, below the
+/// local tracer's data directory. Returns the two `OLD` file paths.
+fn seed_old_unit_and_ledger(data: &Path) -> [&'static str; 2] {
+    let files = [
+        "ignition/database-translator/OLD/config.json",
+        "ignition/database-translator/OLD/resource.json",
+    ];
+    for file in files {
+        let path = data.join("config/resources/dev").join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("unit dir");
+        std::fs::write(path, b"{}").expect("live file");
+    }
+    let ledger = serde_json::json!({
+        "schema_version": 1,
+        "gateway": "tracer-gw",
+        "mode": "dev",
+        "render_sha256": "0".repeat(64),
+        "run_id": "cli-test",
+        "files": files,
+    });
+    let dir = data.join("ign-deploy/tracer-gw/dev");
+    std::fs::create_dir_all(&dir).expect("ledger dir");
+    std::fs::write(
+        dir.join("ledger.json"),
+        serde_json::to_vec_pretty(&ledger).expect("ledger json"),
+    )
+    .expect("ledger file");
+    files
+}
+
+#[test]
+fn plan_local_with_ledger_lists_delete_set() {
+    let (_scratch, repo, data) = local_tracer();
+    let files = seed_old_unit_and_ledger(&data);
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let data = &envelope["data"];
+    let delete: Vec<&str> = data["delete_set"]["files"]
+        .as_array()
+        .expect("delete_set.files")
+        .iter()
+        .map(|v| v.as_str().expect("path"))
+        .collect();
+    assert_eq!(delete, files);
+    assert_eq!(data["summary"]["removed"], 1);
+    assert_eq!(data["summary"]["has_changes"], true);
+    let removed = data["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|e| e["status"] == "removed")
+        .expect("a removed entry");
+    assert_eq!(removed["key"], "ignition/database-translator/OLD");
+    assert_eq!(removed["destructive"], true);
+    assert_eq!(removed["destructive_reason"], "resource_removed");
+    assert_eq!(removed["lockout_risk"], false);
+    assert_eq!(removed["core"], "none");
+}
+
+#[test]
+fn plan_local_human_lists_delete_lines_and_flags() {
+    let (_scratch, repo, data) = local_tracer();
+    let files = seed_old_unit_and_ledger(&data);
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.iter().any(
+            |l| l.starts_with("removed ignition/database-translator/OLD ")
+                && l.ends_with(" destructive=resource_removed")
+        ),
+        "{stdout}"
+    );
+    for file in files {
+        assert!(
+            lines.contains(&format!("delete {file}").as_str()),
+            "{stdout}"
+        );
+    }
+    assert!(
+        lines.last().expect("last").starts_with("plan_sha256 "),
+        "plan_sha256 stays the last line: {stdout}"
+    );
+}
+
+#[test]
+fn plan_local_corrupt_ledger_exits_6() {
+    let (_scratch, repo, data) = local_tracer();
+    seed_old_unit_and_ledger(&data);
+    std::fs::write(
+        data.join("ign-deploy/tracer-gw/dev/ledger.json"),
+        b"not json",
+    )
+    .expect("corrupt the ledger");
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(out.status.code(), Some(6));
+    assert!(out.stdout.is_empty(), "stdout stays empty on a refusal");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_ledger_invalid");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("ign-deploy/tracer-gw/dev/ledger.json"),
+        "{message}"
+    );
 }

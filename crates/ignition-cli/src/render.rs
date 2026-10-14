@@ -1435,13 +1435,23 @@ fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanR
         if entry.status == ignition_core::deploy::plan::PlanStatus::Same {
             continue;
         }
-        println!(
+        let mut line = format!(
             "{} {} core={} live_in={}",
             entry.status.word(),
             entry.key,
             entry.core.word(),
             entry.live_in.join(",")
         );
+        if let Some(reason) = &entry.destructive_reason {
+            line.push_str(&format!(" destructive={reason}"));
+        }
+        if entry.lockout_risk {
+            line.push_str(" lockout_risk");
+        }
+        println!("{line}");
+    }
+    for path in &result.delete_set.files {
+        println!("delete {path}");
     }
     println!("plan_sha256 {}", result.plan_sha256);
     for warning in &result.warnings {
