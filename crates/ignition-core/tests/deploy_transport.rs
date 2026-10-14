@@ -2102,16 +2102,18 @@ mod sftp_mirror {
         let data = posix_root(&sc.data.display().to_string()).expect("root");
         let dev = format!("{data}/config/resources/{MODE}");
         let batches = tap.lines();
-        let mut mkdirs: Vec<(usize, String)> = Vec::new();
+        // (session, line within the session, path); mkdirs share the batch of
+        // the writes, parents first
+        let mut mkdirs: Vec<(usize, usize, String)> = Vec::new();
         for (index, batch) in batches.iter().enumerate() {
-            for line in batch {
+            for (at, line) in batch.iter().enumerate() {
                 if let Some(rest) = line.strip_prefix("mkdir \"") {
-                    mkdirs.push((index, rest.trim_end_matches('"').to_string()));
+                    mkdirs.push((index, at, rest.trim_end_matches('"').to_string()));
                 }
             }
         }
         let made: std::collections::BTreeSet<&str> =
-            mkdirs.iter().map(|(_, path)| path.as_str()).collect();
+            mkdirs.iter().map(|(_, _, path)| path.as_str()).collect();
         let want = [
             format!("{dev}/ignition/brand-new-type"),
             format!("{dev}/ignition/brand-new-type/X"),
@@ -2124,13 +2126,15 @@ mod sftp_mirror {
         );
         assert_eq!(mkdirs.len(), 3, "each exactly once: {mkdirs:?}");
         // every mkdir's parent was listed in an earlier session or created earlier
-        for (index, path) in &mkdirs {
+        for (index, at, path) in &mkdirs {
             let parent = path.rsplit_once('/').expect("parent").0;
             let listed_before = batches[..*index]
                 .iter()
                 .flatten()
                 .any(|line| line == &format!("@ls -la \"{parent}\""));
-            let made_before = mkdirs.iter().any(|(i, other)| other == parent && i < index);
+            let made_before = mkdirs
+                .iter()
+                .any(|(i, a, other)| other == parent && (i, a) < (index, at));
             assert!(
                 listed_before || made_before,
                 "{path}: parent {parent} was never established"
@@ -2344,6 +2348,67 @@ mod sftp_mirror {
         assert!(err.to_string().contains("SHA-256"), "{err}");
         assert_eq!(snapshot(&sc.resources()), before);
         assert_no_collection_mutation(&tap, &sc);
+    }
+
+    /// F6 follow-up: sftp has no atomic verify-then-rename. A swap that lands
+    /// AFTER the pre-rename read-back (just before the rename batch runs) is
+    /// detected by the post-commit read-back of the final paths, and no delete
+    /// runs.
+    #[tokio::test]
+    async fn sftp_mirror_tamper_between_pre_verify_and_rename_is_caught_after_commit() {
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let victim = sc.stage_root.join(format!("{DT}/NEW/config.json"));
+        let hook_victim = victim.clone();
+        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
+            if batch.contains("rename \"") {
+                std::fs::write(&hook_victim, NEW_EVIL).expect("swap");
+            }
+        }));
+        let m = sftp_mirror(&sc, sc.separate(), tap.clone());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("swapped between verify and rename");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("content changed on the host during commit"),
+            "{text}"
+        );
+        assert!(text.contains("NEW/config.json"), "{text}");
+        assert!(text.contains("no delete was run"), "{text}");
+        // the renames did happen (that is what the post-commit check detects)...
+        assert_eq!(
+            std::fs::read(sc.collection().join(format!("{DT}/NEW/config.json"))).unwrap(),
+            NEW_EVIL
+        );
+        // ...but no delete did
+        for gone in ["OLD/config.json", "OLD/resource.json"] {
+            assert!(
+                sc.collection().join(format!("{DT}/{gone}")).is_file(),
+                "{gone} was deleted after a failed post-commit verification"
+            );
+        }
+        for line in tap.lines().iter().flatten() {
+            assert!(!line.starts_with("rm "), "a delete ran: {line}");
+            assert!(!line.starts_with("rmdir "), "an rmdir ran: {line}");
+        }
+        // verification and the renames are adjacent sessions: the session
+        // after the pre-rename `get`s is the one that renames
+        let batches = tap.lines();
+        let first_get = batches
+            .iter()
+            .position(|b| b.iter().any(|l| l.starts_with("get \"")))
+            .expect("a read-back session");
+        assert!(
+            batches[first_get + 1]
+                .iter()
+                .any(|l| l.starts_with("rename \"")),
+            "something ran between the pre-rename verification and the renames: {:?}",
+            batches[first_get + 1]
+        );
     }
 
     /// F6: a staged copy swapped for a far larger file is bounded by the same

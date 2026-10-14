@@ -1127,10 +1127,15 @@ impl TreeReader for SftpTransport {
 // Integrity: a listing size says nothing about content, so before the first
 // rename (`Separate`) every staged copy on the host is fetched back with a
 // typed `get` into a per-operation temp dir and hashed HERE against the
-// SHA-256 the stage recorded (no remote hash command). `InPlace` has no
-// staged copy on the host: it writes the final path and reads it back before
-// the first delete. The read-back uses the read side's watchdog and caps and
-// `open_regular_file`. A mismatch is `transport_failed`.
+// SHA-256 the stage recorded (no remote hash command). The directories to
+// create lead the same batch as the renames, so nothing sits between that
+// verification and the moves. sftp has no atomic verify-then-rename, so after
+// the moves (and for `InPlace`, which has no staged copy on the host) the
+// FINAL paths are read back and hashed again before the first delete; a
+// mismatch is `transport_failed` ("content changed on the host during
+// commit") and no delete runs. The read-backs use the read side's watchdog
+// and caps and `open_regular_file`. What remains is a host-side writer with
+// write access to the staging or collection directory.
 
 /// What the write half needs: the mode collection and the staging mode (the
 /// staging root normalised to an absolute POSIX path).
@@ -1830,8 +1835,18 @@ impl SftpTransport {
         if seen.get(&mode_chain) == Some(&Seen::Missing) {
             missing.insert(mode_chain.clone());
         }
-        self.make_dirs(OP, &self.data_dir, &missing).await?;
-        let mut moves: Vec<(SftpOp, u64)> = Vec::with_capacity(files.len());
+        // The missing directories lead the SAME batch as the renames (a sorted
+        // set lists a parent before its children), so nothing but the batch
+        // itself sits between the pre-rename verification above and the moves.
+        let mut moves: Vec<(SftpOp, u64)> = Vec::with_capacity(missing.len() + files.len());
+        for chain in &missing {
+            moves.push((
+                SftpOp::Mkdir {
+                    path: join_abs(&self.data_dir, chain),
+                },
+                0,
+            ));
+        }
         for (((path, _), chain), size) in files.iter().zip(&staged_chains).zip(&sizes) {
             let target = join_abs(&self.data_dir, chain);
             let op = match remote_root {
@@ -1847,33 +1862,34 @@ impl SftpTransport {
             moves.push((op, *size));
         }
         self.run_chunked(OP, moves).await?;
-        if remote_root.is_none() {
-            // InPlace wrote the final paths directly, so the read-back can only
-            // come after the write. A mismatch cannot be undone here; it stops
-            // before the first delete and says what was left.
-            let copies: Vec<RemoteCopy> = files
-                .iter()
-                .zip(&staged_chains)
-                .zip(&sizes)
-                .map(|(((path, sha), chain), size)| RemoteCopy {
-                    rel: path.clone(),
-                    remote: join_abs(&self.data_dir, chain),
-                    sha: sha.clone(),
-                    size: *size,
-                })
-                .collect();
-            let bad = self.verify_remote_copies(OP, &copies).await?;
-            if !bad.is_empty() {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "after the write, the {} collection holds content that does not match the staged SHA-256 for {}; the {} written files were not rolled back and no delete was run",
-                        setup.mode,
-                        named(&bad),
-                        files.len()
-                    ),
-                ));
-            }
+
+        // ---- post-commit verification, before any delete. sftp has no atomic
+        // verify-then-rename, so a host-side writer can still change a staged
+        // copy between the read-back above and the rename (and `InPlace` has no
+        // pre-write check at all). Read the FINAL paths back and hash them: a
+        // mismatch is detected, reported, and stops before the first delete.
+        let copies: Vec<RemoteCopy> = files
+            .iter()
+            .zip(&staged_chains)
+            .zip(&sizes)
+            .map(|(((path, sha), chain), size)| RemoteCopy {
+                rel: path.clone(),
+                remote: join_abs(&self.data_dir, chain),
+                sha: sha.clone(),
+                size: *size,
+            })
+            .collect();
+        let bad = self.verify_remote_copies(OP, &copies).await?;
+        if !bad.is_empty() {
+            return Err(self.mirror_fail(
+                OP,
+                format!(
+                    "content changed on the host during commit: the {} collection holds content that does not match the staged SHA-256 for {}; the {} written files were not rolled back and no delete was run",
+                    setup.mode,
+                    named(&bad),
+                    files.len()
+                ),
+            ));
         }
         let written: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
 
