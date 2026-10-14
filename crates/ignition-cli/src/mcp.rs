@@ -908,6 +908,31 @@ mod tests {
         );
     }
 
+    /// 22-11 (DPLN-07, Decision D): `deploy verify` is read-only (no write
+    /// path, no `GUARDED_OPS` entry), so the derived catalog tool
+    /// `deploy_verify` advertises no `confirm`.
+    #[test]
+    fn deploy_verify_is_an_unguarded_catalog_tool() {
+        let catalog = build_catalog();
+        let entry = catalog
+            .iter()
+            .find(|e| e.name == "deploy_verify")
+            .expect("deploy_verify derives from the clap tree");
+        assert_eq!(entry.path, "deploy verify");
+        assert!(
+            !GUARDED_OPS.iter().any(|(path, _)| *path == "deploy verify"),
+            "deploy verify is read-only and must not be guarded"
+        );
+        assert!(
+            entry
+                .schema
+                .get("properties")
+                .and_then(|props| props.get("confirm"))
+                .is_none(),
+            "deploy_verify advertises no confirm property"
+        );
+    }
+
     /// 22-08 (DPLN-06, D-11, Decision D): `deploy pull` replaces a
     /// non-empty declared tree in the caller's repo, so it is registered in
     /// `GUARDED_OPS` and the derived tool `deploy_pull` advertises the

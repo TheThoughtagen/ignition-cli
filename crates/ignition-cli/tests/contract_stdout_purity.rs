@@ -493,3 +493,146 @@ fn deploy_plan_json_stdout_is_the_envelope_only() {
         "nothing but the newline follows the envelope"
     );
 }
+
+/// 22-11: a RED `deploy verify` against a wiremock gateway keeps stdout to
+/// exactly one JSON value and its trailing newline under max diagnostics, and
+/// exits 6 (the verdict exception).
+#[tokio::test]
+async fn deploy_verify_json_stdout_is_the_envelope_only() {
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let dest = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), &dest).expect("copy");
+            }
+        }
+    }
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    copy_dir(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ignition-core/tests/fixtures/deploy/repos/tracer"
+        )),
+        &repo,
+    );
+    // an empty live data dir: the REST list below is empty too, so the
+    // verdict is red (resources missing) without any other setup
+    let data = scratch.path().join("data");
+    std::fs::create_dir_all(data.join("config").join("resources")).expect("resources dir");
+    std::fs::write(
+        repo.join("targets/dev.yaml"),
+        format!(
+            "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+            data.display()
+        ),
+    )
+    .expect("target file");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/scan/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "scanActive": false, "lastScanTimestamp": 1_792_000_000_000_i64, "lastScanDuration": 300
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/gateway-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deploymentMode": "dev"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-translator",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [], "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/singleton/ignition/general-alarm-settings",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"timestamp": 1_792_999_999_999_i64, "loggerName": "x", "level": "INFO", "message": "m"}],
+            "metadata": {"total": 1, "matching": 1, "limit": 1, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [], "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+
+    let config = scratch.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "active = \"dev\"\n\n[profiles.dev]\nurl = \"{}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    cmd.env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_LOG", "trace")
+        .env_remove("IGNITION_URL")
+        .env_remove("IGNITION_PROFILE")
+        .env_remove("IGNITION_JSON")
+        .env_remove("IGNITION_YES");
+    let output = cmd
+        .args(["--json", "deploy", "verify", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = &output.stdout;
+    assert!(
+        stdout.ends_with(b"\n") && !stdout.ends_with(b"\n\n"),
+        "exactly one trailing newline: {:?}",
+        String::from_utf8_lossy(stdout)
+    );
+    let mut stream = serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>();
+    let envelope = stream
+        .next()
+        .expect("one JSON value")
+        .expect("stdout parses as JSON");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["ok"], false);
+    assert_eq!(envelope["data"]["slug"], "deploy_verify_failed");
+    let value_end = stream.byte_offset();
+    assert!(
+        stream.next().is_none(),
+        "stdout holds exactly one JSON value"
+    );
+    assert_eq!(
+        stdout[value_end..],
+        *b"\n",
+        "nothing but the newline follows the envelope"
+    );
+}

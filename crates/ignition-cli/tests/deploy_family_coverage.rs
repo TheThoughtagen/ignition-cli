@@ -173,3 +173,49 @@ fn every_deploy_leaf_has_a_projects_route_row() {
     }
     assert!(problems.is_empty(), "{problems:#?}");
 }
+
+/// DSURF-04: the `deploy verify` verdict exception is documented under
+/// `## Output contract (for agents)` in a dated `###` section, names the
+/// envelope fields and exit 6, and the verdict slug is NOT an exit-table row
+/// (it lives only in `data.slug`).
+#[test]
+fn verify_verdict_exception_is_dated_and_documented() {
+    let contract = section("Output contract (for agents)");
+    let prefix = "### The `deploy verify` verdict exception (";
+    let start = contract
+        .find(prefix)
+        .unwrap_or_else(|| panic!("no `{prefix}<YYYY-MM-DD>)` heading under the output contract"));
+    let after = &contract[start + prefix.len()..];
+    let close = after.find(")\n").expect("the heading closes with `)`");
+    let date = &after[..close];
+    let bytes = date.as_bytes();
+    assert!(
+        bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit()),
+        "the heading date must be YYYY-MM-DD, got {date:?}"
+    );
+    let body_start = &after[close..];
+    let body_end = body_start[3..]
+        .find("\n### ")
+        .map_or(body_start.len(), |i| i + 3);
+    let body = &body_start[..body_end];
+    for needle in ["data.ok", "deploy_verify_failed", "exit 6", "`ok: true`"] {
+        assert!(
+            body.contains(needle),
+            "exception text must mention {needle}: {body}"
+        );
+    }
+    assert!(
+        !section("Exit codes").contains("deploy_verify_failed"),
+        "`deploy_verify_failed` is a verdict slug, never an exit-table row"
+    );
+    assert!(
+        !CoreError::DEPLOY_SLUGS.contains(&"deploy_verify_failed"),
+        "the verdict slug is not a CoreError slug"
+    );
+}
