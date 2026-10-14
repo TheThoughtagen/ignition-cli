@@ -48,6 +48,25 @@
 //! The [`DeployPullResult`] `data` keys, in order: `env, gateway, mode, node,
 //! transport, out, files_written, manifest, render_sha256, skipped,
 //! warnings`.
+//!
+//! ## `deploy verify` (22-10, DPLN-07, DPLN-08, DPLN-09)
+//!
+//! [`deploy_verify`] gathers read-only evidence from the master gateway and
+//! judges it with the pure [`verify::evaluate`] (six checks, fixed order; see
+//! [`crate::deploy::verify`] for the rules). It takes a [`DeployApi`] for the
+//! REST resource, scan and mode reads, a [`GatewayApi`] for the log and the
+//! WebDev tag probes, and a [`TreeReader`] for the live files. It takes no
+//! scan-lock, triggers no scan and writes nothing.
+//!
+//! A red verdict is a normal result: `ok: false`, `slug:
+//! deploy_verify_failed`, and [`DeployVerifyResult::failure_exit_code`]
+//! returns `Some(6)` for the binary to apply after rendering (Decision A).
+//! An unreachable gateway, a refused resource, scan or mode read, and a
+//! transport failure are [`CoreError`]s instead, because there is nothing to
+//! judge. No log text, tag value or file byte reaches the result.
+//!
+//! The [`DeployVerifyResult`] `data` keys, in order: `env, gateway, mode,
+//! node, project, ok, slug, checks, resources_checked, warnings`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,6 +74,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::client::logs::{DEFAULT_LOG_LIMIT, LogQuery};
+use crate::client::mode::normalize_deployment_mode;
+use crate::client::query::ListQuery;
+use crate::client::scan::{ScanKind, ScanStatus};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, ledger_location};
@@ -792,7 +815,23 @@ impl DeployVerifyResult {
     }
 }
 
-/// Verify the master gateway against `declared`. Not implemented yet.
+/// Most pages of log lines read before the answer is called truncated.
+const LOG_PAGES_MAX: usize = 5;
+
+/// Verify the master gateway against `declared` (DPLN-07, DPLN-08, DPLN-09).
+///
+/// Reads only: `scan_status`, `deployment_mode`, `resource_list` or
+/// `resource_singleton` per declared non-tag type, one read of the live files
+/// through `reader`, the gateway log, and the tag probes through `project`'s
+/// WebDev route. It acquires no scan-lock, triggers no scan and writes no
+/// file. Evidence is gathered, then judged by [`verify::evaluate`].
+///
+/// A gateway that cannot be reached ([`CoreError::Network`]), any refusal of
+/// the resource, scan or mode reads, and a transport failure return a
+/// [`CoreError`]: there is nothing to judge. A refusal of the log or tag
+/// source is evidence, not an error: that check fails with the refusal's slug
+/// (never its text). A red verdict is a normal `Ok` result; the binary maps
+/// it to exit 6 through [`DeployVerifyResult::failure_exit_code`].
 pub async fn deploy_verify(
     declared: &Declared,
     project: &str,
@@ -801,8 +840,216 @@ pub async fn deploy_verify(
     reader: &dyn TreeReader,
     opts: &VerifyOptions,
 ) -> Result<DeployVerifyResult, CoreError> {
-    let _ = (declared, project, deploy, gateway, reader, opts);
-    Err(CoreError::Internal(
-        "deploy_verify is not implemented".to_string(),
-    ))
+    let expected =
+        verify::Expected::from_render(&declared.target.mode, &declared.outcome, &declared.manifest);
+
+    let scan = deploy.scan_status(ScanKind::Config).await?;
+    let scan_read_at = std::time::Instant::now();
+    let mode = normalize_deployment_mode(deploy.deployment_mode().await?);
+    let read_back = gather_read_back(deploy, &expected).await?;
+
+    // The live files, once, over the read-only transport. Tag units are the
+    // ones judged; reading is also what proves the host is reachable.
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let live = reader.read(&scope).await?;
+    let planned = plan(&declared.outcome.tree, &live, None, &scope);
+    let files = planned
+        .entries
+        .iter()
+        .filter(|entry| expected.tag_units.contains(&entry.key))
+        .map(|entry| (entry.key.clone(), entry.status))
+        .collect();
+
+    let logs = if scan.scan_active {
+        // Its lines are not readable yet; the check reports "not observed".
+        Ok(Vec::new())
+    } else {
+        settle_logs(gateway, &scan, scan_read_at, opts.log_settle).await?;
+        read_logs(gateway, verify::log_window_start(&scan)).await?
+    };
+    let probes = if expected.probes.is_empty() {
+        None
+    } else {
+        Some(poll_probes(gateway, project, &expected.probes, opts).await?)
+    };
+
+    let observed = verify::ObservedState {
+        scan,
+        mode,
+        read_back,
+        files,
+        logs,
+        probes,
+    };
+    let report = verify::evaluate(&expected, &observed);
+    Ok(DeployVerifyResult {
+        env: declared.env.clone(),
+        gateway: declared.target.gateway.clone(),
+        mode: declared.target.mode.clone(),
+        node: "master".to_string(),
+        project: project.to_string(),
+        ok: report.ok,
+        slug: report.slug,
+        checks: report.checks,
+        resources_checked: report.resources_checked,
+        warnings: report.warnings,
+    })
+}
+
+/// Read each declared, comparable resource from the REST effective view:
+/// one list per named type, one singleton read per singleton. An absent
+/// resource (or a type whose route answers 404) is `Missing`; any other
+/// refusal is an error.
+async fn gather_read_back(
+    deploy: &dyn DeployApi,
+    expected: &verify::Expected,
+) -> Result<BTreeMap<String, verify::Remote>, CoreError> {
+    let classify = |record: crate::client::config_resources::ResourceRecord| {
+        if record.collection.as_deref() == Some(verify::SYSTEM_COLLECTION) {
+            verify::Remote::System
+        } else {
+            verify::Remote::Config(record.config)
+        }
+    };
+    let mut lists: BTreeMap<(String, String), Option<Vec<_>>> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for res in &expected.resources {
+        let remote = match &res.name {
+            None => match deploy.resource_singleton(&res.module, &res.ty, None).await {
+                Ok(record) => classify(record),
+                Err(CoreError::NotFound { .. }) => verify::Remote::Missing,
+                Err(e) => return Err(e),
+            },
+            Some(name) => {
+                let type_key = (res.module.clone(), res.ty.clone());
+                if !lists.contains_key(&type_key) {
+                    let items = match deploy
+                        .resource_list(&res.module, &res.ty, &ListQuery::default())
+                        .await
+                    {
+                        Ok(envelope) => Some(envelope.items),
+                        Err(CoreError::NotFound { .. }) => None,
+                        Err(e) => return Err(e),
+                    };
+                    lists.insert(type_key.clone(), items);
+                }
+                lists
+                    .get(&type_key)
+                    .and_then(Option::as_ref)
+                    .and_then(|items| items.iter().find(|r| r.name.as_deref() == Some(name)))
+                    .map_or(verify::Remote::Missing, |r| classify(r.clone()))
+            }
+        };
+        out.insert(res.key.clone(), remote);
+    }
+    Ok(out)
+}
+
+/// Wait until an empty answer from the log means something (CV1: a line is
+/// readable up to about 1.5 s after the scan completed). The wait is skipped
+/// when the gateway has logged anything stamped after the settle point.
+async fn settle_logs(
+    gateway: &dyn GatewayApi,
+    scan: &ScanStatus,
+    scan_read_at: std::time::Instant,
+    settle: Duration,
+) -> Result<(), CoreError> {
+    if settle.is_zero() {
+        return Ok(());
+    }
+    let settle_ms = i64::try_from(settle.as_millis()).unwrap_or(i64::MAX);
+    let probe = LogQuery {
+        start_time: Some(scan.last_scan_timestamp.saturating_add(settle_ms)),
+        limit: 1,
+        ..LogQuery::default()
+    };
+    match gateway.logs(&probe).await {
+        Ok(envelope) if !envelope.items.is_empty() => return Ok(()),
+        Err(e @ CoreError::Network { .. }) => return Err(e),
+        // An unreadable log is reported by the real read that follows.
+        Ok(_) | Err(_) => {}
+    }
+    tokio::time::sleep(settle.saturating_sub(scan_read_at.elapsed())).await;
+    Ok(())
+}
+
+/// The WARN-or-higher log lines since `start_time` (CV1: no `logger` filter,
+/// no `endTime`; matched client-side). The inner `Err` is the slug of why
+/// they could not be read.
+async fn read_logs(
+    gateway: &dyn GatewayApi,
+    start_time: i64,
+) -> Result<Result<Vec<verify::LogLine>, String>, CoreError> {
+    let mut lines = Vec::new();
+    let mut offset = 0i64;
+    for _ in 0..LOG_PAGES_MAX {
+        let query = LogQuery {
+            start_time: Some(start_time),
+            min_level: Some("WARN".to_string()),
+            limit: DEFAULT_LOG_LIMIT,
+            offset,
+            ..LogQuery::default()
+        };
+        match gateway.logs(&query).await {
+            Ok(envelope) => {
+                let count = i64::try_from(envelope.items.len()).unwrap_or(i64::MAX);
+                lines.extend(envelope.items.into_iter().map(|e| verify::LogLine {
+                    timestamp: e.timestamp,
+                    logger: e.logger_name,
+                    message: e.message,
+                }));
+                if count < DEFAULT_LOG_LIMIT {
+                    return Ok(Ok(lines));
+                }
+                offset += count;
+            }
+            Err(e @ CoreError::Network { .. }) => return Err(e),
+            Err(e) => return Ok(Err(e.code().to_string())),
+        }
+    }
+    Ok(Err("logs_truncated".to_string()))
+}
+
+/// Read `paths` through the WebDev `tags` route every `probe_interval` until
+/// every one is Good or `probe_deadline` passed; the last reading is judged.
+/// Values are dropped at once. The inner `Err` is the slug of why the route
+/// could not be read.
+async fn poll_probes(
+    gateway: &dyn GatewayApi,
+    project: &str,
+    paths: &[String],
+    opts: &VerifyOptions,
+) -> Result<Result<Vec<verify::ProbeReading>, String>, CoreError> {
+    let interval = opts.probe_interval.max(Duration::from_millis(1));
+    let started = tokio::time::Instant::now();
+    loop {
+        let readings: Vec<verify::ProbeReading> =
+            match crate::actions::tags::tags_read(gateway, project, paths).await {
+                Ok(result) => result
+                    .results
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, row)| verify::ProbeReading {
+                        // A row that does not echo its path is the one asked for.
+                        path: if row.path.is_empty() {
+                            paths.get(i).cloned().unwrap_or_default()
+                        } else {
+                            row.path
+                        },
+                        quality: row.quality,
+                    })
+                    .collect(),
+                Err(e @ CoreError::Network { .. }) => return Err(e),
+                Err(e) => return Ok(Err(e.code().to_string())),
+            };
+        let all_good = paths.iter().all(|path| {
+            readings
+                .iter()
+                .any(|r| &r.path == path && r.quality.starts_with("Good"))
+        });
+        if all_good || started.elapsed() + interval > opts.probe_deadline {
+            return Ok(Ok(readings));
+        }
+        tokio::time::sleep(interval).await;
+    }
 }

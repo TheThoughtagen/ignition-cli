@@ -1419,34 +1419,68 @@ async fn verify_probe_route_absent_is_unavailable() {
     assert_eq!(probes.findings[0].detail, "routes_not_deployed");
 }
 
+/// Through the real client on the wire: a singleton whose effective copy is in
+/// the `system` collection is skipped with a warning (CV2), never compared.
 #[tokio::test]
 async fn verify_system_collection_copy_is_skipped_with_a_warning() {
     let env = env();
     let server = wiremock::MockServer::start().await;
     mount_logs(&server, Vec::new()).await;
+    let get = |p: &str| {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(p.to_string()))
+    };
+    get("/data/api/v1/scan/config")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "scanActive": false, "lastScanTimestamp": 1_792_000_000_000_i64, "lastScanDuration": 300
+        })))
+        .mount(&server)
+        .await;
+    get("/data/api/v1/gateway-info")
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"deploymentMode": MODE})),
+        )
+        .mount(&server)
+        .await;
+    get("/data/api/v1/resources/list/ignition/database-translator")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "type": "ignition/database-translator", "name": "POSTGRES", "collection": MODE,
+                "config": rest_config(&env.declared, NAMED)
+            }],
+            "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+        })))
+        .mount(&server)
+        .await;
+    get("/data/api/v1/resources/singleton/ignition/general-alarm-settings")
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "type": "ignition/general-alarm-settings", "collection": "system",
+            "config": {"anything": 1}
+        })))
+        .mount(&server)
+        .await;
     let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
-    // The singleton exists only in the system collection.
-    let fake = FakeGateway::new();
-    fake.set_deployment_mode(Some(MODE.to_string()));
-    let mut create = ResourceCreate::new("POSTGRES", rest_config(&env.declared, NAMED));
-    create.collection = Some(MODE.to_string());
-    fake.client("s")
-        .resource_create("ignition", "database-translator", &[create])
-        .await
-        .unwrap();
-    fake.seed_singleton(
-        "ignition",
-        "general-alarm-settings",
-        "system",
-        record(json!({"anything": 1})),
-    );
-    let result = run(&env, &fake, &api).await.expect("verdict");
+    let result = deploy_verify(
+        &env.declared,
+        "ign-cli",
+        &api,
+        &api,
+        env.reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect("verdict");
     assert!(result.ok, "{result:#?}");
     assert_eq!(result.resources_checked, 1);
     assert!(
         result
             .warnings
             .iter()
-            .any(|w| w.contains(SINGLETON) && w.contains("system"))
+            .any(|w| w.contains(SINGLETON) && w.contains("system")),
+        "{:?}",
+        result.warnings
     );
+    // Nothing but GETs reached the gateway.
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().all(|r| r.method.as_str() == "GET"));
 }
