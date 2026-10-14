@@ -2,8 +2,8 @@
 //!
 //! A transport reaches the gateway HOST's `data/config/resources/<collection>/`
 //! directories. This module defines the **read half** the verbs receive:
-//! [`TreeReader`]. The write half (a mirror driven by an explicit delete set)
-//! is a separate trait that lands later and is never reachable from a verb,
+//! [`TreeReader`]. The write half (a mirror driven by an explicit delete set,
+//! [`TreeMirror`]) is a separate trait that is never reachable from a verb,
 //! so "plan, pull and verify never write to the host" is a compile-time
 //! fact for `actions::deploy`, not a convention.
 //!
@@ -18,6 +18,10 @@
 //! - **Scoped.** Only the directories the manifest allowlists are opened
 //!   (see [`Scope`]); nothing outside them is listed or read.
 //!
+//! The write half is [`TreeMirror`]; [`mirror_for_node`] is the only way to
+//! obtain one, and a source-scan test (`write_half_unreachable`) pins that no
+//! verb or surface names it.
+//!
 //! [`for_node`] chooses the reader for a target node: `local: { data_dir }`
 //! selects [`local::LocalFsTransport`] (D-02); `ssh` with `os: linux` selects
 //! [`sftp::SftpTransport`] over the hardened [`remote::RemoteShell`].
@@ -27,7 +31,7 @@ pub mod process;
 pub mod remote;
 pub mod sftp;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -35,7 +39,9 @@ use serde::Serialize;
 
 use super::layout::{RelPath, TAG_TYPES};
 use super::manifest::Manifest;
+use super::rules::GATEWAY_OWNED_FILES;
 use super::target::{NodeTarget, TargetOs};
+use super::tree::RenderedTree;
 use crate::error::CoreError;
 
 /// The literal name of the base resource collection on a gateway.
@@ -141,18 +147,27 @@ pub trait TreeReader: Send + Sync {
     async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
 }
 
-/// The reader for `node`, from its target block.
-///
-/// `local` builds the local-filesystem transport (a relative `data_dir`
-/// resolves against `repo`). A node with neither `ssh` nor `local` is
-/// refused as `deploy_tree_invalid` naming `label`, because a verb that
-/// reads the host needs host access (D-02).
-pub fn for_node(
+/// How a node's data directory is reached, resolved once for both halves.
+enum NodeAccess {
+    /// A directory on the runner's own filesystem.
+    Local(std::path::PathBuf),
+    /// A Linux host over the hardened ssh shell.
+    Ssh {
+        shell: Box<remote::RemoteShell>,
+        data_dir: String,
+    },
+}
+
+/// Resolve `node` to an access path; `verb` ("read" or "written") names the
+/// refusal for a Windows ssh node, which stays refused until the Windows sftp
+/// path form is captured (D-14, C7a; 22-13).
+fn node_access(
     repo: &Path,
     target_file: &str,
     label: &str,
     node: &NodeTarget,
-) -> Result<Box<dyn TreeReader>, CoreError> {
+    verb: &str,
+) -> Result<NodeAccess, CoreError> {
     match (&node.ssh, &node.local) {
         (Some(_), Some(_)) => Err(CoreError::deploy_tree_invalid(
             target_file,
@@ -167,7 +182,7 @@ pub fn for_node(
             } else {
                 repo.join(configured)
             };
-            Ok(Box::new(local::LocalFsTransport::new(data_dir, label)))
+            Ok(NodeAccess::Local(data_dir))
         }
         (Some(ssh), None) => match ssh.os {
             TargetOs::Linux => {
@@ -186,16 +201,17 @@ pub fn for_node(
                     ssh,
                     Arc::new(process::TokioProcessRunner),
                 )?;
-                Ok(Box::new(sftp::SftpTransport::new(shell, data_dir, label)))
+                Ok(NodeAccess::Ssh {
+                    shell: Box::new(shell),
+                    data_dir,
+                })
             }
-            // The Windows sftp path form is a capture still to be made
-            // (D-14, C7a); 22-13 replaces this refusal.
             TargetOs::Windows => Err(CoreError::deploy_tree_invalid(
                 target_file,
                 None,
                 None,
                 format!(
-                    "{label}.ssh.os: windows hosts cannot be read over ssh yet (the Windows sftp path form is not captured); use os: linux or a local data_dir"
+                    "{label}.ssh.os: windows hosts cannot be {verb} over ssh yet (the Windows sftp path form is not captured); use os: linux or a local data_dir"
                 ),
             )),
         },
@@ -206,4 +222,410 @@ pub fn for_node(
             format!("{label}: set ssh or local; this verb needs host access"),
         )),
     }
+}
+
+/// The reader for `node`, from its target block.
+///
+/// `local` builds the local-filesystem transport (a relative `data_dir`
+/// resolves against `repo`). A node with neither `ssh` nor `local` is
+/// refused as `deploy_tree_invalid` naming `label`, because a verb that
+/// reads the host needs host access (D-02).
+pub fn for_node(
+    repo: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn TreeReader>, CoreError> {
+    Ok(match node_access(repo, target_file, label, node, "read")? {
+        NodeAccess::Local(data_dir) => Box::new(local::LocalFsTransport::new(data_dir, label)),
+        NodeAccess::Ssh { shell, data_dir } => {
+            Box::new(sftp::SftpTransport::new(*shell, data_dir, label))
+        }
+    })
+}
+
+/// The write half of a transport: stage a rendered tree, then commit it with
+/// an explicit delete set.
+///
+/// **No Phase 22 verb may import this trait.** `render`, `plan`, `pull` and
+/// `verify` receive a [`TreeReader`] from [`for_node`] and cannot reach it;
+/// the `write_half_unreachable` test scans the verb sources for
+/// `TreeMirror`, `mirror_for_node`, `StagingMode`, `.stage(` and `.commit(`.
+/// Phase 23 is the first caller: it calls [`stage`](TreeMirror::stage) before
+/// the scan-lock and [`commit`](TreeMirror::commit) inside it.
+///
+/// What a mirror guarantees, on both transports:
+///
+/// - **Bounded writes.** [`commit`](TreeMirror::commit) writes exactly the
+///   staged files and removes exactly the delete-set files. Nothing else in
+///   the collection is touched (never `config-mode.json`, never an
+///   undeclared resource, no mirror-style removal of extras). A directory
+///   emptied by a delete is removed; the `<module>/<type>` directory and
+///   everything above it never is.
+/// - **Nothing foreign in the collection.** No temp, backup, staging or
+///   dot-named entry is created below `config/resources` (the Designer
+///   rejects such names). Staging happens in a private temp dir and, for
+///   [`StagingMode::Separate`], in a root outside `config/resources`.
+/// - **Fail closed.** Every path is validated before any I/O. The expected
+///   state (delete targets are regular files, write targets are absent or
+///   regular files, no component is a symlink, staged copies are intact) is
+///   checked before the first write; any mismatch is `transport_failed` with
+///   nothing written. Symlinks are never followed and never created.
+/// - **Bounded size.** The staged tree obeys the read side's
+///   [`READ_MAX_FILE_BYTES`], [`READ_MAX_TOTAL_BYTES`] and
+///   [`READ_MAX_ENTRIES`].
+/// - **Atomic where the platform allows.** `Separate` moves each staged file
+///   into place with a rename (a replace on the same filesystem); `InPlace`
+///   writes the target directly and is not atomic per file. A commit is not
+///   atomic across files: a failure part-way leaves the files already moved
+///   in place, which is why Phase 23 wraps it in a snapshot.
+///
+/// A [`Staged`] belongs to the mirror that made it and is consumed by its
+/// commit in `Separate` mode (the staged files are moved); stage again to
+/// commit again.
+#[async_trait::async_trait]
+pub trait TreeMirror: Send + Sync {
+    /// Copy `tree` into staging. Writes nothing into the collection.
+    async fn stage(&self, tree: &RenderedTree) -> Result<Staged, CoreError>;
+
+    /// Write the staged files into the mode collection and remove
+    /// `delete_set`. Refuses, with nothing written, anything that is not a
+    /// valid, in-bounds, expected-state operation.
+    async fn commit(
+        &self,
+        staged: &Staged,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError>;
+}
+
+/// Where staged files wait before they are moved into the collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagingMode {
+    /// Staged files are uploaded to `root`, a directory OUTSIDE
+    /// `config/resources`, and moved in with a rename at commit.
+    Separate {
+        /// The staging root, as the transport spells paths (a local path, or
+        /// an absolute POSIX path on the host).
+        root: String,
+    },
+    /// Files are written straight into the collection at commit.
+    InPlace,
+}
+
+/// A rendered tree held in staging, ready to commit.
+#[derive(Debug)]
+pub struct Staged {
+    /// Each staged file with the lowercase hex SHA-256 of its bytes.
+    pub files: Vec<(RelPath, String)>,
+    /// A private temp dir holding a copy of every staged file. Commit
+    /// re-reads and re-verifies it through
+    /// [`open_regular_file`](super::tree::open_regular_file).
+    pub(crate) local: tempfile::TempDir,
+    /// The `Separate` staging root the files were copied to, `None` for
+    /// `InPlace`.
+    pub(crate) remote_root: Option<String>,
+    /// Which mirror (node and mode) staged this.
+    pub(crate) owner: String,
+}
+
+/// What a commit did, collection-relative and byte-sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MirrorReport {
+    /// Files written (staged files).
+    pub written: Vec<String>,
+    /// Files removed (the delete set).
+    pub deleted: Vec<String>,
+    /// Directories removed because a delete emptied them.
+    pub removed_dirs: Vec<String>,
+}
+
+/// The write half for `node`'s `mode` collection.
+///
+/// `local` builds the local-filesystem mirror; an `ssh` Linux node builds the
+/// sftp mirror over the same hardened shell as [`for_node`]. A Windows ssh
+/// node stays refused until 22-13. `mode` is the mode collection name; `core`
+/// and `local` are never written.
+pub fn mirror_for_node(
+    repo: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+    mode: &str,
+    staging: StagingMode,
+) -> Result<Box<dyn TreeMirror>, CoreError> {
+    let invalid = |detail: String| CoreError::deploy_tree_invalid(target_file, None, None, detail);
+    Ok(
+        match node_access(repo, target_file, label, node, "written")? {
+            NodeAccess::Local(data_dir) => Box::new(
+                local::LocalFsTransport::new(data_dir, label)
+                    .with_mirror(mode, staging)
+                    .map_err(|why| invalid(format!("{label}: {why}")))?,
+            ),
+            NodeAccess::Ssh { shell, data_dir } => Box::new(
+                sftp::SftpTransport::new(*shell, data_dir, label)
+                    .with_mirror(mode, staging)
+                    .map_err(|why| invalid(format!("{label}: {why}")))?,
+            ),
+        },
+    )
+}
+
+/// A mode name that may be written: a plain path component that is not one of
+/// the collections a mirror must never touch.
+pub(crate) fn mirror_mode_problem(mode: &str) -> Option<String> {
+    if let Some(why) = super::component_problem(mode) {
+        return Some(format!("the mode {why}"));
+    }
+    if mode == CORE_COLLECTION || mode == "local" {
+        return Some(format!(
+            "the mode {mode:?} names a collection a mirror never writes"
+        ));
+    }
+    None
+}
+
+/// Why `path` may not be written or deleted by a mirror, or `None`.
+///
+/// A mirror path is `<module>/<type>/<name>...`: at least three components,
+/// no dot-named component (the Designer rejects them), no gateway-owned file
+/// name and no control character.
+pub(crate) fn mirror_path_problem(path: &RelPath) -> Option<String> {
+    let parts: Vec<&str> = path.components().collect();
+    if parts.len() < MIRROR_MIN_COMPONENTS {
+        return Some(format!(
+            "{path} is not a collection path (<module>/<type>/<name>..., at least {MIRROR_MIN_COMPONENTS} components)"
+        ));
+    }
+    for part in parts {
+        if part.starts_with('.') {
+            return Some(format!("{path} has a dot-named component {part:?}"));
+        }
+        if GATEWAY_OWNED_FILES.contains(&part) {
+            return Some(format!("{path} names the gateway-owned file {part:?}"));
+        }
+        if part.chars().any(char::is_control) {
+            return Some(format!("{path} has a control character in a name"));
+        }
+    }
+    None
+}
+
+/// The shallowest path a mirror touches: `<module>/<type>/<name>`.
+pub(crate) const MIRROR_MIN_COMPONENTS: usize = 3;
+
+/// Refuse a staged tree and delete set before any I/O: every path valid, no
+/// path both staged and deleted, no path a file and a directory of another,
+/// bytes and entries within the read side's caps, and a `Separate` staging
+/// root that is not inside (or around) `resources_root`.
+pub(crate) fn validate_mirror_inputs(
+    tree: &RenderedTree,
+    delete_set: &DeleteSet,
+    staging: &StagingMode,
+    resources_root: &str,
+) -> Result<(), String> {
+    let mut total: u64 = 0;
+    for (path, bytes) in &tree.files {
+        let len = bytes.len() as u64;
+        if len > READ_MAX_FILE_BYTES {
+            return Err(format!(
+                "{path} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
+            ));
+        }
+        total = total.saturating_add(len);
+        if total > READ_MAX_TOTAL_BYTES {
+            return Err(format!(
+                "the staged tree exceeds {READ_MAX_TOTAL_BYTES} bytes in total (at {path})"
+            ));
+        }
+    }
+    let staged: Vec<&RelPath> = tree.files.keys().collect();
+    validate_mirror_paths(&staged, delete_set)?;
+    validate_staging_root(staging, resources_root)
+}
+
+/// The path half of [`validate_mirror_inputs`], also run by commit on the
+/// paths of a [`Staged`].
+pub(crate) fn validate_mirror_paths(
+    staged: &[&RelPath],
+    delete_set: &DeleteSet,
+) -> Result<(), String> {
+    for path in staged {
+        if let Some(why) = mirror_path_problem(path) {
+            return Err(format!("staged path refused: {why}"));
+        }
+    }
+    let mut deleting: BTreeSet<&str> = BTreeSet::new();
+    for path in &delete_set.files {
+        if let Some(why) = mirror_path_problem(path) {
+            return Err(format!("delete-set path refused: {why}"));
+        }
+        if !deleting.insert(path.as_str()) {
+            return Err(format!("delete-set path {path} is listed twice"));
+        }
+    }
+    let staging: BTreeSet<&str> = staged.iter().map(|p| p.as_str()).collect();
+    if staging.len() != staged.len() {
+        return Err("a path is staged twice".to_string());
+    }
+    if let Some(both) = deleting.iter().find(|p| staging.contains(**p)) {
+        return Err(format!("{both} is both staged and in the delete set"));
+    }
+    // A path may not be a file and the directory of another path.
+    let mut dirs: BTreeSet<&str> = BTreeSet::new();
+    for path in staging.iter().chain(deleting.iter()) {
+        for (at, _) in path.match_indices('/') {
+            dirs.insert(&path[..at]);
+        }
+    }
+    if let Some(clash) = staging
+        .iter()
+        .chain(deleting.iter())
+        .find(|p| dirs.contains(**p))
+    {
+        return Err(format!(
+            "{clash} is a file and also the directory of another path"
+        ));
+    }
+    if staging.len() + deleting.len() + dirs.len() > READ_MAX_ENTRIES {
+        return Err(format!(
+            "more than {READ_MAX_ENTRIES} entries (files, deletes and directories together)"
+        ));
+    }
+    Ok(())
+}
+
+/// The components of an absolute path spelled with `/` or `\`, or why it is
+/// not usable as a staging root.
+pub(crate) fn absolute_components(text: &str) -> Result<Vec<String>, String> {
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return Err("must be a non-empty path without control characters".to_string());
+    }
+    let normal = text.replace('\\', "/");
+    let bytes = normal.as_bytes();
+    let absolute = normal.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[1] == b':'
+            && bytes[2] == b'/'
+            && bytes[0].is_ascii_alphabetic());
+    if !absolute {
+        return Err("must be an absolute path".to_string());
+    }
+    let mut parts = Vec::new();
+    for part in normal.split('/') {
+        match part {
+            "" => {}
+            "." | ".." => return Err("must not contain `.` or `..` components".to_string()),
+            other => parts.push(other.to_string()),
+        }
+    }
+    Ok(parts)
+}
+
+/// Refuse a `Separate` staging root that is relative, too shallow, inside
+/// `resources_root` (`config/resources`) or around it. `InPlace` has no root.
+pub(crate) fn validate_staging_root(
+    staging: &StagingMode,
+    resources_root: &str,
+) -> Result<(), String> {
+    let StagingMode::Separate { root } = staging else {
+        return Ok(());
+    };
+    let staging_parts =
+        absolute_components(root).map_err(|why| format!("the staging root {root:?} {why}"))?;
+    if staging_parts.len() < 2 {
+        return Err(format!(
+            "the staging root {root:?} must be at least two directories deep"
+        ));
+    }
+    let resources_parts = absolute_components(resources_root)
+        .map_err(|why| format!("the resources root {resources_root:?} {why}"))?;
+    let same = |a: &String, b: &String| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let starts_with = |long: &[String], short: &[String]| {
+        long.len() >= short.len() && long.iter().zip(short).all(|(a, b)| same(a, b))
+    };
+    if starts_with(&staging_parts, &resources_parts) {
+        return Err(format!(
+            "the staging root {root:?} is inside config/resources; staging entries there would be scanned by the gateway"
+        ));
+    }
+    if starts_with(&resources_parts, &staging_parts) {
+        return Err(format!(
+            "the staging root {root:?} contains config/resources"
+        ));
+    }
+    Ok(())
+}
+
+/// Copy every file of `tree` into a fresh private temp dir and hash it. The
+/// dir is new and ours, so a plain `create_new` write is safe.
+pub(crate) fn copy_to_temp(
+    tree: &RenderedTree,
+) -> Result<(tempfile::TempDir, Vec<(RelPath, String)>), String> {
+    use std::io::Write;
+    let temp = tempfile::Builder::new()
+        .prefix("ign-stage-")
+        .tempdir()
+        .map_err(|e| format!("cannot create a staging dir ({})", e.kind()))?;
+    let mut files = Vec::with_capacity(tree.files.len());
+    for (path, bytes) in &tree.files {
+        let target = temp.path().join(path.as_str());
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create the staging dir for {path} ({})", e.kind()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| format!("cannot stage {path} ({})", e.kind()))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("cannot stage {path} ({})", e.kind()))?;
+        files.push((path.clone(), super::tree::sha256_hex(bytes)));
+    }
+    Ok((temp, files))
+}
+
+/// The bytes of the staged copy `rel` below `base`, read through
+/// [`open_regular_file`](super::tree::open_regular_file) (descriptor-relative,
+/// no symlink followed) and required to be a regular file within the file cap
+/// whose SHA-256 is `expect_sha`.
+pub(crate) fn read_staged_copy(
+    base: &Path,
+    rel: &RelPath,
+    expect_sha: &str,
+) -> Result<Vec<u8>, String> {
+    use super::tree::{OpenError, open_regular_file, sha256_hex};
+    use std::io::Read;
+    let path = base.join(rel.as_str());
+    let before = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("the staged copy of {rel} is gone ({})", e.kind()))?;
+    if !before.file_type().is_file() {
+        return Err(format!("the staged copy of {rel} is not a regular file"));
+    }
+    let (file, held) =
+        open_regular_file(base, Path::new(rel.as_str()), &before).map_err(|e| match e {
+            OpenError::Changed => format!("the staged copy of {rel} changed while it was read"),
+            OpenError::Io(e) => format!("cannot read the staged copy of {rel} ({})", e.kind()),
+        })?;
+    if held.len() > READ_MAX_FILE_BYTES {
+        return Err(format!(
+            "the staged copy of {rel} is over the {READ_MAX_FILE_BYTES} byte file cap"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(held.len() as usize);
+    file.take(READ_MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read the staged copy of {rel} ({})", e.kind()))?;
+    if bytes.len() as u64 > READ_MAX_FILE_BYTES || sha256_hex(&bytes) != expect_sha {
+        return Err(format!(
+            "the staged copy of {rel} changed after it was staged"
+        ));
+    }
+    Ok(bytes)
 }

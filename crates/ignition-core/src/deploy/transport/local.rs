@@ -9,20 +9,28 @@
 //! enforced while walking. Only an ABSENT collection directory reads as
 //! empty; every other failure is `transport_failed` naming the node and the
 //! path relative to `data_dir`, never file content.
+//!
+//! The write half ([`TreeMirror`]) is implemented below, bound to
+//! `<data_dir>/config/resources/<mode>`. It never follows a symlink, creates
+//! no temp or dot-named entry inside the collection, checks the whole
+//! expected state before its first write and touches only the staged files
+//! and the delete set (see the trait's contract).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    CORE_COLLECTION, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
-    READ_MAX_TOTAL_BYTES, Scope, TreeReader,
+    CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
+    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
+    copy_to_temp, mirror_mode_problem, read_staged_copy, validate_mirror_inputs,
+    validate_mirror_paths, validate_staging_root,
 };
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
 use crate::deploy::ledger::{LEDGER_MAX_BYTES, ledger_location};
 use crate::deploy::plan::unit_key;
-use crate::deploy::tree::{OpenError, open_regular_file, sha256_hex, walk_capped};
+use crate::deploy::tree::{OpenError, RenderedTree, open_regular_file, sha256_hex, walk_capped};
 use crate::error::CoreError;
 
 /// The collection that overrides the mode collection on the gateway.
@@ -33,6 +41,14 @@ const LOCAL_COLLECTION: &str = "local";
 pub struct LocalFsTransport {
     data_dir: PathBuf,
     label: String,
+    mirror: Option<MirrorSetup>,
+}
+
+/// What the write half needs: the mode collection and the staging mode.
+#[derive(Debug, Clone)]
+struct MirrorSetup {
+    mode: String,
+    staging: StagingMode,
 }
 
 /// Running totals of one read, shared by every walk in it.
@@ -49,7 +65,38 @@ impl LocalFsTransport {
         LocalFsTransport {
             data_dir,
             label: label.into(),
+            mirror: None,
         }
+    }
+
+    /// Bind the write half to the `mode` collection with `staging`. Fails
+    /// when `mode` is not a writable collection name or the staging root is
+    /// unusable, so a misconfigured mirror cannot be built.
+    pub fn with_mirror(mut self, mode: &str, staging: StagingMode) -> Result<Self, String> {
+        if let Some(why) = mirror_mode_problem(mode) {
+            return Err(why);
+        }
+        validate_staging_root(&staging, &self.resources_display())?;
+        self.mirror = Some(MirrorSetup {
+            mode: mode.to_string(),
+            staging,
+        });
+        Ok(self)
+    }
+
+    /// `<data_dir>/config/resources` spelled with `/`, for the staging-root
+    /// containment check.
+    fn resources_display(&self) -> String {
+        let mut text = self
+            .data_dir
+            .join("config")
+            .join("resources")
+            .display()
+            .to_string();
+        if cfg!(windows) {
+            text = text.replace('\\', "/");
+        }
+        text
     }
 
     fn fail(&self, detail: impl std::fmt::Display) -> CoreError {
@@ -424,6 +471,612 @@ impl TreeReader for LocalFsTransport {
         tokio::task::spawn_blocking(move || this.read_ledger_blocking(&gateway, &mode))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The write half (22-07)
+// ---------------------------------------------------------------------------
+
+/// What `symlink_metadata` says a path is. A symlink is never followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Node {
+    Missing,
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+fn node_of(path: &Path) -> std::io::Result<Node> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let kind = meta.file_type();
+            Ok(if kind.is_symlink() {
+                Node::Symlink
+            } else if kind.is_dir() {
+                Node::Dir
+            } else if kind.is_file() {
+                Node::File
+            } else {
+                Node::Other
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Node::Missing),
+        Err(e) => Err(e),
+    }
+}
+
+/// The canonical form of `path`: its deepest existing ancestor resolved
+/// (symlinks and all), the missing tail appended. Used only to compare where
+/// two paths really are.
+fn canonical_with_tail(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(&current) {
+            let mut out = resolved;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                current = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+impl LocalFsTransport {
+    fn mirror_fail(&self, op: &str, detail: impl std::fmt::Display) -> CoreError {
+        CoreError::TransportFailed {
+            operation: op.to_string(),
+            node: self.label.clone(),
+            detail: detail.to_string(),
+        }
+    }
+
+    fn mirror_setup(&self, op: &str) -> Result<&MirrorSetup, CoreError> {
+        self.mirror.as_ref().ok_or_else(|| {
+            self.mirror_fail(
+                op,
+                "this transport has no write half; build it with mirror_for_node",
+            )
+        })
+    }
+
+    /// Which node and mode a [`Staged`] belongs to.
+    fn mirror_owner(&self, setup: &MirrorSetup) -> String {
+        format!("local:{}:{}", self.data_dir.display(), setup.mode)
+    }
+
+    /// `<data_dir>/config/resources`, after requiring `data_dir`, `config`
+    /// and `resources` to be real directories (no symlinks).
+    fn mirror_resources(&self, op: &str) -> Result<PathBuf, CoreError> {
+        let mut path = self.data_dir.clone();
+        for (shown, part) in [
+            ("data_dir", None),
+            ("config", Some("config")),
+            ("config/resources", Some("resources")),
+        ] {
+            if let Some(part) = part {
+                path.push(part);
+            }
+            match node_of(&path) {
+                Ok(Node::Dir) => {}
+                Ok(Node::Symlink) => {
+                    return Err(
+                        self.mirror_fail(op, format!("{shown} is a symlink; symlinks are refused"))
+                    );
+                }
+                Ok(Node::Missing) => {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!("{shown} does not exist; is data_dir a gateway data directory?"),
+                    ));
+                }
+                Ok(_) => {
+                    return Err(self.mirror_fail(op, format!("{shown} is not a directory")));
+                }
+                Err(e) => {
+                    return Err(
+                        self.mirror_fail(op, format!("{shown} cannot be inspected ({})", e.kind()))
+                    );
+                }
+            }
+        }
+        Ok(path)
+    }
+
+    /// Where the staging root REALLY is must not be inside or around
+    /// `config/resources`, even through a symlinked ancestor.
+    fn check_staging_real(&self, op: &str, root: &str, resources: &Path) -> Result<(), CoreError> {
+        let real_root = canonical_with_tail(Path::new(root));
+        let real_resources = canonical_with_tail(resources);
+        if real_root.starts_with(&real_resources) || real_resources.starts_with(&real_root) {
+            return Err(self.mirror_fail(
+                op,
+                format!(
+                    "the staging root {root:?} resolves to {} which overlaps config/resources",
+                    real_root.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Walk `parts` below `base`, creating each missing directory with
+    /// `create_dir`; an existing component must be a real directory.
+    fn ensure_dir_chain(
+        &self,
+        op: &str,
+        base: &Path,
+        parts: &[&str],
+    ) -> Result<PathBuf, CoreError> {
+        let mut path = base.to_path_buf();
+        for part in parts {
+            path.push(part);
+            match node_of(&path) {
+                Ok(Node::Dir) => {}
+                Ok(Node::Missing) => std::fs::create_dir(&path).map_err(|e| {
+                    self.mirror_fail(
+                        op,
+                        format!("cannot create {} ({})", self.shown(&path), e.kind()),
+                    )
+                })?,
+                Ok(Node::Symlink) => {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!("{} is a symlink; symlinks are refused", self.shown(&path)),
+                    ));
+                }
+                Ok(_) => {
+                    return Err(
+                        self.mirror_fail(op, format!("{} is not a directory", self.shown(&path)))
+                    );
+                }
+                Err(e) => {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!("cannot inspect {} ({})", self.shown(&path), e.kind()),
+                    ));
+                }
+            }
+        }
+        Ok(path)
+    }
+
+    /// `path` for a message: below `data_dir` when it is, else as given.
+    fn shown(&self, path: &Path) -> String {
+        path.strip_prefix(&self.data_dir)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
+    /// What `rel` is below `base`: every component above the last must be a
+    /// real directory (a symlink or file there is refused), an absent
+    /// component makes the whole path `Missing`.
+    fn inspect(&self, op: &str, base: &Path, rel: &RelPath) -> Result<Node, CoreError> {
+        let parts: Vec<&str> = rel.components().collect();
+        let mut path = base.to_path_buf();
+        for (index, part) in parts.iter().enumerate() {
+            path.push(part);
+            let last = index + 1 == parts.len();
+            match node_of(&path) {
+                Ok(Node::Missing) => return Ok(Node::Missing),
+                Ok(Node::Symlink) => {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!("{} is a symlink; symlinks are refused", self.shown(&path)),
+                    ));
+                }
+                Ok(node) if last => return Ok(node),
+                Ok(Node::Dir) => {}
+                Ok(_) => {
+                    return Err(
+                        self.mirror_fail(op, format!("{} is not a directory", self.shown(&path)))
+                    );
+                }
+                Err(e) => {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!("cannot inspect {} ({})", self.shown(&path), e.kind()),
+                    ));
+                }
+            }
+        }
+        Ok(Node::Missing)
+    }
+
+    /// A newly created regular file: never replaces, never follows a link.
+    fn write_new(&self, op: &str, path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                self.mirror_fail(
+                    op,
+                    format!("cannot create {} ({})", self.shown(path), e.kind()),
+                )
+            })?;
+        file.write_all(bytes).map_err(|e| {
+            self.mirror_fail(
+                op,
+                format!("cannot write {} ({})", self.shown(path), e.kind()),
+            )
+        })
+    }
+
+    /// Overwrite (or create) `path` in place without following a symlink at
+    /// the final component.
+    fn write_in_place(&self, op: &str, path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        }
+        let mut file = options.open(path).map_err(|e| {
+            self.mirror_fail(
+                op,
+                format!(
+                    "cannot open {} for writing ({})",
+                    self.shown(path),
+                    e.kind()
+                ),
+            )
+        })?;
+        file.write_all(bytes).map_err(|e| {
+            self.mirror_fail(
+                op,
+                format!("cannot write {} ({})", self.shown(path), e.kind()),
+            )
+        })
+    }
+
+    /// The bytes of the staged copy `rel` below `base`, verified against
+    /// `expect_sha` (see [`read_staged_copy`]).
+    fn read_staged(
+        &self,
+        op: &str,
+        base: &Path,
+        rel: &RelPath,
+        expect_sha: &str,
+    ) -> Result<Vec<u8>, CoreError> {
+        read_staged_copy(base, rel, expect_sha).map_err(|why| self.mirror_fail(op, why))
+    }
+
+    fn stage_blocking(&self, tree: &RenderedTree) -> Result<Staged, CoreError> {
+        const OP: &str = "stage";
+        let setup = self.mirror_setup(OP)?;
+        validate_mirror_inputs(
+            tree,
+            &DeleteSet::default(),
+            &setup.staging,
+            &self.resources_display(),
+        )
+        .map_err(|why| self.mirror_fail(OP, why))?;
+        let resources = self.mirror_resources(OP)?;
+        let remote_root = match &setup.staging {
+            StagingMode::Separate { root } => {
+                self.check_staging_real(OP, root, &resources)?;
+                Some(root.clone())
+            }
+            StagingMode::InPlace => None,
+        };
+
+        let (local, files) = copy_to_temp(tree).map_err(|why| self.mirror_fail(OP, why))?;
+
+        if let Some(root) = &remote_root {
+            let root_path = PathBuf::from(root);
+            match node_of(&root_path) {
+                Ok(Node::Dir) => {}
+                Ok(Node::Missing) => std::fs::create_dir_all(&root_path).map_err(|e| {
+                    self.mirror_fail(
+                        OP,
+                        format!("cannot create the staging root {root:?} ({})", e.kind()),
+                    )
+                })?,
+                Ok(_) => {
+                    return Err(self.mirror_fail(
+                        OP,
+                        format!("the staging root {root:?} is not a real directory"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(self.mirror_fail(
+                        OP,
+                        format!(
+                            "the staging root {root:?} cannot be inspected ({})",
+                            e.kind()
+                        ),
+                    ));
+                }
+            }
+            if node_of(&root_path).ok() != Some(Node::Dir) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!("the staging root {root:?} is not a real directory"),
+                ));
+            }
+            for (path, bytes) in &tree.files {
+                let parts: Vec<&str> = path.components().collect();
+                let Some((name, parents)) = parts.split_last() else {
+                    continue;
+                };
+                let dir = self.ensure_dir_chain(OP, &root_path, parents)?;
+                let target = dir.join(name);
+                match node_of(&target) {
+                    Ok(Node::Missing) => {}
+                    Ok(Node::File) => std::fs::remove_file(&target).map_err(|e| {
+                        self.mirror_fail(
+                            OP,
+                            format!("cannot replace a stale staged file ({})", e.kind()),
+                        )
+                    })?,
+                    Ok(_) => {
+                        return Err(self.mirror_fail(
+                            OP,
+                            format!(
+                                "{} exists in the staging root and is not a regular file",
+                                path
+                            ),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(self.mirror_fail(
+                            OP,
+                            format!("cannot inspect {path} in the staging root ({})", e.kind()),
+                        ));
+                    }
+                }
+                self.write_new(OP, &target, bytes)?;
+            }
+        }
+        Ok(Staged {
+            files,
+            local,
+            remote_root,
+            owner: self.mirror_owner(setup),
+        })
+    }
+
+    fn commit_blocking(
+        &self,
+        local: &Path,
+        files: &[(RelPath, String)],
+        remote_root: Option<&str>,
+        owner: &str,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError> {
+        const OP: &str = "commit";
+        let setup = self.mirror_setup(OP)?;
+        if owner != self.mirror_owner(setup) {
+            return Err(self.mirror_fail(
+                OP,
+                "these files were staged by a different mirror (another node or mode)",
+            ));
+        }
+        let expected_root = match &setup.staging {
+            StagingMode::Separate { root } => Some(root.as_str()),
+            StagingMode::InPlace => None,
+        };
+        if remote_root != expected_root {
+            return Err(self.mirror_fail(OP, "these files were staged in a different staging mode"));
+        }
+        let staged_paths: Vec<&RelPath> = files.iter().map(|(path, _)| path).collect();
+        validate_mirror_paths(&staged_paths, delete_set)
+            .and_then(|()| validate_staging_root(&setup.staging, &self.resources_display()))
+            .map_err(|why| self.mirror_fail(OP, why))?;
+
+        // ---- expected state: everything is checked before the first write.
+        let resources = self.mirror_resources(OP)?;
+        if let Some(root) = remote_root {
+            self.check_staging_real(OP, root, &resources)?;
+        }
+        let collection = resources.join(&setup.mode);
+        let collection_exists = match node_of(&collection) {
+            Ok(Node::Dir) => true,
+            Ok(Node::Missing) => false,
+            Ok(Node::Symlink) => {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "the {} collection is a symlink; symlinks are refused",
+                        setup.mode
+                    ),
+                ));
+            }
+            Ok(_) => {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!("the {} collection is not a directory", setup.mode),
+                ));
+            }
+            Err(e) => {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "the {} collection cannot be inspected ({})",
+                        setup.mode,
+                        e.kind()
+                    ),
+                ));
+            }
+        };
+
+        let mut deletes: Vec<&RelPath> = delete_set.files.iter().collect();
+        deletes.sort();
+        for path in &deletes {
+            let node = if collection_exists {
+                self.inspect(OP, &collection, path)?
+            } else {
+                Node::Missing
+            };
+            if node != Node::File {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!("{path} is not a regular file in the {} collection ({node:?}); nothing was changed", setup.mode),
+                ));
+            }
+        }
+        for (path, _) in files {
+            let node = if collection_exists {
+                self.inspect(OP, &collection, path)?
+            } else {
+                Node::Missing
+            };
+            if !matches!(node, Node::Missing | Node::File) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!("{path} exists in the {} collection and is not a regular file ({node:?}); nothing was changed", setup.mode),
+                ));
+            }
+        }
+        let source = remote_root.map_or_else(|| local.to_path_buf(), PathBuf::from);
+        for (path, sha) in files {
+            self.read_staged(OP, &source, path, sha)?;
+        }
+
+        // ---- writes
+        if !collection_exists {
+            std::fs::create_dir(&collection).map_err(|e| {
+                self.mirror_fail(
+                    OP,
+                    format!("cannot create the {} collection ({})", setup.mode, e.kind()),
+                )
+            })?;
+        }
+        let mut written = Vec::new();
+        for (path, sha) in files {
+            let parts: Vec<&str> = path.components().collect();
+            let Some((name, parents)) = parts.split_last() else {
+                continue;
+            };
+            let dir = self.ensure_dir_chain(OP, &collection, parents)?;
+            let target = dir.join(name);
+            match node_of(&target) {
+                Ok(Node::Missing | Node::File) => {}
+                _ => {
+                    return Err(self.mirror_fail(
+                        OP,
+                        format!("{path} changed during the commit and is not a regular file"),
+                    ));
+                }
+            }
+            if remote_root.is_some() {
+                std::fs::rename(source.join(path.as_str()), &target).map_err(|e| {
+                    self.mirror_fail(
+                        OP,
+                        format!(
+                            "cannot move {path} into place ({}); the staging root must be on the same filesystem as the collection",
+                            e.kind()
+                        ),
+                    )
+                })?;
+            } else {
+                let bytes = self.read_staged(OP, &source, path, sha)?;
+                self.write_in_place(OP, &target, &bytes)?;
+            }
+            written.push(path.to_string());
+        }
+
+        // ---- deletes
+        let mut deleted = Vec::new();
+        for path in &deletes {
+            let target = collection.join(path.as_str());
+            if !matches!(node_of(&target), Ok(Node::File)) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!("{path} is no longer a regular file; stopped before deleting it"),
+                ));
+            }
+            std::fs::remove_file(&target).map_err(|e| {
+                self.mirror_fail(OP, format!("cannot delete {path} ({})", e.kind()))
+            })?;
+            deleted.push(path.to_string());
+        }
+
+        // ---- directories a delete emptied, never `<module>/<type>` or above
+        let mut removed: BTreeSet<String> = BTreeSet::new();
+        for path in &deletes {
+            let parts: Vec<&str> = path.components().collect();
+            for depth in (super::MIRROR_MIN_COMPONENTS..parts.len()).rev() {
+                let rel = parts[..depth].join("/");
+                if removed.contains(&rel) {
+                    continue;
+                }
+                let dir = collection.join(&rel);
+                match node_of(&dir) {
+                    Ok(Node::Dir) => {}
+                    Ok(Node::Missing) => continue,
+                    _ => {
+                        return Err(self.mirror_fail(
+                            OP,
+                            format!("{rel} is not a real directory; stopped before removing it"),
+                        ));
+                    }
+                }
+                match std::fs::remove_dir(&dir) {
+                    Ok(()) => {
+                        removed.insert(rel);
+                    }
+                    Err(e) => {
+                        let occupied = std::fs::read_dir(&dir)
+                            .map(|mut entries| entries.next().is_some())
+                            .unwrap_or(false);
+                        if occupied {
+                            break;
+                        }
+                        return Err(self.mirror_fail(
+                            OP,
+                            format!("cannot remove the emptied directory {rel} ({})", e.kind()),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(MirrorReport {
+            written,
+            deleted,
+            removed_dirs: removed.into_iter().collect(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TreeMirror for LocalFsTransport {
+    async fn stage(&self, tree: &RenderedTree) -> Result<Staged, CoreError> {
+        let this = self.clone();
+        let tree = tree.clone();
+        tokio::task::spawn_blocking(move || this.stage_blocking(&tree))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local stage task failed: {e}")))?
+    }
+
+    async fn commit(
+        &self,
+        staged: &Staged,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError> {
+        let this = self.clone();
+        let local = staged.local.path().to_path_buf();
+        let files = staged.files.clone();
+        let remote_root = staged.remote_root.clone();
+        let owner = staged.owner.clone();
+        let delete_set = delete_set.clone();
+        tokio::task::spawn_blocking(move || {
+            this.commit_blocking(&local, &files, remote_root.as_deref(), &owner, &delete_set)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("local commit task failed: {e}")))?
     }
 }
 

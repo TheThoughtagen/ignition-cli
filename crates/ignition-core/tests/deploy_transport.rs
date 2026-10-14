@@ -1194,3 +1194,1141 @@ mod sftp_read {
         );
     }
 }
+
+/// The write half (22-07): scratch collections only, no verb involved.
+mod mirror {
+    use super::*;
+    use ignition_core::deploy::layout::RelPath;
+    use ignition_core::deploy::target::{Local, NodeTarget};
+    use ignition_core::deploy::transport::local::LocalFsTransport;
+    use ignition_core::deploy::transport::{
+        self, DeleteSet, MirrorReport, READ_MAX_FILE_BYTES, StagingMode, TreeMirror,
+    };
+    use ignition_core::deploy::tree::RenderedTree;
+    use std::collections::BTreeMap;
+
+    pub const MODE: &str = "dev";
+    pub const DT: &str = "ignition/database-translator";
+
+    /// A scratch gateway data directory plus a sibling staging root.
+    pub struct Scratch {
+        pub root: tempfile::TempDir,
+        pub data: PathBuf,
+        pub stage_root: PathBuf,
+    }
+
+    pub type Snapshot = BTreeMap<String, Option<Vec<u8>>>;
+
+    impl Scratch {
+        pub fn new() -> Scratch {
+            let root = tempfile::tempdir().expect("scratch");
+            let data = root.path().join("data");
+            let stage_root = root.path().join("stage");
+            let sc = Scratch {
+                root,
+                data,
+                stage_root,
+            };
+            let dev = sc.resources().join(MODE);
+            put(&dev.join("config-mode.json"), b"{\"mode\":\"dev\"}");
+            put(&dev.join(format!("{DT}/KEEP/config.json")), b"{\"keep\":1}");
+            put(&dev.join(format!("{DT}/KEEP/resource.json")), b"{}");
+            put(&dev.join(format!("{DT}/OLD/config.json")), b"{\"old\":1}");
+            put(&dev.join(format!("{DT}/OLD/resource.json")), b"{\"old\":2}");
+            put(&dev.join(format!("{DT}/UPD/config.json")), b"{\"v\":1}");
+            put(
+                &dev.join("ignition/general-alarm-settings/config.json"),
+                b"{\"alarm\":1}",
+            );
+            put(
+                &sc.resources().join(format!("core/{DT}/CORE/config.json")),
+                b"{\"core\":1}",
+            );
+            sc
+        }
+
+        pub fn resources(&self) -> PathBuf {
+            self.data.join("config/resources")
+        }
+
+        pub fn collection(&self) -> PathBuf {
+            self.resources().join(MODE)
+        }
+
+        pub fn separate(&self) -> StagingMode {
+            StagingMode::Separate {
+                root: self.stage_root.display().to_string(),
+            }
+        }
+    }
+
+    pub fn put(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    /// Every file (bytes) and directory (`None`) below `dir`, by relative path.
+    pub fn snapshot(dir: &Path) -> Snapshot {
+        fn walk(dir: &Path, rel: &str, out: &mut Snapshot) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry"))
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let name = entry.file_name().into_string().expect("utf8");
+                let path = format!("{rel}{name}");
+                let meta = std::fs::symlink_metadata(entry.path()).expect("meta");
+                if meta.file_type().is_dir() {
+                    out.insert(path.clone(), None);
+                    walk(&entry.path(), &format!("{path}/"), out);
+                } else if meta.file_type().is_symlink() {
+                    out.insert(path, Some(b"<symlink>".to_vec()));
+                } else {
+                    out.insert(path, Some(std::fs::read(entry.path()).expect("read")));
+                }
+            }
+        }
+        let mut out = Snapshot::new();
+        walk(dir, "", &mut out);
+        out
+    }
+
+    pub fn rel(text: &str) -> RelPath {
+        RelPath::new(text).expect("rel path")
+    }
+
+    pub fn tree(files: &[(&str, &[u8])]) -> RenderedTree {
+        RenderedTree {
+            files: files
+                .iter()
+                .map(|(path, bytes)| (rel(path), bytes.to_vec()))
+                .collect(),
+        }
+    }
+
+    pub fn deletes(paths: &[&str]) -> DeleteSet {
+        DeleteSet {
+            files: paths.iter().map(|p| rel(p)).collect(),
+        }
+    }
+
+    pub fn scenario_tree() -> RenderedTree {
+        tree(&[
+            (&format!("{DT}/UPD/config.json"), b"{\"v\":2}"),
+            (&format!("{DT}/NEW/config.json"), b"{\"new\":1}"),
+            (&format!("{DT}/NEW/resource.json"), b"{\"new\":2}"),
+        ])
+    }
+
+    pub fn scenario_deletes() -> DeleteSet {
+        deletes(&[
+            &format!("{DT}/OLD/config.json"),
+            &format!("{DT}/OLD/resource.json"),
+        ])
+    }
+
+    pub fn local_mirror(sc: &Scratch, staging: StagingMode) -> LocalFsTransport {
+        LocalFsTransport::new(sc.data.clone(), "nodes.master")
+            .with_mirror(MODE, staging)
+            .expect("mirror")
+    }
+
+    /// A walk finds no dot-named entry and no temp-looking name.
+    pub fn assert_nothing_foreign(snap: &Snapshot) {
+        for path in snap.keys() {
+            for part in path.split('/') {
+                assert!(!part.starts_with('.'), "dot-named entry {path}");
+                for suffix in [".tmp", ".bak", ".stage", ".part", "~", ".orig", ".new"] {
+                    assert!(!part.ends_with(suffix), "temp-looking entry {path}");
+                }
+            }
+        }
+    }
+
+    /// The scenario both transports run: update, add, delete, leave the rest.
+    pub async fn run_scenario(m: &dyn TreeMirror, sc: &Scratch) -> (MirrorReport, Snapshot) {
+        let before = snapshot(&sc.resources());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        assert_eq!(
+            snapshot(&sc.resources()),
+            before,
+            "stage must not touch the collection"
+        );
+        let report = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect("commit");
+        let after = snapshot(&sc.resources());
+
+        let mut expected = before.clone();
+        for gone in [
+            format!("{MODE}/{DT}/OLD"),
+            format!("{MODE}/{DT}/OLD/config.json"),
+            format!("{MODE}/{DT}/OLD/resource.json"),
+        ] {
+            assert!(expected.remove(&gone).is_some(), "{gone}");
+        }
+        expected.insert(
+            format!("{MODE}/{DT}/UPD/config.json"),
+            Some(b"{\"v\":2}".to_vec()),
+        );
+        expected.insert(format!("{MODE}/{DT}/NEW"), None);
+        expected.insert(
+            format!("{MODE}/{DT}/NEW/config.json"),
+            Some(b"{\"new\":1}".to_vec()),
+        );
+        expected.insert(
+            format!("{MODE}/{DT}/NEW/resource.json"),
+            Some(b"{\"new\":2}".to_vec()),
+        );
+        assert_eq!(
+            after, expected,
+            "exactly the staged and deleted files changed"
+        );
+        assert_eq!(
+            after[&format!("{MODE}/config-mode.json")],
+            Some(b"{\"mode\":\"dev\"}".to_vec())
+        );
+        assert!(after.contains_key(&format!("{MODE}/{DT}/KEEP/config.json")));
+        assert_eq!(
+            report,
+            MirrorReport {
+                written: vec![
+                    format!("{DT}/NEW/config.json"),
+                    format!("{DT}/NEW/resource.json"),
+                    format!("{DT}/UPD/config.json"),
+                ],
+                deleted: vec![
+                    format!("{DT}/OLD/config.json"),
+                    format!("{DT}/OLD/resource.json"),
+                ],
+                removed_dirs: vec![format!("{DT}/OLD")],
+            }
+        );
+        assert_nothing_foreign(&after);
+        (report, after)
+    }
+
+    pub fn code(err: &CoreError) -> &'static str {
+        err.code()
+    }
+
+    /// Refusals that must leave the collection byte-identical.
+    pub async fn assert_refusals_write_nothing(m: &dyn TreeMirror, sc: &Scratch) {
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
+        let cases: Vec<(&str, DeleteSet)> = vec![
+            ("gateway-owned", deletes(&["config-mode.json"])),
+            (
+                "gateway-owned deep",
+                deletes(&[&format!("{DT}/config-mode.json")]),
+            ),
+            ("dot-named", deletes(&["ignition/.x/a/b"])),
+            ("too short", deletes(&["ignition/x"])),
+            ("staged", deletes(&[&format!("{DT}/UPD/config.json")])),
+            (
+                "twice",
+                deletes(&[
+                    &format!("{DT}/OLD/config.json"),
+                    &format!("{DT}/OLD/config.json"),
+                ]),
+            ),
+            (
+                "does not exist",
+                deletes(&[
+                    &format!("{DT}/OLD/config.json"),
+                    &format!("{DT}/GONE/config.json"),
+                ]),
+            ),
+            ("a directory", deletes(&[&format!("{DT}/KEEP")])),
+            (
+                "file and directory of another",
+                deletes(&[
+                    &format!("{DT}/OLD/config.json"),
+                    &format!("{DT}/OLD/config.json/x"),
+                ]),
+            ),
+        ];
+        for (name, set) in cases {
+            let err = m
+                .commit(&staged, &set)
+                .await
+                .expect_err(&format!("{name} must be refused"));
+            assert_eq!(code(&err), "transport_failed", "{name}: {err}");
+            assert_eq!(snapshot(&sc.resources()), before, "{name} wrote something");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_mirror_separate() {
+        let sc = Scratch::new();
+        let m = local_mirror(&sc, sc.separate());
+        run_scenario(&m, &sc).await;
+        // the staging root is outside the collection and its files were moved
+        assert!(!sc.resources().join(".stage").exists());
+        assert!(!snapshot(&sc.stage_root).values().any(Option::is_some));
+    }
+
+    #[tokio::test]
+    async fn local_mirror_inplace() {
+        let sc = Scratch::new();
+        let m = local_mirror(&sc, StagingMode::InPlace);
+        run_scenario(&m, &sc).await;
+        assert!(
+            !sc.stage_root.exists(),
+            "inplace never makes a staging root"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_foreign_entries_in_collection() {
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = local_mirror(&sc, staging);
+            let staged = m.stage(&scenario_tree()).await.expect("stage");
+            assert_nothing_foreign(&snapshot(&sc.resources()));
+            m.commit(&staged, &scenario_deletes())
+                .await
+                .expect("commit");
+            assert_nothing_foreign(&snapshot(&sc.resources()));
+            // the data dir holds only what it held
+            assert_eq!(
+                snapshot(&sc.data)
+                    .keys()
+                    .filter(|k| !k.starts_with("config/resources"))
+                    .count(),
+                1, // `config`
+                "separate={separate}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_set_refusals_write_nothing() {
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            assert_refusals_write_nothing(&local_mirror(&sc, staging), &sc).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_root_inside_collection_refused() {
+        let sc = Scratch::new();
+        let inside = |tail: &str| StagingMode::Separate {
+            root: sc.resources().join(tail).display().to_string(),
+        };
+        for staging in [
+            inside("dev/stage"),
+            inside("stage"),
+            inside("core/ignition/stage"),
+            StagingMode::Separate {
+                root: sc.resources().display().to_string(),
+            },
+            // around it
+            StagingMode::Separate {
+                root: sc.data.display().to_string(),
+            },
+            StagingMode::Separate {
+                root: "relative/stage".to_string(),
+            },
+            StagingMode::Separate {
+                root: "/onlyone".to_string(),
+            },
+        ] {
+            let why = LocalFsTransport::new(sc.data.clone(), "nodes.master")
+                .with_mirror(MODE, staging.clone())
+                .expect_err(&format!("{staging:?}"));
+            assert!(why.contains("staging root"), "{why}");
+        }
+        assert!(!sc.resources().join("dev/stage").exists());
+        assert!(!sc.resources().join("stage").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_root_through_a_symlink_into_the_collection_refused() {
+        let sc = Scratch::new();
+        let link = sc.root.path().join("sneaky");
+        std::os::unix::fs::symlink(sc.resources().join("dev/ignition"), &link).expect("symlink");
+        let m = local_mirror(
+            &sc,
+            StagingMode::Separate {
+                root: link.join("stage").display().to_string(),
+            },
+        );
+        let before = snapshot(&sc.resources());
+        let err = m.stage(&scenario_tree()).await.expect_err("overlap");
+        assert!(err.to_string().contains("overlaps"), "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
+    }
+
+    #[tokio::test]
+    async fn commit_is_idempotent() {
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = local_mirror(&sc, staging);
+            let rendered = scenario_tree();
+            let staged = m.stage(&rendered).await.expect("stage");
+            m.commit(&staged, &DeleteSet::default())
+                .await
+                .expect("first");
+            let after_first = snapshot(&sc.resources());
+            let staged = m.stage(&rendered).await.expect("stage again");
+            let report = m
+                .commit(&staged, &DeleteSet::default())
+                .await
+                .expect("second");
+            assert_eq!(
+                snapshot(&sc.resources()),
+                after_first,
+                "separate={separate}"
+            );
+            assert!(report.deleted.is_empty() && report.removed_dirs.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn module_type_dirs_survive() {
+        let sc = Scratch::new();
+        // the only resource of its type
+        let m = local_mirror(&sc, StagingMode::InPlace);
+        let staged = m.stage(&RenderedTree::default()).await.expect("stage");
+        let report = m
+            .commit(
+                &staged,
+                &deletes(&["ignition/general-alarm-settings/config.json"]),
+            )
+            .await
+            .expect("commit");
+        assert!(report.removed_dirs.is_empty(), "{report:?}");
+        assert!(
+            sc.collection()
+                .join("ignition/general-alarm-settings")
+                .is_dir()
+        );
+        // every unit of a type
+        let report = m
+            .commit(
+                &staged,
+                &deletes(&[
+                    &format!("{DT}/KEEP/config.json"),
+                    &format!("{DT}/KEEP/resource.json"),
+                    &format!("{DT}/OLD/config.json"),
+                    &format!("{DT}/OLD/resource.json"),
+                    &format!("{DT}/UPD/config.json"),
+                ]),
+            )
+            .await
+            .expect("commit all");
+        assert_eq!(
+            report.removed_dirs,
+            vec![
+                format!("{DT}/KEEP"),
+                format!("{DT}/OLD"),
+                format!("{DT}/UPD")
+            ]
+        );
+        assert!(
+            sc.collection().join(DT).is_dir(),
+            "<module>/<type> survives"
+        );
+        assert!(sc.collection().join("ignition").is_dir());
+        assert!(sc.collection().join("config-mode.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_dir_with_other_files_is_not_removed() {
+        let sc = Scratch::new();
+        put(&sc.collection().join(format!("{DT}/OLD/extra.json")), b"{}");
+        let m = local_mirror(&sc, StagingMode::InPlace);
+        let staged = m.stage(&RenderedTree::default()).await.expect("stage");
+        let report = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect("commit");
+        assert!(report.removed_dirs.is_empty(), "{report:?}");
+        assert!(
+            sc.collection()
+                .join(format!("{DT}/OLD/extra.json"))
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_file_is_refused_before_any_io() {
+        let sc = Scratch::new();
+        let m = local_mirror(&sc, sc.separate());
+        let big = RenderedTree {
+            files: [(
+                rel(&format!("{DT}/BIG/config.json")),
+                vec![0u8; READ_MAX_FILE_BYTES as usize + 1],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let err = m.stage(&big).await.expect_err("over the file cap");
+        assert!(err.to_string().contains("file cap"), "{err}");
+        assert!(!sc.stage_root.exists(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn dot_named_and_gateway_owned_staged_paths_are_refused() {
+        let sc = Scratch::new();
+        let m = local_mirror(&sc, StagingMode::InPlace);
+        for bad in [
+            format!("{DT}/.hidden/config.json"),
+            format!("{DT}/X/.config.json"),
+            format!("{DT}/X/config-mode.json"),
+            "ignition/short".to_string(),
+        ] {
+            let err = m.stage(&tree(&[(&bad, b"{}")])).await.expect_err(&bad);
+            assert_eq!(code(&err), "transport_failed", "{bad}: {err}");
+        }
+        let err = m
+            .stage(&tree(&[
+                (&format!("{DT}/X"), b"{}"),
+                (&format!("{DT}/X/config.json"), b"{}"),
+            ]))
+            .await
+            .expect_err("file and directory");
+        assert!(err.to_string().contains("directory of another"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_are_never_followed_or_created() {
+        // a symlinked unit directory under a staged path
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let outside = sc.root.path().join("outside");
+            put(&outside.join("config.json"), b"{\"secret\":1}");
+            std::os::unix::fs::symlink(&outside, sc.collection().join(format!("{DT}/LINK")))
+                .expect("symlink");
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = local_mirror(&sc, staging);
+            let staged = m
+                .stage(&tree(&[(
+                    &format!("{DT}/LINK/config.json"),
+                    b"{\"pwn\":1}",
+                )]))
+                .await
+                .expect("stage");
+            let before = snapshot(&sc.resources());
+            let err = m
+                .commit(&staged, &DeleteSet::default())
+                .await
+                .expect_err("symlinked parent");
+            assert!(err.to_string().contains("symlink"), "{err}");
+            assert_eq!(snapshot(&sc.resources()), before);
+            assert_eq!(
+                std::fs::read(outside.join("config.json")).unwrap(),
+                b"{\"secret\":1}"
+            );
+
+            // a symlink where a staged file goes
+            std::os::unix::fs::symlink(
+                outside.join("config.json"),
+                sc.collection().join(format!("{DT}/KEEP/link.json")),
+            )
+            .expect("symlink file");
+            let staged = m
+                .stage(&tree(&[(&format!("{DT}/KEEP/link.json"), b"{\"pwn\":2}")]))
+                .await
+                .expect("stage");
+            let err = m
+                .commit(&staged, &DeleteSet::default())
+                .await
+                .expect_err("symlink target");
+            assert!(err.to_string().contains("symlink"), "{err}");
+            assert_eq!(
+                std::fs::read(outside.join("config.json")).unwrap(),
+                b"{\"secret\":1}"
+            );
+
+            // a symlink as a delete target is not deleted, its target neither
+            let err = m
+                .commit(
+                    &m.stage(&RenderedTree::default()).await.expect("stage"),
+                    &deletes(&[&format!("{DT}/KEEP/link.json")]),
+                )
+                .await
+                .expect_err("symlink delete");
+            assert!(err.to_string().contains("symlink"), "{err}");
+            assert!(
+                sc.collection()
+                    .join(format!("{DT}/KEEP/link.json"))
+                    .is_symlink()
+            );
+            assert!(outside.join("config.json").is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_staged_copy_is_refused() {
+        let sc = Scratch::new();
+        let m = local_mirror(&sc, sc.separate());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
+        std::fs::write(
+            sc.stage_root.join(format!("{DT}/NEW/config.json")),
+            b"{\"evil\":1}",
+        )
+        .expect("tamper");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("tampered");
+        assert!(
+            err.to_string().contains("changed after it was staged"),
+            "{err}"
+        );
+        assert_eq!(snapshot(&sc.resources()), before, "nothing was written");
+        // and a vanished one
+        std::fs::remove_file(sc.stage_root.join(format!("{DT}/NEW/config.json"))).expect("rm");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("gone");
+        assert!(err.to_string().contains("gone"), "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
+    }
+
+    #[tokio::test]
+    async fn staged_files_belong_to_their_mirror() {
+        let sc = Scratch::new();
+        let dev = local_mirror(&sc, StagingMode::InPlace);
+        let prod = LocalFsTransport::new(sc.data.clone(), "nodes.master")
+            .with_mirror("prod", StagingMode::InPlace)
+            .expect("prod");
+        let staged = dev.stage(&scenario_tree()).await.expect("stage");
+        let err = prod
+            .commit(&staged, &DeleteSet::default())
+            .await
+            .expect_err("other mode");
+        assert!(err.to_string().contains("different mirror"), "{err}");
+        let separate = local_mirror(&sc, sc.separate());
+        let err = separate
+            .commit(&staged, &DeleteSet::default())
+            .await
+            .expect_err("other staging mode");
+        assert!(err.to_string().contains("staging mode"), "{err}");
+        assert!(!sc.resources().join("prod").exists());
+    }
+
+    #[tokio::test]
+    async fn a_missing_mode_collection_is_created_and_core_is_never_written() {
+        let sc = Scratch::new();
+        let err = LocalFsTransport::new(sc.data.clone(), "nodes.master")
+            .with_mirror("core", StagingMode::InPlace)
+            .expect_err("core");
+        assert!(err.contains("never writes"), "{err}");
+        for bad in ["local", "", ".x", "a/b"] {
+            assert!(
+                LocalFsTransport::new(sc.data.clone(), "nodes.master")
+                    .with_mirror(bad, StagingMode::InPlace)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let m = LocalFsTransport::new(sc.data.clone(), "nodes.master")
+            .with_mirror("qa", StagingMode::InPlace)
+            .expect("qa");
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        // deleting from a collection that does not exist yet is refused
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("nothing to delete");
+        assert_eq!(code(&err), "transport_failed");
+        assert!(!sc.resources().join("qa").exists());
+        m.commit(&staged, &DeleteSet::default())
+            .await
+            .expect("commit");
+        assert!(
+            sc.resources()
+                .join(format!("qa/{DT}/NEW/config.json"))
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_data_dir_without_config_resources_is_refused() {
+        let bare = tempfile::tempdir().expect("bare");
+        let m = LocalFsTransport::new(bare.path().to_path_buf(), "nodes.master")
+            .with_mirror(MODE, StagingMode::InPlace)
+            .expect("mirror");
+        let err = m.stage(&scenario_tree()).await.expect_err("bare");
+        assert!(err.to_string().contains("gateway data directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mirror_for_node_builds_local_and_refuses_windows_and_core() {
+        let sc = Scratch::new();
+        let node = NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: Some(Local {
+                data_dir: sc.data.display().to_string(),
+            }),
+        };
+        let m = transport::mirror_for_node(
+            Path::new("."),
+            "targets/dev.yaml",
+            "nodes.master",
+            &node,
+            MODE,
+            StagingMode::InPlace,
+        )
+        .expect("local mirror");
+        run_scenario(m.as_ref(), &sc).await;
+
+        let err = transport::mirror_for_node(
+            Path::new("."),
+            "targets/dev.yaml",
+            "nodes.master",
+            &node,
+            "core",
+            StagingMode::InPlace,
+        )
+        .err()
+        .expect("core refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+
+        let repo = repo_with_known_hosts(KNOWN_HOSTS);
+        let mut ssh = ssh_block();
+        ssh.os = TargetOs::Windows;
+        let node = NodeTarget {
+            profile: "p".to_string(),
+            ssh: Some(ssh),
+            local: None,
+        };
+        let err = transport::mirror_for_node(
+            repo.path(),
+            "targets/dev.yaml",
+            "nodes.master",
+            &node,
+            MODE,
+            StagingMode::InPlace,
+        )
+        .err()
+        .expect("windows refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("nodes.master.ssh.os"), "{err}");
+    }
+}
+
+/// The sftp write half through a real `sftp-server` (`sftp -D`).
+#[cfg(unix)]
+mod sftp_mirror {
+    use super::mirror::{
+        DT, MODE, Scratch, assert_nothing_foreign, assert_refusals_write_nothing, deletes, put,
+        run_scenario, scenario_deletes, scenario_tree, snapshot, tree,
+    };
+    use super::*;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use ignition_core::deploy::transport::{DeleteSet, StagingMode, TreeMirror};
+    use ignition_core::deploy::tree::RenderedTree;
+
+    /// Runs the real `sftp` and records every batch it was fed; a hook may act
+    /// on a batch just before it runs.
+    type BatchHook = Box<dyn Fn(&str) + Send + Sync>;
+
+    #[derive(Default)]
+    struct Tap {
+        batches: Mutex<Vec<String>>,
+        before: Mutex<Option<BatchHook>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Tap {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            let text = stdin
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            self.batches.lock().expect("batches").push(text.clone());
+            if let Some(hook) = self.before.lock().expect("hook").as_ref() {
+                hook(&text);
+            }
+            TokioProcessRunner.run(program, args, stdin, timeout).await
+        }
+    }
+
+    impl Tap {
+        fn lines(&self) -> Vec<Vec<String>> {
+            self.batches
+                .lock()
+                .expect("batches")
+                .iter()
+                .map(|b| b.lines().map(str::to_string).collect())
+                .collect()
+        }
+    }
+
+    fn sftp_mirror(
+        sc: &Scratch,
+        staging: StagingMode,
+        tap: Arc<dyn ProcessRunner>,
+    ) -> SftpTransport {
+        let shell = RemoteShell::local_sftp_server(&sftp_server(), tap, Duration::from_secs(60));
+        let root = posix_root(&sc.data.display().to_string()).expect("posix root");
+        SftpTransport::new(shell, root, "nodes.master")
+            .with_mirror(MODE, staging)
+            .expect("mirror")
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_separate_and_inplace() {
+        for separate in [true, false] {
+            let local_sc = Scratch::new();
+            let sftp_sc = Scratch::new();
+            let tap = Arc::new(Tap::default());
+            let (staging_l, staging_s) = if separate {
+                (local_sc.separate(), sftp_sc.separate())
+            } else {
+                (StagingMode::InPlace, StagingMode::InPlace)
+            };
+            let local = super::mirror::local_mirror(&local_sc, staging_l);
+            let (want_report, want) = run_scenario(&local, &local_sc).await;
+            let sftp = sftp_mirror(&sftp_sc, staging_s, tap.clone());
+            let (got_report, got) = run_scenario(&sftp, &sftp_sc).await;
+            assert_eq!(
+                got, want,
+                "separate={separate}: same collection bytes as the local mirror"
+            );
+            assert_eq!(got_report, want_report);
+            assert_nothing_foreign(&got);
+
+            // the exact command sequence, for the C7a comparison (22-12)
+            let root = sftp_sc.data.display().to_string();
+            let stage_root = sftp_sc.stage_root.display().to_string();
+            println!("--- sftp command sequence, separate={separate} ---");
+            for (n, batch) in tap.lines().iter().enumerate() {
+                for line in batch {
+                    let shown = line
+                        .replace(&stage_root, "<STAGE>")
+                        .replace(&root, "<DATA>");
+                    let shown = match shown.find("ign-stage-") {
+                        Some(at) => {
+                            let start = shown[..at].rfind('"').map_or(0, |i| i + 1);
+                            let end = shown[at..].find('/').map_or(shown.len(), |i| at + i);
+                            format!("{}<LOCAL>{}", &shown[..start], &shown[end..])
+                        }
+                        None => shown,
+                    };
+                    println!("session {}: {shown}", n + 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_never_suppresses_errors() {
+        // no batch line starts with `-`
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let m = sftp_mirror(&sc, sc.separate(), tap.clone());
+        run_scenario(&m, &sc).await;
+        let all = tap.lines();
+        assert!(!all.is_empty());
+        for line in all.iter().flatten() {
+            assert!(!line.starts_with('-'), "{line}");
+            assert!(!line.starts_with("-@"), "{line}");
+            assert!(!line.starts_with('!'), "{line}");
+            assert!(!line.contains("get -R"), "{line}");
+        }
+        // an `rm` of a file that vanished is transport_failed
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let victim = sc.collection().join(format!("{DT}/OLD/config.json"));
+        let hook_victim = victim.clone();
+        *tap.before.lock().expect("hook") = Some(Box::new(move |batch: &str| {
+            if batch.contains("rm \"") {
+                let _ = std::fs::remove_file(&hook_victim);
+            }
+        }));
+        let m = sftp_mirror(&sc, StagingMode::InPlace, tap.clone());
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("vanished file");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(!victim.exists());
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_existence_first_mkdir() {
+        let sc = Scratch::new();
+        let tap = Arc::new(Tap::default());
+        let m = sftp_mirror(&sc, StagingMode::InPlace, tap.clone());
+        let rendered = tree(&[
+            (&format!("{DT}/UPD/config.json"), b"{\"v\":2}"),
+            (&format!("{DT}/NEW/config.json"), b"{\"new\":1}"),
+            ("ignition/brand-new-type/X/config.json", b"{}"),
+        ]);
+        let staged = m.stage(&rendered).await.expect("stage");
+        assert!(tap.lines().is_empty(), "inplace staging runs no session");
+        m.commit(&staged, &DeleteSet::default())
+            .await
+            .expect("commit");
+
+        let data = posix_root(&sc.data.display().to_string()).expect("root");
+        let dev = format!("{data}/config/resources/{MODE}");
+        let batches = tap.lines();
+        let mut mkdirs: Vec<(usize, String)> = Vec::new();
+        for (index, batch) in batches.iter().enumerate() {
+            for line in batch {
+                if let Some(rest) = line.strip_prefix("mkdir \"") {
+                    mkdirs.push((index, rest.trim_end_matches('"').to_string()));
+                }
+            }
+        }
+        let made: std::collections::BTreeSet<&str> =
+            mkdirs.iter().map(|(_, path)| path.as_str()).collect();
+        let want = [
+            format!("{dev}/ignition/brand-new-type"),
+            format!("{dev}/ignition/brand-new-type/X"),
+            format!("{dev}/{DT}/NEW"),
+        ];
+        assert_eq!(
+            made,
+            want.iter().map(String::as_str).collect(),
+            "mkdir only for levels a listing showed missing (never `ignition` or `{DT}`)"
+        );
+        assert_eq!(mkdirs.len(), 3, "each exactly once: {mkdirs:?}");
+        // every mkdir's parent was listed in an earlier session or created earlier
+        for (index, path) in &mkdirs {
+            let parent = path.rsplit_once('/').expect("parent").0;
+            let listed_before = batches[..*index]
+                .iter()
+                .flatten()
+                .any(|line| line == &format!("@ls -la \"{parent}\""));
+            let made_before = mkdirs.iter().any(|(i, other)| other == parent && i < index);
+            assert!(
+                listed_before || made_before,
+                "{path}: parent {parent} was never established"
+            );
+        }
+        assert_eq!(
+            std::fs::read(sc.collection().join(format!("{DT}/NEW/config.json"))).unwrap(),
+            b"{\"new\":1}"
+        );
+    }
+    #[tokio::test]
+    async fn sftp_mirror_delete_set_refusals_write_nothing() {
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = sftp_mirror(&sc, staging, Arc::new(TokioProcessRunner));
+            assert_refusals_write_nothing(&m, &sc).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_refuses_a_staging_root_inside_the_collection() {
+        let sc = Scratch::new();
+        let shell =
+            RemoteShell::local_sftp_server(&sftp_server(), runner(), Duration::from_secs(60));
+        let root = posix_root(&sc.data.display().to_string()).expect("root");
+        for bad in [
+            format!("{root}/config/resources/stage"),
+            format!("{root}/config/resources/dev/stage"),
+            format!("{root}/config/resources"),
+            root.clone(),
+            "relative/stage".to_string(),
+            "/onlyone".to_string(),
+        ] {
+            let why = SftpTransport::new(
+                RemoteShell::local_sftp_server(&sftp_server(), runner(), Duration::from_secs(60)),
+                root.clone(),
+                "nodes.master",
+            )
+            .with_mirror(MODE, StagingMode::Separate { root: bad.clone() })
+            .err()
+            .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert!(why.contains("staging root"), "{why}");
+        }
+        drop(shell);
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_symlinks_are_refused_and_never_followed() {
+        for separate in [true, false] {
+            let sc = Scratch::new();
+            let outside = sc.root.path().join("outside");
+            put(&outside.join("config.json"), b"{\"secret\":1}");
+            std::os::unix::fs::symlink(&outside, sc.collection().join(format!("{DT}/LINK")))
+                .expect("symlink");
+            std::os::unix::fs::symlink(
+                outside.join("config.json"),
+                sc.collection().join(format!("{DT}/KEEP/link.json")),
+            )
+            .expect("symlink file");
+            let staging = if separate {
+                sc.separate()
+            } else {
+                StagingMode::InPlace
+            };
+            let m = sftp_mirror(&sc, staging, Arc::new(TokioProcessRunner));
+            let before = snapshot(&sc.resources());
+            for (name, rendered, set, needle) in [
+                (
+                    "symlinked parent",
+                    tree(&[(&format!("{DT}/LINK/config.json"), b"{\"pwn\":1}")]),
+                    DeleteSet::default(),
+                    "symlink",
+                ),
+                (
+                    "symlink as write target",
+                    tree(&[(&format!("{DT}/KEEP/link.json"), b"{\"pwn\":2}")]),
+                    DeleteSet::default(),
+                    "symlink",
+                ),
+                (
+                    "symlink as delete target",
+                    RenderedTree::default(),
+                    deletes(&[&format!("{DT}/KEEP/link.json")]),
+                    "symlink",
+                ),
+            ] {
+                let staged = m.stage(&rendered).await.expect("stage");
+                let err = m.commit(&staged, &set).await.expect_err(name);
+                assert!(err.to_string().contains(needle), "{name}: {err}");
+                assert_eq!(snapshot(&sc.resources()), before, "{name}");
+                assert_eq!(
+                    std::fs::read(outside.join("config.json")).unwrap(),
+                    b"{\"secret\":1}",
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_tampered_staged_copy_is_refused() {
+        let sc = Scratch::new();
+        let m = sftp_mirror(&sc, sc.separate(), Arc::new(TokioProcessRunner));
+        let staged = m.stage(&scenario_tree()).await.expect("stage");
+        let before = snapshot(&sc.resources());
+        // wrong size on the host
+        std::fs::write(sc.stage_root.join(format!("{DT}/NEW/config.json")), b"{}").expect("tamper");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("wrong size");
+        assert!(err.to_string().contains("wrong size"), "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
+        // missing on the host
+        std::fs::remove_file(sc.stage_root.join(format!("{DT}/NEW/config.json"))).expect("rm");
+        let err = m
+            .commit(&staged, &scenario_deletes())
+            .await
+            .expect_err("missing");
+        assert!(err.to_string().contains("missing"), "{err}");
+        assert_eq!(snapshot(&sc.resources()), before);
+    }
+
+    #[tokio::test]
+    async fn sftp_mirror_hostile_but_legal_names_are_inert() {
+        let sc = Scratch::new();
+        let name = "it's $(touch IGN_PWNED_MARKER) `id`; echo !x";
+        let m = sftp_mirror(&sc, sc.separate(), Arc::new(TokioProcessRunner));
+        let path = format!("{DT}/{name}/config.json");
+        let staged = m.stage(&tree(&[(&path, b"{}")])).await.expect("stage");
+        m.commit(&staged, &DeleteSet::default())
+            .await
+            .expect("commit");
+        assert!(sc.collection().join(&path).is_file());
+        let staged = m.stage(&RenderedTree::default()).await.expect("stage");
+        let report = m.commit(&staged, &deletes(&[&path])).await.expect("delete");
+        assert_eq!(report.removed_dirs, vec![format!("{DT}/{name}")]);
+        for dir in [sc.root.path(), &sc.data, Path::new(".")] {
+            assert!(!dir.join("IGN_PWNED_MARKER").exists());
+        }
+        // names the sftp client would glob or escape are refused up front
+        for bad in ["odd[1]", "q\"uote", "g*lob"] {
+            let err = m
+                .stage(&tree(&[(&format!("{DT}/{bad}/config.json"), b"{}")]))
+                .await;
+            let staged = match err {
+                Ok(staged) => staged,
+                Err(_) => continue,
+            };
+            let err = m
+                .commit(&staged, &DeleteSet::default())
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), "transport_failed", "{bad}");
+        }
+    }
+}
+
+/// No Phase 22 verb or surface can reach the write half (T-22-30): the three
+/// sources that dispatch verbs name none of its identifiers. `deploy_plan`,
+/// `deploy_pull` and `deploy_verify` live in `actions/deploy.rs`, receive a
+/// `Box<dyn TreeReader>` from `for_node`, and the CLI and MCP surfaces only
+/// call those actions.
+#[test]
+fn write_half_unreachable() {
+    let sources: [(&str, &str); 3] = [
+        (
+            "crates/ignition-core/src/actions/deploy.rs",
+            include_str!("../src/actions/deploy.rs"),
+        ),
+        (
+            "crates/ignition-cli/src/main.rs",
+            include_str!("../../ignition-cli/src/main.rs"),
+        ),
+        (
+            "crates/ignition-cli/src/mcp.rs",
+            include_str!("../../ignition-cli/src/mcp.rs"),
+        ),
+    ];
+    let forbidden = [
+        "TreeMirror",
+        "mirror_for_node",
+        "StagingMode",
+        ".stage(",
+        ".commit(",
+    ];
+    for (file, text) in sources {
+        assert!(text.len() > 1000, "{file} was not read");
+        for identifier in forbidden {
+            assert!(
+                !text.contains(identifier),
+                "{file} names `{identifier}`: no Phase 22 verb or surface may reach the transport write half"
+            );
+        }
+    }
+}

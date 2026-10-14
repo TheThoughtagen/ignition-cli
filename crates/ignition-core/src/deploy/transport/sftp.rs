@@ -56,15 +56,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::{
-    CORE_COLLECTION, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
-    READ_MAX_TOTAL_BYTES, Scope, TreeReader,
+    CORE_COLLECTION, DeleteSet, FileBlob, MIRROR_MIN_COMPONENTS, MirrorReport, ObservedFiles,
+    READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode,
+    TreeMirror, TreeReader, absolute_components, copy_to_temp, mirror_mode_problem,
+    read_staged_copy, validate_mirror_inputs, validate_mirror_paths, validate_staging_root,
 };
 use crate::client::config_resources::validate_segment;
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
 use crate::deploy::ledger::{LEDGER_MAX_BYTES, ledger_location};
 use crate::deploy::plan::unit_key;
-use crate::deploy::tree::{OpenError, open_regular_file, sha256_hex, walk_capped};
+use crate::deploy::tree::{OpenError, RenderedTree, open_regular_file, sha256_hex, walk_capped};
 use crate::error::CoreError;
 
 /// The collection that overrides the mode collection on the gateway.
@@ -329,6 +331,7 @@ pub struct SftpTransport {
     data_dir: String,
     label: String,
     sessions: AtomicUsize,
+    mirror: Option<MirrorSetup>,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -350,6 +353,7 @@ impl SftpTransport {
             data_dir,
             label: label.into(),
             sessions: AtomicUsize::new(0),
+            mirror: None,
         }
     }
 
@@ -382,6 +386,16 @@ impl SftpTransport {
         dirs: &[String],
         budget: &mut Budget,
     ) -> Result<Vec<Vec<ListedEntry>>, CoreError> {
+        self.list_level_as("read", dirs, budget).await
+    }
+
+    /// [`list_level`](Self::list_level) reporting failures as operation `op`.
+    async fn list_level_as(
+        &self,
+        op: &str,
+        dirs: &[String],
+        budget: &mut Budget,
+    ) -> Result<Vec<Vec<ListedEntry>>, CoreError> {
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
@@ -391,15 +405,20 @@ impl SftpTransport {
             .collect();
         self.sessions.fetch_add(1, Ordering::Relaxed);
         let out = self.shell.sftp_batch(&ops).await?;
-        let out = self.shell.require_success("read", out)?;
+        let out = self.shell.require_success(op, out)?;
         let remaining = READ_MAX_ENTRIES.saturating_sub(budget.entries);
+        let fail = |detail: String| CoreError::TransportFailed {
+            operation: op.to_string(),
+            node: self.label.clone(),
+            detail,
+        };
         let listings =
             parse_batch_listing_capped(dirs, &out.stdout, remaining).map_err(|e| match e {
-                ListingError::TooMany => self.fail(format!(
+                ListingError::TooMany => fail(format!(
                     "more than {READ_MAX_ENTRIES} entries under the data directory (at {})",
                     self.shown(&dirs[0])
                 )),
-                ListingError::Bad(why) => self.fail(format!("cannot use the sftp listing: {why}")),
+                ListingError::Bad(why) => fail(format!("cannot use the sftp listing: {why}")),
             })?;
         budget.entries += listings.iter().map(Vec::len).sum::<usize>();
         Ok(listings)
@@ -1089,6 +1108,611 @@ impl TreeReader for SftpTransport {
                 "the file is {actual} bytes but was listed as {listed}; it changed while it was read"
             ))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The write half (22-07)
+// ---------------------------------------------------------------------------
+
+/// What the write half needs: the mode collection and the staging mode (the
+/// staging root normalised to an absolute POSIX path).
+#[derive(Debug, Clone)]
+struct MirrorSetup {
+    mode: String,
+    staging: StagingMode,
+}
+
+/// What a survey listing says about one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Missing,
+    Dir,
+    File(u64),
+}
+
+/// `base` plus `chain`, joined with `/`.
+fn join_abs(base: &str, chain: &[String]) -> String {
+    let mut path = base.to_string();
+    for part in chain {
+        path.push('/');
+        path.push_str(part);
+    }
+    path
+}
+
+fn chain_of(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|p| (*p).to_string()).collect()
+}
+
+impl SftpTransport {
+    /// Bind the write half to the `mode` collection with `staging`. A
+    /// `Separate` root is normalised to an absolute POSIX path here and must
+    /// lie outside `config/resources`.
+    pub fn with_mirror(mut self, mode: &str, staging: StagingMode) -> Result<Self, String> {
+        if let Some(why) = mirror_mode_problem(mode) {
+            return Err(why);
+        }
+        safe_remote_path(mode).map_err(|why| format!("the mode is unsafe: {why}"))?;
+        let resources = self.resources_display();
+        validate_staging_root(&staging, &resources)?;
+        let staging = match staging {
+            StagingMode::Separate { root } => {
+                let parts = absolute_components(&root)
+                    .map_err(|why| format!("the staging root {root:?} {why}"))?;
+                if !root.starts_with('/') {
+                    return Err(format!(
+                        "the staging root {root:?} must be an absolute POSIX path on the host"
+                    ));
+                }
+                let normal = format!("/{}", parts.join("/"));
+                safe_remote_path(&normal)
+                    .map_err(|why| format!("the staging root is unsafe: {why}"))?;
+                StagingMode::Separate { root: normal }
+            }
+            StagingMode::InPlace => StagingMode::InPlace,
+        };
+        self.mirror = Some(MirrorSetup {
+            mode: mode.to_string(),
+            staging,
+        });
+        Ok(self)
+    }
+
+    /// `<data_dir>/config/resources`, for the staging-root containment check.
+    fn resources_display(&self) -> String {
+        format!("{}/config/resources", self.data_dir)
+    }
+
+    fn mirror_fail(&self, op: &str, detail: impl std::fmt::Display) -> CoreError {
+        CoreError::TransportFailed {
+            operation: op.to_string(),
+            node: self.label.clone(),
+            detail: detail.to_string(),
+        }
+    }
+
+    fn mirror_setup(&self, op: &str) -> Result<&MirrorSetup, CoreError> {
+        self.mirror.as_ref().ok_or_else(|| {
+            self.mirror_fail(
+                op,
+                "this transport has no write half; build it with mirror_for_node",
+            )
+        })
+    }
+
+    /// Which node and mode a [`Staged`] belongs to.
+    fn mirror_owner(&self, setup: &MirrorSetup) -> String {
+        format!("sftp:{}:{}:{}", self.label, self.data_dir, setup.mode)
+    }
+
+    /// Run one mutating batch; an empty batch spawns nothing.
+    async fn run_batch(&self, op: &str, ops: Vec<SftpOp>) -> Result<(), CoreError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.sessions.fetch_add(1, Ordering::Relaxed);
+        let out = self.shell.sftp_batch(&ops).await?;
+        self.shell.require_success(op, out)?;
+        Ok(())
+    }
+
+    /// Read-only: what every path in `targets` (chains below the existing
+    /// directory `base`) is on the host, one listing session per depth.
+    ///
+    /// A directory is listed only when it is known to exist and has a needed
+    /// child; a child of a missing directory is missing without a listing. A
+    /// symlink or special file anywhere, or a file where a directory is
+    /// needed, is refused. `base` itself is listed first, so a missing or
+    /// unreadable `base` is `transport_failed`.
+    async fn survey(
+        &self,
+        op: &str,
+        base: &str,
+        targets: &[Vec<String>],
+        budget: &mut Budget,
+    ) -> Result<BTreeMap<Vec<String>, Seen>, CoreError> {
+        let mut needed: BTreeSet<Vec<String>> = BTreeSet::new();
+        for target in targets {
+            for len in 1..=target.len() {
+                needed.insert(target[..len].to_vec());
+            }
+        }
+        let mut has_child: BTreeSet<Vec<String>> = BTreeSet::new();
+        for chain in &needed {
+            if chain.len() > 1 {
+                has_child.insert(chain[..chain.len() - 1].to_vec());
+            }
+        }
+        let max_depth = needed.iter().map(Vec::len).max().unwrap_or(0);
+        if max_depth > READ_MAX_DEPTH {
+            return Err(self.mirror_fail(op, "a path is deeper than the walk bound"));
+        }
+        let mut seen: BTreeMap<Vec<String>, Seen> = BTreeMap::new();
+        for depth in 0..max_depth {
+            let children: Vec<&Vec<String>> =
+                needed.iter().filter(|c| c.len() == depth + 1).collect();
+            let mut parents: BTreeSet<Vec<String>> = BTreeSet::new();
+            for child in &children {
+                let parent = child[..depth].to_vec();
+                let parent_state = if depth == 0 {
+                    Seen::Dir
+                } else {
+                    seen.get(&parent).copied().unwrap_or(Seen::Missing)
+                };
+                if parent_state == Seen::Dir {
+                    parents.insert(parent);
+                }
+            }
+            let parents: Vec<Vec<String>> = parents.into_iter().collect();
+            let dirs: Vec<String> = parents.iter().map(|p| join_abs(base, p)).collect();
+            let listings = self.list_level_as(op, &dirs, budget).await?;
+            for child in children {
+                let parent = child[..depth].to_vec();
+                let name = &child[depth];
+                let state = match parents.iter().position(|p| *p == parent) {
+                    None => Seen::Missing,
+                    Some(index) => match listings[index].iter().find(|e| e.name == *name) {
+                        None => Seen::Missing,
+                        Some(entry) => {
+                            let shown = self.shown(&join_abs(base, child));
+                            match entry.kind {
+                                EntryKind::Symlink => {
+                                    return Err(self.mirror_fail(
+                                        op,
+                                        format!("{shown} is a symlink; symlinks are refused"),
+                                    ));
+                                }
+                                EntryKind::Other => {
+                                    return Err(self.mirror_fail(
+                                        op,
+                                        format!("{shown} is not a regular file or directory"),
+                                    ));
+                                }
+                                EntryKind::File if has_child.contains(child) => {
+                                    return Err(
+                                        self.mirror_fail(op, format!("{shown} is not a directory"))
+                                    );
+                                }
+                                EntryKind::File => Seen::File(entry.size),
+                                EntryKind::Dir => Seen::Dir,
+                            }
+                        }
+                    },
+                };
+                seen.insert(child.clone(), state);
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Create every directory in `missing` (chains below `base`), one `mkdir`
+    /// session per depth, shallowest first. Only chains a survey showed
+    /// missing are passed, so `mkdir` is never issued for an existing level.
+    async fn make_dirs(
+        &self,
+        op: &str,
+        base: &str,
+        missing: &BTreeSet<Vec<String>>,
+    ) -> Result<(), CoreError> {
+        let max_depth = missing.iter().map(Vec::len).max().unwrap_or(0);
+        for depth in 1..=max_depth {
+            let ops: Vec<SftpOp> = missing
+                .iter()
+                .filter(|chain| chain.len() == depth)
+                .map(|chain| SftpOp::Mkdir {
+                    path: join_abs(base, chain),
+                })
+                .collect();
+            self.run_batch(op, ops).await?;
+        }
+        Ok(())
+    }
+
+    /// The directories above `files` that a survey showed missing.
+    fn dirs_to_make(
+        seen: &BTreeMap<Vec<String>, Seen>,
+        files: &[Vec<String>],
+    ) -> BTreeSet<Vec<String>> {
+        let mut missing = BTreeSet::new();
+        for file in files {
+            for len in 1..file.len() {
+                let chain = file[..len].to_vec();
+                if seen.get(&chain) == Some(&Seen::Missing) {
+                    missing.insert(chain);
+                }
+            }
+        }
+        missing
+    }
+
+    /// Sessions of at most [`DOWNLOAD_CHUNK_FILES`] lines and, for `bytes`
+    /// per op, at most [`DOWNLOAD_CHUNK_BYTES`] bytes.
+    async fn run_chunked(&self, op: &str, ops: Vec<(SftpOp, u64)>) -> Result<(), CoreError> {
+        let mut batch: Vec<SftpOp> = Vec::new();
+        let mut bytes = 0u64;
+        for (line, size) in ops {
+            if !batch.is_empty()
+                && (batch.len() >= DOWNLOAD_CHUNK_FILES || bytes + size > DOWNLOAD_CHUNK_BYTES)
+            {
+                self.run_batch(op, std::mem::take(&mut batch)).await?;
+                bytes = 0;
+            }
+            bytes += size;
+            batch.push(line);
+        }
+        self.run_batch(op, batch).await
+    }
+
+    async fn stage_inner(&self, tree: &RenderedTree) -> Result<Staged, CoreError> {
+        const OP: &str = "stage";
+        let setup = self.mirror_setup(OP)?;
+        validate_mirror_inputs(
+            tree,
+            &DeleteSet::default(),
+            &setup.staging,
+            &self.resources_display(),
+        )
+        .map_err(|why| self.mirror_fail(OP, why))?;
+        let owned = tree.clone();
+        let (local, files) = tokio::task::spawn_blocking(move || copy_to_temp(&owned))
+            .await
+            .map_err(|e| CoreError::Internal(format!("sftp stage task failed: {e}")))?
+            .map_err(|why| self.mirror_fail(OP, why))?;
+
+        let remote_root = match &setup.staging {
+            StagingMode::InPlace => None,
+            StagingMode::Separate { root } => {
+                let parts = absolute_components(root).map_err(|why| self.mirror_fail(OP, why))?;
+                // `/<first>` is assumed to exist; its listing proves it.
+                let base = format!("/{}", parts[0]);
+                let rest: Vec<String> = parts[1..].to_vec();
+                let mut targets: Vec<Vec<String>> = Vec::new();
+                let mut file_chains: Vec<Vec<String>> = Vec::new();
+                for (path, _) in &files {
+                    let mut chain = rest.clone();
+                    chain.extend(path.components().map(str::to_string));
+                    file_chains.push(chain.clone());
+                    targets.push(chain);
+                }
+                targets.push(rest.clone());
+                let mut budget = Budget::default();
+                let seen = self.survey(OP, &base, &targets, &mut budget).await?;
+                for chain in &file_chains {
+                    if matches!(seen.get(chain), Some(Seen::Dir)) {
+                        return Err(self.mirror_fail(
+                            OP,
+                            format!(
+                                "{} exists in the staging root and is a directory",
+                                self.shown(&join_abs(&base, chain))
+                            ),
+                        ));
+                    }
+                }
+                if matches!(seen.get(&rest), Some(Seen::File(_))) {
+                    return Err(self.mirror_fail(
+                        OP,
+                        format!("the staging root {root:?} is a file, not a directory"),
+                    ));
+                }
+                let mut missing = Self::dirs_to_make(&seen, &file_chains);
+                // the root itself and its missing ancestors
+                for len in 1..=rest.len() {
+                    let chain = rest[..len].to_vec();
+                    if seen.get(&chain) == Some(&Seen::Missing) {
+                        missing.insert(chain);
+                    }
+                }
+                self.make_dirs(OP, &base, &missing).await?;
+                let puts: Vec<(SftpOp, u64)> = tree
+                    .files
+                    .iter()
+                    .map(|(path, bytes)| {
+                        (
+                            SftpOp::Put {
+                                local: local.path().join(path.as_str()),
+                                remote: format!("{root}/{path}"),
+                            },
+                            bytes.len() as u64,
+                        )
+                    })
+                    .collect();
+                self.run_chunked(OP, puts).await?;
+                Some(root.clone())
+            }
+        };
+        Ok(Staged {
+            files,
+            local,
+            remote_root,
+            owner: self.mirror_owner(setup),
+        })
+    }
+
+    async fn commit_inner(
+        &self,
+        local: &Path,
+        files: &[(RelPath, String)],
+        remote_root: Option<&str>,
+        owner: &str,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError> {
+        const OP: &str = "commit";
+        let setup = self.mirror_setup(OP)?;
+        if owner != self.mirror_owner(setup) {
+            return Err(self.mirror_fail(
+                OP,
+                "these files were staged by a different mirror (another node or mode)",
+            ));
+        }
+        let expected_root = match &setup.staging {
+            StagingMode::Separate { root } => Some(root.as_str()),
+            StagingMode::InPlace => None,
+        };
+        if remote_root != expected_root {
+            return Err(self.mirror_fail(OP, "these files were staged in a different staging mode"));
+        }
+        let staged_paths: Vec<&RelPath> = files.iter().map(|(path, _)| path).collect();
+        validate_mirror_paths(&staged_paths, delete_set)
+            .and_then(|()| validate_staging_root(&setup.staging, &self.resources_display()))
+            .map_err(|why| self.mirror_fail(OP, why))?;
+        for path in staged_paths.iter().copied().chain(delete_set.files.iter()) {
+            safe_remote_path(path.as_str()).map_err(|why| {
+                self.mirror_fail(
+                    OP,
+                    format!("{path} cannot be placed in an sftp batch: {why}"),
+                )
+            })?;
+        }
+
+        // ---- expected state: everything is checked before the first write.
+        // The local copies first, through `open_regular_file`.
+        let sizes: Vec<u64> = {
+            let (base, copies) = (local.to_path_buf(), files.to_vec());
+            tokio::task::spawn_blocking(move || -> Result<Vec<u64>, String> {
+                copies
+                    .iter()
+                    .map(|(path, sha)| read_staged_copy(&base, path, sha).map(|b| b.len() as u64))
+                    .collect()
+            })
+            .await
+            .map_err(|e| CoreError::Internal(format!("sftp commit task failed: {e}")))?
+            .map_err(|why| self.mirror_fail(OP, why))?
+        };
+
+        let mode_chain = chain_of(&[RESOURCES[0], RESOURCES[1], setup.mode.as_str()]);
+        let in_collection = |path: &RelPath| -> Vec<String> {
+            let mut chain = mode_chain.clone();
+            chain.extend(path.components().map(str::to_string));
+            chain
+        };
+        let mut deletes: Vec<&RelPath> = delete_set.files.iter().collect();
+        deletes.sort();
+        let mut targets: Vec<Vec<String>> = vec![
+            chain_of(&[RESOURCES[0]]),
+            chain_of(&[RESOURCES[0], RESOURCES[1]]),
+            mode_chain.clone(),
+        ];
+        let staged_chains: Vec<Vec<String>> = files.iter().map(|(p, _)| in_collection(p)).collect();
+        let delete_chains: Vec<Vec<String>> = deletes.iter().map(|p| in_collection(p)).collect();
+        targets.extend(staged_chains.iter().cloned());
+        targets.extend(delete_chains.iter().cloned());
+        let mut budget = Budget::default();
+        let seen = self
+            .survey(OP, &self.data_dir, &targets, &mut budget)
+            .await?;
+        for required in [
+            chain_of(&[RESOURCES[0]]),
+            chain_of(&[RESOURCES[0], RESOURCES[1]]),
+        ] {
+            if seen.get(&required) != Some(&Seen::Dir) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "{} is not a directory; is data_dir a gateway data directory?",
+                        required.join("/")
+                    ),
+                ));
+            }
+        }
+        if let Some(Seen::File(_)) = seen.get(&mode_chain) {
+            return Err(self.mirror_fail(
+                OP,
+                format!("the {} collection is not a directory", setup.mode),
+            ));
+        }
+        for (path, chain) in deletes.iter().zip(&delete_chains) {
+            if !matches!(seen.get(chain), Some(Seen::File(_))) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "{path} is not a regular file in the {} collection; nothing was changed",
+                        setup.mode
+                    ),
+                ));
+            }
+        }
+        for ((path, _), chain) in files.iter().zip(&staged_chains) {
+            if matches!(seen.get(chain), Some(Seen::Dir)) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "{path} is a directory in the {} collection; nothing was changed",
+                        setup.mode
+                    ),
+                ));
+            }
+        }
+        if let Some(root) = remote_root {
+            let parts = absolute_components(root).map_err(|why| self.mirror_fail(OP, why))?;
+            let base = format!("/{}", parts[0]);
+            let rest: Vec<String> = parts[1..].to_vec();
+            let chains: Vec<Vec<String>> = files
+                .iter()
+                .map(|(path, _)| {
+                    let mut chain = rest.clone();
+                    chain.extend(path.components().map(str::to_string));
+                    chain
+                })
+                .collect();
+            let mut staging_budget = Budget::default();
+            let staging_seen = self.survey(OP, &base, &chains, &mut staging_budget).await?;
+            for (((path, _), chain), size) in files.iter().zip(&chains).zip(&sizes) {
+                match staging_seen.get(chain) {
+                    Some(Seen::File(found)) if found == size => {}
+                    other => {
+                        return Err(self.mirror_fail(
+                            OP,
+                            format!(
+                                "the staged copy of {path} on the host is missing or the wrong size ({other:?}, expected {size} bytes); nothing was changed"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // ---- writes
+        let mut missing = Self::dirs_to_make(&seen, &staged_chains);
+        if seen.get(&mode_chain) == Some(&Seen::Missing) {
+            missing.insert(mode_chain.clone());
+        }
+        self.make_dirs(OP, &self.data_dir, &missing).await?;
+        let mut moves: Vec<(SftpOp, u64)> = Vec::with_capacity(files.len());
+        for (((path, _), chain), size) in files.iter().zip(&staged_chains).zip(&sizes) {
+            let target = join_abs(&self.data_dir, chain);
+            let op = match remote_root {
+                Some(root) => SftpOp::Rename {
+                    from: format!("{root}/{path}"),
+                    to: target,
+                },
+                None => SftpOp::Put {
+                    local: local.join(path.as_str()),
+                    remote: target,
+                },
+            };
+            moves.push((op, *size));
+        }
+        self.run_chunked(OP, moves).await?;
+        let written: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
+
+        // ---- deletes
+        let rms: Vec<(SftpOp, u64)> = delete_chains
+            .iter()
+            .map(|chain| {
+                (
+                    SftpOp::Rm {
+                        path: join_abs(&self.data_dir, chain),
+                    },
+                    0,
+                )
+            })
+            .collect();
+        self.run_chunked(OP, rms).await?;
+        let deleted: Vec<String> = deletes.iter().map(|path| path.to_string()).collect();
+
+        // ---- directories a delete emptied, never `<module>/<type>` or above
+        let removed = self
+            .remove_emptied(OP, &deletes, &mode_chain, &mut budget)
+            .await?;
+        Ok(MirrorReport {
+            written,
+            deleted,
+            removed_dirs: removed,
+        })
+    }
+
+    /// Remove the directories above `deletes` that are now empty, deepest
+    /// first, listing each candidate level in one session. A directory that is
+    /// not empty keeps its ancestors. Stops before `<module>/<type>`.
+    async fn remove_emptied(
+        &self,
+        op: &str,
+        deletes: &[&RelPath],
+        mode_chain: &[String],
+        budget: &mut Budget,
+    ) -> Result<Vec<String>, CoreError> {
+        let mut pending: BTreeMap<usize, BTreeSet<Vec<String>>> = BTreeMap::new();
+        for path in deletes {
+            let parts: Vec<&str> = path.components().collect();
+            for depth in MIRROR_MIN_COMPONENTS..parts.len() {
+                pending
+                    .entry(depth)
+                    .or_default()
+                    .insert(chain_of(&parts[..depth]));
+            }
+        }
+        let mut blocked: BTreeSet<Vec<String>> = BTreeSet::new();
+        let mut removed: Vec<String> = Vec::new();
+        let depths: Vec<usize> = pending.keys().rev().copied().collect();
+        for depth in depths {
+            let candidates: Vec<Vec<String>> = pending[&depth]
+                .iter()
+                .filter(|chain| !blocked.contains(*chain))
+                .cloned()
+                .collect();
+            let dirs: Vec<String> = candidates
+                .iter()
+                .map(|chain| join_abs(&join_abs(&self.data_dir, mode_chain), chain))
+                .collect();
+            let listings = self.list_level_as(op, &dirs, budget).await?;
+            let mut empty: Vec<SftpOp> = Vec::new();
+            for ((chain, dir), listing) in candidates.iter().zip(&dirs).zip(&listings) {
+                if listing.is_empty() {
+                    empty.push(SftpOp::Rmdir { path: dir.clone() });
+                    removed.push(chain.join("/"));
+                } else {
+                    for len in MIRROR_MIN_COMPONENTS..chain.len() {
+                        blocked.insert(chain[..len].to_vec());
+                    }
+                }
+            }
+            self.run_batch(op, empty).await?;
+        }
+        removed.sort();
+        Ok(removed)
+    }
+}
+
+#[async_trait::async_trait]
+impl TreeMirror for SftpTransport {
+    async fn stage(&self, tree: &RenderedTree) -> Result<Staged, CoreError> {
+        self.stage_inner(tree).await
+    }
+
+    async fn commit(
+        &self,
+        staged: &Staged,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError> {
+        self.commit_inner(
+            staged.local.path(),
+            &staged.files,
+            staged.remote_root.as_deref(),
+            &staged.owner,
+            delete_set,
+        )
+        .await
     }
 }
 
