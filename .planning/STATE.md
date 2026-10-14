@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-03-PLAN.md
-last_updated: "2026-10-14T14:14:03.110Z"
+stopped_at: Completed 22-04-PLAN.md
+last_updated: "2026-10-14T15:25:19.114Z"
 last_activity: 2026-10-14
 last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 18
+  completed_plans: 19
   percent: 33
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 4 of 14
+Plan: 5 of 14
 Status: Ready to execute
 Last activity: 2026-10-14 — Phase 22 execution started
 
-Progress: [██████░░░░] 62%
+Progress: [███████░░░] 66%
 
 ## Performance Metrics
 
@@ -64,6 +64,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P01 | 30min | 2 tasks | 12 files |
 | Phase 22 P02 | 25min | 2 tasks | 10 files |
 | Phase 22 P03 | 75min | 3 tasks | 13 files |
+| Phase 22 P04 | 70min | 2 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -80,7 +81,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 ### Blockers
 
 - [Before Phase 23 planning] Decision B (staging location / svc-ignition-deploy write scope) is OPEN. Resolve in Phase 22 from capture C6 and record it; Phase 23 also needs the OQ5 measured hold budget.
-- [Before Phase 22 reads render.json] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Fix it or have Phase 22 re-hash instead of trusting the marker (21-SECURITY.md).
+- [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
 - [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
 
 ### Quick Tasks Completed
@@ -96,8 +97,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T14:14:03.095Z
-**Stopped At:** Completed 22-03-PLAN.md
+**Last session:** 2026-10-14T15:25:19.102Z
+**Stopped At:** Completed 22-04-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -134,3 +135,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [22-01] Scope::from_manifest drops tag-type types entries (tag_providers covers them); for_node refuses ssh nodes until 22-06
 - [Phase ?]: 22-02: CORE-01 profile header suppressed for deploy plan (no session resolves); DPLN-02/03 stay unchecked until 22-03
 - [Phase ?]: 22-03: removed means not rendered with at least one delete-set file; lockout_risk excludes unmanaged entries (needs confirmation); ledger v1 and deploy_ledger_invalid (exit 6) adopted
+- [Phase ?]: 22-04: plan --base re-hashes the previous render (render.json is identity and consistency only), resolving WR-03 / R-03; --diff withholds any member with a secret-bearing location on either side
