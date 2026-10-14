@@ -1480,7 +1480,7 @@ fn verify_ign(url: &str) -> (tempfile::TempDir, Command) {
     (dir, cmd)
 }
 
-fn verify_args<'a>(repo: &'a Path, json: bool) -> Vec<std::ffi::OsString> {
+fn verify_args(repo: &Path, json: bool) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     if json {
         args.push("--json".into());

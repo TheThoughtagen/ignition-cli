@@ -115,7 +115,7 @@ the frozen success envelope, then ends with **exit 6** (target state):
 - A **green verdict** has `data.ok: true`, `data.slug: null` and exits 0.
 
 `deploy_verify_failed` lives only in `data.slug`. It is not a `CoreError` slug
-and is never a row of the `## Exit codes` table; an agent that wants the
+and is never a row of the exit-code table below; an agent that wants the
 verdict reads `data.ok`, and one that only looks at the exit code sees 6. The
 rule exists because the error envelope has no `data` field, and a verdict is
 only useful with its findings.
