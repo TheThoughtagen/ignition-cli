@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 22
-current_phase_name: Transport, Plan, Pull & Verify
+current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Phase 22 context gathered
-last_updated: "2026-10-14T12:37:13.032Z"
-last_activity: 2026-10-13
-last_activity_desc: Phase 21 complete, transitioned to Phase 22
+stopped_at: Completed 22-01-PLAN.md
+last_updated: "2026-10-14T13:07:30.243Z"
+last_activity: 2026-10-14
+last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 15
+  completed_plans: 16
   percent: 33
 ---
 
@@ -24,16 +24,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-13)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 22 — Transport, Plan, Pull & Verify
+**Current focus:** Phase 22 — transport-plan-pull-verify
 
 ## Current Position
 
-Phase: 22 — Transport, Plan, Pull & Verify
-Plan: Not started
+Phase: 22 (transport-plan-pull-verify) — EXECUTING
+Plan: 2 of 14
 Status: Ready to execute
-Last activity: 2026-10-13 — Phase 21 complete, transitioned to Phase 22
+Last activity: 2026-10-14 — Phase 22 execution started
 
-Progress: [██████████] 100%
+Progress: [██████░░░░] 55%
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 21 P07 | 75min | 2 tasks | 7 files |
 | Phase 21 P08 | 55min | 2 tasks | 8 files |
 | Phase 21 P09 | 75min | 2 tasks | 9 files |
+| Phase 22 P01 | 30min | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -93,9 +94,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T10:09:56.956Z
-**Stopped At:** Phase 22 context gathered
-**Resume file:** .planning/phases/22-transport-plan-pull-verify/22-CONTEXT.md
+**Last session:** 2026-10-14T13:07:30.229Z
+**Stopped At:** Completed 22-01-PLAN.md
+**Resume file:** None
 
 ## Decisions
 
@@ -127,3 +128,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 21]: 21-08: tag-origin files get the Embedded scan only; schema-path and key-name secret rules apply to resource config.json (no resource type for tags)
 - [Phase 21]: 21-08: empty string at an OpenAPI secret path is refused as plaintext; empty string under a key-name hit passes; DRND-07 residual (other key names in undescribed types) flagged
 - [Phase ?]: 21-09: render.json marker schema_version 1 {gateway, env, mode, render_sha256, files[{path,sha256,bytes}]} is read by Phase 22; --out clobber ladder never deletes and refuses before any write
+- [Phase ?]: [22-01] unit_key never climbs above module/type; plan_sha256 canonical text pinned by PLAN_GOLDEN a89de504...c473 and an independent in-test recomputation
+- [Phase ?]: [22-01] Scope::from_manifest drops tag-type types entries (tag_providers covers them); for_node refuses ssh nodes until 22-06
