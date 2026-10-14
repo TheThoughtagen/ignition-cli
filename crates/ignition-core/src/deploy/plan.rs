@@ -225,6 +225,10 @@ pub struct PlanEntry {
     pub drift: Option<bool>,
     /// The unit's files, byte-sorted.
     pub files: Vec<PlanFile>,
+    /// Redacted unified text diff of the unit's differing files (`--diff`);
+    /// null without it, and for `same` and `unmanaged` entries. Excluded from
+    /// `plan_sha256`.
+    pub diff: Option<String>,
 }
 
 /// Counts by status.
@@ -498,6 +502,7 @@ pub fn plan(
             lockout_risk,
             drift: None,
             files,
+            diff: None,
         });
     }
 
@@ -864,6 +869,18 @@ pub fn apply_base(plan: &mut Plan, base: &BaseTree) {
         drifted += usize::from(drift);
     }
     plan.summary.drifted = Some(drifted);
+}
+
+/// The longest diff text one entry carries; longer diffs end with a
+/// truncation marker.
+pub const DIFF_MAX_BYTES: usize = 65_536;
+
+/// Opening words of the line printed in place of a secret-bearing member.
+pub const DIFF_WITHHELD: &str = "withheld: contains secret-bearing locations";
+
+/// Fill `diff` on `added`, `changed` and `removed` entries (skeleton).
+pub fn render_diffs(plan: &mut Plan, rendered: &RenderedTree, observed: &ObservedFiles) {
+    let _ = (plan, rendered, observed);
 }
 
 /// The canonical text `plan_sha256` hashes (see the module doc).

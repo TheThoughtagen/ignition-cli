@@ -39,7 +39,7 @@ use serde::Serialize;
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, ledger_location};
 use crate::deploy::manifest::Manifest;
-use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan};
+use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::Target;
 use crate::deploy::transport::{DeleteSet, Scope, TreeReader};
@@ -273,6 +273,9 @@ pub async fn deploy_plan(
     let mut planned = plan(&declared.outcome.tree, &observed, ledger.as_ref(), &scope);
     if let Some(base) = &base {
         apply_base(&mut planned, base);
+    }
+    if opts.diff {
+        render_diffs(&mut planned, &declared.outcome.tree, &observed);
     }
 
     let mut warnings = declared.outcome.warnings.clone();

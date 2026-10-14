@@ -15,7 +15,9 @@ use ignition_core::actions::deploy::{
 };
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::plan::{CoreRelation, Plan, PlanStatus, plan as plan_with_ledger};
+use ignition_core::deploy::plan::{
+    CoreRelation, DIFF_MAX_BYTES, DIFF_WITHHELD, Plan, PlanStatus, plan as plan_with_ledger,
+};
 use ignition_core::deploy::transport::{self, FileBlob, ObservedFiles, READ_MAX_FILE_BYTES, Scope};
 use ignition_core::deploy::tree::{EMPTY_RENDER_SHA256, RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
@@ -1516,4 +1518,283 @@ async fn bad_base_costs_no_transport_work() {
         "invalid_input",
         "base is checked before the read"
     );
+}
+
+// ---- `--diff` with secret withholding (22-04) -------------------------------
+
+const CANARY: &str = "IGN-CANARY-22-03";
+const ALARM_CONFIG: &str = "ignition/general-alarm-settings/config.json";
+
+fn diff_opts() -> PlanOptions {
+    PlanOptions {
+        base: None,
+        diff: true,
+    }
+}
+
+fn diff_of<'a>(result: &'a DeployPlanResult, key: &str) -> Option<&'a str> {
+    result
+        .entries
+        .iter()
+        .find(|e| e.key == key)
+        .unwrap_or_else(|| panic!("entry {key}"))
+        .diff
+        .as_deref()
+}
+
+/// Live equals the render, except `path` which holds `bytes` instead.
+fn live_with(fx: &PlanFixture, path: &str, bytes: &[u8]) {
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.mode(path, bytes);
+}
+
+#[tokio::test]
+async fn diff_changed_json_shows_unified_text() {
+    let fx = PlanFixture::new();
+    let live = String::from_utf8({
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        fx.read("dev", DB_CONFIG)
+    })
+    .expect("utf-8")
+    .replace("\"textType\": \"text\"", "\"textType\": \"textOLD\"");
+    fx.mode(DB_CONFIG, live.as_bytes());
+
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+    let diff = diff_of(&result, DB_KEY).expect("a changed entry carries a diff");
+    assert!(diff.contains(&format!("--- live/{DB_CONFIG}")), "{diff}");
+    assert!(diff.contains(&format!("+++ desired/{DB_CONFIG}")), "{diff}");
+    assert!(diff.contains("-  \"textType\": \"textOLD\""), "{diff}");
+    assert!(diff.contains("+  \"textType\": \"text\""), "{diff}");
+    assert!(diff.contains("@@"), "{diff}");
+    // an entry that is the same carries none
+    assert_eq!(diff_of(&result, "ignition/general-alarm-settings"), None);
+}
+
+#[tokio::test]
+async fn diff_added_and_removed_entries() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.remove("dev", "ignition/database-translator/POSTGRES");
+    fx.mode(
+        "ignition/database-translator/OLD/config.json",
+        b"{\n  \"a\": 1\n}\n",
+    );
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &["ignition/database-translator/OLD/config.json"],
+    );
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+
+    let added = diff_of(&result, DB_KEY).expect("added entry diff");
+    assert!(added.contains("+  \"textType\": \"text\""), "{added}");
+    assert!(!added.lines().any(|l| l.starts_with("-  ")), "{added}");
+
+    let removed = diff_of(&result, "ignition/database-translator/OLD").expect("removed diff");
+    assert!(removed.contains("-  \"a\": 1"), "{removed}");
+}
+
+#[tokio::test]
+async fn diff_withholds_secret_bearing_member() {
+    let fx = PlanFixture::new();
+    let live = format!(
+        "{{\n  \"extra\": {{\"type\": \"Embedded\", \"data\": {{\"ciphertext\": \"{CANARY}\"}}}}\n}}\n"
+    );
+    live_with(&fx, DB_CONFIG, live.as_bytes());
+    let (declared, _) = fx.load("dev");
+    let desired = sha256_hex(&declared.outcome.tree.files[&RelPath::new(DB_CONFIG).unwrap()]);
+
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+    let diff = diff_of(&result, DB_KEY).expect("diff");
+    assert!(diff.contains(DIFF_WITHHELD), "{diff}");
+    assert!(diff.contains(&sha256_hex(live.as_bytes())), "{diff}");
+    assert!(diff.contains(&desired), "{diff}");
+    assert!(
+        !diff.contains(CANARY) && !diff.contains("ciphertext"),
+        "{diff}"
+    );
+    assert!(
+        !diff.contains("@@"),
+        "no text diff for a withheld member: {diff}"
+    );
+}
+
+#[tokio::test]
+async fn diff_withholds_when_only_the_desired_side_is_secret_bearing() {
+    // desired side secret-bearing cannot come from a real render (render
+    // refuses it), so drive the engine directly
+    let path = RelPath::new(DB_CONFIG).unwrap();
+    let secret =
+        format!("{{\"k\": {{\"type\": \"Embedded\", \"data\": {{\"c\": \"{CANARY}\"}}}}}}\n");
+    let rendered = RenderedTree {
+        files: BTreeMap::from([(path.clone(), secret.clone().into_bytes())]),
+    };
+    let live_bytes = b"{\n  \"k\": 1\n}\n".to_vec();
+    let observed = ObservedFiles {
+        core: BTreeMap::new(),
+        mode: BTreeMap::from([(
+            path,
+            FileBlob {
+                sha256: sha256_hex(&live_bytes),
+                bytes: live_bytes,
+            },
+        )]),
+        local_units: Vec::new(),
+    };
+    let scope = Scope {
+        mode: MODE.to_string(),
+        types: vec![("ignition".into(), "database-translator".into())],
+        tag_providers: Vec::new(),
+    };
+    let mut p = plan_with_ledger(&rendered, &observed, None, &scope);
+    ignition_core::deploy::plan::render_diffs(&mut p, &rendered, &observed);
+    let diff = p.entries[0].diff.as_deref().expect("diff");
+    assert!(diff.contains(DIFF_WITHHELD), "{diff}");
+    assert!(!diff.contains(CANARY), "{diff}");
+}
+
+#[tokio::test]
+async fn diff_non_json_member_is_hash_only() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let text = "ignition/database-translator/POSTGRES/notes.txt";
+    let broken = "ignition/database-translator/POSTGRES/broken.json";
+    fx.mode(text, b"password=IGN-CANARY-22-03\n");
+    fx.mode(broken, b"{ not json IGN-CANARY-22-03");
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+    let diff = diff_of(&result, DB_KEY).expect("diff");
+    assert!(
+        diff.contains(&format!(
+            "{text}: differs (live {}, desired -)",
+            sha256_hex(b"password=IGN-CANARY-22-03\n")
+        )),
+        "{diff}"
+    );
+    assert!(
+        diff.contains(&format!("{broken}: differs (live ")),
+        "{diff}"
+    );
+    assert!(!diff.contains(CANARY), "{diff}");
+    assert!(!diff.contains("@@"), "{diff}");
+}
+
+#[tokio::test]
+async fn diff_is_capped() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let mut big = String::from("{\n");
+    for i in 0..10_000 {
+        big.push_str(&format!("  \"k{i:05}\": \"value-{i:05}\",\n"));
+    }
+    big.push_str("  \"last\": 0\n}\n");
+    fx.mode(DB_CONFIG, big.as_bytes());
+    let result = plan_with(&fx, &diff_opts()).await.expect("plan");
+    let diff = diff_of(&result, DB_KEY).expect("diff");
+    let marker = format!("... [diff truncated at {DIFF_MAX_BYTES} bytes]");
+    assert!(
+        diff.ends_with(&marker),
+        "{}",
+        &diff[diff.len().saturating_sub(120)..]
+    );
+    assert!(
+        diff.len() <= DIFF_MAX_BYTES + marker.len() + 1,
+        "{}",
+        diff.len()
+    );
+}
+
+#[tokio::test]
+async fn diff_absent_without_flag() {
+    let fx = PlanFixture::new();
+    let live = String::from_utf8({
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        fx.read("dev", DB_CONFIG)
+    })
+    .expect("utf-8")
+    .replace("\"textType\": \"text\"", "\"textType\": \"textOLD\"");
+    fx.mode(DB_CONFIG, live.as_bytes());
+
+    let without = plan_with(&fx, &PlanOptions::default()).await.expect("plan");
+    for entry in &without.entries {
+        assert_eq!(entry.diff, None, "{}", entry.key);
+    }
+    let json = serde_json::to_value(&without).expect("json");
+    assert!(json["entries"][0]["diff"].is_null());
+
+    let with = plan_with(&fx, &diff_opts()).await.expect("plan");
+    assert!(diff_of(&with, DB_KEY).is_some());
+    assert_eq!(
+        without.plan_sha256, with.plan_sha256,
+        "diff is hash-excluded"
+    );
+}
+
+#[tokio::test]
+async fn canary_never_leaves_plan() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let (_scratch, base) = render_base(&fx);
+
+    // a changed unit with Embedded ciphertext, a changed unit with a
+    // plaintext password key, an unmanaged unit and a removed unit
+    fx.mode(
+        DB_CONFIG,
+        format!(
+            "{{\"x\": {{\"type\": \"Embedded\", \"data\": {{\"ciphertext\": \"{CANARY}\"}}}}}}"
+        )
+        .as_bytes(),
+    );
+    fx.mode(
+        ALARM_CONFIG,
+        format!("{{\"password\": \"{CANARY}\"}}").as_bytes(),
+    );
+    fx.mode(
+        "ignition/database-translator/LEAK/config.json",
+        format!(
+            "{{\"x\": {{\"type\": \"Embedded\", \"data\": {{\"ciphertext\": \"{CANARY}\"}}}}}}"
+        )
+        .as_bytes(),
+    );
+    fx.mode(
+        "ignition/database-translator/OLD/config.json",
+        format!("{{\"password\": \"{CANARY}\"}}").as_bytes(),
+    );
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &["ignition/database-translator/OLD/config.json"],
+    );
+
+    let opts = PlanOptions {
+        base: Some(base),
+        diff: true,
+    };
+    let result = plan_with(&fx, &opts).await.expect("plan");
+    for key in [
+        DB_KEY,
+        "ignition/general-alarm-settings",
+        "ignition/database-translator/OLD",
+    ] {
+        let diff = diff_of(&result, key).expect("diff");
+        assert!(diff.contains(DIFF_WITHHELD), "{key}: {diff}");
+    }
+    assert_eq!(diff_of(&result, "ignition/database-translator/LEAK"), None);
+
+    let json = serde_json::to_string(&result).expect("json");
+    let debug = format!("{result:?}");
+    let pretty = serde_json::to_string_pretty(&result).expect("json");
+    for (name, text) in [("json", &json), ("debug", &debug), ("pretty", &pretty)] {
+        assert!(!text.contains(CANARY), "canary leaked into {name}");
+        assert!(
+            !text.contains("ciphertext"),
+            "ciphertext leaked into {name}"
+        );
+    }
 }

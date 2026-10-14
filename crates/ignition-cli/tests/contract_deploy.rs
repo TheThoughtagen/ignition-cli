@@ -964,3 +964,142 @@ fn plan_local_corrupt_ledger_exits_6() {
         "{message}"
     );
 }
+
+/// Canary seeded into live secret-bearing content (22-04, SC-5 plan half).
+const CANARY_PLAN: &str = "IGN-CANARY-22-03";
+
+#[test]
+fn plan_diff_canary_cli() {
+    let (_scratch, repo, data) = local_tracer();
+    let live = data.join("config/resources/dev");
+    let db = live.join("ignition/database-translator/POSTGRES/config.json");
+    let alarm = live.join("ignition/general-alarm-settings/config.json");
+    let leak = live.join("ignition/database-translator/LEAK");
+    std::fs::write(
+        &db,
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_PLAN}"}}}}}}"#),
+    )
+    .expect("seed embedded");
+    std::fs::write(&alarm, format!(r#"{{"password":"{CANARY_PLAN}"}}"#)).expect("seed password");
+    std::fs::create_dir_all(&leak).expect("leak dir");
+    std::fs::write(
+        leak.join("config.json"),
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_PLAN}"}}}}}}"#),
+    )
+    .expect("seed unmanaged");
+
+    // --json
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args([
+            "--json", "deploy", "plan", "--env", "dev", "--diff", "--repo",
+        ])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains(CANARY_PLAN), "canary in json {name}");
+        assert!(!text.contains("ciphertext"), "ciphertext in json {name}");
+    }
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let entries = envelope["data"]["entries"].as_array().expect("entries");
+    let changed: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["status"] == "changed")
+        .collect();
+    assert_eq!(changed.len(), 2);
+    for entry in changed {
+        let diff = entry["diff"].as_str().expect("diff text");
+        assert!(
+            diff.contains("withheld: contains secret-bearing locations"),
+            "{diff}"
+        );
+    }
+    let unmanaged = entries
+        .iter()
+        .find(|e| e["key"] == "ignition/database-translator/LEAK")
+        .expect("unmanaged entry");
+    assert_eq!(unmanaged["status"], "unmanaged");
+    assert!(unmanaged["diff"].is_null());
+
+    // human
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["deploy", "plan", "--env", "dev", "--diff", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(0));
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains(CANARY_PLAN), "canary in human {name}");
+        assert!(!text.contains("ciphertext"), "ciphertext in human {name}");
+    }
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("  ")
+                && l.contains("withheld: contains secret-bearing locations")),
+        "diff lines are indented two spaces under their entry: {stdout}"
+    );
+    let last = stdout.lines().last().expect("last line");
+    assert!(last.starts_with("plan_sha256 "), "{stdout}");
+}
+
+#[test]
+fn plan_base_cli_marks_drift_and_refuses_a_tampered_base() {
+    let (scratch, repo, data) = local_tracer();
+    let base = scratch.path().join("out");
+    let live = data.join("config/resources/dev");
+    let db = live.join("ignition/database-translator/POSTGRES/config.json");
+    let mut bytes = std::fs::read(&db).expect("read live");
+    bytes.push(b' ');
+    std::fs::write(&db, bytes).expect("edit live");
+
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--base")
+        .arg(&base)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["summary"]["drifted"], 1);
+    assert_eq!(envelope["data"]["base"]["files"], 4);
+    let drifted: Vec<&Value> = envelope["data"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|e| e["drift"] == true)
+        .collect();
+    assert_eq!(drifted.len(), 1);
+
+    // a modified base is invalid_input (exit 2) and prints nothing on stdout
+    std::fs::write(base.join("extra.json"), b"{}").expect("tamper");
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .arg("--base")
+        .arg(&base)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(stderr_json(&out)["error"]["code"], "invalid_input");
+}
