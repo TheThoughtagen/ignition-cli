@@ -132,6 +132,21 @@ pub enum CheckId {
     Probes,
 }
 
+impl CheckId {
+    /// The word the check serializes as (`read_back`, not `ReadBack`), for the
+    /// human renderer.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::Mode => "mode",
+            Self::ReadBack => "read_back",
+            Self::Files => "files",
+            Self::Loaded => "loaded",
+            Self::Probes => "probes",
+        }
+    }
+}
+
 /// The outcome of one check. `warn` never fails the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -142,6 +157,17 @@ pub enum CheckStatus {
     Fail,
     /// Not a failure, but not a plain pass either.
     Warn,
+}
+
+impl CheckStatus {
+    /// The word the status serializes as, for the human renderer.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Warn => "warn",
+        }
+    }
 }
 
 /// One value-free observation.
@@ -962,6 +988,25 @@ fn printable(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The renderer words are the serialized words, so the human and JSON
+    /// forms never drift.
+    #[test]
+    fn words_equal_the_serialized_forms() {
+        for id in [
+            CheckId::Scan,
+            CheckId::Mode,
+            CheckId::ReadBack,
+            CheckId::Files,
+            CheckId::Loaded,
+            CheckId::Probes,
+        ] {
+            assert_eq!(json!(id), json!(id.word()));
+        }
+        for status in [CheckStatus::Pass, CheckStatus::Fail, CheckStatus::Warn] {
+            assert_eq!(json!(status), json!(status.word()));
+        }
+    }
 
     #[test]
     fn quality_codes_carry_no_free_text() {

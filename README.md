@@ -343,6 +343,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign deploy render --env <ENV> [--repo DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
 | `ign deploy plan --env <ENV> [--repo DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
 | `ign deploy pull --env <ENV> [--repo DIR]` | Bootstrap `gateways/<name>/` in the local repo from the master node's live tree: `core` files into `resources/` and `tags/`, the mode collection's files into `modes/<ENV>/`, a manifest generated when none exists | read-only against the gateway (it reads the host through `nodes.master.local` or `ssh`, resolves no session, sends no REST request, writes nothing to the host); writes only the local repo; units holding a secret, or that `render` would not reproduce byte for byte, are skipped and listed in `data.skipped[]` with a reason (they show as `unmanaged` in `plan`); **guarded**: replacing existing files in `resources/`, `tags/` or `modes/<ENV>/` exits 2 `confirmation_required` without the global `--yes` (the message names the file count and the first five paths), `manifest.yaml` and other environments' overlays are never touched; MCP tool `deploy_pull` advertises `confirm`; JSON data `{env, gateway, mode, node, transport, out, files_written, manifest, render_sha256, skipped, warnings}` |
+| `ign deploy verify --env <ENV> [--repo DIR] [--project NAME]` | Verify that the master gateway runs what the target declares, through six checks: `scan`, `mode`, `read_back`, `files`, `loaded`, `probes` | read-only (no scan is triggered, no scan-lock taken, nothing written); the master's `profile` from the target resolves through the normal secret chain (`profile_not_found` exit 3, `secret_unavailable` exit 3, `network_error` exit 4 when unreachable, `transport_failed` exit 4 when the host cannot be read); **verdict exit**: green exits 0, a RED verdict renders the success envelope with `data.ok: false`, `data.slug: deploy_verify_failed` and the findings in `data.checks`, and exits **6** after the envelope (see [the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14)); failures before a verdict exists stay ordinary error envelopes with their own exit codes; `--project` (default `ign-cli`) names the project hosting the WebDev `tags` route used for probes; MCP tool `deploy_verify` is unguarded (Decision D); JSON data `{env, gateway, mode, node, project, ok, slug, checks, resources_checked, warnings}` |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -2802,6 +2803,83 @@ and, being guarded, advertises the synthetic optional `confirm`. A pull into an
 absent or empty `gateways/<name>/` runs without `confirm`, because D-11 guards
 only a non-empty overwrite; the write is confined to `gateways/<name>/` of the
 caller's own `--repo`.
+
+### `deploy verify`
+
+`ign deploy verify --env <ENV> [--repo DIR] [--project NAME]` asks whether the
+**master** gateway runs what `targets/<ENV>.yaml` declares. It is
+**read-only**: it triggers no scan, takes no scan-lock and writes nothing to
+the gateway or the host. The master's `profile` name comes from the target and
+is resolved through the normal secret chain (flag, keyring and environment, as
+for any gateway verb), so the credential used is the one the target names; the
+envelope `profile` echoes it. The host files are read through the same reader
+as `deploy plan` (`nodes.master.local` or `nodes.master.ssh`).
+
+**The six checks** run in a fixed order and always all appear in
+`data.checks`. Each is `pass`, `warn` or `fail`; `warn` never fails the
+verdict.
+
+| Check | Passes when | Finding codes |
+|-------|-------------|---------------|
+| `scan` | no config scan is running | `scan_active` |
+| `mode` | the gateway runs the target's `mode` exactly (no mode is a mismatch) | `mode_mismatch` |
+| `read_back` | every declared resource is present over REST with an equal `config` | `resource_missing`, `resource_differs` (JSON paths only) |
+| `files` | every declared tag unit on the host is byte-equal to the render | `files_differ` |
+| `loaded` | the gateway log holds no `will not be loaded` line for a declared resource | `unloaded_resource`, `logs_unavailable` |
+| `probes` | every `verify.tag_probes[]` path of the manifest reads quality `Good*` | `tag_probe_not_good`, `tag_probes_unavailable`, `tag_probes_absent` (warn) |
+
+**The log window (CV1).** `loaded` reads WARN-or-higher gateway log lines from
+`lastScanTimestamp - lastScanDuration - 1000 ms` (gateway clock only; 30 s
+when the gateway gives no scan duration), up to 5 pages of 200 lines, and
+matches client-side. The gateway writes a line about 1.5 s after the scan
+completes, so the check waits up to 5 s after the scan was read unless the
+gateway has logged something since. It sees the last scan only: a clean log is
+evidence about that scan, and the pass detail says so. While a scan is running
+the check is `warn` (not observed). A log that cannot be read, or that fills
+all 5 pages, is `fail` with `logs_unavailable`.
+
+**The read-back comparison (CV2).** Equality is JSON value equality (key
+order is ignored, `1` equals `1.0`). Members that are `null` in the file are
+dropped before comparing (N1). `ignition/security-levels` compares by `name`:
+every level of the file must appear in REST with its members, extra REST
+levels are fine (N2). A unit with no `config.json` compares only the
+attribute keys REST also carries (N3). A REST item whose effective collection
+is `system`, and the types that have no REST read route
+(`com.inductiveautomation.opcua/one-time`, `ignition/images`), are listed in
+`data.warnings` and are not counted in `data.resources_checked`. A
+hand-written, minimal `config.json` can differ from REST in members the
+gateway fills with defaults; a tree made by `deploy pull` carries the full
+config and compares equal.
+
+**Probes.** The manifest's `verify.tag_probes` are read through the WebDev
+`tags` route of `--project`, every second for up to 30 s, and the last reading
+is judged. No probes declared is a `warn` (`tag_probes_absent`), never a
+`pass`. A route that cannot be read (for example `routes_not_deployed`) is a
+`fail` carrying only the error slug.
+
+**What is never printed.** A finding carries a code, a subject (a resource
+key, unit key, tag path, `mode` or `logs`) and a detail made of JSON paths,
+quality codes, timestamps, logger names and error slugs. Log message text, tag
+values and file bytes never reach stdout, stderr or the envelope.
+
+**Output.** Human output is `verify <gateway> (<env>, mode <mode>): PASS|FAIL`,
+one `<id>: <status> <detail>` line per check, and one indented
+`<code> <subject> <detail>` line per finding. With `--json`, `data` carries, in
+this order: `env`, `gateway`, `mode`, `node` (`master`), `project`, `ok`,
+`slug`, `checks`, `resources_checked` and `warnings`. `slug` is
+`deploy_verify_failed` when `ok` is false, else `null`.
+
+**Exit codes.** A green verdict exits 0. A red verdict exits 6 after the
+success envelope is printed; see
+[the verdict exception](#the-deploy-verify-verdict-exception-2026-10-14).
+A gateway that cannot be reached, a refused scan, mode or resource read, an
+unreadable host and a refused tree are ordinary error envelopes with their own
+exit codes: there is no evidence to judge, so no verdict is given.
+
+**Over MCP.** `deploy verify` is in the `ign mcp serve` catalog as
+`deploy_verify`. It is read-only, so the tool is not guarded and takes no
+`confirm`. A red verdict is a normal result (`ok: true`, `data.ok: false`),
+not an MCP error.
 
 ## Linting (`ign lint`)
 

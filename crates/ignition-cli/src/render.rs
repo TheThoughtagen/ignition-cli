@@ -294,6 +294,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployRender(result) => render_deploy_render_human(result),
         ActionOutput::DeployPlan(result) => render_deploy_plan_human(result),
         ActionOutput::DeployPull(result) => render_deploy_pull_human(result),
+        ActionOutput::DeployVerify(result) => render_deploy_verify_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1487,6 +1488,34 @@ fn render_deploy_pull_human(result: &ignition_core::actions::deploy::DeployPullR
         println!("skipped {}: {}", skipped.path, skipped.reason);
     }
     println!("render_sha256 {}", result.render_sha256);
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `ign deploy verify` human form: the verdict line, one line per check in the
+/// fixed order, then one indented line per finding. Keys, paths, codes,
+/// timestamps and logger names only; the engine keeps log text, tag values and
+/// file bytes out of every finding (SC-5). Warnings go to stderr.
+fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVerifyResult) {
+    println!(
+        "verify {} ({}, mode {}): {}",
+        result.gateway,
+        result.env,
+        result.mode,
+        if result.ok { "PASS" } else { "FAIL" }
+    );
+    for check in &result.checks {
+        println!(
+            "{}: {} {}",
+            check.id.word(),
+            check.status.word(),
+            check.detail
+        );
+        for finding in &check.findings {
+            println!("  {} {} {}", finding.code, finding.subject, finding.detail);
+        }
+    }
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }

@@ -235,6 +235,10 @@ enum ActionOutput {
     /// changed (SF-2); `profile` is the master's profile name.
     DeployPlan(actions::deploy::DeployPlanResult),
     DeployPull(actions::deploy::DeployPullResult),
+    /// `ign deploy verify` (22-11): the read-only six-check verdict. A red
+    /// verdict is a SUCCESS envelope (`data.ok: false`) and exit 6, set in
+    /// `main` after the envelope is rendered (Decision A, DPLN-09).
+    DeployVerify(actions::deploy::DeployVerifyResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -415,6 +419,7 @@ impl ActionOutput {
             ActionOutput::DeployRender(result) => render_success(profile, result, compact),
             ActionOutput::DeployPlan(result) => render_success(profile, result, compact),
             ActionOutput::DeployPull(result) => render_success(profile, result, compact),
+            ActionOutput::DeployVerify(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -552,6 +557,20 @@ fn main() -> ExitCode {
             // exit-code tables.
             if let ActionOutput::TestingRun(testing) = &out
                 && let Some(code) = testing.failure_exit_code()
+            {
+                return ExitCode::from(code);
+            }
+            // The THIRD sanctioned success-path EXIT exception (22-11,
+            // Decision A, DPLN-09, DSURF-04), same shape as `ign testing
+            // run` above: a RED `ign deploy verify` renders the full
+            // verdict in the success envelope (`data.ok: false`,
+            // `data.slug: deploy_verify_failed`, the findings in
+            // `data.checks`) and exits 6 afterwards. The slug is NOT a
+            // `CoreError` and never belongs in the exit-code table; the
+            // README's dated verdict exception documents it. Failures before
+            // a verdict exists stay ordinary error envelopes.
+            if let ActionOutput::DeployVerify(verify) = &out
+                && let Some(code) = verify.failure_exit_code()
             {
                 return ExitCode::from(code);
             }
@@ -3159,6 +3178,43 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 let result = actions::deploy::deploy_pull(&repo, &env, reader.as_ref(), cli.yes)
                     .await
                     .map(ActionOutput::DeployPull);
+                (profile, result)
+            }
+            // `ign deploy verify` (22-11): READ-ONLY. The master's profile
+            // NAME comes from the target and resolves through the normal
+            // secret chain (T-22-47); the host is read through the
+            // transport read seam. No scan is triggered, no scan-lock is
+            // taken, nothing is written (DPLN-07).
+            DeployCommand::Verify { env, repo, project } => {
+                let declared = match actions::deploy::load_declared(&repo, &env) {
+                    Ok(declared) => declared,
+                    Err(err) => return (None, Err(err)),
+                };
+                let master = &declared.target.nodes.master;
+                let profile = Some(master.profile.clone());
+                let reader = match ignition_core::deploy::transport::for_node(
+                    &repo,
+                    &declared.target_file,
+                    "nodes.master",
+                    master,
+                ) {
+                    Ok(reader) => reader,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let session = match named_profile_client(&mut config, &master.profile) {
+                    Ok(session) => session,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let result = actions::deploy::deploy_verify(
+                    &declared,
+                    &project,
+                    session.api(),
+                    session.api(),
+                    reader.as_ref(),
+                    &actions::deploy::VerifyOptions::default(),
+                )
+                .await
+                .map(ActionOutput::DeployVerify);
                 (profile, result)
             }
         },

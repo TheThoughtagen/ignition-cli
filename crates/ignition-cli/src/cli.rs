@@ -684,6 +684,26 @@ pub enum DeployCommand {
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
     },
+    /// Verify that the master gateway runs what the target declares:
+    /// no scan running, the target's deployment mode, every declared
+    /// resource read back equal over REST, tag-unit files byte-equal on the
+    /// host, no `will not be loaded` WARN for a declared resource, and the
+    /// manifest's tag probes reading Good. Read-only: no scan is triggered,
+    /// no lock is taken, nothing is written. Resolves the master's profile
+    /// through the normal secret chain. Prints a verdict: exit 0 when green,
+    /// exit 6 with `data.slug` `deploy_verify_failed` when red
+    Verify {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+        /// The project hosting the WebDev `tags` route used for the tag
+        /// probes
+        #[arg(long, value_name = "NAME", default_value = "ign-cli")]
+        project: String,
+    },
 }
 
 /// `ign edit` args (13-08): the kubectl-edit loop over ONE resource.
