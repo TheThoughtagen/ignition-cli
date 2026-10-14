@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-05-PLAN.md
-last_updated: "2026-10-14T15:58:43.738Z"
+stopped_at: Completed 22-06-PLAN.md
+last_updated: "2026-10-14T17:14:49.061Z"
 last_activity: 2026-10-14
 last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 20
+  completed_plans: 21
   percent: 33
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 6 of 14
+Plan: 7 of 14
 Status: Ready to execute
 Last activity: 2026-10-14 — Phase 22 execution started
 
-Progress: [███████░░░] 69%
+Progress: [███████░░░] 72%
 
 ## Performance Metrics
 
@@ -66,6 +66,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P03 | 75min | 3 tasks | 13 files |
 | Phase 22 P04 | 70min | 2 tasks | 11 files |
 | Phase 22 P05 | 55min | 2 tasks | 9 files |
+| Phase 22 P06 | 150min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -98,8 +99,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T15:58:43.715Z
-**Stopped At:** Completed 22-05-PLAN.md
+**Last session:** 2026-10-14T17:14:49.034Z
+**Stopped At:** Completed 22-06-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -139,3 +140,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-04: plan --base re-hashes the previous render (render.json is identity and consistency only), resolving WR-03 / R-03; --diff withholds any member with a secret-bearing location on either side
 - [Phase ?]: 22-05: stdout capture is bounded (32 MiB, overflow kills the child as code -2) and a timed-out child is killed and reaped before the call returns
 - [Phase ?]: 22-05: ssh option paths quote whitespace, double %, refuse quote/$/control characters; host and user refuse leading -, whitespace, control characters and @
+- [Phase ?]: 22-06: SftpTransport lists with ls -la and fetches per-file get (never get -R) so symlinks, sizes and every cap are enforced from the listing; DPLN-01 stays pending until Windows and the write half
