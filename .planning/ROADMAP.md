@@ -327,7 +327,7 @@ Plans:
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 22-09-PLAN.md — Rig captures CV1–CV3 (log shape/window, read-back equality, post-scan bytes); live pull→render→plan empty on 8.3.6
+- [x] 22-09-PLAN.md — Rig captures CV1–CV3 (log shape/window, read-back equality, post-scan bytes); live pull→render→plan empty on 8.3.6
 
 **Wave 9** *(blocked on Wave 8 completion)*
 
@@ -424,7 +424,7 @@ Plans:
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
-| 22. Transport, Plan, Pull & Verify | v1.6 | 8/14 | In Progress|  |
+| 22. Transport, Plan, Pull & Verify | v1.6 | 9/14 | In Progress|  |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |

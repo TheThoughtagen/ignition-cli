@@ -2,19 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 22
-current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-08-PLAN.md
-last_updated: "2026-10-14T19:33:44.415Z"
+stopped_at: Completed 22-09-PLAN.md
+last_updated: "2026-10-14T20:15:31.892Z"
 last_activity: 2026-10-14
-last_activity_desc: Phase 22 execution started
 progress:
-  total_phases: 6
+  total_phases: 3
   completed_phases: 2
   total_plans: 29
-  completed_plans: 23
-  percent: 33
+  completed_plans: 24
+  percent: 83
 ---
 
 # Project State
@@ -29,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 9 of 14
+Plan: 10 of 14
 Status: Ready to execute
-Last activity: 2026-10-14 — Phase 22 execution started
+Last activity: 2026-10-14
 
-Progress: [████████░░] 79%
+Progress: [████████░░] 83%
 
 ## Performance Metrics
 
@@ -69,6 +66,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P06 | 150min | 2 tasks | 6 files |
 | Phase 22 P07 | 80min | 2 tasks | 4 files |
 | Phase 22 P08 | 190min | 2 tasks | 12 files |
+| Phase 22 P09 | 95min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -101,8 +99,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T19:33:44.379Z
-**Stopped At:** Completed 22-08-PLAN.md
+**Last session:** 2026-10-14T20:15:31.727Z
+**Stopped At:** Completed 22-09-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -146,3 +144,6 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-07: a Staged belongs to its mirror, mode and staging mode; Separate commit consumes the staged files, so idempotence is stage+commit twice
 - [Phase ?]: 22-07: mirror writes are ordered writes, deletes, emptied-dir removal; modes core and local are never mirrored
 - [Phase ?]: 22-08: deploy pull's --yes guard counts only files in the three subtrees it replaces; DPLN-06 stays pending until live captures (22-09, 22-14)
+- [Phase ?]: 22-09 CV1: match 'will not be loaded' client-side (logger filter is not a prefix filter); window = lastScanTimestamp - lastScanDuration - 1000 ms; settle 5 s; line logged once; REST view still lists the resource
+- [Phase ?]: 22-09 CV2: REST config equals file config.json except N1 (null members), N2 (security-levels name-keyed subset), N3 (files [] resource); system-collection items and routeless types skipped
+- [Phase ?]: 22-09 CV3: a scan does not rewrite plain-file-write resource files; post-scan bytes equal rendered bytes
