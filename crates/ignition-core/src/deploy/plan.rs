@@ -102,15 +102,23 @@
 //! (`PLAN_GOLDEN` in `tests/deploy_plan.rs`) and Phase 23's recomputation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::Path;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::layout::{RelPath, TAG_TYPES};
 use super::ledger::Ledger;
 use super::rules::GATEWAY_OWNED_FILES;
-use super::transport::{DeleteSet, FileBlob, ObservedFiles, Scope};
-use super::tree::{RenderedTree, sha256_hex};
+use super::transport::{
+    DeleteSet, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
+    READ_MAX_TOTAL_BYTES, Scope,
+};
+use super::tree::{
+    MarkerFile, OpenError, RENDER_MARKER, RenderMarker, RenderedTree, TMP_SUFFIX,
+    open_regular_file, sha256_hex, walk_capped,
+};
 use crate::error::CoreError;
 
 /// First line of the canonical `plan_sha256` text.
@@ -531,30 +539,331 @@ pub fn plan(
 }
 
 /// A previous render (a `deploy render --out` directory), re-hashed from its
-/// real bytes. Skeleton: filled in by the GREEN commit.
+/// real bytes (`--base`, 22-04).
+///
+/// `render.json` is read for identity (`gateway`, `env`, `mode`) and as a
+/// consistency check only: its file list, every per-file sha256 and its
+/// `render_sha256` must agree with what [`BaseTree::read`] recomputes from the
+/// directory, so a crash-unsafe refresh (21-SECURITY R-03 / WR-03), a leftover
+/// `.ign-render-tmp` file, or any hand edit is refused instead of being
+/// trusted. File bytes are hashed while streaming and never kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseTree {
     /// The directory as given.
     pub dir: String,
-    /// The recomputed `render_sha256`.
+    /// The recomputed `render_sha256` (equals the marker's).
     pub render_sha256: String,
     /// Recomputed sha256 per collection path (`render.json` excluded).
     pub files: BTreeMap<RelPath, String>,
 }
 
+/// `--base <dir>: <problem>[ (first difference: <path>)]`.
+fn base_refusal(dir: &Path, problem: impl std::fmt::Display, first: Option<&str>) -> CoreError {
+    let at = first.map_or_else(String::new, |p| format!(" (first difference: {p})"));
+    CoreError::InvalidInput {
+        reason: format!("--base {}: {problem}{at}", dir.display()),
+    }
+}
+
+/// The first path (byte order) held by exactly one of the two sets.
+fn first_difference<'a>(a: &'a BTreeSet<String>, b: &'a BTreeSet<String>) -> Option<&'a String> {
+    a.symmetric_difference(b)
+        .min_by(|x, y| x.as_bytes().cmp(y.as_bytes()))
+}
+
 impl BaseTree {
     /// Read and verify `dir` as a clean render of `gateway`, `env`, `mode`.
+    ///
+    /// `dir` must be a real directory (not a symlink). It is walked with
+    /// `symlink_metadata`, capped at [`READ_MAX_ENTRIES`]; a symlink, special
+    /// file or non-UTF-8 name anywhere under it is refused. `render.json`
+    /// must parse as a schema 1 [`RenderMarker`] of the same gateway,
+    /// environment and mode; the walked files must be exactly the marker's
+    /// files; every recomputed sha256, size and the recomputed listing digest
+    /// must equal the marker's. Every refusal is `invalid_input` naming the
+    /// directory, the problem and the first differing path; none echoes file
+    /// content.
     pub fn read(dir: &Path, gateway: &str, env: &str, mode: &str) -> Result<BaseTree, CoreError> {
-        let _ = (gateway, env, mode);
-        Err(CoreError::InvalidInput {
-            reason: format!("--base {}: not implemented", dir.display()),
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(base_refusal(dir, "does not exist", None));
+            }
+            Err(e) => {
+                return Err(base_refusal(
+                    dir,
+                    format!("cannot inspect it ({})", e.kind()),
+                    None,
+                ));
+            }
+        };
+        if meta.file_type().is_symlink() {
+            return Err(base_refusal(
+                dir,
+                "is a symlink; symlinks are refused",
+                None,
+            ));
+        }
+        if !meta.file_type().is_dir() {
+            return Err(base_refusal(dir, "is not a directory", None));
+        }
+
+        let mut walked: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        walk_capped(dir, "", &mut walked, &mut dirs, READ_MAX_ENTRIES)
+            .map_err(|why| base_refusal(dir, why, None))?;
+
+        let Some(marker_path) = walked.remove(RENDER_MARKER) else {
+            return Err(base_refusal(
+                dir,
+                format!("holds no {RENDER_MARKER}; it is not a `deploy render --out` directory"),
+                Some(RENDER_MARKER),
+            ));
+        };
+        let marker = read_marker(dir, &marker_path)?;
+        if marker.schema_version != 1 {
+            return Err(base_refusal(
+                dir,
+                format!(
+                    "{RENDER_MARKER} has schema_version {}, expected 1",
+                    marker.schema_version
+                ),
+                None,
+            ));
+        }
+        for (what, found, expected) in [
+            ("gateway", &marker.gateway, gateway),
+            ("env", &marker.env, env),
+            ("mode", &marker.mode, mode),
+        ] {
+            if found != expected {
+                return Err(base_refusal(
+                    dir,
+                    format!("{RENDER_MARKER} {what} is {found}, this plan's is {expected}"),
+                    None,
+                ));
+            }
+        }
+
+        let mut listed: BTreeMap<&str, &MarkerFile> = BTreeMap::new();
+        for entry in &marker.files {
+            if listed.insert(entry.path.as_str(), entry).is_some() {
+                return Err(base_refusal(
+                    dir,
+                    format!("{RENDER_MARKER} lists a path twice"),
+                    Some(&entry.path),
+                ));
+            }
+        }
+        let found: BTreeSet<String> = walked.keys().cloned().collect();
+        let named: BTreeSet<String> = listed.keys().map(|p| (*p).to_string()).collect();
+        if let Some(path) = first_difference(&found, &named) {
+            let problem = if path.ends_with(TMP_SUFFIX) {
+                "holds a leftover temporary file from an interrupted render".to_string()
+            } else if found.contains(path) {
+                format!("holds a file not listed in {RENDER_MARKER}")
+            } else {
+                format!("is missing a file listed in {RENDER_MARKER}")
+            };
+            return Err(base_refusal(dir, problem, Some(path)));
+        }
+        for d in &dirs {
+            let prefix = format!("{d}/");
+            if !named.iter().any(|p| p.starts_with(&prefix)) {
+                return Err(base_refusal(
+                    dir,
+                    "holds a directory with no rendered file",
+                    Some(d),
+                ));
+            }
+        }
+
+        let mut files: BTreeMap<RelPath, String> = BTreeMap::new();
+        let mut total: u64 = 0;
+        for (rel, path) in &walked {
+            let entry = listed[rel.as_str()];
+            let key = RelPath::new(rel).map_err(|why| {
+                base_refusal(
+                    dir,
+                    format!("{RENDER_MARKER} lists an unusable path ({why})"),
+                    Some(rel),
+                )
+            })?;
+            let (sha256, len) = hash_base_file(dir, rel, path, &mut total)?;
+            if sha256 != entry.sha256 || len != entry.bytes {
+                return Err(base_refusal(
+                    dir,
+                    format!("a file differs from the sha256 recorded in {RENDER_MARKER}"),
+                    Some(rel),
+                ));
+            }
+            files.insert(key, sha256);
+        }
+
+        let render_sha256 = listing_digest(&files);
+        if render_sha256 != marker.render_sha256 {
+            return Err(base_refusal(
+                dir,
+                format!("the files do not match the render_sha256 recorded in {RENDER_MARKER}"),
+                None,
+            ));
+        }
+        Ok(BaseTree {
+            dir: dir.to_string_lossy().into_owned(),
+            render_sha256,
+            files,
         })
     }
 }
 
-/// Mark each entry's `drift` against `base`.
+/// `render.json`, read through the descriptor-relative helper and parsed
+/// without echoing anything the file says.
+fn read_marker(dir: &Path, path: &Path) -> Result<RenderMarker, CoreError> {
+    let before = std::fs::symlink_metadata(path).map_err(|e| {
+        base_refusal(
+            dir,
+            format!("cannot inspect {RENDER_MARKER} ({})", e.kind()),
+            None,
+        )
+    })?;
+    let (file, held) = open_base_file(dir, RENDER_MARKER, &before)?;
+    if held.len() > READ_MAX_FILE_BYTES {
+        return Err(base_refusal(
+            dir,
+            format!("{RENDER_MARKER} is over the {READ_MAX_FILE_BYTES} byte cap"),
+            None,
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(READ_MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            base_refusal(
+                dir,
+                format!("cannot read {RENDER_MARKER} ({})", e.kind()),
+                None,
+            )
+        })?;
+    if bytes.len() as u64 > READ_MAX_FILE_BYTES {
+        return Err(base_refusal(
+            dir,
+            format!("{RENDER_MARKER} is over the {READ_MAX_FILE_BYTES} byte cap"),
+            None,
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        base_refusal(
+            dir,
+            format!("{RENDER_MARKER} is not a valid render marker"),
+            None,
+        )
+    })
+}
+
+fn open_base_file(
+    dir: &Path,
+    rel: &str,
+    before: &std::fs::Metadata,
+) -> Result<(std::fs::File, std::fs::Metadata), CoreError> {
+    open_regular_file(dir, Path::new(rel), before).map_err(|e| match e {
+        OpenError::Changed => base_refusal(dir, "changed while it was read", Some(rel)),
+        OpenError::Io(e) => {
+            base_refusal(dir, format!("cannot read a file ({})", e.kind()), Some(rel))
+        }
+    })
+}
+
+/// Stream one base file through SHA-256 (never keeping its bytes), enforcing
+/// the per-file and total byte caps. Returns the digest and the byte count.
+fn hash_base_file(
+    dir: &Path,
+    rel: &str,
+    path: &Path,
+    total: &mut u64,
+) -> Result<(String, u64), CoreError> {
+    let before = std::fs::symlink_metadata(path).map_err(|e| {
+        base_refusal(
+            dir,
+            format!("cannot inspect a file ({})", e.kind()),
+            Some(rel),
+        )
+    })?;
+    if !before.file_type().is_file() {
+        return Err(base_refusal(dir, "is no longer a regular file", Some(rel)));
+    }
+    let (file, held) = open_base_file(dir, rel, &before)?;
+    if held.len() > READ_MAX_FILE_BYTES {
+        return Err(base_refusal(
+            dir,
+            format!("a file is over the {READ_MAX_FILE_BYTES} byte cap"),
+            Some(rel),
+        ));
+    }
+    *total += held.len();
+    if *total > READ_MAX_TOTAL_BYTES {
+        return Err(base_refusal(
+            dir,
+            format!("the files exceed {READ_MAX_TOTAL_BYTES} bytes in total"),
+            Some(rel),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut len: u64 = 0;
+    let mut reader = file.take(READ_MAX_FILE_BYTES + 1);
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| {
+            base_refusal(dir, format!("cannot read a file ({})", e.kind()), Some(rel))
+        })?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        if len > READ_MAX_FILE_BYTES {
+            return Err(base_refusal(
+                dir,
+                format!("a file grew past the {READ_MAX_FILE_BYTES} byte cap while it was read"),
+                Some(rel),
+            ));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), len))
+}
+
+/// The `render_sha256` listing digest over `path NUL sha256 LF` lines, the
+/// same text [`RenderedTree::render_sha256`] hashes.
+fn listing_digest(files: &BTreeMap<RelPath, String>) -> String {
+    let mut hasher = Sha256::new();
+    for (path, sha256) in files {
+        hasher.update(path.as_str().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(sha256.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Mark each entry's `drift` against `base` and count them.
+///
+/// An entry drifted when any of its files has a live sha256 that differs from
+/// both the base sha256 and the desired sha256; an absent side counts as its
+/// own value (`None`). This includes `unmanaged` entries (a unit created on
+/// the gateway outside the pipeline) and an `added` entry whose live copy was
+/// deleted outside the pipeline. The flag is not part of `plan_sha256`.
 pub fn apply_base(plan: &mut Plan, base: &BaseTree) {
-    let _ = (plan, base);
+    let mut drifted = 0;
+    for entry in &mut plan.entries {
+        let drift = entry.files.iter().any(|file| {
+            let base_sha = RelPath::new(&file.path)
+                .ok()
+                .and_then(|path| base.files.get(&path));
+            file.live_sha256.as_ref() != base_sha && file.live_sha256 != file.desired_sha256
+        });
+        entry.drift = Some(drift);
+        drifted += usize::from(drift);
+    }
+    plan.summary.drifted = Some(drifted);
 }
 
 /// The canonical text `plan_sha256` hashes (see the module doc).

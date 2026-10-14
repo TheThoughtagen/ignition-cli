@@ -651,6 +651,14 @@ pub enum DeployCommand {
         /// Declared repo root (default: the current directory)
         #[arg(long, value_name = "DIR", default_value = ".")]
         repo: PathBuf,
+        /// A directory written by `deploy render --out`: a previous render
+        /// of this gateway, environment and mode. It is re-hashed, never
+        /// trusted; a base that is modified, incomplete or of another
+        /// gateway is refused (`invalid_input`). Each entry then carries
+        /// `drift`: true when a live file differs from both the base and
+        /// the desired tree
+        #[arg(long, value_name = "DIR")]
+        base: Option<PathBuf>,
     },
 }
 

@@ -700,10 +700,12 @@ fn plan_cli_live_equal_to_render_exits_0() {
         "summary",
         "entries",
         "delete_set",
+        "base",
         "warnings",
     ];
     expected.sort_unstable();
     assert_eq!(keys, expected);
+    assert!(data["base"].is_null(), "no --base, no base summary");
     assert_eq!(data["node"], "master");
     assert_eq!(data["transport"], "local");
     assert_eq!(data["summary"]["has_changes"], false);

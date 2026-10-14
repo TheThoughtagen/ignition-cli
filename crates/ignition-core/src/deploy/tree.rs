@@ -128,7 +128,7 @@ impl SourceTree {
 pub const RENDER_MARKER: &str = "render.json";
 
 /// Suffix of the temporary file a write goes through before its rename.
-const TMP_SUFFIX: &str = ".ign-render-tmp";
+pub(crate) const TMP_SUFFIX: &str = ".ign-render-tmp";
 
 /// `render.json`: ign's own record of a render written with `--out`. It is
 /// not a gateway file and is never part of `render_sha256`. Phase 22 reads

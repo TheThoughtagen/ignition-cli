@@ -1395,19 +1395,23 @@ async fn base_modified_refused() {
     .await;
     assert!(reason.contains(DB_CONFIG), "{reason}");
 
-    // a changed byte AND a marker hash rewritten to match: the listing digest
-    // recorded in the marker no longer matches
+    // a changed byte AND the marker's per-file hash and size rewritten to
+    // match: only the listing digest recorded in the marker still disagrees
     let reason = refused(|b| {
         let path = b.join(DB_CONFIG);
         let mut bytes = std::fs::read(&path).expect("read");
-        let old = sha256_hex(&bytes);
         bytes.push(b' ');
-        let new = sha256_hex(&bytes);
         std::fs::write(&path, &bytes).expect("write");
         let marker = b.join("render.json");
-        let text = std::fs::read_to_string(&marker).expect("marker");
-        assert!(text.contains(&old));
-        std::fs::write(&marker, text.replace(&old, &new)).expect("marker");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker).expect("marker")).expect("json");
+        for file in doc["files"].as_array_mut().expect("files") {
+            if file["path"] == DB_CONFIG {
+                file["sha256"] = sha256_hex(&bytes).into();
+                file["bytes"] = bytes.len().into();
+            }
+        }
+        std::fs::write(&marker, serde_json::to_vec_pretty(&doc).expect("json")).expect("marker");
     })
     .await;
     assert!(reason.contains("render_sha256"), "{reason}");

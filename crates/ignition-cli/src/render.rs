@@ -1448,6 +1448,9 @@ fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanR
         if entry.lockout_risk {
             line.push_str(" lockout_risk");
         }
+        if entry.drift == Some(true) {
+            line.push_str(" drift");
+        }
         println!("{line}");
     }
     for path in &result.delete_set.files {
