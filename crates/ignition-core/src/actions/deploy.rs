@@ -1,4 +1,5 @@
-//! Deploy actions (Phase 21): `ign deploy render`.
+//! Deploy actions: `ign deploy render` (Phase 21) and the `deploy plan`
+//! engine entry point (Phase 22).
 //!
 //! An OFFLINE verb: it reads a declared repo from disk and returns a model.
 //! There is no `Session`, no profile resolution, no network connection and
@@ -15,6 +16,21 @@
 //!
 //! Errors never echo file contents: findings name repo-relative paths and
 //! key names only.
+//!
+//! ## `deploy plan` (22-01)
+//!
+//! [`load_declared`] is the shared front half of every verb that starts from
+//! a declared repo (render, plan, later pull and verify): it reads
+//! `targets/<env>.yaml`, the gateway manifest and the source tree and
+//! renders them. [`deploy_plan`] then compares that render with a node's
+//! live files, read through a [`TreeReader`]. It opens no gateway session,
+//! sends no REST request, takes no scan-lock and writes nothing: the reader
+//! has no write half to call.
+//!
+//! The [`DeployPlanResult`] `data` keys, in order: `env, gateway, mode,
+//! node, transport, render_sha256, plan_sha256, summary, entries,
+//! warnings`. Later plans add keys additively (`delete_set`, `base`).
+//! Entries carry paths and sha256 only, never file bytes.
 
 use std::path::Path;
 
@@ -22,9 +38,11 @@ use serde::Serialize;
 
 use crate::deploy::component_problem;
 use crate::deploy::manifest::Manifest;
-use crate::deploy::render::{RenderInput, RenderedResource, render};
+use crate::deploy::plan::{PlanEntry, PlanSummary, plan};
+use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::Target;
-use crate::deploy::tree::{RenderMarker, SourceTree, write_out};
+use crate::deploy::transport::{Scope, TreeReader};
+use crate::deploy::tree::{RenderMarker, SourceTree, read_repo_file, require_repo_dir, write_out};
 use crate::error::CoreError;
 
 /// The `ign deploy render` result (the envelope's `data`).
@@ -56,34 +74,51 @@ pub struct DeployRenderResult {
     pub warnings: Vec<String>,
 }
 
-/// Render the declared tree of `env` under `repo`, optionally writing it
-/// (and `render.json`) to `out`.
-pub fn deploy_render(
-    repo: &Path,
-    env: &str,
-    out: Option<&Path>,
-) -> Result<DeployRenderResult, CoreError> {
+/// Read and parse `targets/<env>.yaml`: the target file's repo-relative
+/// name and the parsed target.
+pub fn load_target(repo: &Path, env: &str) -> Result<(String, Target), CoreError> {
     if let Some(problem) = component_problem(env) {
         return Err(CoreError::InvalidInput {
             reason: format!("--env {env}: {problem}"),
         });
     }
-
     let target_rel = format!("targets/{env}.yaml");
-    let target_bytes = read_tree_file(
+    let target_bytes = read_repo_file(
         repo,
         &target_rel,
         Some(&format!("--env {env} selects {target_rel}")),
     )?;
     let target = Target::parse(&target_rel, &target_bytes)?;
+    Ok((target_rel, target))
+}
+
+/// A declared repo, loaded and rendered for one environment.
+#[derive(Debug, Clone)]
+pub struct Declared {
+    /// The `--env` value.
+    pub env: String,
+    /// Repo-relative path of the target file (`targets/<env>.yaml`).
+    pub target_file: String,
+    /// The parsed target.
+    pub target: Target,
+    /// The parsed gateway manifest.
+    pub manifest: Manifest,
+    /// The render of the declared tree.
+    pub outcome: RenderOutcome,
+}
+
+/// Load the target, the manifest and the source tree of `env` under `repo`
+/// and render them. Reads the repo and nothing else.
+pub fn load_declared(repo: &Path, env: &str) -> Result<Declared, CoreError> {
+    let (target_file, target) = load_target(repo, env)?;
 
     let gateway_rel = format!("gateways/{}", target.gateway);
     let gateway_dir = repo.join("gateways").join(&target.gateway);
-    require_real_dir(repo, "gateways")?;
-    require_real_dir(repo, &gateway_rel)?;
+    require_repo_dir(repo, "gateways")?;
+    require_repo_dir(repo, &gateway_rel)?;
 
     let manifest_rel = format!("{gateway_rel}/manifest.yaml");
-    let manifest_bytes = read_tree_file(repo, &manifest_rel, None)?;
+    let manifest_bytes = read_repo_file(repo, &manifest_rel, None)?;
     let manifest = Manifest::parse(&manifest_rel, &manifest_bytes)?;
 
     let source = SourceTree::read_gateway(&gateway_dir, env)?;
@@ -94,6 +129,25 @@ pub fn deploy_render(
         target: &target,
         source: &source,
     })?;
+    Ok(Declared {
+        env: env.to_string(),
+        target_file,
+        target,
+        manifest,
+        outcome,
+    })
+}
+
+/// Render the declared tree of `env` under `repo`, optionally writing it
+/// (and `render.json`) to `out`.
+pub fn deploy_render(
+    repo: &Path,
+    env: &str,
+    out: Option<&Path>,
+) -> Result<DeployRenderResult, CoreError> {
+    let Declared {
+        target, outcome, ..
+    } = load_declared(repo, env)?;
 
     // Only a successful render reaches the filesystem.
     if let Some(out) = out {
@@ -117,67 +171,60 @@ pub fn deploy_render(
     })
 }
 
-/// `symlink_metadata` of `repo/rel`, as a finding on failure.
-fn tree_meta(repo: &Path, rel: &str, hint: Option<&str>) -> Result<std::fs::Metadata, CoreError> {
-    match std::fs::symlink_metadata(repo.join(rel)) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::deploy_tree_invalid(
-            rel,
-            None,
-            None,
-            "is a symlink; symlinks are refused",
-        )),
-        Ok(meta) => Ok(meta),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let message = match hint {
-                Some(hint) => format!("does not exist ({hint})"),
-                None => "does not exist".to_string(),
-            };
-            Err(CoreError::deploy_tree_invalid(rel, None, None, message))
-        }
-        Err(e) => Err(CoreError::deploy_tree_invalid(
-            rel,
-            None,
-            None,
-            format!("cannot inspect ({})", e.kind()),
-        )),
-    }
+/// The `ign deploy plan` result (the envelope's `data`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeployPlanResult {
+    /// The `--env` value.
+    pub env: String,
+    /// Gateway directory name from the target.
+    pub gateway: String,
+    /// Deployment mode from the target.
+    pub mode: String,
+    /// The node that was read: always `master` in this phase.
+    pub node: String,
+    /// How the node's host was read: `local` or `ssh`.
+    pub transport: String,
+    /// Lowercase hex SHA-256 of the rendered listing.
+    pub render_sha256: String,
+    /// Lowercase hex SHA-256 of the canonical plan text (D-08).
+    pub plan_sha256: String,
+    /// Counts by status; `has_changes` ignores `unmanaged`.
+    pub summary: PlanSummary,
+    /// One entry per unit, in unit-key byte order.
+    pub entries: Vec<PlanEntry>,
+    /// Render warnings, then plan warnings.
+    pub warnings: Vec<String>,
 }
 
-/// Require `repo/rel` to be a real directory (not a symlink, not a file).
-fn require_real_dir(repo: &Path, rel: &str) -> Result<(), CoreError> {
-    let meta = tree_meta(repo, rel, None)?;
-    if meta.file_type().is_dir() {
-        Ok(())
-    } else {
-        Err(CoreError::deploy_tree_invalid(
-            rel,
-            None,
-            None,
-            "must be a directory",
-        ))
-    }
-}
+/// Plan `declared` against the live files `reader` returns for the master
+/// node. Reads once; never writes, never opens a gateway session, never
+/// prints.
+pub async fn deploy_plan(
+    declared: &Declared,
+    reader: &dyn TreeReader,
+) -> Result<DeployPlanResult, CoreError> {
+    let node = &declared.target.nodes.master;
+    let transport = match (&node.ssh, &node.local) {
+        (Some(_), _) => "ssh",
+        (None, Some(_)) => "local",
+        (None, None) => "none",
+    };
+    let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
+    let observed = reader.read(&scope).await?;
+    let planned = plan(&declared.outcome.tree, &observed);
 
-/// Read `repo/rel` as a regular file; a symlink or non-file is refused.
-/// Parent directories are checked too, so a symlinked parent cannot
-/// redirect the read.
-fn read_tree_file(repo: &Path, rel: &str, hint: Option<&str>) -> Result<Vec<u8>, CoreError> {
-    if let Some((parent, _)) = rel.rsplit_once('/')
-        && let Some(first) = parent.split('/').next()
-        && repo.join(first).exists()
-    {
-        require_real_dir(repo, first)?;
-    }
-    let meta = tree_meta(repo, rel, hint)?;
-    if !meta.file_type().is_file() {
-        return Err(CoreError::deploy_tree_invalid(
-            rel,
-            None,
-            None,
-            "is not a regular file",
-        ));
-    }
-    std::fs::read(repo.join(rel)).map_err(|e| {
-        CoreError::deploy_tree_invalid(rel, None, None, format!("cannot read ({})", e.kind()))
+    let mut warnings = declared.outcome.warnings.clone();
+    warnings.extend(planned.warnings);
+    Ok(DeployPlanResult {
+        env: declared.env.clone(),
+        gateway: declared.target.gateway.clone(),
+        mode: declared.target.mode.clone(),
+        node: "master".to_string(),
+        transport: transport.to_string(),
+        render_sha256: declared.outcome.tree.render_sha256(),
+        plan_sha256: planned.plan_sha256,
+        summary: planned.summary,
+        entries: planned.entries,
+        warnings,
     })
 }

@@ -1,5 +1,8 @@
 //! `targets/<env>.yaml`: where a rendered tree is deployed.
 //!
+//! A node reaches its host through `ssh` (SF-10) or `local` (D-02), never
+//! both; a node with neither can still be read through the config API.
+//!
 //! The `ssh` block (SF-10) is parsed now so strict parsing does not reject
 //! it when Phase 22 starts reading it. Credentials never live here:
 //! `profile` names an `ign` profile (its secret chain holds the token) and
@@ -48,6 +51,19 @@ pub struct NodeTarget {
     /// SSH access for host-level steps (SF-10, decided in Phase 22).
     #[serde(default)]
     pub ssh: Option<Ssh>,
+    /// The gateway data directory on the runner's own filesystem (D-02).
+    /// Mutually exclusive with `ssh`; selects the local-filesystem transport.
+    #[serde(default)]
+    pub local: Option<Local>,
+}
+
+/// Local-filesystem access to a node's gateway data directory (D-02).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Local {
+    /// The gateway data directory on the runner's own filesystem; a relative
+    /// value resolves against `--repo`.
+    pub data_dir: String,
 }
 
 /// SSH access to a node's host (SF-10).
@@ -113,6 +129,14 @@ impl Target {
             if node.profile.is_empty() {
                 push(format!("{label}.profile: must not be empty"));
             }
+            if node.ssh.is_some() && node.local.is_some() {
+                push(format!("{label}: set ssh or local, not both"));
+            }
+            if let Some(local) = &node.local
+                && local.data_dir.is_empty()
+            {
+                push(format!("{label}.local.data_dir: must not be empty"));
+            }
             let Some(ssh) = &node.ssh else { continue };
             for (field, value) in [
                 ("host", &ssh.host),
@@ -175,6 +199,37 @@ mod tests {
         .expect("parses");
         assert_eq!(t.nodes.backup, None);
         assert_eq!(t.nodes.master.ssh, None);
+        assert_eq!(t.nodes.master.local, None);
+    }
+
+    #[test]
+    fn local_node_parses() {
+        let yaml = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: /var/ignition/data\n";
+        let t = Target::parse("targets/dev.yaml", yaml.as_bytes()).expect("parses");
+        let local = t.nodes.master.local.expect("local");
+        assert_eq!(local.data_dir, "/var/ignition/data");
+    }
+
+    #[test]
+    fn ssh_and_local_together_are_refused() {
+        let yaml = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: /d\n  backup:\n    profile: q\n    local:\n      data_dir: /d\n    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /d\n";
+        let all: Vec<String> =
+            findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err("both"))
+                .into_iter()
+                .map(|f| f.message)
+                .collect();
+        assert_eq!(all, vec!["nodes.backup: set ssh or local, not both"]);
+    }
+
+    #[test]
+    fn empty_local_data_dir_is_refused() {
+        let yaml = "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: ''\n";
+        let all: Vec<String> =
+            findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err("empty"))
+                .into_iter()
+                .map(|f| f.message)
+                .collect();
+        assert_eq!(all, vec!["nodes.master.local.data_dir: must not be empty"]);
     }
 
     #[test]

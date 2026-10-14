@@ -356,11 +356,25 @@ fn check_out(tree: &RenderedTree, out: &Path, marker: &RenderMarker) -> Result<O
 
 /// Walk `dir` with `symlink_metadata`, entries sorted by name bytes.
 /// Symlinks, special files and non-UTF-8 names are errors naming the path.
-fn walk_out(
+/// Shared by `--out` checks and the live-tree readers (plan, pull).
+pub(crate) fn walk_out(
     dir: &Path,
     rel: &str,
     files: &mut BTreeMap<String, PathBuf>,
     dirs: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    walk_capped(dir, rel, files, dirs, usize::MAX)
+}
+
+/// [`walk_out`] that stops with an error as soon as `files` and `dirs`
+/// together hold more than `max_entries` entries, so a hostile tree cannot
+/// be enumerated in full before a cap is checked.
+pub(crate) fn walk_capped(
+    dir: &Path,
+    rel: &str,
+    files: &mut BTreeMap<String, PathBuf>,
+    dirs: &mut BTreeSet<String>,
+    max_entries: usize,
 ) -> Result<(), String> {
     let read = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read directory {} ({})", join(rel, ""), e.kind()))?;
@@ -385,14 +399,89 @@ fn walk_out(
             return Err(format!("{child} is a symlink; symlinks are refused"));
         } else if kind.is_dir() {
             dirs.insert(child.clone());
-            walk_out(&path, &child, files, dirs)?;
+            if files.len() + dirs.len() > max_entries {
+                return Err(format!("more than {max_entries} entries (at {child})"));
+            }
+            walk_capped(&path, &child, files, dirs, max_entries)?;
         } else if kind.is_file() {
-            files.insert(child, path);
+            files.insert(child.clone(), path);
+            if files.len() + dirs.len() > max_entries {
+                return Err(format!("more than {max_entries} entries (at {child})"));
+            }
         } else {
             return Err(format!("{child} is not a regular file or directory"));
         }
     }
     Ok(())
+}
+
+/// `symlink_metadata` of `repo/rel`, as a finding on failure.
+fn tree_meta(repo: &Path, rel: &str, hint: Option<&str>) -> Result<std::fs::Metadata, CoreError> {
+    match std::fs::symlink_metadata(repo.join(rel)) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            "is a symlink; symlinks are refused",
+        )),
+        Ok(meta) => Ok(meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let message = match hint {
+                Some(hint) => format!("does not exist ({hint})"),
+                None => "does not exist".to_string(),
+            };
+            Err(CoreError::deploy_tree_invalid(rel, None, None, message))
+        }
+        Err(e) => Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            format!("cannot inspect ({})", e.kind()),
+        )),
+    }
+}
+
+/// Require `repo/rel` to be a real directory (not a symlink, not a file).
+pub(crate) fn require_repo_dir(repo: &Path, rel: &str) -> Result<(), CoreError> {
+    let meta = tree_meta(repo, rel, None)?;
+    if meta.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            "must be a directory",
+        ))
+    }
+}
+
+/// Read `repo/rel` as a regular file; a symlink or non-file is refused.
+/// Parent directories are checked too, so a symlinked parent cannot
+/// redirect the read.
+pub(crate) fn read_repo_file(
+    repo: &Path,
+    rel: &str,
+    hint: Option<&str>,
+) -> Result<Vec<u8>, CoreError> {
+    if let Some((parent, _)) = rel.rsplit_once('/')
+        && let Some(first) = parent.split('/').next()
+        && repo.join(first).exists()
+    {
+        require_repo_dir(repo, first)?;
+    }
+    let meta = tree_meta(repo, rel, hint)?;
+    if !meta.file_type().is_file() {
+        return Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            "is not a regular file",
+        ));
+    }
+    std::fs::read(repo.join(rel)).map_err(|e| {
+        CoreError::deploy_tree_invalid(rel, None, None, format!("cannot read ({})", e.kind()))
+    })
 }
 
 fn io_failure(what: &str, path: &Path, e: &std::io::Error) -> CoreError {

@@ -10,7 +10,7 @@
 //! | 1    | internal       | `internal`
 //! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
-//! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01)
+//! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
 //! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
@@ -805,6 +805,23 @@ pub enum CoreError {
     /// findings only: no field exists that could carry a secret value.
     #[error("refusing to render an embedded or plaintext secret: {0}")]
     EmbeddedSecret(Box<EmbeddedSecretDetails>),
+
+    /// A deploy host transport could not read (or later write) a node's
+    /// gateway data directory (22-01): a missing or unreadable directory, a
+    /// hostile live tree (symlink, special file, non-UTF-8 name), a size cap
+    /// breach or an ssh failure. Exit 4 — network class: the host could not
+    /// be reached or read. A failed read is NEVER an empty result, so a plan
+    /// cannot mistake an unreadable tree for deletions. `detail` names paths
+    /// and causes only, never file content.
+    #[error("transport failed ({operation}) on {node}: {detail}")]
+    TransportFailed {
+        /// What was being done, e.g. `read`.
+        operation: String,
+        /// The target node label, e.g. `nodes.master`.
+        node: String,
+        /// What went wrong; names paths and causes, never file content.
+        detail: String,
+    },
 }
 
 /// Findings shown inline by the deploy error Displays; the rest collapse
@@ -1036,6 +1053,7 @@ impl CoreError {
             Self::ModeExists { .. } => "mode_exists",
             Self::DeployTreeInvalid(..) => "deploy_tree_invalid",
             Self::EmbeddedSecret(..) => "embedded_secret",
+            Self::TransportFailed { .. } => "transport_failed",
         }
     }
 
@@ -1057,7 +1075,9 @@ impl CoreError {
             | Self::ConfigInvalid { .. }
             | Self::PollIntervalTooSmall { .. }
             | Self::ModuleNotRegistered { .. } => 3,
-            Self::Network { .. } | Self::ModuleFeedUnreachable { .. } => 4,
+            Self::Network { .. }
+            | Self::ModuleFeedUnreachable { .. }
+            | Self::TransportFailed { .. } => 4,
             Self::Auth { .. } => 5,
             Self::GatewayTooOld { .. }
             | Self::GatewayNotCommissioned { .. }
@@ -1470,6 +1490,12 @@ impl CoreError {
                  \"secretName\":\"…\"}}; never commit an Embedded or plaintext secret"
                     .to_string(),
             ),
+            Self::TransportFailed { .. } => Some(
+                "check the node's host access in targets/<env>.yaml: for `local`, that \
+                 data_dir exists and is readable; for `ssh`, the pinned host key, the \
+                 key and reachability. Nothing was read as absent, so no plan was made"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1513,7 +1539,8 @@ impl CoreError {
     }
 
     /// The deploy slugs (21-03), in the order the README row lists them.
-    pub const DEPLOY_SLUGS: &'static [&'static str] = &["deploy_tree_invalid", "embedded_secret"];
+    pub const DEPLOY_SLUGS: &'static [&'static str] =
+        &["deploy_tree_invalid", "embedded_secret", "transport_failed"];
 
     /// A single positioned (or file-only, when `line`/`column` are
     /// `None`) tree finding as a [`Self::DeployTreeInvalid`].
@@ -2064,6 +2091,15 @@ mod tests {
                 2,
                 "embedded_secret",
             ),
+            (
+                CoreError::TransportFailed {
+                    operation: "read".into(),
+                    node: "nodes.master".into(),
+                    detail: "cannot read directory config/resources (NotFound)".into(),
+                },
+                4,
+                "transport_failed",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2122,6 +2158,7 @@ mod tests {
         (6, "provider_root_unsupported"),
         (6, "bundle_not_available"),
         (4, "module_feed_unreachable"),
+        (4, "transport_failed"),
         (6, "module_release_not_found"),
         (6, "module_digest_mismatch"),
         (6, "module_feed_unusable"),
@@ -2837,16 +2874,30 @@ mod tests {
     }
 
     #[test]
-    fn deploy_slugs_are_exit_two() {
+    fn deploy_slugs_have_their_exit_codes() {
         let errs = [
-            CoreError::deploy_tree_invalid("m.yaml", None, None, "bad"),
-            CoreError::embedded_secret(vec!["a.json: p".into()], vec![]),
+            (
+                CoreError::deploy_tree_invalid("m.yaml", None, None, "bad"),
+                2,
+            ),
+            (
+                CoreError::embedded_secret(vec!["a.json: p".into()], vec![]),
+                2,
+            ),
+            (
+                CoreError::TransportFailed {
+                    operation: "read".into(),
+                    node: "nodes.master".into(),
+                    detail: "data_dir is missing".into(),
+                },
+                4,
+            ),
         ];
-        let codes: Vec<&str> = errs.iter().map(CoreError::code).collect();
+        let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
-        for err in &errs {
-            assert_eq!(err.exit_code(), 2, "{err}");
-            assert_eq!(err.endpoint(), None, "render is offline: {err}");
+        for (err, exit) in &errs {
+            assert_eq!(err.exit_code(), *exit, "{err}");
+            assert_eq!(err.endpoint(), None, "deploy errors name no URL: {err}");
             let hint = err.hint().expect("hint required");
             assert!(
                 !hint.contains("`ign ") && !hint.contains("ign "),
