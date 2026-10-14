@@ -102,6 +102,7 @@
 //! (`PLAN_GOLDEN` in `tests/deploy_plan.rs`) and Phase 23's recomputation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -110,6 +111,7 @@ use super::ledger::Ledger;
 use super::rules::GATEWAY_OWNED_FILES;
 use super::transport::{DeleteSet, FileBlob, ObservedFiles, Scope};
 use super::tree::{RenderedTree, sha256_hex};
+use crate::error::CoreError;
 
 /// First line of the canonical `plan_sha256` text.
 pub const PLAN_HASH_HEADER: &str = "ign-deploy:plan:v1";
@@ -209,6 +211,10 @@ pub struct PlanEntry {
     /// True when a unit of a security type that the plan touches could lock
     /// the operator out of the gateway.
     pub lockout_risk: bool,
+    /// Three-way drift against a `--base` render: true when any file's live
+    /// sha256 differs from both the base and the desired sha256. Null
+    /// without `--base`. Excluded from `plan_sha256`.
+    pub drift: Option<bool>,
     /// The unit's files, byte-sorted.
     pub files: Vec<PlanFile>,
 }
@@ -229,6 +235,8 @@ pub struct PlanSummary {
     /// True when anything would be added, changed or removed. `unmanaged`
     /// never counts (D-06).
     pub has_changes: bool,
+    /// Entries with `drift: true`; null without `--base`.
+    pub drifted: Option<usize>,
 }
 
 /// The plan.
@@ -480,6 +488,7 @@ pub fn plan(
             destructive_reason: destructive
                 .then(|| destructive_reason(module, ty, status).to_string()),
             lockout_risk,
+            drift: None,
             files,
         });
     }
@@ -519,6 +528,33 @@ pub fn plan(
         plan_sha256,
         warnings,
     }
+}
+
+/// A previous render (a `deploy render --out` directory), re-hashed from its
+/// real bytes. Skeleton: filled in by the GREEN commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseTree {
+    /// The directory as given.
+    pub dir: String,
+    /// The recomputed `render_sha256`.
+    pub render_sha256: String,
+    /// Recomputed sha256 per collection path (`render.json` excluded).
+    pub files: BTreeMap<RelPath, String>,
+}
+
+impl BaseTree {
+    /// Read and verify `dir` as a clean render of `gateway`, `env`, `mode`.
+    pub fn read(dir: &Path, gateway: &str, env: &str, mode: &str) -> Result<BaseTree, CoreError> {
+        let _ = (gateway, env, mode);
+        Err(CoreError::InvalidInput {
+            reason: format!("--base {}: not implemented", dir.display()),
+        })
+    }
+}
+
+/// Mark each entry's `drift` against `base`.
+pub fn apply_base(plan: &mut Plan, base: &BaseTree) {
+    let _ = (plan, base);
 }
 
 /// The canonical text `plan_sha256` hashes (see the module doc).

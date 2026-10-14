@@ -10,7 +10,9 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
-use ignition_core::actions::deploy::{DeployPlanResult, deploy_plan, load_declared};
+use ignition_core::actions::deploy::{
+    DeployPlanResult, PlanOptions, deploy_plan, deploy_render, load_declared,
+};
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::plan::{CoreRelation, Plan, PlanStatus, plan as plan_with_ledger};
@@ -23,7 +25,7 @@ const DB_CONFIG: &str = "ignition/database-translator/POSTGRES/config.json";
 
 async fn plan(fx: &PlanFixture) -> DeployPlanResult {
     let (declared, reader) = fx.load("dev");
-    deploy_plan(&declared, reader.as_ref())
+    deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect("plan succeeds")
 }
@@ -41,7 +43,9 @@ async fn plan_local_live_equal_to_render_is_empty() {
     let fx = PlanFixture::new();
     let (declared, reader) = fx.load("dev");
     fx.live_render("dev", &declared);
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
 
     assert_eq!(
         (result.node.as_str(), result.transport.as_str()),
@@ -66,7 +70,7 @@ async fn plan_local_byte_change_is_changed() {
     bytes.push(b' ');
     fx.mode(DB_CONFIG, &bytes);
 
-    let result = deploy_plan(&declared, reader.as_ref())
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect("changed is not an error");
     assert!(result.summary.has_changes);
@@ -84,7 +88,9 @@ async fn plan_local_core_only_is_same_with_live_in_core() {
     let fx = PlanFixture::new();
     let (declared, reader) = fx.load("dev");
     fx.live_render("core", &declared);
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
 
     assert!(!result.summary.has_changes);
     assert_eq!(result.entries.len(), 2);
@@ -100,7 +106,9 @@ async fn plan_local_missing_unit_is_added() {
     let (declared, reader) = fx.load("dev");
     fx.live_render("dev", &declared);
     fx.remove("dev", "ignition/database-translator/POSTGRES");
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
 
     assert!(result.summary.has_changes);
     assert_eq!(result.summary.added, 1);
@@ -120,7 +128,9 @@ async fn plan_local_extra_live_unit_is_unmanaged() {
     fx.live_render("dev", &declared);
     fx.mode("ignition/database-translator/OTHER/config.json", b"{}");
     fx.mode("ignition/database-translator/OTHER/resource.json", b"{}");
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
 
     assert!(!result.summary.has_changes, "unmanaged never counts");
     assert_eq!(result.summary.unmanaged, 1);
@@ -183,7 +193,7 @@ async fn plan_unreadable_data_dir_is_transport_failed() {
         &declared.target.nodes.master,
     )
     .expect("reader");
-    let err = deploy_plan(&declared, reader.as_ref())
+    let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect_err("an unreadable host is an error, not an empty plan");
     assert_eq!((err.code(), err.exit_code()), ("transport_failed", 4));
@@ -196,7 +206,7 @@ async fn plan_missing_config_resources_is_transport_failed() {
     let fx = PlanFixture::new();
     std::fs::remove_dir_all(fx.data_dir().join("config")).expect("remove config");
     let (declared, reader) = fx.load("dev");
-    let err = deploy_plan(&declared, reader.as_ref())
+    let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect_err("error");
     assert_eq!(err.code(), "transport_failed");
@@ -521,8 +531,12 @@ async fn deterministic() {
     fx.live_render("dev", &declared);
     fx.mode("ignition/database-translator/ZED/config.json", b"{}");
     fx.mode("ignition/database-translator/ALPHA/config.json", b"{}");
-    let first = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
-    let second = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let first = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
+    let second = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(
         serde_json::to_string(&first).expect("json"),
         serde_json::to_string(&second).expect("json")
@@ -596,7 +610,9 @@ async fn plan_sha256_golden() {
     bytes.push(b' ');
     fx.mode(DB_CONFIG, &bytes);
     fx.remove("dev", "ignition/general-alarm-settings");
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!((result.summary.changed, result.summary.added), (1, 1));
     assert_eq!(
         result.plan_sha256,
@@ -610,20 +626,26 @@ async fn plan_sha256_golden() {
     let mut again = fx.read("dev", DB_CONFIG);
     again.push(b'!');
     fx.mode(DB_CONFIG, &again);
-    let moved = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let moved = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_ne!(moved.plan_sha256, result.plan_sha256);
 
     // an unmanaged unit does not
     fx.mode("ignition/database-translator/EXTRA/config.json", b"{}");
     fx.mode("ignition/database-translator/EXTRA/resource.json", b"{}");
-    let with_extra = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let with_extra = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(with_extra.summary.unmanaged, 1);
     assert_eq!(with_extra.plan_sha256, moved.plan_sha256);
     fx.mode(
         "ignition/database-translator/EXTRA/config.json",
         b"{\"x\":1}",
     );
-    let edited = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let edited = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(edited.plan_sha256, moved.plan_sha256);
 }
 
@@ -634,7 +656,9 @@ async fn local_overrides_warn() {
     fx.live_render("dev", &declared);
     fx.local("ignition/database-translator/POSTGRES/config.json", b"{}");
     fx.local("ignition/database-translator/POSTGRES/resource.json", b"{}");
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert!(
         result
             .warnings
@@ -662,7 +686,7 @@ async fn caps_and_hostile_tree() {
     let file = std::fs::File::create(big.join("config.json")).expect("create");
     file.set_len(READ_MAX_FILE_BYTES + 1).expect("sparse");
     drop(file);
-    let err = deploy_plan(&declared, reader.as_ref())
+    let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
         .await
         .expect_err("an oversized file is refused, not skipped");
     assert_eq!((err.code(), err.exit_code()), ("transport_failed", 4));
@@ -684,7 +708,7 @@ async fn caps_and_hostile_tree() {
             .join("ignition/database-translator/LINK");
         std::fs::create_dir_all(&link_dir).expect("dir");
         std::os::unix::fs::symlink("/etc/hosts", link_dir.join("config.json")).expect("symlink");
-        let err = deploy_plan(&declared, reader.as_ref())
+        let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
             .await
             .expect_err("a symlink in the live tree is refused");
         assert_eq!(err.code(), "transport_failed");
@@ -973,11 +997,15 @@ async fn ledger_change_changes_hash() {
     fx.mode("ignition/database-translator/OLD/config.json", b"{}");
     fx.mode("ignition/database-translator/OLD/resource.json", b"{}");
 
-    let none = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let none = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert!(none.delete_set.files.is_empty());
 
     fx.ledger(GATEWAY, MODE, &[]);
-    let empty = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let empty = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(empty.plan_sha256, none.plan_sha256);
 
     fx.ledger(
@@ -985,7 +1013,9 @@ async fn ledger_change_changes_hash() {
         MODE,
         &["ignition/database-translator/OLD/config.json"],
     );
-    let one = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let one = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_ne!(one.plan_sha256, none.plan_sha256, "D lines bind the set");
     assert_eq!(one.delete_set.files.len(), 1);
     assert_eq!(
@@ -1002,13 +1032,17 @@ async fn ledger_change_changes_hash() {
             "ignition/database-translator/OLD/resource.json",
         ],
     );
-    let two = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let two = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_ne!(two.plan_sha256, one.plan_sha256);
     assert_eq!(two.plan_sha256, recompute_plan_sha256(&two));
     assert_eq!(two.summary.removed, 1);
 
     // idempotent over unchanged inputs
-    let again = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let again = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(
         serde_json::to_string(&again).expect("json"),
         serde_json::to_string(&two).expect("json")
@@ -1040,7 +1074,9 @@ async fn plan_sha256_golden_with_ledger() {
             "ignition/database-translator/OLD/resource.json",
         ],
     );
-    let result = deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    let result = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(
         (
             result.summary.changed,
@@ -1082,7 +1118,7 @@ async fn deploy_plan_refuses_corrupt_ledger() {
     ];
     for (name, bytes) in cases {
         fx.ledger_bytes(GATEWAY, MODE, &bytes);
-        let err = deploy_plan(&declared, reader.as_ref())
+        let err = deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
             .await
             .expect_err(name);
         assert_eq!(
@@ -1119,7 +1155,9 @@ async fn plan_never_writes_the_ledger() {
         .expect("meta")
         .modified()
         .expect("mtime");
-    deploy_plan(&declared, reader.as_ref()).await.expect("plan");
+    deploy_plan(&declared, reader.as_ref(), &PlanOptions::default())
+        .await
+        .expect("plan");
     assert_eq!(std::fs::read(&path).expect("ledger"), before);
     assert_eq!(
         std::fs::metadata(&path)
@@ -1127,5 +1165,351 @@ async fn plan_never_writes_the_ledger() {
             .modified()
             .expect("mtime"),
         modified
+    );
+}
+
+// ---- `--base` three-way drift (22-04) --------------------------------------
+
+const DB_RESOURCE: &str = "ignition/database-translator/POSTGRES/resource.json";
+const DB_KEY: &str = "ignition/database-translator/POSTGRES";
+const SOURCE_DB_CONFIG: &str =
+    "gateways/tracer-gw/resources/ignition/database-translator/POSTGRES/config.json";
+
+/// Render `env` dev of the fixture's repo into `<scratch>/base` and return
+/// the directory. The scratch dir is returned so it outlives the test body.
+fn render_base(fx: &PlanFixture) -> (tempfile::TempDir, std::path::PathBuf) {
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let base = scratch.path().join("base");
+    deploy_render(&fx.repo("dev"), "dev", Some(&base)).expect("render --out");
+    (scratch, base)
+}
+
+fn with_base(dir: &std::path::Path) -> PlanOptions {
+    PlanOptions {
+        base: Some(dir.to_path_buf()),
+        diff: false,
+    }
+}
+
+/// Change the desired side of the repo: the render now differs from a base
+/// rendered before this call.
+fn edit_source(fx: &PlanFixture) {
+    let path = fx.repo("dev").join(SOURCE_DB_CONFIG);
+    let text = std::fs::read_to_string(&path).expect("source config");
+    assert!(text.contains("\"textType\": \"text\""));
+    std::fs::write(
+        path,
+        text.replace("\"textType\": \"text\"", "\"textType\": \"text2\""),
+    )
+    .expect("edit source");
+}
+
+fn drift_of(result: &DeployPlanResult, key: &str) -> Option<bool> {
+    result
+        .entries
+        .iter()
+        .find(|e| e.key == key)
+        .unwrap_or_else(|| panic!("entry {key}"))
+        .drift
+}
+
+async fn plan_with(fx: &PlanFixture, opts: &PlanOptions) -> Result<DeployPlanResult, CoreError> {
+    let (declared, reader) = fx.load("dev");
+    deploy_plan(&declared, reader.as_ref(), opts).await
+}
+
+fn invalid_input(err: &CoreError) -> &str {
+    match err {
+        CoreError::InvalidInput { reason } => reason,
+        other => panic!("expected invalid_input, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn drift_three_way() {
+    // base == desired; live edited outside the pipeline: drift
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let (_scratch, base) = render_base(&fx);
+    let mut bytes = fx.read("dev", DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    let result = plan_with(&fx, &with_base(&base)).await.expect("plan");
+    assert_eq!(drift_of(&result, DB_KEY), Some(true));
+    assert_eq!(
+        drift_of(&result, "ignition/general-alarm-settings"),
+        Some(false)
+    );
+    assert_eq!(result.summary.drifted, Some(1));
+    let summary = result.base.as_ref().expect("base summary");
+    assert_eq!(summary.files, 4);
+    assert_eq!(summary.dir, base.to_string_lossy());
+
+    // live == base != desired: a pipeline change not yet applied
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let (_scratch, base) = render_base(&fx);
+    edit_source(&fx);
+    let result = plan_with(&fx, &with_base(&base)).await.expect("plan");
+    assert_eq!(result.summary.changed, 1);
+    assert_eq!(drift_of(&result, DB_KEY), Some(false));
+    assert_eq!(result.summary.drifted, Some(0));
+
+    // live == desired != base: the change was applied since the base
+    let fx = PlanFixture::new();
+    let (_scratch, base) = render_base(&fx);
+    edit_source(&fx);
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let result = plan_with(&fx, &with_base(&base)).await.expect("plan");
+    assert_eq!(result.summary.changed, 0);
+    assert_eq!(drift_of(&result, DB_KEY), Some(false));
+}
+
+#[tokio::test]
+async fn drift_for_unit_added_outside_pipeline() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let (_scratch, base) = render_base(&fx);
+    fx.mode("ignition/database-translator/EXTRA/config.json", b"{}");
+    let result = plan_with(&fx, &with_base(&base)).await.expect("plan");
+    let extra = result
+        .entries
+        .iter()
+        .find(|e| e.key == "ignition/database-translator/EXTRA")
+        .expect("extra entry");
+    assert_eq!(extra.status, PlanStatus::Unmanaged);
+    assert_eq!(extra.drift, Some(true));
+}
+
+#[tokio::test]
+async fn drift_for_unit_deleted_outside_pipeline() {
+    // Flagged assumption (DPLN-05): present in base and desired, absent
+    // live: an `added` entry that is also drift.
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let (_scratch, base) = render_base(&fx);
+    fx.remove("dev", "ignition/database-translator/POSTGRES");
+    let result = plan_with(&fx, &with_base(&base)).await.expect("plan");
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| e.key == DB_KEY)
+        .expect("entry");
+    assert_eq!(entry.status, PlanStatus::Added);
+    assert_eq!(entry.drift, Some(true));
+}
+
+#[tokio::test]
+async fn drift_null_without_base() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    fx.mode("ignition/database-translator/EXTRA/config.json", b"{}");
+    let result = plan_with(&fx, &PlanOptions::default()).await.expect("plan");
+    assert!(result.base.is_none());
+    assert_eq!(result.summary.drifted, None);
+    for entry in &result.entries {
+        assert_eq!(entry.drift, None, "{}", entry.key);
+    }
+    let json = serde_json::to_value(&result).expect("json");
+    assert!(json["base"].is_null());
+    assert!(json["entries"][0]["drift"].is_null());
+}
+
+#[tokio::test]
+async fn hash_independent_of_base() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let (_scratch, base) = render_base(&fx);
+    let mut bytes = fx.read("dev", DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    let without = plan_with(&fx, &PlanOptions::default()).await.expect("plan");
+    let with = plan_with(&fx, &with_base(&base)).await.expect("plan");
+    assert_eq!(drift_of(&with, DB_KEY), Some(true));
+    assert_eq!(without.plan_sha256, with.plan_sha256);
+}
+
+#[tokio::test]
+async fn base_identity_mismatch_refused() {
+    for (field, needle) in [("gateway", "gateway"), ("env", "env"), ("mode", "mode")] {
+        let fx = PlanFixture::new();
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        let (_scratch, base) = render_base(&fx);
+        let marker = base.join("render.json");
+        let text = std::fs::read_to_string(&marker).expect("marker");
+        let from = match field {
+            "gateway" => "\"gateway\": \"tracer-gw\"",
+            "env" => "\"env\": \"dev\"",
+            _ => "\"mode\": \"dev\"",
+        };
+        assert!(text.contains(from), "{text}");
+        let to = from
+            .replace("tracer-gw", "other-gw")
+            .replace("\"dev\"", "\"prod\"");
+        std::fs::write(&marker, text.replace(from, &to)).expect("tamper");
+        let err = plan_with(&fx, &with_base(&base))
+            .await
+            .expect_err("identity mismatch");
+        assert_eq!(err.code(), "invalid_input", "{field}");
+        let reason = invalid_input(&err);
+        assert!(reason.contains("--base"), "{reason}");
+        assert!(reason.contains(needle), "{field}: {reason}");
+    }
+}
+
+#[tokio::test]
+async fn base_modified_refused() {
+    async fn refused(tamper: impl Fn(&std::path::Path)) -> String {
+        let fx = PlanFixture::new();
+        let (declared, _) = fx.load("dev");
+        fx.live_render("dev", &declared);
+        let (_scratch, base) = render_base(&fx);
+        tamper(&base);
+        let err = plan_with(&fx, &with_base(&base))
+            .await
+            .expect_err("a modified base is refused");
+        assert_eq!(err.code(), "invalid_input");
+        invalid_input(&err).to_string()
+    }
+
+    // an extra file
+    let reason = refused(|b| std::fs::write(b.join("extra.json"), b"{}").expect("write")).await;
+    assert!(reason.contains("extra.json"), "{reason}");
+
+    // a changed byte in a listed file; the marker still says the old hash,
+    // which proves the file is re-hashed
+    let reason = refused(|b| {
+        let path = b.join(DB_CONFIG);
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes.push(b' ');
+        std::fs::write(path, bytes).expect("write");
+    })
+    .await;
+    assert!(reason.contains(DB_CONFIG), "{reason}");
+
+    // a changed byte AND a marker hash rewritten to match: the listing digest
+    // recorded in the marker no longer matches
+    let reason = refused(|b| {
+        let path = b.join(DB_CONFIG);
+        let mut bytes = std::fs::read(&path).expect("read");
+        let old = sha256_hex(&bytes);
+        bytes.push(b' ');
+        let new = sha256_hex(&bytes);
+        std::fs::write(&path, &bytes).expect("write");
+        let marker = b.join("render.json");
+        let text = std::fs::read_to_string(&marker).expect("marker");
+        assert!(text.contains(&old));
+        std::fs::write(&marker, text.replace(&old, &new)).expect("marker");
+    })
+    .await;
+    assert!(reason.contains("render_sha256"), "{reason}");
+
+    // a leftover temporary file of an interrupted refresh (R-03 / WR-03)
+    let reason = refused(|b| {
+        std::fs::write(
+            b.join("ignition/database-translator/POSTGRES/config.json.ign-render-tmp"),
+            b"{",
+        )
+        .expect("write")
+    })
+    .await;
+    assert!(reason.contains("ign-render-tmp"), "{reason}");
+
+    // a listed file missing
+    let reason = refused(|b| std::fs::remove_file(b.join(DB_RESOURCE)).expect("remove")).await;
+    assert!(reason.contains(DB_RESOURCE), "{reason}");
+
+    // no marker at all
+    let reason = refused(|b| std::fs::remove_file(b.join("render.json")).expect("remove")).await;
+    assert!(reason.contains("render.json"), "{reason}");
+
+    // a marker that is not a marker
+    let reason =
+        refused(|b| std::fs::write(b.join("render.json"), b"{\"x\":1}").expect("write")).await;
+    assert!(reason.contains("render.json"), "{reason}");
+}
+
+#[tokio::test]
+async fn base_hostile_refused() {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render("dev", &declared);
+    let scratch = tempfile::TempDir::new().expect("scratch");
+
+    // absent
+    let missing = scratch.path().join("no-such-base");
+    let err = plan_with(&fx, &with_base(&missing))
+        .await
+        .expect_err("absent");
+    assert_eq!(err.code(), "invalid_input");
+    assert!(invalid_input(&err).contains("--base"), "{err}");
+
+    // a regular file
+    let file = scratch.path().join("a-file");
+    std::fs::write(&file, b"x").expect("write");
+    let err = plan_with(&fx, &with_base(&file)).await.expect_err("file");
+    assert_eq!(err.code(), "invalid_input");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let (_keep, base) = render_base(&fx);
+
+        // a symlinked base
+        let link = scratch.path().join("link-to-base");
+        symlink(&base, &link).expect("symlink");
+        let err = plan_with(&fx, &with_base(&link))
+            .await
+            .expect_err("symlink base");
+        assert_eq!(err.code(), "invalid_input");
+        assert!(invalid_input(&err).contains("symlink"), "{err}");
+
+        // a symlink inside the base
+        symlink("/etc/hosts", base.join("sneaky")).expect("symlink");
+        let err = plan_with(&fx, &with_base(&base))
+            .await
+            .expect_err("inner symlink");
+        assert_eq!(err.code(), "invalid_input");
+        assert!(invalid_input(&err).contains("sneaky"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn bad_base_costs_no_transport_work() {
+    // the data dir does not exist: a transport read would be transport_failed
+    let fx = PlanFixture::new();
+    let missing = fx.data_dir().join("no-such-data-dir");
+    let repo = fx.repo_with_master(
+        "dev",
+        &format!("    local:\n      data_dir: '{}'\n", missing.display()),
+    );
+    let declared = load_declared(&repo, "dev").expect("declared");
+    let reader = transport::for_node(
+        &repo,
+        &declared.target_file,
+        "nodes.master",
+        &declared.target.nodes.master,
+    )
+    .expect("reader");
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let err = deploy_plan(
+        &declared,
+        reader.as_ref(),
+        &with_base(&scratch.path().join("absent")),
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(
+        err.code(),
+        "invalid_input",
+        "base is checked before the read"
     );
 }

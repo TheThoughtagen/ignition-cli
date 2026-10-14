@@ -29,17 +29,17 @@
 //!
 //! The [`DeployPlanResult`] `data` keys, in order: `env, gateway, mode,
 //! node, transport, render_sha256, plan_sha256, summary, entries,
-//! delete_set, warnings`. Later plans add keys additively (`base`).
+//! delete_set, base, warnings`. Later plans add keys additively.
 //! Entries carry paths and sha256 only, never file bytes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, ledger_location};
 use crate::deploy::manifest::Manifest;
-use crate::deploy::plan::{PlanEntry, PlanSummary, plan};
+use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan};
 use crate::deploy::render::{RenderInput, RenderOutcome, RenderedResource, render};
 use crate::deploy::target::Target;
 use crate::deploy::transport::{DeleteSet, Scope, TreeReader};
@@ -196,8 +196,31 @@ pub struct DeployPlanResult {
     /// The files plan proposes to delete: the declared-names ledger's files
     /// minus the rendered files (22-03). Empty without a ledger.
     pub delete_set: DeleteSet,
+    /// The `--base` render the drift was computed against; null without it.
+    pub base: Option<BaseSummary>,
     /// Render warnings, then plan warnings.
     pub warnings: Vec<String>,
+}
+
+/// Options of `deploy plan`.
+#[derive(Debug, Clone, Default)]
+pub struct PlanOptions {
+    /// A directory written by `deploy render --out`, re-hashed and used as
+    /// the base of the three-way drift check.
+    pub base: Option<PathBuf>,
+    /// Add redacted unified text diffs to the entries.
+    pub diff: bool,
+}
+
+/// What `--base` was: the directory and its recomputed digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaseSummary {
+    /// The `--base` directory as given.
+    pub dir: String,
+    /// The base's recomputed `render_sha256`.
+    pub render_sha256: String,
+    /// Number of files in the base (`render.json` excluded).
+    pub files: usize,
 }
 
 /// Plan `declared` against the live files `reader` returns for the master
@@ -206,12 +229,31 @@ pub struct DeployPlanResult {
 pub async fn deploy_plan(
     declared: &Declared,
     reader: &dyn TreeReader,
+    opts: &PlanOptions,
 ) -> Result<DeployPlanResult, CoreError> {
     let node = &declared.target.nodes.master;
     let transport = match (&node.ssh, &node.local) {
         (Some(_), _) => "ssh",
         (None, Some(_)) => "local",
         (None, None) => "none",
+    };
+    // A base that is not exactly a clean render is refused before any
+    // transport work (22-04).
+    let base = match &opts.base {
+        Some(dir) => {
+            let dir = dir.clone();
+            let (gateway, env, mode) = (
+                declared.target.gateway.clone(),
+                declared.env.clone(),
+                declared.target.mode.clone(),
+            );
+            let read =
+                tokio::task::spawn_blocking(move || BaseTree::read(&dir, &gateway, &env, &mode))
+                    .await
+                    .map_err(|e| CoreError::Internal(format!("--base read task failed: {e}")))?;
+            Some(read?)
+        }
+        None => None,
     };
     let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
     let observed = reader.read(&scope).await?;
@@ -228,7 +270,10 @@ pub async fn deploy_plan(
         )?),
         None => None,
     };
-    let planned = plan(&declared.outcome.tree, &observed, ledger.as_ref(), &scope);
+    let mut planned = plan(&declared.outcome.tree, &observed, ledger.as_ref(), &scope);
+    if let Some(base) = &base {
+        apply_base(&mut planned, base);
+    }
 
     let mut warnings = declared.outcome.warnings.clone();
     warnings.extend(planned.warnings);
@@ -243,6 +288,11 @@ pub async fn deploy_plan(
         summary: planned.summary,
         entries: planned.entries,
         delete_set: planned.delete_set,
+        base: base.map(|b| BaseSummary {
+            dir: b.dir,
+            render_sha256: b.render_sha256,
+            files: b.files.len(),
+        }),
         warnings,
     })
 }
