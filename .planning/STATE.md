@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-01-PLAN.md
-last_updated: "2026-10-14T13:07:30.243Z"
+stopped_at: Completed 22-02-PLAN.md
+last_updated: "2026-10-14T13:27:59.015Z"
 last_activity: 2026-10-14
 last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 16
+  completed_plans: 17
   percent: 33
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 2 of 14
+Plan: 3 of 14
 Status: Ready to execute
 Last activity: 2026-10-14 — Phase 22 execution started
 
-Progress: [██████░░░░] 55%
+Progress: [██████░░░░] 59%
 
 ## Performance Metrics
 
@@ -62,6 +62,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 21 P08 | 55min | 2 tasks | 8 files |
 | Phase 21 P09 | 75min | 2 tasks | 9 files |
 | Phase 22 P01 | 30min | 2 tasks | 12 files |
+| Phase 22 P02 | 25min | 2 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -94,8 +95,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T13:07:30.229Z
-**Stopped At:** Completed 22-01-PLAN.md
+**Last session:** 2026-10-14T13:27:58.999Z
+**Stopped At:** Completed 22-02-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -130,3 +131,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 21-09: render.json marker schema_version 1 {gateway, env, mode, render_sha256, files[{path,sha256,bytes}]} is read by Phase 22; --out clobber ladder never deletes and refuses before any write
 - [Phase ?]: [22-01] unit_key never climbs above module/type; plan_sha256 canonical text pinned by PLAN_GOLDEN a89de504...c473 and an independent in-test recomputation
 - [Phase ?]: [22-01] Scope::from_manifest drops tag-type types entries (tag_providers covers them); for_node refuses ssh nodes until 22-06
+- [Phase ?]: 22-02: CORE-01 profile header suppressed for deploy plan (no session resolves); DPLN-02/03 stay unchecked until 22-03
