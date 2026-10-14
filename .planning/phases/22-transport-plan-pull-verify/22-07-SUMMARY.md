@@ -113,8 +113,8 @@ No line starts with `-`, `!`, or `get -R` (asserted by `sftp_mirror_never_suppre
 ## Known limitations
 
 - **Not atomic across files.** A failure part-way leaves the files already moved in place; Phase 23's snapshot and `restore_snapshot` own that (T-22-34, transferred). `InPlace` is not atomic per file either (open with truncate); `Separate` is a rename per file.
-- **Residual races.** Intermediate directories are checked with `symlink_metadata` and then used; a component swapped for a symlink between the check and the use by a concurrent attacker with write access to the collection is not defended against (only the final component is `O_NOFOLLOW`; sftp has the same check-then-act window). The host's own gateway account is the only party able to do that.
-- **sftp staging copies are size-checked, not hash-checked, on the host.** A file replaced by one of the same size in the staging root between `stage` and `commit` would be moved in. The staging root must be private to the deploy user.
+- **Residual races.** SUPERSEDED for the local mirror on unix by F7 below (the sftp check-then-act window remains, see F6). Originally: intermediate directories are checked with `symlink_metadata` and then used; a component swapped for a symlink between the check and the use by a concurrent attacker with write access to the collection is not defended against (only the final component is `O_NOFOLLOW`; sftp has the same check-then-act window). The host's own gateway account is the only party able to do that.
+- **sftp staging copies are size-checked, not hash-checked, on the host.** SUPERSEDED by F6 below: copies are now read back and hashed before the first rename.
 - **Listing the ancestors of the staging root** requires read access to each. A root under `/home/<user>` where `/home` is not listable fails closed.
 - **`Separate` needs one filesystem.** A rename across filesystems fails with `transport_failed` (local) rather than falling back to copy.
 - Staging directories left empty under the root after a `Separate` commit are not removed.
@@ -138,3 +138,52 @@ None beyond the plan's register. T-22-30 (trait split plus `write_half_unreachab
 - Files present: `grep -n 'pub trait TreeMirror' crates/ignition-core/src/deploy/transport/mod.rs` prints one line; `grep -n 'impl TreeMirror for' crates/ignition-core/src/deploy/transport/local.rs crates/ignition-core/src/deploy/transport/sftp.rs` prints one line each; `grep -n 'fn write_half_unreachable' crates/ignition-core/tests/deploy_transport.rs` prints one line.
 - Commit `183344a` present in `git log`.
 - No `unwrap`, TODO or placeholder in the new non-test code; `.planning/config.json` and `.planning/research/.cache/` untouched.
+
+## Post-review security fixes
+
+Two confirmed findings and one follow-up from the coordinator. Commits: F6 `ab760dd`, F6 follow-up `120c518`, F7 `02707b9`.
+
+### F6: integrity bypass in the sftp mirror (`ab760dd`, `120c518`)
+
+**Finding.** Staged copies on the host were only size-checked before `rename`, so a same-size different-content file committed.
+
+**Fix** (`transport/sftp.rs`):
+
+- `verify_remote_copies` fetches every file back with typed `SftpOp::Get` into a per-operation temp dir (`download_dir(op)`), re-reads each through `read_downloaded` (which uses `open_regular_file`, the size equal to the expected size and `READ_MAX_FILE_BYTES`), and hashes it locally with `sha256_hex` against `Staged.files`. No remote hashing command (no Windows variant, command surface unchanged). The 22-06 watchdog is reused: `run_download` now takes the operation name, kills sftp when the temp dir outgrows expected bytes + 1 MiB, chunks are at most 256 MiB / 10 000 files, and the running total is checked against `READ_MAX_TOTAL_BYTES` before each chunk.
+- `Separate`: after the size survey and before the first rename, any mismatch is `transport_failed` naming up to 8 files ("does not match its SHA-256 ... nothing was changed"). The staged copies are then discarded (`discard_staged`): a fresh listing must show each one is still a regular file with no symlink above it, then only those `rm`s run, and only inside the staging root. The error says what was removed, what was left, and that empty directories remain. If the re-check fails the copies are left and the error says so.
+- Follow-up `120c518` (coordinator): sftp has no atomic verify-then-rename. (1) The missing-directory `mkdir`s now lead the SAME batch as the renames/puts (a sorted set lists parents first), so no session sits between the pre-rename read-back and the moves; a test asserts the session after the first `get` is the renaming one. (2) After the moves, in BOTH modes, the FINAL paths are read back and hashed again. A mismatch is `transport_failed` with "content changed on the host during commit", names the files, says the written files were not rolled back, and no delete runs. (3) Deletes and emptied-directory removal only run after that verification passes.
+- Command sequence change for the 22-12 C7a comparison: `Separate` commit gains one `get` session (all staged copies) before the move batch and one after; `InPlace` gains one `get` session after the puts. The move batch now starts with the `mkdir` lines. No `get -R`, no line starting with `-` or `!`.
+
+**What `InPlace` can and cannot guarantee.** `InPlace` writes the final path directly, so there is no staged copy on the host to check beforehand. The bytes sent come from the hash-pinned private local copy. After the write, the final paths are read back and hashed before the first delete. It can detect that the host holds different bytes (corruption, a racing writer) and stop before deleting anything. It cannot prevent the write, and it cannot roll back: the overwritten originals are gone, so a mismatch leaves the collection holding the unverified content (the error says so). Phase 23's snapshot owns recovery.
+
+**Residual (documented honestly).** The remaining window is a host-side writer with write access to the staging root or the collection directory during commit. Such a writer can already alter the gateway directly, so this is detected after the fact, not prevented; sftp offers no atomic verify-then-rename and no handle to pin the verified inode. The read-backs are also sequential reads of paths (sftp has no fd semantics).
+
+**Tests** (`tests/deploy_transport.rs`, real `sftp -D` with a `Tap` runner hook; red before the fix: all three committed the tampered bytes):
+`sftp_mirror_same_size_tampered_staged_copy_is_refused` (nothing renamed or deleted, staged copies removed, an untampered restage commits), `sftp_mirror_tamper_after_the_size_survey_is_refused` (swap lands just before the read-back), `sftp_mirror_oversize_swap_is_refused_before_any_rename` (24 MiB swap), `sftp_mirror_inplace_verifies_after_the_write_and_stops_before_deletes` (honest InPlace run still passes; tamper stops before every delete), and for the follow-up `sftp_mirror_tamper_between_pre_verify_and_rename_is_caught_after_commit` (swap just before the rename batch; post-commit check catches it, no `rm` or `rmdir` line, OLD files still present, and the renaming session directly follows the pre-verify `get`). `sftp_mirror_existence_first_mkdir` was adjusted: the mkdirs now share a batch with the moves, so "parent made earlier" compares (session, line).
+
+### F7: TOCTOU in the local mirror (`02707b9`)
+
+**Finding.** Writes, creates, renames, deletes and rmdirs were path-based; only the final open used `O_NOFOLLOW`, so an intermediate directory swapped for a symlink redirected them outside the collection root.
+
+**Fix** (unix; `deploy/tree.rs` `dirfd` module next to `open_regular_file`, used by `transport/local.rs`):
+
+- `dirfd` helpers take a directory handle and ONE name: `open_root` / `open_dir` / `walk` (`O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`), `ensure_dir` / `ensure_walk` (`mkdirat` for a missing level, then open with `O_NOFOLLOW`), `kind_at` / `ident_at` (`statat` with `AT_SYMLINK_NOFOLLOW`), `create_new` (`O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`, mode 0666 under the umask like `File::create_new`), `open_overwrite` (`O_NOFOLLOW|O_NONBLOCK`, `fstat` must be a regular file BEFORE `ftruncate`), `read_file`, `rename_at` (`renameat` between dir fds), `unlink_at`, `rmdir_at` (`AT_REMOVEDIR`). `ELOOP`, `ENOTDIR` and `ENXIO` are `FdError::Changed` ("{what} changed while it was written ... refused, nothing outside it was touched"); the same wording as the read side's "changed while it was read".
+- `commit_blocking` is split into `commit_preflight` (path-based, advisory: ownership, validation, whole expected state, staged sources hash-verified) and `commit_apply`. The unix `commit_apply` opens `data_dir` -> `config` -> `resources` -> the mode collection as a dir-fd chain and does every mutation `*at`. For `Separate` it opens the staged file by handle, hashes it, checks the name still has that dev+ino, `renameat`s, then checks the target has that dev+ino. `InPlace` re-reads the hash-pinned private copy and writes through `open_overwrite`. Deletes and emptied-directory removal re-walk the fd chain per file. The staging-root writes in `stage` (`fill_staging_root`) are descriptor-relative from the staging root's own handle too.
+- Windows: the previous path-based `commit_apply` / `fill_staging_root` stay behind `#[cfg(not(unix))]`, as does the helpers' use (`ensure_dir_chain`, `write_new`, `write_in_place`). Not compiled or run here (no windows target installed), same status as the read side.
+
+**Tests** (`local.rs` `tests::toctou`, red before the fix: the staging-directory swap moved a decoy into the collection, and the others failed on the old message): a stale plan where each of unit dir, delete target's dir, type dir, module dir, mode collection and `config` is replaced by a symlink to an outside tree AFTER `commit_preflight` and BEFORE `commit_apply`, in both staging modes, is refused with "changed while it was written" and the outside tree is byte-identical (names, contents, no new entries); a swapped staging directory is not renamed from; staging never writes through a symlink in the staging root; an honest apply still produces the same collection, report and a writable file mode. All existing `deploy_transport` local and sftp mirror tests pass unchanged.
+
+**Residuals.**
+
+- Windows keeps path-based mutations: an intermediate directory swapped between the preflight and a mutation is not defended against there (std has no descriptor-relative primitives).
+- The roots of the chains (`data_dir`, the staging root) are opened by path with a final-component `O_NOFOLLOW`; ancestors above them are the operator's own and followed.
+- Staged-file verify-then-rename on `Separate` is hash through the handle, then `renameat` by name: a swap in that instant is caught only by the dev+ino re-check before and after (detect, not prevent). The staging root is private to the deploy user.
+- The preflight, `check_staging_real` and `canonical_with_tail` stay path-based by design (read-only, advisory).
+- Not atomic across files (unchanged, Phase 23).
+
+### Verification
+
+- `cargo test --workspace`: 2001 passed, 0 failed. `deploy_transport` 59 passed (was 54: +5 sftp tests); `ignition-core --lib` 732 passed (includes the 4 new `toctou` tests); `deploy_plan` 57 passed, `PLAN_GOLDEN` and `PLAN_GOLDEN_LEDGER` unchanged (no plan code touched).
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean.
+- New packages: none. `Cargo.lock` is byte-identical to `d38f42b` (`git diff d38f42b HEAD -- Cargo.lock` is empty); `rustix` (`fs`) and `base64` were already direct dependencies.
+- `.planning/config.json` and `.planning/research/.cache/` untouched (still the pre-existing uncommitted state).
