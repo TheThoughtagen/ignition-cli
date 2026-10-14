@@ -659,6 +659,13 @@ pub enum DeployCommand {
         /// the desired tree
         #[arg(long, value_name = "DIR")]
         base: Option<PathBuf>,
+        /// Add a unified text diff (live against desired, 3 lines of
+        /// context, at most 65536 bytes per unit) to added, changed and
+        /// removed entries. Members that hold, or may hold, a secret are
+        /// withheld and print only their sha256 values; non-JSON members
+        /// print only that they differ
+        #[arg(long)]
+        diff: bool,
     },
 }
 

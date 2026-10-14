@@ -1452,6 +1452,11 @@ fn render_deploy_plan_human(result: &ignition_core::actions::deploy::DeployPlanR
             line.push_str(" drift");
         }
         println!("{line}");
+        if let Some(diff) = &entry.diff {
+            for text in diff.lines() {
+                println!("  {text}");
+            }
+        }
     }
     for path in &result.delete_set.files {
         println!("delete {path}");

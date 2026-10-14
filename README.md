@@ -341,7 +341,7 @@ defaults to `8.3.3`; unset reproduces the default run exactly.
 | `ign workspace status [PATH]` | Report workspace drift against the gateway — a PATH/STATE table (clean rows INCLUDED — agents diff full state) + the `x local edits, y gateway drift, z conflicts, n untracked` summary | states are **push-relative** (each row names what push would do — the table in the workspace section below); the project comes from the manifest, never re-typed; a missing/corrupt/foreign-schema manifest refuses exit 2 PRE-resolution (profile null, ZERO requests — the usage-guard convention); read-only (one export GET); JSON data `{project, clean, rows}` |
 | `ign workspace push [PATH] [--delete]` | Push local edits to the gateway — manifest-recorded local bytes spliced into a FRESH export, imported exactly once | **destructive**: exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius preview (exactly what would be written/deleted); **conflicts refuse EVEN WITH `--yes`** (manual reconciliation — see the workspace section); locally-deleted members need `--delete` (default: reported as `skipped`); untracked files are NEVER imported; an empty selection writes nothing and never prompts; JSON data `{project, wrote, deleted, skipped}`; over MCP the tool carries an OPTIONAL `confirm` boolean and `confirm: true` is the MCP-native confirmation for it — `--yes`/`IGNITION_YES` remain CLI-only, and the conflict refusal is still never confirmable on either surface |
 | `ign deploy render --env <ENV> [--repo DIR] [--out DIR]` | Render a declared `gateways/<name>/` tree for one environment into the bytes the gateway holds on disk, and report file and byte counts plus the `render_sha256` digest | offline: `profile: null`, no network, no credentials, no profile resolution; deterministic `render_sha256` (listing format in the deploy section); refusals exit 2 `deploy_tree_invalid` / `embedded_secret`; `--env` must be a safe single path component (`invalid_input` otherwise); MCP tool `deploy_render` is unguarded (Decision D; the `--out` clobber ladder is the safety); JSON data `{env, gateway, mode, out, files, bytes, render_sha256, resources, tag_providers, uuids_minted, opaque_files, warnings}` |
-| `ign deploy plan --env <ENV> [--repo DIR]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, warnings}` |
+| `ign deploy plan --env <ENV> [--repo DIR] [--base DIR] [--diff]` | Plan one environment against the master node's live gateway files: each unit is `added`, `changed`, `removed`, `same` or `unmanaged`, with where live copies sit (`live_in`) and the `core` relation, plus the canonical `plan_sha256` | read-only; exits 0 whether or not anything changed (SF-2); resolves no session, so no secret is needed and no gateway is contacted; `profile` is the master node's profile name from the target; reads the host through `nodes.master.local` (or `ssh`); refusals exit 2 `deploy_tree_invalid` (master with neither `ssh` nor `local`) and exit 4 `transport_failed` (unreadable host); MCP tool `deploy_plan` is unguarded (Decision D); JSON data `{env, gateway, mode, node, transport, render_sha256, plan_sha256, summary, entries, delete_set, base, warnings}`; `--base DIR` adds three-way drift against a re-hashed previous render, `--diff` adds a redacted text diff (secret-bearing members withheld) |
 | `ign edit <PROJECT> <RESOURCE_PATH> [--yes]` | Fetch a gateway resource, edit it in `$EDITOR`, push back — the kubectl-edit loop over ONE resource (whole-tree authoring is `ign workspace`'s job) | **destructive**: the push re-imports the project — exit 2 (`confirmation_required`) without `--yes` and the refusal message IS the blast-radius summary; **ZERO stdout in every mode** (the editor owns the terminal — all prose on stderr, see the edit section); an unchanged save is a clean no-op (nothing pushed, never prompted); a gateway changed since fetch refuses EVEN WITH `--yes` (`changed on gateway since fetch` — re-run to fetch fresh); a JSON-breaking save refuses FAIL-CLOSED with the temp tree kept (path printed); no `$EDITOR`/`VISUAL` refuses exit 2 pre-resolution (profile null, zero requests) |
 | `ign resource list <PROJECT> [--prefix PREFIX]` | A project's resource members, one path per line | rides project-export ZIP surgery (05-02): the project is exported, the member tree under `<collection>/resources/…` is mapped to user paths (`resources/` stripped — `ignition/script-python/…`); `--prefix` filters client-side; JSON items carry exactly the typed `path` |
 | `ign resource get <PROJECT> <PATH>` | Read ONE resource: JSON pretty-printed, text raw — the surgical edit loop's first half | `PATH` keeps its slashes (e.g. `ignition/script-python/myscript`) and addresses a ZIP MEMBER (the file at `<collection>/resources/<rest>`); a binary member (data.bin-class, sniffed from the member bytes) refuses with exit 6 `resource_binary` (use export/import instead — never corrupted through the JSON loop); JSON data carries `{project, path, content_kind, content}` |
@@ -2478,7 +2478,7 @@ checks also apply to tag files, which use their mapped collection paths.
 
 ### `deploy plan`
 
-`ign deploy plan --env <ENV> [--repo DIR]` compares the rendered tree for one
+`ign deploy plan --env <ENV> [--repo DIR] [--base DIR] [--diff]` compares the rendered tree for one
 environment with the live gateway files of `nodes.master` and reports what a
 deploy would do. It is **read-only**: it writes nothing, takes no lock, opens
 no gateway session and sends no REST request, so it needs no secret and no
@@ -2523,19 +2523,22 @@ gateway keeps running the `core` copy; Phase 23 blocks an apply on it).
 **Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
 `mode`, `node` (always `master`), `transport` (`local` or `ssh`),
 `render_sha256`, `plan_sha256`, `summary` (`added`, `changed`, `removed`,
-`same`, `unmanaged`, `has_changes`), `entries`, `delete_set` and `warnings`.
-Each entry is
-`{key, module, type, name, status, live_in, core, destructive, destructive_reason, lockout_risk, files}`
+`same`, `unmanaged`, `has_changes`, `drifted`), `entries`, `delete_set`, `base`
+and `warnings`. Each entry is
+`{key, module, type, name, status, live_in, core, destructive, destructive_reason, lockout_risk, drift, files, diff}`
 where `files` are `{path, live_sha256, desired_sha256}`; entries are in
 unit-key byte order. `delete_set` is `{"files": [...]}`, byte-sorted.
-Keys are only ever added, never renamed. Entries carry paths and hashes,
-never file bytes.
+`drift`, `summary.drifted` and `base` are null without `--base`; `diff` is
+null without `--diff`. Keys are only ever added, never renamed. Entries carry
+paths and hashes, never file bytes; the only file text in a plan is a `--diff`
+section that passed the secret scan (see below).
 
 **Human output.** The first line is
 `plan <gateway> (<env>, mode <mode>) via <transport>: <a> added, <c> changed, <r> removed, <s> same, <u> unmanaged`,
 then one line per entry whose status is not `same`
 (`<status> <key> core=<core> live_in=<a,b>`, followed by
-`destructive=<reason>` and `lockout_risk` when set), then one
+`destructive=<reason>`, `lockout_risk` and `drift` when set, and, with
+`--diff`, the entry's diff text indented two spaces), then one
 `delete <path>` line per delete-set file, then `plan_sha256 <hex>`. Each
 warning goes to stderr as `warning: ...`.
 
@@ -2624,6 +2627,57 @@ v1 is one strict JSON object:
   exits 6 `deploy_ledger_invalid`, naming the ledger location and the problem.
   Plan never falls back to an empty delete set. The problem text names fields
   and listed paths only, never other file content.
+
+#### Drift (`--base DIR`)
+
+`--base DIR` takes a directory written by `ign deploy render --out` (a
+previous render of the same gateway, environment and mode) and marks each
+entry `drift`: **true** when any of its files has a live sha256 that differs
+from both the base sha256 and the desired sha256. An absent side counts as its
+own value, so a unit created on the gateway outside the pipeline (absent from
+the base and the desired tree, so `unmanaged`) is drift, and a unit deleted
+outside the pipeline (in the base and the desired tree, not live, so `added`)
+is drift. A live copy that equals the base while the desired tree moved on
+(a pipeline change not yet applied) and a live copy that equals the desired
+tree while the base is older are not drift. Without `--base`, `drift`,
+`summary.drifted` and `base` are null. `base` otherwise carries `{dir,
+render_sha256, files}`.
+
+The base is **re-hashed, never trusted**. `render.json` supplies the identity
+(`gateway`, `env` and `mode` must equal the plan's) and a consistency record
+only. Plan walks the directory, hashes every file's real bytes and refuses
+the base as `invalid_input`, naming the first difference, when the walked
+files are not exactly the marker's files, when any recomputed sha256 or size
+disagrees with the marker, or when the recomputed `render_sha256` disagrees
+with the marker's. An extra file, an edited file, a missing file or a leftover
+`<file>.ign-render-tmp` from an interrupted `render --out` refresh therefore
+never passes as a clean base. An absent path, a regular file, a symlink, or a
+directory holding a symlink, a special file or a non-UTF-8 name is refused the
+same way, before the live tree is read. `drift` is excluded from
+`plan_sha256`: the same plan with and without `--base` has the same hash.
+
+#### The diff (`--diff`)
+
+`--diff` adds a `diff` text to every `added`, `changed` and `removed` entry
+(null for `same` and `unmanaged`). For each file of the unit whose live and
+desired sha256 differ, in path order:
+
+- a `.json` member where both present sides parse and carry no secret-bearing
+  location is a unified text diff, live against desired, 3 lines of context,
+  with headers `--- live/<path>` and `+++ desired/<path>` (an absent side is
+  empty);
+- a `.json` member where the render's secret scan reports any refused
+  location or warning on either side (an `Embedded` secret object, a value at
+  a secret-typed path, a possible secret by key name) is printed as
+  `<path>: withheld: contains secret-bearing locations (<n>); live <sha256 or
+  ->, desired <sha256 or ->`, with no content;
+- any other member, and a `.json` member that does not parse, is printed as
+  `<path>: differs (live <sha256 or ->, desired <sha256 or ->)`.
+
+An entry's diff is capped at 65536 bytes; a longer one ends with
+`... [diff truncated at 65536 bytes]`. Diff text is excluded from
+`plan_sha256`. No secret value, Embedded ciphertext or plaintext secret is
+printed in the plan, its diff, stderr or the debug form of the result.
 
 **Over MCP.** `deploy plan` is in the `ign mcp serve` tool catalog as
 `deploy_plan`. It is read-only, so the tool is not guarded and takes no

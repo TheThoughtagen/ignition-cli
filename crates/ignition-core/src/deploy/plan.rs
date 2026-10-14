@@ -108,8 +108,12 @@ use std::path::Path;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::layout::{RelPath, TAG_TYPES};
+use similar::TextDiff;
+
+use super::layout::{RelPath, TAG_TYPES, resource_key};
 use super::ledger::Ledger;
+use super::lint::{scan_embedded, scan_secrets};
+use super::node::{Node, classify};
 use super::rules::GATEWAY_OWNED_FILES;
 use super::transport::{
     DeleteSet, FileBlob, ObservedFiles, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES,
@@ -878,9 +882,145 @@ pub const DIFF_MAX_BYTES: usize = 65_536;
 /// Opening words of the line printed in place of a secret-bearing member.
 pub const DIFF_WITHHELD: &str = "withheld: contains secret-bearing locations";
 
-/// Fill `diff` on `added`, `changed` and `removed` entries (skeleton).
+/// Fill `diff` on `added`, `changed` and `removed` entries (`--diff`).
+///
+/// Each file of the entry whose live and desired sha256 differ contributes one
+/// section, in path order:
+///
+/// - a `.json` member whose present sides both parse ([`classify`]) and carry
+///   no secret-bearing location on either side is a unified text diff
+///   (`similar`, 3 lines of context, headers `live/<path>` and
+///   `desired/<path>`; an absent side is empty);
+/// - a `.json` member where [`scan_secrets`] (`config.json`) or
+///   [`scan_embedded`] (every other `.json`, and tag files) reports any
+///   refused location or warning on either side is
+///   `<path>: withheld: contains secret-bearing locations (<n>); live <sha|->,
+///   desired <sha|->`, where `<n>` counts locations only;
+/// - any other member, and a `.json` member that does not parse, is
+///   `<path>: differs (live <sha|->, desired <sha|->)`.
+///
+/// The text diff is the only place file bytes reach the plan, and only after
+/// both sides passed the scan, so Embedded ciphertext and plaintext secrets
+/// never leave it. An entry's text is capped at [`DIFF_MAX_BYTES`] and then
+/// ends with a truncation marker. The live side of an entry is its effective
+/// copy (the mode collection when the unit exists there, else `core`), the
+/// same basis the digests use.
 pub fn render_diffs(plan: &mut Plan, rendered: &RenderedTree, observed: &ObservedFiles) {
-    let _ = (plan, rendered, observed);
+    for entry in &mut plan.entries {
+        if !matches!(
+            entry.status,
+            PlanStatus::Added | PlanStatus::Changed | PlanStatus::Removed
+        ) {
+            continue;
+        }
+        let layer = if entry.live_in.iter().any(|l| l == "mode") {
+            &observed.mode
+        } else {
+            &observed.core
+        };
+        let mut text = String::new();
+        for file in &entry.files {
+            if file.live_sha256 == file.desired_sha256 {
+                continue;
+            }
+            let Ok(path) = RelPath::new(&file.path) else {
+                continue;
+            };
+            let live = layer.get(&path).map(|blob| blob.bytes.as_slice());
+            let desired = rendered.files.get(&path).map(Vec::as_slice);
+            text.push_str(&file_diff(
+                &path,
+                live,
+                desired,
+                file.live_sha256.as_deref(),
+                file.desired_sha256.as_deref(),
+            ));
+        }
+        entry.diff = (!text.is_empty()).then(|| cap_diff(text));
+    }
+}
+
+/// One file's section of an entry's diff, newline-terminated.
+fn file_diff(
+    path: &RelPath,
+    live: Option<&[u8]>,
+    desired: Option<&[u8]>,
+    live_sha: Option<&str>,
+    desired_sha: Option<&str>,
+) -> String {
+    let shas = format!(
+        "live {}, desired {}",
+        live_sha.unwrap_or("-"),
+        desired_sha.unwrap_or("-")
+    );
+    let hash_only = || format!("{path}: differs ({shas})\n");
+    if !path.as_str().ends_with(".json") {
+        return hash_only();
+    }
+    let mut locations = 0;
+    for bytes in [live, desired].into_iter().flatten() {
+        let Ok((_, node)) = classify(bytes) else {
+            return hash_only();
+        };
+        locations += secret_locations(path, &node);
+    }
+    if locations > 0 {
+        return format!("{path}: {DIFF_WITHHELD} ({locations}); {shas}\n");
+    }
+    // Both sides parsed as JSON, so they are valid UTF-8.
+    let old = live.and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+    let new = desired
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .unwrap_or("");
+    let diff = TextDiff::from_lines(old, new);
+    let mut unified = diff.unified_diff();
+    unified
+        .context_radius(3)
+        .header(&format!("live/{path}"), &format!("desired/{path}"));
+    let mut text = unified.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// How many secret-bearing locations (refused or warned) the render lints
+/// find in one parsed member. Counts only; nothing the scan says is kept.
+fn secret_locations(path: &RelPath, node: &Node) -> usize {
+    let origin = path.as_str();
+    let parts: Vec<&str> = path.components().collect();
+    let tag_file =
+        parts.first() == Some(&"ignition") && parts.get(1).is_some_and(|ty| TAG_TYPES.contains(ty));
+    let scan = if tag_file {
+        scan_embedded(origin, node)
+    } else {
+        let key = resource_key(path);
+        let skip = if key.name.is_some() { 3 } else { 2 };
+        let rest: Vec<&str> = parts.iter().skip(skip).copied().collect();
+        scan_secrets(origin, &key, &rest.join("/"), node)
+    };
+    scan.refused.len() + scan.warnings.len()
+}
+
+/// Cap an entry's diff at [`DIFF_MAX_BYTES`], ending a longer one with the
+/// truncation marker; otherwise drop the trailing newline.
+fn cap_diff(mut text: String) -> String {
+    if text.len() > DIFF_MAX_BYTES {
+        let mut cut = DIFF_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("... [diff truncated at {DIFF_MAX_BYTES} bytes]"));
+    } else {
+        while text.ends_with('\n') {
+            text.pop();
+        }
+    }
+    text
 }
 
 /// The canonical text `plan_sha256` hashes (see the module doc).

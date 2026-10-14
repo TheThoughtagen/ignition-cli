@@ -3099,7 +3099,12 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
             // `ign deploy plan` (22-02): read-only. NO `Session::resolve`,
             // no REST, no scan-lock: the master's profile NAME only labels
             // the envelope, and the host is read through its ssh/local block.
-            DeployCommand::Plan { env, repo, base } => {
+            DeployCommand::Plan {
+                env,
+                repo,
+                base,
+                diff,
+            } => {
                 let declared = match actions::deploy::load_declared(&repo, &env) {
                     Ok(declared) => declared,
                     Err(err) => return (None, Err(err)),
@@ -3115,7 +3120,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     Ok(reader) => reader,
                     Err(err) => return (profile, Err(err)),
                 };
-                let opts = actions::deploy::PlanOptions { base, diff: false };
+                let opts = actions::deploy::PlanOptions { base, diff };
                 let result = actions::deploy::deploy_plan(&declared, reader.as_ref(), &opts)
                     .await
                     .map(ActionOutput::DeployPlan);
