@@ -6,7 +6,10 @@
 //! decisions CV1 (log match), CV2 (read-back table N1 to N3 and the two skip
 //! classes) and CV3 (post-scan bytes), and the confirmed 22-03 vocabulary.
 
+mod common;
+
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use ignition_core::client::scan::ScanStatus;
 use ignition_core::deploy::plan::PlanStatus;
@@ -760,4 +763,690 @@ fn no_message_or_value_echo() {
         "ObservedState Debug leaked"
     );
     assert!(!format!("{e:?}").contains(CANARY), "Expected Debug leaked");
+}
+
+// =============================================================================
+// Task 2: the read-only action over fakes
+// =============================================================================
+
+use common::fake_deploy::FakeGateway;
+use common::forbid_writes::ForbidWrites;
+use common::plan_fixture::{MODE, PlanFixture};
+use ignition_core::actions::deploy::{Declared, VerifyOptions, deploy_verify};
+use ignition_core::client::DeployApi;
+use ignition_core::client::ReqwestGatewayApi;
+use ignition_core::client::config_resources::{ResourceCreate, ResourceRecord};
+use ignition_core::client::scan::{LockObservation, ScanKind};
+use ignition_core::deploy::layout::RelPath;
+use ignition_core::deploy::manifest::Verify;
+use ignition_core::deploy::transport::{ObservedFiles, Scope, TreeReader};
+use ignition_core::error::CoreError;
+
+const NAMED: &str = "ignition/database-translator/POSTGRES";
+const SINGLETON: &str = "ignition/general-alarm-settings";
+const TAG_FILE: &str = "ignition/tag-definition/P/F/tags.json";
+const TAG_MARKER: &str = "ignition/tag-definition/P/F/unary-resource.json";
+
+/// Options with every wait shortened for tests.
+fn fast() -> VerifyOptions {
+    VerifyOptions {
+        probe_deadline: Duration::from_millis(400),
+        probe_interval: Duration::from_millis(20),
+        log_settle: Duration::ZERO,
+    }
+}
+
+/// The rendered `config.json` of `key` with JSON null members removed, as the
+/// gateway's REST view reports it (CV2 N1).
+fn rest_config(declared: &Declared, key: &str) -> Value {
+    fn strip(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| (k.clone(), strip(v)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let path = RelPath::new(&format!("{key}/config.json")).unwrap();
+    let bytes = declared
+        .outcome
+        .tree
+        .files
+        .get(&path)
+        .expect("rendered config");
+    strip(&serde_json::from_slice(bytes).unwrap())
+}
+
+fn record(config: Value) -> ResourceRecord {
+    ResourceRecord {
+        resource_type: String::new(),
+        name: None,
+        description: None,
+        enabled: Some(true),
+        version: Some(1),
+        collection: None,
+        collections: Vec::new(),
+        signature: None,
+        config,
+        backup_config: None,
+        attributes: None,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// A fake gateway in mode `dev` holding the tracer resources in the mode
+/// collection (`named` controls whether the named one is present).
+async fn seeded_fake(declared: &Declared, named: bool) -> FakeGateway {
+    let fake = FakeGateway::new();
+    fake.set_deployment_mode(Some(MODE.to_string()));
+    let setup = fake.client("setup");
+    if named {
+        let mut create = ResourceCreate::new("POSTGRES", rest_config(declared, NAMED));
+        create.collection = Some(MODE.to_string());
+        setup
+            .resource_create("ignition", "database-translator", &[create])
+            .await
+            .expect("seed named");
+    }
+    fake.seed_singleton(
+        "ignition",
+        "general-alarm-settings",
+        MODE,
+        record(rest_config(declared, SINGLETON)),
+    );
+    fake
+}
+
+struct Env {
+    fx: PlanFixture,
+    declared: Declared,
+    reader: Box<dyn TreeReader>,
+}
+
+/// The tracer repo with its render written to the live mode collection.
+fn env() -> Env {
+    let fx = PlanFixture::new();
+    let (declared, reader) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    Env {
+        fx,
+        declared,
+        reader,
+    }
+}
+
+fn logs_body(items: Vec<Value>) -> Value {
+    json!({"items": items, "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}})
+}
+
+async fn mount_logs(server: &wiremock::MockServer, items: Vec<Value>) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/logs"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(logs_body(items)))
+        .mount(server)
+        .await;
+}
+
+async fn mount_tags_present(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"action": "version"}),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "data": {"routeVersion": ignition_core::webdev::ROUTE_BUNDLE_VERSION, "minCli": "1.0"},
+        })))
+        .mount(server)
+        .await;
+}
+
+fn read_rows(rows: &[(&str, &str)]) -> Value {
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|(path, quality)| {
+            json!({"path": path, "value": CANARY, "quality": quality, "timestamp": "t"})
+        })
+        .collect();
+    json!({"ok": true, "data": {"results": results}})
+}
+
+/// Mount a tags `read` answer, used at most `times` times when given.
+async fn mount_read(server: &wiremock::MockServer, rows: &[(&str, &str)], times: Option<u64>) {
+    let mock = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"action": "read"}),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(read_rows(rows)));
+    match times {
+        Some(n) => mock.up_to_n_times(n).mount(server).await,
+        None => mock.mount(server).await,
+    }
+}
+
+async fn run(
+    env: &Env,
+    fake: &FakeGateway,
+    api: &ReqwestGatewayApi,
+) -> Result<ignition_core::actions::deploy::DeployVerifyResult, CoreError> {
+    deploy_verify(
+        &env.declared,
+        "ign-cli",
+        &ForbidWrites(fake.client("verify")),
+        api,
+        env.reader.as_ref(),
+        &fast(),
+    )
+    .await
+}
+
+fn probes(declared: &mut Declared, paths: &[&str]) {
+    declared.manifest.verify = Some(Verify {
+        tag_probes: paths.iter().map(|p| (*p).to_string()).collect(),
+    });
+}
+
+#[tokio::test]
+async fn verify_green_and_red_through_action() {
+    let mut env = env();
+    probes(&mut env.declared, &["[default]Heartbeat"]);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    mount_tags_present(&server).await;
+    mount_read(&server, &[("[default]Heartbeat", "Good")], None).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+
+    let fake = seeded_fake(&env.declared, true).await;
+    let green = run(&env, &fake, &api).await.expect("verdict");
+    assert!(green.ok, "{green:#?}");
+    assert_eq!(green.slug, None);
+    assert_eq!(green.failure_exit_code(), None);
+    assert_eq!(green.resources_checked, 2);
+    assert_eq!(
+        (
+            green.env.as_str(),
+            green.gateway.as_str(),
+            green.mode.as_str()
+        ),
+        ("dev", "tracer-gw", "dev")
+    );
+    assert_eq!(
+        (green.node.as_str(), green.project.as_str()),
+        ("master", "ign-cli")
+    );
+    assert_eq!(green.checks.len(), 6);
+
+    // Same everything, but the named resource is absent from the gateway.
+    let fake = seeded_fake(&env.declared, false).await;
+    let red = run(&env, &fake, &api).await.expect("verdict");
+    assert!(!red.ok);
+    assert_eq!(red.slug, Some(VERIFY_FAILED_SLUG));
+    assert_eq!(red.failure_exit_code(), Some(6));
+    let read_back = red
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .unwrap();
+    assert_eq!(read_back.status, CheckStatus::Fail);
+    assert_eq!(read_back.findings[0].code, "resource_missing");
+    assert_eq!(read_back.findings[0].subject, NAMED);
+}
+
+#[tokio::test]
+async fn verify_result_keys_are_in_contract_order() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    let text = serde_json::to_string(&result).unwrap();
+    let keys = [
+        "env",
+        "gateway",
+        "mode",
+        "node",
+        "project",
+        "ok",
+        "slug",
+        "checks",
+        "resources_checked",
+        "warnings",
+    ];
+    let mut last = 0;
+    for key in keys {
+        let at = text
+            .find(&format!("\"{key}\":"))
+            .unwrap_or_else(|| panic!("{key} missing in {text}"));
+        assert!(at >= last, "{key} out of order in {text}");
+        last = at;
+    }
+    // No probes declared: a warning, not a failure.
+    assert!(result.ok, "{result:#?}");
+    assert!(result.warnings.iter().any(|w| w.starts_with("probes:")));
+}
+
+#[tokio::test]
+async fn verify_makes_no_writes() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let before = fake
+        .client("watcher")
+        .scan_status(ScanKind::Config)
+        .await
+        .unwrap();
+    run(&env, &fake, &api).await.expect("verdict");
+    let after = fake
+        .client("watcher")
+        .scan_status(ScanKind::Config)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.last_scan_timestamp, after.last_scan_timestamp,
+        "no scan"
+    );
+    assert!(!after.scan_active);
+    assert!(matches!(
+        fake.client("watcher")
+            .scan_lock_info(ScanKind::Config)
+            .await
+            .unwrap(),
+        LockObservation::Free
+    ));
+    // Only gateway reads reached the mock: logs, no POST for the lock or scan.
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| r.method.as_str() == "GET"),
+        "{:?}",
+        requests
+            .iter()
+            .map(|r| (r.method.to_string(), r.url.path().to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "plan, pull and verify must not write")]
+async fn forbid_writes_double_really_panics() {
+    let fake = FakeGateway::new();
+    let _ = ForbidWrites(fake.client("x"))
+        .scan_request(ScanKind::Config)
+        .await;
+}
+
+#[tokio::test]
+async fn verify_unreachable_gateway_is_an_error() {
+    let env = env();
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let dead = ReqwestGatewayApi::for_tests(&format!("http://127.0.0.1:{port}"), None);
+    let err = deploy_verify(
+        &env.declared,
+        "ign-cli",
+        &dead,
+        &dead,
+        env.reader.as_ref(),
+        &fast(),
+    )
+    .await
+    .expect_err("no verdict without a gateway");
+    assert!(matches!(err, CoreError::Network { .. }), "{err:?}");
+    assert_eq!(err.code(), "network_error");
+}
+
+struct DeadTransport;
+
+#[async_trait::async_trait]
+impl TreeReader for DeadTransport {
+    async fn list_types(&self, _c: &str) -> Result<Vec<(String, String)>, CoreError> {
+        unreachable!("verify reads through `read`")
+    }
+
+    async fn read(&self, _scope: &Scope) -> Result<ObservedFiles, CoreError> {
+        Err(CoreError::TransportFailed {
+            operation: "read".to_string(),
+            node: "nodes.master".to_string(),
+            detail: "connection refused".to_string(),
+        })
+    }
+
+    async fn read_ledger(&self, _g: &str, _m: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        unreachable!("verify does not read the ledger")
+    }
+}
+
+#[tokio::test]
+async fn verify_transport_failure_is_an_error() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let err = deploy_verify(
+        &env.declared,
+        "ign-cli",
+        &ForbidWrites(fake.client("v")),
+        &api,
+        &DeadTransport,
+        &fast(),
+    )
+    .await
+    .expect_err("no verdict without the files");
+    assert_eq!(err.code(), "transport_failed");
+}
+
+#[tokio::test]
+async fn verify_logs_refusal_is_unavailable_not_error() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/logs"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(403).set_body_json(json!({"message": CANARY})),
+        )
+        .mount(&server)
+        .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api)
+        .await
+        .expect("a verdict, not an error");
+    assert!(!result.ok);
+    let loaded = result
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::Loaded)
+        .unwrap();
+    assert_eq!(loaded.status, CheckStatus::Fail);
+    assert_eq!(loaded.findings[0].code, "logs_unavailable");
+    assert!(!loaded.findings[0].detail.is_empty());
+    assert!(
+        !serde_json::to_string(&result).unwrap().contains(CANARY),
+        "the refusal body must not be echoed"
+    );
+}
+
+#[tokio::test]
+async fn verify_log_hit_for_a_declared_resource_is_red_and_value_free() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(
+        &server,
+        vec![json!({
+            "timestamp": 1_792_000_000_050_i64,
+            "loggerName": "NamedResourceHandler-ignition/database-translator",
+            "level": "WARN",
+            "message": format!("Resource {NAMED} does not have required UUID attribute, will not be loaded {CANARY}"),
+        })],
+    )
+    .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert!(!result.ok);
+    assert_eq!(result.failure_exit_code(), Some(6));
+    let loaded = result
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::Loaded)
+        .unwrap();
+    assert_eq!(loaded.findings[0].code, "unloaded_resource");
+    assert_eq!(loaded.findings[0].subject, NAMED);
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(!text.contains(CANARY) && !format!("{result:?}").contains(CANARY));
+    // The query was the CV1 one: WARN, an explicit window and limit.
+    let requests = server.received_requests().await.unwrap();
+    let query = requests[0].url.query().unwrap_or_default().to_string();
+    assert!(query.contains("minLevel=WARN"), "{query}");
+    assert!(query.contains("startTime="), "{query}");
+    assert!(query.contains("limit=200"), "{query}");
+    assert!(!query.contains("endTime"), "{query}");
+    assert!(!query.contains("logger="), "{query}");
+}
+
+#[tokio::test]
+async fn verify_log_window_starts_before_the_last_scan() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let status = fake
+        .client("w")
+        .scan_status(ScanKind::Config)
+        .await
+        .unwrap();
+    let expected_start = ignition_core::deploy::verify::log_window_start(&status);
+    run(&env, &fake, &api).await.expect("verdict");
+    let requests = server.received_requests().await.unwrap();
+    let query = requests[0].url.query().unwrap_or_default().to_string();
+    assert!(
+        query.contains(&format!("startTime={expected_start}")),
+        "{query} vs {expected_start}"
+    );
+}
+
+#[tokio::test]
+async fn verify_log_settle_is_skipped_when_the_gateway_logged_since() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    // The probe for "the gateway logged after the settle point" finds a line.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/logs"))
+        .and(wiremock::matchers::query_param("limit", "1"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(logs_body(vec![json!({
+            "timestamp": 1_792_999_999_999_i64, "loggerName": "x", "level": "INFO", "message": "m"
+        })])))
+        .mount(&server)
+        .await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let mut opts = fast();
+    opts.log_settle = Duration::from_secs(60);
+    let started = Instant::now();
+    let result = deploy_verify(
+        &env.declared,
+        "ign-cli",
+        &ForbidWrites(fake.client("v")),
+        &api,
+        env.reader.as_ref(),
+        &opts,
+    )
+    .await
+    .expect("verdict");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "settle was not skipped"
+    );
+    assert!(result.ok, "{result:#?}");
+}
+
+#[tokio::test]
+async fn verify_slug_is_not_an_error_slug() {
+    assert!(!CoreError::DEPLOY_SLUGS.contains(&VERIFY_FAILED_SLUG));
+    for code in [
+        "transport_failed",
+        "deploy_ledger_invalid",
+        "deploy_tree_invalid",
+    ] {
+        assert_ne!(code, VERIFY_FAILED_SLUG);
+    }
+    // A red result is data, not an error: the exit-6 class is applied by the
+    // binary through `failure_exit_code`.
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, false).await;
+    let red = run(&env, &fake, &api).await;
+    assert!(red.is_ok());
+}
+
+// ---- files over the transport -----------------------------------------------------
+
+fn with_tag_unit(env: &mut Env, live: Option<(&str, &str)>) {
+    let tree = &mut env.declared.outcome.tree.files;
+    tree.insert(RelPath::new(TAG_FILE).unwrap(), b"[]".to_vec());
+    tree.insert(RelPath::new(TAG_MARKER).unwrap(), b"{}".to_vec());
+    env.declared.manifest.tag_providers = vec!["P".to_string()];
+    env.fx.mode(TAG_MARKER, b"{}");
+    match live {
+        Some((path, bytes)) => env.fx.mode(path, bytes.as_bytes()),
+        None => env.fx.mode(TAG_FILE, b"[]"),
+    }
+}
+
+#[tokio::test]
+async fn verify_files_check_compares_tag_units_byte_for_byte() {
+    let mut env = env();
+    with_tag_unit(&mut env, None);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let green = run(&env, &fake, &api).await.expect("verdict");
+    let files = green
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::Files)
+        .unwrap();
+    assert_eq!(files.status, CheckStatus::Pass, "{green:#?}");
+    assert!(
+        files.detail.starts_with("1 declared tag unit"),
+        "{}",
+        files.detail
+    );
+
+    // One byte off on the host.
+    env.fx.mode(TAG_FILE, b"[ ]");
+    let red = run(&env, &fake, &api).await.expect("verdict");
+    assert!(!red.ok);
+    assert_eq!(red.failure_exit_code(), Some(6));
+    let files = red.checks.iter().find(|c| c.id == CheckId::Files).unwrap();
+    assert_eq!(files.findings[0].code, "files_differ");
+    assert_eq!(files.findings[0].subject, "ignition/tag-definition/P/F");
+    assert!(!serde_json::to_string(&red).unwrap().contains("[ ]"));
+}
+
+// ---- probes ------------------------------------------------------------------------
+
+fn probe_check(result: &ignition_core::actions::deploy::DeployVerifyResult) -> &Check {
+    result
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::Probes)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn verify_probe_that_turns_good_before_the_deadline_passes() {
+    let mut env = env();
+    probes(&mut env.declared, &["[default]Heartbeat"]);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    mount_tags_present(&server).await;
+    mount_read(&server, &[("[default]Heartbeat", "Bad_NotFound")], Some(3)).await;
+    mount_read(&server, &[("[default]Heartbeat", "Good")], None).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert_eq!(
+        probe_check(&result).status,
+        CheckStatus::Pass,
+        "{result:#?}"
+    );
+    assert!(result.ok);
+    assert!(
+        !serde_json::to_string(&result).unwrap().contains(CANARY),
+        "tag value leaked"
+    );
+}
+
+#[tokio::test]
+async fn verify_probe_that_never_turns_good_fails_after_the_deadline() {
+    let mut env = env();
+    probes(&mut env.declared, &["[default]Heartbeat"]);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    mount_tags_present(&server).await;
+    mount_read(&server, &[("[default]Heartbeat", "Bad_NotFound")], None).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let started = Instant::now();
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(300),
+        "gave up early: {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(10), "unbounded: {waited:?}");
+    let probes = probe_check(&result);
+    assert_eq!(probes.status, CheckStatus::Fail);
+    assert_eq!(probes.findings[0].code, "tag_probe_not_good");
+    assert!(probes.findings[0].detail.contains("Bad_NotFound"));
+    assert_eq!(result.failure_exit_code(), Some(6));
+}
+
+#[tokio::test]
+async fn verify_probe_route_absent_is_unavailable() {
+    let mut env = env();
+    probes(&mut env.declared, &["[default]Heartbeat"]);
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/system/webdev/ign-cli/cli/tags"))
+        .respond_with(wiremock::ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake(&env.declared, true).await;
+    let result = run(&env, &fake, &api)
+        .await
+        .expect("a verdict, not an error");
+    let probes = probe_check(&result);
+    assert_eq!(probes.status, CheckStatus::Fail);
+    assert_eq!(probes.findings[0].code, "tag_probes_unavailable");
+    assert_eq!(probes.findings[0].detail, "routes_not_deployed");
+}
+
+#[tokio::test]
+async fn verify_system_collection_copy_is_skipped_with_a_warning() {
+    let env = env();
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    // The singleton exists only in the system collection.
+    let fake = FakeGateway::new();
+    fake.set_deployment_mode(Some(MODE.to_string()));
+    let mut create = ResourceCreate::new("POSTGRES", rest_config(&env.declared, NAMED));
+    create.collection = Some(MODE.to_string());
+    fake.client("s")
+        .resource_create("ignition", "database-translator", &[create])
+        .await
+        .unwrap();
+    fake.seed_singleton(
+        "ignition",
+        "general-alarm-settings",
+        "system",
+        record(json!({"anything": 1})),
+    );
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    assert!(result.ok, "{result:#?}");
+    assert_eq!(result.resources_checked, 1);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains(SINGLETON) && w.contains("system"))
+    );
 }

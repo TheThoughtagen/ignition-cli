@@ -51,9 +51,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, ledger_location};
 use crate::deploy::manifest::Manifest;
@@ -65,6 +67,7 @@ use crate::deploy::transport::{CORE_COLLECTION, DeleteSet, READ_MAX_ENTRIES, Sco
 use crate::deploy::tree::{
     RenderMarker, SourceTree, read_repo_file, require_repo_dir, walk_capped, write_out,
 };
+use crate::deploy::verify;
 use crate::error::CoreError;
 
 /// The `ign deploy render` result (the envelope's `data`).
@@ -730,4 +733,76 @@ fn write_pulled(
         create(&dest, bytes)?;
     }
     Ok(())
+}
+
+/// Options of `deploy verify`.
+#[derive(Debug, Clone)]
+pub struct VerifyOptions {
+    /// How long the probes are polled before the verdict.
+    pub probe_deadline: Duration,
+    /// Time between two probe polls.
+    pub probe_interval: Duration,
+    /// How long after a scan completed the gateway log is trusted to hold its
+    /// lines (CV1). Skipped when the gateway has logged since.
+    pub log_settle: Duration,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            probe_deadline: verify::PROBE_DEADLINE,
+            probe_interval: verify::PROBE_INTERVAL,
+            log_settle: Duration::from_millis(verify::LOG_SETTLE_MS.unsigned_abs()),
+        }
+    }
+}
+
+/// The `ign deploy verify` result (the envelope's `data`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeployVerifyResult {
+    /// The `--env` value.
+    pub env: String,
+    /// Gateway directory name from the target.
+    pub gateway: String,
+    /// Deployment mode from the target.
+    pub mode: String,
+    /// The node that was verified: always `master`.
+    pub node: String,
+    /// The WebDev project the tag probes were read through.
+    pub project: String,
+    /// True when no check failed.
+    pub ok: bool,
+    /// `deploy_verify_failed` when `ok` is false, else null.
+    pub slug: Option<&'static str>,
+    /// The six checks in fixed order.
+    pub checks: Vec<verify::Check>,
+    /// Declared resources `read_back` compared.
+    pub resources_checked: usize,
+    /// Non-failing notes.
+    pub warnings: Vec<String>,
+}
+
+impl DeployVerifyResult {
+    /// The red-verdict exit passthrough (Decision A), mirroring
+    /// [`crate::actions::testing::TestingRunResult::failure_exit_code`]:
+    /// `Some(6)` (target state) when a check failed, `None` otherwise. The
+    /// envelope renders first; the binary decides the exit after.
+    pub fn failure_exit_code(&self) -> Option<u8> {
+        (!self.ok).then_some(6)
+    }
+}
+
+/// Verify the master gateway against `declared`. Not implemented yet.
+pub async fn deploy_verify(
+    declared: &Declared,
+    project: &str,
+    deploy: &dyn DeployApi,
+    gateway: &dyn GatewayApi,
+    reader: &dyn TreeReader,
+    opts: &VerifyOptions,
+) -> Result<DeployVerifyResult, CoreError> {
+    let _ = (declared, project, deploy, gateway, reader, opts);
+    Err(CoreError::Internal(
+        "deploy_verify is not implemented".to_string(),
+    ))
 }
