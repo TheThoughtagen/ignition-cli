@@ -598,7 +598,13 @@ fn write_pulled(
         other => CoreError::Internal(format!("cannot write {what}: {other:?}")),
     };
 
-    let root = dirfd::open_root(repo).map_err(|e| fail("the repo", e))?;
+    // The repo root is the operator's own and may legitimately be reached
+    // through a symlink (`--repo link`), so it is resolved once here; every
+    // component below it is then opened without following symlinks.
+    let repo_real = std::fs::canonicalize(repo).map_err(|e| {
+        CoreError::Internal(format!("cannot resolve the repo {}: {e}", repo.display()))
+    })?;
+    let root = dirfd::open_root(&repo_real).map_err(|e| fail("the repo", e))?;
     let gateways = dirfd::ensure_dir(&root, "gateways").map_err(|e| fail("gateways", e))?;
     let gw_label = format!("gateways/{gateway}");
     let gw = dirfd::ensure_dir(&gateways, gateway).map_err(|e| fail(&gw_label, e))?;

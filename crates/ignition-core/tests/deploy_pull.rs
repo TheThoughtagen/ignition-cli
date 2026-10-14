@@ -1036,3 +1036,22 @@ async fn pull_is_read_only_on_a_failed_read() {
         "a failed read writes nothing"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pull_works_through_a_symlinked_repo_root() {
+    // the repo root is the operator's own: `--repo link` is fine, only
+    // components below it are never followed
+    let fx = PlanFixture::new();
+    populate_live(&fx);
+    let repo = empty_repo(&fx);
+    let holder = tempfile::TempDir::new().expect("holder");
+    let link = holder.path().join("repo-link");
+    std::os::unix::fs::symlink(&repo, &link).expect("symlink");
+    let reader = reader_for(&link, "dev");
+    let result = deploy_pull(&link, "dev", &reader, false)
+        .await
+        .expect("pull through a symlinked root");
+    assert!(result.files_written > 0);
+    assert!(repo.join("gateways/tracer-gw/manifest.yaml").is_file());
+}
