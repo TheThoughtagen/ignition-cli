@@ -523,6 +523,18 @@ impl SftpTransport {
                 if chains.contains(chain) {
                     roots.push(chain.clone());
                 }
+                // `config` and `config/resources` must exist: a data directory
+                // without them is not a gateway data directory, which is a
+                // failure and never an empty tree.
+                let required = RESOURCES.get(chain.len()).copied();
+                if let Some(need) = required
+                    && !entries.iter().any(|e| e.name == need)
+                {
+                    return Err(self.fail(format!(
+                        "{} cannot be read (not found); is data_dir a gateway data directory?",
+                        RESOURCES[..=chain.len()].join("/")
+                    )));
+                }
                 for entry in entries {
                     let mut child = chain.clone();
                     child.push(entry.name.clone());
@@ -553,7 +565,9 @@ impl SftpTransport {
                                     .fail(format!("{shown} is not a regular file or directory")));
                             }
                         }
-                    } else if chains.iter().any(|t| t.starts_with(child.as_slice())) {
+                    } else if required == Some(entry.name.as_str())
+                        || chains.iter().any(|t| t.starts_with(child.as_slice()))
+                    {
                         match entry.kind {
                             EntryKind::Dir => next.push(child),
                             EntryKind::Symlink => {
@@ -2300,5 +2314,34 @@ mod tests {
         let all: Vec<String> = fake.session_lines().into_iter().flatten().collect();
         assert!(all.iter().any(|l| l.starts_with("get \"")));
         assert!(all.iter().all(|l| !l.contains("get -R")), "{all:?}");
+    }
+
+    #[tokio::test]
+    async fn data_dir_without_config_resources_is_transport_failed() {
+        for missing in ["config", "config/resources"] {
+            let fake = FakeSftp::new();
+            fake.mkdirs(RES);
+            let full = format!("{DATA}/{missing}");
+            fake.fs
+                .lock()
+                .expect("fs")
+                .retain(|k, _| k != &full && !k.starts_with(&format!("{full}/")));
+            let why = detail(transport(&fake).read(&scope()).await.expect_err(missing));
+            assert!(why.contains(missing), "{missing}: {why}");
+            assert!(why.contains("gateway data directory"), "{why}");
+        }
+        // also with an empty scope
+        let fake = FakeSftp::new();
+        let empty = Scope {
+            mode: "production".to_string(),
+            types: Vec::new(),
+            tag_providers: Vec::new(),
+        };
+        detail(
+            transport(&fake)
+                .read(&empty)
+                .await
+                .expect_err("bare data dir"),
+        );
     }
 }
