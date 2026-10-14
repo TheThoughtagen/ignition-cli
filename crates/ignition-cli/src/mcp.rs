@@ -883,6 +883,31 @@ mod tests {
         );
     }
 
+    /// 22-02 (DPLN-02, Decision D): `deploy plan` is read-only (no write
+    /// path, no `GUARDED_OPS` entry), so the derived catalog tool
+    /// `deploy_plan` advertises no `confirm`.
+    #[test]
+    fn deploy_plan_is_an_unguarded_catalog_tool() {
+        let catalog = build_catalog();
+        let entry = catalog
+            .iter()
+            .find(|e| e.name == "deploy_plan")
+            .expect("deploy_plan derives from the clap tree");
+        assert_eq!(entry.path, "deploy plan");
+        assert!(
+            !GUARDED_OPS.iter().any(|(path, _)| *path == "deploy plan"),
+            "deploy plan is read-only and must not be guarded"
+        );
+        assert!(
+            entry
+                .schema
+                .get("properties")
+                .and_then(|props| props.get("confirm"))
+                .is_none(),
+            "deploy_plan advertises no confirm property"
+        );
+    }
+
     /// The catalog's name encoding is injective over the leaf paths —
     /// two distinct leaves mapping to one tool name would let
     /// tools/call dispatch the WRONG verb.

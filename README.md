@@ -2094,6 +2094,7 @@ followed.
 | `mode` | required deployment mode name |
 | `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block |
 | `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir` |
+| `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
 
 **The allowlist (D-02).** Only the `module/type` directories listed in the
 manifest `types` are rendered. A type directory that is not listed is
@@ -2474,6 +2475,91 @@ Plane counts as 2), not bytes or characters. Reserved names compare the
 ASCII-uppercased stem. A zero-byte non-JSON member renders as a zero-byte
 file; an empty directory contributes no file and no resource entry. These
 checks also apply to tag files, which use their mapped collection paths.
+
+### `deploy plan`
+
+`ign deploy plan --env <ENV> [--repo DIR]` compares the rendered tree for one
+environment with the live gateway files of `nodes.master` and reports what a
+deploy would do. It is **read-only**: it writes nothing, takes no lock, opens
+no gateway session and sends no REST request, so it needs no secret and no
+reachable gateway; the envelope `profile` is the master node's profile name
+from the target file, used as a label only. The host is read through
+`nodes.master.local` (the gateway data directory on this machine) or
+`nodes.master.ssh`. A master with neither block exits 2 `deploy_tree_invalid`
+naming `nodes.master`; a host that cannot be read exits 4 `transport_failed`
+naming `nodes.master`. A read failure is never treated as an empty gateway.
+
+**Exit 0 always.** A plan that finds changes still exits 0 (the success
+envelope carries `data.summary.has_changes`); only a refusal exits non-zero.
+
+**Basis and `live_in` (D-17).** The plan reasons about **units**, not files:
+one `<module>/<type>/<name>` resource, one singleton, or one tag folder. A
+rendered unit is compared with its **effective live copy**: the copy in the
+mode collection (`config/resources/<mode>/`) when the unit exists there, else
+the copy in `core`, because the gateway overrides whole resources and tag
+folders by name. `live_in` lists where live copies sit, the ordered subset of
+`["core", "mode"]`, so a `same` unit that is not yet in the mode collection is
+still visible. Comparison is byte-exact: a whitespace-only change is
+`changed`.
+
+**Statuses (D-06).**
+
+| Status | Meaning |
+|--------|---------|
+| `added` | rendered, no effective live copy |
+| `changed` | rendered, the effective copy differs in file set or any byte |
+| `removed` | produced from the delete set (arrives with the ledger, plan 22-03) |
+| `same` | rendered, the effective copy has the same files, byte-equal |
+| `unmanaged` | live, of an allowlisted type or declared provider, not rendered; never deleted and never counted in `has_changes` |
+
+**`core` relation.** `core` relates the `core` collection's copy of a unit to
+the rendered unit: `none` (no core copy), `identical`, `differs`, `hidden` (a
+tag folder defined in the mode collection whose core copy holds files the
+rendered folder lacks; the gateway overrides these by folder, so those core
+files are invisible) or `shadows_removal` (status `removed` while a core copy
+exists; arrives with plan 22-03).
+
+**Data keys.** With `--json` the envelope's `data` carries `env`, `gateway`,
+`mode`, `node` (always `master`), `transport` (`local` or `ssh`),
+`render_sha256`, `plan_sha256`, `summary` (`added`, `changed`, `removed`,
+`same`, `unmanaged`, `has_changes`), `entries` and `warnings`. Each entry is
+`{key, module, type, name, status, live_in, core, files}` where `files` are
+`{path, live_sha256, desired_sha256}`; entries are in unit-key byte order.
+Keys are only ever added, never renamed. Entries carry paths and hashes,
+never file bytes.
+
+**Human output.** The first line is
+`plan <gateway> (<env>, mode <mode>) via <transport>: <a> added, <c> changed, <r> removed, <s> same, <u> unmanaged`,
+then one line per entry whose status is not `same`
+(`<status> <key> core=<core> live_in=<a,b>`), then `plan_sha256 <hex>`. Each
+warning goes to stderr as `warning: ...`.
+
+**`plan_sha256` (D-08).** The lowercase hex SHA-256 of this UTF-8 text, byte
+for byte. `LF` is `0x0A` and `NUL` is `0x00`:
+
+```text
+ign-deploy:plan:v1 LF
+render_sha256 NUL <render_sha256 hex> LF
+E NUL <key> NUL <status> NUL <core> NUL <live_in joined by ","> LF
+F NUL <collection path> NUL <live sha256 or -> NUL <desired sha256 or -> LF
+D NUL <collection path> LF
+```
+
+One `E` line per entry that is not `unmanaged`, in unit-key byte order, each
+followed by its `F` lines in path byte order; then one `D` line per delete-set
+path in byte order (none until plan 22-03). `status` and `core` are the
+serialized words. Drift, diff text and warnings are excluded on purpose, as
+are `unmanaged` entries, so a review hash is reproducible and unrelated live
+resources never invalidate it.
+
+**The `local/` collection.** The gateway loads the `local` collection over the
+mode collection. The plan does not model it: when a unit also exists in
+`config/resources/local/`, the plan adds a warning that it does not describe
+what the gateway runs for that unit.
+
+**Over MCP.** `deploy plan` is in the `ign mcp serve` tool catalog as
+`deploy_plan`. It is read-only, so the tool is not guarded and takes no
+`confirm` argument.
 
 ## Linting (`ign lint`)
 

@@ -41,7 +41,7 @@ Numbering: new categories. **47 requirements.**
 ### Transport, Plan, Pull, Verify (read-only)
 
 - [ ] **DPLN-01**: `ign` reads and writes a gateway's config tree over system OpenSSH to a Windows OpenSSH host (and over the local filesystem for rigs and tests) with batch mode, a pinned host key, per-call timeouts and argv-only invocation; file hashes are computed client-side
-- [ ] **DPLN-02**: User can run `ign deploy plan` to see each resource as added, changed, removed or same against the live master, with zero writes and zero locks, exit 0, `data.summary.has_changes`, and a `plan_sha256`
+- [ ] **DPLN-02**: User can run `ign deploy plan` to see each resource as added, changed, removed or same against the live master, with zero writes and zero locks, exit 0, `data.summary.has_changes`, and a `plan_sha256` (Phase 22 D-06: a fifth status, `unmanaged`, lists live allowlisted resources that are neither rendered nor in the delete set; never deleted, never counted in has_changes)
 - [ ] **DPLN-03**: The plan classifies every entry's relation to `core` (none, identical, differs, hidden, shadows_removal) and flags destructive and lockout-risk entries
 - [ ] **DPLN-04**: The plan states the exact delete set — previously declared names minus rendered names — which never includes `config-mode.json` or an undeclared resource
 - [ ] **DPLN-05**: User can pass `--base <previous render>` to mark entries the live gateway changed outside the pipeline as drift

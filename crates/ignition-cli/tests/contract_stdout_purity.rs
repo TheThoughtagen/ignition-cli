@@ -419,3 +419,77 @@ fn deploy_render_refusal_keeps_stdout_byte_empty() {
         "expected the slug on stderr: {stderr}"
     );
 }
+
+/// 22-02: `deploy plan` over a `local:` tracer copy (an empty live
+/// `config/resources/`, so every unit is `added`) keeps stdout to exactly one
+/// JSON value and its trailing newline under max diagnostics.
+#[test]
+fn deploy_plan_json_stdout_is_the_envelope_only() {
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let dest = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), &dest).expect("copy");
+            }
+        }
+    }
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    copy_dir(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ignition-core/tests/fixtures/deploy/repos/tracer"
+        )),
+        &repo,
+    );
+    let data = scratch.path().join("data");
+    std::fs::create_dir_all(data.join("config").join("resources")).expect("resources dir");
+    std::fs::write(
+        repo.join("targets/dev.yaml"),
+        format!(
+            "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+            data.display()
+        ),
+    )
+    .expect("target file");
+
+    let (_dir, mut cmd) = noisy_ign();
+    let output = cmd
+        .args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = &output.stdout;
+    assert!(
+        stdout.ends_with(b"\n") && !stdout.ends_with(b"\n\n"),
+        "exactly one trailing newline: {:?}",
+        String::from_utf8_lossy(stdout)
+    );
+    let mut stream = serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>();
+    let envelope = stream
+        .next()
+        .expect("one JSON value")
+        .expect("stdout parses as JSON");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["summary"]["has_changes"], true);
+    let value_end = stream.byte_offset();
+    assert!(
+        stream.next().is_none(),
+        "stdout holds exactly one JSON value"
+    );
+    assert_eq!(
+        stdout[value_end..],
+        *b"\n",
+        "nothing but the newline follows the envelope"
+    );
+}
