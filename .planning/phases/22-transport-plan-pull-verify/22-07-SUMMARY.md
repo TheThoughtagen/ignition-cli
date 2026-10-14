@@ -187,3 +187,7 @@ Two confirmed findings and one follow-up from the coordinator. Commits: F6 `ab76
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean.
 - New packages: none. `Cargo.lock` is byte-identical to `d38f42b` (`git diff d38f42b HEAD -- Cargo.lock` is empty); `rustix` (`fs`) and `base64` were already direct dependencies.
 - `.planning/config.json` and `.planning/research/.cache/` untouched (still the pre-existing uncommitted state).
+
+### Accepted residual (orchestrator, 2026-10-14)
+
+- A further review flagged a TOCTOU in `local.rs` after `02707b9`. No path-based mutation remains in the local mirror. What remains are the documented residuals: chain roots (`data_dir`, staging root) opened by path, and the detect-only hash-then-`renameat` window. Exploiting either needs local write access to the gateway data dir or staging root, which can already alter the gateway. The write half is unreachable until Phase 23. Re-audit when Phase 23 makes it reachable (`/gsd-secure-phase 23`).
