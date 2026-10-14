@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -822,6 +822,21 @@ pub enum CoreError {
         /// What went wrong; names paths and causes, never file content.
         detail: String,
     },
+
+    /// The on-box declared-names ledger exists but cannot be trusted (22-03,
+    /// D-07): unreadable, empty, over its size cap, not strict UTF-8 JSON, of
+    /// another schema version, naming another gateway or mode, unsorted or
+    /// duplicated, or listing a path plan must never delete. Exit 6 -
+    /// target_state class: the on-box state is wrong, not the caller's input.
+    /// Plan never falls back to an empty delete set. `problem` names fields
+    /// and listed paths only, never other file content.
+    #[error("declared-names ledger {location} is unusable: {problem}")]
+    DeployLedgerInvalid {
+        /// The ledger location relative to the node's data directory.
+        location: String,
+        /// What is wrong; names fields and listed paths, never file content.
+        problem: String,
+    },
 }
 
 /// Findings shown inline by the deploy error Displays; the rest collapse
@@ -1054,6 +1069,7 @@ impl CoreError {
             Self::DeployTreeInvalid(..) => "deploy_tree_invalid",
             Self::EmbeddedSecret(..) => "embedded_secret",
             Self::TransportFailed { .. } => "transport_failed",
+            Self::DeployLedgerInvalid { .. } => "deploy_ledger_invalid",
         }
     }
 
@@ -1111,7 +1127,8 @@ impl CoreError {
             | Self::ScanLockHeld { .. }
             | Self::ResourceSignatureRejected { .. }
             | Self::ResourceExists { .. }
-            | Self::ModeExists { .. } => 6,
+            | Self::ModeExists { .. }
+            | Self::DeployLedgerInvalid { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1496,6 +1513,11 @@ impl CoreError {
                  key and reachability. Nothing was read as absent, so no plan was made"
                     .to_string(),
             ),
+            Self::DeployLedgerInvalid { .. } => Some(
+                "the delete set is never assumed empty, so no plan was made; inspect or \
+                 restore the ledger file named above (only an apply writes it) and rerun"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1539,8 +1561,12 @@ impl CoreError {
     }
 
     /// The deploy slugs (21-03), in the order the README row lists them.
-    pub const DEPLOY_SLUGS: &'static [&'static str] =
-        &["deploy_tree_invalid", "embedded_secret", "transport_failed"];
+    pub const DEPLOY_SLUGS: &'static [&'static str] = &[
+        "deploy_tree_invalid",
+        "embedded_secret",
+        "transport_failed",
+        "deploy_ledger_invalid",
+    ];
 
     /// A single positioned (or file-only, when `line`/`column` are
     /// `None`) tree finding as a [`Self::DeployTreeInvalid`].
@@ -2100,6 +2126,14 @@ mod tests {
                 4,
                 "transport_failed",
             ),
+            (
+                CoreError::DeployLedgerInvalid {
+                    location: "ign-deploy/gw/dev/ledger.json".into(),
+                    problem: "files is not byte-sorted".into(),
+                },
+                6,
+                "deploy_ledger_invalid",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2168,6 +2202,7 @@ mod tests {
         (6, "resource_signature_rejected"),
         (6, "resource_exists"),
         (6, "mode_exists"),
+        (6, "deploy_ledger_invalid"),
         (7, "rig_error"),
     ];
 
@@ -2891,6 +2926,13 @@ mod tests {
                     detail: "data_dir is missing".into(),
                 },
                 4,
+            ),
+            (
+                CoreError::DeployLedgerInvalid {
+                    location: "ign-deploy/gw/dev/ledger.json".into(),
+                    problem: "the file is empty".into(),
+                },
+                6,
             ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
