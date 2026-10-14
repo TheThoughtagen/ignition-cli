@@ -2093,7 +2093,10 @@ followed.
 | `gateway` | required directory name under `gateways/` |
 | `mode` | required deployment mode name |
 | `nodes.master`, `nodes.backup` | `master` required, `backup` optional; each has `profile` (an `ign` profile NAME, never a secret) and an optional `ssh` block |
-| `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir` |
+| `nodes.*.ssh` | `host`, `port`, `user`, `key_file` or `key_env` (a file path or an env var NAME, never both and never a key), `os` (`windows` or `linux`), `data_dir`, `known_hosts`, `connect_timeout_s`, `op_timeout_s` |
+| `nodes.*.ssh.known_hosts` | required: a repo-relative path (no leading `/`, no `..`, no backslash) to the reviewed `known_hosts` file that pins the host key. `ign` copies it into a private temp directory and gives ssh that copy with `StrictHostKeyChecking=yes`; the runner's own `~/.ssh/known_hosts` is never read |
+| `nodes.*.ssh.connect_timeout_s` | optional, `1`..`120`, default `10`: ssh `ConnectTimeout` in seconds |
+| `nodes.*.ssh.op_timeout_s` | optional, `1`..`3600`, default `120`: one ssh or sftp call may run this long before it is killed (`transport_failed`) |
 | `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
 
 **The allowlist (D-02).** Only the `module/type` directories listed in the
@@ -2627,6 +2630,32 @@ v1 is one strict JSON object:
   exits 6 `deploy_ledger_invalid`, naming the ledger location and the problem.
   Plan never falls back to an empty delete set. The problem text names fields
   and listed paths only, never other file content.
+
+#### SSH transport hardening
+
+An `ssh` node is reached with the system `ssh` and `sftp` clients, started with
+an argument vector and never through a shell string; `host` and `user` may not
+start with `-`, hold whitespace or control characters, or contain `@`, and `--`
+always precedes `user@host`. Every call pins, on the command line (so a
+user's `~/.ssh/config` cannot weaken them): `BatchMode=yes`,
+`StrictHostKeyChecking=yes`, `UserKnownHostsFile` set to the copy of the
+repo's `known_hosts`, `GlobalKnownHostsFile` set to the null device,
+`UpdateHostKeys=no`, `VerifyHostKeyDNS=no`, public-key authentication only (no
+password or keyboard-interactive prompts), no agent, X11 or port forwarding, no
+local command, no control socket, `ConnectTimeout` from `connect_timeout_s`,
+`ServerAliveInterval=5`, `ServerAliveCountMax=3` and `LogLevel=ERROR`. Stdin is
+closed after the call's input, a call that outlives `op_timeout_s` is killed,
+and captured output is bounded; a failure keeps only the last five stderr
+lines (at most 1 KiB, control characters and the private temp path removed).
+
+`key_env` names an environment variable holding the private key **text**. It
+is normalised (CRLF to LF, one trailing newline), written with owner-only
+permissions into a private temp directory (an owner-only ACL through `icacls`
+on a Windows runner), passed as `-i <file>` with `IdentitiesOnly=yes`, and
+deleted when the call set ends. The key never appears in an argument, an
+error, the JSON envelope or a log line; an unset or empty variable is exit 4
+`transport_failed` naming the variable. With neither `key_file` nor `key_env`
+the SSH agent is used.
 
 #### Drift (`--base DIR`)
 
