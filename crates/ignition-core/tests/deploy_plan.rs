@@ -166,7 +166,7 @@ async fn plan_master_without_host_access_is_refused() {
 
     // both blocks: load_declared refuses, naming the node
     let both = format!(
-        "    local:\n      data_dir: '{}'\n    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /d\n",
+        "    local:\n      data_dir: '{}'\n    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /d\n      known_hosts: kh\n",
         fx.data_dir().display()
     );
     let repo = fx.repo_with_master("dev", &both);

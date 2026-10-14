@@ -864,7 +864,7 @@ mod tests {
         // allowed relative length by 12
         let dir = format!("D:\\{}", "d".repeat(60));
         let windows = format!(
-            "    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: '{dir}'\n"
+            "    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: '{dir}'\n      known_hosts: kh\n"
         );
         let t2 = target("production", &windows);
         assert_eq!(windows_prefix_len(&t2), 79 + 12);
@@ -872,12 +872,12 @@ mod tests {
         assert_eq!(lint(&[(&path_of(168 - 12), b"")], &t2).len(), 1);
 
         // a trailing separator is trimmed and the backup node counts
-        let backup = "  backup:\n    profile: b\n    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: 'C:\\Program Files\\Inductive Automation\\Ignition\\data\\ab\\'\n";
+        let backup = "  backup:\n    profile: b\n    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: 'C:\\Program Files\\Inductive Automation\\Ignition\\data\\ab\\'\n      known_hosts: kh\n";
         assert_eq!(windows_prefix_len(&target("production", backup)), 79 + 3);
 
         // a Linux node never lowers the budget
         let linux = format!(
-            "    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /{}\n",
+            "    ssh:\n      host: h\n      user: u\n      os: linux\n      data_dir: /{}\n      known_hosts: kh\n",
             "l".repeat(100)
         );
         assert_eq!(windows_prefix_len(&target("production", &linux)), 79);

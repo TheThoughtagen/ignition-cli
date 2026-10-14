@@ -1948,7 +1948,7 @@ fn windows_node_data_dir_lowers_the_render_budget() {
     };
     let linux = TARGET;
     let windows = format!(
-        "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: 'D:\\{}'\n",
+        "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: dev\n    ssh:\n      host: h\n      user: u\n      os: windows\n      data_dir: 'D:\\{}'\n      known_hosts: kh\n",
         "d".repeat(60)
     );
     let at_limit = |target: &[u8], units: usize| {
