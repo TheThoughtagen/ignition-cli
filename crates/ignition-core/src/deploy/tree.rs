@@ -17,13 +17,14 @@
 //! empty tree hashes the empty listing ([`EMPTY_RENDER_SHA256`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::layout::RelPath;
+use super::transport::READ_MAX_FILE_BYTES;
 use crate::error::{CoreError, DeployFinding};
 
 /// SHA-256 of the empty listing (the digest of a render that produced no
@@ -378,18 +379,8 @@ pub(crate) fn walk_capped(
 ) -> Result<(), String> {
     let read = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read directory {} ({})", join(rel, ""), e.kind()))?;
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    for entry in read {
-        let entry = entry.map_err(|e| format!("cannot read a directory entry ({})", e.kind()))?;
-        let name = entry.file_name().into_string().map_err(|raw| {
-            format!(
-                "{} has a name that is not valid UTF-8",
-                join(rel, &raw.to_string_lossy())
-            )
-        })?;
-        entries.push((name, entry.path()));
-    }
-    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let listing = read.map(|entry| entry.map(|entry| (entry.file_name(), entry.path())));
+    let entries = collect_capped(listing, rel, files.len() + dirs.len(), max_entries)?;
     for (name, path) in entries {
         let child = join(rel, &name);
         let meta = std::fs::symlink_metadata(&path)
@@ -413,6 +404,84 @@ pub(crate) fn walk_capped(
         }
     }
     Ok(())
+}
+
+/// Collect one directory's entries, sorted by name bytes, stopping with an
+/// error as soon as `taken` (entries the walk already holds) plus the entries
+/// collected here exceed `max_entries`, so a flat directory of millions of
+/// entries is never enumerated or allocated in full.
+fn collect_capped(
+    listing: impl Iterator<Item = std::io::Result<(std::ffi::OsString, PathBuf)>>,
+    rel: &str,
+    taken: usize,
+    max_entries: usize,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for entry in listing {
+        let (raw, path) =
+            entry.map_err(|e| format!("cannot read a directory entry ({})", e.kind()))?;
+        let name = raw.into_string().map_err(|raw| {
+            format!(
+                "{} has a name that is not valid UTF-8",
+                join(rel, &raw.to_string_lossy())
+            )
+        })?;
+        if taken.saturating_add(entries.len()) >= max_entries {
+            return Err(format!(
+                "more than {max_entries} entries (at {})",
+                join(rel, &name)
+            ));
+        }
+        entries.push((name, path));
+    }
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    Ok(entries)
+}
+
+/// Why [`open_regular_file`] refused.
+#[derive(Debug)]
+pub(crate) enum OpenError {
+    /// The open or a metadata call failed.
+    Io(std::io::Error),
+    /// The opened handle is not the regular file that was inspected: it was
+    /// swapped (for a symlink target or another file) after the check.
+    Changed,
+}
+
+/// Open `path` and validate the HANDLE against `before`, the
+/// `symlink_metadata` taken when the path was inspected. Closes the window
+/// between that check and the open, in which the file could be replaced by a
+/// symlink to something outside the tree: the opened file must be a regular
+/// file and, on unix, the same device and inode as `before`; on windows the
+/// open does not follow reparse points and the handle must not be one.
+/// Returns the file and its handle metadata (take sizes from that).
+pub(crate) fn open_regular_file(
+    path: &Path,
+    before: &std::fs::Metadata,
+) -> Result<(std::fs::File, std::fs::Metadata), OpenError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the link itself, never its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path).map_err(OpenError::Io)?;
+    let held = file.metadata().map_err(OpenError::Io)?;
+    if held.file_type().is_symlink() || !held.is_file() {
+        return Err(OpenError::Changed);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if held.dev() != before.dev() || held.ino() != before.ino() {
+            return Err(OpenError::Changed);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = before;
+    Ok((file, held))
 }
 
 /// `symlink_metadata` of `repo/rel`, as a finding on failure.
@@ -457,18 +526,34 @@ pub(crate) fn require_repo_dir(repo: &Path, rel: &str) -> Result<(), CoreError> 
 }
 
 /// Read `repo/rel` as a regular file; a symlink or non-file is refused.
-/// Parent directories are checked too, so a symlinked parent cannot
-/// redirect the read.
+/// Every parent directory is checked, so a symlinked parent at any depth
+/// cannot redirect the read. The file is then opened first and the handle
+/// validated against the inspected metadata, and at most
+/// [`READ_MAX_FILE_BYTES`] are read.
+///
+/// Residual race: a parent directory swapped for a symlink between the
+/// parent check and the open is not detected (it would take descriptor-
+/// relative `openat`, which std does not expose). The repo is the operator's
+/// own checkout; the gateway data directory, the untrusted side, goes
+/// through the same handle check in the local transport.
 pub(crate) fn read_repo_file(
     repo: &Path,
     rel: &str,
     hint: Option<&str>,
 ) -> Result<Vec<u8>, CoreError> {
-    if let Some((parent, _)) = rel.rsplit_once('/')
-        && let Some(first) = parent.split('/').next()
-        && repo.join(first).exists()
-    {
-        require_repo_dir(repo, first)?;
+    if let Some((parent, _)) = rel.rsplit_once('/') {
+        let mut prefix = String::new();
+        for part in parent.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            match std::fs::symlink_metadata(repo.join(&prefix)) {
+                // A missing component is reported by the file check below.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                _ => require_repo_dir(repo, &prefix)?,
+            }
+        }
     }
     let meta = tree_meta(repo, rel, hint)?;
     if !meta.file_type().is_file() {
@@ -479,9 +564,40 @@ pub(crate) fn read_repo_file(
             "is not a regular file",
         ));
     }
-    std::fs::read(repo.join(rel)).map_err(|e| {
-        CoreError::deploy_tree_invalid(rel, None, None, format!("cannot read ({})", e.kind()))
-    })
+    let (file, held) = open_regular_file(&repo.join(rel), &meta).map_err(|e| match e {
+        OpenError::Changed => CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            "changed while it was read; symlinks are refused",
+        ),
+        OpenError::Io(e) => {
+            CoreError::deploy_tree_invalid(rel, None, None, format!("cannot read ({})", e.kind()))
+        }
+    })?;
+    if held.len() > READ_MAX_FILE_BYTES {
+        return Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            format!("is over the {READ_MAX_FILE_BYTES} byte file cap"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(READ_MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            CoreError::deploy_tree_invalid(rel, None, None, format!("cannot read ({})", e.kind()))
+        })?;
+    if bytes.len() as u64 > READ_MAX_FILE_BYTES {
+        return Err(CoreError::deploy_tree_invalid(
+            rel,
+            None,
+            None,
+            format!("grew past the {READ_MAX_FILE_BYTES} byte file cap while it was read"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn io_failure(what: &str, path: &Path, e: &std::io::Error) -> CoreError {
@@ -834,6 +950,102 @@ mod tests {
         let why = walk_capped(dir.path(), "root", &mut files, &mut dirs, 2)
             .expect_err("three entries exceed a cap of two");
         assert!(why.contains("more than 2 entries"), "{why}");
+    }
+
+    #[test]
+    fn walk_capped_stops_a_flat_directory_before_enumerating_it() {
+        // A lazy listing of far more entries than the cap: the collector must
+        // stop pulling as soon as the cap is crossed, not drain the iterator.
+        let pulled = std::cell::Cell::new(0_usize);
+        let listing = (0..1_000_000_usize).map(|i| {
+            pulled.set(pulled.get() + 1);
+            Ok((
+                std::ffi::OsString::from(format!("e{i}")),
+                PathBuf::from("x"),
+            ))
+        });
+        let why = collect_capped(listing, "root", 0, 5)
+            .expect_err("a flat directory over the cap must fail");
+        assert!(why.contains("more than 5 entries (at root/"), "{why}");
+        assert!(pulled.get() <= 6, "pulled {} entries", pulled.get());
+
+        // Entries already held by the walk count against the same cap, and
+        // the entries that fit stay sorted by name bytes.
+        let fits = [("b", "p"), ("a", "p")]
+            .into_iter()
+            .map(|(n, p)| Ok((std::ffi::OsString::from(n), PathBuf::from(p))));
+        let got = collect_capped(fits, "root", 3, 5).expect("two more fit under five");
+        assert_eq!(
+            got.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let fits = [("b", "p"), ("a", "p")]
+            .into_iter()
+            .map(|(n, p)| Ok((std::ffi::OsString::from(n), PathBuf::from(p))));
+        assert!(collect_capped(fits, "root", 4, 5).is_err());
+    }
+
+    #[test]
+    fn walk_capped_counts_a_flat_directory_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"x").expect("write");
+        }
+        let (mut files, mut dirs) = (BTreeMap::new(), BTreeSet::new());
+        let why = walk_capped(dir.path(), "root", &mut files, &mut dirs, 4)
+            .expect_err("ten entries exceed a cap of four");
+        assert!(why.contains("more than 4 entries"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_rejects_a_swapped_inode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let inside = dir.path().join("f");
+        std::fs::write(&inside, b"inside").expect("write");
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, b"outside").expect("write");
+
+        // The check-time metadata is of the real file.
+        let before = std::fs::symlink_metadata(&inside).expect("meta");
+        let (_, held) = open_regular_file(&inside, &before).expect("unswapped file opens");
+        assert_eq!(held.len(), 6);
+
+        // Swap the file for a symlink to an outside file after the check.
+        std::fs::remove_file(&inside).expect("remove");
+        std::os::unix::fs::symlink(&secret, &inside).expect("symlink");
+        assert!(matches!(
+            open_regular_file(&inside, &before),
+            Err(OpenError::Changed)
+        ));
+
+        // Swap in a different regular file: also a changed inode.
+        std::fs::remove_file(&inside).expect("remove");
+        std::fs::write(&inside, b"replaced").expect("write");
+        assert!(matches!(
+            open_regular_file(&inside, &before),
+            Err(OpenError::Changed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_repo_file_refuses_a_symlinked_deep_parent_and_caps_bytes() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("m.json"), b"{}").expect("write");
+        std::fs::create_dir_all(repo.path().join("a")).expect("mkdir");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("a/b")).expect("symlink");
+        let err = read_repo_file(repo.path(), "a/b/m.json", None)
+            .expect_err("a symlinked second component must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        std::fs::write(repo.path().join("a/ok.json"), b"{}").expect("write");
+        assert_eq!(
+            read_repo_file(repo.path(), "a/ok.json", None).expect("plain read"),
+            b"{}"
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::deploy::layout::{RelPath, TAG_TYPES};
 use crate::deploy::plan::unit_key;
-use crate::deploy::tree::{sha256_hex, walk_capped};
+use crate::deploy::tree::{OpenError, open_regular_file, sha256_hex, walk_capped};
 use crate::error::CoreError;
 
 /// The collection that overrides the mode collection on the gateway.
@@ -181,26 +181,29 @@ impl LocalFsTransport {
         let mut blobs = BTreeMap::new();
         for (key, path) in paths {
             let shown = format!("config/resources/{collection}/{key}");
-            let meta = std::fs::symlink_metadata(&path)
+            let before = std::fs::symlink_metadata(&path)
                 .map_err(|e| self.fail(format!("cannot inspect {shown} ({})", e.kind())))?;
-            if !meta.file_type().is_file() {
+            if !before.file_type().is_file() {
                 return Err(self.fail(format!("{shown} is no longer a regular file")));
             }
-            if meta.len() > READ_MAX_FILE_BYTES {
+            // Open first, then validate the handle: a file swapped for a
+            // symlink after the check above is not read.
+            let (file, held) = self.open_checked(&path, &before, &shown)?;
+            let len = held.len();
+            if len > READ_MAX_FILE_BYTES {
                 return Err(self.fail(format!(
-                    "{shown} is {} bytes, over the {READ_MAX_FILE_BYTES} byte file cap",
-                    meta.len()
+                    "{shown} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
                 )));
             }
-            budget.bytes += meta.len();
+            budget.bytes += len;
             if budget.bytes > READ_MAX_TOTAL_BYTES {
                 return Err(self.fail(format!(
                     "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {shown})"
                 )));
             }
-            let mut bytes = Vec::with_capacity(meta.len() as usize);
-            std::fs::File::open(&path)
-                .and_then(|file| file.take(READ_MAX_FILE_BYTES + 1).read_to_end(&mut bytes))
+            let mut bytes = Vec::with_capacity(len as usize);
+            file.take(READ_MAX_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
                 .map_err(|e| self.fail(format!("cannot read {shown} ({})", e.kind())))?;
             if bytes.len() as u64 > READ_MAX_FILE_BYTES {
                 return Err(self.fail(format!(
@@ -211,6 +214,19 @@ impl LocalFsTransport {
             blobs.insert(key, FileBlob { bytes, sha256 });
         }
         Ok(blobs)
+    }
+
+    /// Open `path` and validate the handle against `before`.
+    fn open_checked(
+        &self,
+        path: &Path,
+        before: &std::fs::Metadata,
+        shown: &str,
+    ) -> Result<(std::fs::File, std::fs::Metadata), CoreError> {
+        open_regular_file(path, before).map_err(|e| match e {
+            OpenError::Changed => self.fail(format!("{shown} changed while it was read")),
+            OpenError::Io(e) => self.fail(format!("cannot read {shown} ({})", e.kind())),
+        })
     }
 
     fn read_blocking(&self, scope: &Scope) -> Result<ObservedFiles, CoreError> {
@@ -239,10 +255,11 @@ impl LocalFsTransport {
         };
         let coll_rel = format!("{base_rel}/{collection}");
         let mut pairs = Vec::new();
-        for module in self.child_dirs(&coll_dir, &coll_rel)? {
+        let mut seen = 0;
+        for module in self.child_dirs(&coll_dir, &coll_rel, &mut seen, READ_MAX_ENTRIES)? {
             let module_dir = coll_dir.join(&module);
             let module_rel = format!("{coll_rel}/{module}");
-            for ty in self.child_dirs(&module_dir, &module_rel)? {
+            for ty in self.child_dirs(&module_dir, &module_rel, &mut seen, READ_MAX_ENTRIES)? {
                 pairs.push((module.clone(), ty));
             }
         }
@@ -253,14 +270,26 @@ impl LocalFsTransport {
     }
 
     /// Names of the sub-directories of `dir`; plain files are ignored, a
-    /// symlink or a non-UTF-8 name is refused.
-    fn child_dirs(&self, dir: &Path, rel: &str) -> Result<Vec<String>, CoreError> {
+    /// symlink or a non-UTF-8 name is refused. Every entry read, files
+    /// included, counts against `seen`, shared across one listing, and the
+    /// listing stops as soon as `seen` passes `max_entries`.
+    fn child_dirs(
+        &self,
+        dir: &Path,
+        rel: &str,
+        seen: &mut usize,
+        max_entries: usize,
+    ) -> Result<Vec<String>, CoreError> {
         let read = std::fs::read_dir(dir)
             .map_err(|e| self.fail(format!("cannot read directory {rel} ({})", e.kind())))?;
         let mut names = Vec::new();
         for entry in read {
             let entry = entry
                 .map_err(|e| self.fail(format!("cannot read an entry of {rel} ({})", e.kind())))?;
+            *seen += 1;
+            if *seen > max_entries {
+                return Err(self.fail(format!("more than {max_entries} entries (at {rel})")));
+            }
             let name = entry.file_name().into_string().map_err(|raw| {
                 self.fail(format!(
                     "{rel}/{} has a name that is not valid UTF-8",
@@ -297,5 +326,78 @@ impl TreeReader for LocalFsTransport {
         tokio::task::spawn_blocking(move || this.read_blocking(&scope))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_dirs_stops_at_the_entry_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"x").expect("write");
+        }
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let mut seen = 0;
+        let err = transport
+            .child_dirs(dir.path(), "config/resources/core", &mut seen, 3)
+            .expect_err("six entries exceed a cap of three");
+        let text = err.to_string();
+        assert!(text.contains("more than 3 entries"), "{text}");
+        assert!(text.contains("config/resources/core"), "{text}");
+
+        // The counter is shared: a second directory continues from it.
+        let mut seen = 0;
+        assert!(
+            transport
+                .child_dirs(dir.path(), "r", &mut seen, 6)
+                .expect("six fit under six")
+                .is_empty()
+        );
+        assert_eq!(seen, 6);
+        assert!(transport.child_dirs(dir.path(), "r", &mut seen, 6).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_blobs_refuses_a_file_swapped_for_a_symlink_after_the_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, b"outside").expect("write");
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"inside").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+
+        let mut paths = BTreeMap::new();
+        paths.insert(RelPath::new("f").expect("rel"), file.clone());
+        let blobs = transport
+            .read_blobs("core", paths.clone(), &mut Budget::default())
+            .expect("a plain file reads");
+        assert_eq!(blobs.values().next().expect("one").bytes, b"inside");
+
+        // The swap itself is a race between check and open; the handle check
+        // that closes it is exercised directly with the stale metadata.
+        let before = std::fs::symlink_metadata(&file).expect("meta");
+        std::fs::remove_file(&file).expect("remove");
+        std::os::unix::fs::symlink(&secret, &file).expect("symlink");
+        let err = transport
+            .open_checked(&file, &before, "config/resources/core/f")
+            .expect_err("a swapped inode must be refused");
+        assert!(
+            err.to_string()
+                .contains("config/resources/core/f changed while it was read"),
+            "{err}"
+        );
+        // And a symlink present at check time is still refused up front.
+        let err = transport
+            .read_blobs("core", paths, &mut Budget::default())
+            .expect_err("a symlink is not a regular file");
+        assert!(
+            err.to_string().contains("no longer a regular file"),
+            "{err}"
+        );
     }
 }
