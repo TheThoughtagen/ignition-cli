@@ -376,7 +376,7 @@ impl RemoteCommand {
 ///
 /// Each op renders to `<command> "<path>"…` with every remote path through
 /// [`safe_remote_path`] and every local path through [`safe_local_path`]
-/// (both also refuse a leading `-`). Only the two listing ops carry the `@`
+/// (both also refuse a leading `-`). Only the listing ops carry the `@`
 /// quiet prefix, which hides the echoed command so stdout is the listing; no
 /// op ever starts with `-`, so a failure is never suppressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +385,10 @@ pub enum SftpOp {
     Ls { path: String },
     /// `@ls -l "<path>"`: the long listing.
     LsLong { path: String },
+    /// `@ls -la "<path>"`: the long listing including dot-named entries and
+    /// the `.` / `..` pair. The read transport lists with this so that no
+    /// entry is hidden from it and a symlink or special file is visible.
+    LsLongAll { path: String },
     /// `get "<remote>" "<local>"`.
     Get { remote: String, local: PathBuf },
     /// `get -R "<remote>" "<local>"`: a directory tree; symlinks are skipped
@@ -425,6 +429,7 @@ impl SftpOp {
         Ok(match self {
             SftpOp::Ls { path } => format!("@ls -1 {}", remote(path)?),
             SftpOp::LsLong { path } => format!("@ls -l {}", remote(path)?),
+            SftpOp::LsLongAll { path } => format!("@ls -la {}", remote(path)?),
             SftpOp::Get {
                 remote: r,
                 local: l,
@@ -1023,6 +1028,7 @@ mod tests {
                 path: "/d/a b".into(),
             },
             SftpOp::LsLong { path: "/d".into() },
+            SftpOp::LsLongAll { path: "/d".into() },
             SftpOp::Get {
                 remote: "/r/f".into(),
                 local: PathBuf::from("/l/f"),
@@ -1054,6 +1060,7 @@ mod tests {
             [
                 "@ls -1 \"/d/a b\"",
                 "@ls -l \"/d\"",
+                "@ls -la \"/d\"",
                 "get \"/r/f\" \"/l/f\"",
                 "get -R \"/r/dir\" \"/l/mirror/\"",
                 "put \"/l/f\" \"/r/f\"",
@@ -1092,6 +1099,7 @@ mod tests {
             let remote_ops = [
                 SftpOp::Ls { path: bad.into() },
                 SftpOp::LsLong { path: bad.into() },
+                SftpOp::LsLongAll { path: bad.into() },
                 SftpOp::Get {
                     remote: bad.into(),
                     local: PathBuf::from("/l"),

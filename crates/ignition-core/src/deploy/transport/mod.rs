@@ -19,20 +19,23 @@
 //!   (see [`Scope`]); nothing outside them is listed or read.
 //!
 //! [`for_node`] chooses the reader for a target node: `local: { data_dir }`
-//! selects [`local::LocalFsTransport`] (D-02).
+//! selects [`local::LocalFsTransport`] (D-02); `ssh` with `os: linux` selects
+//! [`sftp::SftpTransport`] over the hardened [`remote::RemoteShell`].
 
 pub mod local;
 pub mod process;
 pub mod remote;
+pub mod sftp;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Serialize;
 
 use super::layout::{RelPath, TAG_TYPES};
 use super::manifest::Manifest;
-use super::target::NodeTarget;
+use super::target::{NodeTarget, TargetOs};
 use crate::error::CoreError;
 
 /// The literal name of the base resource collection on a gateway.
@@ -166,14 +169,36 @@ pub fn for_node(
             };
             Ok(Box::new(local::LocalFsTransport::new(data_dir, label)))
         }
-        (Some(_), None) => Err(CoreError::deploy_tree_invalid(
-            target_file,
-            None,
-            None,
-            format!(
-                "{label}.ssh: the ssh transport is not available in this build yet; use a local data_dir"
-            ),
-        )),
+        (Some(ssh), None) => match ssh.os {
+            TargetOs::Linux => {
+                let data_dir = sftp::posix_root(&ssh.data_dir).map_err(|why| {
+                    CoreError::deploy_tree_invalid(
+                        target_file,
+                        None,
+                        None,
+                        format!("{label}.ssh.data_dir: {why}"),
+                    )
+                })?;
+                let shell = remote::RemoteShell::from_ssh(
+                    repo,
+                    target_file,
+                    label,
+                    ssh,
+                    Arc::new(process::TokioProcessRunner),
+                )?;
+                Ok(Box::new(sftp::SftpTransport::new(shell, data_dir, label)))
+            }
+            // The Windows sftp path form is a capture still to be made
+            // (D-14, C7a); 22-13 replaces this refusal.
+            TargetOs::Windows => Err(CoreError::deploy_tree_invalid(
+                target_file,
+                None,
+                None,
+                format!(
+                    "{label}.ssh.os: windows hosts cannot be read over ssh yet (the Windows sftp path form is not captured); use os: linux or a local data_dir"
+                ),
+            )),
+        },
         (None, None) => Err(CoreError::deploy_tree_invalid(
             target_file,
             None,
