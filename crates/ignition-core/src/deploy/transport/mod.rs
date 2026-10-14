@@ -22,6 +22,8 @@
 //! selects [`local::LocalFsTransport`] (D-02).
 
 pub mod local;
+pub mod process;
+pub mod remote;
 
 use std::collections::BTreeMap;
 use std::path::Path;
