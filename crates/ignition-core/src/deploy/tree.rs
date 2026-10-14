@@ -448,26 +448,45 @@ pub(crate) enum OpenError {
     Changed,
 }
 
-/// Open `path` and validate the HANDLE against `before`, the
-/// `symlink_metadata` taken when the path was inspected. Closes the window
-/// between that check and the open, in which the file could be replaced by a
-/// symlink to something outside the tree: the opened file must be a regular
-/// file and, on unix, the same device and inode as `before`; on windows the
-/// open does not follow reparse points and the handle must not be one.
+/// Open `rel` beneath the directory `root` and validate the HANDLE against
+/// `before`, the `symlink_metadata` taken when the path was inspected.
+///
+/// On unix the open is descriptor-relative: `root` is opened once as a
+/// directory fd, then every component of `rel` is opened with `openat`
+/// relative to the previous fd, intermediate directories with
+/// `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC` and the final file with
+/// `O_NOFOLLOW | O_CLOEXEC` (read-only). A component that is, or has been
+/// swapped for, a symlink fails the open (`ELOOP` / `ENOTDIR`) instead of
+/// redirecting it, so no component at any depth can lead outside `root` even
+/// when it is replaced after the walk and the metadata check. The handle is
+/// then `fstat`ed: it must be a regular file and the same device and inode as
+/// `before`. `root` itself is the operator's own directory and is opened
+/// through a final symlink (callers that refuse a symlinked root do so first).
+///
+/// On windows the full path is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and
+/// the handle must not be a reparse point. Windows has no descriptor-relative
+/// open in std, so an intermediate directory swapped for a link between the
+/// caller's check and the open remains a residual race there.
+///
 /// Returns the file and its handle metadata (take sizes from that).
 pub(crate) fn open_regular_file(
-    path: &Path,
+    root: &Path,
+    rel: &Path,
     before: &std::fs::Metadata,
 ) -> Result<(std::fs::File, std::fs::Metadata), OpenError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
+    #[cfg(unix)]
+    let file = open_beneath(root, rel)?;
     #[cfg(windows)]
-    {
+    let file = {
         use std::os::windows::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
         // FILE_FLAG_OPEN_REPARSE_POINT: open the link itself, never its target.
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(path).map_err(OpenError::Io)?;
+        options.read(true).custom_flags(0x0020_0000);
+        options.open(root.join(rel)).map_err(OpenError::Io)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(root.join(rel)).map_err(OpenError::Io)?;
+
     let held = file.metadata().map_err(OpenError::Io)?;
     if held.file_type().is_symlink() || !held.is_file() {
         return Err(OpenError::Changed);
@@ -482,6 +501,54 @@ pub(crate) fn open_regular_file(
     #[cfg(not(unix))]
     let _ = before;
     Ok((file, held))
+}
+
+/// The descriptor-relative open behind [`open_regular_file`] (unix).
+#[cfg(unix)]
+fn open_beneath(root: &Path, rel: &Path) -> Result<std::fs::File, OpenError> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    use rustix::io::Errno;
+    use std::path::Component;
+
+    // A swapped or non-directory component: the tree changed under us.
+    let map = |e: Errno| -> OpenError {
+        if e == Errno::LOOP || e == Errno::NOTDIR {
+            OpenError::Changed
+        } else {
+            OpenError::Io(e.into())
+        }
+    };
+
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => parts.push(name),
+            // `.`, `..`, a root or a prefix could leave `root`.
+            _ => return Err(OpenError::Changed),
+        }
+    }
+    let Some((last, parents)) = parts.split_last() else {
+        return Err(OpenError::Changed);
+    };
+
+    let mut dir = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(map)?;
+    let dir_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    for part in parents {
+        dir = openat(&dir, *part, dir_flags, Mode::empty()).map_err(map)?;
+    }
+    let fd = openat(
+        &dir,
+        *last,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(map)?;
+    Ok(std::fs::File::from(fd))
 }
 
 /// `symlink_metadata` of `repo/rel`, as a finding on failure.
@@ -531,11 +598,11 @@ pub(crate) fn require_repo_dir(repo: &Path, rel: &str) -> Result<(), CoreError> 
 /// validated against the inspected metadata, and at most
 /// [`READ_MAX_FILE_BYTES`] are read.
 ///
-/// Residual race: a parent directory swapped for a symlink between the
-/// parent check and the open is not detected (it would take descriptor-
-/// relative `openat`, which std does not expose). The repo is the operator's
-/// own checkout; the gateway data directory, the untrusted side, goes
-/// through the same handle check in the local transport.
+/// The open is descriptor-relative on unix (see [`open_regular_file`]): a
+/// parent directory swapped for a symlink after the parent check is refused
+/// as "changed while it was read" rather than followed. On windows that
+/// intermediate-directory race remains (std has no descriptor-relative open);
+/// the repo is the operator's own checkout.
 pub(crate) fn read_repo_file(
     repo: &Path,
     rel: &str,
@@ -564,7 +631,7 @@ pub(crate) fn read_repo_file(
             "is not a regular file",
         ));
     }
-    let (file, held) = open_regular_file(&repo.join(rel), &meta).map_err(|e| match e {
+    let (file, held) = open_regular_file(repo, Path::new(rel), &meta).map_err(|e| match e {
         OpenError::Changed => CoreError::deploy_tree_invalid(
             rel,
             None,
@@ -1009,14 +1076,15 @@ mod tests {
 
         // The check-time metadata is of the real file.
         let before = std::fs::symlink_metadata(&inside).expect("meta");
-        let (_, held) = open_regular_file(&inside, &before).expect("unswapped file opens");
+        let (_, held) =
+            open_regular_file(dir.path(), Path::new("f"), &before).expect("unswapped file opens");
         assert_eq!(held.len(), 6);
 
         // Swap the file for a symlink to an outside file after the check.
         std::fs::remove_file(&inside).expect("remove");
         std::os::unix::fs::symlink(&secret, &inside).expect("symlink");
         assert!(matches!(
-            open_regular_file(&inside, &before),
+            open_regular_file(dir.path(), Path::new("f"), &before),
             Err(OpenError::Changed)
         ));
 
@@ -1024,8 +1092,76 @@ mod tests {
         std::fs::remove_file(&inside).expect("remove");
         std::fs::write(&inside, b"replaced").expect("write");
         assert!(matches!(
-            open_regular_file(&inside, &before),
+            open_regular_file(dir.path(), Path::new("f"), &before),
             Err(OpenError::Changed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_does_not_follow_a_swapped_intermediate_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        // `a/b/f` resolves outside when `a/b` is swapped (outside/f) and when
+        // `a` is swapped (outside/b/f).
+        std::fs::create_dir(outside.path().join("b")).expect("mkdir");
+        std::fs::write(outside.path().join("f"), b"outside-secret").expect("write");
+        std::fs::write(outside.path().join("b/f"), b"outside-secret").expect("write");
+        std::fs::create_dir_all(root.path().join("a/b")).expect("mkdir");
+        std::fs::write(root.path().join("a/b/f"), b"inside").expect("write");
+        let rel = Path::new("a/b/f");
+
+        let before = std::fs::symlink_metadata(root.path().join(rel)).expect("meta");
+        let (mut file, held) = open_regular_file(root.path(), rel, &before).expect("plain open");
+        assert_eq!(held.len(), 6);
+        let mut text = String::new();
+        file.read_to_string(&mut text).expect("read");
+        assert_eq!(text, "inside");
+
+        // Swap the deepest directory, then a shallower one, for a symlink to
+        // an outside directory holding a same-named regular file. The stale
+        // metadata is what a fresh `symlink_metadata(path)` would return
+        // after the swap: the outside file, since it follows parents.
+        for swapped in ["a/b", "a"] {
+            let target = root.path().join(swapped);
+            let moved = root.path().join("moved");
+            std::fs::rename(&target, &moved).expect("move aside");
+            std::os::unix::fs::symlink(outside.path(), &target).expect("symlink");
+            let after = std::fs::symlink_metadata(root.path().join(rel)).expect("meta");
+            assert!(after.is_file(), "the full path still resolves to a file");
+            assert!(
+                matches!(
+                    open_regular_file(root.path(), rel, &after),
+                    Err(OpenError::Changed)
+                ),
+                "a symlinked `{swapped}` must be refused even with fresh metadata"
+            );
+            std::fs::remove_file(&target).expect("unlink");
+            std::fs::rename(&moved, &target).expect("restore");
+        }
+
+        // A symlinked final component and path escapes are refused too.
+        std::fs::remove_file(root.path().join(rel)).expect("remove");
+        std::os::unix::fs::symlink(outside.path().join("f"), root.path().join(rel))
+            .expect("symlink");
+        let after = std::fs::symlink_metadata(root.path().join(rel)).expect("meta");
+        assert!(matches!(
+            open_regular_file(root.path(), rel, &after),
+            Err(OpenError::Changed)
+        ));
+        for escape in ["../x", "/etc/passwd", "a/../f", ""] {
+            assert!(
+                matches!(
+                    open_regular_file(root.path(), Path::new(escape), &before),
+                    Err(OpenError::Changed)
+                ),
+                "{escape:?}"
+            );
+        }
+        // An absent file is an I/O error, not a swap.
+        assert!(matches!(
+            open_regular_file(root.path(), Path::new("a/b/missing"), &before),
+            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound
         ));
     }
 

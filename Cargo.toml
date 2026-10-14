@@ -78,6 +78,12 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 lsp-server = "0.10"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
+# Phase 22 (22-01 TOCTOU fix): descriptor-relative openat for the deploy tree
+# readers (deploy/tree.rs open_regular_file). Already in the graph through
+# tempfile at 1.1.4, so no new crate in Cargo.lock; only `fs` (+ `std` for
+# io::Error conversion) is enabled and the dependency is cfg(unix) in
+# ignition-core.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

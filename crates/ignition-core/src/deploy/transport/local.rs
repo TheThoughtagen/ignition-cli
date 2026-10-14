@@ -216,14 +216,19 @@ impl LocalFsTransport {
         Ok(blobs)
     }
 
-    /// Open `path` and validate the handle against `before`.
+    /// Open `path` (a file below `data_dir`) descriptor-relative from
+    /// `data_dir` and validate the handle against `before`: no component of
+    /// the path is followed if it has become a symlink since the walk.
     fn open_checked(
         &self,
         path: &Path,
         before: &std::fs::Metadata,
         shown: &str,
     ) -> Result<(std::fs::File, std::fs::Metadata), CoreError> {
-        open_regular_file(path, before).map_err(|e| match e {
+        let Ok(rel) = path.strip_prefix(&self.data_dir) else {
+            return Err(self.fail(format!("{shown} is outside data_dir")));
+        };
+        open_regular_file(&self.data_dir, rel, before).map_err(|e| match e {
             OpenError::Changed => self.fail(format!("{shown} changed while it was read")),
             OpenError::Io(e) => self.fail(format!("cannot read {shown} ({})", e.kind())),
         })
@@ -399,5 +404,40 @@ mod tests {
             err.to_string().contains("no longer a regular file"),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_blobs_refuses_a_parent_directory_swapped_for_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("f"), b"outside-secret").expect("write");
+        std::fs::create_dir(dir.path().join("a")).expect("mkdir");
+        std::fs::write(dir.path().join("a/f"), b"inside").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+
+        // The walk already ran: this is its (now stale) path list.
+        let mut paths = BTreeMap::new();
+        paths.insert(RelPath::new("a/f").expect("rel"), dir.path().join("a/f"));
+        let blobs = transport
+            .read_blobs("core", paths.clone(), &mut Budget::default())
+            .expect("an unswapped tree reads");
+        assert_eq!(blobs.values().next().expect("one").bytes, b"inside");
+
+        // Swap the parent directory for a symlink to an outside directory
+        // holding a same-named regular file. lstat and open of the full path
+        // both follow it to that file, so only a descriptor-relative open
+        // refuses it.
+        std::fs::remove_dir_all(dir.path().join("a")).expect("remove");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).expect("symlink");
+        let err = transport
+            .read_blobs("core", paths, &mut Budget::default())
+            .expect_err("a swapped parent directory must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("config/resources/core/a/f changed while it was read"),
+            "{text}"
+        );
+        assert!(!text.contains("outside-secret"), "{text}");
     }
 }

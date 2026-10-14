@@ -32,6 +32,9 @@ csv = { workspace = true } # 11-03 TAGS-12: legacy CSV loss scan + 11-04 generat
 base64 = { workspace = true } # 11-04: byte-faithful envelope carrier (payload_b64 decode / file_b64 encode — the ONLY transfer transformation)
 sha2 = { workspace = true } # promoted from ignition-cli's dev-dependencies (15-01): the module artifact fetch's streaming sha256 verification — already workspace-pinned at 0.10, NOT a new dependency
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true } # 22-01: descriptor-relative openat (deploy/tree.rs open_regular_file) — already in the graph via tempfile, NOT a new crate
+
 [dev-dependencies]
 wiremock = { workspace = true }
 tempfile = { workspace = true }
