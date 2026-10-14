@@ -2,19 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 22
-current_phase_name: Transport, Plan, Pull & Verify
 status: planning
-stopped_at: Phase 21 complete, ready to plan Phase 22
-last_updated: "2026-10-14T01:05:56.129Z"
-last_activity: 2026-10-13
-last_activity_desc: Phase 21 complete (UAT 2/2, security 44/44 closed)
+stopped_at: Phase 22 context gathered
+last_updated: "2026-10-14T10:09:57.005Z"
+last_activity: 2026-10-13 — Phase 21 complete, transitioned to Phase 22
 progress:
-  total_phases: 6
+  total_phases: 3
   completed_phases: 2
   total_plans: 15
   completed_plans: 15
-  percent: 33
+  percent: 100
 ---
 
 # Project State
@@ -93,9 +90,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T01:06:17Z
-**Stopped At:** Phase 21 complete, ready to plan Phase 22
-**Resume file:** None
+**Last session:** 2026-10-14T10:09:56.956Z
+**Stopped At:** Phase 22 context gathered
+**Resume file:** .planning/phases/22-transport-plan-pull-verify/22-CONTEXT.md
 
 ## Decisions
 
