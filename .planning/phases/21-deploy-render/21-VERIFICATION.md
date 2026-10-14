@@ -1,40 +1,47 @@
 ---
 phase: 21-deploy-render
 verified: 2026-10-13T17:30:00Z
-status: human_needed
+status: passed
 score: 4/5 must-haves verified
 behavior_unverified: 0
 overrides_applied: 0
 re_verification: false
 human_verification:
+
   - test: "Push local main (83 commits ahead of origin/main, head 039a552) or a PR branch carrying crates/ignition-core/tests/deploy_corpus.rs, and wait for the CI workflow (.github/workflows/ci.yml) to finish on ubuntu-latest, macos-latest and windows-latest"
     expected: "All three legs green, in particular deploy_corpus (6 tests), deploy_render (61), deploy_fixtures (9) and contract_deploy (9). Then record the run id and flip DRND-05 to Complete in REQUIREMENTS.md"
     why_human: "Pushing is an outward action, and the DRND-05 and ROADMAP SC3 wording requires byte identity on Linux, macOS and Windows. Only macOS (this machine) has been exercised. The Windows and Linux legs have never run this code."
+
   - test: "Decide whether the WR-02 fail-open (a Referenced secret wrapper whose data carries an extra plaintext member passes the secret lint) is closed before ship or accepted as a residual"
     expected: "Either a small follow-up that makes is_referenced require data to be exactly {providerName, secretName} strings, or a recorded acceptance in 21-VERIFICATION.md overrides"
     why_human: "The behavior was reproduced against the built binary. Whether a hand-crafted malformed wrapper counts as in scope for DRND-07 is a product/security judgment."
 gaps: []
 warnings:
+
   - id: W-1
     ref: "21-REVIEW WR-02"
     truth: "DRND-07 / SC4: render refuses a plaintext secret field"
     evidence: "Reproduced: ignition/database-connection config.json {\"password\":{\"type\":\"Referenced\",\"data\":{\"providerName\":\"p\",\"secretName\":\"s\",\"password\":\"hunter2\"}}} renders (exit 0, render_sha256 emitted). The plaintext reaches the rendered tree."
     severity: warning
+
   - id: W-2
     ref: "21-REVIEW WR-01"
     truth: "DRND-07: key-name rule in OpenAPI-undescribed types"
     evidence: "lint.rs Walker.walk applies key_hit only in the Node::Str arm, so object, number, boolean values under password/secret keys are not flagged, and only password/secret needles are used. Plan 21-08 accepted the other-key-name residual explicitly. Does not affect any of the 10 OpenAPI-described secret types, where non-string values ARE refused (verified: numeric password refused as plaintext)."
     severity: warning
+
   - id: W-3
     ref: "21-REVIEW WR-03"
     truth: "SC1 / determinism and --out safety"
     evidence: "write_out is not crash-safe in Refresh mode (stale render.json over mixed content; leftover .ign-render-tmp makes later runs refuse). Does not affect render_sha256 or the stdout path; affects the --out convenience only. Phase 22 reads render.json as plan --base, so it should be hardened before Phase 22 trusts it."
     severity: warning
+
   - id: W-4
     ref: "21-REVIEW WR-05"
     truth: "SC1 / DRND-01 determinism"
     evidence: "targets/<env>.yaml and gateways/<name> are opened by path, so on case-insensitive filesystems (macOS APFS) a mis-cased --env or target.gateway resolves, and the gateway spelling feeds name_based_uuid. The same repo then yields different uuids than on Linux. Identical-input determinism (same bytes, same spelling) holds: three runs gave identical digests."
     severity: warning
+
   - id: W-5
     ref: "21-REVIEW WR-04"
     truth: "SC4 error-envelope quality"

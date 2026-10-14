@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 21
-current_phase_name: deploy-render
-status: verifying
-stopped_at: Completed 21-09-PLAN.md
-last_updated: "2026-10-13T15:38:29.205Z"
+current_phase: 22
+current_phase_name: Transport, Plan, Pull & Verify
+status: planning
+stopped_at: Phase 21 complete, ready to plan Phase 22
+last_updated: "2026-10-14T01:05:56.129Z"
 last_activity: 2026-10-13
-last_activity_desc: Phase 21 execution started
+last_activity_desc: Phase 21 complete (UAT 2/2, security 44/44 closed)
 progress:
   total_phases: 6
   completed_phases: 2
@@ -21,17 +21,17 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-10)
+See: .planning/PROJECT.md (updated 2026-10-13)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 21 — deploy-render
+**Current focus:** Phase 22 — Transport, Plan, Pull & Verify
 
 ## Current Position
 
-Phase: 21 (deploy-render) — EXECUTING
-Plan: 9 of 9
-Status: Phase complete — ready for verification
-Last activity: 2026-10-13 - Completed quick task 261013-neg: fix WR-02 Referenced secret fail-open
+Phase: 22 — Transport, Plan, Pull & Verify
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-13 — Phase 21 complete, transitioned to Phase 22
 
 Progress: [██████████] 100%
 
@@ -77,7 +77,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 ### Blockers
 
 - [Before Phase 23 planning] Decision B (staging location / svc-ignition-deploy write scope) is OPEN. Resolve in Phase 22 from capture C6 and record it; Phase 23 also needs the OQ5 measured hold budget.
-- Phase 21 SC3 / DRND-05: cross-OS byte identity unproven until a green three-leg CI run (ubuntu, macos, windows) of a commit carrying deploy_corpus.rs is recorded; not pushed (cross-OS: pending CI)
+- [Before Phase 22 reads render.json] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Fix it or have Phase 22 re-hash instead of trusting the marker (21-SECURITY.md).
+- [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
 
 ### Quick Tasks Completed
 
@@ -92,8 +93,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-13T15:38:23.668Z
-**Stopped At:** Completed 21-09-PLAN.md
+**Last session:** 2026-10-14T01:06:17Z
+**Stopped At:** Phase 21 complete, ready to plan Phase 22
 **Resume file:** None
 
 ## Decisions
