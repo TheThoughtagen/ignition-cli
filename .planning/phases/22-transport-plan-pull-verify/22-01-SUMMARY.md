@@ -151,3 +151,18 @@ None. No new network endpoint or auth path; the only new filesystem surface is t
 - Files: `plan.rs`, `transport/mod.rs`, `transport/local.rs`, `tests/deploy_plan.rs`, `tests/common/plan_fixture.rs` all present.
 - Commits `66b8f2c`, `db2c894`, `e7fc465` present in `git log`.
 - `cargo test -p ignition-core --lib` 632 passed; `--test deploy_plan` 19 passed; `contract_deploy` 11 passed; `deploy_family_coverage` 4 passed; `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean.
+
+## Post-review security fixes
+
+Two confirmed findings in this plan's code were fixed in `6852f49`.
+
+- **F1, resource-cap bypass.** `walk_capped` (`deploy/tree.rs`) collected every `read_dir` entry of a directory before any cap check, and the local transport's `child_dirs` had no cap. Both now stop as soon as the cap is crossed: `walk_capped` counts entries already held plus entries collected in this directory against `max_entries` while iterating (same "more than N entries (at ...)" message, entries that fit stay sorted by name bytes). `child_dirs` counts every entry read against a counter shared across one `list_types` call, bounded by `READ_MAX_ENTRIES`, and fails with `transport_failed`.
+- **F2, TOCTOU symlink follow.** `read_blobs` and `read_repo_file` checked `symlink_metadata` and then opened the path, which follows symlinks. They now open first and validate the handle through the shared `open_regular_file`: the handle must be a regular file and, on unix, share dev+ino with the inspected metadata (mismatch is "{path} changed while it was read"). On windows the open uses `FILE_FLAG_OPEN_REPARSE_POINT` and rejects a symlink or non-file handle. Size caps come from the handle metadata; the `take(READ_MAX_FILE_BYTES + 1)` guard is kept. `read_repo_file` additionally checks every parent component (not only the first) and now caps bytes read at `READ_MAX_FILE_BYTES`.
+
+Tests added (all in `ignition-core --lib`): lazy-iterator test proving the collector stops pulling at the cap, an on-disk flat-directory cap test, `child_dirs` cap test, a deterministic unix inode-mismatch test of `open_regular_file` (stale metadata plus a symlink or replacement file at the path), the `read_blobs` swap path via `open_checked`, and a deep symlinked-parent test for `read_repo_file`.
+
+Verification: `--lib` 638 passed, `--test deploy_plan` 19 passed, `contract_deploy` 11 passed, clippy `-D warnings` and `fmt --check` clean.
+
+**Not covered:**
+- An intermediate-directory swap race: a parent directory replaced by a symlink after the parent/symlink check but before the open is not detected, since std exposes no `openat`-style descriptor-relative open. For the gateway side the entry paths come from a walk that already refused symlinks; for the repo side (the operator's own checkout) the residual is accepted.
+- The unix dev+ino check and the windows reparse-point flag are separate cfg branches; the windows branch is compiled only on windows and has no test here. The swap itself (the race between check and open) cannot be forced deterministically, so the inode-mismatch branch is tested through the helper with stale metadata.
