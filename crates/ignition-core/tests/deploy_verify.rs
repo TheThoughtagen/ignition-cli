@@ -42,7 +42,10 @@ fn expected() -> Expected {
         not_checked: Vec::new(),
         declared_ids: vec![DB.to_string()],
         tag_units: vec![TAG_UNIT.to_string()],
-        probes: vec!["[default]Heartbeat".to_string(), "[default]Pump".to_string()],
+        probes: vec![
+            "[default]Heartbeat".to_string(),
+            "[default]Pump".to_string(),
+        ],
     }
 }
 
@@ -90,9 +93,7 @@ fn unloaded_line() -> LogLine {
     LogLine {
         timestamp: 1_792_000_000_050,
         logger: "NamedResourceHandler-ignition/database-translator".to_string(),
-        message: format!(
-            "Resource {DB} does not have required UUID attribute, will not be loaded"
-        ),
+        message: format!("Resource {DB} does not have required UUID attribute, will not be loaded"),
     }
 }
 
@@ -211,14 +212,15 @@ fn one_resource(compare: Compare) -> Expected {
 
 fn read_back_with(config: Value) -> ObservedState {
     let mut o = observed();
-    o.read_back
-        .insert(DB.to_string(), Remote::Config(config));
+    o.read_back.insert(DB.to_string(), Remote::Config(config));
     o
 }
 
 #[test]
 fn read_back_key_order_ignored() {
-    let e = one_resource(Compare::Exact(json!({"a": 1, "b": {"c": [1, {"d": 2, "e": 3}]}})));
+    let e = one_resource(Compare::Exact(
+        json!({"a": 1, "b": {"c": [1, {"d": 2, "e": 3}]}}),
+    ));
     let o = read_back_with(json!({"b": {"c": [1, {"e": 3, "d": 2}]}, "a": 1.0}));
     let report = evaluate(&e, &o);
     assert_eq!(
@@ -321,7 +323,8 @@ fn read_back_n2_security_levels_is_a_name_keyed_subset() {
 
 #[test]
 fn read_back_n3_attributes_only_unit_ignores_rest_only_keys() {
-    let attrs = json!({"caseInsensitive": false, "ignoreTags": true, "lastModification": {"actor": "x"}});
+    let attrs =
+        json!({"caseInsensitive": false, "ignoreTags": true, "lastModification": {"actor": "x"}});
     let Value::Object(attrs) = attrs else {
         unreachable!()
     };
@@ -357,7 +360,10 @@ fn read_back_n3_attributes_only_unit_ignores_rest_only_keys() {
 #[test]
 fn read_back_skips_system_collection_and_no_route_types_with_a_warning() {
     let mut e = expected();
-    e.not_checked = vec![("ignition/images".to_string(), "no REST read route".to_string())];
+    e.not_checked = vec![(
+        "ignition/images".to_string(),
+        "no REST read route".to_string(),
+    )];
     let mut o = observed();
     o.read_back.insert(DB.to_string(), Remote::System);
     let report = evaluate(&e, &o);
@@ -369,7 +375,10 @@ fn read_back_skips_system_collection_and_no_route_types_with_a_warning() {
         report.warnings
     );
     assert!(
-        report.warnings.iter().any(|w| w.contains("ignition/images")),
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignition/images")),
         "{:?}",
         report.warnings
     );
@@ -471,7 +480,8 @@ fn log_hit_needs_the_phrase_and_the_whole_name() {
     }]);
     // The phrase alone cannot tell "Prod" from "Prod Backup" when both are
     // declared: the longest declared id wins the line.
-    e.declared_ids.push("ignition/database-connection/Prod Backup".to_string());
+    e.declared_ids
+        .push("ignition/database-connection/Prod Backup".to_string());
     e.declared_ids.sort();
     let report = evaluate(&e, &o);
     let c = check(&report, CheckId::Loaded);
@@ -529,7 +539,8 @@ fn log_window_follows_cv1() {
     s.last_scan_duration = None;
     assert_eq!(
         log_window_start(&s),
-        1_792_000_000_000 - ignition_core::deploy::verify::LOG_WINDOW_FALLBACK_MS
+        1_792_000_000_000
+            - ignition_core::deploy::verify::LOG_WINDOW_FALLBACK_MS
             - ignition_core::deploy::verify::LOG_WINDOW_SLACK_MS
     );
     s.last_scan_timestamp = 10;
@@ -559,7 +570,10 @@ fn probes_unavailable_fails() {
     let report = evaluate(&expected(), &o);
     let c = check(&report, CheckId::Probes);
     assert_eq!(c.status, CheckStatus::Fail);
-    assert_eq!(codes(&report, CheckId::Probes), vec!["tag_probes_unavailable"]);
+    assert_eq!(
+        codes(&report, CheckId::Probes),
+        vec!["tag_probes_unavailable"]
+    );
     assert!(c.findings[0].detail.contains("routes_not_deployed"));
     // Declared probes that were never read are unavailable too, not a pass.
     o.probes = None;
@@ -640,7 +654,11 @@ fn probe_findings_in_manifest_order() {
 
 #[test]
 fn deterministic_ordering() {
-    let units = ["ignition/tag-definition/default/B", "ignition/tag-definition/default/A", "ignition/tag-definition/default/C"];
+    let units = [
+        "ignition/tag-definition/default/B",
+        "ignition/tag-definition/default/A",
+        "ignition/tag-definition/default/C",
+    ];
     let mut e = expected();
     e.tag_units = units.iter().map(|s| s.to_string()).collect();
     let mut o = observed();
@@ -672,10 +690,19 @@ fn deterministic_ordering() {
 #[test]
 fn report_serializes_in_contract_order() {
     let text = serde_json::to_string(&evaluate(&expected(), &observed())).unwrap();
-    let positions: Vec<usize> = ["\"ok\"", "\"slug\"", "\"checks\"", "\"resources_checked\"", "\"warnings\""]
-        .iter()
-        .map(|key| text.find(key).unwrap_or_else(|| panic!("{key} missing: {text}")))
-        .collect();
+    let positions: Vec<usize> = [
+        "\"ok\"",
+        "\"slug\"",
+        "\"checks\"",
+        "\"resources_checked\"",
+        "\"warnings\"",
+    ]
+    .iter()
+    .map(|key| {
+        text.find(key)
+            .unwrap_or_else(|| panic!("{key} missing: {text}"))
+    })
+    .collect();
     assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
     let report: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(report["slug"], Value::Null);
@@ -685,7 +712,10 @@ fn report_serializes_in_contract_order() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["scan", "mode", "read_back", "files", "loaded", "probes"]);
+    assert_eq!(
+        ids,
+        vec!["scan", "mode", "read_back", "files", "loaded", "probes"]
+    );
     let red = serde_json::to_value({
         let mut o = observed();
         o.mode = None;
@@ -725,6 +755,9 @@ fn no_message_or_value_echo() {
         !format!("{report:?}").contains(CANARY),
         "report Debug leaked"
     );
-    assert!(!format!("{o:?}").contains(CANARY), "ObservedState Debug leaked");
+    assert!(
+        !format!("{o:?}").contains(CANARY),
+        "ObservedState Debug leaked"
+    );
     assert!(!format!("{e:?}").contains(CANARY), "Expected Debug leaked");
 }

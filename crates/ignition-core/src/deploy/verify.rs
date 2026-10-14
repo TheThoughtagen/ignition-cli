@@ -100,8 +100,10 @@ pub const WILL_NOT_BE_LOADED: &str = "will not be loaded";
 
 /// Types whose list and singleton routes both answer 404 on 8.3.6 (CV2): they
 /// cannot be read back and are reported, not compared.
-pub const NO_READ_ROUTE: &[(&str, &str)] =
-    &[("com.inductiveautomation.opcua", "one-time"), ("ignition", "images")];
+pub const NO_READ_ROUTE: &[(&str, &str)] = &[
+    ("com.inductiveautomation.opcua", "one-time"),
+    ("ignition", "images"),
+];
 
 /// The collection name of gateway-provided, non-file-backed resources (CV2).
 pub const SYSTEM_COLLECTION: &str = "system";
@@ -393,12 +395,21 @@ impl fmt::Debug for LogLine {
 }
 
 /// One tag probe reading. The value is never carried.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProbeReading {
     /// The tag path read.
     pub path: String,
     /// The quality string (`Good`, `Bad_NotFound`, ...).
     pub quality: String,
+}
+
+impl fmt::Debug for ProbeReading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProbeReading")
+            .field("path", &self.path)
+            .field("quality", &quality_code(&self.quality))
+            .finish()
+    }
 }
 
 /// What the action read.
@@ -429,28 +440,568 @@ pub fn log_window_start(scan: &ScanStatus) -> i64 {
 
 /// Evaluate `observed` against `expected`.
 pub fn evaluate(expected: &Expected, observed: &ObservedState) -> VerifyReport {
-    let _ = (expected, observed);
-    let checks = [
-        CheckId::Scan,
-        CheckId::Mode,
-        CheckId::ReadBack,
-        CheckId::Files,
-        CheckId::Loaded,
-        CheckId::Probes,
-    ]
-    .into_iter()
-    .map(|id| Check {
-        id,
-        status: CheckStatus::Pass,
-        detail: String::new(),
-        findings: Vec::new(),
-    })
-    .collect();
+    let mut warnings = Vec::new();
+    let (read_back, resources_checked) = check_read_back(expected, observed, &mut warnings);
+    let checks = vec![
+        check_scan(observed),
+        check_mode(expected, observed),
+        read_back,
+        check_files(expected, observed),
+        check_loaded(expected, observed),
+        check_probes(expected, observed),
+    ];
+    for check in &checks {
+        if check.status == CheckStatus::Warn {
+            warnings.push(format!("{}: {}", check_word(check.id), check.detail));
+        }
+    }
+    let ok = checks.iter().all(|c| c.status != CheckStatus::Fail);
     VerifyReport {
-        ok: true,
-        slug: None,
+        ok,
+        slug: (!ok).then_some(VERIFY_FAILED_SLUG),
         checks,
-        resources_checked: 0,
-        warnings: Vec::new(),
+        resources_checked,
+        warnings,
+    }
+}
+
+fn check_word(id: CheckId) -> &'static str {
+    match id {
+        CheckId::Scan => "scan",
+        CheckId::Mode => "mode",
+        CheckId::ReadBack => "read_back",
+        CheckId::Files => "files",
+        CheckId::Loaded => "loaded",
+        CheckId::Probes => "probes",
+    }
+}
+
+fn finding(code: &'static str, subject: impl Into<String>, detail: impl Into<String>) -> Finding {
+    Finding {
+        code,
+        subject: subject.into(),
+        detail: detail.into(),
+    }
+}
+
+/// Sort findings by subject bytes, then code, so the report does not depend
+/// on input order.
+fn sort_findings(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        a.subject
+            .as_bytes()
+            .cmp(b.subject.as_bytes())
+            .then_with(|| a.code.cmp(b.code))
+    });
+}
+
+fn finished(id: CheckId, detail: String, findings: Vec<Finding>) -> Check {
+    Check {
+        id,
+        status: if findings.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        detail,
+        findings,
+    }
+}
+
+// ---- 1. scan ------------------------------------------------------------------
+
+fn check_scan(observed: &ObservedState) -> Check {
+    if observed.scan.scan_active {
+        return finished(
+            CheckId::Scan,
+            "a config scan is running".to_string(),
+            vec![finding(
+                "scan_active",
+                "config",
+                "the gateway reports an active config scan; verify reads settled state only",
+            )],
+        );
+    }
+    finished(
+        CheckId::Scan,
+        "no config scan is running".to_string(),
+        Vec::new(),
+    )
+}
+
+// ---- 2. mode ------------------------------------------------------------------
+
+fn check_mode(expected: &Expected, observed: &ObservedState) -> Check {
+    if observed.mode.as_deref() == Some(expected.mode.as_str()) {
+        return finished(
+            CheckId::Mode,
+            format!("the gateway runs mode `{}`", expected.mode),
+            Vec::new(),
+        );
+    }
+    let seen = match &observed.mode {
+        Some(mode) => format!("`{}`", printable(mode)),
+        None => "no mode".to_string(),
+    };
+    finished(
+        CheckId::Mode,
+        "the gateway does not run the target's mode".to_string(),
+        vec![finding(
+            "mode_mismatch",
+            "mode",
+            format!("expected `{}`, the gateway reports {seen}", expected.mode),
+        )],
+    )
+}
+
+// ---- 3. read_back -------------------------------------------------------------
+
+fn check_read_back(
+    expected: &Expected,
+    observed: &ObservedState,
+    warnings: &mut Vec<String>,
+) -> (Check, usize) {
+    let mut findings = Vec::new();
+    let mut checked = 0usize;
+    for res in &expected.resources {
+        match observed.read_back.get(&res.key).unwrap_or(&Remote::Missing) {
+            Remote::Missing => {
+                checked += 1;
+                findings.push(finding(
+                    "resource_missing",
+                    res.key.clone(),
+                    "not in the gateway's effective view",
+                ));
+            }
+            Remote::System => warnings.push(format!(
+                "read_back: {} not compared: the effective copy is in the `{SYSTEM_COLLECTION}` collection (gateway-provided, not file-backed)",
+                res.key
+            )),
+            Remote::Config(rest) => {
+                checked += 1;
+                let mut paths = Vec::new();
+                match &res.compare {
+                    Compare::Exact(file) => diff_exact(&strip_nulls(file), rest, "", &mut paths),
+                    Compare::NameKeyedSubset(file) => {
+                        diff_subset(&strip_nulls(file), rest, "", &mut paths);
+                    }
+                    Compare::Attributes(attrs) => diff_attributes(attrs, rest, &mut paths),
+                }
+                if !paths.is_empty() {
+                    findings.push(finding(
+                        "resource_differs",
+                        res.key.clone(),
+                        format!("differs at: {}", join_paths(paths)),
+                    ));
+                }
+            }
+        }
+    }
+    for (key, reason) in &expected.not_checked {
+        warnings.push(format!("read_back: {key} not compared: {reason}"));
+    }
+    if checked == 0 && findings.is_empty() {
+        warnings.push(
+            "read_back: no declared non-tag resource was compared (nothing to read back)"
+                .to_string(),
+        );
+    }
+    sort_findings(&mut findings);
+    let detail = format!("{checked} declared resource(s) compared with the REST effective view");
+    (finished(CheckId::ReadBack, detail, findings), checked)
+}
+
+/// The file value with every JSON `null` object member removed, at every
+/// depth (N1).
+fn strip_nulls(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), strip_nulls(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(strip_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
+fn child_path(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+fn root_or(path: &str) -> String {
+    if path.is_empty() {
+        "(root)".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// JSON number equality that does not tell `1` from `1.0`.
+fn same_scalar(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            x == y
+                || match (x.as_f64(), y.as_f64()) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                }
+        }
+        _ => a == b,
+    }
+}
+
+/// The JSON paths at which `file` and `rest` differ (key order ignored).
+fn diff_exact(file: &Value, rest: &Value, path: &str, out: &mut Vec<String>) {
+    match (file, rest) {
+        (Value::Object(f), Value::Object(r)) => {
+            for (key, fv) in f {
+                match r.get(key) {
+                    Some(rv) => diff_exact(fv, rv, &child_path(path, key), out),
+                    None => out.push(child_path(path, key)),
+                }
+            }
+            for key in r.keys().filter(|k| !f.contains_key(*k)) {
+                out.push(child_path(path, key));
+            }
+        }
+        (Value::Array(f), Value::Array(r)) if f.len() == r.len() => {
+            for (i, (fv, rv)) in f.iter().zip(r).enumerate() {
+                diff_exact(fv, rv, &child_path(path, &i.to_string()), out);
+            }
+        }
+        (Value::Object(_) | Value::Array(_), _) | (_, Value::Object(_) | Value::Array(_)) => {
+            out.push(root_or(path));
+        }
+        (f, r) => {
+            if !same_scalar(f, r) {
+                out.push(root_or(path));
+            }
+        }
+    }
+}
+
+/// N2: every part of `file` must appear in `rest`; arrays of named objects
+/// are matched by `name`, other array elements must appear somewhere.
+fn diff_subset(file: &Value, rest: &Value, path: &str, out: &mut Vec<String>) {
+    match (file, rest) {
+        (Value::Object(f), Value::Object(r)) => {
+            for (key, fv) in f {
+                match r.get(key) {
+                    Some(rv) => diff_subset(fv, rv, &child_path(path, key), out),
+                    None => out.push(child_path(path, key)),
+                }
+            }
+        }
+        (Value::Array(f), Value::Array(r)) => {
+            for (i, fv) in f.iter().enumerate() {
+                let name = fv.get("name").and_then(Value::as_str);
+                if let (Some(name), true) = (name, fv.is_object()) {
+                    let at = format!("{path}[{}]", printable(name));
+                    match r
+                        .iter()
+                        .find(|rv| rv.get("name").and_then(Value::as_str) == Some(name))
+                    {
+                        Some(rv) => diff_subset(fv, rv, &at, out),
+                        None => out.push(at),
+                    }
+                } else {
+                    let found = r.iter().any(|rv| {
+                        let mut inner = Vec::new();
+                        diff_exact(fv, rv, "", &mut inner);
+                        inner.is_empty()
+                    });
+                    if !found {
+                        out.push(child_path(path, &i.to_string()));
+                    }
+                }
+            }
+        }
+        (Value::Object(_) | Value::Array(_), _) | (_, Value::Object(_) | Value::Array(_)) => {
+            out.push(root_or(path));
+        }
+        (f, r) => {
+            if !same_scalar(f, r) {
+                out.push(root_or(path));
+            }
+        }
+    }
+}
+
+/// N3: the attribute keys the REST config also carries must be equal.
+fn diff_attributes(attrs: &Map<String, Value>, rest: &Value, out: &mut Vec<String>) {
+    let Some(rest) = rest.as_object() else {
+        out.push("(root)".to_string());
+        return;
+    };
+    for (key, expected) in attrs {
+        if let Some(seen) = rest.get(key) {
+            let mut inner = Vec::new();
+            diff_exact(&strip_nulls(expected), seen, "", &mut inner);
+            if !inner.is_empty() {
+                out.push(key.clone());
+            }
+        }
+    }
+}
+
+fn join_paths(mut paths: Vec<String>) -> String {
+    paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    paths.dedup();
+    let more = paths.len().saturating_sub(MAX_PATHS);
+    paths.truncate(MAX_PATHS);
+    let mut text = paths.join(", ");
+    if more > 0 {
+        text.push_str(&format!(" (+{more} more)"));
+    }
+    text
+}
+
+// ---- 4. files -----------------------------------------------------------------
+
+fn check_files(expected: &Expected, observed: &ObservedState) -> Check {
+    let mut findings = Vec::new();
+    for unit in &expected.tag_units {
+        let status = observed
+            .files
+            .iter()
+            .find(|(key, _)| key == unit)
+            .map(|(_, status)| *status);
+        match status {
+            Some(PlanStatus::Same) => {}
+            Some(other) => findings.push(finding(
+                "files_differ",
+                unit.clone(),
+                format!(
+                    "the effective live copy is `{}` against the render",
+                    other.word()
+                ),
+            )),
+            None => findings.push(finding(
+                "files_differ",
+                unit.clone(),
+                "the unit was not found among the live files",
+            )),
+        }
+    }
+    sort_findings(&mut findings);
+    finished(
+        CheckId::Files,
+        format!(
+            "{} declared tag unit(s) compared byte for byte with the live files",
+            expected.tag_units.len()
+        ),
+        findings,
+    )
+}
+
+// ---- 5. loaded ----------------------------------------------------------------
+
+fn check_loaded(expected: &Expected, observed: &ObservedState) -> Check {
+    if observed.scan.scan_active {
+        return Check {
+            id: CheckId::Loaded,
+            status: CheckStatus::Warn,
+            detail: "not observed: a scan is running, so its log lines are not readable yet"
+                .to_string(),
+            findings: Vec::new(),
+        };
+    }
+    let lines = match &observed.logs {
+        Ok(lines) => lines,
+        Err(slug) => {
+            return finished(
+                CheckId::Loaded,
+                "the gateway log could not be read".to_string(),
+                vec![finding("logs_unavailable", "logs", printable(slug))],
+            );
+        }
+    };
+
+    // The longest declared id that prefixes the resource text wins the line,
+    // so `Prod` does not claim a line about `Prod Backup`.
+    let mut hits: BTreeMap<&str, (i64, &str)> = BTreeMap::new();
+    for line in lines {
+        if !line.message.contains(WILL_NOT_BE_LOADED) {
+            continue;
+        }
+        let owner = expected
+            .declared_ids
+            .iter()
+            .filter(|id| line.message.contains(&format!("Resource {id} ")))
+            .max_by_key(|id| id.len());
+        if let Some(id) = owner {
+            let entry = hits
+                .entry(id.as_str())
+                .or_insert((line.timestamp, line.logger.as_str()));
+            if line.timestamp < entry.0 {
+                *entry = (line.timestamp, line.logger.as_str());
+            }
+        }
+    }
+    let mut findings: Vec<Finding> = hits
+        .into_iter()
+        .map(|(id, (timestamp, logger))| {
+            finding(
+                "unloaded_resource",
+                id,
+                format!("logged at {timestamp} by `{}`", printable(logger)),
+            )
+        })
+        .collect();
+    sort_findings(&mut findings);
+    let detail = if findings.is_empty() {
+        format!(
+            "no `{WILL_NOT_BE_LOADED}` line for a declared resource since the last scan (the gateway logs it once per scan that finds the resource, and not for every type, so this covers the last scan only)"
+        )
+    } else {
+        format!("{} declared resource(s) were not loaded", findings.len())
+    };
+    finished(CheckId::Loaded, detail, findings)
+}
+
+// ---- 6. probes ----------------------------------------------------------------
+
+fn check_probes(expected: &Expected, observed: &ObservedState) -> Check {
+    if expected.probes.is_empty() {
+        return Check {
+            id: CheckId::Probes,
+            status: CheckStatus::Warn,
+            detail: "the manifest declares no `verify.tag_probes`; nothing was probed".to_string(),
+            findings: vec![finding(
+                "tag_probes_absent",
+                "verify.tag_probes",
+                "add tag paths to the manifest to probe them after a deploy",
+            )],
+        };
+    }
+    let readings = match &observed.probes {
+        Some(Ok(readings)) => readings,
+        Some(Err(slug)) => {
+            return finished(
+                CheckId::Probes,
+                "the probes could not be read".to_string(),
+                vec![finding("tag_probes_unavailable", "tags", printable(slug))],
+            );
+        }
+        None => {
+            return finished(
+                CheckId::Probes,
+                "the probes could not be read".to_string(),
+                vec![finding("tag_probes_unavailable", "tags", "not read")],
+            );
+        }
+    };
+    let mut findings = Vec::new();
+    for path in &expected.probes {
+        match readings.iter().find(|r| &r.path == path) {
+            Some(r) if r.quality.starts_with("Good") => {}
+            Some(r) => findings.push(finding(
+                "tag_probe_not_good",
+                path.clone(),
+                format!("quality {}", quality_code(&r.quality)),
+            )),
+            None => findings.push(finding("tag_probe_not_good", path.clone(), "no reading")),
+        }
+    }
+    // Manifest order, not sorted.
+    finished(
+        CheckId::Probes,
+        format!("{} tag probe(s) read", expected.probes.len()),
+        findings,
+    )
+}
+
+/// A quality string reduced to a code that cannot carry free text: the class
+/// (`Good`, `Bad`, `Uncertain`, `Error`) and, when the rest is plain letters,
+/// the Ignition suffix (`Bad_NotFound`).
+fn quality_code(quality: &str) -> String {
+    if quality.is_empty() {
+        return "empty".to_string();
+    }
+    let (class, rest) = match quality.split_once('_') {
+        Some((class, rest)) => (class, Some(rest)),
+        None => (quality, None),
+    };
+    if !matches!(class, "Good" | "Bad" | "Uncertain" | "Error") {
+        return "unrecognised".to_string();
+    }
+    match rest {
+        Some(rest)
+            if !rest.is_empty()
+                && rest.len() <= 48
+                && rest.chars().all(|c| c.is_ascii_alphabetic() || c == '_') =>
+        {
+            format!("{class}_{rest}")
+        }
+        _ => class.to_string(),
+    }
+}
+
+/// `text` limited to printable characters and [`MAX_CODE_CHARS`], for the few
+/// gateway-supplied names that reach a finding (logger names, error slugs,
+/// the active mode).
+fn printable(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_CODE_CHARS)
+        .collect();
+    if text.chars().count() > MAX_CODE_CHARS {
+        out.push_str("...");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn quality_codes_carry_no_free_text() {
+        assert_eq!(quality_code("Good"), "Good");
+        assert_eq!(quality_code("Good_Provisional"), "Good_Provisional");
+        assert_eq!(quality_code("Bad_NotFound"), "Bad_NotFound");
+        assert_eq!(quality_code("Bad_secret-123"), "Bad");
+        assert_eq!(quality_code("Weird"), "unrecognised");
+        assert_eq!(quality_code(""), "empty");
+    }
+
+    #[test]
+    fn printable_drops_controls_and_caps_length() {
+        assert_eq!(printable("a\nb\u{7}c"), "abc");
+        let long = "x".repeat(MAX_CODE_CHARS + 10);
+        assert_eq!(printable(&long).len(), MAX_CODE_CHARS + 3);
+    }
+
+    #[test]
+    fn numbers_compare_by_value() {
+        let mut out = Vec::new();
+        diff_exact(
+            &json!({"a": 1, "b": 2.5}),
+            &json!({"a": 1.0, "b": 2.5}),
+            "",
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        diff_exact(&json!({"a": 1}), &json!({"a": 2}), "", &mut out);
+        assert_eq!(out, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn path_list_is_sorted_deduplicated_and_capped() {
+        let paths: Vec<String> = (0..MAX_PATHS + 3)
+            .rev()
+            .map(|i| format!("p{i:02}"))
+            .collect();
+        let text = join_paths(paths);
+        assert!(text.starts_with("p00, p01"), "{text}");
+        assert!(text.ends_with("(+3 more)"), "{text}");
     }
 }
