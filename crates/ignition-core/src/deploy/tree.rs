@@ -551,6 +551,227 @@ fn open_beneath(root: &Path, rel: &Path) -> Result<std::fs::File, OpenError> {
     Ok(std::fs::File::from(fd))
 }
 
+/// Descriptor-relative mutation helpers (unix), the write-side twin of
+/// [`open_regular_file`]'s read chain.
+///
+/// Every function takes a directory handle and ONE name, never a path, and
+/// every open of a directory uses `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. A
+/// component that is, or has been swapped for, a symlink (or any non-directory)
+/// fails with [`FdError::Changed`] instead of redirecting the operation, so a
+/// mutation can never leave the directory it was rooted in however the tree
+/// changes underneath. The root of a chain is the operator's own directory and
+/// is opened without following a final symlink.
+///
+/// Windows has no descriptor-relative primitives in std; its callers stay
+/// path-based and carry that as a documented residual.
+#[cfg(unix)]
+pub(crate) mod dirfd {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    use rustix::fs::{
+        AtFlags, FileType, Mode, OFlags, mkdirat, openat, renameat, statat, unlinkat,
+    };
+    use rustix::io::Errno;
+
+    /// Why a descriptor-relative operation was refused.
+    #[derive(Debug)]
+    pub(crate) enum FdError {
+        /// A component is, or became, a symlink or a non-directory (`ELOOP`,
+        /// `ENOTDIR`, `ENXIO`), or an opened handle is not what was inspected.
+        Changed,
+        Missing,
+        Exists,
+        NotEmpty,
+        Io(std::io::Error),
+    }
+
+    fn map(e: Errno) -> FdError {
+        if e == Errno::LOOP || e == Errno::NOTDIR || e == Errno::NXIO {
+            FdError::Changed
+        } else if e == Errno::NOENT {
+            FdError::Missing
+        } else if e == Errno::EXIST {
+            FdError::Exists
+        } else if e == Errno::NOTEMPTY {
+            FdError::NotEmpty
+        } else {
+            FdError::Io(e.into())
+        }
+    }
+
+    /// What a name is inside a directory (never followed).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Kind {
+        Missing,
+        Dir,
+        File,
+        Symlink,
+        Other,
+    }
+
+    const DIR_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+
+    /// Open `path` as a directory without following a final symlink.
+    pub(crate) fn open_root(path: &Path) -> Result<File, FdError> {
+        rustix::fs::open(path, DIR_FLAGS, Mode::empty())
+            .map(File::from)
+            .map_err(map)
+    }
+
+    /// Open the directory `name` inside `dir`.
+    pub(crate) fn open_dir(dir: &File, name: &str) -> Result<File, FdError> {
+        openat(dir, name, DIR_FLAGS, Mode::empty())
+            .map(File::from)
+            .map_err(map)
+    }
+
+    /// Open `parts` below `dir`, one `openat` per component.
+    pub(crate) fn walk(dir: &File, parts: &[&str]) -> Result<File, FdError> {
+        let mut current = dir.try_clone().map_err(FdError::Io)?;
+        for part in parts {
+            current = open_dir(&current, part)?;
+        }
+        Ok(current)
+    }
+
+    /// Open the directory `name` inside `dir`, creating it (`mkdirat`, mode
+    /// 0777 under the umask like `create_dir`) when absent.
+    pub(crate) fn ensure_dir(dir: &File, name: &str) -> Result<File, FdError> {
+        match open_dir(dir, name) {
+            Err(FdError::Missing) => {
+                match mkdirat(dir, name, Mode::from_raw_mode(0o777)) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(e) => return Err(map(e)),
+                }
+                open_dir(dir, name)
+            }
+            other => other,
+        }
+    }
+
+    /// [`walk`] that creates each missing level.
+    pub(crate) fn ensure_walk(dir: &File, parts: &[&str]) -> Result<File, FdError> {
+        let mut current = dir.try_clone().map_err(FdError::Io)?;
+        for part in parts {
+            current = ensure_dir(&current, part)?;
+        }
+        Ok(current)
+    }
+
+    /// What `name` is inside `dir`, without following it.
+    pub(crate) fn kind_at(dir: &File, name: &str) -> Result<Kind, FdError> {
+        match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory => Kind::Dir,
+                FileType::RegularFile => Kind::File,
+                FileType::Symlink => Kind::Symlink,
+                _ => Kind::Other,
+            }),
+            Err(Errno::NOENT) => Ok(Kind::Missing),
+            Err(e) => Err(map(e)),
+        }
+    }
+
+    /// `(device, inode)` of `name` inside `dir`, `None` when absent.
+    #[allow(clippy::unnecessary_cast)] // the raw widths differ per platform
+    pub(crate) fn ident_at(dir: &File, name: &str) -> Result<Option<(u64, u64)>, FdError> {
+        match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some((stat.st_dev as u64, stat.st_ino as u64))),
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(map(e)),
+        }
+    }
+
+    /// Create `name` in `dir`, which must not exist: `O_CREAT | O_EXCL |
+    /// O_NOFOLLOW`, mode 0666 under the umask like `File::create_new`.
+    pub(crate) fn create_new(dir: &File, name: &str) -> Result<File, FdError> {
+        openat(
+            dir,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map(File::from)
+        .map_err(map)
+    }
+
+    /// Open `name` in `dir` for an in-place overwrite (create when absent,
+    /// truncate when present), never following a symlink and never touching a
+    /// non-regular file: the handle is checked with `fstat` BEFORE the
+    /// truncate.
+    pub(crate) fn open_overwrite(dir: &File, name: &str) -> Result<File, FdError> {
+        let fd = openat(
+            dir,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(map)?;
+        let file = File::from(fd);
+        if !file.metadata().map_err(FdError::Io)?.is_file() {
+            return Err(FdError::Changed);
+        }
+        file.set_len(0).map_err(FdError::Io)?;
+        Ok(file)
+    }
+
+    /// Open the regular file `name` in `dir` for reading (no symlink, no
+    /// blocking on a FIFO) and read at most `cap + 1` bytes. Returns the
+    /// handle's identity and the bytes; a non-regular file is
+    /// [`FdError::Changed`].
+    pub(crate) fn read_file(
+        dir: &File,
+        name: &str,
+        cap: u64,
+    ) -> Result<((u64, u64), Vec<u8>), FdError> {
+        let fd = openat(
+            dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map)?;
+        let mut file = File::from(fd);
+        let meta = file.metadata().map_err(FdError::Io)?;
+        if !meta.is_file() {
+            return Err(FdError::Changed);
+        }
+        let mut bytes = Vec::with_capacity(meta.len().min(cap) as usize);
+        (&mut file)
+            .take(cap + 1)
+            .read_to_end(&mut bytes)
+            .map_err(FdError::Io)?;
+        Ok(((meta.dev(), meta.ino()), bytes))
+    }
+
+    /// `renameat` between directory handles (replaces an existing file).
+    pub(crate) fn rename_at(
+        from_dir: &File,
+        from: &str,
+        to_dir: &File,
+        to: &str,
+    ) -> Result<(), FdError> {
+        renameat(from_dir, from, to_dir, to).map_err(map)
+    }
+
+    /// `unlinkat` of a non-directory (a symlink is removed, never its target).
+    pub(crate) fn unlink_at(dir: &File, name: &str) -> Result<(), FdError> {
+        unlinkat(dir, name, AtFlags::empty()).map_err(map)
+    }
+
+    /// `unlinkat(AT_REMOVEDIR)`: removes an EMPTY directory only
+    /// ([`FdError::NotEmpty`] otherwise).
+    pub(crate) fn rmdir_at(dir: &File, name: &str) -> Result<(), FdError> {
+        unlinkat(dir, name, AtFlags::REMOVEDIR).map_err(map)
+    }
+}
+
 /// `symlink_metadata` of `repo/rel`, as a finding on failure.
 fn tree_meta(repo: &Path, rel: &str, hint: Option<&str>) -> Result<std::fs::Metadata, CoreError> {
     match std::fs::symlink_metadata(repo.join(rel)) {
