@@ -75,7 +75,7 @@ Full phase details, goals, requirements mapping, and planner decisions: [milesto
 **Decisions in force** (recorded in REQUIREMENTS.md at scoping, 2026-10-10):
 
 - **A — verdict envelope:** post-write red outcomes keep the frozen envelope: `ok:true`, `data.ok=false`, verdict slug in `data`, exit 6. Pre-write refusals stay `CoreError` envelopes.
-- **B — staging location: OPEN.** Resolved in Phase 22 from capture C6 and recorded before Phase 23 is planned: (i) home-relative staging outside `data/config/` (needs a spec §9 amendment) if C6 confirms write access and no collection-read risk, otherwise (ii) in-place mirror with the scan-lock covering the transfer.
+- **B — staging location: B(i), recorded 2026-10-15.** Home-relative staging outside `data/config/` in the service account's home, committed by renaming into the mode collection; ledger and journal at `ign-deploy/<gateway>/<mode>/` in that home on ssh nodes (spec §9 amendment still to do; the account needs `Modify` on each mode collection). Evidence and the measured hold budget (505 s without and 699 s with a Defender exclusion at 152 files, both above the 300 s ceiling, an open item for Phase 23 planning): `.planning/phases/22-transport-plan-pull-verify/22-LIVE-CAPTURES.md`.
 - **C — plan-hash handshake:** CI and agent callers must pass `--plan-sha256`; it is optional interactively.
 - **D — MCP exposure:** `apply`, `rollback` and `projects` are not MCP tools in v1.6; `render`, `plan`, `pull` and `verify` are.
 - **Scope:** bootstrap (`ign deploy pull`) is in; the spec §13.5 core strip is not (SF-5). Also in: the `--base` drift gate, verify tag probes, the `.gwbk` snapshot default-on, the Designer preflight.

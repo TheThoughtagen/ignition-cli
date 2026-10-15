@@ -88,10 +88,11 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ### Blockers
 
-- [Before Phase 23 planning] Decision B (staging location / svc-ignition-deploy write scope) is OPEN. Resolve in Phase 22 from capture C6 and record it; Phase 23 also needs the OQ5 measured hold budget.
+- [RESOLVED 22-14, exit gate] Decision B = B(i) (home-relative staging, recorded 22-12) and the OQ5 hold budget are recorded in 22-LIVE-CAPTURES.md (`## Decisions: OQ5 ...`). The hold budget `ceil(2 x (p95 commit + p95 scan) + 1)` measured at 152 files is 505 s (Defender exclusion off) and 699 s (on), both ABOVE the 300 s ceiling.
+- [OPEN, Phase 23 planning must open with it] Hold budget above the ceiling: a measured 152-file commit takes 234 to 348 s on the Windows host (per-file sftp renames), so a 300 s hold lapses mid-commit; a 1,520-file tree extrapolates (not measured) to roughly ten times that. Decide: shorten the locked window, raise the ceiling with the user, or budget the transfer separately (OQ5-2). `op_timeout_s` above 3600 would also be needed for such a tree (OQ5-4).
 - [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
 - [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
-- 22-12: svc-ignition-deploy has no write on the Azure VM mode collection; the user-approved Modify grant was not made (permission classifier refused); needed for 22-13 live proof and 22-14 timings
+- [RESOLVED 22-13] svc-ignition-deploy has Modify on the Azure VM `production` collection (post-C6 grant of 2026-10-15, verified as the account); used by the 22-13 live proof and the 22-14 timings
 
 ### Quick Tasks Completed
 

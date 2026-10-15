@@ -7851,6 +7851,291 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; fini
 ~~~
 
 
+## OQ5 run B (Defender exclusion on)
+
+**Excluded paths (reported by the coordinator after the user added them as administrator with `az vm run-command` and `Add-MpPreference`; `Get-MpPreference` read them back verbatim as):**
+
+```
+C:\Program Files\Inductive Automation\Ignition\data
+C:\Users\svc-ignition-deploy\ign-deploy
+```
+
+`RealTimeProtectionEnabled` is still `True`. The read-back went through `az vm run-command` (as SYSTEM), not as `svc-ignition-deploy`; the account cannot read Defender settings (T-22-61: the exclusion is on a capture host, the production recommendation is recorded in OQ5-3, not applied).
+
+Same harness, host, account, payload (scale 1: 70 named units, 152 files, 91,833 bytes) and sample counts as run A, so the A/B delta is like for like. The scale-10 probe was ruled out by the coordinator; the 1,520-file figures in the decisions are extrapolations.
+
+Command (environment as in run A):
+
+```
+IGNITION_LIVE_WFLWVM01=1 IGNITION_LIVE_OQ5=1 IGN_OQ5_LABEL=B IGN_OQ5_SCALE=1 \
+  cargo test -p ignition-core --test live_transport_wflwvm01 oq5_timings -- --ignored --nocapture
+```
+
+### Attempts
+
+1. **Attempt B1** (2026-10-15T14:59:06Z to 15:38:01Z, 2329 s) was cut off in iteration 5 by `exit code 255: Connection closed` on a `stage` call. It completed 4 iterations (stage, commit, scans, delete) and no reads, then restored the host (`production_listing_equals_pre_run: true`, `ign-deploy` absent). Its samples are listed under "Attempt B1" and are **not pooled** into the table below.
+2. **Attempt B2** (2026-10-15T15:39:29Z to 18:14:42Z, 9303 s) is the run B of this section: 10 iterations, 20 reads, 20 connect samples. All its measurements completed. Its final restore step failed (`remove_tree: exit code 255` from ssh, a transient connection failure; the harness' own summary line was therefore not printed). The host was then restored with the harness' restore-only mode (`IGN_OQ5_RESTORE_ONLY`, first try: `ssh: connect to host ... port 22: Operation timed out`; second try, minutes later: restored, `production_listing_equals_pre_run: true`). The harness' restore now retries transient ssh failures (`remove_tree_retry`). The summary below is computed from the printed sample lines of B2 with the same nearest-rank rule as the harness (and the same script that reproduces run A's table exactly).
+
+### Gateway and license state
+
+- The trial was reset by the coordinator at about 2026-10-15T14:58Z (`POST /data/api/v1/trial`, `trialSecondsLeft` 7199) before attempt B1; it was at 4744 s left when B2 started at 15:39Z.
+- It expired at about 16:58:09Z during B2 (`trialSecondsLeft` 0, `expired: true` at 16:58:09Z). **I reset it myself at 2026-10-15T16:58:14Z** with `ign api call --method POST --path /data/api/v1/trial --profile azure-win --json` (the token profile; `status 200`, `trialSecondsLeft` 7199, `expired: false`), as instructed. The run continued across the reset without a visible step. The trial had about 2257 s left at 18:20Z, after the run.
+- Scans: no scan was refused. Gateway-side `lastScanDuration` with the payload present was 291 to 338 ms in B2 (run A: 539 to 676 ms).
+
+### Summary (nearest-rank percentiles, seconds; `_ms` rows are the gateway's `lastScanDuration` in milliseconds), attempt B2
+
+| Phase | n | p50 | p95 | min | max | run A p95 |
+|---|---|---|---|---|---|---|
+| connect (`sftp` session running `pwd`) | 20 | 2.010 | 2.423 | 1.507 | 3.026 | 1.688 |
+| read of the scoped collection, payload present | 20 | 169.436 | 214.448 | 161.436 | 221.489 | 181.155 |
+| stage | 10 | 84.490 | 100.471 | 74.056 | 100.471 | 83.265 |
+| commit (rename into `production`, empty delete set) | 10 | 285.193 | 348.225 | 241.641 | 348.225 | 251.063 |
+| scan, wall, payload present | 10 | 0.520 | 0.642 | 0.389 | 0.642 | 0.888 |
+| scan, gateway `lastScanDuration`, payload present (ms) | 10 | 301 | 338 | 291 | 338 | 676 |
+| commit of the delete set (152 files, 70 directories removed) | 10 | 111.838 | 128.288 | 108.247 | 128.288 | 114.182 |
+| scan, wall, after delete | 10 | 0.378 | 0.562 | 0.299 | 0.562 | 0.981 |
+| scan, gateway `lastScanDuration`, after delete (ms) | 10 | 197 | 266 | 194 | 266 | 489 |
+
+Attempt B1 (n = 4, not pooled): stage p50 77.354 / max 99.467; commit p50 272.475 / max 324.699; delete commit p50 123.610 / max 136.220; scan with payload wall p50 0.508, gateway 315 to 489 ms; connect (20 samples) p50 1.446, p95 1.665.
+
+### Restore and host-clean proof (T-22-59)
+
+After the run: `production` lists `config-mode.json` only (sha256 `f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa`, 133 bytes; the harness' hash-equality assertion `production_listing_equals_pre_run: true` passed in the restore-only run and again in a second restore-only check); `ign-deploy` is absent from the account home (`ign_deploy_in_home_exists: false`); and over ssh as the account, `dir /b production` printed `config-mode.json` only and `dir /b %USERPROFILE% | findstr /i ign-` printed nothing. The Defender exclusions were left in place by the harness; removing them is the user's call.
+
+### Raw output, attempt B2
+
+~~~
+OQ5 {"connect_samples":20,"iters":10,"label":"B","op_timeout_s":1800,"payload":{"bytes":91833,"files":152,"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","types":27,"units":70},"reads":20}
+OQ5 {"gateway_scan_state_before":{"lastScanDuration":240,"lastScanTimestamp":1792078489720,"scanActive":false},"label":"B"}
+OQ5 {"label":"B","pre_run_listing":[{"dir":false,"path":"config-mode.json","sha256":"f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa","size":133}]}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"connect_pwd","value":1.865}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"connect_pwd","value":2.147}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"connect_pwd","value":2.378}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"connect_pwd","value":1.737}
+OQ5 {"extra":{},"iter":5,"label":"B","phase":"connect_pwd","value":2.01}
+OQ5 {"extra":{},"iter":6,"label":"B","phase":"connect_pwd","value":1.772}
+OQ5 {"extra":{},"iter":7,"label":"B","phase":"connect_pwd","value":1.878}
+OQ5 {"extra":{},"iter":8,"label":"B","phase":"connect_pwd","value":1.729}
+OQ5 {"extra":{},"iter":9,"label":"B","phase":"connect_pwd","value":2.297}
+OQ5 {"extra":{},"iter":10,"label":"B","phase":"connect_pwd","value":2.338}
+OQ5 {"extra":{},"iter":11,"label":"B","phase":"connect_pwd","value":1.855}
+OQ5 {"extra":{},"iter":12,"label":"B","phase":"connect_pwd","value":2.264}
+OQ5 {"extra":{},"iter":13,"label":"B","phase":"connect_pwd","value":1.507}
+test oq5_timings has been running for over 60 seconds
+OQ5 {"extra":{},"iter":14,"label":"B","phase":"connect_pwd","value":2.103}
+OQ5 {"extra":{},"iter":15,"label":"B","phase":"connect_pwd","value":1.748}
+OQ5 {"extra":{},"iter":16,"label":"B","phase":"connect_pwd","value":2.355}
+OQ5 {"extra":{},"iter":17,"label":"B","phase":"connect_pwd","value":3.026}
+OQ5 {"extra":{},"iter":18,"label":"B","phase":"connect_pwd","value":2.241}
+OQ5 {"extra":{},"iter":19,"label":"B","phase":"connect_pwd","value":1.874}
+OQ5 {"extra":{},"iter":20,"label":"B","phase":"connect_pwd","value":2.423}
+OQ5 {"extra":{"files":152},"iter":1,"label":"B","phase":"stage","value":100.471}
+OQ5 {"extra":{"files":152},"iter":1,"label":"B","phase":"commit","value":289.487}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_with_payload","value":0.511}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_with_payload_gateway_ms","value":338.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":1,"label":"B","phase":"commit_delete","value":128.017}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_after_delete","value":0.423}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_after_delete_gateway_ms","value":197.0}
+OQ5 {"extra":{"files":152},"iter":2,"label":"B","phase":"stage","value":96.904}
+OQ5 {"extra":{"files":152},"iter":2,"label":"B","phase":"commit","value":289.002}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_with_payload","value":0.613}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_with_payload_gateway_ms","value":295.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":2,"label":"B","phase":"commit_delete","value":128.288}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_after_delete","value":0.482}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_after_delete_gateway_ms","value":195.0}
+OQ5 {"extra":{"files":152},"iter":3,"label":"B","phase":"stage","value":92.319}
+OQ5 {"extra":{"files":152},"iter":3,"label":"B","phase":"commit","value":306.513}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_with_payload","value":0.429}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_with_payload_gateway_ms","value":297.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":3,"label":"B","phase":"commit_delete","value":115.531}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_after_delete","value":0.378}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_after_delete_gateway_ms","value":198.0}
+OQ5 {"extra":{"files":152},"iter":4,"label":"B","phase":"stage","value":92.924}
+OQ5 {"extra":{"files":152},"iter":4,"label":"B","phase":"commit","value":348.225}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_with_payload","value":0.394}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_with_payload_gateway_ms","value":301.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":4,"label":"B","phase":"commit_delete","value":127.507}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_after_delete","value":0.299}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_after_delete_gateway_ms","value":206.0}
+OQ5 {"extra":{"files":152},"iter":5,"label":"B","phase":"stage","value":82.387}
+OQ5 {"extra":{"files":152},"iter":5,"label":"B","phase":"commit","value":292.818}
+OQ5 {"extra":{},"iter":5,"label":"B","phase":"scan_with_payload","value":0.52}
+OQ5 {"extra":{},"iter":5,"label":"B","phase":"scan_with_payload_gateway_ms","value":322.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":5,"label":"B","phase":"commit_delete","value":108.247}
+OQ5 {"extra":{},"iter":5,"label":"B","phase":"scan_after_delete","value":0.371}
+OQ5 {"extra":{},"iter":5,"label":"B","phase":"scan_after_delete_gateway_ms","value":194.0}
+OQ5 {"extra":{"files":152},"iter":6,"label":"B","phase":"stage","value":84.49}
+OQ5 {"extra":{"files":152},"iter":6,"label":"B","phase":"commit","value":241.641}
+OQ5 {"extra":{},"iter":6,"label":"B","phase":"scan_with_payload","value":0.557}
+OQ5 {"extra":{},"iter":6,"label":"B","phase":"scan_with_payload_gateway_ms","value":325.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":6,"label":"B","phase":"commit_delete","value":111.838}
+OQ5 {"extra":{},"iter":6,"label":"B","phase":"scan_after_delete","value":0.562}
+OQ5 {"extra":{},"iter":6,"label":"B","phase":"scan_after_delete_gateway_ms","value":228.0}
+OQ5 {"extra":{"files":152},"iter":7,"label":"B","phase":"stage","value":75.207}
+OQ5 {"extra":{"files":152},"iter":7,"label":"B","phase":"commit","value":255.937}
+OQ5 {"extra":{},"iter":7,"label":"B","phase":"scan_with_payload","value":0.389}
+OQ5 {"extra":{},"iter":7,"label":"B","phase":"scan_with_payload_gateway_ms","value":301.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":7,"label":"B","phase":"commit_delete","value":109.41}
+OQ5 {"extra":{},"iter":7,"label":"B","phase":"scan_after_delete","value":0.392}
+OQ5 {"extra":{},"iter":7,"label":"B","phase":"scan_after_delete_gateway_ms","value":197.0}
+OQ5 {"extra":{"files":152},"iter":8,"label":"B","phase":"stage","value":84.61}
+OQ5 {"extra":{"files":152},"iter":8,"label":"B","phase":"commit","value":285.193}
+OQ5 {"extra":{},"iter":8,"label":"B","phase":"scan_with_payload","value":0.642}
+OQ5 {"extra":{},"iter":8,"label":"B","phase":"scan_with_payload_gateway_ms","value":326.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":8,"label":"B","phase":"commit_delete","value":109.767}
+OQ5 {"extra":{},"iter":8,"label":"B","phase":"scan_after_delete","value":0.345}
+OQ5 {"extra":{},"iter":8,"label":"B","phase":"scan_after_delete_gateway_ms","value":203.0}
+OQ5 {"extra":{"files":152},"iter":9,"label":"B","phase":"stage","value":74.056}
+OQ5 {"extra":{"files":152},"iter":9,"label":"B","phase":"commit","value":265.5}
+OQ5 {"extra":{},"iter":9,"label":"B","phase":"scan_with_payload","value":0.552}
+OQ5 {"extra":{},"iter":9,"label":"B","phase":"scan_with_payload_gateway_ms","value":291.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":9,"label":"B","phase":"commit_delete","value":118.625}
+OQ5 {"extra":{},"iter":9,"label":"B","phase":"scan_after_delete","value":0.386}
+OQ5 {"extra":{},"iter":9,"label":"B","phase":"scan_after_delete_gateway_ms","value":266.0}
+OQ5 {"extra":{"files":152},"iter":10,"label":"B","phase":"stage","value":80.364}
+OQ5 {"extra":{"files":152},"iter":10,"label":"B","phase":"commit","value":264.526}
+OQ5 {"extra":{},"iter":10,"label":"B","phase":"scan_with_payload","value":0.536}
+OQ5 {"extra":{},"iter":10,"label":"B","phase":"scan_with_payload_gateway_ms","value":326.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":10,"label":"B","phase":"commit_delete","value":108.883}
+OQ5 {"extra":{},"iter":10,"label":"B","phase":"scan_after_delete","value":0.36}
+OQ5 {"extra":{},"iter":10,"label":"B","phase":"scan_after_delete_gateway_ms","value":197.0}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":1,"label":"B","phase":"read","value":168.23}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":2,"label":"B","phase":"read","value":170.942}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":3,"label":"B","phase":"read","value":205.709}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":4,"label":"B","phase":"read","value":175.804}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":5,"label":"B","phase":"read","value":165.635}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":6,"label":"B","phase":"read","value":212.931}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":7,"label":"B","phase":"read","value":169.436}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":8,"label":"B","phase":"read","value":162.286}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":9,"label":"B","phase":"read","value":167.901}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":10,"label":"B","phase":"read","value":168.011}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":11,"label":"B","phase":"read","value":170.99}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":12,"label":"B","phase":"read","value":161.436}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":13,"label":"B","phase":"read","value":185.873}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":14,"label":"B","phase":"read","value":214.448}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":15,"label":"B","phase":"read","value":221.489}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":16,"label":"B","phase":"read","value":164.397}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":17,"label":"B","phase":"read","value":176.672}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":18,"label":"B","phase":"read","value":172.419}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":19,"label":"B","phase":"read","value":166.887}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":20,"label":"B","phase":"read","value":164.468}
+OQ5 {"label":"B","restore":{"files_to_remove":152}}
+OQ5 {"label":"B","restore":{"commit_secs":112.617156959,"removed_dirs":70}}
+OQ5 {"label":"B","restore":{"scan_secs":0.326581666}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.cirruslink.mqtt.distributor.gateway"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.cirruslink.mqtt.engine.gateway"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.cirruslink.mqtt.transmission.gateway"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.eam"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.historian"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.opcua"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.perspective"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"ignition"}}
+thread 'oq5_timings' (35122017) panicked at crates/ignition-core/tests/live_transport_wflwvm01.rs:272:10:
+remove_tree: TransportFailed { operation: "exec", node: "nodes.master", detail: "remove_tree: exit code 255" }
+test oq5_timings ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 9302.90s
+~~~
+
+### Raw output, restore-only runs after B2 (first try failed on a transient connection timeout, second restored)
+
+~~~
+OQ5 {"connect_samples":20,"iters":10,"label":"B-restore","op_timeout_s":1800,"payload":{"bytes":918330,"files":1520,"source":"sanitized corpus (183 .json, 195 files) x 10, named units only","types":27,"units":700},"reads":20}
+OQ5 {"gateway_scan_state_before":{"lastScanDuration":202,"lastScanTimestamp":1792088041065,"scanActive":false},"label":"B-restore"}
+OQ5 {"label":"B-restore","pre_run_listing":[{"dir":false,"path":"config-mode.json","sha256":"f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa","size":133}]}
+thread 'oq5_timings' (36824595) panicked at crates/ignition-core/tests/live_transport_wflwvm01.rs:282:10:
+enumerate: TransportFailed { operation: "exec", node: "nodes.master", detail: "enumerate: exit code 255: ssh: connect to host 40.114.71.134 port 22: Operation timed out" }
+test oq5_timings ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 50.15s
+OQ5 {"connect_samples":20,"iters":10,"label":"B-restore","op_timeout_s":1800,"payload":{"bytes":918330,"files":1520,"source":"sanitized corpus (183 .json, 195 files) x 10, named units only","types":27,"units":700},"reads":20}
+OQ5 {"gateway_scan_state_before":{"lastScanDuration":202,"lastScanTimestamp":1792088041065,"scanActive":false},"label":"B-restore"}
+OQ5 {"label":"B-restore","pre_run_listing":[{"dir":false,"path":"config-mode.json","sha256":"f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa","size":133}]}
+OQ5 {"label":"B-restore","restore":{"files_to_remove":0}}
+OQ5 {"label":"B-restore","restore":{"staging_gone":true}}
+OQ5 {"label":"B-restore","summary":{"bytes":918330,"files":1520,"label":"B-restore","percentile":"nearest rank","phases":{},"source":"sanitized corpus (183 .json, 195 files) x 10, named units only","unit":"seconds unless the phase name ends in _ms","units":700}}
+OQ5 {"label":"B-restore","total_secs":41.507943292}
+OQ5 {"label":"B-restore","restore_assertion":{"entries_after":1,"entries_before":1,"production_listing_equals_pre_run":true}}
+OQ5 {"ign_deploy_in_home_exists":false,"label":"B-restore"}
+PASS oq5_timings
+test oq5_timings ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 43.59s
+~~~
+
+### Raw output, attempt B1
+
+~~~
+OQ5 {"connect_samples":20,"iters":10,"label":"B","op_timeout_s":1800,"payload":{"bytes":91833,"files":152,"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","types":27,"units":70},"reads":20}
+OQ5 {"gateway_scan_state_before":{"lastScanDuration":416,"lastScanTimestamp":1792075704531,"scanActive":false},"label":"B"}
+OQ5 {"label":"B","pre_run_listing":[{"dir":false,"path":"config-mode.json","sha256":"f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa","size":133}]}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"connect_pwd","value":1.44}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"connect_pwd","value":1.569}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"connect_pwd","value":1.387}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"connect_pwd","value":1.493}
+OQ5 {"extra":{},"iter":5,"label":"B","phase":"connect_pwd","value":1.427}
+OQ5 {"extra":{},"iter":6,"label":"B","phase":"connect_pwd","value":1.525}
+OQ5 {"extra":{},"iter":7,"label":"B","phase":"connect_pwd","value":1.498}
+OQ5 {"extra":{},"iter":8,"label":"B","phase":"connect_pwd","value":1.446}
+OQ5 {"extra":{},"iter":9,"label":"B","phase":"connect_pwd","value":1.52}
+OQ5 {"extra":{},"iter":10,"label":"B","phase":"connect_pwd","value":1.355}
+OQ5 {"extra":{},"iter":11,"label":"B","phase":"connect_pwd","value":1.444}
+OQ5 {"extra":{},"iter":12,"label":"B","phase":"connect_pwd","value":1.323}
+OQ5 {"extra":{},"iter":13,"label":"B","phase":"connect_pwd","value":1.444}
+OQ5 {"extra":{},"iter":14,"label":"B","phase":"connect_pwd","value":1.58}
+OQ5 {"extra":{},"iter":15,"label":"B","phase":"connect_pwd","value":1.421}
+OQ5 {"extra":{},"iter":16,"label":"B","phase":"connect_pwd","value":1.416}
+test oq5_timings has been running for over 60 seconds
+OQ5 {"extra":{},"iter":17,"label":"B","phase":"connect_pwd","value":1.635}
+OQ5 {"extra":{},"iter":18,"label":"B","phase":"connect_pwd","value":1.665}
+OQ5 {"extra":{},"iter":19,"label":"B","phase":"connect_pwd","value":1.573}
+OQ5 {"extra":{},"iter":20,"label":"B","phase":"connect_pwd","value":1.705}
+OQ5 {"extra":{"files":152},"iter":1,"label":"B","phase":"stage","value":76.698}
+OQ5 {"extra":{"files":152},"iter":1,"label":"B","phase":"commit","value":248.735}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_with_payload","value":0.581}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_with_payload_gateway_ms","value":489.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":1,"label":"B","phase":"commit_delete","value":110.727}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_after_delete","value":0.398}
+OQ5 {"extra":{},"iter":1,"label":"B","phase":"scan_after_delete_gateway_ms","value":212.0}
+OQ5 {"extra":{"files":152},"iter":2,"label":"B","phase":"stage","value":82.979}
+OQ5 {"extra":{"files":152},"iter":2,"label":"B","phase":"commit","value":272.475}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_with_payload","value":0.508}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_with_payload_gateway_ms","value":325.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":2,"label":"B","phase":"commit_delete","value":123.61}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_after_delete","value":0.343}
+OQ5 {"extra":{},"iter":2,"label":"B","phase":"scan_after_delete_gateway_ms","value":201.0}
+OQ5 {"extra":{"files":152},"iter":3,"label":"B","phase":"stage","value":77.354}
+OQ5 {"extra":{"files":152},"iter":3,"label":"B","phase":"commit","value":279.026}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_with_payload","value":0.54}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_with_payload_gateway_ms","value":335.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":3,"label":"B","phase":"commit_delete","value":136.22}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_after_delete","value":0.351}
+OQ5 {"extra":{},"iter":3,"label":"B","phase":"scan_after_delete_gateway_ms","value":203.0}
+OQ5 {"extra":{"files":152},"iter":4,"label":"B","phase":"stage","value":99.467}
+OQ5 {"extra":{"files":152},"iter":4,"label":"B","phase":"commit","value":324.699}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_with_payload","value":0.404}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_with_payload_gateway_ms","value":315.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":4,"label":"B","phase":"commit_delete","value":135.361}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_after_delete","value":0.499}
+OQ5 {"extra":{},"iter":4,"label":"B","phase":"scan_after_delete_gateway_ms","value":240.0}
+OQ5 {"label":"B","restore":{"files_to_remove":0}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.cirruslink.mqtt.distributor.gateway"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.cirruslink.mqtt.engine.gateway"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.cirruslink.mqtt.transmission.gateway"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.eam"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.historian"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.opcua"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"com.inductiveautomation.perspective"}}
+OQ5 {"label":"B","restore":{"removing_stray_dir":"ignition"}}
+OQ5 {"label":"B","restore":{"staging_gone":true}}
+OQ5 {"label":"B","summary":{"bytes":91833,"files":152,"label":"B","percentile":"nearest rank","phases":{"commit":{"max":324.698530292,"min":248.734927792,"n":4,"p50":272.474689625,"p95":324.698530292},"commit_delete":{"max":136.22041625,"min":110.727371875,"n":4,"p50":123.610231,"p95":136.22041625},"connect_pwd":{"max":1.705235958,"min":1.3229339580000001,"n":20,"p50":1.446371083,"p95":1.6652476250000001},"scan_after_delete":{"max":0.499330042,"min":0.342669,"n":4,"p50":0.350623083,"p95":0.499330042},"scan_after_delete_gateway_ms":{"max":240.0,"min":201.0,"n":4,"p50":203.0,"p95":240.0},"scan_with_payload":{"max":0.581023417,"min":0.4041645,"n":4,"p50":0.507575625,"p95":0.581023417},"scan_with_payload_gateway_ms":{"max":489.0,"min":315.0,"n":4,"p50":325.0,"p95":489.0},"stage":{"max":99.467064416,"min":76.697937458,"n":4,"p50":77.354143333,"p95":99.467064416}},"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","unit":"seconds unless the phase name ends in _ms","units":70}}
+OQ5 {"label":"B","total_secs":2324.94185225}
+OQ5 {"label":"B","restore_assertion":{"entries_after":1,"entries_before":1,"production_listing_equals_pre_run":true}}
+OQ5 {"ign_deploy_in_home_exists":false,"label":"B"}
+thread 'oq5_timings' (34397006) panicked at crates/ignition-core/tests/live_transport_wflwvm01.rs:1708:14:
+the measurement loop failed; the host was restored: "TransportFailed { operation: \"stage\", node: \"nodes.master\", detail: \"exit code 255: Connection closed\" }"
+test oq5_timings ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 2328.51s
+~~~
+
+
 ## Decisions
 
 Written after `capture22.sh cv1`, `cv2` and `cv3` ran to completion against the rig above. Every decision cites the blocks it rests on. Two points where a capture contradicts 22-RESEARCH are marked CONTRADICTS. 22-10 follows these decisions; nothing below is taken from research or inference.
@@ -8070,3 +8355,66 @@ The rule (ROADMAP v1.6, Decision B): choose (i) home-relative staging when C6 co
 **Commit-sequence rules inherited from C7a-4** (for 22-13 and Phase 23): replace files by renaming over them; never rename a path onto itself; rename a directory aside (or delete it) before renaming a new one into its place; retry a `Failure` rename a bounded number of times, then classify it.
 
 **Undo cost:** changing this now is a plan edit (`ledger_location`, the default `StagingMode`, 22-13). After Phase 23 writes ledgers and journals on hosts, moving them is a one-way migration across runners and hosts.
+
+## Decisions: OQ5 timings, hold budget and timeout defaults (22-14)
+
+Rests on `## OQ5 run A (Defender exclusion off)` and `## OQ5 run B (Defender exclusion on)` above. Host: the Azure VM `ign-win-836` standing in for WFLWVM01 (22-CONTEXT A-01), Windows Server 2022, Win32-OpenSSH 8.1, Ignition 8.3.6, driven from a macOS runner over the public internet as `svc-ignition-deploy`. Payload: the sanitized corpus at **scale 1** (70 named units, 152 files, 91,833 bytes), because the OQ5 source is `none` (A-03) and a ten-times payload costs about 75 minutes per iteration on this link (see run A). Every figure below is measured at 152 files; every 1,520-file figure is a labelled extrapolation. Sample counts: 10 stage/commit/scan iterations and 20 reads per run (n = 10 makes the nearest-rank p95 the maximum). Run B is attempt B2; attempt B1 (4 iterations) is in the run B section and is not pooled. One A/B pair was taken, not repeated.
+
+### OQ5-1 — p50 and p95 for read, stage, commit and scan, both runs (seconds)
+
+| Phase | n | A p50 | A p95 | B p50 | B p95 |
+|---|---|---|---|---|---|
+| connect (one sftp session, `pwd`) | 20 | 1.575 | 1.688 | 2.010 | 2.423 |
+| read of the scoped collection (46 core + 152 mode files, 117,914 bytes) | 20 | 164.120 | 181.155 | 169.436 | 214.448 |
+| stage (152 files into the account-home staging, B(i)) | 10 | 78.012 | 83.265 | 84.490 | 100.471 |
+| commit (152 renames into `production`) | 10 | 244.594 | 251.063 | 285.193 | 348.225 |
+| scan, wall, payload present | 10 | 0.792 | 0.888 | 0.520 | 0.642 |
+| scan, gateway `lastScanDuration`, payload present | 10 | 0.601 | 0.676 | 0.301 | 0.338 |
+| commit of the delete set (152 files, 70 directories) | 10 | 108.702 | 114.182 | 111.838 | 128.288 |
+| scan, wall, after delete | 10 | 0.680 | 0.981 | 0.378 | 0.562 |
+
+What the numbers say:
+- Time is per file and per session, not per byte: 91 KB took 78 to 100 s to stage, 234 to 348 s to commit and 155 to 221 s to read. Per file that is about 0.5 s (stage), 1.6 to 2.3 s (commit: a rename costs three to four times a put), 1.0 to 1.4 s (read) and 0.7 to 0.8 s (delete). The cause is not measured here (per-op latency on this link, the Windows rename retry path of 22-13, or Defender are each possible); do not read one into these numbers.
+- A config scan is not the bottleneck: it completes in under a second on this gateway, with and without 152 extra resources, on an expired and on a live trial.
+- **Extrapolation, not measurement:** at the same per-file rates a 1,520-file tree would take roughly ten times as long (commit about 2,500 to 3,500 s, read about 1,600 to 2,200 s, stage about 780 to 1,000 s). Linear scaling is assumed and was not measured.
+
+### OQ5-2 — the hold budget: `holdTimeout_s = ceil(2 x (p95 commit + p95 scan) + 1)`, floor 10 s, ceiling 300 s
+
+| Run | Defender state | p95 commit | p95 scan (wall) | formula | result |
+|---|---|---|---|---|---|
+| A | exclusion off | 251.063 | 0.888 | ceil(2 x 251.951 + 1) | **505 s** |
+| B | exclusion on | 348.225 | 0.642 | ceil(2 x 348.867 + 1) | **699 s** |
+
+- **Both values are above the 300 s ceiling. This is recorded as an OPEN BLOCKER FOR PHASE 23, not clamped** and not replaced by 300: a hold of 300 s would lapse while a 152-file commit is still renaming (the commit alone takes 242 to 348 s here), which is the failure the lock exists to prevent. The spec's 5 s figure (a local `docker cp`) is off by two orders of magnitude on this transport, and the 1,520-file extrapolation (commit 2,500 to 3,500 s, hold roughly 5,000 to 7,000 s by the same formula) is further out.
+- **Defender state to assume for Phase 23:** run B's 699 s (exclusion on) as the working figure. It is the larger measured value, and the exclusion did not make the commit faster (OQ5-3), so assuming the smaller figure of A would be the unsafe choice. Floor 10 s is not reached.
+- Under Decision B(i) the lock window is the commit (renames), the upload is outside it (stage 83 to 100 s of the totals above is not under the lock). That is already the case in these numbers: the commit is the dominant part, and it is a sequence of per-file sftp renames. Phase 23 must therefore either (a) shorten the locked window (the measured commit of 152 files already costs minutes; whether fewer, directory-level renames or a pipelined batch would shorten it is a question this data raises and does not answer), (b) decide a larger ceiling than 300 s with the user, or (c) hold a lock that is released by the scan the deploy triggers (D12 in 20-LIVE-CAPTURES: the lock ends when the holder's scan runs) and budget the transfer separately. Which one is Phase 23's planning decision.
+
+### OQ5-3 — Defender exclusion recommendation, with the measured p95 delta
+
+Exclusions were `C:\Program Files\Inductive Automation\Ignition\data` and `C:\Users\svc-ignition-deploy\ign-deploy` (run B header), real-time protection still on.
+
+| Phase | p95 A to B | p50 A to B |
+|---|---|---|
+| connect | 1.688 to 2.423 (+0.7 s) | 1.575 to 2.010 |
+| read | 181.155 to 214.448 (+33.3 s, +18%) | 164.120 to 169.436 (+3%) |
+| stage | 83.265 to 100.471 (+17.2 s, +21%) | 78.012 to 84.490 (+8%) |
+| commit | 251.063 to 348.225 (+97.2 s, +39%) | 244.594 to 285.193 (+17%) |
+| delete-set commit | 114.182 to 128.288 (+14.1 s, +12%) | 108.702 to 111.838 (+3%) |
+| scan, gateway-measured | 676 to 338 ms (about halved) | 601 to 301 ms |
+
+- **Recommendation: do not recommend a Defender exclusion for the transport on timing grounds.** The exclusion did not make any transport phase faster; every one was slower in run B (connect is a bare ssh session with no files, and is also slower, which points at network and host variation between the two runs rather than at Defender). The only improvement is the gateway-measured scan, about 300 ms either way, which is irrelevant against a commit of minutes.
+- The honest limit: one A/B pair on a WAN link, taken in different hours, with the gateway trial reset between and during them. Differences of the size seen here are not distinguishable from run-to-run noise, so the data does not show that Defender costs time on this host, and it does not show that an exclusion is worth its attack-surface cost. The hypothesis that Defender holding files explains the slow commit is therefore not supported.
+- Not applied anywhere: the exclusions stay as the user set them on the capture host; for a production host the recommendation is "none for this reason", and the administrator decides.
+
+### OQ5-4 — the D-04 timeout defaults, revisited
+
+Rule (22-14): `DEFAULT_OP_TIMEOUT_S` at least three times the larger of read p95 and commit p95, rounded up to 30 s; `DEFAULT_CONNECT_TIMEOUT_S` stays 10 unless the captured connect times exceed it.
+
+- Larger p95 across both runs: B commit 348.225 s. 3 x 348.225 = 1044.7 s, rounded up to the next multiple of 30 = **1050 s**. (Run A alone would give 3 x 251.063 = 753.2, so 780 s; the larger p95 decides.) Within the accepted range 1..=3600.
+- **`DEFAULT_OP_TIMEOUT_S` changes from 120 to 1050.** The old 120 s was below every measured commit (234 to 348 s) and read (155 to 221 s) of even this 152-file tree; those calls would have been killed as `transport_failed`. Landed in `crates/ignition-core/src/deploy/target.rs` (constant, doc comment, pinned test with a range check) and the README `nodes.*.ssh.op_timeout_s` row in the same commit; `cargo test -p ignition-core --lib deploy::target` is green.
+- **`DEFAULT_CONNECT_TIMEOUT_S` stays 10.** Over 60 measured sessions (A 20, B2 20, B1 20) the slowest was 3.026 s.
+- **Carry-forward (not a defect of the default):** the 1,520-file extrapolation (commit about 2,500 to 3,500 s) needs more than the 1050 s default and, at the top of the estimate, reaches the 3600 s upper bound of the accepted `op_timeout_s` range. A tree that size must set `op_timeout_s` explicitly, and the range cap itself would bind; whether to raise it, or to split a commit into calls that each fit, belongs with the Phase 23 hold-budget decision (OQ5-2).
+
+### Exit gate (ROADMAP v1.6, before Phase 23 is planned)
+
+Decision B is recorded (B(i), `## Decisions: Windows OpenSSH host (22-12)`, section "Decision B (recorded 2026-10-15 ...)"). The measured hold budget is recorded here: **505 s without a Defender exclusion, 699 s with one, both above the 300 s ceiling, so the budget replaces the spec's 5 s figure as an open blocker with these measurements attached, not as a number to clamp.** Phase 23 planning must open with that decision.
