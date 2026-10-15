@@ -30,6 +30,7 @@ pub mod local;
 pub mod process;
 pub mod remote;
 pub mod sftp;
+pub mod winps;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

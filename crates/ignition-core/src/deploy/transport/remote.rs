@@ -36,6 +36,7 @@ use std::time::Duration;
 use base64::Engine as _;
 
 use super::process::{ProcessOutput, ProcessRunner};
+use super::winps::{self, COMMAND_BUDGET, WinScript};
 use crate::deploy::target::{DEFAULT_CONNECT_TIMEOUT_S, DEFAULT_OP_TIMEOUT_S, Ssh};
 use crate::deploy::tree::read_repo_file;
 use crate::error::CoreError;
@@ -389,6 +390,12 @@ pub enum SftpOp {
     /// the `.` / `..` pair. The read transport lists with this so that no
     /// entry is hidden from it and a symlink or special file is visible.
     LsLongAll { path: String },
+    /// `@pwd`: prints `Remote working directory: <absolute path>`, the
+    /// account's home at the start of a session. A Windows OpenSSH server
+    /// prints long-listing names WITHOUT the listed directory in front of them
+    /// (C7a-2), so a batch that lists several directories puts a `pwd` before
+    /// each listing as the marker that says where one directory's lines start.
+    Pwd,
     /// `get "<remote>" "<local>"`.
     Get { remote: String, local: PathBuf },
     /// `get -R "<remote>" "<local>"`: a directory tree; symlinks are skipped
@@ -430,6 +437,7 @@ impl SftpOp {
             SftpOp::Ls { path } => format!("@ls -1 {}", remote(path)?),
             SftpOp::LsLong { path } => format!("@ls -l {}", remote(path)?),
             SftpOp::LsLongAll { path } => format!("@ls -la {}", remote(path)?),
+            SftpOp::Pwd => "@pwd".to_string(),
             SftpOp::Get {
                 remote: r,
                 local: l,
@@ -444,11 +452,79 @@ impl SftpOp {
                 local: l,
                 remote: r,
             } => format!("put {} {}", local(l)?, remote(r)?),
-            SftpOp::Rename { from, to } => format!("rename {} {}", remote(from)?, remote(to)?),
+            SftpOp::Rename { from, to } => {
+                // A rename onto itself DELETES the file on a Windows OpenSSH
+                // server (C7a-4): the source is removed and the target, the
+                // same path, is gone. Refuse it for every host.
+                if same_remote_path(from, to) {
+                    return Err(format!(
+                        "refused a rename of {from:?} onto itself (on a Windows OpenSSH host that deletes the file)"
+                    ));
+                }
+                format!("rename {} {}", remote(from)?, remote(to)?)
+            }
             SftpOp::Rm { path } => format!("rm {}", remote(path)?),
             SftpOp::Mkdir { path } => format!("mkdir {}", remote(path)?),
             SftpOp::Rmdir { path } => format!("rmdir {}", remote(path)?),
         })
+    }
+}
+
+/// Whether two remote paths name the same entry as far as a Windows host is
+/// concerned: equal after ASCII-lowercasing (NTFS is case-insensitive) and
+/// collapsing repeated `/`, ignoring a trailing `/`. Over-matches on a
+/// case-sensitive host, which is the safe direction for a refusal.
+pub(crate) fn same_remote_path(a: &str, b: &str) -> bool {
+    fn fold(path: &str) -> String {
+        let mut out = String::with_capacity(path.len());
+        let mut last_slash = false;
+        for c in path.chars() {
+            let c = c.to_ascii_lowercase();
+            if c == '/' {
+                if last_slash {
+                    continue;
+                }
+                last_slash = true;
+            } else {
+                last_slash = false;
+            }
+            out.push(c);
+        }
+        while out.len() > 1 && out.ends_with('/') {
+            out.pop();
+        }
+        out
+    }
+    fold(a) == fold(b)
+}
+
+/// What an sftp failure said, read from stderr text because every failure
+/// exits 1 (C7a-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpFailure {
+    /// "not found" / "No such file". On a Windows host a read the ACL denies
+    /// on a file that exists reports this too.
+    NotFound,
+    /// "Permission denied".
+    PermissionDenied,
+    /// "Failure": no reason given (a held target, a non-empty directory, an
+    /// existing directory).
+    Failure,
+    /// Anything else.
+    Other,
+}
+
+/// Classify an sftp client's stderr by its text.
+pub fn classify_sftp_stderr(stderr: &str) -> SftpFailure {
+    let text = stderr.to_ascii_lowercase();
+    if text.contains("permission denied") {
+        SftpFailure::PermissionDenied
+    } else if text.contains("no such file") || text.contains(" not found") {
+        SftpFailure::NotFound
+    } else if text.trim_end().ends_with(": failure") || text.contains(": failure") {
+        SftpFailure::Failure
+    } else {
+        SftpFailure::Other
     }
 }
 
@@ -791,10 +867,24 @@ impl RemoteShell {
             )));
         }
         if out.code != 0 {
-            return Err(failure(if tail.is_empty() {
-                format!("exit code {}", out.code)
+            // Every sftp failure exits 1 and the class is only in stderr
+            // text (C7a-3): name it. A not-found answer for a path a listing
+            // just returned means "unreadable" on a Windows host, where a
+            // read the ACL denies reports not found.
+            let class = if out.code == 1 {
+                match classify_sftp_stderr(&String::from_utf8_lossy(&out.stderr)) {
+                    SftpFailure::NotFound => " (not found or unreadable)",
+                    SftpFailure::PermissionDenied => " (permission denied)",
+                    SftpFailure::Failure => " (refused with no reason: a held or non-empty target)",
+                    SftpFailure::Other => "",
+                }
             } else {
-                format!("exit code {}: {tail}", out.code)
+                ""
+            };
+            return Err(failure(if tail.is_empty() {
+                format!("exit code {}{class}", out.code)
+            } else {
+                format!("exit code {}{class}: {tail}", out.code)
             }));
         }
         if !out.stderr.is_empty() {
@@ -802,11 +892,43 @@ impl RemoteShell {
         }
         Ok(out)
     }
+
+    /// Run a fixed [`WinScript`] on a Windows host over ssh and return its
+    /// result. The remote command is built by
+    /// [`winps::encoded_command`] (the typed
+    /// [`RemoteCommand::powershell_encoded`], held to the 8000 character
+    /// budget before anything spawns); success needs exit 0 within the
+    /// per-call timeout and exactly one `IGN-RESULT:` stdout line, and
+    /// anything else, CLIXML on stderr included, is
+    /// [`CoreError::TransportFailed`] (see [`winps`]).
+    pub async fn exec_powershell(
+        &self,
+        script: &WinScript,
+    ) -> Result<serde_json::Value, CoreError> {
+        let failure = |detail: String| CoreError::TransportFailed {
+            operation: "exec".to_string(),
+            node: self.label.clone(),
+            detail,
+        };
+        let command = winps::encoded_command(script, COMMAND_BUDGET).map_err(&failure)?;
+        let out = self
+            .runner
+            .run(
+                OsStr::new("ssh"),
+                &self.ssh_argv(Some(&command)),
+                None,
+                self.op_timeout,
+            )
+            .await;
+        winps::interpret_output(&out, self.op_timeout.as_secs(), self.temp_dir())
+            .map_err(|detail| failure(format!("{}: {detail}", script.name)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn safe_remote_path_hostile_table() {
@@ -1029,6 +1151,7 @@ mod tests {
             },
             SftpOp::LsLong { path: "/d".into() },
             SftpOp::LsLongAll { path: "/d".into() },
+            SftpOp::Pwd,
             SftpOp::Get {
                 remote: "/r/f".into(),
                 local: PathBuf::from("/l/f"),
@@ -1061,6 +1184,7 @@ mod tests {
                 "@ls -1 \"/d/a b\"",
                 "@ls -l \"/d\"",
                 "@ls -la \"/d\"",
+                "@pwd",
                 "get \"/r/f\" \"/l/f\"",
                 "get -R \"/r/dir\" \"/l/mirror/\"",
                 "put \"/l/f\" \"/r/f\"",
@@ -1269,5 +1393,236 @@ mod tests {
             assert!(matches!(err, CoreError::TransportFailed { .. }), "{line:?}");
         }
         assert_eq!(recording.calls.lock().expect("calls").len(), 1);
+    }
+
+    // ---- 22-13: Windows host behaviours from C7a ---------------------------
+
+    #[test]
+    fn rename_onto_itself_is_refused_because_it_deletes_the_file() {
+        // C7a-4: on Win32-OpenSSH `rename x x` answers "No such file" and the
+        // file is GONE. No spelling of the same path may reach the host.
+        for (from, to) in [
+            ("/C:/Users/u/f.json", "/C:/Users/u/f.json"),
+            ("/C:/Users/u/f.json", "/c:/users/U/F.JSON"),
+            ("/C:/Users/u//f.json", "/C:/Users/u/f.json"),
+            ("/C:/Users/u/dir/", "/C:/Users/u/dir"),
+            ("rel/f", "rel/f"),
+        ] {
+            let err = SftpOp::Rename {
+                from: from.into(),
+                to: to.into(),
+            }
+            .render()
+            .expect_err(from);
+            assert!(err.contains("onto itself"), "{from} -> {to}: {err}");
+        }
+        // different paths still render
+        assert!(
+            SftpOp::Rename {
+                from: "/C:/Users/u/staging/f.json".into(),
+                to: "/C:/Program Files/x/f.json".into(),
+            }
+            .render()
+            .is_ok()
+        );
+        assert!(same_remote_path("/a/B", "/A/b"));
+        assert!(!same_remote_path("/a/b", "/a/bc"));
+    }
+
+    #[test]
+    fn sftp_stderr_is_classified_by_text() {
+        use SftpFailure::*;
+        for (text, want) in [
+            ("Can't ls: \"/C:/x\" not found", NotFound),
+            ("File \"/C:/x\" not found.", NotFound),
+            ("remote delete /C:/x: No such file or directory", NotFound),
+            (
+                "remote rename \"a\" to \"b\": No such file or directory",
+                NotFound,
+            ),
+            ("dest open \"/C:/x\": Permission denied", PermissionDenied),
+            (
+                "remote mkdir \"/C:/x\": Permission denied",
+                PermissionDenied,
+            ),
+            ("remote mkdir \"/C:/x\": Failure", Failure),
+            ("remote rename \"a\" to \"b\": Failure", Failure),
+            ("remote readdir(\"/C:/x/\"): Bad message", Other),
+            ("", Other),
+        ] {
+            assert_eq!(classify_sftp_stderr(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn require_success_names_the_sftp_failure_class_for_exit_1_only() {
+        let recording = Arc::new(Recording::default());
+        let shell =
+            RemoteShell::local_sftp_server(Path::new("/unused"), recording, Duration::from_secs(1));
+        let out = |code: i32, stderr: &str| ProcessOutput {
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            code,
+            timed_out: false,
+        };
+        let detail = |o: ProcessOutput| match shell.require_success("read", o).expect_err("fail") {
+            CoreError::TransportFailed { detail, .. } => detail,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            detail(out(1, "File \"/C:/x\" not found.\r\n")).contains("(not found or unreadable)")
+        );
+        assert!(detail(out(1, "dest open: Permission denied")).contains("(permission denied)"));
+        assert!(detail(out(1, "remote rename: Failure")).contains("(refused with no reason"));
+        // ssh's own auth failure exits 255 and is not an sftp class
+        let ssh = detail(out(255, "Permission denied (publickey)."));
+        assert!(!ssh.contains("(permission denied)"), "{ssh}");
+    }
+
+    struct ScriptedExec {
+        out: Mutex<Option<ProcessOutput>>,
+        argv: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for ScriptedExec {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            _stdin: Option<Vec<u8>>,
+            _timeout: Duration,
+        ) -> ProcessOutput {
+            self.argv.lock().expect("argv").push((
+                program.to_string_lossy().into_owned(),
+                args.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
+            ));
+            self.out.lock().expect("out").take().expect("one call")
+        }
+    }
+
+    fn exec_shell(out: ProcessOutput) -> (Arc<ScriptedExec>, RemoteShell) {
+        let runner = Arc::new(ScriptedExec {
+            out: Mutex::new(Some(out)),
+            argv: Mutex::new(Vec::new()),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused"),
+            runner.clone(),
+            Duration::from_secs(3),
+        );
+        (runner, shell)
+    }
+
+    fn exec_script(params: serde_json::Value) -> WinScript {
+        WinScript {
+            name: "probe",
+            body: "E @{ok=1}",
+            params,
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_powershell_runs_ssh_with_the_encoded_command_and_parses_the_sentinel() {
+        let (runner, shell) = exec_shell(ProcessOutput {
+            stdout: b"IGN-RESULT:{\"ok\":1}\r\n".to_vec(),
+            stderr: Vec::new(),
+            code: 0,
+            timed_out: false,
+        });
+        let value = shell
+            .exec_powershell(&exec_script(serde_json::Value::Null))
+            .await
+            .expect("exec");
+        assert_eq!(value["ok"], 1);
+        let argv = runner.argv.lock().expect("argv");
+        assert_eq!(argv[0].0, "ssh");
+        let last = argv[0].1.last().expect("remote command");
+        assert!(
+            last.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "{last}"
+        );
+        // the encoded command is ONE argv element, after `--` and the destination
+        assert!(argv[0].1.iter().any(|a| a == "--"));
+    }
+
+    #[tokio::test]
+    async fn exec_powershell_failures_are_transport_failed() {
+        let cases = [
+            (
+                "non-zero exit with CLIXML",
+                ProcessOutput {
+                    stdout: Vec::new(),
+                    stderr: b"#< CLIXML\r\n<Objs><S S=\"Error\">boom_x000D__x000A_</S></Objs>"
+                        .to_vec(),
+                    code: 1,
+                    timed_out: false,
+                },
+                "boom",
+            ),
+            (
+                "missing sentinel",
+                ProcessOutput {
+                    stdout: b"hello\r\n".to_vec(),
+                    stderr: Vec::new(),
+                    code: 0,
+                    timed_out: false,
+                },
+                "IGN-RESULT:",
+            ),
+            (
+                "timeout",
+                ProcessOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    code: -1,
+                    timed_out: true,
+                },
+                "timed out after 3s",
+            ),
+        ];
+        for (name, out, needle) in cases {
+            let (_runner, shell) = exec_shell(out);
+            let err = shell
+                .exec_powershell(&exec_script(serde_json::Value::Null))
+                .await
+                .expect_err(name);
+            let CoreError::TransportFailed {
+                operation, detail, ..
+            } = err
+            else {
+                panic!("{name}: not transport_failed");
+            };
+            assert_eq!(operation, "exec", "{name}");
+            assert!(detail.contains(needle), "{name}: {detail}");
+            assert!(detail.starts_with("probe: "), "{name}: {detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_powershell_over_budget_never_spawns() {
+        // an over-budget command is refused before the runner is called: the
+        // scripted runner would panic on a call with no output queued
+        let runner = Arc::new(ScriptedExec {
+            out: Mutex::new(None),
+            argv: Mutex::new(Vec::new()),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused"),
+            runner.clone(),
+            Duration::from_secs(3),
+        );
+        let big = "x".repeat(winps::COMMAND_BUDGET);
+        let err = shell
+            .exec_powershell(&exec_script(serde_json::json!({ "p": big })))
+            .await
+            .expect_err("over budget");
+        assert!(matches!(err, CoreError::TransportFailed { .. }));
+        assert!(
+            runner.argv.lock().expect("argv").is_empty(),
+            "nothing spawned"
+        );
     }
 }

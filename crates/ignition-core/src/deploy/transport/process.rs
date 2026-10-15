@@ -18,6 +18,11 @@
 //!   truncated listing is never mistaken for a complete one. Stderr keeps its
 //!   last [`STDERR_CAP_BYTES`] bytes.
 //! - **A spawn failure is data**, code 127 with the reason, never a panic.
+//! - **The child runs in a UTF-8 locale** ([`utf8_locale`], `LC_ALL`). The
+//!   sftp client prints a non-ASCII name raw only in a UTF-8 locale and as
+//!   `caf\303\251.txt` otherwise (C7a-2); a listing parser must not read an
+//!   escaped name as the real one (a backslash in a name is refused), so a
+//!   locale the host lacks fails closed.
 
 use std::ffi::{OsStr, OsString};
 use std::process::Stdio;
@@ -76,6 +81,16 @@ impl ProcessRunner for TokioProcessRunner {
         timeout: Duration,
     ) -> ProcessOutput {
         run_capped(program, args, stdin, timeout, STDOUT_CAP_BYTES).await
+    }
+}
+
+/// The UTF-8 locale children run in: `en_US.UTF-8` on macOS (which has no
+/// `C.UTF-8`) and `C.UTF-8` elsewhere.
+pub fn utf8_locale() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
     }
 }
 
@@ -148,6 +163,7 @@ pub(crate) async fn run_capped(
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
+        .env("LC_ALL", utf8_locale())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -223,6 +239,24 @@ mod tests {
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
+    }
+
+    /// C7a-2: the sftp client prints non-ASCII names raw only in a UTF-8
+    /// locale, so every child runs in one whatever the caller's environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn children_run_in_a_utf8_locale() {
+        let out = run_capped(
+            &os("sh"),
+            &[os("-c"), os("printf %s \"$LC_ALL\"")],
+            None,
+            Duration::from_secs(5),
+            1024,
+        )
+        .await;
+        assert_eq!(out.code, 0);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), utf8_locale());
+        assert!(utf8_locale().ends_with("UTF-8"));
     }
 
     #[cfg(unix)]
