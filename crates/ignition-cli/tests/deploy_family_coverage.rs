@@ -186,8 +186,13 @@ fn verify_verdict_exception_is_dated_and_documented() {
         .find(prefix)
         .unwrap_or_else(|| panic!("no `{prefix}<YYYY-MM-DD>)` heading under the output contract"));
     let after = &contract[start + prefix.len()..];
-    let close = after.find(")\n").expect("the heading closes with `)`");
-    let date = &after[..close];
+    // `lines()` drops a CRLF too: git for Windows checks the README out with
+    // CRLF line endings.
+    let date = after
+        .lines()
+        .next()
+        .and_then(|line| line.strip_suffix(')'))
+        .expect("the heading closes with `)`");
     let bytes = date.as_bytes();
     assert!(
         bytes.len() == 10
@@ -199,7 +204,7 @@ fn verify_verdict_exception_is_dated_and_documented() {
                 .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit()),
         "the heading date must be YYYY-MM-DD, got {date:?}"
     );
-    let body_start = &after[close..];
+    let body_start = &after[date.len()..];
     let body_end = body_start[3..]
         .find("\n### ")
         .map_or(body_start.len(), |i| i + 3);
