@@ -1160,6 +1160,7 @@ mod tests {
 
     // ---- RemoteCommand (22-05 review, F5a) --------------------------------
 
+    #[cfg(unix)]
     const HOSTILE_ARGS: [&str; 12] = [
         "plain",
         "with space",

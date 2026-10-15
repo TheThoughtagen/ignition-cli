@@ -1262,7 +1262,7 @@ impl LocalFsTransport {
 
         // ---- writes
         if !collection_exists {
-            std::fs::create_dir(&collection).map_err(|e| {
+            std::fs::create_dir(collection).map_err(|e| {
                 self.mirror_fail(
                     OP,
                     format!("cannot create the {} collection ({})", setup.mode, e.kind()),
@@ -1275,7 +1275,7 @@ impl LocalFsTransport {
             let Some((name, parents)) = parts.split_last() else {
                 continue;
             };
-            let dir = self.ensure_dir_chain(OP, &collection, parents)?;
+            let dir = self.ensure_dir_chain(OP, collection, parents)?;
             let target = dir.join(name);
             match node_of(&target) {
                 Ok(Node::Missing | Node::File) => {}
@@ -1297,7 +1297,7 @@ impl LocalFsTransport {
                     )
                 })?;
             } else {
-                let bytes = self.read_staged(OP, &source, path, sha)?;
+                let bytes = self.read_staged(OP, source, path, sha)?;
                 self.write_in_place(OP, &target, &bytes)?;
             }
             written.push(path.to_string());

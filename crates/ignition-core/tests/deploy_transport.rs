@@ -1264,6 +1264,8 @@ mod mirror {
 
     /// A scratch gateway data directory plus a sibling staging root.
     pub struct Scratch {
+        // Held for its drop. Only the unix-gated tests read it.
+        #[cfg_attr(not(unix), allow(dead_code))]
         pub root: tempfile::TempDir,
         pub data: PathBuf,
         pub stage_root: PathBuf,
