@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use ignition_core::actions::deploy::{Declared, load_declared};
-use ignition_core::deploy::ledger::{Ledger, ledger_location};
+use ignition_core::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use ignition_core::deploy::transport::{self, TreeReader};
 use tempfile::TempDir;
 
@@ -114,7 +114,7 @@ impl PlanFixture {
 
     /// Write raw `bytes` at the ledger location (for corrupt-ledger tests).
     pub fn ledger_bytes(&self, gateway: &str, mode: &str, bytes: &[u8]) {
-        let dest = ledger_location(gateway, mode)
+        let dest = ledger_location(LedgerRoot::DataDir, gateway, mode)
             .split('/')
             .fold(self.data.path().to_path_buf(), |acc, c| acc.join(c));
         std::fs::create_dir_all(dest.parent().expect("parent")).expect("create dirs");

@@ -32,13 +32,25 @@
 //! type the gateway describes (the OpenAPI resource types, or the four tag
 //! types under `ignition`).
 //!
-//! ## Location
+//! ## Location (Decision B, plan 22-12, applied by 22-13)
 //!
-//! [`ledger_location`]: `ign-deploy/<gateway>/<mode>/ledger.json`, relative
-//! to the node's data directory. It is never inside `config/resources/` (the
-//! gateway scans that tree) and never dot-named. Decision B of plan 22-12
-//! confirms or moves it; nothing writes a ledger before Phase 23, so moving
-//! it costs this one function.
+//! The ledger is `ign-deploy/<gateway>/<mode>/ledger.json` ([`ledger_rel`]),
+//! and what it is relative to depends on how the node is reached
+//! ([`LedgerRoot`], [`ledger_location`]):
+//!
+//! | Node | Root | On the Windows capture host |
+//! |---|---|---|
+//! | `ssh` (Linux or Windows) | [`LedgerRoot::AccountHome`]: the service account's home directory | `C:\Users\svc-ignition-deploy\ign-deploy\<gateway>\<mode>\ledger.json` (sftp `/C:/Users/svc-ignition-deploy/ign-deploy/...`) |
+//! | `local` | [`LedgerRoot::DataDir`]: the node's data directory | `<data_dir>/ign-deploy/<gateway>/<mode>/ledger.json` |
+//!
+//! Why: the C6 captures showed that the service account can write its own
+//! home but nothing under the data directory, so Decision B(i) puts the
+//! ledger, the journal and the staging area there
+//! (`ign-deploy/<gateway>/<mode>/staging/<run_id>/`, [`staging_rel`]), outside
+//! every collection the gateway scans. It is never inside `config/resources/`
+//! and never dot-named. A ledger is per service account, not per gateway: a
+//! second deploy account on one gateway does not see the first one's ledger.
+//! Nothing writes a ledger before Phase 23, so nothing was migrated.
 //!
 //! ## Refusals
 //!
@@ -98,9 +110,47 @@ pub struct Ledger {
     pub files: Vec<String>,
 }
 
-/// The ledger location relative to the node's data directory (module doc).
-pub fn ledger_location(gateway: &str, mode: &str) -> String {
+/// What the ledger location is relative to (module doc, Decision B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerRoot {
+    /// The node's data directory: `local` nodes.
+    DataDir,
+    /// The service account's home directory: `ssh` nodes.
+    AccountHome,
+}
+
+impl LedgerRoot {
+    /// The root for how `node` is reached: an `ssh` node keeps its ledger in
+    /// the account home, a `local` node (or one with neither) in its data
+    /// directory.
+    pub fn for_node(node: &super::target::NodeTarget) -> LedgerRoot {
+        if node.ssh.is_some() {
+            LedgerRoot::AccountHome
+        } else {
+            LedgerRoot::DataDir
+        }
+    }
+}
+
+/// The ledger path below its root: `ign-deploy/<gateway>/<mode>/ledger.json`.
+pub fn ledger_rel(gateway: &str, mode: &str) -> String {
     format!("ign-deploy/{gateway}/{mode}/{LEDGER_FILE}")
+}
+
+/// The staging directory of one apply run below its root:
+/// `ign-deploy/<gateway>/<mode>/staging/<run_id>` (Decision B(i)).
+pub fn staging_rel(gateway: &str, mode: &str, run_id: &str) -> String {
+    format!("ign-deploy/{gateway}/{mode}/staging/{run_id}")
+}
+
+/// The ledger location as an error and a log name it: the relative path for a
+/// [`LedgerRoot::DataDir`] node, `~/` plus the relative path for a
+/// [`LedgerRoot::AccountHome`] node.
+pub fn ledger_location(root: LedgerRoot, gateway: &str, mode: &str) -> String {
+    match root {
+        LedgerRoot::DataDir => ledger_rel(gateway, mode),
+        LedgerRoot::AccountHome => format!("~/{}", ledger_rel(gateway, mode)),
+    }
 }
 
 /// At most 64 printable characters of `text`, for a problem message.
@@ -275,7 +325,7 @@ mod tests {
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn loc() -> String {
-        ledger_location(GW, MODE)
+        ledger_location(LedgerRoot::DataDir, GW, MODE)
     }
 
     fn ledger(files: &[&str]) -> Ledger {
@@ -313,6 +363,58 @@ mod tests {
     #[test]
     fn location_is_below_ign_deploy() {
         assert_eq!(loc(), "ign-deploy/tracer-gw/dev/ledger.json");
+    }
+
+    /// Decision B(i) (22-12): ssh nodes keep the ledger, the journal and the
+    /// staging area in the service account's home; local nodes keep them in
+    /// the data directory. The relative layout is the same.
+    #[test]
+    fn ledger_location_follows_decision_b() {
+        use crate::deploy::target::{Local, NodeTarget, Ssh, TargetOs};
+        assert_eq!(
+            ledger_location(LedgerRoot::DataDir, GW, MODE),
+            "ign-deploy/tracer-gw/dev/ledger.json"
+        );
+        assert_eq!(
+            ledger_location(LedgerRoot::AccountHome, GW, MODE),
+            "~/ign-deploy/tracer-gw/dev/ledger.json"
+        );
+        assert_eq!(ledger_rel(GW, MODE), "ign-deploy/tracer-gw/dev/ledger.json");
+        assert_eq!(
+            staging_rel(GW, MODE, "run-1"),
+            "ign-deploy/tracer-gw/dev/staging/run-1"
+        );
+        // the staging area is below the same directory as the ledger and is
+        // never inside config/resources or dot-named
+        assert!(staging_rel(GW, MODE, "r").starts_with("ign-deploy/tracer-gw/dev/"));
+        assert!(!ledger_rel(GW, MODE).contains("config/resources"));
+        assert!(ledger_rel(GW, MODE).split('/').all(|p| !p.starts_with('.')));
+
+        let ssh = NodeTarget {
+            profile: "p".to_string(),
+            ssh: Some(Ssh {
+                host: "h".to_string(),
+                user: "u".to_string(),
+                port: None,
+                key_env: None,
+                key_file: None,
+                os: TargetOs::Windows,
+                data_dir: "C:\\ignition\\data".to_string(),
+                known_hosts: "known_hosts".to_string(),
+                connect_timeout_s: None,
+                op_timeout_s: None,
+            }),
+            local: None,
+        };
+        let local = NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: Some(Local {
+                data_dir: "/data".to_string(),
+            }),
+        };
+        assert_eq!(LedgerRoot::for_node(&ssh), LedgerRoot::AccountHome);
+        assert_eq!(LedgerRoot::for_node(&local), LedgerRoot::DataDir);
     }
 
     #[test]

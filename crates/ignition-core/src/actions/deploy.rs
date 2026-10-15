@@ -80,7 +80,7 @@ use crate::client::query::ListQuery;
 use crate::client::scan::{ScanKind, ScanStatus};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
-use crate::deploy::ledger::{Ledger, ledger_location};
+use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
 use crate::deploy::plan::{BaseTree, PlanEntry, PlanSummary, apply_base, plan, render_diffs};
 use crate::deploy::pull::{PullInput, Skipped, generate_manifest, pull};
@@ -310,7 +310,7 @@ pub async fn deploy_plan(
     // but cannot be trusted is a refusal, never an empty delete set (D-07).
     let ledger = match reader.read_ledger(gateway, mode).await? {
         Some(bytes) => Some(Ledger::parse(
-            &ledger_location(gateway, mode),
+            &ledger_location(LedgerRoot::for_node(node), gateway, mode),
             &bytes,
             gateway,
             mode,

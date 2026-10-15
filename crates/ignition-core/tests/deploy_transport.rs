@@ -754,7 +754,43 @@ mod sftp_read {
         sftp_reader_with(data_dir, runner())
     }
 
+    /// Runs the real `sftp` with `home` as its working directory, which is
+    /// what the server's `pwd` answers: the account home of Decision B(i).
+    /// The tests use the fixture data directory as that home, so a ledger
+    /// `PlanFixture::ledger` writes below the data directory is the ledger
+    /// the ssh reader finds in "the home".
+    struct Homed {
+        home: PathBuf,
+        inner: Arc<dyn ProcessRunner>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Homed {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            let mut wrapped: Vec<OsString> = vec![
+                OsString::from("-c"),
+                OsString::from("cd \"$0\" && exec \"$@\""),
+                self.home.clone().into_os_string(),
+                program.to_os_string(),
+            ];
+            wrapped.extend(args.iter().cloned());
+            self.inner
+                .run(OsStr::new("sh"), &wrapped, stdin, timeout)
+                .await
+        }
+    }
+
     fn sftp_reader_with(data_dir: &Path, runner: Arc<dyn ProcessRunner>) -> SftpTransport {
+        let runner: Arc<dyn ProcessRunner> = Arc::new(Homed {
+            home: data_dir.to_path_buf(),
+            inner: runner,
+        });
         let shell = RemoteShell::local_sftp_server(&sftp_server(), runner, Duration::from_secs(60));
         let root = posix_root(&data_dir.display().to_string()).expect("posix data dir");
         SftpTransport::new(shell, root, "nodes.master")
@@ -1093,14 +1129,13 @@ mod sftp_read {
         };
         reader.read(&scope).await.expect_err("glob data dir");
         reader.list_types("core").await.expect_err("glob data dir");
-        reader
-            .read_ledger("gw", "dev")
-            .await
-            .expect_err("glob data dir");
         assert!(
             recording.calls.lock().expect("calls").is_empty(),
             "no process was spawned"
         );
+        // the ledger is read from the account home (Decision B(i)), so the
+        // data directory is not part of it
+        let _ = reader.read_ledger("gw", "dev").await;
     }
 
     #[tokio::test]
@@ -1156,7 +1191,7 @@ mod sftp_read {
     }
 
     #[tokio::test]
-    async fn for_node_builds_sftp_for_linux_and_refuses_windows() {
+    async fn for_node_builds_sftp_for_linux_and_windows() {
         let fx = PlanFixture::new();
         let ssh_yaml = |os: &str, data_dir: &str| {
             format!(
@@ -1177,13 +1212,30 @@ mod sftp_read {
         let (linux, _) = load(ssh_yaml("linux", "/usr/local/bin/ignition/data"));
         assert!(linux.is_ok(), "linux ssh node builds a reader");
 
+        // a Windows OpenSSH node builds a reader from a drive-letter path (22-13)
         let (windows, _) = load(ssh_yaml(
             "windows",
             "C:\\Program Files\\Inductive Automation\\Ignition\\data",
         ));
-        let err = windows.err().expect("windows refused");
-        assert_eq!(err.code(), "deploy_tree_invalid");
-        assert!(err.to_string().contains("nodes.master.ssh.os"), "{err}");
+        assert!(windows.is_ok(), "windows ssh node builds a reader");
+        for bad in [
+            "relative\\data",
+            "\\\\server\\share\\data",
+            "C:data",
+            "/usr/local/ignition/data",
+            "C:\\a\\..\\b",
+        ] {
+            let (refused, _) = load(ssh_yaml("windows", bad));
+            let err = refused.err().expect(bad);
+            assert_eq!(err.code(), "deploy_tree_invalid", "{bad}");
+            assert!(
+                err.to_string().contains("nodes.master.ssh.data_dir"),
+                "{bad}: {err}"
+            );
+        }
+        // and a POSIX path is refused for a Windows node and the reverse
+        let (reverse, _) = load(ssh_yaml("linux", "C:\\Program Files\\Ignition\\data"));
+        assert!(reverse.is_err(), "a drive-letter path for a linux node");
 
         let (bad_dir, _) = load(ssh_yaml("linux", "relative/data"));
         let err = bad_dir.err().expect("relative refused");
@@ -1882,7 +1934,7 @@ mod mirror {
     }
 
     #[tokio::test]
-    async fn mirror_for_node_builds_local_and_refuses_windows_and_core() {
+    async fn mirror_for_node_builds_local_and_windows_and_refuses_core() {
         let sc = Scratch::new();
         let node = NodeTarget {
             profile: "p".to_string(),
@@ -1914,26 +1966,155 @@ mod mirror {
         .expect("core refused");
         assert_eq!(err.code(), "deploy_tree_invalid");
 
+        // a Windows ssh node builds a mirror (22-13); a bad data dir and the
+        // `core` collection are still refused
         let repo = repo_with_known_hosts(KNOWN_HOSTS);
         let mut ssh = ssh_block();
         ssh.os = TargetOs::Windows;
-        let node = NodeTarget {
+        ssh.data_dir = "C:\\Program Files\\Inductive Automation\\Ignition\\data".to_string();
+        let windows_node = |ssh: Ssh| NodeTarget {
             profile: "p".to_string(),
             ssh: Some(ssh),
             local: None,
         };
+        let built = transport::mirror_for_node(
+            repo.path(),
+            "targets/dev.yaml",
+            "nodes.master",
+            &windows_node(ssh.clone()),
+            MODE,
+            StagingMode::InPlace,
+        );
+        assert!(built.is_ok(), "windows mirror builds");
         let err = transport::mirror_for_node(
             repo.path(),
             "targets/dev.yaml",
             "nodes.master",
-            &node,
+            &windows_node(ssh.clone()),
+            "core",
+            StagingMode::InPlace,
+        )
+        .err()
+        .expect("core refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        // a staging root inside the collection is refused whatever its case
+        // (the host is case-insensitive, whatever OS the runner is)
+        let resources = "/c:/PROGRAM FILES/inductive automation/ignition/data/config/resources";
+        for root in [
+            format!("{resources}/staging"),
+            "/C:/Program Files/Inductive Automation/Ignition/data/config/resources".to_string(),
+            "/C:/Program Files/Inductive Automation".to_string(),
+        ] {
+            let err = transport::mirror_for_node(
+                repo.path(),
+                "targets/dev.yaml",
+                "nodes.master",
+                &windows_node(ssh.clone()),
+                MODE,
+                StagingMode::Separate { root: root.clone() },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{root} refused"));
+            assert_eq!(err.code(), "deploy_tree_invalid", "{root}");
+        }
+        ssh.data_dir = "relative".to_string();
+        let err = transport::mirror_for_node(
+            repo.path(),
+            "targets/dev.yaml",
+            "nodes.master",
+            &windows_node(ssh),
             MODE,
             StagingMode::InPlace,
         )
         .err()
-        .expect("windows refused");
+        .expect("relative refused");
         assert_eq!(err.code(), "deploy_tree_invalid");
-        assert!(err.to_string().contains("nodes.master.ssh.os"), "{err}");
+        assert!(
+            err.to_string().contains("nodes.master.ssh.data_dir"),
+            "{err}"
+        );
+    }
+}
+
+/// Decision B(i): the default staging mode (22-13).
+mod default_staging {
+    use super::*;
+    use ignition_core::deploy::target::{Local, NodeTarget};
+    use ignition_core::deploy::transport::{self, StagingMode};
+
+    fn local_node(data_dir: &Path) -> NodeTarget {
+        NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: Some(Local {
+                data_dir: data_dir.display().to_string(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_nodes_stage_below_the_data_dir_and_inputs_are_checked() {
+        let data = tempfile::tempdir().expect("data");
+        let node = local_node(data.path());
+        let mode = transport::default_staging_mode(
+            Path::new("."),
+            "targets/dev.yaml",
+            "nodes.master",
+            &node,
+            "gw",
+            "production",
+            "run-1.a_b",
+        )
+        .await
+        .expect("local staging");
+        let StagingMode::Separate { root } = mode else {
+            panic!("a separate staging root");
+        };
+        assert_eq!(
+            Path::new(&root),
+            data.path()
+                .join("ign-deploy/gw/production/staging/run-1.a_b")
+        );
+        for (gateway, mode, run) in [
+            ("../gw", "production", "r"),
+            ("gw", "a/b", "r"),
+            ("gw", "production", ""),
+            ("gw", "production", ".hidden"),
+            ("gw", "production", "has space"),
+            ("gw", "production", "x/../y"),
+        ] {
+            let err = transport::default_staging_mode(
+                Path::new("."),
+                "targets/dev.yaml",
+                "nodes.master",
+                &node,
+                gateway,
+                mode,
+                run,
+            )
+            .await
+            .expect_err(&format!("{gateway}/{mode}/{run}"));
+            assert_eq!(err.code(), "deploy_tree_invalid");
+        }
+        // a node with no host access has no staging
+        let neither = NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: None,
+        };
+        assert!(
+            transport::default_staging_mode(
+                Path::new("."),
+                "targets/dev.yaml",
+                "nodes.master",
+                &neither,
+                "gw",
+                "production",
+                "r",
+            )
+            .await
+            .is_err()
+        );
     }
 }
 

@@ -35,7 +35,7 @@ use super::{
 };
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
-use crate::deploy::ledger::{LEDGER_MAX_BYTES, ledger_location};
+use crate::deploy::ledger::{LEDGER_MAX_BYTES, LedgerRoot, ledger_location, ledger_rel};
 use crate::deploy::plan::unit_key;
 #[cfg(unix)]
 use crate::deploy::tree::dirfd::{self, FdError, Kind};
@@ -339,7 +339,8 @@ impl LocalFsTransport {
         gateway: &str,
         mode: &str,
     ) -> Result<Option<Vec<u8>>, CoreError> {
-        let location = ledger_location(gateway, mode);
+        let location = ledger_location(LedgerRoot::DataDir, gateway, mode);
+        let rel = ledger_rel(gateway, mode);
         let bad = |problem: String| CoreError::DeployLedgerInvalid {
             location: location.clone(),
             problem,
@@ -352,7 +353,7 @@ impl LocalFsTransport {
         // An unreadable host is not an absent ledger.
         self.require_data_dir()?;
 
-        let parts: Vec<&str> = location.split('/').collect();
+        let parts: Vec<&str> = rel.split('/').collect();
         let mut path = self.data_dir.clone();
         let mut meta = None;
         for (index, part) in parts.iter().enumerate() {
@@ -378,7 +379,7 @@ impl LocalFsTransport {
         let Some(before) = meta else {
             return Ok(None);
         };
-        let (file, held) = match open_regular_file(&self.data_dir, Path::new(&location), &before) {
+        let (file, held) = match open_regular_file(&self.data_dir, Path::new(&rel), &before) {
             Ok(opened) => opened,
             Err(OpenError::Changed) => {
                 return Err(bad(

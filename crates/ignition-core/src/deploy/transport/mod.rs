@@ -23,8 +23,12 @@
 //! verb or surface names it.
 //!
 //! [`for_node`] chooses the reader for a target node: `local: { data_dir }`
-//! selects [`local::LocalFsTransport`] (D-02); `ssh` with `os: linux` selects
-//! [`sftp::SftpTransport`] over the hardened [`remote::RemoteShell`].
+//! selects [`local::LocalFsTransport`] (D-02); `ssh` selects
+//! [`sftp::SftpTransport`] over the hardened [`remote::RemoteShell`], for a
+//! Linux host with a POSIX `data_dir` and for a Windows OpenSSH host with a
+//! drive-letter `data_dir` ([`sftp::windows_sftp_root`], 22-13). A Windows read
+//! is cross-checked against a PowerShell enumeration ([`winps`]) before it is
+//! reported complete.
 
 pub mod local;
 pub mod process;
@@ -152,22 +156,23 @@ pub trait TreeReader: Send + Sync {
 enum NodeAccess {
     /// A directory on the runner's own filesystem.
     Local(std::path::PathBuf),
-    /// A Linux host over the hardened ssh shell.
+    /// A host over the hardened ssh shell.
     Ssh {
         shell: Box<remote::RemoteShell>,
+        /// The data directory as sftp spells it (`/opt/ignition/data`, or
+        /// `/C:/Program Files/.../data` on Windows).
         data_dir: String,
+        /// A Windows OpenSSH host.
+        windows: bool,
     },
 }
 
-/// Resolve `node` to an access path; `verb` ("read" or "written") names the
-/// refusal for a Windows ssh node, which stays refused until the Windows sftp
-/// path form is captured (D-14, C7a; 22-13).
+/// Resolve `node` to an access path.
 fn node_access(
     repo: &Path,
     target_file: &str,
     label: &str,
     node: &NodeTarget,
-    verb: &str,
 ) -> Result<NodeAccess, CoreError> {
     match (&node.ssh, &node.local) {
         (Some(_), Some(_)) => Err(CoreError::deploy_tree_invalid(
@@ -185,43 +190,54 @@ fn node_access(
             };
             Ok(NodeAccess::Local(data_dir))
         }
-        (Some(ssh), None) => match ssh.os {
-            TargetOs::Linux => {
-                let data_dir = sftp::posix_root(&ssh.data_dir).map_err(|why| {
-                    CoreError::deploy_tree_invalid(
-                        target_file,
-                        None,
-                        None,
-                        format!("{label}.ssh.data_dir: {why}"),
-                    )
-                })?;
-                let shell = remote::RemoteShell::from_ssh(
-                    repo,
-                    target_file,
-                    label,
-                    ssh,
-                    Arc::new(process::TokioProcessRunner),
-                )?;
-                Ok(NodeAccess::Ssh {
-                    shell: Box::new(shell),
-                    data_dir,
-                })
+        (Some(ssh), None) => {
+            let windows = ssh.os == TargetOs::Windows;
+            let data_dir = if windows {
+                sftp::windows_sftp_root(&ssh.data_dir)
+            } else {
+                sftp::posix_root(&ssh.data_dir)
             }
-            TargetOs::Windows => Err(CoreError::deploy_tree_invalid(
+            .map_err(|why| {
+                CoreError::deploy_tree_invalid(
+                    target_file,
+                    None,
+                    None,
+                    format!("{label}.ssh.data_dir: {why}"),
+                )
+            })?;
+            let shell = remote::RemoteShell::from_ssh(
+                repo,
                 target_file,
-                None,
-                None,
-                format!(
-                    "{label}.ssh.os: windows hosts cannot be {verb} over ssh yet (the Windows sftp path form is not captured); use os: linux or a local data_dir"
-                ),
-            )),
-        },
+                label,
+                ssh,
+                Arc::new(process::TokioProcessRunner),
+            )?;
+            Ok(NodeAccess::Ssh {
+                shell: Box::new(shell),
+                data_dir,
+                windows,
+            })
+        }
         (None, None) => Err(CoreError::deploy_tree_invalid(
             target_file,
             None,
             None,
             format!("{label}: set ssh or local; this verb needs host access"),
         )),
+    }
+}
+
+/// An sftp transport over `shell` for a Linux or a Windows host.
+fn sftp_transport(
+    shell: remote::RemoteShell,
+    data_dir: String,
+    label: &str,
+    windows: bool,
+) -> sftp::SftpTransport {
+    if windows {
+        sftp::SftpTransport::new_windows(shell, data_dir, label)
+    } else {
+        sftp::SftpTransport::new(shell, data_dir, label)
     }
 }
 
@@ -237,11 +253,13 @@ pub fn for_node(
     label: &str,
     node: &NodeTarget,
 ) -> Result<Box<dyn TreeReader>, CoreError> {
-    Ok(match node_access(repo, target_file, label, node, "read")? {
+    Ok(match node_access(repo, target_file, label, node)? {
         NodeAccess::Local(data_dir) => Box::new(local::LocalFsTransport::new(data_dir, label)),
-        NodeAccess::Ssh { shell, data_dir } => {
-            Box::new(sftp::SftpTransport::new(*shell, data_dir, label))
-        }
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Box::new(sftp_transport(*shell, data_dir, label, windows)),
     })
 }
 
@@ -342,10 +360,10 @@ pub struct MirrorReport {
 
 /// The write half for `node`'s `mode` collection.
 ///
-/// `local` builds the local-filesystem mirror; an `ssh` Linux node builds the
-/// sftp mirror over the same hardened shell as [`for_node`]. A Windows ssh
-/// node stays refused until 22-13. `mode` is the mode collection name; `core`
-/// and `local` are never written.
+/// `local` builds the local-filesystem mirror; an `ssh` node (Linux or
+/// Windows) builds the sftp mirror over the same hardened shell as
+/// [`for_node`]. `mode` is the mode collection name; `core` and `local` are
+/// never written.
 pub fn mirror_for_node(
     repo: &Path,
     target_file: &str,
@@ -355,20 +373,84 @@ pub fn mirror_for_node(
     staging: StagingMode,
 ) -> Result<Box<dyn TreeMirror>, CoreError> {
     let invalid = |detail: String| CoreError::deploy_tree_invalid(target_file, None, None, detail);
-    Ok(
-        match node_access(repo, target_file, label, node, "written")? {
-            NodeAccess::Local(data_dir) => Box::new(
-                local::LocalFsTransport::new(data_dir, label)
-                    .with_mirror(mode, staging)
-                    .map_err(|why| invalid(format!("{label}: {why}")))?,
-            ),
-            NodeAccess::Ssh { shell, data_dir } => Box::new(
-                sftp::SftpTransport::new(*shell, data_dir, label)
-                    .with_mirror(mode, staging)
-                    .map_err(|why| invalid(format!("{label}: {why}")))?,
-            ),
-        },
-    )
+    Ok(match node_access(repo, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Box::new(
+            local::LocalFsTransport::new(data_dir, label)
+                .with_mirror(mode, staging)
+                .map_err(|why| invalid(format!("{label}: {why}")))?,
+        ),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Box::new(
+            sftp_transport(*shell, data_dir, label, windows)
+                .with_mirror(mode, staging)
+                .map_err(|why| invalid(format!("{label}: {why}")))?,
+        ),
+    })
+}
+
+/// The staging mode Phase 23 uses by default (Decision B(i), D-05): a
+/// [`StagingMode::Separate`] root at `ign-deploy/<gateway>/<mode>/staging/<run_id>`
+/// below the ledger root of the node's transport, outside every collection:
+///
+/// - `ssh` nodes (Linux and Windows): below the service account's home, which
+///   the server reports (`/C:/Users/svc-ignition-deploy/...` on the Windows
+///   capture host). The account can write there and not under the data
+///   directory (C6), and the commit is a rename from the home into the mode
+///   collection on the same volume.
+/// - `local` nodes: below `<data_dir>`.
+///
+/// `gateway` and `mode` are single path components and `run_id` is
+/// `[A-Za-z0-9._-]{1,128}` not starting with a dot, or the call is refused
+/// before any I/O. Only an `ssh` node touches the network (one `pwd`).
+pub async fn default_staging_mode(
+    repo: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+    gateway: &str,
+    mode: &str,
+    run_id: &str,
+) -> Result<StagingMode, CoreError> {
+    let invalid = |detail: String| CoreError::deploy_tree_invalid(target_file, None, None, detail);
+    for (what, value) in [("gateway", gateway), ("mode", mode)] {
+        if let Some(why) = super::component_problem(value) {
+            return Err(invalid(format!("{label}: the staging {what} {why}")));
+        }
+    }
+    let run_ok = (1..=128).contains(&run_id.len())
+        && !run_id.starts_with('.')
+        && run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !run_ok {
+        return Err(invalid(format!(
+            "{label}: the run id must be 1 to 128 characters of [A-Za-z0-9._-] and must not start with a dot"
+        )));
+    }
+    let rel = super::ledger::staging_rel(gateway, mode, run_id);
+    Ok(match node_access(repo, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => {
+            let root = data_dir.join(&rel);
+            let root = root.to_str().ok_or_else(|| {
+                invalid(format!("{label}: the data directory is not valid UTF-8"))
+            })?;
+            StagingMode::Separate {
+                root: root.to_string(),
+            }
+        }
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => {
+            sftp_transport(*shell, data_dir, label, windows)
+                .default_staging(gateway, mode, run_id)
+                .await?
+        }
+    })
 }
 
 /// A mode name that may be written: a plain path component that is not one of
@@ -528,6 +610,18 @@ pub(crate) fn validate_staging_root(
     staging: &StagingMode,
     resources_root: &str,
 ) -> Result<(), String> {
+    validate_staging_root_for(staging, resources_root, cfg!(windows))
+}
+
+/// [`validate_staging_root`] with the comparison's case rule chosen by the
+/// HOST the paths name, not by the runner: a Windows OpenSSH host is
+/// case-insensitive, so `/c:/program files/.../staging` is inside
+/// `/C:/Program Files/.../resources` whatever OS `ign` runs on.
+pub(crate) fn validate_staging_root_for(
+    staging: &StagingMode,
+    resources_root: &str,
+    case_insensitive: bool,
+) -> Result<(), String> {
     let StagingMode::Separate { root } = staging else {
         return Ok(());
     };
@@ -541,7 +635,7 @@ pub(crate) fn validate_staging_root(
     let resources_parts = absolute_components(resources_root)
         .map_err(|why| format!("the resources root {resources_root:?} {why}"))?;
     let same = |a: &String, b: &String| {
-        if cfg!(windows) {
+        if case_insensitive {
             a.eq_ignore_ascii_case(b)
         } else {
             a == b
