@@ -2728,6 +2728,4667 @@ identical ignition/general-alarm-settings/resource.json
 [exit 0]
 ~~~
 
+
+## C7a — Windows OpenSSH behaviours as svc-ignition-deploy (D-13, D-15)
+
+Capture host: 40.114.71.134, an Azure VM (Windows Server 2022) standing in for WFLWVM01 by user decision of 2026-10-14. Account: `svc-ignition-deploy`. Every command runs from the macOS runner with the hardened option set of `hardened_options`; `<key>` is the temp key file. `ssh` is ssh -T with the remote command as one argument; `sftp` is `sftp -q -b -` with the batch on stdin. The Windows-client ssh.exe stdin item of the C7a procedure is NOT applicable to a macOS runner; it is exercised by the windows-latest CI leg (22-13).
+
+`<H>` stands for exactly these ssh/sftp options, in this order (the `hardened_options` set with an identity): `-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.cache/ign-wflwvm01/known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR `
+
+### C7a-host — account, shell, groups, host key types
+
+#### whoami
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 whoami ` @ 2026-10-15T02:34:16Z
+
+~~~
+[stdout]
+ignwin836\svc-ignition-deploy
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### hostname
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 hostname ` @ 2026-10-15T02:34:17Z
+
+~~~
+[stdout]
+ignwin836
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ver
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ver ` @ 2026-10-15T02:34:18Z
+
+~~~
+[stdout]
+
+Microsoft Windows [Version 10.0.20348.5761]
+[2 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### default shell: COMSPEC and the registry value
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 echo\ COMSPEC=%COMSPEC%\ \&\ reg\ query\ HKLM\\SOFTWARE\\OpenSSH\ /v\ DefaultShell ` @ 2026-10-15T02:34:20Z
+
+~~~
+[stdout]
+COMSPEC=C:\Windows\system32\cmd.exe 
+
+
+[3 CR bytes removed from stdout]
+[stderr]
+ERROR: The system was unable to find the specified registry key or value.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### USERPROFILE
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 echo\ %USERPROFILE% ` @ 2026-10-15T02:34:21Z
+
+~~~
+[stdout]
+C:\Users\svc-ignition-deploy
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### the account groups (whoami /groups)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 whoami\ /groups ` @ 2026-10-15T02:34:22Z
+
+~~~
+[stdout]
+
+GROUP INFORMATION
+-----------------
+
+Group Name                             Type             SID          Attributes                                        
+====================================== ================ ============ ==================================================
+Everyone                               Well-known group S-1-1-0      Mandatory group, Enabled by default, Enabled group
+BUILTIN\Users                          Alias            S-1-5-32-545 Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\NETWORK                   Well-known group S-1-5-2      Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\Authenticated Users       Well-known group S-1-5-11     Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\This Organization         Well-known group S-1-5-15     Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\Local account             Well-known group S-1-5-113    Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\NTLM Authentication       Well-known group S-1-5-64-10  Mandatory group, Enabled by default, Enabled group
+Mandatory Label\Medium Mandatory Level Label            S-1-16-8192                                                    
+[14 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### the account privileges (whoami /priv)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 whoami\ /priv ` @ 2026-10-15T02:34:24Z
+
+~~~
+[stdout]
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                    State  
+============================= ============================== =======
+SeChangeNotifyPrivilege       Bypass traverse checking       Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set Enabled
+[8 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### is the account an administrator? (net localgroup Administrators)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 net\ localgroup\ Administrators ` @ 2026-10-15T02:34:25Z
+
+~~~
+[stdout]
+Alias name     Administrators
+Comment        Administrators have complete and unrestricted access to the computer/domain
+
+Members
+
+-------------------------------------------------------------------------------
+ignadmin
+The command completed successfully.
+
+[9 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### PowerShell version on the host
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgACQAUABTAFYAZQByAHMAaQBvAG4AVABhAGIAbABlAC4AUABTAFYAZQByAHMAaQBvAG4ALgBUAG8AUwB0AHIAaQBuAGcAKAApAA== ` @ 2026-10-15T02:34:26Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $PSVersionTable.PSVersion.ToString()
+[stdout]
+5.1.20348.5756
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### host key types offered: ssh-keyscan -t ed25519,rsa,ecdsa (fingerprints via ssh-keygen -lf -)
+
+`bash -c ssh-keyscan\ -p\ \"\$1\"\ -t\ ed25519\,rsa\,ecdsa\ \"\$2\"\ 2\>\&1\ \|\ tee\ /dev/stderr\ \|\ ssh-keygen\ -lf\ -\ 2\>\&1 _ 22 40.114.71.134 ` @ 2026-10-15T02:34:28Z
+
+~~~
+[stdout]
+256 SHA256:CfSLIMXEfRsxKLydfjt7/I6skou0EBb0a4tBGBYs6D0 40.114.71.134 (ECDSA)
+3072 SHA256:JFUQNah6KkrSZEA1I/BonrLJ6MVu4mTWENEgbEBgoYc 40.114.71.134 (RSA)
+256 SHA256:wgjZzSMU/Ss+bnO8SgMfOY90cnutJvlAuxSGNPJNkZo 40.114.71.134 (ED25519)
+[stderr]
+# 40.114.71.134:22 SSH-2.0-OpenSSH_for_Windows_8.1
+40.114.71.134 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFwfiMH9jljf3UmtSCQQ631fhn+vxyWq/Wa7YpixaJNsRp2xKLBeiiC3n2qQFm1qbLcrDlWWW+ln9xPG1Y+tsvU=
+# 40.114.71.134:22 SSH-2.0-OpenSSH_for_Windows_8.1
+40.114.71.134 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDIKmJnzho4cUNq0x3ab1cdSnPGTylGxHWy+wigT4E00PEExlyuCcvnYxvoIrv1hmuCAenpDPx4tkF4URB5mKqJoOdAcf4Xc7rJoomgFltfo808n6vGr7f6r1Lzm7aIa0CR5xACQ1xjyYl7/FqCZVhC8QY73ptJrWWURkR+eHEYzE00TOmPMdmx9LClJ+tuLRkOPDCwg2eczm1lbEFMG6ew4qmeTLajPJ+X4wvDsqJ+NJA82OHBeTzXBRIkXyPFqfnknzodkpb03ioA0N+htQvVODYnWapQhc1fRWSxcbcNG2WJxEpSaU/ToOUxhstjB/y22TdH3GVPAObvHGfIUzDk2hoyJbZlbKEVFAKE9w81U5uaYVA1eCDx5Qvs/uiw47s4lfbj9RBENru6/NfOGCXlQqc1Kpn+KL6A/PJajjRhpAJ3X48mRzFHhlRBROA3xcJY++6//H2f4YiCcI0zu7ZrGYamAegRuQMhgMdo051gZ0kiuHslXSk6Q3hvXmkV5G0=
+# 40.114.71.134:22 SSH-2.0-OpenSSH_for_Windows_8.1
+40.114.71.134 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIASouJX1oLlJYlXh11eqmpE0nfqK5SM6Dsurw64fxmqI
+[exit 0]
+~~~
+
+#### host key types the server offers in KEX (ssh -vv, algorithm lines only; LogLevel option left out of this one block so -vv shows)
+
+`bash -c $'\n    ssh -vv -T -p "$1" -i "$2" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$3" -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=10 -- "$4" exit 0 2>&1 </dev/null | grep -E "host key algorithms|kex algorithms|Server host key|Remote protocol version" | cut -c1-300' _ 22 <key> $HOME/.cache/ign-wflwvm01/known_hosts svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:29Z
+
+~~~
+[stdout]
+debug1: Remote protocol version 2.0, remote software version OpenSSH_for_Windows_8.1
+debug2: host key algorithms: ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,webauthn-sk-ecdsa-sha2-nistp256-cer
+debug2: host key algorithms: rsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-sha2-nistp256,ssh-ed25519
+debug1: Server host key: ssh-ed25519 SHA256:wgjZzSMU/Ss+bnO8SgMfOY90cnutJvlAuxSGNPJNkZo
+debug2: host key algorithms: ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,webauthn-sk-ecdsa-sha2-nistp256-cer
+[3 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+Home as seen by sftp: `/C:/Users/svc-ignition-deploy`; as seen by cmd.exe: `C:\Users\svc-ignition-deploy`. All scratch work is under `ign-c7a/` in that home and is removed at the end.
+
+### C7a-1 — sftp path forms
+
+#### pwd and a listing of the login directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:33Z
+
+~~~
+[stdin]
+pwd
+@ls -1 "."
+[stdout]
+sftp> pwd
+Remote working directory: /C:/Users/svc-ignition-deploy
+./AppData
+./Application Data
+./Cookies
+./Desktop
+./Documents
+./Downloads
+./Favorites
+./Links
+./Local Settings
+./Music
+./My Documents
+./NTUSER.DAT
+./NTUSER.DAT{6b3cbf8b-c6cb-11f1-8338-00155d013703}.TM.blf
+./NTUSER.DAT{6b3cbf8b-c6cb-11f1-8338-00155d013703}.TMContainer00000000000000000001.regtrans-ms
+./NTUSER.DAT{6b3cbf8b-c6cb-11f1-8338-00155d013703}.TMContainer00000000000000000002.regtrans-ms
+./NetHood
+./Pictures
+./PrintHood
+./Recent
+./Saved Games
+./SendTo
+./Start Menu
+./Templates
+./Videos
+./ntuser.dat.LOG1
+./ntuser.dat.LOG2
+./ntuser.ini
+[stderr]
+[exit 0]
+~~~
+
+#### create the scratch directory (relative path)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:35Z
+
+~~~
+[stdin]
+mkdir "ign-c7a"
+mkdir "ign-c7a/d"
+@ls -1 "ign-c7a"
+[stdout]
+sftp> mkdir "ign-c7a"
+sftp> mkdir "ign-c7a/d"
+ign-c7a/d
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 with the path form: /C:/Program Files/Inductive Automation/Ignition/data/config/resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:37Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/external
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/local
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/migration-log-202610150204.md
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 with the path form: C:/Program Files/Inductive Automation/Ignition/data/config/resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:39Z
+
+~~~
+[stdin]
+@ls -1 "C:/Program Files/Inductive Automation/Ignition/data/config/resources"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/C:/Program Files/Inductive Automation/Ignition/data/config/resources" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -1 with the path form: /c:/program files/inductive automation/ignition/data/config/resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:41Z
+
+~~~
+[stdin]
+@ls -1 "/c:/program files/inductive automation/ignition/data/config/resources"
+[stdout]
+/c:/program files/inductive automation/ignition/data/config/resources/core
+/c:/program files/inductive automation/ignition/data/config/resources/external
+/c:/program files/inductive automation/ignition/data/config/resources/local
+/c:/program files/inductive automation/ignition/data/config/resources/migration-log-202610150204.md
+/c:/program files/inductive automation/ignition/data/config/resources/production
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 with the path form: /C:\Program Files\Inductive Automation\Ignition\data\config\resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:43Z
+
+~~~
+[stdin]
+@ls -1 "/C:\Program Files\Inductive Automation\Ignition\data\config\resources"
+[stdout]
+[stderr]
+Can't ls: "/C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -1 with the path form: C:\Program Files\Inductive Automation\Ignition\data\config\resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:44Z
+
+~~~
+[stdin]
+@ls -1 "C:\Program Files\Inductive Automation\Ignition\data\config\resources"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -1 with the path form: /Program Files/Inductive Automation/Ignition/data/config/resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:46Z
+
+~~~
+[stdin]
+@ls -1 "/Program Files/Inductive Automation/Ignition/data/config/resources"
+[stdout]
+/Program Files/Inductive Automation/Ignition/data/config/resources/core
+/Program Files/Inductive Automation/Ignition/data/config/resources/external
+/Program Files/Inductive Automation/Ignition/data/config/resources/local
+/Program Files/Inductive Automation/Ignition/data/config/resources/migration-log-202610150204.md
+/Program Files/Inductive Automation/Ignition/data/config/resources/production
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 with the path form: /C:/Program Files/Inductive Automation/Ignition/data/config/resources/
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:48Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/external
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/local
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/migration-log-202610150204.md
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of the drive root forms
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:50Z
+
+~~~
+[stdin]
+@ls -1 "/C:/"
+[stdout]
+/C:/$Recycle.Bin
+/C:/Documents and Settings
+/C:/Packages
+/C:/PerfLogs
+/C:/Program Files
+/C:/Program Files (x86)
+/C:/ProgramData
+/C:/Recovery
+/C:/System Volume Information
+/C:/Temp
+/C:/Users
+/C:/Windows
+/C:/WindowsAzure
+/C:/ign-install
+/C:/inetpub
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of "/"
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:52Z
+
+~~~
+[stdin]
+@ls -1 "/"
+[stdout]
+/C:
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of "C:/" (no leading slash)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:54Z
+
+~~~
+[stdin]
+@ls -1 "C:/"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/C:/" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### what core/ignition holds (to pick a small directory for get -R)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:56Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/cobranding
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/database-driver
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/database-translator
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/edge-system-properties
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/gateway-network-proxy-rules
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/gateway-network-queue-settings
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/gateway-network-settings
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/general-alarm-settings
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/identity-provider
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/images
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/keyboard_layout
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/opc-connection
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/quickstart
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/schedule
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-levels
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/system-properties
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-provider
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/translations
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/user-source
+[stderr]
+[exit 0]
+~~~
+
+#### ls -l of the small directory chosen for get -R
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:34:58Z
+
+~~~
+[stdin]
+@ls -l "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties"
+[stdout]
+-rw-******    1 -        -            2839 Oct 15 02:07 config.json
+-rw-******    1 -        -             117 Oct 15 02:07 resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### get -R with the path form: /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:00Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" "$TMP/local/get1"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/get1"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties/
+[stderr]
+[exit 0]
+~~~
+
+#### what get -R left locally (find, sizes, sha256 of each file)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ \|\ LC_ALL=C\ sort\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local/get1 ` @ 2026-10-15T02:35:02Z
+
+~~~
+[stdout]
+.
+./security-properties
+./security-properties/config.json
+./security-properties/resource.json
+7321dabb9e1d3a8d52eb845232d4c666b2be15241fb237dba4feb3b6f51cc41d  ./security-properties/config.json
+bc15af88b472315f0500943d714a752a33d15103e9e6ec28d0c63be5271edb7a  ./security-properties/resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### get -R with the path form: C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:02Z
+
+~~~
+[stdin]
+get -R "C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" "$TMP/local/get2"
+[stdout]
+sftp> get -R "C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/get2"
+[stderr]
+File "/C:/Users/svc-ignition-deploy/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### what get -R left locally (find, sizes, sha256 of each file)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ \|\ LC_ALL=C\ sort\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local/get2 ` @ 2026-10-15T02:35:04Z
+
+~~~
+[stdout]
+.
+[stderr]
+[exit 0]
+~~~
+
+#### get -R with the path form: C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\security-properties
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:04Z
+
+~~~
+[stdin]
+get -R "C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\security-properties" "$TMP/local/get3"
+[stdout]
+sftp> get -R "C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\security-properties" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/get3"
+[stderr]
+File "/C:/Users/svc-ignition-deploy/C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources\\core\\ignition\\security-properties" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### what get -R left locally (find, sizes, sha256 of each file)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ \|\ LC_ALL=C\ sort\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local/get3 ` @ 2026-10-15T02:35:06Z
+
+~~~
+[stdout]
+.
+[stderr]
+[exit 0]
+~~~
+
+#### put with the relative path form
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:06Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "ign-c7a/put-rel.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/put-rel.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### put with the /C:/ absolute path form
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:08Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "/C:/Users/svc-ignition-deploy/ign-c7a/put-slashc.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "/C:/Users/svc-ignition-deploy/ign-c7a/put-slashc.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### put with the C:/ drive path form (no leading slash)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:10Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "C:/Users/svc-ignition-deploy/ign-c7a/put-drive.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "C:/Users/svc-ignition-deploy/ign-c7a/put-drive.txt"
+[stderr]
+dest open "/C:/Users/svc-ignition-deploy/C:/Users/svc-ignition-deploy/ign-c7a/put-drive.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### put with backslashes: ign-c7a\put-bs.txt
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:11Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "ign-c7a\put-bs.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a\put-bs.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### put with an absolute backslash drive path
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:13Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "C:\Users\svc-ignition-deploy\ign-c7a\put-bs2.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "C:\Users\svc-ignition-deploy\ign-c7a\put-bs2.txt"
+[stderr]
+dest open "/C:/Users/svc-ignition-deploy/C:\\Users\\svc-ignition-deploy\\ign-c7a\\put-bs2.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### what exists after the puts (ls -1)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:15Z
+
+~~~
+[stdin]
+@ls -1 "ign-c7a"
+[stdout]
+ign-c7a/d
+ign-c7a/put-bs.txt
+ign-c7a/put-rel.txt
+ign-c7a/put-slashc.txt
+[stderr]
+[exit 0]
+~~~
+
+#### what exists after the puts (dir /b from the cmd.exe side)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"%USERPROFILE%\\ign-c7a\" ` @ 2026-10-15T02:35:17Z
+
+~~~
+[stdout]
+d
+put-bs.txt
+put-rel.txt
+put-slashc.txt
+[4 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### rename, relative to relative
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:18Z
+
+~~~
+[stdin]
+put "$TMP/local/b.txt" "ign-c7a/r1.txt"
+rename "ign-c7a/r1.txt" "ign-c7a/r1-renamed.txt"
+@ls -1 "ign-c7a"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/b.txt" "ign-c7a/r1.txt"
+sftp> rename "ign-c7a/r1.txt" "ign-c7a/r1-renamed.txt"
+ign-c7a/d
+ign-c7a/put-bs.txt
+ign-c7a/put-rel.txt
+ign-c7a/put-slashc.txt
+ign-c7a/r1-renamed.txt
+[stderr]
+[exit 0]
+~~~
+
+#### rename, /C:/ absolute to /C:/ absolute
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:21Z
+
+~~~
+[stdin]
+rename "/C:/Users/svc-ignition-deploy/ign-c7a/r1-renamed.txt" "/C:/Users/svc-ignition-deploy/ign-c7a/r1-abs.txt"
+@ls -1 "ign-c7a"
+[stdout]
+sftp> rename "/C:/Users/svc-ignition-deploy/ign-c7a/r1-renamed.txt" "/C:/Users/svc-ignition-deploy/ign-c7a/r1-abs.txt"
+ign-c7a/d
+ign-c7a/put-bs.txt
+ign-c7a/put-rel.txt
+ign-c7a/put-slashc.txt
+ign-c7a/r1-abs.txt
+[stderr]
+[exit 0]
+~~~
+
+#### rename, relative source to absolute /C:/ target
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:22Z
+
+~~~
+[stdin]
+rename "ign-c7a/r1-abs.txt" "/C:/Users/svc-ignition-deploy/ign-c7a/r1-mixed.txt"
+@ls -1 "ign-c7a"
+[stdout]
+sftp> rename "ign-c7a/r1-abs.txt" "/C:/Users/svc-ignition-deploy/ign-c7a/r1-mixed.txt"
+ign-c7a/d
+ign-c7a/put-bs.txt
+ign-c7a/put-rel.txt
+ign-c7a/put-slashc.txt
+ign-c7a/r1-mixed.txt
+[stderr]
+[exit 0]
+~~~
+
+#### rename into a subdirectory (same volume)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:24Z
+
+~~~
+[stdin]
+rename "ign-c7a/r1-mixed.txt" "ign-c7a/d/r1-moved.txt"
+@ls -1 "ign-c7a/d"
+[stdout]
+sftp> rename "ign-c7a/r1-mixed.txt" "ign-c7a/d/r1-moved.txt"
+ign-c7a/d/r1-moved.txt
+[stderr]
+[exit 0]
+~~~
+
+#### rename with backslash paths
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:27Z
+
+~~~
+[stdin]
+rename "ign-c7a\d\r1-moved.txt" "ign-c7a\d\r1-bs.txt"
+@ls -1 "ign-c7a/d"
+[stdout]
+sftp> rename "ign-c7a\d\r1-moved.txt" "ign-c7a\d\r1-bs.txt"
+ign-c7a/d/r1-bs.txt
+[stderr]
+[exit 0]
+~~~
+
+### C7a-2 — listing format (ls -1, ls -l, ls -la), paths with spaces and commas
+
+#### create a directory with spaces and a comma, files with spaces, commas and non-ASCII
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:29Z
+
+~~~
+[stdin]
+mkdir "ign-c7a/dir with space, comma"
+put "$TMP/local/a.txt" "ign-c7a/dir with space, comma/f one.txt"
+put "$TMP/local/b.txt" "ign-c7a/dir with space, comma/f,two.txt"
+put "$TMP/local/u.txt" "ign-c7a/dir with space, comma/café.txt"
+mkdir "ign-c7a/dir with space, comma/sub dir"
+[stdout]
+sftp> mkdir "ign-c7a/dir with space, comma"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/dir with space, comma/f one.txt"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/b.txt" "ign-c7a/dir with space, comma/f,two.txt"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/u.txt" "ign-c7a/dir with space, comma/caf\303\251.txt"
+sftp> mkdir "ign-c7a/dir with space, comma/sub dir"
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of the spaces-and-comma directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:31Z
+
+~~~
+[stdin]
+@ls -1 "ign-c7a/dir with space, comma"
+[stdout]
+ign-c7a/dir with space, comma/caf\303\251.txt
+ign-c7a/dir with space, comma/f one.txt
+ign-c7a/dir with space, comma/f,two.txt
+ign-c7a/dir with space, comma/sub dir
+[stderr]
+[exit 0]
+~~~
+
+#### ls -l of the spaces-and-comma directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:33Z
+
+~~~
+[stdin]
+@ls -l "ign-c7a/dir with space, comma"
+[stdout]
+-rw-******    1 -        -               8 Oct 15 02:35 caf\303\251.txt
+-rw-******    1 -        -               6 Oct 15 02:35 f one.txt
+-rw-******    1 -        -               6 Oct 15 02:35 f,two.txt
+drwx******    1 -        -               0 Oct 15 02:35 sub dir
+[stderr]
+[exit 0]
+~~~
+
+#### ls -la of the spaces-and-comma directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:35Z
+
+~~~
+[stdin]
+@ls -la "ign-c7a/dir with space, comma"
+[stdout]
+-rw-******    1 -        -               8 Oct 15 02:35 caf\303\251.txt
+-rw-******    1 -        -               6 Oct 15 02:35 f one.txt
+-rw-******    1 -        -               6 Oct 15 02:35 f,two.txt
+drwx******    1 -        -               0 Oct 15 02:35 sub dir
+[stderr]
+[exit 0]
+~~~
+
+#### the same ls -l with the client in a UTF-8 locale (LC_ALL=en_US.UTF-8): does the sftp client print the non-ASCII name raw?
+
+`env LC_ALL=en_US.UTF-8 sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:36Z
+
+~~~
+[stdin]
+@ls -l "ign-c7a/dir with space, comma"
+[stdout]
+-rw-******    1 -        -               8 Oct 15 02:35 café.txt
+-rw-******    1 -        -               6 Oct 15 02:35 f one.txt
+-rw-******    1 -        -               6 Oct 15 02:35 f,two.txt
+drwx******    1 -        -               0 Oct 15 02:35 sub dir
+[stderr]
+[exit 0]
+~~~
+
+#### get -R of the spaces-and-comma directory with the client in a UTF-8 locale (local names)
+
+`env LC_ALL=en_US.UTF-8 sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:38Z
+
+~~~
+[stdin]
+get -R "ign-c7a/dir with space, comma" "$TMP/local/spaceget"
+[stdout]
+sftp> get -R "ign-c7a/dir with space, comma" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/spaceget"
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma/
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma/sub dir
+[stderr]
+[exit 0]
+~~~
+
+#### what that get -R left locally (names as the local filesystem holds them, sha256)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ \|\ LC_ALL=C\ sort\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local/spaceget ` @ 2026-10-15T02:35:41Z
+
+~~~
+[stdout]
+.
+./dir with space, comma
+./dir with space, comma/café.txt
+./dir with space, comma/f one.txt
+./dir with space, comma/f,two.txt
+./dir with space, comma/sub dir
+5da8f23decf397b13f4f55b6fb8a61936238bfe08ed9d901132974f1beccc45c  ./dir with space, comma/f,two.txt
+b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060  ./dir with space, comma/f one.txt
+ebc45fabefbabdd06424b3c476b11e93fec784069ff10844e7383d59f491f8cb  ./dir with space, comma/café.txt
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 with the absolute /C:/ form of the same directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:41Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma"
+[stdout]
+/C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma/caf\303\251.txt
+/C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma/f one.txt
+/C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma/f,two.txt
+/C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma/sub dir
+[stderr]
+[exit 0]
+~~~
+
+#### ls -l of a single file
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:43Z
+
+~~~
+[stdin]
+@ls -l "ign-c7a/dir with space, comma/f one.txt"
+[stdout]
+-rw-------    ? 0        0               6 Oct 14 20:35 ign-c7a/dir with space, comma/f one.txt
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of a single file
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:44Z
+
+~~~
+[stdin]
+@ls -1 "ign-c7a/dir with space, comma/f one.txt"
+[stdout]
+ign-c7a/dir with space, comma/f one.txt
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of an empty directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:46Z
+
+~~~
+[stdin]
+mkdir "ign-c7a/empty"
+@ls -1 "ign-c7a/empty"
+[stdout]
+sftp> mkdir "ign-c7a/empty"
+[stderr]
+[exit 0]
+~~~
+
+#### ls -la of an empty directory (. and .. entries?)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:48Z
+
+~~~
+[stdin]
+@ls -la "ign-c7a/empty"
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### the same directory from the cmd.exe side (dir /b, dir /a)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /a\ \"%USERPROFILE%\\ign-c7a\\dir\ with\ space\,\ comma\" ` @ 2026-10-15T02:35:50Z
+
+~~~
+[stdout]
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Users\svc-ignition-deploy\ign-c7a\dir with space, comma
+
+10/15/2026  02:35 AM    <DIR>          .
+10/15/2026  02:35 AM    <DIR>          ..
+10/15/2026  02:35 AM                 8 caf\x82.txt
+10/15/2026  02:35 AM                 6 f one.txt
+10/15/2026  02:35 AM                 6 f,two.txt
+10/15/2026  02:35 AM    <DIR>          sub dir
+               3 File(s)             20 bytes
+               3 Dir(s)  116,343,496,704 bytes free
+[13 CR bytes removed from stdout]
+[stdout is not valid UTF-8: every byte outside printable ASCII is shown as \xNN]
+[stderr]
+[exit 0]
+~~~
+
+#### ls -l of the real collection root (owners, permissions, size, date columns)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:51Z
+
+~~~
+[stdin]
+@ls -l "/C:/Program Files/Inductive Automation/Ignition/data/config/resources"
+[stdout]
+drwx******    1 -        -            4096 Oct 15 02:05 core
+drwx******    1 -        -               0 Oct 15 02:07 external
+drwx******    1 -        -               0 Oct 15 02:05 local
+-rw-******    1 -        -           26893 Oct 15 02:04 migration-log-202610150204.md
+drwx******    1 -        -               0 Oct 15 02:08 production
+[stderr]
+[exit 0]
+~~~
+
+#### ls -la of the real collection root
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:53Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources"
+[stdout]
+drwx******    1 -        -          262144 Oct 15 02:10 .resources
+drwx******    1 -        -            4096 Oct 15 02:05 core
+drwx******    1 -        -               0 Oct 15 02:07 external
+drwx******    1 -        -               0 Oct 15 02:05 local
+-rw-******    1 -        -           26893 Oct 15 02:04 migration-log-202610150204.md
+drwx******    1 -        -               0 Oct 15 02:08 production
+[stderr]
+[exit 0]
+~~~
+
+### C7a-3 — error signalling: sftp -b - exit codes and stderr
+
+#### not found: ls -1
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:56Z
+
+~~~
+[stdin]
+@ls -1 "ign-c7a/does-not-exist"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### not found: get
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:58Z
+
+~~~
+[stdin]
+get "ign-c7a/does-not-exist" "$TMP/local/nf.txt"
+[stdout]
+sftp> get "ign-c7a/does-not-exist" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/nf.txt"
+[stderr]
+File "/C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### not found: get -R
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:35:59Z
+
+~~~
+[stdin]
+get -R "ign-c7a/does-not-exist" "$TMP/local"
+[stdout]
+sftp> get -R "ign-c7a/does-not-exist" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local"
+[stderr]
+File "/C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### not found: rm
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:01Z
+
+~~~
+[stdin]
+rm "ign-c7a/does-not-exist"
+[stdout]
+sftp> rm "ign-c7a/does-not-exist"
+[stderr]
+remote delete /C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist: No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### not found: rmdir
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:02Z
+
+~~~
+[stdin]
+rmdir "ign-c7a/does-not-exist"
+[stdout]
+sftp> rmdir "ign-c7a/does-not-exist"
+[stderr]
+remote rmdir "/C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### not found: rename source
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:04Z
+
+~~~
+[stdin]
+rename "ign-c7a/does-not-exist" "ign-c7a/xx"
+[stdout]
+sftp> rename "ign-c7a/does-not-exist" "ign-c7a/xx"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist" to "/C:/Users/svc-ignition-deploy/ign-c7a/xx": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rename target parent missing
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:06Z
+
+~~~
+[stdin]
+put "$TMP/local/c.txt" "ign-c7a/np.txt"
+rename "ign-c7a/np.txt" "ign-c7a/no-such-dir/np.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/c.txt" "ign-c7a/np.txt"
+sftp> rename "ign-c7a/np.txt" "ign-c7a/no-such-dir/np.txt"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-c7a/np.txt" to "/C:/Users/svc-ignition-deploy/ign-c7a/no-such-dir/np.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### mkdir of an existing directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:07Z
+
+~~~
+[stdin]
+mkdir "ign-c7a/d"
+[stdout]
+sftp> mkdir "ign-c7a/d"
+[stderr]
+remote mkdir "/C:/Users/svc-ignition-deploy/ign-c7a/d": Failure
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rmdir of a non-empty directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:09Z
+
+~~~
+[stdin]
+rmdir "ign-c7a/dir with space, comma"
+[stdout]
+sftp> rmdir "ign-c7a/dir with space, comma"
+[stderr]
+remote rmdir "/C:/Users/svc-ignition-deploy/ign-c7a/dir with space, comma": Failure
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### permission denied: put into the resources root
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:10Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c7a-denied.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c7a-denied.txt"
+[stderr]
+dest open "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c7a-denied.txt": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### permission denied: mkdir in the resources root
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:12Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c7a-denied"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c7a-denied"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c7a-denied": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### what the data dir holds (ls -1)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:13Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/certificates
+/C:/Program Files/Inductive Automation/Ignition/data/commissioning.json
+/C:/Program Files/Inductive Automation/Ignition/data/config
+/C:/Program Files/Inductive Automation/Ignition/data/db
+/C:/Program Files/Inductive Automation/Ignition/data/email-profiles
+/C:/Program Files/Inductive Automation/Ignition/data/gateway.xml
+/C:/Program Files/Inductive Automation/Ignition/data/gateway.xml_clean
+/C:/Program Files/Inductive Automation/Ignition/data/ignition.conf
+/C:/Program Files/Inductive Automation/Ignition/data/init.properties.bak
+/C:/Program Files/Inductive Automation/Ignition/data/jar-cache
+/C:/Program Files/Inductive Automation/Ignition/data/log4j.properties
+/C:/Program Files/Inductive Automation/Ignition/data/logback.xml
+/C:/Program Files/Inductive Automation/Ignition/data/metricsdb
+/C:/Program Files/Inductive Automation/Ignition/data/modules.json
+/C:/Program Files/Inductive Automation/Ignition/data/projects
+/C:/Program Files/Inductive Automation/Ignition/data/redundancy.xml
+/C:/Program Files/Inductive Automation/Ignition/data/request
+/C:/Program Files/Inductive Automation/Ignition/data/response
+/C:/Program Files/Inductive Automation/Ignition/data/var
+[stderr]
+[exit 0]
+~~~
+
+#### user profile directories on the host (dir /b C:\Users)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ C:\\Users ` @ 2026-10-15T02:36:15Z
+
+~~~
+[stdout]
+Public
+svc-ignition-deploy
+[2 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### permission denied: ls of another account's profile directory (none found)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:17Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/none"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/none" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### permission denied: ls of C:/Windows/System32/config
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:18Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Windows/System32/config"
+[stdout]
+[stderr]
+remote readdir("/C:/Windows/System32/config/"): Bad message
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### permission denied: ls -l of the sshd host private key file (metadata only; the file is never fetched)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:21Z
+
+~~~
+[stdin]
+@ls -l "/C:/ProgramData/ssh/ssh_host_ed25519_key"
+[stdout]
+-rw-------    ? 0        0             411 Oct 14 19:54 /C:/ProgramData/ssh/ssh_host_ed25519_key
+[stderr]
+[exit 0]
+~~~
+
+#### permission denied: get of the sshd log (a file that exists and is not readable by Users)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:23Z
+
+~~~
+[stdin]
+get "/C:/ProgramData/ssh/logs/sshd.log" "$TMP/local/sshd.log"
+[stdout]
+sftp> get "/C:/ProgramData/ssh/logs/sshd.log" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/sshd.log"
+[stderr]
+File "/C:/ProgramData/ssh/logs/sshd.log" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### permission denied: get of the SAM hive
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:25Z
+
+~~~
+[stdin]
+get "/C:/Windows/System32/config/SAM" "$TMP/local/sam"
+[stdout]
+sftp> get "/C:/Windows/System32/config/SAM" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/sam"
+[stderr]
+File "/C:/Windows/System32/config/SAM" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### after the denied writes: nothing was created in the resources root
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\"\ \|\ findstr\ /i\ zz-c7a ` @ 2026-10-15T02:36:27Z
+
+~~~
+[stdout]
+[stderr]
+[exit 1]
+~~~
+
+#### sftp exit code with a failing command in the MIDDLE of a batch (does the batch abort?)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:28Z
+
+~~~
+[stdin]
+@ls -1 "ign-c7a/d"
+@ls -1 "ign-c7a/does-not-exist"
+@ls -1 "ign-c7a/empty"
+[stdout]
+ign-c7a/d/r1-bs.txt
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/does-not-exist" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### sftp batch whose commands all succeed (exit code 0)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:31Z
+
+~~~
+[stdin]
+@ls -1 "ign-c7a/d"
+@ls -1 "ign-c7a/empty"
+[stdout]
+ign-c7a/d/r1-bs.txt
+[stderr]
+[exit 0]
+~~~
+
+### C7a-4 — rename over an existing target
+
+#### file over an existing file: setup
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:34Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "ign-c7a/ow-src.txt"
+put "$TMP/local/b.txt" "ign-c7a/ow-dst.txt"
+@ls -l "ign-c7a/ow-src.txt"
+@ls -l "ign-c7a/ow-dst.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/ow-src.txt"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/b.txt" "ign-c7a/ow-dst.txt"
+-rw-------    ? 0        0               6 Oct 14 20:36 ign-c7a/ow-src.txt
+-rw-------    ? 0        0               6 Oct 14 20:36 ign-c7a/ow-dst.txt
+[stderr]
+[exit 0]
+~~~
+
+#### file over an existing file: rename ow-src.txt onto ow-dst.txt
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:37Z
+
+~~~
+[stdin]
+rename "ign-c7a/ow-src.txt" "ign-c7a/ow-dst.txt"
+[stdout]
+sftp> rename "ign-c7a/ow-src.txt" "ign-c7a/ow-dst.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### file over an existing file: what is left, and the content of ow-dst.txt (alpha means replaced, bravo means untouched)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"%USERPROFILE%\\ign-c7a\\ow-\*\"\ \&\ type\ \"%USERPROFILE%\\ign-c7a\\ow-dst.txt\" ` @ 2026-10-15T02:36:39Z
+
+~~~
+[stdout]
+ow-dst.txt
+alpha
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### directory over an existing EMPTY directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:41Z
+
+~~~
+[stdin]
+mkdir "ign-c7a/od-src"
+put "$TMP/local/a.txt" "ign-c7a/od-src/in-src.txt"
+mkdir "ign-c7a/od-dst-empty"
+rename "ign-c7a/od-src" "ign-c7a/od-dst-empty"
+[stdout]
+sftp> mkdir "ign-c7a/od-src"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/od-src/in-src.txt"
+sftp> mkdir "ign-c7a/od-dst-empty"
+sftp> rename "ign-c7a/od-src" "ign-c7a/od-dst-empty"
+[stderr]
+[exit 0]
+~~~
+
+#### directory over an empty directory: the whole tree (is in-src.txt inside od-dst-empty?)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ \"dir\ /b\ /s\ \"%USERPROFILE%\\ign-c7a\"\ \|\ findstr\ /i\ /c:\"\\od-\"\" ` @ 2026-10-15T02:36:43Z
+
+~~~
+[stdout]
+C:\Users\svc-ignition-deploy\ign-c7a\od-dst-empty
+C:\Users\svc-ignition-deploy\ign-c7a\od-dst-empty\in-src.txt
+[2 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### directory over an existing NON-EMPTY directory: setup
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:44Z
+
+~~~
+[stdin]
+mkdir "ign-c7a/od2-src"
+put "$TMP/local/a.txt" "ign-c7a/od2-src/in-src.txt"
+mkdir "ign-c7a/od2-dst"
+put "$TMP/local/b.txt" "ign-c7a/od2-dst/in-dst.txt"
+[stdout]
+sftp> mkdir "ign-c7a/od2-src"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/od2-src/in-src.txt"
+sftp> mkdir "ign-c7a/od2-dst"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/b.txt" "ign-c7a/od2-dst/in-dst.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### directory over an existing NON-EMPTY directory: rename
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:46Z
+
+~~~
+[stdin]
+rename "ign-c7a/od2-src" "ign-c7a/od2-dst"
+[stdout]
+sftp> rename "ign-c7a/od2-src" "ign-c7a/od2-dst"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-c7a/od2-src" to "/C:/Users/svc-ignition-deploy/ign-c7a/od2-dst": Failure
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### directory over a non-empty directory: the whole tree (both directories intact?)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ \"dir\ /b\ /s\ \"%USERPROFILE%\\ign-c7a\"\ \|\ findstr\ /i\ /c:\"\\od2-\"\" ` @ 2026-10-15T02:36:48Z
+
+~~~
+[stdout]
+C:\Users\svc-ignition-deploy\ign-c7a\od2-dst
+C:\Users\svc-ignition-deploy\ign-c7a\od2-src
+C:\Users\svc-ignition-deploy\ign-c7a\od2-dst\in-dst.txt
+C:\Users\svc-ignition-deploy\ign-c7a\od2-src\in-src.txt
+[4 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### file over an existing DIRECTORY
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:50Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "ign-c7a/fd-src.txt"
+mkdir "ign-c7a/fd-dst"
+rename "ign-c7a/fd-src.txt" "ign-c7a/fd-dst"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/fd-src.txt"
+sftp> mkdir "ign-c7a/fd-dst"
+sftp> rename "ign-c7a/fd-src.txt" "ign-c7a/fd-dst"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-c7a/fd-src.txt" to "/C:/Users/svc-ignition-deploy/ign-c7a/fd-dst": Failure
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rename onto itself, step 1: a fresh file and its listing
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:52Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "ign-c7a/self.txt"
+@ls -l "ign-c7a/self.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/self.txt"
+-rw-------    ? 0        0               6 Oct 14  2026 ign-c7a/self.txt
+[stderr]
+[exit 0]
+~~~
+
+#### rename onto itself, step 2: rename self.txt onto self.txt
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:54Z
+
+~~~
+[stdin]
+rename "ign-c7a/self.txt" "ign-c7a/self.txt"
+[stdout]
+sftp> rename "ign-c7a/self.txt" "ign-c7a/self.txt"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-c7a/self.txt" to "/C:/Users/svc-ignition-deploy/ign-c7a/self.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rename onto itself, step 3: is the file still there?
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:55Z
+
+~~~
+[stdin]
+@ls -l "ign-c7a/self.txt"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/self.txt" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rename onto itself, step 4: the file from the cmd.exe side
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"%USERPROFILE%\\ign-c7a\\self.txt\"\ \&\ type\ \"%USERPROFILE%\\ign-c7a\\self.txt\" ` @ 2026-10-15T02:36:57Z
+
+~~~
+[stdout]
+[stderr]
+File Not Found
+The system cannot find the file specified.
+[2 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rename over an existing file twice in a row (the commit step may repeat): first
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:36:58Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "ign-c7a/tw-src1.txt"
+put "$TMP/local/b.txt" "ign-c7a/tw-dst.txt"
+rename "ign-c7a/tw-src1.txt" "ign-c7a/tw-dst.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/a.txt" "ign-c7a/tw-src1.txt"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/b.txt" "ign-c7a/tw-dst.txt"
+sftp> rename "ign-c7a/tw-src1.txt" "ign-c7a/tw-dst.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### rename over an existing file twice in a row: second
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:01Z
+
+~~~
+[stdin]
+put "$TMP/local/c.txt" "ign-c7a/tw-src2.txt"
+rename "ign-c7a/tw-src2.txt" "ign-c7a/tw-dst.txt"
+@ls -1 "ign-c7a"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/c.txt" "ign-c7a/tw-src2.txt"
+sftp> rename "ign-c7a/tw-src2.txt" "ign-c7a/tw-dst.txt"
+ign-c7a/d
+ign-c7a/dir with space, comma
+ign-c7a/empty
+ign-c7a/fd-dst
+ign-c7a/fd-src.txt
+ign-c7a/np.txt
+ign-c7a/od-dst-empty
+ign-c7a/od2-dst
+ign-c7a/od2-src
+ign-c7a/ow-dst.txt
+ign-c7a/put-bs.txt
+ign-c7a/put-rel.txt
+ign-c7a/put-slashc.txt
+ign-c7a/tw-dst.txt
+[stderr]
+[exit 0]
+~~~
+
+#### rename over an existing file twice in a row: content of tw-dst.txt (charlie means the second replaced the first)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 type\ \"%USERPROFILE%\\ign-c7a\\tw-dst.txt\" ` @ 2026-10-15T02:37:03Z
+
+~~~
+[stdout]
+charlie
+[stderr]
+[exit 0]
+~~~
+
+#### rename over a file that another session holds open: setup
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:04Z
+
+~~~
+[stdin]
+put "$TMP/local/b.txt" "ign-c7a/lock-dst.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/b.txt" "ign-c7a/lock-dst.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### rename over a file that a second ssh session holds open with FileShare.None (4 s hold; the sftp rename starts 2 s after it)
+
+`bash -c $'\n    HOLD=$(printf "%s" "\\$f=[IO.File]::Open((Join-Path \\$env:USERPROFILE \\"ign-c7a\\\\lock-dst.txt\\"),\\"Open\\",\\"Read\\",\\"None\\"); \\"held\\"; Start-Sleep 4; \\$f.C...[890 chars]' _ 22 <key> $HOME/.cache/ign-wflwvm01/known_hosts svc-ignition-deploy@40.114.71.134 $TMP/local/c.txt ` @ 2026-10-15T02:37:06Z
+
+~~~
+[stdout]
+held
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/c.txt" "ign-c7a/lock-src.txt"
+sftp> rename "ign-c7a/lock-src.txt" "ign-c7a/lock-dst.txt"
+sftp-exit=1
+released
+[2 CR bytes removed from stdout]
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-c7a/lock-src.txt" to "/C:/Users/svc-ignition-deploy/ign-c7a/lock-dst.txt": Failure
+[1 CR bytes removed from stderr]
+[exit 0]
+~~~
+
+#### after the held-handle rename attempt: which names exist, and the content of lock-dst.txt
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"%USERPROFILE%\\ign-c7a\\lock-\*\"\ \&\ type\ \"%USERPROFILE%\\ign-c7a\\lock-dst.txt\" ` @ 2026-10-15T02:37:12Z
+
+~~~
+[stdout]
+lock-dst.txt
+lock-src.txt
+bravo
+[2 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+### C7a-5 — junctions and links
+
+#### create jx/real, a file in it, and a junction jx/junc to it (cmd /c mklink /J)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ \"mkdir\ \"%USERPROFILE%\\ign-c7a\\jx\\real\"\ \&\&\ echo\ inreal\>\ \"%USERPROFILE%\\ign-c7a\\jx\\real\\r.txt\"\ \&\&\ mklink\ /J\ \"%USERPROFILE%\\ign-c7a\\jx\\junc\"\ \"%USERPROFILE%\\ign-c7a\\jx\\real\"\" ` @ 2026-10-15T02:37:13Z
+
+~~~
+[stdout]
+Junction created for C:\Users\svc-ignition-deploy\ign-c7a\jx\junc <<===>> C:\Users\svc-ignition-deploy\ign-c7a\jx\real
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### dir of jx (junction marker)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /a\ \"%USERPROFILE%\\ign-c7a\\jx\" ` @ 2026-10-15T02:37:15Z
+
+~~~
+[stdout]
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Users\svc-ignition-deploy\ign-c7a\jx
+
+10/15/2026  02:37 AM    <DIR>          .
+10/15/2026  02:37 AM    <DIR>          ..
+10/15/2026  02:37 AM    <JUNCTION>     junc [C:\Users\svc-ignition-deploy\ign-c7a\jx\real]
+10/15/2026  02:37 AM    <DIR>          real
+               0 File(s)              0 bytes
+               4 Dir(s)  116,335,869,952 bytes free
+[11 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ls -la of jx (how the junction appears to sftp)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:16Z
+
+~~~
+[stdin]
+@ls -la "ign-c7a/jx"
+[stdout]
+drwx******    1 -        -               0 Oct 15 02:37 junc
+drwx******    1 -        -               0 Oct 15 02:37 real
+[stderr]
+[exit 0]
+~~~
+
+#### ls -l of jx/junc contents
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:18Z
+
+~~~
+[stdin]
+@ls -l "ign-c7a/jx/junc"
+[stdout]
+-rw-******    1 -        -               9 Oct 15 02:37 r.txt
+[stderr]
+[exit 0]
+~~~
+
+#### get of a file reached through the junction
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:20Z
+
+~~~
+[stdin]
+get "ign-c7a/jx/junc/r.txt" "$TMP/local/viajunc.txt"
+[stdout]
+sftp> get "ign-c7a/jx/junc/r.txt" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/viajunc.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### get -R of jx (contains the junction)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:22Z
+
+~~~
+[stdin]
+get -R "ign-c7a/jx" "$TMP/local/jget"
+[stdout]
+sftp> get -R "ign-c7a/jx" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/jget"
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/real
+[stderr]
+[exit 0]
+~~~
+
+#### what get -R over a junction left locally
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ \|\ LC_ALL=C\ sort\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local/jget ` @ 2026-10-15T02:37:25Z
+
+~~~
+[stdout]
+.
+./jx
+./jx/junc
+./jx/junc/r.txt
+./jx/real
+./jx/real/r.txt
+34f451e9277d4b96776445a4e3353233f37ae2f44af56297dfe26c0ea47eac63  ./jx/real/r.txt
+34f451e9277d4b96776445a4e3353233f37ae2f44af56297dfe26c0ea47eac63  ./jx/junc/r.txt
+[stderr]
+[exit 0]
+~~~
+
+#### a junction that points at its own parent (jx/loop -> jx)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ mklink\ /J\ \"%USERPROFILE%\\ign-c7a\\jx\\loop\"\ \"%USERPROFILE%\\ign-c7a\\jx\" ` @ 2026-10-15T02:37:25Z
+
+~~~
+[stdout]
+Junction created for C:\Users\svc-ignition-deploy\ign-c7a\jx\loop <<===>> C:\Users\svc-ignition-deploy\ign-c7a\jx
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### get -R of jx WITH the self-referencing junction (150 s alarm bounds a runaway)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:37:27Z
+
+~~~
+[stdin]
+get -R "ign-c7a/jx" "$TMP/local/jloop"
+[stdout]
+sftp> get -R "ign-c7a/jx" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/jloop"
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/real
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/jx/real
+[stderr]
+remote readdir("/C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loo: No such file or directory
+remote readdir "/C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/junc" failed
+remote readdir("/C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loo: No such file or directory
+remote readdir "/C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop" failed
+remote readdir("/C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loo: No such file or directory
+remote readdir "/C:/Users/svc-ignition-deploy/ign-c7a/jx/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/loop/real" failed
+[6 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### what the looping get -R left locally: entry count and deepest path length (not the listing)
+
+`bash -c cd\ \"\$1\"\ \&\&\ echo\ \"entries=\$\(find\ .\ \|\ wc\ -l\ \|\ tr\ -d\ \"\ \"\)\"\ \&\&\ echo\ \"deepest_path_chars=\$\(find\ .\ \|\ awk\ \"\{\ if\ \(length\(\\\$0\)\ \>\ m\)\ m\ =\ length\(\\\$0\)\ \}\ END\ \{\ print\ m\ \}\"\)\"\ \&\&\ find\ .\ -type\ f\ \|\ head\ -n\ 5 _ $TMP/local/jloop ` @ 2026-10-15T02:38:41Z
+
+~~~
+[stdout]
+entries=218
+deepest_path_chars=224
+./jx/real/r.txt
+./jx/junc/r.txt
+./jx/loop/real/r.txt
+./jx/loop/junc/r.txt
+./jx/loop/loop/real/r.txt
+[stderr]
+[exit 0]
+~~~
+
+#### a directory symbolic link (mklink /D), which needs a privilege the account may not hold
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ mklink\ /D\ \"%USERPROFILE%\\ign-c7a\\jx\\symd\"\ \"%USERPROFILE%\\ign-c7a\\jx\\real\" ` @ 2026-10-15T02:38:41Z
+
+~~~
+[stdout]
+[stderr]
+You do not have sufficient privilege to perform this operation.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -la of jx after the symlink attempt
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:38:43Z
+
+~~~
+[stdin]
+@ls -la "ign-c7a/jx"
+[stdout]
+drwx******    1 -        -               0 Oct 15 02:37 junc
+drwx******    1 -        -               0 Oct 15 02:37 loop
+drwx******    1 -        -               0 Oct 15 02:37 real
+[stderr]
+[exit 0]
+~~~
+
+#### remove the junctions (rmdir removes the link only)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ \"rmdir\ \"%USERPROFILE%\\ign-c7a\\jx\\loop\"\ \&\ rmdir\ \"%USERPROFILE%\\ign-c7a\\jx\\junc\"\ \&\ rmdir\ \"%USERPROFILE%\\ign-c7a\\jx\\symd\"\ \&\ dir\ /a\ \"%USERPROFILE%\\ign-c7a\\jx\"\ \&\ dir\ /b\ \"%USERPROFILE%\\ign-c7a\\jx\\real\"\" ` @ 2026-10-15T02:38:45Z
+
+~~~
+[stdout]
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Users\svc-ignition-deploy\ign-c7a\jx
+
+10/15/2026  02:38 AM    <DIR>          .
+10/15/2026  02:37 AM    <DIR>          ..
+10/15/2026  02:37 AM    <DIR>          real
+               0 File(s)              0 bytes
+               3 Dir(s)  116,336,177,152 bytes free
+r.txt
+[11 CR bytes removed from stdout]
+[stderr]
+The system cannot find the file specified.
+[1 CR bytes removed from stderr]
+[exit 0]
+~~~
+
+### C7a-6 — default shell and PowerShell -EncodedCommand: exit codes and CLIXML
+
+#### ok output, bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JwBvAGsAJwA= ` @ 2026-10-15T02:38:46Z
+
+~~~
+[script]
+'ok'
+[stdout]
+ok
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ok output, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgACcAbwBrACcA ` @ 2026-10-15T02:38:48Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; 'ok'
+[stdout]
+ok
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### exit 7, bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ ZQB4AGkAdAAgADcA ` @ 2026-10-15T02:38:49Z
+
+~~~
+[script]
+exit 7
+[stdout]
+[stderr]
+[exit 7]
+~~~
+
+#### exit 7, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgAGUAeABpAHQAIAA3AA== ` @ 2026-10-15T02:38:51Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; exit 7
+[stdout]
+[stderr]
+[exit 7]
+~~~
+
+#### throw, bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ dABoAHIAbwB3ACAAJwBiAG8AbwBtACcA ` @ 2026-10-15T02:38:52Z
+
+~~~
+[script]
+throw 'boom'
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">boom_x000D__x000A_</S><S S="Error">At line:1 char:1_x000D__x000A_</S><S S="Error">+ throw 'boom'_x000D__x000A_</S><S S="Error">+ ~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : OperationStopped: (boom:String) [], RuntimeException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : boom_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### throw, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgAHQAaAByAG8AdwAgACcAYgBvAG8AbQAnAA== ` @ 2026-10-15T02:38:54Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; throw 'boom'
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">boom_x000D__x000A_</S><S S="Error">At line:1 char:72_x000D__x000A_</S><S S="Error">+ ... rence='SilentlyContinue'; $ErrorActionPreference='Stop'; throw 'boom'_x000D__x000A_</S><S S="Error">+                                                              ~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : OperationStopped: (boom:String) [], RuntimeException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : boom_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### a cmdlet error (Get-Item of a missing path), bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ RwBlAHQALQBJAHQAZQBtACAAJwBDADoAXABkAGUAZgBpAG4AaQB0AGUAbAB5AC0AbQBpAHMAcwBpAG4AZwAnAA== ` @ 2026-10-15T02:38:56Z
+
+~~~
+[script]
+Get-Item 'C:\definitely-missing'
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><S S="Error">Get-Item : Cannot find path 'C:\definitely-missing' because it does not exist._x000D__x000A_</S><S S="Error">At line:1 char:1_x000D__x000A_</S><S S="Error">+ Get-Item 'C:\definitely-missing'_x000D__x000A_</S><S S="Error">+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : ObjectNotFound: (C:\definitely-missing:String) [Get-Item], ItemNotFoundException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### a cmdlet error (Get-Item of a missing path), with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgAEcAZQB0AC0ASQB0AGUAbQAgACcAQwA6AFwAZABlAGYAaQBuAGkAdABlAGwAeQAtAG0AaQBzAHMAaQBuAGcAJwA= ` @ 2026-10-15T02:38:57Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Get-Item 'C:\definitely-missing'
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Get-Item : Cannot find path 'C:\definitely-missing' because it does not exist._x000D__x000A_</S><S S="Error">At line:1 char:72_x000D__x000A_</S><S S="Error">+ ... nue'; $ErrorActionPreference='Stop'; Get-Item 'C:\definitely-missing'_x000D__x000A_</S><S S="Error">+                                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : ObjectNotFound: (C:\definitely-missing:String) [Get-Item], ItemNotFoundException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### Write-Error then continue, bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ VwByAGkAdABlAC0ARQByAHIAbwByACAAJwBlADEAJwA7ACAAJwBhAGYAdABlAHIAJwA= ` @ 2026-10-15T02:38:59Z
+
+~~~
+[script]
+Write-Error 'e1'; 'after'
+[stdout]
+after
+[1 CR bytes removed from stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><S S="Error">Write-Error 'e1'; 'after' : e1_x000D__x000A_</S><S S="Error">    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 0]
+~~~
+
+#### Write-Error then continue, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgAFcAcgBpAHQAZQAtAEUAcgByAG8AcgAgACcAZQAxACcAOwAgACcAYQBmAHQAZQByACcA ` @ 2026-10-15T02:39:01Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Write-Error 'e1'; 'after'
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Write-Error 'e1'; 'after' : e1_x000D__x000A_</S><S S="Error">At line:1 char:72_x000D__x000A_</S><S S="Error">+ ... tlyContinue'; $ErrorActionPreference='Stop'; Write-Error 'e1'; 'after ..._x000D__x000A_</S><S S="Error">+                                                  ~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### Write-Progress, bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ VwByAGkAdABlAC0AUAByAG8AZwByAGUAcwBzACAALQBBAGMAdABpAHYAaQB0AHkAIABhACAALQBTAHQAYQB0AHUAcwAgAGIAOwAgACcAZABvAG4AZQAnAA== ` @ 2026-10-15T02:39:03Z
+
+~~~
+[script]
+Write-Progress -Activity a -Status b; 'done'
+[stdout]
+done
+[1 CR bytes removed from stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="1"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>a</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Processing</T><SR>-1</SR><SD>b</SD></PR></MS></Obj></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 0]
+~~~
+
+#### Write-Progress, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[362\ chars\] ` @ 2026-10-15T02:39:05Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Write-Progress -Activity a -Status b; 'done'
+[stdout]
+done
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### real progress: Compress-Archive of a small file then Expand-Archive, bare
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABkAD0ASgBvAGkAbgAtAFAAYQB0AGgAIAAkAGUAbgB2ADoAVQBTAEUAUgBQAFIATwBGAEkATABFACAAJwBpAGcAbgAtAGMANwBhACcAOw...\[958\ chars\] ` @ 2026-10-15T02:39:06Z
+
+~~~
+[script]
+$d=Join-Path $env:USERPROFILE 'ign-c7a'; Compress-Archive -LiteralPath (Join-Path $d 'put-rel.txt') -DestinationPath (Join-Path $d 'z.zip') -Force; Expand-Archive -LiteralPath (Join-Path $d 'z.zip') -DestinationPath (Join-Path $d 'zx') -Force; Remove-Item -LiteralPath (Join-Path $d 'z.zip'),(Join-Path $d 'zx') -Recurse -Force; 'archived'
+[stdout]
+archived
+[1 CR bytes removed from stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="1"><TNRef RefId="0" /><MS><I64 N="SourceId">2</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="2"><TNRef RefId="0" /><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S="progress" RefId="3"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>Compress-Archive</AV><AI>0</AI><Nil /><PI>-1</PI><PC>1</PC><T>Processing</T><SR>-1</SR><SD>The archive file 'C:\Users\svc-ignition-deploy\ign-c7a\z.zip' creation is in progress...</SD></PR></MS></Obj><Obj S="progress" RefId="4"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>Compress-Archive</AV><AI>0</AI><Nil /><PI>-1</PI><PC>100</PC><T>Processing</T><SR>-1</SR><SD>The archive file 'C:\Users\svc-ignition-deploy\ign-c7a\z.zip' creation is in progress...</SD></PR></MS></Obj><Obj S="progress" RefId="5"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>Compress-Archive</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD>Processing</SD></PR></MS></Obj><Obj S="progress" RefId="6"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>Expand-Archive</AV><AI>0</AI><Nil /><PI>-1</PI><PC>1</PC><T>Processing</T><SR>-1</SR><SD>The archive file 'C:\Users\svc-ignition-deploy\ign-c7a\zx' expansion is in progress...</SD></PR></MS></Obj><Obj S="progress" RefId="7"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>Expand-Archive</AV><AI>0</AI><Nil /><PI>-1</PI><PC>100</PC><T>Processing</T><SR>-1</SR><SD>The archive file 'C:\Users\svc-ignition-deploy\ign-c7a\z.zip' expansion is in progress...</SD></PR></MS></Obj><Obj S="progress" RefId="8"><TNRef RefId="0" /><MS><I64 N="SourceId">0</I64><PR N="Record"><AV>Expand-Archive</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD>Processing</SD></PR></MS></Obj></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 0]
+~~~
+
+#### real progress: Compress-Archive of a small file then Expand-Archive, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1150\ chars\] ` @ 2026-10-15T02:39:09Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $d=Join-Path $env:USERPROFILE 'ign-c7a'; Compress-Archive -LiteralPath (Join-Path $d 'put-rel.txt') -DestinationPath (Join-Path $d 'z.zip') -Force; Expand-Archive -LiteralPath (Join-Path $d 'z.zip') -DestinationPath (Join-Path $d 'zx') -Force; Remove-Item -LiteralPath (Join-Path $d 'z.zip'),(Join-Path $d 'zx') -Recurse -Force; 'archived'
+[stdout]
+archived
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### a stderr line written by the host, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[382\ chars\] ` @ 2026-10-15T02:39:11Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; [Console]::Error.WriteLine('to-stderr'); 'to-stdout'
+[stdout]
+to-stdout
+[1 CR bytes removed from stdout]
+[stderr]
+to-stderr
+[1 CR bytes removed from stderr]
+[exit 0]
+~~~
+
+#### non-ASCII output (UTF-8 or the console code page?), with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgACcAYwBhAGYA6QAgAPwAIADxACcA ` @ 2026-10-15T02:39:12Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; 'café ü ñ'
+[stdout]
+caf\x82 \x81 \xA4
+[1 CR bytes removed from stdout]
+[stdout is not valid UTF-8: every byte outside printable ASCII is shown as \xNN]
+[stderr]
+[exit 0]
+~~~
+
+#### a script that prints a sentinel line and a JSON object, with the prelude
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAEUAcgByAG8AcgBBAGMAdABpAG8AbgBQAHIAZQBmAGUAcgBlAG4AYwBlAD0AJwBTAHQAbwBwACcAOwAgAFcAcgBpAHQAZQAtAE8AdQB0AHAAdQB0ACAAJwBJAEcATgAtAFIARQBTAFUATABUACAAewAiAG8AawAiADoAdAByAHUAZQB9ACcA ` @ 2026-10-15T02:39:14Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Write-Output 'IGN-RESULT {"ok":true}'
+[stdout]
+IGN-RESULT {"ok":true}
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### PowerShell Rename-Item onto an existing name (src and dst both exist)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1054\ chars\] ` @ 2026-10-15T02:39:16Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $d=Join-Path $env:USERPROFILE 'ign-c7a'; Set-Content -LiteralPath (Join-Path $d 'pa-src.txt') -Value 'new'; Set-Content -LiteralPath (Join-Path $d 'pa-dst.txt') -Value 'old'; Rename-Item -LiteralPath (Join-Path $d 'pa-src.txt') -NewName 'pa-dst.txt'; Get-Content -LiteralPath (Join-Path $d 'pa-dst.txt')
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Rename-Item : Cannot create a file when that file already exists._x000D__x000A_</S><S S="Error">At line:1 char:247_x000D__x000A_</S><S S="Error">+ ... alue 'old'; Rename-Item -LiteralPath (Join-Path $d 'pa-src.txt') -New ..._x000D__x000A_</S><S S="Error">+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : WriteError: (C:\Users\svc-ig...-c7a\pa-src.txt:String) [Rename-Item], IOException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : RenameItemIOError,Microsoft.PowerShell.Commands.RenameItemCommand_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### PowerShell Move-Item -Force onto an existing name
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1118\ chars\] ` @ 2026-10-15T02:39:17Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $d=Join-Path $env:USERPROFILE 'ign-c7a'; Set-Content -LiteralPath (Join-Path $d 'pb-src.txt') -Value 'new'; Set-Content -LiteralPath (Join-Path $d 'pb-dst.txt') -Value 'old'; Move-Item -LiteralPath (Join-Path $d 'pb-src.txt') -Destination (Join-Path $d 'pb-dst.txt') -Force; Get-Content -LiteralPath (Join-Path $d 'pb-dst.txt')
+[stdout]
+new
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### .NET File.Move onto an existing name (.NET Framework 4.x has no overwrite)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1046\ chars\] ` @ 2026-10-15T02:39:19Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $d=Join-Path $env:USERPROFILE 'ign-c7a'; Set-Content -LiteralPath (Join-Path $d 'pc-src.txt') -Value 'new'; Set-Content -LiteralPath (Join-Path $d 'pc-dst.txt') -Value 'old'; [IO.File]::Move((Join-Path $d 'pc-src.txt'),(Join-Path $d 'pc-dst.txt')); Get-Content -LiteralPath (Join-Path $d 'pc-dst.txt')
+[stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Exception calling "Move" with "2" argument(s): "Cannot create a file when that file already exists._x000D__x000A_</S><S S="Error">"_x000D__x000A_</S><S S="Error">At line:1 char:247_x000D__x000A_</S><S S="Error">+ ... alue 'old'; [IO.File]::Move((Join-Path $d 'pc-src.txt'),(Join-Path $d ..._x000D__x000A_</S><S S="Error">+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : NotSpecified: (:) [], ParentContainsErrorRecordException_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : IOException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### .NET File.Replace with a null backup name (atomic swap of two files)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1110\ chars\] ` @ 2026-10-15T02:39:22Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $d=Join-Path $env:USERPROFILE 'ign-c7a'; Set-Content -LiteralPath (Join-Path $d 'pd-src.txt') -Value 'new'; Set-Content -LiteralPath (Join-Path $d 'pd-dst.txt') -Value 'old'; [IO.File]::Replace((Join-Path $d 'pd-src.txt'),(Join-Path $d 'pd-dst.txt'),[NullString]::Value); Get-Content -LiteralPath (Join-Path $d 'pd-dst.txt')
+[stdout]
+new
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### Directory swap: Move-Item of a directory onto an existing directory name, and rename-aside-then-rename (the directory commit sequence)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1786\ chars\] ` @ 2026-10-15T02:39:24Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $d=Join-Path $env:USERPROFILE 'ign-c7a'; New-Item -ItemType Directory -Path (Join-Path $d 'pe-new') | Out-Null; Set-Content -LiteralPath (Join-Path $d 'pe-new\n.txt') -Value 'new'; New-Item -ItemType Directory -Path (Join-Path $d 'pe-live') | Out-Null; Set-Content -LiteralPath (Join-Path $d 'pe-live\o.txt') -Value 'old'; Rename-Item -LiteralPath (Join-Path $d 'pe-live') -NewName 'pe-old'; Rename-Item -LiteralPath (Join-Path $d 'pe-new') -NewName 'pe-live'; (Get-ChildItem -LiteralPath (Join-Path $d 'pe-live')).Name; (Get-ChildItem -LiteralPath (Join-Path $d 'pe-old')).Name
+[stdout]
+n.txt
+o.txt
+[2 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ssh with a plain cmd.exe command: exit code propagation
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ exit\ 5 ` @ 2026-10-15T02:39:26Z
+
+~~~
+[stdout]
+[stderr]
+[exit 5]
+~~~
+
+#### ssh with a plain command that does not exist: exit code and stderr
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 definitely-not-a-command-xyz ` @ 2026-10-15T02:39:27Z
+
+~~~
+[stdout]
+[stderr]
+'definitely-not-a-command-xyz' is not recognized as an internal or external command,
+operable program or batch file.
+[2 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ssh with no output and exit 0
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 cmd\ /c\ exit\ 0 ` @ 2026-10-15T02:39:29Z
+
+~~~
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+### C7a-7 — maximum command length
+
+#### command-length ladder: powershell -EncodedCommand with a padded script and the prelude; each row is one ssh run
+
+`script = "<prelude>$x='<pad>'; Write-Output ('LEN=' + $x.Length)"`, padding chosen so the REMOTE COMMAND STRING (the argument after the destination) is about T characters; each row runs `ssh -T -p 22 -i <key> <H> -- user@host <that string>` @ 2026-10-15T02:39:30Z
+
+~~~
+target_chars  actual_chars  exit  seconds  stdout(first line)  stderr(first 120 chars)
+        1000          1002     0        2  LEN=244  
+        4000          4002     0        3  LEN=1369  
+        8000          8002     0        2  LEN=2869  
+        8100          8102     0        2  LEN=2907  
+        8120          8122     0        2  LEN=2914  
+        8140          8142     0        2  LEN=2922  
+        8150          8154     0        2  LEN=2926  
+        8160          8162     1        1    The command line is too long.
+        8170          8174     1        1    The command line is too long.
+        8180          8182     1        1    The command line is too long.
+        8185          8190     1        1    The command line is too long.
+        8190          8194     1        2    The command line is too long.
+        8191          8194     1        1    The command line is too long.
+        8192          8194     1        1    The command line is too long.
+        8300          8302     1        2    The command line is too long.
+       12000         12002     1        1    The command line is too long.
+       24000         24002     1        1    The command line is too long.
+       32000         32002     1        2    The command line is too long.
+       32700         32702     1        1    The command line is too long.
+       32760         32762   255        1    exec request failed on channel 0
+       32766         32770   255        2    exec request failed on channel 0
+       32767         32770   255        1    exec request failed on channel 0
+       32768         32770   255        1    exec request failed on channel 0
+       33000         33002   255        2    exec request failed on channel 0
+       65000         65002   255        1    exec request failed on channel 0
+      100000        100002   255        1    exec request failed on channel 0
+~~~
+
+### C7a-8 — sftp-server paths over 260 characters
+
+#### build seven nested directories of 58 characters by mkdir + cd, then put a file (the batch aborts at the first failing command; the echoed lines show how far it got)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:09Z
+
+~~~
+[stdin]
+mkdir "ign-c7a/lp"
+cd "ign-c7a/lp"
+mkdir "s1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+mkdir "s2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+mkdir "s3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+mkdir "s4xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s4xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+mkdir "s5xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s5xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+mkdir "s6xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s6xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+mkdir "s7xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+cd "s7xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+put "$TMP/local/a.txt" "deep.txt"
+pwd
+@ls -1 "."
+[stdout]
+sftp> mkdir "ign-c7a/lp"
+sftp> cd "ign-c7a/lp"
+sftp> mkdir "s1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+sftp> cd "s1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+sftp> mkdir "s2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+sftp> cd "s2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+sftp> mkdir "s3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+sftp> cd "s3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+sftp> mkdir "s4xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+[stderr]
+remote mkdir "/C:/Users/svc-ignition-deploy/ign-c7a/lp/s1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/s2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/s3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/s4xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### longest full path under ign-c7a/lp as PowerShell sees it (\\?\ prefix; length in characters)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[842\ chars\] ` @ 2026-10-15T02:40:12Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $p='\\?\'+(Join-Path $env:USERPROFILE 'ign-c7a\lp'); $m=0; $last=''; Get-ChildItem -LiteralPath $p -Recurse -Force | ForEach-Object { $l=$_.FullName.Length; if($l -gt $m){ $m=$l; $last=$_.FullName } }; 'max_len=' + $m; $last
+[stdout]
+max_len=220
+\\?\C:\Users\svc-ignition-deploy\ign-c7a\lp\s1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\s2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\s3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+[2 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### build a tree with a 300+ character path with the \\?\ prefix (PowerShell), put a file at the bottom
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[998\ chars\] ` @ 2026-10-15T02:40:13Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $base='\\?\'+(Join-Path $env:USERPROFILE 'ign-c7a\lq'); $seg='y'*56; $p=$base; 1..6 | ForEach-Object { $p=$p+'\'+('t'+$_+$seg) }; New-Item -ItemType Directory -Path $p -Force | Out-Null; Set-Content -LiteralPath ($p+'\deep.txt') -Value 'deep'; 'bottom_len=' + ($p+'\deep.txt').Length
+[stdout]
+bottom_len=406
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of level 1 of the deep tree, absolute path of 99 characters
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:15Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of level 2 of the deep tree, absolute path of 158 characters
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:18Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of level 3 of the deep tree, absolute path of 217 characters
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:20Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of level 4 of the deep tree, absolute path of 276 characters
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:21Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -1 of level 5 of the deep tree, absolute path of 335 characters
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:23Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -1 of level 6 of the deep tree, absolute path of 394 characters
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:25Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -l of the deepest directory by its absolute path (394 chars)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:28Z
+
+~~~
+[stdin]
+@ls -l "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+[stderr]
+Can't ls: "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### get of the deep file by its absolute path
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:30Z
+
+~~~
+[stdin]
+get "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/deep.txt" "$TMP/local/deepget/deep.txt"
+[stdout]
+sftp> get "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/deep.txt" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/deepget/deep.txt"
+[stderr]
+File "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/deep.txt" not found.
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### get -R of ign-c7a/lq (the whole deep tree)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:32Z
+
+~~~
+[stdin]
+get -R "ign-c7a/lq" "$TMP/local/deepget"
+[stdout]
+sftp> get -R "ign-c7a/lq" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.2xgL3f0joV/local/deepget"
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/lq/
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+Retrieving /C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+[stderr]
+[exit 0]
+~~~
+
+#### what the deep get -R left locally: every directory and file with its path length (a silent stop would show as missing levels)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ \|\ awk\ \"\{\ print\ length\(\\\$0\)\ \\\"\ \\\"\ \\\$0\ \}\"\ \|\ cut\ -c1-140\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local/deepget ` @ 2026-10-15T02:40:35Z
+
+~~~
+[stdout]
+1 .
+4 ./lq
+63 ./lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+122 ./lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+181 ./lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t3yyyyyyyyyyy
+[stderr]
+[exit 0]
+~~~
+
+#### what the deep tree really holds (levels and the file) as PowerShell sees it
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[870\ chars\] ` @ 2026-10-15T02:40:35Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; $p='\\?\'+(Join-Path $env:USERPROFILE 'ign-c7a\lq'); Get-ChildItem -LiteralPath $p -Recurse -Force | ForEach-Object { '{0} {1}' -f $_.FullName.Length, ($_.FullName.Substring($_.FullName.Length - [Math]::Min(30, $_.FullName.Length))) }
+[stdout]
+102 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+161 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+220 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+279 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+338 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+397 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+406 yyyyyyyyyyyyyyyyyyyyy\deep.txt
+[7 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of the intermediate levels (is the path limit per call or per tree?)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:40:38Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq"
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+[stdout]
+/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+/C:/Users/svc-ignition-deploy/ign-c7a/lq/t1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/t2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+[stderr]
+[exit 0]
+~~~
+
+### C7a-cleanup
+
+#### cleanup: remove the account-home scratch directory ign-c7a
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1282\ chars\] ` @ 2026-10-15T02:40:42Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Continue'; $p=Join-Path $env:USERPROFILE 'ign-c7a'; if(Test-Path -LiteralPath $p){ foreach($n in 'jx\junc','jx\loop','jx\symd'){ $q=Join-Path $p $n; if(Test-Path -LiteralPath $q){ cmd /c rmdir "$q" } }; Remove-Item -LiteralPath ('\\?\'+$p) -Recurse -Force; if(Test-Path -LiteralPath $p){ cmd /c rd /s /q ('\\?\'+$p) } }; if(Test-Path -LiteralPath $p){ 'STILL PRESENT' } else { 'ign-c7a removed' }
+[stdout]
+ign-c7a removed
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### the scratch directory is gone (dir of the home)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"%USERPROFILE%\" ` @ 2026-10-15T02:40:43Z
+
+~~~
+[stdout]
+.ssh
+Desktop
+Documents
+Downloads
+Favorites
+Links
+Music
+Pictures
+Saved Games
+Videos
+[10 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+
+
+## C6 — what svc-ignition-deploy can write and read (Decision B, research A16)
+
+Account `svc-ignition-deploy` on 40.114.71.134. The gateway is the one behind the `azure-win` profile. A write probe inside the mode collection uses a new directory `zz-c6-probe` that is removed in the same session; `GET /data/api/v1/scan/config` is recorded before and after. Home and `ign-deploy` probes are removed at the end. ACL listings are taken as the account over ssh (`icacls`), the account's own view.
+
+`<H>` stands for exactly these ssh/sftp options, in this order (the `hardened_options` set with an identity): `-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.cache/ign-wflwvm01/known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR `
+
+### C6-acl — the ACLs that explain each answer
+
+#### whoami /groups (the account, again)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 whoami\ /groups ` @ 2026-10-15T02:43:33Z
+
+~~~
+[stdout]
+
+GROUP INFORMATION
+-----------------
+
+Group Name                             Type             SID          Attributes                                        
+====================================== ================ ============ ==================================================
+Everyone                               Well-known group S-1-1-0      Mandatory group, Enabled by default, Enabled group
+BUILTIN\Users                          Alias            S-1-5-32-545 Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\NETWORK                   Well-known group S-1-5-2      Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\Authenticated Users       Well-known group S-1-5-11     Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\This Organization         Well-known group S-1-5-15     Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\Local account             Well-known group S-1-5-113    Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\NTLM Authentication       Well-known group S-1-5-64-10  Mandatory group, Enabled by default, Enabled group
+Mandatory Label\Medium Mandatory Level Label            S-1-16-8192                                                    
+[14 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data dir
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\" ` @ 2026-10-15T02:43:34Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data NT SERVICE\TrustedInstaller:(I)(F)
+                                                    NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                    NT AUTHORITY\SYSTEM:(I)(F)
+                                                    NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                    BUILTIN\Administrators:(I)(F)
+                                                    BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                    BUILTIN\Users:(I)(RX)
+                                                    BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                    CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                    APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                    APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                    APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                    APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data\\config
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\" ` @ 2026-10-15T02:43:35Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data\config NT SERVICE\TrustedInstaller:(I)(F)
+                                                           NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                           NT AUTHORITY\SYSTEM:(I)(F)
+                                                           NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                           BUILTIN\Administrators:(I)(F)
+                                                           BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                           BUILTIN\Users:(I)(RX)
+                                                           BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                           CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                           APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                           APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                           APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                           APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data\\config\\resources
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\" ` @ 2026-10-15T02:43:37Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data\config\resources ignwin836\svc-ignition-deploy:(OI)(CI)(RX)
+                                                                     NT SERVICE\TrustedInstaller:(I)(F)
+                                                                     NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                     NT AUTHORITY\SYSTEM:(I)(F)
+                                                                     NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                     BUILTIN\Administrators:(I)(F)
+                                                                     BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                     BUILTIN\Users:(I)(RX)
+                                                                     BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                     CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data\\config\\resources\\core
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\" ` @ 2026-10-15T02:43:38Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core ignwin836\svc-ignition-deploy:(I)(OI)(CI)(RX)
+                                                                          NT SERVICE\TrustedInstaller:(I)(F)
+                                                                          NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                          NT AUTHORITY\SYSTEM:(I)(F)
+                                                                          NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                          BUILTIN\Administrators:(I)(F)
+                                                                          BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                          BUILTIN\Users:(I)(RX)
+                                                                          BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                          CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                          APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                          APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                          APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                          APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### dir of data\\config\\resources (which collections exist)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /a\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\" ` @ 2026-10-15T02:43:40Z
+
+~~~
+[stdout]
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Program Files\Inductive Automation\Ignition\data\config\resources
+
+10/15/2026  02:08 AM    <DIR>          .
+10/15/2026  02:05 AM    <DIR>          ..
+10/15/2026  02:10 AM    <DIR>          .resources
+10/15/2026  02:05 AM    <DIR>          core
+10/15/2026  02:07 AM    <DIR>          external
+10/15/2026  02:05 AM    <DIR>          local
+10/15/2026  02:04 AM            26,893 migration-log-202610150204.md
+10/15/2026  02:08 AM    <DIR>          production
+               1 File(s)         26,893 bytes
+               7 Dir(s)  116,338,270,208 bytes free
+[15 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data\\config\\resources\\production
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\production\" ` @ 2026-10-15T02:43:41Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\production ignwin836\svc-ignition-deploy:(I)(OI)(CI)(RX)
+                                                                                NT SERVICE\TrustedInstaller:(I)(F)
+                                                                                NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                                NT AUTHORITY\SYSTEM:(I)(F)
+                                                                                NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                                BUILTIN\Administrators:(I)(F)
+                                                                                BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                                BUILTIN\Users:(I)(RX)
+                                                                                BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                                CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data\\ign-deploy (does it exist?)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\ign-deploy\" ` @ 2026-10-15T02:43:42Z
+
+~~~
+[stdout]
+Successfully processed 0 files; Failed processing 1 files
+[1 CR bytes removed from stdout]
+[stderr]
+C:\Program Files\Inductive Automation\Ignition\data\ign-deploy: The system cannot find the file specified.
+[1 CR bytes removed from stderr]
+[exit 2]
+~~~
+
+#### icacls the account home
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"%USERPROFILE%\" ` @ 2026-10-15T02:43:44Z
+
+~~~
+[stdout]
+C:\Users\svc-ignition-deploy NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+                             BUILTIN\Administrators:(OI)(CI)(F)
+                             ignwin836\svc-ignition-deploy:(OI)(CI)(F)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### dir of the data dir
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /a\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\" ` @ 2026-10-15T02:43:45Z
+
+~~~
+[stdout]
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Program Files\Inductive Automation\Ignition\data
+
+10/15/2026  02:05 AM    <DIR>          .
+10/15/2026  02:02 AM    <DIR>          ..
+10/15/2026  02:09 AM                16 .context.tmp
+10/15/2026  02:09 AM             1,313 .gateway.xml.bak
+10/15/2026  02:09 AM             1,286 .redundancy.xml.bak
+10/15/2026  02:03 AM    <DIR>          certificates
+10/15/2026  02:04 AM               139 commissioning.json
+10/15/2026  02:05 AM    <DIR>          config
+10/15/2026  02:10 AM    <DIR>          db
+10/15/2026  02:04 AM    <DIR>          email-profiles
+10/15/2026  02:09 AM             1,313 gateway.xml
+10/15/2026  02:02 AM               811 gateway.xml_clean
+10/15/2026  02:09 AM             8,960 ignition.conf
+10/15/2026  02:04 AM                90 init.properties.bak
+10/15/2026  02:04 AM    <DIR>          jar-cache
+10/15/2026  02:02 AM               271 log4j.properties
+10/15/2026  02:02 AM             2,567 logback.xml
+10/15/2026  02:42 AM    <DIR>          metricsdb
+10/15/2026  02:09 AM             7,813 modules.json
+10/15/2026  02:05 AM    <DIR>          projects
+10/15/2026  02:09 AM             1,286 redundancy.xml
+10/15/2026  02:03 AM                 0 request
+10/15/2026  02:03 AM                 0 response
+10/15/2026  02:05 AM    <DIR>          var
+              14 File(s)         25,865 bytes
+              10 Dir(s)  116,336,730,112 bytes free
+[31 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### is the data dir and the home on the same volume? (fsutil is admin-only; vol and the drive letters instead)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 echo\ %USERPROFILE%\ \&\ echo\ %SystemDrive%\ \&\ vol\ C: ` @ 2026-10-15T02:43:46Z
+
+~~~
+[stdout]
+C:\Users\svc-ignition-deploy 
+C: 
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+[4 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+### C6-scan-before — gateway scan state before any write probe
+
+#### GET scan/config (before)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-15T02:43:48Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1792030196522,
+  "lastScanDuration": 639
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET mode (deployment modes)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/mode ` @ 2026-10-15T02:43:48Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/mode",
+    "result": {
+      "status": 200,
+      "data": {"items":[{"name":"production","title":"Production","description":"ign-win-836 (azure-win)","resourceCount":0}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### GET gateway-info (the active deploymentMode)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/gateway-info ` @ 2026-10-15T02:43:48Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/gateway-info",
+    "result": {
+      "status": 200,
+      "data": {"name":"ign-win-836","redundancyRole":"Independent","edition":"standard","hostname":"40.114.71.134","port":"8088","ignitionVersion":"8.3.6 (b2026042713)","deploymentMode":"production","timeZone":"Coordinated Universal Time","timeZoneId":"Etc/UTC","jvmVersion":"17.0.18","allowUnsignedModules":false,"license":{"mode":"Trial","validForVersion":8,"expirationDate":"Oct 15, 2026, 4:05:48 AM","licenseRestrictions":[]}}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+### C6-1 — home-relative staging directory ign-deploy/
+
+#### mkdir ign-deploy in the home, put a file, rename it, list it
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:43:48Z
+
+~~~
+[stdin]
+mkdir "ign-deploy"
+mkdir "ign-deploy/gw"
+put "$TMP/local/a.txt" "ign-deploy/gw/stage1.txt"
+rename "ign-deploy/gw/stage1.txt" "ign-deploy/gw/stage2.txt"
+@ls -l "ign-deploy/gw"
+[stdout]
+sftp> mkdir "ign-deploy"
+sftp> mkdir "ign-deploy/gw"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/a.txt" "ign-deploy/gw/stage1.txt"
+sftp> rename "ign-deploy/gw/stage1.txt" "ign-deploy/gw/stage2.txt"
+-rw-******    1 -        -               6 Oct 15 02:43 stage2.txt
+[stderr]
+[exit 0]
+~~~
+
+#### the same under the /C:/ absolute home path
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:43:51Z
+
+~~~
+[stdin]
+put "$TMP/local/b.txt" "/C:/Users/svc-ignition-deploy/ign-deploy/gw/abs.txt"
+@ls -1 "/C:/Users/svc-ignition-deploy/ign-deploy/gw"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/b.txt" "/C:/Users/svc-ignition-deploy/ign-deploy/gw/abs.txt"
+/C:/Users/svc-ignition-deploy/ign-deploy/gw/abs.txt
+/C:/Users/svc-ignition-deploy/ign-deploy/gw/stage2.txt
+[stderr]
+[exit 0]
+~~~
+
+### C6-2 — write directly into the mode collection (production)
+
+#### ls -la of production (does the collection directory exist, who owns it)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:43:53Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production"
+[stdout]
+-rw-******    1 -        -             133 Oct 15 02:08 config-mode.json
+[stderr]
+[exit 0]
+~~~
+
+#### mkdir zz-c6-probe inside production
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:43:56Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### cross-directory rename of a staged FILE directly into production (the B(i) commit step; no probe directory needed)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:43:57Z
+
+~~~
+[stdin]
+rename "ign-deploy/gw/stage2.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-moved.txt"
+[stdout]
+sftp> rename "ign-deploy/gw/stage2.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-moved.txt"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-deploy/gw/stage2.txt" to "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-moved.txt": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### cross-directory rename of a staged DIRECTORY directly into production
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:43:59Z
+
+~~~
+[stdin]
+mkdir "ign-deploy/gw/unit"
+put "$TMP/local/a.txt" "ign-deploy/gw/unit/f.txt"
+rename "ign-deploy/gw/unit" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit"
+[stdout]
+sftp> mkdir "ign-deploy/gw/unit"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/a.txt" "ign-deploy/gw/unit/f.txt"
+sftp> rename "ign-deploy/gw/unit" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-deploy/gw/unit" to "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### put a file straight into production (no subdirectory)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:01Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-direct.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-direct.txt"
+[stderr]
+dest open "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-direct.txt": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### put a file into production/zz-c6-probe
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:03Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt"
+[stderr]
+dest open "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### rename inside production/zz-c6-probe
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:04Z
+
+~~~
+[stdin]
+rename "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe2.txt"
+[stdout]
+sftp> rename "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe2.txt"
+[stderr]
+remote rename "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt" to "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe2.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### cross-directory rename from the home staging dir INTO production/zz-c6-probe (the B(i) commit step)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:06Z
+
+~~~
+[stdin]
+rename "ign-deploy/gw/stage2.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/moved.txt"
+[stdout]
+sftp> rename "ign-deploy/gw/stage2.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/moved.txt"
+[stderr]
+remote rename "/C:/Users/svc-ignition-deploy/ign-deploy/gw/stage2.txt" to "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/moved.txt": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ls -l of production/zz-c6-probe after the attempts
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:08Z
+
+~~~
+[stdin]
+@ls -l "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe"
+[stdout]
+[stderr]
+Can't ls: "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### remove the probe: rm the files, rmdir the directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:09Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe2.txt"
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/moved.txt"
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt"
+[stderr]
+remote delete /C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-probe/probe.txt: No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### production after the cleanup (the probe directory must be gone)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:11Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/config-mode.json
+[stderr]
+[exit 0]
+~~~
+
+#### the same probes against the collection root itself: mkdir zz-c6-root-probe directly under resources
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:13Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-root-probe"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-root-probe"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-root-probe": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### mkdir the collection directory production2 under resources (what creating a new collection would need)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:15Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-collection"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-collection"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-collection": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+### C6-3 — write <data_dir>\ign-deploy\
+
+#### mkdir ign-deploy directly under the data dir
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:17Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### mkdir ign-deploy under data/config
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:19Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/ign-deploy"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/ign-deploy"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/ign-deploy": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### mkdir under the data dir (any name): data/zz-c6-datadir
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:20Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/zz-c6-datadir"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/zz-c6-datadir"
+[stderr]
+remote mkdir "/C:/Program Files/Inductive Automation/Ignition/data/zz-c6-datadir": Permission denied
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+### C6-4 — read core and production
+
+#### ls -1 of core
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:22Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/com.inductiveautomation.eam
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/com.inductiveautomation.opcua
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/com.inductiveautomation.perspective
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/com.inductiveautomation.sfc
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/config-mode.json
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of core/ignition
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:24Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/cobranding
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/database-driver
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/database-translator
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/edge-system-properties
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/gateway-network-proxy-rules
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/gateway-network-queue-settings
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/gateway-network-settings
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/general-alarm-settings
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/identity-provider
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/images
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/keyboard_layout
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/opc-connection
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/quickstart
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/schedule
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-levels
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/system-properties
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-group
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-provider
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-type-definition
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/translations
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/user-source
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of production
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:25Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/config-mode.json
+[stderr]
+[exit 0]
+~~~
+
+#### get -R of one core directory (security-properties)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:27Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" "$TMP/local/rd_core"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/rd_core"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/security-properties/
+[stderr]
+[exit 0]
+~~~
+
+#### get -R of production (whatever it holds)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:30Z
+
+~~~
+[stdin]
+get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production" "$TMP/local/rd_prod"
+[stdout]
+sftp> get -R "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.v5PIQfSVVF/local/rd_prod"
+Retrieving /C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/
+[stderr]
+[exit 0]
+~~~
+
+#### what the reads left locally (relative names, sizes; sha256 of the files)
+
+`bash -c cd\ \"\$1\"\ \&\&\ find\ .\ -type\ f\ -exec\ wc\ -c\ \{\}\ \\\;\ \|\ sort\ -k2\ \&\&\ find\ .\ -type\ f\ -exec\ shasum\ -a\ 256\ \{\}\ \\\; _ $TMP/local ` @ 2026-10-15T02:44:32Z
+
+~~~
+[stdout]
+       6 ./a.txt
+       6 ./b.txt
+    2839 ./rd_core/security-properties/config.json
+     117 ./rd_core/security-properties/resource.json
+     133 ./rd_prod/production/config-mode.json
+7321dabb9e1d3a8d52eb845232d4c666b2be15241fb237dba4feb3b6f51cc41d  ./rd_core/security-properties/config.json
+bc15af88b472315f0500943d714a752a33d15103e9e6ec28d0c63be5271edb7a  ./rd_core/security-properties/resource.json
+f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa  ./rd_prod/production/config-mode.json
+5da8f23decf397b13f4f55b6fb8a61936238bfe08ed9d901132974f1beccc45c  ./b.txt
+b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060  ./a.txt
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of the tag definitions in core (tag trees live under core/ignition/tag-definition)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:33Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/System
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/default
+[stderr]
+[exit 0]
+~~~
+
+#### ls -1 of the other top-level data dir entries the plan does not need (config, data/projects), to bound the read scope
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:34Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config"
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/projects"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/com.inductiveautomation.opcua
+/C:/Program Files/Inductive Automation/Ignition/data/config/ignition
+/C:/Program Files/Inductive Automation/Ignition/data/config/local
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources
+[stderr]
+[exit 0]
+~~~
+
+### C6-scan-after — gateway scan state after the probes
+
+#### GET scan/config (after)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-15T02:44:37Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1792030196522,
+  "lastScanDuration": 639
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+### C6-cleanup
+
+#### remove the home staging probe: files
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:37Z
+
+~~~
+[stdin]
+rm "ign-deploy/gw/stage2.txt"
+rm "ign-deploy/gw/abs.txt"
+[stdout]
+sftp> rm "ign-deploy/gw/stage2.txt"
+sftp> rm "ign-deploy/gw/abs.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### remove the home staging probe: unit directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:39Z
+
+~~~
+[stdin]
+rm "ign-deploy/gw/unit/f.txt"
+rmdir "ign-deploy/gw/unit"
+[stdout]
+sftp> rm "ign-deploy/gw/unit/f.txt"
+sftp> rmdir "ign-deploy/gw/unit"
+[stderr]
+[exit 0]
+~~~
+
+#### remove the home staging probe: directories
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:40Z
+
+~~~
+[stdin]
+rmdir "ign-deploy/gw"
+rmdir "ign-deploy"
+[stdout]
+sftp> rmdir "ign-deploy/gw"
+sftp> rmdir "ign-deploy"
+[stderr]
+[exit 0]
+~~~
+
+#### the home after the cleanup
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"%USERPROFILE%\" ` @ 2026-10-15T02:44:42Z
+
+~~~
+[stdout]
+.ssh
+Desktop
+Documents
+Downloads
+Favorites
+Links
+Music
+Pictures
+Saved Games
+Videos
+[10 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### defensive removal: file in production (only present if a rename or put surprisingly succeeded)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:44Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-moved.txt"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-moved.txt"
+[stderr]
+remote delete /C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-moved.txt: No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### defensive removal: file in production (direct put)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:45Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-direct.txt"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-direct.txt"
+[stderr]
+remote delete /C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-direct.txt: No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### defensive removal: directory in production
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:47Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit/f.txt"
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit/f.txt"
+[stderr]
+remote delete /C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6-unit/f.txt: No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### production after all defensive removals
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:49Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/config-mode.json
+[stderr]
+[exit 0]
+~~~
+
+#### defensive removal of anything a surprising success left behind (each line may fail with no such file; the batch aborts at the first)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:51Z
+
+~~~
+[stdin]
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-root-probe"
+[stdout]
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-root-probe"
+[stderr]
+remote rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-root-probe": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### defensive removal: collection probe
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:53Z
+
+~~~
+[stdin]
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-collection"
+[stdout]
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-collection"
+[stderr]
+remote rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/zz-c6-collection": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### defensive removal: data dir probe
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:55Z
+
+~~~
+[stdin]
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/zz-c6-datadir"
+[stdout]
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/zz-c6-datadir"
+[stderr]
+remote rmdir "/C:/Program Files/Inductive Automation/Ignition/data/zz-c6-datadir": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### defensive removal: data/ign-deploy
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:56Z
+
+~~~
+[stdin]
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy"
+[stdout]
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy"
+[stderr]
+remote rmdir "/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### defensive removal: data/config/ign-deploy
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:44:58Z
+
+~~~
+[stdin]
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/ign-deploy"
+[stdout]
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/ign-deploy"
+[stderr]
+remote rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/ign-deploy": No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+
+## C5-NTFS attempt 1 — through `ign tags import` (WebDev routes): every import answered 404, nothing captured
+
+Provider `CAP22H` is created on the capture gateway `azure-win`, nine folders are imported one by one through `ign tags import --provider CAP22H --file -`, the asynchronous flush is given 20 s, the provider's tag directories are listed over sftp as `svc-ignition-deploy` and from the cmd.exe side, the gateway log is read, and the provider is deleted. The WebDev bundle (`ign webdev deploy`, project ign-cli) is deployed first when absent: this is a capture host, not a customer gateway. Render stays fail-closed on Windows-illegal names whatever this shows.
+
+Note on this attempt (written by the operator after the run): `ign webdev deploy` answered success (project `ign-cli` was created on the capture gateway; that project stays there), but `ign webdev status` and every `ign tags import` answered `404 not_found` at `/system/webdev/ign-cli/cli/tags`, because this host's module list has no WebDev module (`ign modules` lists Perspective, Vision, SFC, OPC UA drivers and others, and no `com.inductiveautomation.webdev`). So the nine imports below did not run on the gateway and the directory listings show only the provider's own `unary-resource.json`. These blocks are kept as the record of why the native route was used in the next section. The gateway-log block of this attempt held only unrelated startup errors (a missing audit profile `WIGNVM01_Audit`, stack traces) plus the capture token's client address in its mdc; it was removed from this file, which is the only edit made to this attempt.
+
+`<H>` stands for exactly these ssh/sftp options, in this order (the `hardened_options` set with an identity): `-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.cache/ign-wflwvm01/known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR `
+
+#### ign webdev status (is the bundle there?)
+
+`ign --profile azure-win --json webdev status ` @ 2026-10-15T02:45:10Z
+
+~~~
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign webdev deploy (the capture host has no bundle)
+
+`ign --profile azure-win --json webdev deploy ` @ 2026-10-15T02:45:11Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "project": "ign-cli",
+    "routes": [
+      "tags",
+      "tagConfig",
+      "alarms",
+      "tagHistory"
+    ],
+    "script_exec": false,
+    "secret_rotated": false,
+    "import": {
+      "changes": [
+        {
+          "name": "ign-cli"
+        }
+      ],
+      "success": true
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### ign webdev status (after)
+
+`ign --profile azure-win --json webdev status ` @ 2026-10-15T02:45:11Z
+
+~~~
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags provider create CAP22H
+
+`ign --profile azure-win --json tags provider create CAP22H ` @ 2026-10-15T02:45:12Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "name": "CAP22H"
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### ign tags import: folder named 'plain' (5 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:12Z
+
+~~~
+[stdin]
+[{"name":"plain","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'CON' (3 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:12Z
+
+~~~
+[stdin]
+[{"name":"CON","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'aux' (3 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:13Z
+
+~~~
+[stdin]
+[{"name":"aux","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'NUL' (3 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:13Z
+
+~~~
+[stdin]
+[{"name":"NUL","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'trail ' (6 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:13Z
+
+~~~
+[stdin]
+[{"name":"trail ","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'trail.' (6 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:14Z
+
+~~~
+[stdin]
+[{"name":"trail.","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'a:b' (3 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:14Z
+
+~~~
+[stdin]
+[{"name":"a:b","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'LLLLLLLLLLLLLLLLLLLLLLLL' (200 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:14Z
+
+~~~
+[stdin]
+[{"name":"LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags import: folder named 'lpt1' (4 chars)
+
+`ign --profile azure-win --json tags import --provider CAP22H --file - ` @ 2026-10-15T02:45:14Z
+
+~~~
+[stdin]
+[{"name":"lpt1","tagType":"Folder","tags":[{"name":"T1","tagType":"AtomicTag","dataType":"Int4","valueSource":"memory","value":1}]}]
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+Waiting 20 s for the gateway to flush the tag files (the flush is asynchronous, Phase 21 CD4).
+
+#### sftp listing of the provider tag directory (ls -1)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:45:35Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### sftp listing of the provider tag directory (ls -la)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:45:37Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H"
+[stdout]
+-rw-******    1 -        -             135 Oct 15 02:45 unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### cmd.exe side: dir /b and dir /x (8.3 names) of the provider directory
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-definition\\CAP22H\"\ \&\ echo\ ----\ \&\ dir\ /x\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-definition\\CAP22H\" ` @ 2026-10-15T02:45:39Z
+
+~~~
+[stdout]
+unary-resource.json
+---- 
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H
+
+10/15/2026  02:45 AM    <DIR>                       .
+10/15/2026  02:45 AM    <DIR>                       ..
+10/15/2026  02:45 AM               135 UNARY-~1.JSO unary-resource.json
+               1 File(s)            135 bytes
+               2 Dir(s)  116,338,507,776 bytes free
+[12 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### PowerShell side: Get-ChildItem names with lengths and a hex dump of the first 24 characters of each name
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1262\ chars\] ` @ 2026-10-15T02:45:40Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Get-ChildItem -LiteralPath (Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' 'core\ignition\tag-definition\CAP22H') -Force | ForEach-Object { $n=$_.Name; $h=($n.Substring(0,[Math]::Min(24,$n.Length)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' '; ('{0} chars [{1}] {2}' -f $n.Length,$h,$n.Substring(0,[Math]::Min(24,$n.Length))) }
+[stdout]
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### sftp: the 200-character folder: contents
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:45:42Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL"
+[stdout]
+[stderr]
+Can't ls: "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL" not found
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### ign tags provider list (what the gateway thinks it holds)
+
+`ign --profile azure-win --json tags provider list ` @ 2026-10-15T02:45:44Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "providers": [
+      {
+        "name": "CAP22H",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": false
+      },
+      {
+        "name": "System",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": true
+      },
+      {
+        "name": "default",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": false
+      }
+    ]
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### ign tags provider delete CAP22H --yes
+
+`ign --profile azure-win --json --yes tags provider delete CAP22H ` @ 2026-10-15T02:45:44Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "deleted": "CAP22H"
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### sftp listing after the provider delete (is the directory gone?)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:45:49Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/System
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/default
+[stderr]
+[exit 0]
+~~~
+
+#### cmd.exe side after the delete: CAP22H still there?
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-definition\"\ \|\ findstr\ /i\ CAP22H ` @ 2026-10-15T02:45:51Z
+
+~~~
+[stdout]
+[stderr]
+[exit 1]
+~~~
+
+
+
+## C5-NTFS — on-disk names the 8.3.6 gateway writes on NTFS for hostile tag folder names (deferred here by 21-CONTEXT D-04)
+
+Provider `CAP22H` is created on the capture gateway `azure-win`, nine folders are imported one by one through the gateway's NATIVE route `POST /data/api/v1/tags/import?provider=CAP22H&type=json&collisionPolicy=Abort` (via `ign api call`; this host has no WebDev module, so `ign tags import`, which rides the WebDev routes, cannot be used here, see attempt 1 above), the asynchronous flush is given 20 s, the provider's tag directories are listed over sftp as `svc-ignition-deploy` and from the cmd.exe side, the gateway log is read, and the provider is deleted. Render stays fail-closed on Windows-illegal names whatever this shows.
+
+`<H>` stands for exactly these ssh/sftp options, in this order (the `hardened_options` set with an identity): `-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.cache/ign-wflwvm01/known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR `
+
+#### ign webdev status (is the WebDev module and the ign-cli bundle there?)
+
+`ign --profile azure-win --json webdev status ` @ 2026-10-15T02:48:28Z
+
+~~~
+[stdout]
+[stderr]
+{
+  "ok": false,
+  "profile": "azure-win",
+  "error": {
+    "code": "not_found",
+    "message": "resource not found on the gateway",
+    "endpoint": "http://40.114.71.134:8088/system/webdev/ign-cli/cli/tags",
+    "hint": "check the id/path; a 404 JSON 'No route match' body can also mean a pre-8.3 gateway"
+  }
+}
+[exit 6]
+~~~
+
+#### ign tags provider create CAP22H
+
+`ign --profile azure-win --json tags provider create CAP22H ` @ 2026-10-15T02:48:28Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "name": "CAP22H"
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'plain' (5 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"plain\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:28Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'CON' (3 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"CON\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:29Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'aux' (3 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"aux\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:29Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'NUL' (3 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"NUL\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:29Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'trail ' (6 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"trail\ \"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:29Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'trail.' (6 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"trail.\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:30Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'a:b' (3 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"a:b\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:30Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'LLLLLLLLLLLLLLLLLLLLLLLL' (200 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:30Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### native tags/import: folder named 'lpt1' (4 chars)
+
+`ign --profile azure-win --json api call --method POST --path /data/api/v1/tags/import --query provider=CAP22H --query type=json --query collisionPolicy=Abort --header Content-Type:\ application/octet-stream --data \{\"tags\":\[\{\"name\":\"lpt1\"\,\"tagType\":\"Folder\"\,\"tags\":\[\{\"name\":\"T1\"\,\"tagType\":\"AtomicTag\"\,\"dataType\":\"Int4\"\,\"valueSource\":\"memory\"\,\"value\":1\}\]\}\]\} ` @ 2026-10-15T02:48:31Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "POST",
+    "path": "/data/api/v1/tags/import",
+    "result": {
+      "status": 200,
+      "data": {"successCount":0,"failureCount":0,"failures":[]}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+Waiting 20 s for the gateway to flush the tag files (the flush is asynchronous, Phase 21 CD4).
+
+#### sftp listing of the provider tag directory (ls -1)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:48:51Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/%43%4f%4e
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/%4e%55%4c
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/%61%75%78
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/%6c%70%74%31
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/a%3ab
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/plain
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/trail%20
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/trail%2E
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H/unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### sftp listing of the provider tag directory (ls -la)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:48:53Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/CAP22H"
+[stdout]
+drwx******    1 -        -               0 Oct 15 02:48 %43%4f%4e
+drwx******    1 -        -               0 Oct 15 02:48 %4e%55%4c
+drwx******    1 -        -               0 Oct 15 02:48 %61%75%78
+drwx******    1 -        -               0 Oct 15 02:48 %6c%70%74%31
+drwx******    1 -        -               0 Oct 15 02:48 a%3ab
+drwx******    1 -        -               0 Oct 15 02:48 plain
+drwx******    1 -        -               0 Oct 15 02:48 trail%20
+drwx******    1 -        -               0 Oct 15 02:48 trail%2E
+-rw-******    1 -        -             135 Oct 15 02:48 unary-resource.json
+[stderr]
+[exit 0]
+~~~
+
+#### cmd.exe side: dir /x (8.3 names) of the provider directory and the folders inside it
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /x\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-definition\\CAP22H\"\ \&\ dir\ /b\ /s\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-definition\\CAP22H\" ` @ 2026-10-15T02:48:55Z
+
+~~~
+[stdout]
+ Volume in drive C is Windows
+ Volume Serial Number is 6AEF-F68E
+
+ Directory of C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H
+
+10/15/2026  02:48 AM    <DIR>                       .
+10/15/2026  02:48 AM    <DIR>                       ..
+10/15/2026  02:48 AM    <DIR>          %43%4F~1     %43%4f%4e
+10/15/2026  02:48 AM    <DIR>          %4E%55~1     %4e%55%4c
+10/15/2026  02:48 AM    <DIR>          %61%75~1     %61%75%78
+10/15/2026  02:48 AM    <DIR>          %6C%70~1     %6c%70%74%31
+10/15/2026  02:48 AM    <DIR>                       a%3ab
+10/15/2026  02:48 AM    <DIR>          LLLLLL~1     LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
+10/15/2026  02:48 AM    <DIR>                       plain
+10/15/2026  02:48 AM    <DIR>                       trail%20
+10/15/2026  02:48 AM    <DIR>                       trail%2E
+10/15/2026  02:48 AM               135 UNARY-~1.JSO unary-resource.json
+               1 File(s)            135 bytes
+              11 Dir(s)  116,335,632,384 bytes free
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%43%4f%4e
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%4e%55%4c
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%61%75%78
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%6c%70%74%31
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\a%3ab
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\plain
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\trail%20
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\trail%2E
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%43%4f%4e\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%43%4f%4e\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%4e%55%4c\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%4e%55%4c\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%61%75%78\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%61%75%78\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%6c%70%74%31\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\%6c%70%74%31\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\a%3ab\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\a%3ab\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\plain\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\plain\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\trail%20\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\trail%20\unary-resource.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\trail%2E\tags.json
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\core\ignition\tag-definition\CAP22H\trail%2E\unary-resource.json
+[45 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### PowerShell side: every entry under the provider directory with its name length and a hex dump of the first 24 characters of the name
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIA...\[1286\ chars\] ` @ 2026-10-15T02:48:56Z
+
+~~~
+[script]
+$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Get-ChildItem -LiteralPath (Join-Path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources' 'core\ignition\tag-definition\CAP22H') -Recurse -Force | ForEach-Object { $n=$_.Name; $h=($n.Substring(0,[Math]::Min(24,$n.Length)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' '; ('{0} chars [{1}] {2}' -f $n.Length,$h,$n.Substring(0,[Math]::Min(24,$n.Length))) }
+[stdout]
+9 chars [0025 0034 0033 0025 0034 0066 0025 0034 0065] %43%4f%4e
+9 chars [0025 0034 0065 0025 0035 0035 0025 0034 0063] %4e%55%4c
+9 chars [0025 0036 0031 0025 0037 0035 0025 0037 0038] %61%75%78
+12 chars [0025 0036 0063 0025 0037 0030 0025 0037 0034 0025 0033 0031] %6c%70%74%31
+5 chars [0061 0025 0033 0061 0062] a%3ab
+200 chars [004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C 004C] LLLLLLLLLLLLLLLLLLLLLLLL
+5 chars [0070 006C 0061 0069 006E] plain
+8 chars [0074 0072 0061 0069 006C 0025 0032 0030] trail%20
+8 chars [0074 0072 0061 0069 006C 0025 0032 0045] trail%2E
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+9 chars [0074 0061 0067 0073 002E 006A 0073 006F 006E] tags.json
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+9 chars [0074 0061 0067 0073 002E 006A 0073 006F 006E] tags.json
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+9 chars [0074 0061 0067 0073 002E 006A 0073 006F 006E] tags.json
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+9 chars [0074 0061 0067 0073 002E 006A 0073 006F 006E] tags.json
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+9 chars [0074 0061 0067 0073 002E 006A 0073 006F 006E] tags.json
+19 chars [0075 006E 0061 0072 0079 002D 0072 0065 0073 006F 0075 0072 0063 0065 002E 006A 0073 006F 006E] unary-resource.json
+[20 CR bytes removed from stdout]
+[stderr]
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Get-ChildItem : Could not find a part of the path 'C:\Program Files\Inductive Automation\Ignition\data\config\resources_x000D__x000A_</S><S S="Error">\core\ignition\tag-definition\CAP22H\LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL_x000D__x000A_</S><S S="Error">LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL'_x000D__x000A_</S><S S="Error">._x000D__x000A_</S><S S="Error">At line:1 char:72_x000D__x000A_</S><S S="Error">+ ... nce='Stop'; Get-ChildItem -LiteralPath (Join-Path 'C:\Program Files\I ..._x000D__x000A_</S><S S="Error">+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S="Error">    + CategoryInfo          : ReadError: (C:\Program File...LLLLLLLLLLLLLLL:String) [Get-ChildItem], DirectoryNotFound _x000D__x000A_</S><S S="Error">   Exception_x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : DirIOError,Microsoft.PowerShell.Commands.GetChildItemCommand_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>
+[stderr did not end with a newline]
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+#### gateway log, WARN and above in the last 4 minutes (timestamp, logger, level, message only; stacks and mdc dropped by jq)
+
+`bash -c \"\$1\"\ --profile\ \"\$2\"\ --json\ logs\ --min-level\ warn\ --since\ 4min\ --limit\ 200\ \|\ jq\ -c\ \".data.items\[\]\ \|\ \{timestamp\,\ loggerName\,\ level\,\ message\}\" _ ign azure-win ` @ 2026-10-15T02:48:58Z
+
+~~~
+[stdout]
+{"timestamp":1792032512526,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032512526,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032512236,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032512235,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511922,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511922,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511438,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511438,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511438,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511438,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032511340,"loggerName":"tags.management.provider","level":"ERROR","message":"Error processing edit for tag path '[CAP22H]trail.': Error_Configuration(\"The name 'trail.' is not a valid tag name\")"}
+{"timestamp":1792032510844,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510844,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510844,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510844,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510509,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510508,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510213,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032510213,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509793,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509755,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509714,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509711,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509711,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509688,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509688,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032509663,"loggerName":"com.inductiveautomation.ignition.gateway.tags.ep.StandardTagProviderExtensionPoint","level":"ERROR","message":"valuePersistence not found in Tag Provider: 'CAP22H' profile, defaulting to Database"}
+{"timestamp":1792032509650,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489655,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489654,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489638,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489637,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489634,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489634,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489634,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032489616,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032460428,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032460084,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032459806,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032459515,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032459274,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032458995,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032458742,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032458471,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032458213,"loggerName":"tags.management.provider","level":"ERROR","message":"Error importing tags"}
+{"timestamp":1792032458067,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032458027,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032457980,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032457973,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032457973,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032457944,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032457944,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032457917,"loggerName":"com.inductiveautomation.ignition.gateway.tags.ep.StandardTagProviderExtensionPoint","level":"ERROR","message":"valuePersistence not found in Tag Provider: 'CAP22H' profile, defaulting to Database"}
+{"timestamp":1792032457908,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345810,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345810,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345804,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345804,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345800,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345800,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345800,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032345766,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313472,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313430,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313377,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313374,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313373,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313350,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313350,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032313323,"loggerName":"com.inductiveautomation.ignition.gateway.tags.ep.StandardTagProviderExtensionPoint","level":"ERROR","message":"valuePersistence not found in Tag Provider: 'CAP22H' profile, defaulting to Database"}
+{"timestamp":1792032313287,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032312282,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+{"timestamp":1792032312282,"loggerName":"AuditManager","level":"ERROR","message":"Error getting gateway audit profile 'WIGNVM01_Audit'"}
+[stderr]
+[exit 0]
+~~~
+
+#### ign tags provider list (what the gateway thinks it holds)
+
+`ign --profile azure-win --json tags provider list ` @ 2026-10-15T02:48:58Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "providers": [
+      {
+        "name": "CAP22H",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": false
+      },
+      {
+        "name": "System",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": true
+      },
+      {
+        "name": "default",
+        "enabled": true,
+        "tag_count": null,
+        "health": null,
+        "managed": false
+      }
+    ]
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### ign tags provider delete CAP22H --yes
+
+`ign --profile azure-win --json --yes tags provider delete CAP22H ` @ 2026-10-15T02:48:59Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "deleted": "CAP22H"
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+#### sftp listing after the provider delete (is the directory gone?)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T02:49:04Z
+
+~~~
+[stdin]
+@ls -1 "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition"
+[stdout]
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/System
+/C:/Program Files/Inductive Automation/Ignition/data/config/resources/core/ignition/tag-definition/default
+[stderr]
+[exit 0]
+~~~
+
+#### cmd.exe side after the delete: CAP22H still there?
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 dir\ /b\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\core\\ignition\\tag-definition\"\ \|\ findstr\ /i\ CAP22H ` @ 2026-10-15T02:49:07Z
+
+~~~
+[stdout]
+[stderr]
+[exit 1]
+~~~
+
 ## Decisions
 
 Written after `capture22.sh cv1`, `cv2` and `cv3` ran to completion against the rig above. Every decision cites the blocks it rests on. Two points where a capture contradicts 22-RESEARCH are marked CONTRADICTS. 22-10 follows these decisions; nothing below is taken from research or inference.
@@ -2782,3 +7443,149 @@ Rests on `CV3`, blocks "sha256 of the rendered files", "sha256 of the same files
 - The four files of the tracer render (`database-translator/POSTGRES/{config,resource}.json`, `general-alarm-settings/{config,resource}.json`), written by `cp -R` into `production/`, have the same sha256 in the render directory, right after the scan, and at every 5 s step up to 30 s after it (`3ce93dcc...`, `81f9e836...`, `ce86cc6f...`, `736c80f4...`). `cmp` reports all four identical.
 - Decision for 22-10 check `files` and for Phase 23: after a scan the effective files on disk equal the rendered bytes; `files` can compare sha256 of the post-scan bytes to the rendered sha256 and treat any difference as a finding. The Phase 21 CD2 result (omitted and stale `lastModificationSignature` not rewritten) points the same way and is consistent with this capture.
 - Limits: four signature-bearing files from one render, one scan, 30 s. Tag files (the gateway writes those itself and flushes them asynchronously, Phase 21 CD4) and gateway-created resources are not covered; this rig had no hand-written tag files.
+
+## Decisions: Windows OpenSSH host (22-12)
+
+Written after `capture22w.sh c7a`, `c6` and `c5ntfs` ran to completion against the Azure VM `ign-win-836` (stand-in for WFLWVM01, 22-CONTEXT amendment of 2026-10-14): Windows Server 2022 build 10.0.20348.5761, `OpenSSH_for_Windows_8.1` (sshd banner), PowerShell 5.1.20348.5756, default shell `cmd.exe`, Ignition 8.3.6 (b2026042713), account `svc-ignition-deploy` (member of Users only). Every decision names the blocks it rests on by their titles in `## C7a`, `## C6` and `## C5-NTFS`. The host key was pinned from the `az vm run-command` fingerprint and re-checked by `ssh-keyscan` before any capture (SHA256:wgjZzSMU/Ss+bnO8SgMfOY90cnutJvlAuxSGNPJNkZo, ED25519). Verdicts on 22-RESEARCH assumptions: A4 CONFIRMED (with a correction), A5 CONFIRMED, A12 PARTLY CONTRADICTED, A16 CONFIRMED.
+
+### C7a-1 — sftp path form (research A4)
+
+Rests on C7a-1 blocks "ls -1 with the path form: ...", "get -R with the path form: ...", "put with the ... path form", "rename, ..." and "pwd and a listing of the login directory".
+
+- **Use `/C:/Program Files/...`.** The server's home is `/C:/Users/svc-ignition-deploy` (`pwd`). `ls -1`, `get -R`, `put` and `rename` all work with the `/C:/...` form, with a trailing slash, with a lowercase path (`/c:/program files/...`, case-insensitive, echoed back as given) and with the drive-less form `/Program Files/...` (same files).
+- **`C:/...` without the leading slash is a RELATIVE path**, resolved against the home: `Can't ls: "/C:/Users/svc-ignition-deploy/C:/Program Files/..." not found`. The same for `C:\...`. `/C:\Program Files\...` (backslashes after the drive) is not found either (stderr shows the backslashes doubled). So `windows_sftp_root` must produce `/` + drive letter + `:` + forward-slash path; a backslash path is never sent. (safe_remote_path already refuses backslashes; keep it.)
+- A RELATIVE path with backslashes (`ign-c7a\put-bs.txt`, `ign-c7a\d\r1-moved.txt`) is accepted as separators by `put` and `rename`. This is a tolerance, not a form to rely on.
+- Paths are resolved against the home, so relative names (`ign-deploy/...`) are home-relative. `ls -1 "/"` lists only `/C:`; `ls -1 "/C:/"` lists the drive root.
+- `ls -1 <dir>` prefixes every entry with the directory exactly as the caller wrote it, joined by one `/` (a trailing slash on the input does not double it). `ls -1 <file>` prints the path as given. So A5 is CONFIRMED and `parse_ls_listing` strips the given prefix, never a resolved one.
+
+### C7a-2 — listing format (research A5)
+
+Rests on C7a-2 blocks "ls -1 of the spaces-and-comma directory", "ls -l ...", "ls -la ...", "ls -l of a single file", "ls -1 of an empty directory", "ls -la of an empty directory", the two UTF-8-locale blocks, and "ls -l of the real collection root" / "ls -la of the real collection root".
+
+- `ls -1 dir`: one `<dir-as-given>/<name>` per line. No `.` or `..` entries in `-1`, `-l` or `-la`. An empty directory prints nothing (exit 0).
+- `ls -l dir`: `<10-char mode> <nlink> <owner> <group> <size> <Mon DD HH:MM> <name>`, for example `-rw-******    1 -        -               6 Oct 15 02:27 f one.txt` and `drwx******    1 -        -               0 Oct 15 02:27 sub dir`. The mode shows the type character and `******` for the permission bits it cannot know; owner and group are `-`; the time is the server clock (UTC on this host), `HH:MM`, no year; the size of a directory is not its contents (`0`, `4096` and `262144` were observed).
+- `ls -l <single file>` has a DIFFERENT shape: `-rw-------    ? 0        0               6 Oct 14 20:27 <full path as given>` (link count `?`, uid and gid `0`, the time shown 6 hours behind the server clock, which is this client's zone, sometimes with a year in place of `HH:MM`). The listing parser must only accept the directory form and must never `ls -l` a single file for metadata.
+- `ls -la` is `ls -l` plus the entries that are hidden or dot-named: the collection root shows `.resources` (a 262144-byte gateway directory) only under `-la`. The read transport already lists with `LsLongAll`, which is therefore the form that sees everything; `-1` and `-l` hide it.
+- Names with spaces (`f one.txt`, `sub dir`), commas (`f,two.txt`, `dir with space, comma`) list and transfer intact. A non-ASCII name (`café.txt`) lists raw when the sftp CLIENT runs in a UTF-8 locale and as `caf\303\251.txt` (the client's own escaping) when the client runs with `LC_ALL=C`. **Consequence for 22-06/22-13:** the process runner must set a UTF-8 locale for `sftp`, or the parser must treat a `\ooo` octal-escaped name as an error; it must not silently accept an escaped name as the real one. `get -R` in a UTF-8 locale writes `café.txt` locally with the right bytes (sha256 `ebc45fab...`).
+- `cmd.exe`'s `dir` writes non-UTF-8 bytes (the OEM code page 437: `caf\x82.txt`), see C7a-6.
+
+### C7a-3 — error signalling (stdout/stderr and exit codes of `sftp -q -b -`)
+
+Rests on C7a-3 blocks "not found: ...", "permission denied: ...", "mkdir of an existing directory", "rmdir of a non-empty directory", "sftp exit code with a failing command in the MIDDLE of a batch" and "sftp batch whose commands all succeed".
+
+- A batch whose commands all succeed exits 0. A batch with a failing command stops at it, exits **1**, and the later commands do not run (the middle-failure block printed only the first listing). Every failure kind exits 1; the class is only in stderr. stderr lines end in CRLF.
+- Texts (path in the message is the RESOLVED absolute path, `/C:/...`):
+  - `ls`: `Can't ls: "<abs>" not found`
+  - `get` and `get -R`: `File "<abs>" not found.`
+  - `rm`: `remote delete <abs>: No such file or directory`; `rmdir`: `remote rmdir "<abs>": No such file or directory`; `rename`: `remote rename "<from>" to "<to>": No such file or directory` (source missing, or the target's parent missing)
+  - `mkdir` of an existing directory and `rmdir` of a non-empty directory: `remote mkdir|rmdir "<abs>": Failure` (no reason given)
+  - write denied: `put`: `dest open "<abs>": Permission denied`; `mkdir`: `remote mkdir "<abs>": Permission denied`; `rename` into a directory without write: `remote rename "<from>" to "<to>": Permission denied`
+  - reading `C:\Windows\System32\config` (no read ACE): `remote readdir("<abs>/"): Bad message`
+  - **A read the ACL denies on a file that exists reports NOT FOUND**, not permission denied (`get` of `C:/ProgramData/ssh/logs/sshd.log` and of `C:/Windows/System32/config/SAM` both print `File "..." not found.`), while `ls -l` of `C:/ProgramData/ssh/ssh_host_ed25519_key` shows the file (metadata is readable, content is not). **Consequence:** `not found` on a path the listing just returned means unreadable, not absent. The transport classifies by stderr text into: not_found, permission_denied, failure; and a read of a name the listing returned that answers not-found is `transport_failed` (denied or removed since), never "absent".
+- Nothing was created in the resources root by the denied writes (the follow-up `dir | findstr` found no `zz-c7a` entry, `findstr` exit 1 = no match).
+
+### C7a-4 — rename over an existing target (decides the commit sequence)
+
+Rests on C7a-4 blocks (all of them), plus C6-2 "cross-directory rename ...".
+
+- **File over an existing file: replaces it, atomically from the caller's view, and repeats.** `rename src dst` with both present exits 0; `dst` then holds the source content (alpha); a second rename over the same target also works (charlie). The Windows server evidently uses a replace-existing move, so the write half does NOT need remove-then-rename for files. (`.NET` `File.Move` and `Rename-Item` refuse an existing target; `Move-Item -Force` and `File.Replace(src, dst, [NullString]::Value)` replace it; see C7a-6.)
+- **Directory over an existing EMPTY directory: succeeds** and the source's contents end up inside the target (`od-dst-empty\in-src.txt`).
+- **Directory over an existing NON-EMPTY directory: fails** with `remote rename ... : Failure`; both directories stay intact. **File over an existing directory: fails** the same way. Consequence: a commit that swaps a unit directory must rename the old one aside (or delete it) first, or work per file; PowerShell `Rename-Item` aside then rename in worked (C7a-6, block "Directory swap").
+- **Rename onto itself DELETES the file.** `rename "ign-c7a/self.txt" "ign-c7a/self.txt"` answered `No such file or directory`, exit 1, and the file was gone afterwards (sftp `ls -l` not found; `dir` File Not Found). **The write half must never issue a rename whose source and target resolve to the same path** (compare after normalisation, case-insensitively). This is a data-loss hazard on this server.
+- **A target held open for read with FileShare.None: the rename fails** (`remote rename ... : Failure`, sftp exit 1) and nothing is lost (source and target both remain, target content unchanged). A scanner (Defender, backup agent) holding a handle on a destination file can produce the same refusal; the commit needs a bounded retry on `Failure`, then a classified error.
+- Cross-directory rename inside the home works (`rename ign-c7a/r1-mixed.txt ign-c7a/d/r1-moved.txt`); the home (`C:\Users\...`) and the data dir (`C:\Program Files\...`) are on the same volume `C:` (C6 block "is the data dir and the home on the same volume"), so a home-to-collection rename would be a same-volume move IF permitted (it is not, C6-2).
+
+### C7a-5 — junctions and links
+
+Rests on C7a-5 blocks.
+
+- `mklink /J` works unprivileged; `mklink /D` (directory symlink) is refused for the account: `You do not have sufficient privilege to perform this operation.`
+- sftp shows a junction as a plain directory (`drwx******`, no link marker). `ls -l junc/` lists the target's files and `get junc/r.txt` returns them.
+- **`get -R` follows junctions.** A tree with `jx/real/r.txt` and a junction `jx/junc -> real` was copied as TWO copies of `r.txt` (same sha256). With a junction pointing at its own parent (`jx/loop -> jx`), `get -R` recursed until the server's path limit and ended with several `remote readdir(...)` errors and exit 1, leaving 218 local entries (deepest local path 224 characters). It terminates (the 260 limit stops it) but it is wasteful and the client cannot tell a junction from a directory.
+- **Consequence:** the Windows read transport cannot rely on the client's symlink skip. Before trusting a `get -R` tree, the transport must refuse a tree that holds a reparse point. The reparse check belongs in the one PowerShell call that already lists the tree (C7a-8): `Attributes -band ReparsePoint` per entry; an entry that is one is `transport_failed`, not followed. Removing a junction with `rmdir` removes only the link (the target's file stayed).
+
+### C7a-6 — default shell, PowerShell exit codes and CLIXML (research A12)
+
+Rests on C7a-host blocks "default shell: COMSPEC ...", "PowerShell version on the host" and all C7a-6 blocks.
+
+- Default shell is **cmd.exe** (`COMSPEC=C:\Windows\system32\cmd.exe`; the registry value `HKLM\SOFTWARE\OpenSSH\DefaultShell` does not exist). `ssh -T host <cmd>` runs through `cmd.exe /c`. Exit codes propagate: `cmd /c exit 5` gives 5; an unknown command gives 1 with cmd's `'x' is not recognized ...` on stderr.
+- `powershell -NoProfile -NonInteractive -EncodedCommand <b64>`: the process exit code propagates (`exit 7` gives 7; `throw` gives 1; a terminating cmdlet error gives 1). The encoded form survives cmd.exe with no quoting problem.
+- **The prelude changes what a non-terminating error does.** Bare, `Write-Error 'e1'; 'after'` exits **0** and prints `after`; with `$ErrorActionPreference='Stop'` it exits **1** and prints nothing. So the prelude is required for correctness, not only for output: without it a failed step looks like success.
+- **CLIXML on stderr: A12 is PARTLY CONTRADICTED.** Whenever stderr is not a console, error records are serialized as `#< CLIXML` + `<Objs ...><S S="Error">...` XML on stderr, WITH the prelude too (`throw`, `Get-Item` of a missing path, `Write-Error` with the prelude all print CLIXML and exit 1). What the prelude removes is the PROGRESS CLIXML: `Write-Progress -Activity a ...` bare prints a progress `<Objs>` record on stderr (also the module-load record `Preparing modules for first use.` on first calls, seen even for `Get-Item` and `Write-Error` bare), with `$ProgressPreference='SilentlyContinue'` it prints nothing (exit 0). `[Console]::Error.WriteLine('to-stderr')` arrives as plain text. **Consequence:** the parser must treat stderr as opaque on a non-zero exit (scrub, then show a bounded tail), decode CLIXML `<S S="Error">` text only for display, and decide success from the exit code and the stdout sentinel (`IGN-RESULT {"ok":true}` arrived intact on stdout, CRLF-terminated), never from stderr being empty.
+- **PowerShell stdout is the OEM code page (437), not UTF-8**: `'café ü ñ'` came back as bytes `caf\x82 \x81 \xA4`. 22-13's `WinScript` must keep script output ASCII (JSON with `\uXXXX` escapes) or set `[Console]::OutputEncoding` in the prelude; it must not assume UTF-8.
+- Fallbacks for the file-replace and directory-swap steps, as PowerShell 5.1 runs them: `Rename-Item` and `[IO.File]::Move` onto an existing name fail (`Cannot create a file when that file already exists.`); `Move-Item -Force` replaces; `[IO.File]::Replace(src, dst, [NullString]::Value)` replaces (a plain `$null` backup path is `The path is not of a legal form`); renaming a directory aside and then renaming the new one into its place works.
+
+### C7a-7 — command length budget
+
+Rests on C7a-7 block "command-length ladder".
+
+- The whole remote command string (`powershell -NoProfile -NonInteractive -EncodedCommand <b64>`) works at **8154** characters (script `LEN=2926` plus the prelude) and fails at **8162** with exit 1 and `The command line is too long.` (cmd.exe's 8191-character limit less its own wrapper). Every longer length up to 32702 fails the same way; from **32760** characters the ssh client itself fails: `exec request failed on channel 0`, exit **255**.
+- UTF-16LE plus base64 expands a script 2.67 times, so the practical ceiling is a script of about **2900 characters** for a command of 8000. **Budget for 22-13: keep each `-EncodedCommand` command at or under 8000 characters (about 2900 script characters, prelude included), and treat exit 1 with `The command line is too long.` as `transport_failed` with that reason.** A larger script must be split into steps or fed some other way (the host has no `powershell -File` path that avoids an upload and execution-policy handling; decide in 22-13 whether a staged `.ps1` is acceptable).
+
+### C7a-8 — sftp-server paths over 260 characters (silent truncation)
+
+Rests on C7a-8 blocks, and on C5-NTFS blocks "sftp listing of the provider tag directory" and "PowerShell side".
+
+- The server resolves no path of 260 characters or more. Absolute `ls` of a 217-character directory succeeds (and lists nothing, see the next bullet); `ls` of a 276-character directory answers `Can't ls: ... not found`; `mkdir` of a path that would exceed the limit fails (`remote mkdir "<abs>": No such file or directory`, the batch stops there); `get` of a file at 330+ characters answers `File ... not found.`
+- **A directory that holds an entry whose full path would exceed the limit lists WITHOUT that entry, with exit 0 and no message.** Level 3 of the deep tree (217 chars) lists as empty although it holds a child; `get -R` of the whole tree retrieved levels 1 to 3, exited 0, and left a tree one level short (local find: levels at 63, 122 and 181 characters, nothing deeper) while PowerShell with the `\\?\` prefix showed six levels and the file (406 characters). The gateway itself wrote such a path (C5-NTFS: the 200-character tag folder, 335-character full path): `dir` and `dir /s` on cmd.exe show it, PowerShell without `\\?\` fails on it, and the sftp listing of the same directory simply does not contain it.
+- **Consequence (must be addressed in 22-13, it is a correctness risk for plan, pull and verify):** an sftp listing on this host is NOT proof of completeness. The Windows read transport must cross-check the sftp tree against an independent complete enumeration: one PowerShell call that walks the resources subtree with the `\\?\` prefix and returns relative path, size and the reparse-point flag per entry (this also covers the junction check in C7a-5). Any entry in the enumeration that sftp did not return, or whose absolute path is 240 characters or more, is `transport_failed` naming the path; an sftp read must never be reported complete without that cross-check. The enumeration output must fit the command and output budget (C7a-7), so it is paged per top-level type directory.
+
+### C7a-host — group membership, host keys and the account (D-15)
+
+Rests on C7a-host blocks "the account groups (whoami /groups)", "the account privileges (whoami /priv)", "is the account an administrator? (net localgroup Administrators)", "host key types offered", "host key types the server offers in KEX".
+
+- The account is in `BUILTIN\Users` (and the well-known groups `Everyone`, `NETWORK`, `Authenticated Users`, `This Organization`, `Local account`, `NTLM Authentication`) at Medium integrity; privileges: only `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege`. `net localgroup Administrators` lists only `ignadmin`. The account is NOT an administrator, so the `administrators_authorized_keys` rule does not apply; its key authenticated on every run (the location of the key file was not read).
+- Host keys offered: ED25519 (SHA256:wgjZzSMU/Ss+bnO8SgMfOY90cnutJvlAuxSGNPJNkZo), ECDSA nistp256 (SHA256:CfSLIMXEfRsxKLydfjt7/I6skou0EBb0a4tBGBYs6D0), RSA 3072 (SHA256:JFUQNah6KkrSZEA1I/BonrLJ6MVu4mTWENEgbEBgoYc); the KEX debug shows the server's host key algorithms as `rsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-sha2-nistp256,ssh-ed25519`. A `known_hosts` that pins only the ed25519 key is enough: with `StrictHostKeyChecking=yes` the client asked for and verified `ssh-ed25519` on every run. The committed `known_hosts` may hold one line per type; one ed25519 line is sufficient.
+- sshd banner: `SSH-2.0-OpenSSH_for_Windows_8.1`.
+- The Windows-client `ssh.exe` stdin item is NOT applicable to this macOS runner (recorded in the section prose); it stays with the windows-latest CI leg.
+
+### C6 — what `svc-ignition-deploy` can write and read (Decision B inputs; research A16)
+
+Rests on `## C6`: blocks under C6-acl, C6-1, C6-2, C6-3, C6-4, C6-scan-before/after and C6-cleanup. The account was provisioned (per the task) with read-and-execute on `data\config\resources` and no write access anywhere under the data dir; C6 measures what that is.
+
+| Question | Answer | Evidence |
+| --- | --- | --- |
+| Create and write a home-relative staging directory (`ign-deploy/`) | **YES.** `mkdir`, `put`, `rename` inside it, `ls -l`, `rm`, `rmdir` all worked, by relative and by `/C:/Users/...` absolute path; the account has Full control on its home (`icacls`: `svc-ignition-deploy:(OI)(CI)(F)`) | C6-1 blocks, "icacls the account home" |
+| Write directly into `<data_dir>\config\resources\production\` | **NO.** `mkdir zz-c6-probe`, `put` of a file straight into it, and a cross-directory `rename` of a staged FILE and of a staged DIRECTORY into it all answer `Permission denied`. `production` holds only `config-mode.json` (133 bytes) | C6-2 blocks; ACL: `svc-ignition-deploy:(I)(OI)(CI)(RX)` inherited from `resources`, `BUILTIN\Users:(I)(RX)`, no write ACE |
+| Write `<data_dir>\ign-deploy\` | **NO.** `mkdir` is `Permission denied` for `data\ign-deploy`, `data\config\ign-deploy` and an arbitrary name under `data`; `data\ign-deploy` does not exist (`icacls` cannot find it). Nor can the resources root or a new collection directory be created (`Permission denied`) | C6-3 blocks, C6-2 "the same probes against the collection root" and "mkdir the collection directory" |
+| Read `core\` and `production\` (research A16) | **YES.** `ls -1` of `core`, `core\ignition`, `production`, `tag-definition`; `get -R` of `core\ignition\security-properties` (2 files, sha256 `7321dabb...`, `bc15af88...`) and of `production`; the effective-view basis is readable, A16 is CONFIRMED | C6-4 blocks |
+| Is a staging directory ever read as a collection | Home-relative: **no**. The gateway reads the collections under `data\config\resources\` (here `core`, `external`, `local`, `production`); the home directory is outside `data\`. The scan state was identical before and after the probes (`lastScanTimestamp 1792030196522`, `lastScanDuration 639`, `scanActive false`), and no probe wrote anything inside a collection | C6-scan-before, C6-scan-after |
+| Same volume | Home `C:\Users\svc-ignition-deploy` and data dir `C:\Program Files\...` are both on `C:` | "is the data dir and the home on the same volume" |
+
+Everything created was removed in the same session (C6-cleanup blocks; `production` listed `config-mode.json` only afterwards).
+
+**What C6 does NOT yet settle, and the user must see:** as provisioned, the account cannot write the mode collection. Both options commit into `data\config\resources\<mode>\` (B(i) by renaming from the home, B(ii) by writing in place), and design-spec section 9 scopes the account to write exactly that directory. So an administrator must grant `Modify` on `data\config\resources\production\` (and on every mode collection a node uses) before ANY write flow can be exercised against this host; that grant is outside this plan and was not made. B(ii) additionally needs `data\ign-deploy\` (or another ledger directory) created and granted, which the ROADMAP rule's option text did not anticipate.
+
+### C5-NTFS — on-disk names the 8.3.6 gateway writes on NTFS (deferred by 21-CONTEXT D-04)
+
+Rests on `## C5-NTFS` (the native `tags/import` run) and attempt 1. The host has NO WebDev module, so `ign tags import` (WebDev routes) answered 404 (attempt 1, nothing captured); the capture used the gateway's native `POST /data/api/v1/tags/import?provider=CAP22H&type=json&collisionPolicy=Abort` with a `{"tags":[...]}` body (the first native try sent a bare array and the gateway answered `Not a JSON Object`; that run's blocks were replaced by the correct run, and its nine `Error importing tags` log entries, timestamps 1792032458213 to 1792032460428, still show in the log block). Imported one folder at a time into provider `CAP22H`, waited 20 s, listed over sftp, cmd.exe and PowerShell, then deleted the provider (the directory is gone afterwards).
+
+| Folder name sent | On-disk directory name | Log verdict |
+| --- | --- | --- |
+| `plain` | `plain` | none |
+| `CON` | `%43%4f%4e` (every byte percent-encoded, lowercase hex) | none |
+| `aux` | `%61%75%78` | none |
+| `NUL` | `%4e%55%4c` | none |
+| `lpt1` | `%6c%70%74%31` | none |
+| `trail ` (trailing space) | `trail%20` | none |
+| `trail.` (trailing dot) | `trail%2E` (directory with `tags.json` and `unary-resource.json` exists) | `ERROR tags.management.provider: Error processing edit for tag path '[CAP22H]trail.': Error_Configuration("The name 'trail.' is not a valid tag name")` |
+| `a:b` | `a%3ab` (same as the Linux rig, CD6) | none |
+| 200 × `L` | `LLLL...` (200 characters, raw; full path 335 characters) | none; sftp listing OMITS it (C7a-8), PowerShell without `\\?\` cannot open it, cmd.exe `dir` lists it with the 8.3 name `LLLLLL~1` |
+
+- The import answered `successCount 0, failureCount 0, failures []` for all nine, including `trail.`, whose refusal shows only in the gateway log. Directories for `CON`, `aux`, `NUL`, `lpt1` exist and were created by the gateway: it percent-encodes the Windows reserved device names (the whole name, not just one character), a trailing space and a trailing dot, and the colon. A gateway-written tag directory name on NTFS therefore never contains `< > : " | ? *`, never ends in a space or dot, and is never a reserved device name; it can be 200 characters.
+- Difference from Phase 21 CD6 (Linux rig, WebDev import): there `trail.` produced no directory; here, via the native route, `trail%2E` exists even though the log calls the name invalid. Not resolved here; whichever route wrote it, `pull` must treat a directory name it finds on disk as data (percent-decoding is the layout inverse, 22-08) and `plan` already ignores nothing by name.
+- **Render stays fail-closed on Windows-illegal names** (21-CONTEXT D-04): this capture does not relax it. A repo name that equals one of the gateway's encoded forms is the encoded form, not the original.
+- Reserved-name handling matters for the TRANSPORT: `%43%4f%4e` is an ordinary name for sftp and cmd.exe, so encoded names need no special case in 22-13; a RAW `CON` can never be created by this account (not attempted).
+- Entries whose total path exceeds 259 characters exist on disk and are invisible to the sftp read path (C7a-8). A tag tree with a long folder name therefore needs the C7a-8 cross-check before the Windows `plan` can call its read complete.
+
+### Decision B: computed recommendation by the ROADMAP rule (the choice is the user's, at the Task 3 checkpoint)
+
+The rule (ROADMAP v1.6, Decision B): choose (i) home-relative staging when C6 confirms home write access and no collection-read risk; otherwise (ii).
+
+- **Computed result: (i).** C6 confirms home write access (C6-1: create, write, rename, remove, by relative and absolute path) and shows no collection-read risk (the home is outside `data\`; the scan state did not change). Under the rule's own wording the answer is B(i).
+- **What the rule did not see:** (a) the rule counts the staging side only; the commit side needs the account to write the collection, which it cannot as provisioned (C6-2) in EITHER option; (b) B(ii) additionally needs `data\ign-deploy\` writable (C6-3: denied, and it does not exist); (c) the C7a-4 facts shape the commit sequence in both options (file rename replaces, directory rename over a non-empty directory fails, self-rename deletes, a held target fails with `Failure`).
+- The ledger and journal location each option implies:
+  - **B(i):** `ign-deploy/<gateway>/<mode>/` relative to the service account's home, which is `C:\Users\svc-ignition-deploy\ign-deploy\<gateway>\<mode>\` (sftp `/C:/Users/svc-ignition-deploy/ign-deploy/<gateway>/<mode>/`) for ssh and sftp nodes; `LocalFs` nodes keep `<data_dir>/ign-deploy/<gateway>/<mode>/` (the current `ledger_location` is relative to `data_dir`), so `ledger_location` returns a transport-specific root. Staging for the same run is `ign-deploy/<gateway>/<mode>/staging/<run_id>/` in the same home, outside every collection. A ledger is per service account, not per gateway: a second deploy account would not see the first one's ledger.
+  - **B(ii):** `<data_dir>\ign-deploy\<gateway>\<mode>\` (sftp `/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy/<gateway>/<mode>/`), one location for every transport (the current `ledger_location`), requiring an administrator to create `data\ign-deploy\` and grant the account `Modify` on it. No staging directory: the mirror writes in place under the scan lock.
+- **Undo cost:** until Phase 23 ships, nothing writes a ledger or a journal on any host, so changing the choice now costs a plan edit (`ledger_location`, the default `StagingMode`, 22-13). After Phase 23 apply has written ledgers and journals on hosts, moving them is a one-way migration across runners and hosts (the ledger format v1 and its location are a contract read by every later plan, apply and rollback, D-05). B(i) also needs the design-spec section 9 amendment in whk-environment-orchestration (outside this repository) before it is implemented; B(ii) needs none but needs the `data\ign-deploy\` grant.
+- **Hold budget effect (measured in 22-14):** B(i) keeps the upload outside the scan lock, so the lock covers only the renames; B(ii) runs the whole transfer under the lock, so its hold timeout scales with tree size and link speed.
