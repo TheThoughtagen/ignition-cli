@@ -426,6 +426,15 @@ fn collect_capped(
                 join(rel, &raw.to_string_lossy())
             )
         })?;
+        // The sftp transport refuses control characters in a listed name;
+        // the local walk does the same so the two transports agree and a
+        // name can never carry an escape sequence into a plan or its output.
+        if name.chars().any(char::is_control) {
+            return Err(format!(
+                "{} holds an entry whose name has a control character; refused",
+                join(rel, "")
+            ));
+        }
         if taken.saturating_add(entries.len()) >= max_entries {
             return Err(format!(
                 "more than {max_entries} entries (at {})",
@@ -1225,6 +1234,23 @@ mod tests {
         }
         assert_eq!(tree.render_sha256(), sha256_hex(&listing));
         assert_eq!(tree.bytes(), 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_capped_refuses_a_control_character_in_a_name() {
+        // WR-05: a local file name must not reach the plan renderer raw.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ok.json"), b"{}").expect("write");
+        std::fs::write(dir.path().join("evil\u{1b}[31m.json"), b"{}").expect("write");
+        let (mut files, mut dirs) = (BTreeMap::new(), BTreeSet::new());
+        let why = walk_capped(dir.path(), "root", &mut files, &mut dirs, 10)
+            .expect_err("a control character is refused");
+        assert!(why.contains("control character"), "{why}");
+        assert!(
+            !why.contains('\u{1b}'),
+            "the message is itself sanitised: {why:?}"
+        );
     }
 
     #[test]

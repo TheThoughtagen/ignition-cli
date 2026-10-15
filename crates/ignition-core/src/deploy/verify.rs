@@ -653,8 +653,11 @@ fn strip_nulls(value: &Value) -> Value {
 }
 
 fn child_path(path: &str, key: &str) -> String {
+    // the key may be gateway-supplied (REST body): no control characters and
+    // a bounded length, like every other gateway string in a finding
+    let key = printable(key);
     if path.is_empty() {
-        key.to_string()
+        key
     } else {
         format!("{path}.{key}")
     }
@@ -1023,6 +1026,24 @@ mod tests {
         assert_eq!(printable("a\nb\u{7}c"), "abc");
         let long = "x".repeat(MAX_CODE_CHARS + 10);
         assert_eq!(printable(&long).len(), MAX_CODE_CHARS + 3);
+    }
+
+    #[test]
+    fn gateway_supplied_keys_are_sanitised_in_diff_paths() {
+        // WR-05: a REST key with an escape sequence or a huge length must not
+        // reach a finding raw.
+        let hostile = format!("evil\u{1b}[31m{}", "k".repeat(MAX_CODE_CHARS * 2));
+        let mut rest = serde_json::Map::new();
+        rest.insert(hostile, json!(1));
+        let mut out = Vec::new();
+        diff_exact(&json!({}), &Value::Object(rest), "", &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].contains('\u{1b}'), "{:?}", out[0]);
+        assert!(
+            out[0].chars().count() <= MAX_CODE_CHARS + 3,
+            "{}",
+            out[0].len()
+        );
     }
 
     #[test]
