@@ -675,11 +675,13 @@ fn root_or(path: &str) -> String {
 fn same_scalar(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
-            x == y
-                || match (x.as_f64(), y.as_f64()) {
-                    (Some(x), Some(y)) => x == y,
-                    _ => false,
-                }
+            // `1` equals `1.0`, but two integers are compared exactly: above
+            // 2^53 distinct i64/u64 values collapse to one f64 (WR-06).
+            if x.is_f64() || y.is_f64() {
+                matches!((x.as_f64(), y.as_f64()), (Some(x), Some(y)) if x == y)
+            } else {
+                x == y
+            }
         }
         _ => a == b,
     }
@@ -1044,6 +1046,35 @@ mod tests {
             "{}",
             out[0].len()
         );
+    }
+
+    #[test]
+    fn large_integers_compare_exactly() {
+        // WR-06: 2^53 + 1 and 2^53 are the same f64 but different integers.
+        let mut out = Vec::new();
+        diff_exact(
+            &json!({"id": 9_007_199_254_740_993_i64}),
+            &json!({"id": 9_007_199_254_740_992_i64}),
+            "",
+            &mut out,
+        );
+        assert_eq!(out, vec!["id".to_string()]);
+        let mut out = Vec::new();
+        diff_exact(
+            &json!({"id": u64::MAX}),
+            &json!({"id": u64::MAX - 1}),
+            "",
+            &mut out,
+        );
+        assert_eq!(out, vec!["id".to_string()]);
+        let mut out = Vec::new();
+        diff_exact(
+            &json!({"id": 9_007_199_254_740_993_i64}),
+            &json!({"id": 9_007_199_254_740_993_i64}),
+            "",
+            &mut out,
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
