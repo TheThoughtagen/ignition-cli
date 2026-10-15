@@ -599,11 +599,69 @@ fn safe_component(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
+/// Refuse a pulled tree that cannot be written whole. This runs before the
+/// first delete, so a pull that would fail part-way fails with the existing
+/// tree untouched (CR-01): an unsafe path component, two paths that collide
+/// when case is folded (a case-insensitive filesystem keeps only one), and a
+/// path that is both a file and a directory.
+fn validate_pulled(gateway: &str, source: &SourceTree) -> Result<(), CoreError> {
+    let refuse = |path: &str, why: String| {
+        CoreError::deploy_tree_invalid(format!("gateways/{gateway}/{path}"), None, None, why)
+    };
+    let mut folded: BTreeMap<String, &str> = BTreeMap::new();
+    let mut dir_folds: BTreeSet<String> = BTreeSet::new();
+    for path in source.files.keys() {
+        let parts: Vec<&str> = path.components().collect();
+        if parts.iter().any(|c| !safe_component(c)) {
+            return Err(refuse(
+                path.as_str(),
+                "has an unsafe path component; refused before anything was changed".to_string(),
+            ));
+        }
+        let fold = path.as_str().to_lowercase();
+        if let Some(other) = folded.insert(fold.clone(), path.as_str()) {
+            return Err(refuse(
+                path.as_str(),
+                format!(
+                    "collides with {other} when case is folded; a case-insensitive filesystem keeps only one. Refused before anything was changed"
+                ),
+            ));
+        }
+        for end in fold.match_indices('/').map(|(i, _)| i) {
+            dir_folds.insert(fold[..end].to_string());
+        }
+    }
+    for (fold, path) in &folded {
+        if dir_folds.contains(fold) {
+            return Err(refuse(
+                path,
+                "is both a file and a directory in the pulled tree; refused before anything was changed"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the pulled tree, then replace what a pull replaces and write it
+/// (see [`write_pulled_fs`]). The validation comes first so no destructive
+/// step runs for a tree that is known to be unwritable.
+fn write_pulled(
+    repo: &Path,
+    gateway: &str,
+    existing: Option<&Existing>,
+    source: &SourceTree,
+    manifest: Option<&str>,
+) -> Result<(), CoreError> {
+    validate_pulled(gateway, source)?;
+    write_pulled_fs(repo, gateway, existing, source, manifest)
+}
+
 /// Remove what a pull replaces, then write the pulled tree and, when one was
 /// generated, the manifest. Unix: every step is descriptor-relative and
 /// rooted at the repo, so no component can be redirected by a symlink.
 #[cfg(unix)]
-fn write_pulled(
+fn write_pulled_fs(
     repo: &Path,
     gateway: &str,
     existing: Option<&Existing>,
@@ -704,7 +762,7 @@ fn write_pulled(
 /// subtrees were checked for symlinks by [`scan_existing`] just before and
 /// the operations are path-based (the 22-01 residual for Windows).
 #[cfg(not(unix))]
-fn write_pulled(
+fn write_pulled_fs(
     repo: &Path,
     gateway: &str,
     existing: Option<&Existing>,
@@ -1051,5 +1109,104 @@ async fn poll_probes(
             return Ok(Ok(readings));
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repo whose `gateways/g/resources/` holds one file the pull replaces.
+    fn repo_with_existing() -> (tempfile::TempDir, Existing) {
+        let repo = tempfile::TempDir::new().expect("repo");
+        let dir = repo.path().join("gateways/g/resources/ignition/x");
+        std::fs::create_dir_all(&dir).expect("dirs");
+        std::fs::write(dir.join("keep.json"), b"{\"keep\": true}").expect("file");
+        let existing = Existing {
+            files: vec!["resources/ignition/x/keep.json".to_string()],
+            dirs: ["resources", "resources/ignition", "resources/ignition/x"]
+                .iter()
+                .map(|d| d.to_string())
+                .collect(),
+        };
+        (repo, existing)
+    }
+
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    out.insert(path.clone(), Vec::new());
+                    walk(&path, out);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).expect("read"));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, &mut out);
+        out
+    }
+
+    /// CR-01: a pulled tree that cannot be written is refused before the first
+    /// delete, so the existing tree is left exactly as it was.
+    fn assert_refused_untouched(files: &[(&str, &str)], needle: &str) {
+        let (repo, existing) = repo_with_existing();
+        let before = snapshot(repo.path());
+        let source = SourceTree::from_files(files.iter().copied()).expect("source");
+        let err =
+            write_pulled(repo.path(), "g", Some(&existing), &source, None).expect_err("refused");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        assert!(err.to_string().contains(needle), "{needle}: {err}");
+        assert_eq!(
+            snapshot(repo.path()),
+            before,
+            "a refused pull must not delete the existing tree"
+        );
+    }
+
+    #[test]
+    fn unsafe_component_is_refused_before_any_delete() {
+        assert_refused_untouched(
+            &[
+                ("resources/ignition/x/fine.json", "{}"),
+                ("resources/ignition/x/bad\nname.json", "{}"),
+            ],
+            "unsafe path component",
+        );
+    }
+
+    #[test]
+    fn case_fold_collision_is_refused_before_any_delete() {
+        assert_refused_untouched(
+            &[
+                ("resources/ignition/x/Foo.json", "{}"),
+                ("resources/ignition/x/foo.json", "{}"),
+            ],
+            "case is folded",
+        );
+    }
+
+    #[test]
+    fn file_and_directory_clash_is_refused_before_any_delete() {
+        assert_refused_untouched(
+            &[
+                ("resources/ignition/x", "{}"),
+                ("resources/ignition/x/a.json", "{}"),
+            ],
+            "both a file and a directory",
+        );
+    }
+
+    #[test]
+    fn a_valid_tree_replaces_the_existing_one() {
+        let (repo, existing) = repo_with_existing();
+        let source =
+            SourceTree::from_files([("resources/ignition/x/new.json", "{}")]).expect("source");
+        write_pulled(repo.path(), "g", Some(&existing), &source, None).expect("written");
+        let dir = repo.path().join("gateways/g/resources/ignition/x");
+        assert!(!dir.join("keep.json").exists());
+        assert!(dir.join("new.json").is_file());
     }
 }
