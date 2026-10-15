@@ -2642,8 +2642,10 @@ v1 is one strict JSON object:
 }
 ```
 
-- **Location:** `ign-deploy/<gateway>/<mode>/ledger.json` below the node's
-  data directory, outside `config/resources/` so the gateway never scans it.
+- **Location (Decision B, below):** `ign-deploy/<gateway>/<mode>/ledger.json`,
+  below the service account's **home directory** for an `ssh` node and below
+  the node's data directory for a `local` node. Never inside
+  `config/resources/`, so the gateway never scans it.
 - **Size and encoding:** at most 8 MiB (8388608 bytes), strict UTF-8, never
   empty (a 0-byte file is refused). Unknown fields and repeated keys are
   refused; nesting is bounded.
@@ -2687,6 +2689,69 @@ deleted when the call set ends. The key never appears in an argument, an
 error, the JSON envelope or a log line; an unset or empty variable is exit 4
 `transport_failed` naming the variable. With neither `key_file` nor `key_env`
 the SSH agent is used.
+
+#### Windows OpenSSH hosts
+
+`os: windows` nodes are read (and, by tests and Phase 23, mirrored) over the
+same hardened `ssh` and `sftp`, with the behaviour recorded against a real
+Windows Server 2022 / Win32-OpenSSH 8.1 host as a non-admin account
+(`22-LIVE-CAPTURES.md`, sections C7a, C6 and C6-post):
+
+- **`data_dir`** is a drive-letter path (`C:\Program Files\Inductive
+  Automation\Ignition\data`; forward slashes and a lowercase drive letter are
+  accepted). UNC and `\\?\` paths, relative and drive-relative paths (`C:foo`),
+  `..`, an alternate data stream (`:`), a component ending in a dot or a space,
+  and a path over 150 characters are refused with exit 2 `deploy_tree_invalid`.
+  sftp is always given `/C:/Program Files/...`: the server resolves `C:/...`
+  against the account home, so that form is never sent.
+- **Listings.** A Windows server prints long-listing names without their
+  directory, so each `ls -la` is preceded by `pwd` and the `Remote working
+  directory:` line marks where one directory's entries start. The client runs
+  in a UTF-8 locale; an escaped name (`caf\303\251`) is refused, never read as
+  the real one. Names pass the Windows component gate on top of the POSIX one:
+  no `:`, no trailing dot or space, no reserved device name (`CON`, `NUL`,
+  `COM1`...), no `< > " | ? *`, and no two names that differ only by case.
+- **A listing is not proof of completeness.** The sftp server drops entries
+  whose path is 260 characters or more, with exit 0 and no message, and
+  `get -R` follows junctions. Every Windows read therefore compares what sftp
+  returned with an independent PowerShell walk of the same roots (the `\\?\`
+  prefix, sizes, reparse-point flags). A missing entry, an extra entry, a size
+  that differs, a junction or symlink, or a path of 240 characters or more is
+  exit 4 `transport_failed` naming the path, before any file is downloaded. A
+  denied read of a file that exists reports "not found" on this server, so a
+  not-found answer for a name the listing returned means unreadable.
+- **PowerShell** runs only as fixed scripts: `powershell -NoProfile
+  -NonInteractive -EncodedCommand <base64 UTF-16LE>`, parameters passed only
+  as a base64 JSON blob decoded inside the script (never interpolated), the
+  whole command held to 8000 characters (the host fails at 8162), a prelude
+  that makes a failed step exit non-zero. Success needs exit 0 and exactly one
+  `IGN-RESULT:` stdout line (ASCII, `\uXXXX`-escaped); stderr is treated as
+  opaque CLIXML and is decoded only to explain a failure.
+- **Writes.** A file renamed over an existing file replaces it; a rename onto
+  *itself* deletes the file on this server, so such a rename is refused for
+  every host. A rename answered `Failure` (a scanner holding the target) is
+  retried up to three times, then reported; nothing else is retried.
+
+#### Decision B: where the ledger, the journal and staging live
+
+Recorded at the 22-12 checkpoint (option B(i)) and applied by 22-13:
+
+| Node | Ledger, journal and staging root |
+|---|---|
+| `ssh` (Windows or Linux) | `ign-deploy/<gateway>/<mode>/` relative to the service account's home directory, as the server reports it (`/C:/Users/svc-ignition-deploy/ign-deploy/<gateway>/<mode>/` on Windows) |
+| `local` | `<data_dir>/ign-deploy/<gateway>/<mode>/` |
+
+The **default `StagingMode` Phase 23 uses** is `Separate` at
+`ign-deploy/<gateway>/<mode>/staging/<run_id>/` below that root
+(`transport::default_staging_mode`): files are staged in the account home,
+outside every collection, then committed into `config/resources/<mode>/` by
+rename (same volume, no upload under the scan lock). The reason is measured:
+the service account can write its own home and nothing under the data
+directory (C6), and `Modify` on each mode collection directory is the one
+grant it needs (C6-post). A ledger is per service account, not per gateway.
+Nothing writes a ledger before Phase 23, so nothing was migrated. The design
+spec section 9 amendment (the account also writes `ign-deploy/` in its home)
+lives in whk-environment-orchestration and is still to do.
 
 #### Drift (`--base DIR`)
 
