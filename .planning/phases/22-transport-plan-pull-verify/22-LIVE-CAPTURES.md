@@ -7666,6 +7666,191 @@ remote delete /C:/Program Files/Inductive Automation/Ignition/data/config/resour
 **C6-post result (2026-10-15).** With the post-C6 grant, `svc-ignition-deploy` can: `put` a file straight into `production\`, `rename` inside it, `rename` a staged file from its home onto an existing file there (the target then held the staged bytes, sha256 `5da8f23d...`, "bravo"), `mkdir` and `rmdir` a directory in it, and `rm` its own file. The grant is on `production` only: `resources` still shows `svc-ignition-deploy:(OI)(CI)(RX)`. The scan state (`lastScanTimestamp 1792062546739`, `lastScanDuration 1565`, `scanActive false`) is identical before and after. Everything written was removed in the same session; `production` lists `config-mode.json` (133 bytes) only. The last block's exit 1 is the expected "No such file" for the first probe name, which the rename had already moved. This answers the "what C6 does NOT yet settle" caveat of the C6 table for `production` and for Decision B caveat 2 (`Modify` on the mode collection); the C6 table above is the original provisioning and is deliberately not rewritten.
 
 
+## OQ5 run A (Defender exclusion off)
+
+Capture-only harness `oq5_timings` in `crates/ignition-core/tests/live_transport_wflwvm01.rs` (`#[ignore]`, drives `mirror_for_node` stage and commit, `SftpTransport::read` and the gateway scan through the profile's `DeployApi`; no verb; the write half has no other caller). Host: the Azure VM `ign-win-836` (40.114.71.134), Windows Server 2022, Win32-OpenSSH 8.1, Ignition 8.3.6, as `svc-ignition-deploy` with the pinned host key, from a macOS runner over the public internet. Defender real-time protection ON, no exclusions (the state C7a, C6 and 22-13 were taken in).
+
+Command (key and host from `~/.config/ign-azure-win/env`, mapped to `IGN_WFLWVM01_*`):
+
+```
+IGNITION_LIVE_WFLWVM01=1 IGNITION_LIVE_OQ5=1 IGN_OQ5_LABEL=A IGN_OQ5_SCALE=1 \
+  cargo test -p ignition-core --test live_transport_wflwvm01 oq5_timings -- --ignored --nocapture
+```
+
+Started 2026-10-15T12:28:17Z, ended 2026-10-15T14:48:56Z (8434 s). Defaults of the harness: 10 iterations, 20 reads, 20 connect samples, per-call timeout of the harness target `op_timeout_s: 1800` (so a slow call is measured instead of killed; the product default is 120).
+
+### Payload (D-16) and its limit
+
+- Source: the OQ5 source is `none` (22-CONTEXT A-03), so the payload is the sanitized corpus in `tests/fixtures/deploy/corpus`.
+- This run used **scale 1, not the plan's ten**: 70 named units, **152 files, 91,833 bytes** (the corpus has 195 files; the 42 singleton-unit files and `config-mode.json` are never written, because a copy of a singleton would override the live gateway's own settings in the `production` collection). Each unit goes in under `<name>-oq5-01`, with its `uuid` values re-derived. The unit names follow the corpus (27 module/type directories).
+- Why not scale 10: the first calibration run (scale 1, one iteration) measured stage 77 s, commit 242 s and delete 118 s for these 152 files. Those costs are per file (about 0.5, 1.6 and 0.75 s per file), so ten copies (1,520 files) would take roughly 75 minutes per iteration and 12 hours for ten iterations, on one run, twice. The sample counts the plan requires (10 write iterations, 20 reads) were kept, the payload was not scaled; the per-file cost is stated so the 1,520-file figure can be extrapolated, and is NOT measured here.
+- An earlier calibration run (scale 1, 1 iteration, 1 read, cut off by the shell's 580 s timeout during the read phase) left empty module/type directories in `production`; the restore-only mode of the same harness (`IGN_OQ5_RESTORE_ONLY`) removed them and asserted the listing equal to the recorded one. Its output is not part of the samples below.
+
+### Gateway state during the run
+
+- License: the trial had expired at the end of 22-13. Before the run `ign status` showed `trial_remaining_s: 0`; a manual `POST /data/api/v1/scan/config` on the expired trial completed normally (`lastScanDuration` 607 ms), so scans work the same on an expired trial.
+- The coordinator reset the trial at 2026-10-15T12:47:31Z (`lastUpdated` 1792068451572; `trialSecondsLeft` 7161 at 12:48:07Z). Iterations 1 and 2 (and the start of 3) therefore ran on the expired trial, the rest on the live trial until it expired again at about 14:47Z (`trialSecondsLeft` 107 at 14:45:42Z, 0 and `expired: true` at 14:49Z). The restore scan ran after that expiry. No trial reset was made by the agent. The scan numbers show no step at the reset (gateway-side `lastScanDuration` 539 to 676 ms with the payload present in every iteration).
+- No scan was ever refused or slow; the gateway-side `lastScanDuration` and the wall time from the trigger to the advanced timestamp (polled every 100 ms) are both recorded.
+
+### Summary (nearest-rank percentiles, seconds; `_ms` rows are the gateway's `lastScanDuration` in milliseconds)
+
+| Phase | n | p50 | p95 | min | max |
+|---|---|---|---|---|---|
+| connect (`sftp` session running `pwd`) | 20 | 1.575 | 1.688 | 1.450 | 1.749 |
+| read of the scoped collection, payload present (46 core + 152 mode files, 117,914 bytes) | 20 | 164.120 | 181.155 | 154.791 | 186.683 |
+| stage (152 files into the B(i) staging in the account home) | 10 | 78.012 | 83.265 | 72.676 | 83.265 |
+| commit (rename into `production`, empty delete set) | 10 | 244.594 | 251.063 | 233.932 | 251.063 |
+| scan, wall, payload present | 10 | 0.792 | 0.888 | 0.687 | 0.888 |
+| scan, gateway `lastScanDuration`, payload present (ms) | 10 | 601 | 676 | 539 | 676 |
+| commit of the delete set (152 files, 70 emptied unit directories removed) | 10 | 108.702 | 114.182 | 103.582 | 114.182 |
+| scan, wall, after delete | 10 | 0.680 | 0.981 | 0.513 | 0.981 |
+| scan, gateway `lastScanDuration`, after delete (ms) | 10 | 453 | 489 | 420 | 489 |
+
+With n = 10 the nearest-rank p95 is the maximum; with n = 20 it is the 19th value.
+
+### Restore (T-22-59)
+
+After the loop the harness enumerated `production`, removed every file that was not in the pre-run listing through the delete set (152 files, 108 s), scanned, and removed the empty `<module>` directories that the delete-set commit leaves behind (it removes the emptied unit directory only; 8 module directories, each holding emptied type directories, remained; they were removed with the test-local `Remove-Item` script, not by the product). Then it downloaded and hashed everything in `production` again: `production_listing_equals_pre_run: true` (1 entry, `config-mode.json`, sha256 `f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa`, 133 bytes). `ign-deploy` is absent from the account home. Checked again over ssh after the run: `dir /b production` lists `config-mode.json` only and `dir /b %USERPROFILE% | findstr /i ign-` prints nothing.
+
+### Raw output
+
+~~~
+OQ5 {"connect_samples":20,"iters":10,"label":"A","op_timeout_s":1800,"payload":{"bytes":91833,"files":152,"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","types":27,"units":70},"reads":20}
+OQ5 {"gateway_scan_state_before":{"lastScanDuration":594,"lastScanTimestamp":1792066711645,"scanActive":false},"label":"A"}
+OQ5 {"label":"A","pre_run_listing":[{"dir":false,"path":"config-mode.json","sha256":"f7b5b709abfadf5ad7338bd40ca14ebe4b4d123f4b2689112fa4cca36161b2fa","size":133}]}
+OQ5 {"extra":{},"iter":1,"label":"A","phase":"connect_pwd","value":1.516}
+OQ5 {"extra":{},"iter":2,"label":"A","phase":"connect_pwd","value":1.618}
+test oq5_timings has been running for over 60 seconds
+OQ5 {"extra":{},"iter":3,"label":"A","phase":"connect_pwd","value":1.65}
+OQ5 {"extra":{},"iter":4,"label":"A","phase":"connect_pwd","value":1.568}
+OQ5 {"extra":{},"iter":5,"label":"A","phase":"connect_pwd","value":1.502}
+OQ5 {"extra":{},"iter":6,"label":"A","phase":"connect_pwd","value":1.651}
+OQ5 {"extra":{},"iter":7,"label":"A","phase":"connect_pwd","value":1.568}
+OQ5 {"extra":{},"iter":8,"label":"A","phase":"connect_pwd","value":1.655}
+OQ5 {"extra":{},"iter":9,"label":"A","phase":"connect_pwd","value":1.637}
+OQ5 {"extra":{},"iter":10,"label":"A","phase":"connect_pwd","value":1.583}
+OQ5 {"extra":{},"iter":11,"label":"A","phase":"connect_pwd","value":1.574}
+OQ5 {"extra":{},"iter":12,"label":"A","phase":"connect_pwd","value":1.749}
+OQ5 {"extra":{},"iter":13,"label":"A","phase":"connect_pwd","value":1.688}
+OQ5 {"extra":{},"iter":14,"label":"A","phase":"connect_pwd","value":1.643}
+OQ5 {"extra":{},"iter":15,"label":"A","phase":"connect_pwd","value":1.503}
+OQ5 {"extra":{},"iter":16,"label":"A","phase":"connect_pwd","value":1.645}
+OQ5 {"extra":{},"iter":17,"label":"A","phase":"connect_pwd","value":1.5}
+OQ5 {"extra":{},"iter":18,"label":"A","phase":"connect_pwd","value":1.45}
+OQ5 {"extra":{},"iter":19,"label":"A","phase":"connect_pwd","value":1.502}
+OQ5 {"extra":{},"iter":20,"label":"A","phase":"connect_pwd","value":1.575}
+OQ5 {"extra":{"files":152},"iter":1,"label":"A","phase":"stage","value":72.676}
+OQ5 {"extra":{"files":152},"iter":1,"label":"A","phase":"commit","value":244.594}
+OQ5 {"extra":{},"iter":1,"label":"A","phase":"scan_with_payload","value":0.888}
+OQ5 {"extra":{},"iter":1,"label":"A","phase":"scan_with_payload_gateway_ms","value":676.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":1,"label":"A","phase":"commit_delete","value":113.312}
+OQ5 {"extra":{},"iter":1,"label":"A","phase":"scan_after_delete","value":0.678}
+OQ5 {"extra":{},"iter":1,"label":"A","phase":"scan_after_delete_gateway_ms","value":478.0}
+OQ5 {"extra":{"files":152},"iter":2,"label":"A","phase":"stage","value":81.58}
+OQ5 {"extra":{"files":152},"iter":2,"label":"A","phase":"commit","value":233.932}
+OQ5 {"extra":{},"iter":2,"label":"A","phase":"scan_with_payload","value":0.735}
+OQ5 {"extra":{},"iter":2,"label":"A","phase":"scan_with_payload_gateway_ms","value":601.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":2,"label":"A","phase":"commit_delete","value":114.182}
+OQ5 {"extra":{},"iter":2,"label":"A","phase":"scan_after_delete","value":0.713}
+OQ5 {"extra":{},"iter":2,"label":"A","phase":"scan_after_delete_gateway_ms","value":489.0}
+OQ5 {"extra":{"files":152},"iter":3,"label":"A","phase":"stage","value":79.186}
+OQ5 {"extra":{"files":152},"iter":3,"label":"A","phase":"commit","value":251.063}
+OQ5 {"extra":{},"iter":3,"label":"A","phase":"scan_with_payload","value":0.794}
+OQ5 {"extra":{},"iter":3,"label":"A","phase":"scan_with_payload_gateway_ms","value":581.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":3,"label":"A","phase":"commit_delete","value":112.001}
+OQ5 {"extra":{},"iter":3,"label":"A","phase":"scan_after_delete","value":0.691}
+OQ5 {"extra":{},"iter":3,"label":"A","phase":"scan_after_delete_gateway_ms","value":480.0}
+OQ5 {"extra":{"files":152},"iter":4,"label":"A","phase":"stage","value":83.265}
+OQ5 {"extra":{"files":152},"iter":4,"label":"A","phase":"commit","value":248.693}
+OQ5 {"extra":{},"iter":4,"label":"A","phase":"scan_with_payload","value":0.854}
+OQ5 {"extra":{},"iter":4,"label":"A","phase":"scan_with_payload_gateway_ms","value":611.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":4,"label":"A","phase":"commit_delete","value":105.15}
+OQ5 {"extra":{},"iter":4,"label":"A","phase":"scan_after_delete","value":0.688}
+OQ5 {"extra":{},"iter":4,"label":"A","phase":"scan_after_delete_gateway_ms","value":481.0}
+OQ5 {"extra":{"files":152},"iter":5,"label":"A","phase":"stage","value":74.704}
+OQ5 {"extra":{"files":152},"iter":5,"label":"A","phase":"commit","value":241.349}
+OQ5 {"extra":{},"iter":5,"label":"A","phase":"scan_with_payload","value":0.743}
+OQ5 {"extra":{},"iter":5,"label":"A","phase":"scan_with_payload_gateway_ms","value":607.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":5,"label":"A","phase":"commit_delete","value":105.688}
+OQ5 {"extra":{},"iter":5,"label":"A","phase":"scan_after_delete","value":0.68}
+OQ5 {"extra":{},"iter":5,"label":"A","phase":"scan_after_delete_gateway_ms","value":453.0}
+OQ5 {"extra":{"files":152},"iter":6,"label":"A","phase":"stage","value":79.558}
+OQ5 {"extra":{"files":152},"iter":6,"label":"A","phase":"commit","value":239.751}
+OQ5 {"extra":{},"iter":6,"label":"A","phase":"scan_with_payload","value":0.868}
+OQ5 {"extra":{},"iter":6,"label":"A","phase":"scan_with_payload_gateway_ms","value":611.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":6,"label":"A","phase":"commit_delete","value":104.98}
+OQ5 {"extra":{},"iter":6,"label":"A","phase":"scan_after_delete","value":0.555}
+OQ5 {"extra":{},"iter":6,"label":"A","phase":"scan_after_delete_gateway_ms","value":429.0}
+OQ5 {"extra":{"files":152},"iter":7,"label":"A","phase":"stage","value":76.103}
+OQ5 {"extra":{"files":152},"iter":7,"label":"A","phase":"commit","value":248.052}
+OQ5 {"extra":{},"iter":7,"label":"A","phase":"scan_with_payload","value":0.687}
+OQ5 {"extra":{},"iter":7,"label":"A","phase":"scan_with_payload_gateway_ms","value":593.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":7,"label":"A","phase":"commit_delete","value":108.702}
+OQ5 {"extra":{},"iter":7,"label":"A","phase":"scan_after_delete","value":0.513}
+OQ5 {"extra":{},"iter":7,"label":"A","phase":"scan_after_delete_gateway_ms","value":420.0}
+OQ5 {"extra":{"files":152},"iter":8,"label":"A","phase":"stage","value":78.012}
+OQ5 {"extra":{"files":152},"iter":8,"label":"A","phase":"commit","value":247.752}
+OQ5 {"extra":{},"iter":8,"label":"A","phase":"scan_with_payload","value":0.792}
+OQ5 {"extra":{},"iter":8,"label":"A","phase":"scan_with_payload_gateway_ms","value":623.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":8,"label":"A","phase":"commit_delete","value":111.692}
+OQ5 {"extra":{},"iter":8,"label":"A","phase":"scan_after_delete","value":0.699}
+OQ5 {"extra":{},"iter":8,"label":"A","phase":"scan_after_delete_gateway_ms","value":429.0}
+OQ5 {"extra":{"files":152},"iter":9,"label":"A","phase":"stage","value":73.92}
+OQ5 {"extra":{"files":152},"iter":9,"label":"A","phase":"commit","value":246.081}
+OQ5 {"extra":{},"iter":9,"label":"A","phase":"scan_with_payload","value":0.733}
+OQ5 {"extra":{},"iter":9,"label":"A","phase":"scan_with_payload_gateway_ms","value":547.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":9,"label":"A","phase":"commit_delete","value":110.435}
+OQ5 {"extra":{},"iter":9,"label":"A","phase":"scan_after_delete","value":0.981}
+OQ5 {"extra":{},"iter":9,"label":"A","phase":"scan_after_delete_gateway_ms","value":460.0}
+OQ5 {"extra":{"files":152},"iter":10,"label":"A","phase":"stage","value":78.633}
+OQ5 {"extra":{"files":152},"iter":10,"label":"A","phase":"commit","value":242.86}
+OQ5 {"extra":{},"iter":10,"label":"A","phase":"scan_with_payload","value":0.812}
+OQ5 {"extra":{},"iter":10,"label":"A","phase":"scan_with_payload_gateway_ms","value":539.0}
+OQ5 {"extra":{"files":152,"removed_dirs":70},"iter":10,"label":"A","phase":"commit_delete","value":103.582}
+OQ5 {"extra":{},"iter":10,"label":"A","phase":"scan_after_delete","value":0.518}
+OQ5 {"extra":{},"iter":10,"label":"A","phase":"scan_after_delete_gateway_ms","value":438.0}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":1,"label":"A","phase":"read","value":166.158}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":2,"label":"A","phase":"read","value":161.497}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":3,"label":"A","phase":"read","value":165.869}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":4,"label":"A","phase":"read","value":177.936}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":5,"label":"A","phase":"read","value":164.867}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":6,"label":"A","phase":"read","value":154.791}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":7,"label":"A","phase":"read","value":156.445}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":8,"label":"A","phase":"read","value":158.33}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":9,"label":"A","phase":"read","value":171.4}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":10,"label":"A","phase":"read","value":165.62}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":11,"label":"A","phase":"read","value":162.006}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":12,"label":"A","phase":"read","value":163.312}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":13,"label":"A","phase":"read","value":164.12}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":14,"label":"A","phase":"read","value":186.683}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":15,"label":"A","phase":"read","value":164.61}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":16,"label":"A","phase":"read","value":181.155}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":17,"label":"A","phase":"read","value":160.507}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":18,"label":"A","phase":"read","value":164.146}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":19,"label":"A","phase":"read","value":163.367}
+OQ5 {"extra":{"bytes":117914,"core_files":46,"mode_files":152},"iter":20,"label":"A","phase":"read","value":159.947}
+OQ5 {"label":"A","restore":{"files_to_remove":152}}
+OQ5 {"label":"A","restore":{"commit_secs":108.073015459,"removed_dirs":70}}
+OQ5 {"label":"A","restore":{"scan_secs":0.621665458}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.cirruslink.mqtt.distributor.gateway"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.cirruslink.mqtt.engine.gateway"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.cirruslink.mqtt.transmission.gateway"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.inductiveautomation.eam"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.inductiveautomation.historian"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.inductiveautomation.opcua"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"com.inductiveautomation.perspective"}}
+OQ5 {"label":"A","restore":{"removing_stray_dir":"ignition"}}
+OQ5 {"label":"A","restore":{"staging_gone":true}}
+OQ5 {"label":"A","summary":{"bytes":91833,"files":152,"label":"A","percentile":"nearest rank","phases":{"commit":{"max":251.063169042,"min":233.931712458,"n":10,"p50":244.593935,"p95":251.063169042},"commit_delete":{"max":114.18224675,"min":103.582237416,"n":10,"p50":108.701847333,"p95":114.18224675},"connect_pwd":{"max":1.7489185,"min":1.450035292,"n":20,"p50":1.574673041,"p95":1.6878268749999998},"read":{"max":186.683217167,"min":154.791211459,"n":20,"p50":164.119644125,"p95":181.154829291},"scan_after_delete":{"max":0.9807775,"min":0.51339875,"n":10,"p50":0.680079791,"p95":0.9807775},"scan_after_delete_gateway_ms":{"max":489.0,"min":420.0,"n":10,"p50":453.0,"p95":489.0},"scan_with_payload":{"max":0.887850459,"min":0.686637167,"n":10,"p50":0.792468834,"p95":0.887850459},"scan_with_payload_gateway_ms":{"max":676.0,"min":539.0,"n":10,"p50":601.0,"p95":676.0},"stage":{"max":83.265237791,"min":72.676209958,"n":10,"p50":78.012278208,"p95":83.265237791}},"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","unit":"seconds unless the phase name ends in _ms","units":70}}
+OQ5 {"label":"A","total_secs":8434.232989}
+OQ5 {"label":"A","restore_assertion":{"entries_after":1,"entries_before":1,"production_listing_equals_pre_run":true}}
+OQ5 {"ign_deploy_in_home_exists":false,"label":"A"}
+PASS oq5_timings
+test oq5_timings ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 8437.77s
+~~~
+
+
 ## Decisions
 
 Written after `capture22.sh cv1`, `cv2` and `cv3` ran to completion against the rig above. Every decision cites the blocks it rests on. Two points where a capture contradicts 22-RESEARCH are marked CONTRADICTS. 22-10 follows these decisions; nothing below is taken from research or inference.
