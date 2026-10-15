@@ -1361,7 +1361,9 @@ const VERIFY_CANARY: &str = "CANARY-VERIFY-LOG-22";
 const NAMED_TRANSLATOR: &str = "ignition/database-translator/POSTGRES";
 
 /// The rendered `config.json` of `key` from the live tree, with JSON null
-/// members removed, as the gateway's REST view reports it (CV2 N1).
+/// members removed. Most types' REST view omits null members, and this helper
+/// models that shape. `ignition/cobranding` is the exception: it echoes unset
+/// members as explicit `null`, which `rest_config_raw` models.
 fn rest_config(data: &Path, key: &str) -> Value {
     fn strip(v: &Value) -> Value {
         match v {
@@ -1381,15 +1383,35 @@ fn rest_config(data: &Path, key: &str) -> Value {
     strip(&serde_json::from_slice(&std::fs::read(path).expect("live config")).expect("json"))
 }
 
+/// The rendered `config.json` of `key` from the live tree with its null
+/// members KEPT: a REST view that echoes unset members as explicit `null`
+/// (`ignition/cobranding`; G-22-2).
+fn rest_config_raw(data: &Path, key: &str) -> Value {
+    let path = data
+        .join("config/resources/dev")
+        .join(key)
+        .join("config.json");
+    serde_json::from_slice(&std::fs::read(path).expect("live config")).expect("json")
+}
+
 /// A mock gateway that agrees with the live tree. `omit_translator` leaves
 /// the declared database-translator out of the REST list (a red read_back);
-/// `log_items` are the WARN lines the gateway returns.
+/// `log_items` are the WARN lines the gateway returns. `rest_keeps_nulls`
+/// serves the translator and the singleton with their null members kept.
 async fn mount_verify_gateway(
     server: &wiremock::MockServer,
     data: &Path,
     omit_translator: bool,
+    rest_keeps_nulls: bool,
     log_items: Vec<Value>,
 ) {
+    let rest_of = |key: &str| {
+        if rest_keeps_nulls {
+            rest_config_raw(data, key)
+        } else {
+            rest_config(data, key)
+        }
+    };
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
@@ -1414,7 +1436,7 @@ async fn mount_verify_gateway(
             "type": "ignition/database-translator",
             "name": "POSTGRES",
             "collection": "dev",
-            "config": rest_config(data, NAMED_TRANSLATOR)
+            "config": rest_of(NAMED_TRANSLATOR)
         }])
     };
     Mock::given(method("GET"))
@@ -1434,7 +1456,7 @@ async fn mount_verify_gateway(
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "type": "ignition/general-alarm-settings",
             "collection": "dev",
-            "config": rest_config(data, "ignition/general-alarm-settings")
+            "config": rest_of("ignition/general-alarm-settings")
         })))
         .mount(server)
         .await;
@@ -1498,7 +1520,7 @@ fn verify_args(repo: &Path, json: bool) -> Vec<std::ffi::OsString> {
 async fn verify_cli_red_exits_6() {
     let (_scratch, repo, data) = local_tracer();
     let server = wiremock::MockServer::start().await;
-    mount_verify_gateway(&server, &data, true, Vec::new()).await;
+    mount_verify_gateway(&server, &data, true, false, Vec::new()).await;
     let (_cfg, mut cmd) = verify_ign(&server.uri());
     let out = cmd
         .args(verify_args(&repo, true))
@@ -1545,7 +1567,7 @@ async fn verify_cli_red_exits_6() {
 async fn verify_cli_green_exits_0() {
     let (_scratch, repo, data) = local_tracer();
     let server = wiremock::MockServer::start().await;
-    mount_verify_gateway(&server, &data, false, Vec::new()).await;
+    mount_verify_gateway(&server, &data, false, false, Vec::new()).await;
     let (_cfg, mut cmd) = verify_ign(&server.uri());
     let out = cmd
         .args(verify_args(&repo, true))
@@ -1567,6 +1589,53 @@ async fn verify_cli_green_exits_0() {
     assert!(
         envelope.get("error").is_none(),
         "no error member: {envelope}"
+    );
+}
+
+/// Green when the REST view echoes the tree's own null members (G-22-2): a
+/// pulled `ignition/cobranding` is the real case, the tracer's translator and
+/// singleton carry the same shape. Null equals absent on both sides.
+#[tokio::test]
+async fn verify_cli_green_when_rest_echoes_file_nulls() {
+    let (_scratch, repo, data) = local_tracer();
+    // the shape precondition: the live tree really holds null members
+    let has_null = |key: &str| {
+        rest_config_raw(&data, key)
+            .as_object()
+            .is_some_and(|m| m.values().any(Value::is_null))
+    };
+    assert!(
+        has_null(NAMED_TRANSLATOR) || has_null("ignition/general-alarm-settings"),
+        "the live tree carries no null member; the test would pass vacuously"
+    );
+    let server = wiremock::MockServer::start().await;
+    mount_verify_gateway(&server, &data, false, true, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(verify_args(&repo, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["ok"], true);
+    let data = &envelope["data"];
+    assert_eq!(data["ok"], true);
+    assert!(data["slug"].is_null());
+    assert_eq!(data["resources_checked"], 2);
+    assert!(
+        envelope.get("error").is_none(),
+        "no error member: {envelope}"
+    );
+    assert!(
+        out.stderr.is_empty() || !String::from_utf8_lossy(&out.stderr).contains("\"error\""),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -1637,6 +1706,7 @@ async fn verify_cli_human_lines() {
         &server,
         &data,
         true,
+        false,
         vec![json!({
             "timestamp": 1_792_000_000_050_i64,
             "loggerName": "NamedResourceHandler-ignition/database-translator",

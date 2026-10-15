@@ -462,6 +462,107 @@ fn read_back_n3_attributes_only_unit_ignores_rest_only_keys() {
 }
 
 #[test]
+fn read_back_n2_rest_nulls_are_dropped() {
+    let key = "ignition/security-levels";
+    let rest_with_null = json!({"securityLevels": [
+        {"name": "Authenticated", "description": null, "children": []}
+    ]});
+    let mut o = observed();
+    o.read_back
+        .insert(key.to_string(), Remote::Config(rest_with_null));
+    let level = |file: Value| {
+        let mut e = expected();
+        e.resources = vec![ExpectedResource::new(
+            "ignition",
+            "security-levels",
+            None,
+            Compare::NameKeyedSubset(file),
+        )];
+        e
+    };
+    // The file declares no description, REST echoes `description: null`.
+    let ok = evaluate(
+        &level(json!({"securityLevels": [{"name": "Authenticated", "children": []}]})),
+        &o,
+    );
+    assert_eq!(
+        check(&ok, CheckId::ReadBack).status,
+        CheckStatus::Pass,
+        "{ok:#?}"
+    );
+
+    // The file declares a description, REST holds null: the level differs.
+    let bad = evaluate(
+        &level(json!({"securityLevels": [
+            {"name": "Authenticated", "description": "FILE-DESC-SECRET", "children": []}
+        ]})),
+        &o,
+    );
+    let c = check(&bad, CheckId::ReadBack);
+    assert_eq!(c.status, CheckStatus::Fail, "{bad:#?}");
+    assert!(c.findings[0].detail.contains("description"), "{c:?}");
+    assert!(
+        !serde_json::to_string(&bad)
+            .unwrap()
+            .contains("FILE-DESC-SECRET")
+    );
+}
+
+#[test]
+fn read_back_n3_rest_nulls_are_dropped() {
+    let key = "ignition/translations";
+    let attrs = |value: Value| {
+        let Value::Object(attrs) = value else {
+            unreachable!()
+        };
+        let mut e = expected();
+        e.resources = vec![ExpectedResource::new(
+            "ignition",
+            "translations",
+            None,
+            Compare::Attributes(attrs),
+        )];
+        e
+    };
+    let observe = |rest: Value| {
+        let mut o = observed();
+        o.read_back.insert(key.to_string(), Remote::Config(rest));
+        o
+    };
+
+    // A nested object holding a null member, echoed by REST with that null.
+    let ok = evaluate(
+        &attrs(json!({"opts": {"a": 1, "b": null}})),
+        &observe(json!({"opts": {"a": 1, "b": null}, "terms": {}})),
+    );
+    assert_eq!(
+        check(&ok, CheckId::ReadBack).status,
+        CheckStatus::Pass,
+        "{ok:#?}"
+    );
+    // The file lacks the nested null, REST carries it.
+    let ok = evaluate(
+        &attrs(json!({"opts": {"a": 1}})),
+        &observe(json!({"opts": {"a": 1, "b": null}})),
+    );
+    assert_eq!(
+        check(&ok, CheckId::ReadBack).status,
+        CheckStatus::Pass,
+        "{ok:#?}"
+    );
+
+    // A REST null for an attribute the file declares as `true` still differs:
+    // the key lookup is on the raw REST map, so the null key is present.
+    let bad = evaluate(
+        &attrs(json!({"ignoreTags": true})),
+        &observe(json!({"ignoreTags": null})),
+    );
+    let c = check(&bad, CheckId::ReadBack);
+    assert_eq!(c.status, CheckStatus::Fail, "{bad:#?}");
+    assert!(c.findings[0].detail.contains("ignoreTags"), "{c:?}");
+}
+
+#[test]
 fn read_back_skips_system_collection_and_no_route_types_with_a_warning() {
     let mut e = expected();
     e.not_checked = vec![(
@@ -897,8 +998,10 @@ fn fast() -> VerifyOptions {
     }
 }
 
-/// The rendered `config.json` of `key` with JSON null members removed, as the
-/// gateway's REST view reports it (CV2 N1).
+/// The rendered `config.json` of `key` with JSON null members removed. Most
+/// types' REST view omits null members, and this helper models that shape.
+/// `ignition/cobranding` is the exception: it echoes unset members as explicit
+/// `null`, which `rest_config_raw` models.
 fn rest_config(declared: &Declared, key: &str) -> Value {
     fn strip(v: &Value) -> Value {
         match v {
