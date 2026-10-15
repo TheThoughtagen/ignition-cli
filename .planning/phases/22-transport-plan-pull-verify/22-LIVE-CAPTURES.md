@@ -7389,6 +7389,283 @@ $ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; Get-Child
 [exit 1]
 ~~~
 
+
+## C6-post — after the post-C6 grant on production (2026-10-15)
+
+POST-C6 PROVISIONING CHANGE. After the C6 section above was captured (and after Decision B was recorded), the USER ran, on the capture host, `icacls "C:\Program Files\Inductive Automation\Ignition\data\config\resources\production" /grant "ignwin836\svc-ignition-deploy:(OI)(CI)(M)"` on 2026-10-15 (output: "Successfully processed 1 files"). The C6 answers above keep describing the account as originally provisioned; this section describes it after the grant. This driver made no ACL change. Probes below run as `svc-ignition-deploy` over ssh and sftp: put a file straight into `production`, rename it there, rename a staged file from the home into it, remove it; the scan state is read before and after.
+
+`<H>` stands for exactly these ssh/sftp options, in this order (the `hardened_options` set with an identity): `-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.cache/ign-wflwvm01/known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR `
+
+### C6-post-acl — the ACL after the grant
+
+#### icacls data\\config\\resources\\production (after the grant)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\\production\" ` @ 2026-10-15T11:16:23Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data\config\resources\production ignwin836\svc-ignition-deploy:(OI)(CI)(M)
+                                                                                ignwin836\svc-ignition-deploy:(I)(OI)(CI)(RX)
+                                                                                NT SERVICE\TrustedInstaller:(I)(F)
+                                                                                NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                                NT AUTHORITY\SYSTEM:(I)(F)
+                                                                                NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                                BUILTIN\Administrators:(I)(F)
+                                                                                BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                                BUILTIN\Users:(I)(RX)
+                                                                                BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                                CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                                APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+#### icacls data\\config\\resources (the grant must be on production only)
+
+`ssh -T -p 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 icacls\ \"C:\\Program\ Files\\Inductive\ Automation\\Ignition\\data\\config\\resources\" ` @ 2026-10-15T11:16:25Z
+
+~~~
+[stdout]
+C:\Program Files\Inductive Automation\Ignition\data\config\resources ignwin836\svc-ignition-deploy:(OI)(CI)(RX)
+                                                                     NT SERVICE\TrustedInstaller:(I)(F)
+                                                                     NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                                                                     NT AUTHORITY\SYSTEM:(I)(F)
+                                                                     NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                                                                     BUILTIN\Administrators:(I)(F)
+                                                                     BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                                                                     BUILTIN\Users:(I)(RX)
+                                                                     BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                                                                     CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                                                                     APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+[1 CR bytes removed from stdout]
+[stderr]
+[exit 0]
+~~~
+
+### C6-post-scan-before
+
+#### GET scan/config (before)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-15T11:16:26Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1792062546739,
+  "lastScanDuration": 1565
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+### C6-post-1 — put, rename, rm directly in production
+
+#### ls -la of production before
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:26Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production"
+[stdout]
+-rw-******    1 -        -             133 Oct 15 02:08 config-mode.json
+[stderr]
+[exit 0]
+~~~
+
+#### put a probe file straight into production
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:28Z
+
+~~~
+[stdin]
+put "$TMP/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt"
+[stdout]
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.S44hU6HxXk/local/a.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### rename it inside production (replaces nothing)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:30Z
+
+~~~
+[stdin]
+rename "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt"
+[stdout]
+sftp> rename "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### stage a file in the home and rename it into production OVER the existing probe (the B(i) commit step, a replace)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:31Z
+
+~~~
+[stdin]
+mkdir "ign-deploy-c6post"
+put "$TMP/local/b.txt" "ign-deploy-c6post/staged.txt"
+rename "ign-deploy-c6post/staged.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt"
+[stdout]
+sftp> mkdir "ign-deploy-c6post"
+sftp> put "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.S44hU6HxXk/local/b.txt" "ign-deploy-c6post/staged.txt"
+sftp> rename "ign-deploy-c6post/staged.txt" "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### get the replaced probe back (bytes must be bravo)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:33Z
+
+~~~
+[stdin]
+get "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt" "$TMP/local/back.txt"
+[stdout]
+sftp> get "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt" "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.S44hU6HxXk/local/back.txt"
+[stderr]
+[exit 0]
+~~~
+
+#### what the get-back holds locally
+
+`bash -c cat\ \"\$1\"\;\ shasum\ -a\ 256\ \"\$1\" _ $TMP/local/back.txt ` @ 2026-10-15T11:16:35Z
+
+~~~
+[stdout]
+bravo
+5da8f23decf397b13f4f55b6fb8a61936238bfe08ed9d901132974f1beccc45c  /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.S44hU6HxXk/local/back.txt
+[stderr]
+[exit 0]
+~~~
+
+#### mkdir and rmdir a probe directory inside production
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:35Z
+
+~~~
+[stdin]
+mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-dir"
+rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-dir"
+[stdout]
+sftp> mkdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-dir"
+sftp> rmdir "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-dir"
+[stderr]
+[exit 0]
+~~~
+
+#### rm the probe file
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:37Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe2.txt"
+[stderr]
+[exit 0]
+~~~
+
+### C6-post-scan-after
+
+#### GET scan/config (after)
+
+`ign --profile azure-win --json api call --method GET --path /data/api/v1/scan/config ` @ 2026-10-15T11:16:38Z
+
+~~~
+[stdout]
+{
+  "ok": true,
+  "profile": "azure-win",
+  "data": {
+    "method": "GET",
+    "path": "/data/api/v1/scan/config",
+    "result": {
+      "status": 200,
+      "data": {
+  "scanActive": false,
+  "lastScanTimestamp": 1792062546739,
+  "lastScanDuration": 1565
+}
+    }
+  }
+}
+[stderr]
+[exit 0]
+~~~
+
+### C6-post-cleanup
+
+#### remove the home staging directory
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:39Z
+
+~~~
+[stdin]
+rmdir "ign-deploy-c6post"
+[stdout]
+sftp> rmdir "ign-deploy-c6post"
+[stderr]
+[exit 0]
+~~~
+
+#### production after the cleanup (config-mode.json only)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:40Z
+
+~~~
+[stdin]
+@ls -la "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production"
+[stdout]
+-rw-******    1 -        -             133 Oct 15 02:08 config-mode.json
+[stderr]
+[exit 0]
+~~~
+
+#### defensive removal of the first probe name (fails with no such file when the rename moved it)
+
+`sftp -q -b - -P 22 -i <key> <H> -- svc-ignition-deploy@40.114.71.134 ` @ 2026-10-15T11:16:42Z
+
+~~~
+[stdin]
+rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt"
+[stdout]
+sftp> rm "/C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt"
+[stderr]
+remote delete /C:/Program Files/Inductive Automation/Ignition/data/config/resources/production/zz-c6post-probe.txt: No such file or directory
+[1 CR bytes removed from stderr]
+[exit 1]
+~~~
+
+**C6-post result (2026-10-15).** With the post-C6 grant, `svc-ignition-deploy` can: `put` a file straight into `production\`, `rename` inside it, `rename` a staged file from its home onto an existing file there (the target then held the staged bytes, sha256 `5da8f23d...`, "bravo"), `mkdir` and `rmdir` a directory in it, and `rm` its own file. The grant is on `production` only: `resources` still shows `svc-ignition-deploy:(OI)(CI)(RX)`. The scan state (`lastScanTimestamp 1792062546739`, `lastScanDuration 1565`, `scanActive false`) is identical before and after. Everything written was removed in the same session; `production` lists `config-mode.json` (133 bytes) only. The last block's exit 1 is the expected "No such file" for the first probe name, which the rename had already moved. This answers the "what C6 does NOT yet settle" caveat of the C6 table for `production` and for Decision B caveat 2 (`Modify` on the mode collection); the C6 table above is the original provisioning and is deliberately not rewritten.
+
+
 ## Decisions
 
 Written after `capture22.sh cv1`, `cv2` and `cv3` ran to completion against the rig above. Every decision cites the blocks it rests on. Two points where a capture contradicts 22-RESEARCH are marked CONTRADICTS. 22-10 follows these decisions; nothing below is taken from research or inference.

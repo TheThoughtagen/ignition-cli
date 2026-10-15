@@ -14,6 +14,8 @@
 #              exit codes and CLIXML, command length, paths over 260 chars,
 #              host key types, the account's groups
 #   c6         what the service account can write and read (Decision B)
+#   c6post     C6 re-checked AFTER the administrator's Modify grant on production
+#              (post-C6 provisioning change of 2026-10-15; C6 itself is untouched)
 #   c5ntfs     on-disk names the gateway writes on NTFS for hostile tag names
 #   clean      remove every scratch artefact this script may have left
 #
@@ -62,8 +64,8 @@ esac
 
 SUB=${1:-}
 case "$SUB" in
-  preflight | c7a | c6 | c5ntfs | clean) ;;
-  *) echo "usage: capture22w.sh preflight|c7a|c6|c5ntfs|clean" >&2; exit 64 ;;
+  preflight | c7a | c6 | c6post | c5ntfs | clean) ;;
+  *) echo "usage: capture22w.sh preflight|c7a|c6|c6post|c5ntfs|clean" >&2; exit 64 ;;
 esac
 
 [ -n "$HOST" ] || { echo "IGN_WFLWVM01_HOST (or IGN_WINVM_HOST) is not set" >&2; exit 2; }
@@ -694,6 +696,44 @@ c6() {
 }
 
 # ===========================================================================
+# c6post: the post-C6 provisioning change. The C6 section describes the
+# account as originally provisioned and is NOT rewritten; this section records
+# the administrator's grant and what the account can do with it. The driver
+# makes no ACL change: it only looks (icacls) and probes with put, rename and
+# rm as the account, then removes everything it wrote.
+c6post() {
+  refuse_if_present 'C6-post'
+  sect 'C6-post — after the post-C6 grant on production (2026-10-15)'
+  prose "POST-C6 PROVISIONING CHANGE. After the C6 section above was captured (and after Decision B was recorded), the USER ran, on the capture host, \`icacls \"C:\\Program Files\\Inductive Automation\\Ignition\\data\\config\\resources\\production\" /grant \"ignwin836\\svc-ignition-deploy:(OI)(CI)(M)\"\` on 2026-10-15 (output: \"Successfully processed 1 files\"). The C6 answers above keep describing the account as originally provisioned; this section describes it after the grant. This driver made no ACL change. Probes below run as \`$SSH_USER\` over ssh and sftp: put a file straight into \`production\`, rename it there, rename a staged file from the home into it, remove it; the scan state is read before and after."
+  h_def
+  local P="$RES_SFTP/production"
+  printf 'alpha\n' > "$LOC/a.txt"
+  printf 'bravo\n' > "$LOC/b.txt"
+  sub 'C6-post-acl — the ACL after the grant'
+  rcap 'icacls data\\config\\resources\\production (after the grant)' "icacls \"$RES_WIN\\production\""
+  rcap 'icacls data\\config\\resources (the grant must be on production only)' "icacls \"$RES_WIN\""
+  sub 'C6-post-scan-before'
+  icap 'GET scan/config (before)' api call --method GET --path /data/api/v1/scan/config
+  sub 'C6-post-1 — put, rename, rm directly in production'
+  scap 'ls -la of production before' "@ls -la \"$P\""
+  scap 'put a probe file straight into production' "put \"$LOC/a.txt\" \"$P/zz-c6post-probe.txt\""
+  scap 'rename it inside production (replaces nothing)' "rename \"$P/zz-c6post-probe.txt\" \"$P/zz-c6post-probe2.txt\""
+  scap 'stage a file in the home and rename it into production OVER the existing probe (the B(i) commit step, a replace)' \
+    'mkdir "ign-deploy-c6post"' "put \"$LOC/b.txt\" \"ign-deploy-c6post/staged.txt\"" \
+    "rename \"ign-deploy-c6post/staged.txt\" \"$P/zz-c6post-probe2.txt\""
+  scap 'get the replaced probe back (bytes must be bravo)' "get \"$P/zz-c6post-probe2.txt\" \"$LOC/back.txt\""
+  run_block 'what the get-back holds locally' "" bash -c 'cat "$1"; shasum -a 256 "$1"' _ "$LOC/back.txt"
+  scap 'mkdir and rmdir a probe directory inside production' "mkdir \"$P/zz-c6post-dir\"" "rmdir \"$P/zz-c6post-dir\""
+  scap 'rm the probe file' "rm \"$P/zz-c6post-probe2.txt\""
+  sub 'C6-post-scan-after'
+  icap 'GET scan/config (after)' api call --method GET --path /data/api/v1/scan/config
+  sub 'C6-post-cleanup'
+  scap 'remove the home staging directory' 'rmdir "ign-deploy-c6post"'
+  scap 'production after the cleanup (config-mode.json only)' "@ls -la \"$P\""
+  scap 'defensive removal of the first probe name (fails with no such file when the rename moved it)' "rm \"$P/zz-c6post-probe.txt\""
+}
+
+# ===========================================================================
 c5ntfs() {
   refuse_if_present 'C5-NTFS —'
   sect 'C5-NTFS — on-disk names the 8.3.6 gateway writes on NTFS for hostile tag folder names (deferred here by 21-CONTEXT D-04)'
@@ -735,6 +775,7 @@ case "$SUB" in
   preflight) preflight ;;
   c7a) c7a ;;
   c6) c6 ;;
+  c6post) c6post ;;
   c5ntfs) c5ntfs ;;
   clean) SPLICED=1; scratch_clean; cat "$SEC" ;;
 esac
