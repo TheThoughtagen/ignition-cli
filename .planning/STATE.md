@@ -4,16 +4,17 @@ milestone: v1.6
 milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
-status: verifying
-stopped_at: Completed 22-14-PLAN.md
-last_updated: "2026-10-15T18:32:45.800Z"
+status: executing
+stopped_at: Completed 22-15-PLAN.md
+last_updated: "2026-10-15T22:08:09.351Z"
 last_activity: 2026-10-15
+last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 6
-  completed_phases: 3
-  total_plans: 29
-  completed_plans: 29
-  percent: 50
+  completed_phases: 2
+  total_plans: 31
+  completed_plans: 30
+  percent: 33
 ---
 
 # Project State
@@ -28,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 14 of 14
-Status: Phase complete — ready for verification
-Last activity: 2026-10-15
+Plan: 2 of 16
+Status: Ready to execute
+Last activity: 2026-10-15 — Phase 22 execution started
 
-Progress: [██████████] 100%
+Progress: [██████████] 97%
 
 ## Performance Metrics
 
@@ -74,6 +75,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P12 | 75min | 3 tasks | 3 files |
 | Phase 22 P13 | 3h | 2 tasks | 14 files |
 | Phase 22 P14 | 15h | 3 tasks | 7 files |
+| Phase 22 P15 | 2h25m | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -108,8 +110,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-15T18:32:45.732Z
-**Stopped At:** Completed 22-14-PLAN.md
+**Last session:** 2026-10-15T22:08:09.339Z
+**Stopped At:** Completed 22-15-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -162,3 +164,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-12 Decision B = B(i): home-relative staging; ledger and journal at ign-deploy/<gateway>/<mode>/ in the service account home on ssh nodes (LocalFs keeps data_dir/ign-deploy); spec section 9 amendment still to do; account needs Modify on each mode collection
 - [Phase ?]: 22-13: Windows listings are marked with pwd and every Windows read is cross-checked against a PowerShell \\?\ walk; ssh ledgers and staging live in the account home (B(i))
 - [Phase ?]: 22-14: hold budget measured at 152 files is 505 s (no Defender exclusion) and 699 s (exclusion), both above the 300 s ceiling: open for Phase 23; op_timeout_s default 120 to 1050; no Defender exclusion recommended on timing grounds
+- [Phase ?]: 22-15: N1 null normalisation is symmetric (null equals absent on file and REST side); N3 key lookup stays on raw REST map
