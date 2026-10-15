@@ -151,6 +151,15 @@ impl Target {
                 push(format!("{field} {value:?}: {why}"));
             }
         }
+        // `core` and `local` are collections the gateway reserves. The write
+        // half refuses them (`mirror_mode_problem`); the read half would take
+        // `core` for the mode layer, or find `local` empty over sftp.
+        if self.mode == "core" || self.mode == "local" {
+            push(format!(
+                "mode {:?}: names a collection the gateway reserves",
+                self.mode
+            ));
+        }
         let backup = self.nodes.backup.as_ref().map(|n| ("nodes.backup", n));
         for (label, node) in std::iter::once(("nodes.master", &self.nodes.master)).chain(backup) {
             if node.profile.is_empty() {
@@ -284,6 +293,27 @@ mod tests {
         let bssh = backup.ssh.expect("backup ssh");
         assert_eq!((bssh.os, bssh.port), (TargetOs::Linux, None));
         assert_eq!(bssh.key_env.as_deref(), Some("PLANT_A_KEY"));
+    }
+
+    #[test]
+    fn reserved_collection_modes_are_refused() {
+        // WR-02: `core` and `local` are collections the gateway reserves; a
+        // plan, pull or verify of them would read the wrong collection.
+        for mode in ["core", "local"] {
+            let yaml = format!(
+                "schema_version: 1\ngateway: g\nmode: {mode}\nnodes:\n  master:\n    profile: p\n"
+            );
+            let all: Vec<String> =
+                findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err(mode))
+                    .into_iter()
+                    .map(|f| f.message)
+                    .collect();
+            assert_eq!(all.len(), 1, "{all:?}");
+            assert!(
+                all[0].contains(mode) && all[0].contains("reserves"),
+                "{all:?}"
+            );
+        }
     }
 
     #[test]
