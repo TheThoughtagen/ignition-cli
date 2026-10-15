@@ -5,16 +5,16 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-15-PLAN.md
-last_updated: "2026-10-15T22:08:09.351Z"
+stopped_at: "22-16 Task 3: CI red on windows-latest (run 38816133586); SUMMARY status failed"
+last_updated: "2026-10-15T22:21:31.200Z"
 last_activity: 2026-10-15
 last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 31
-  completed_plans: 30
-  percent: 33
+  completed_plans: 31
+  percent: 50
 ---
 
 # Project State
@@ -96,6 +96,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
 - [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
 - [RESOLVED 22-13] svc-ignition-deploy has Modify on the Azure VM `production` collection (post-C6 grant of 2026-10-15, verified as the account); used by the 22-13 live proof and the 22-14 timings
+- G-22-1 not closed: CI run 38816133586 red on check (windows-latest); 3 needless borrows in local.rs commit_apply (cfg(not(unix))) lines 1265/1278/1300; macos/ubuntu cancelled
 
 ### Quick Tasks Completed
 
@@ -110,9 +111,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-15T22:08:09.339Z
-**Stopped At:** Completed 22-15-PLAN.md
-**Resume file:** None
+**Last session:** 2026-10-15T22:21:31.179Z
+**Stopped At:** 22-16 Task 3: CI red on windows-latest (run 38816133586); SUMMARY status failed
+**Resume file:** .planning/phases/22-transport-plan-pull-verify/22-16-SUMMARY.md
 
 ## Decisions
 
