@@ -15,6 +15,10 @@
 //!   text; it is normalised, written 0600 into the temp dir, passed as
 //!   `-i <file>` with `IdentitiesOnly=yes`, and deleted with the temp dir on
 //!   drop. Only the path ever appears in argv. The key text is not retained.
+//!   The binary installs no signal handler, so a SIGINT or SIGTERM can skip
+//!   that drop. The residual is bounded: the dir is 0700 and the key 0600, and
+//!   the next shell sweeps `ign-ssh-*` dirs of the same owner that are older
+//!   than [`STALE_TEMP_AGE`] ([`sweep_stale_temp_dirs`]).
 //! - **Bounded in time (D-04).** `ConnectTimeout` plus `ServerAlive*` inside
 //!   ssh, and a per-call timeout with kill in the process runner.
 //! - **One temp dir per shell**, so two shells never share a file.
@@ -280,6 +284,82 @@ fn setup_failed(label: &str, detail: impl Into<String>) -> CoreError {
         node: label.to_string(),
         detail: detail.into(),
     }
+}
+
+/// Name prefix of a shell's private temp dir.
+const TEMP_PREFIX: &str = "ign-ssh-";
+
+/// How old an `ign-ssh-*` dir must be before a later shell treats it as left
+/// behind by a killed run. Far longer than any one run (the default op timeout
+/// is 1050 s), so a concurrent run's dir is never swept.
+pub(crate) const STALE_TEMP_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Best-effort removal of `ign-ssh-*` dirs left in `root` by a run that was
+/// killed before its `TempDir` dropped (SIGINT, SIGTERM): they may hold a
+/// `key_env` private key and downloaded gateway files.
+///
+/// Only a real directory (never a symlink) whose name starts with
+/// [`TEMP_PREFIX`], whose owner is `owner` (the uid of this shell's own temp
+/// dir; `None` skips the check on platforms without uids) and whose mtime is at
+/// least `max_age` before `now` is removed. Every error is ignored: a failed
+/// sweep must never fail a run. Returns how many dirs were removed.
+pub(crate) fn sweep_stale_temp_dirs(
+    root: &Path,
+    owner: Option<u32>,
+    now: std::time::SystemTime,
+    max_age: Duration,
+) -> usize {
+    let Ok(read) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in read.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if owner.is_some_and(|uid| uid != meta.uid()) {
+                continue;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = owner;
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if old && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Sweep the siblings of `own` (this shell's fresh temp dir) that a killed run
+/// left behind.
+fn sweep_own_stale_temp_dirs(own: &Path) {
+    let Some(root) = own.parent() else { return };
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(own).ok().map(|m| m.uid())
+    };
+    #[cfg(not(unix))]
+    let owner = None;
+    #[cfg(unix)]
+    if owner.is_none() {
+        return;
+    }
+    sweep_stale_temp_dirs(root, owner, std::time::SystemTime::now(), STALE_TEMP_AGE);
 }
 
 /// Create `path` exclusively with owner-only permissions and write `bytes`.
@@ -617,11 +697,12 @@ impl RemoteShell {
         }
 
         let temp = tempfile::Builder::new()
-            .prefix("ign-ssh-")
+            .prefix(TEMP_PREFIX)
             .tempdir()
             .map_err(|e| {
                 setup_failed(label, format!("cannot create a temp dir ({:?})", e.kind()))
             })?;
+        sweep_own_stale_temp_dirs(temp.path());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -929,6 +1010,65 @@ impl RemoteShell {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_ssh_temp_dirs_are_swept_and_nothing_else() {
+        // WR-01: a killed run leaves its key and downloads behind; the next
+        // run removes only old, owned, real `ign-ssh-*` directories.
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().expect("root");
+        let age = |dir: &Path, by: Duration| {
+            let file = std::fs::File::open(dir).expect("open dir");
+            file.set_modified(std::time::SystemTime::now() - by)
+                .expect("set mtime");
+        };
+        let old = root.path().join("ign-ssh-old");
+        std::fs::create_dir_all(old.join("ign-read-1")).expect("old");
+        std::fs::write(old.join("key"), b"PRIVATE").expect("key");
+        age(&old, Duration::from_secs(7 * 60 * 60));
+        let fresh = root.path().join("ign-ssh-fresh");
+        std::fs::create_dir(&fresh).expect("fresh");
+        let other = root.path().join("other-old");
+        std::fs::create_dir(&other).expect("other");
+        age(&other, Duration::from_secs(7 * 60 * 60));
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("precious"), b"x").expect("precious");
+        age(outside.path(), Duration::from_secs(7 * 60 * 60));
+        let link = root.path().join("ign-ssh-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+
+        let uid = std::fs::metadata(root.path()).expect("meta").uid();
+        // a different owner is never swept
+        assert_eq!(
+            sweep_stale_temp_dirs(
+                root.path(),
+                Some(uid.wrapping_add(1)),
+                std::time::SystemTime::now(),
+                STALE_TEMP_AGE
+            ),
+            0
+        );
+        assert!(old.exists());
+        let removed = sweep_stale_temp_dirs(
+            root.path(),
+            Some(uid),
+            std::time::SystemTime::now(),
+            STALE_TEMP_AGE,
+        );
+        assert_eq!(removed, 1);
+        assert!(!old.exists(), "the stale dir and its key are gone");
+        assert!(fresh.exists(), "a recent dir may belong to a live run");
+        assert!(other.exists(), "only ign-ssh-* dirs are touched");
+        assert!(
+            outside.path().join("precious").exists(),
+            "a symlink is never followed"
+        );
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "the symlink itself is left alone"
+        );
+    }
 
     #[test]
     fn safe_remote_path_hostile_table() {
