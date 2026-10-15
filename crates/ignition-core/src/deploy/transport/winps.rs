@@ -77,6 +77,80 @@ pub const MOVE_REPLACE: &str = "Move-Item -LiteralPath $p.src -Destination $p.ds
 /// `x=0`. An unreadable directory is a terminating error.
 pub const ENUMERATE: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){$l=$b.Length+1;$s=New-Object Collections.Stack;$s.Push($b);while($s.Count){foreach($f in ([IO.DirectoryInfo]$s.Pop()).EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$n=$f.FullName;$e+=,@($n.Substring($l),$d,$z,$r,$n.Length);if($d -and !$r){$s.Push($n)}}}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
 
+/// Why `name` cannot be ONE component of a path on a Windows host, or `None`.
+///
+/// This is the Windows half of the path gate. It refuses everything the POSIX
+/// gate refuses (empty, `.`, `..`, a separator, NUL and other control
+/// characters) and the ways Windows lets a name leave its directory or mean
+/// something else: a `:` (a drive letter injected into a component, or an
+/// alternate data stream `name:stream`), the characters NTFS forbids
+/// (`< > " | ? *`), a trailing dot or space (Windows strips them, so two names
+/// would be one entry) and the reserved device names (`CON`, `NUL`, `COM1`,
+/// ... with or without an extension). `\\?\` and UNC prefixes cannot pass as a
+/// component because they hold separators and a colon.
+pub fn windows_component_problem(name: &str) -> Option<String> {
+    let quoted = |why: &str| Some(format!("the name {name:?} {why}"));
+    if name.is_empty() {
+        return quoted("is empty");
+    }
+    if name == "." || name == ".." {
+        return quoted("is `.` or `..`");
+    }
+    if let Some(bad) = name.chars().find(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+    }) {
+        return Some(format!(
+            "the name {name:?} holds {bad:?}, which cannot be part of a Windows path component (separators, drive letters, alternate data streams and reserved characters)"
+        ));
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return quoted("ends in a dot or a space, which Windows strips");
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            upper
+                .strip_prefix(prefix)
+                .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+        });
+    if device {
+        return quoted("is a reserved Windows device name");
+    }
+    None
+}
+
+/// Why `path` is not an absolute path in the sftp spelling of a Windows host
+/// (`/C:/dir/...`), or `None`: a leading `/`, a drive letter component
+/// (`C:`), at least one more component, and every component passing
+/// [`windows_component_problem`]. Refuses `C:/...` (home-relative on this
+/// server), UNC (`//host/...`), `\\?\` prefixes, `..`, empty components and a
+/// second drive letter.
+pub fn windows_absolute_path_problem(path: &str) -> Option<String> {
+    let Some(rest) = path.strip_prefix('/') else {
+        return Some(format!("{path:?} does not start with `/`"));
+    };
+    let mut parts = rest.split('/');
+    let drive = parts.next().unwrap_or_default();
+    let drive_ok = matches!(drive.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic());
+    if !drive_ok {
+        return Some(format!(
+            "{path:?} does not start with a drive letter component such as `/C:/`"
+        ));
+    }
+    let mut below = 0usize;
+    for part in parts {
+        if let Some(why) = windows_component_problem(part) {
+            return Some(format!("{path:?}: {why}"));
+        }
+        below += 1;
+    }
+    if below == 0 {
+        return Some(format!("{path:?} is a drive root"));
+    }
+    None
+}
+
 /// One fixed script and its parameters.
 #[derive(Debug, Clone)]
 pub struct WinScript {
@@ -308,8 +382,16 @@ pub fn parse_enumeration(
             ) else {
                 return Err(bad("an entry has the wrong columns"));
             };
+            // every path the host reports passes the same gate as any other
+            // path that can reach a batch line
+            let rel = rel.replace('\\', "/");
+            for component in rel.split('/') {
+                if let Some(why) = windows_component_problem(component) {
+                    return Err(bad(&format!("an entry path is refused: {why}")));
+                }
+            }
             list.push(EnumEntry {
-                rel: rel.replace('\\', "/"),
+                rel,
                 dir: dir != 0,
                 size,
                 reparse: reparse != 0,
@@ -761,6 +843,132 @@ mod tests {
                 .expect("the link is reported");
             // on macOS/Linux pwsh the ReparsePoint attribute is set for symlinks
             assert!(link.reparse, "a symlink is flagged: {link:?}");
+        }
+    }
+
+    /// Gate parity (post-review): everything the POSIX gate refuses, and the
+    /// Windows-only ways to escape a directory, are refused as a component.
+    #[test]
+    fn windows_component_gate_refuses_what_posix_refuses_and_more() {
+        for ok in [
+            "plain",
+            "MES db,1",
+            "Caf\u{e9} DB",
+            ".resources",
+            "Program Files (x86)",
+            "a.b",
+            "%43%4f%4e",
+            "CONSOLE",
+            "NULL1",
+            "COM10",
+        ] {
+            assert_eq!(windows_component_problem(ok), None, "{ok:?} is allowed");
+        }
+        for bad in [
+            // the POSIX gate
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "a\nb",
+            // drive letters and alternate data streams
+            "C:",
+            "C:x",
+            "a:b",
+            "name:stream",
+            "name::$DATA",
+            // \\?\ and UNC prefixes arrive as separators and colons
+            "\\\\?\\C:",
+            "?",
+            // Windows strips a trailing dot or space: two names, one entry
+            "a.",
+            "a ",
+            "a..",
+            // reserved device names, with or without an extension
+            "CON",
+            "con",
+            "Nul",
+            "aux.txt",
+            "PRN.json",
+            "COM1",
+            "lpt9.cfg",
+            // characters Windows forbids
+            "a<b",
+            "a>b",
+            "a|b",
+            "a\"b",
+            "a*b",
+        ] {
+            assert!(
+                windows_component_problem(bad).is_some(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_absolute_path_gate() {
+        for ok in [
+            "/C:/Users/svc",
+            "/c:/Users/svc/ign-deploy/gw/production/staging/run-1",
+            "/D:/a b/c",
+        ] {
+            assert_eq!(windows_absolute_path_problem(ok), None, "{ok}");
+        }
+        for bad in [
+            "",
+            "/",
+            "/C:",
+            "C:/Users/svc",
+            "/Users/svc",
+            "/C:/Users/../x",
+            "/C:/Users/./x",
+            "/C:/Users//x",
+            "/C:/Users/svc/D:/x",
+            "/C:/Users/svc/x:stream",
+            "/C:/Users/svc/x.",
+            "/C:/Users/svc/NUL",
+            "//server/share/x",
+            "/C:\\Users",
+            "/C:/Users/svc\0",
+            "/\\\\?\\C:/x",
+            "/CC:/x",
+        ] {
+            assert!(
+                windows_absolute_path_problem(bad).is_some(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_enumeration_applies_the_windows_gate_to_every_path() {
+        let entry = |rel: &str| {
+            serde_json::json!({
+                "ok": 1,
+                "res": [{ "i": 0, "x": 1, "e": [[rel, 0, 1, 0, 50]] }]
+            })
+        };
+        assert!(parse_enumeration(&entry("a\\b.json"), 1).is_ok());
+        for bad in [
+            "..\\x",
+            "a\\..\\b",
+            "\\\\?\\C:\\x",
+            "C:\\x",
+            "/abs",
+            "a\\\\b",
+            "a:b\\c",
+            "a\\b.",
+            "a\\NUL",
+            "",
+            "a\0b",
+        ] {
+            assert!(
+                parse_enumeration(&entry(bad), 1).is_err(),
+                "{bad:?} must be refused"
+            );
         }
     }
 }

@@ -55,7 +55,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::remote::{RemoteShell, SftpFailure, SftpOp, classify_sftp_stderr, safe_remote_path};
-use super::winps::{self, LONG_PATH_LIMIT, LONG_PATH_PREFIX};
+use super::winps::{
+    self, LONG_PATH_LIMIT, LONG_PATH_PREFIX, windows_absolute_path_problem,
+    windows_component_problem,
+};
 use super::{
     CORE_COLLECTION, DeleteSet, FileBlob, MIRROR_MIN_COMPONENTS, MirrorReport, ObservedFiles,
     READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode,
@@ -430,7 +433,13 @@ pub fn parse_batch_listing_as(
         if name.is_empty() {
             return Err(bad("a listing line has an empty name".to_string()));
         }
-        if let Err(why) = safe_remote_path(name) {
+        let problem = safe_remote_path(name).err().or_else(|| {
+            // a Windows host's names also pass the Windows component gate
+            (format == ListFormat::Marked)
+                .then(|| windows_component_problem(name))
+                .flatten()
+        });
+        if let Some(why) = problem {
             if names == NameRule::Skip {
                 continue;
             }
@@ -452,6 +461,20 @@ pub fn parse_batch_listing_as(
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         if let Some(pair) = entries.windows(2).find(|w| w[0].name == w[1].name) {
             return Err(bad(format!("the name {:?} is listed twice", pair[0].name)));
+        }
+        if format == ListFormat::Marked {
+            // NTFS is case-insensitive: two names that differ only by case
+            // cannot be two entries of one directory
+            let mut folded: BTreeSet<String> = BTreeSet::new();
+            if let Some(dup) = entries
+                .iter()
+                .find(|e| !folded.insert(e.name.to_lowercase()))
+            {
+                return Err(bad(format!(
+                    "the name {:?} is listed twice, ignoring case",
+                    dup.name
+                )));
+            }
         }
     }
     Ok(out)
@@ -670,6 +693,8 @@ impl SftpTransport {
     /// `abs` relative to `data_dir`, for messages.
     fn shown(&self, abs: &str) -> String {
         abs.strip_prefix(&self.data_dir)
+            // only a whole component of data_dir: `/data-evil` is not below `/data`
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
             .map(|rest| rest.trim_start_matches('/'))
             .filter(|rest| !rest.is_empty())
             .unwrap_or(".")
@@ -742,7 +767,9 @@ impl SftpTransport {
             return Err(self.fail("the server did not report exactly one working directory"));
         };
         let trimmed = raw.trim_end_matches('/');
-        let problem = if !trimmed.starts_with('/') {
+        let problem = if self.windows {
+            windows_absolute_path_problem(trimmed)
+        } else if !trimmed.starts_with('/') {
             Some("is not an absolute path".to_string())
         } else {
             safe_remote_path(trimmed).err().or_else(|| {
@@ -771,6 +798,9 @@ impl SftpTransport {
         mode: &str,
         run_id: &str,
     ) -> Result<StagingMode, CoreError> {
+        for (what, value) in [("gateway", gateway), ("mode", mode), ("run id", run_id)] {
+            self.windows_gate(&format!("the staging {what}"), value)?;
+        }
         let home = self.account_home().await?;
         let root = format!(
             "{home}/{}",
@@ -778,6 +808,11 @@ impl SftpTransport {
         );
         safe_remote_path(&root)
             .map_err(|why| self.fail(format!("the staging root is unsafe: {why}")))?;
+        if self.windows
+            && let Some(why) = windows_absolute_path_problem(&root)
+        {
+            return Err(self.fail(format!("the staging root is refused: {why}")));
+        }
         Ok(StagingMode::Separate { root })
     }
 
@@ -915,22 +950,39 @@ impl SftpTransport {
 
     /// The directory chains a read of `scope` opens, each starting with
     /// `config/resources/<collection>`.
+    /// The Windows half of the component gate: on a Windows host `name` must
+    /// also pass [`windows_component_problem`]. `what` names it in the error.
+    fn windows_gate(&self, what: &str, name: &str) -> Result<(), CoreError> {
+        match self
+            .windows
+            .then(|| windows_component_problem(name))
+            .flatten()
+        {
+            Some(why) => Err(self.fail(format!("{what}: {why}"))),
+            None => Ok(()),
+        }
+    }
+
     fn target_chains(&self, scope: &Scope) -> Result<BTreeSet<Vec<String>>, CoreError> {
         if let Some(why) = component_problem(&scope.mode) {
             return Err(self.fail(format!("the target mode {why}")));
         }
+        self.windows_gate("the target mode", &scope.mode)?;
         safe_remote_path(&scope.mode)
             .map_err(|why| self.fail(format!("the target mode is unsafe: {why}")))?;
         let mut dirs: Vec<Vec<String>> = Vec::new();
         for (module, ty) in &scope.types {
             validate_segment("module", module).map_err(|e| self.fail(e))?;
             validate_segment("type", ty).map_err(|e| self.fail(e))?;
+            self.windows_gate("the module", module)?;
+            self.windows_gate("the type", ty)?;
             dirs.push(vec![module.clone(), ty.clone()]);
         }
         for provider in &scope.tag_providers {
             if let Some(why) = component_problem(provider) {
                 return Err(self.fail(format!("tag provider {provider:?} {why}")));
             }
+            self.windows_gate("the tag provider", provider)?;
             safe_remote_path(provider)
                 .map_err(|why| self.fail(format!("tag provider {provider:?} is unsafe: {why}")))?;
             for tag_type in TAG_TYPES {
@@ -1362,6 +1414,7 @@ impl TreeReader for SftpTransport {
         if let Some(why) = component_problem(collection) {
             return Err(self.fail(format!("the collection name {why}")));
         }
+        self.windows_gate("the collection name", collection)?;
         safe_remote_path(collection)
             .map_err(|why| self.fail(format!("the collection name is unsafe: {why}")))?;
         let mut budget = Budget::default();
@@ -1506,6 +1559,13 @@ impl TreeReader for SftpTransport {
         for (what, value) in [("gateway", gateway), ("mode", mode)] {
             if let Some(why) = component_problem(value) {
                 return Err(bad(format!("the target {what} {why}")));
+            }
+            if let Some(why) = self
+                .windows
+                .then(|| windows_component_problem(value))
+                .flatten()
+            {
+                return Err(bad(format!("the target {what}: {why}")));
             }
         }
         let parts: Vec<&str> = rel.split('/').collect();
@@ -1675,6 +1735,11 @@ impl SftpTransport {
             return Err(why);
         }
         safe_remote_path(mode).map_err(|why| format!("the mode is unsafe: {why}"))?;
+        if self.windows
+            && let Some(why) = windows_component_problem(mode)
+        {
+            return Err(format!("the mode is refused: {why}"));
+        }
         let resources = self.resources_display();
         validate_staging_root_for(&staging, &resources, self.windows)?;
         let staging = match staging {
@@ -1689,6 +1754,11 @@ impl SftpTransport {
                 let normal = format!("/{}", parts.join("/"));
                 safe_remote_path(&normal)
                     .map_err(|why| format!("the staging root is unsafe: {why}"))?;
+                if self.windows
+                    && let Some(why) = windows_absolute_path_problem(&normal)
+                {
+                    return Err(format!("the staging root is refused: {why}"));
+                }
                 StagingMode::Separate { root: normal }
             }
             StagingMode::InPlace => StagingMode::InPlace,
@@ -1711,6 +1781,28 @@ impl SftpTransport {
             node: self.label.clone(),
             detail: detail.to_string(),
         }
+    }
+
+    /// On a Windows host every component of a staged or deleted path must
+    /// also pass the Windows component gate; checked before any I/O.
+    fn windows_paths<'a>(
+        &self,
+        op: &str,
+        paths: impl Iterator<Item = &'a RelPath>,
+    ) -> Result<(), CoreError> {
+        if !self.windows {
+            return Ok(());
+        }
+        for path in paths {
+            for component in path.components() {
+                if let Some(why) = windows_component_problem(component) {
+                    return Err(
+                        self.mirror_fail(op, format!("{path} cannot be a Windows path: {why}"))
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn mirror_setup(&self, op: &str) -> Result<&MirrorSetup, CoreError> {
@@ -2087,6 +2179,7 @@ impl SftpTransport {
     async fn stage_inner(&self, tree: &RenderedTree) -> Result<Staged, CoreError> {
         const OP: &str = "stage";
         let setup = self.mirror_setup(OP)?;
+        self.windows_paths(OP, tree.files.keys())?;
         validate_mirror_inputs(
             tree,
             &DeleteSet::default(),
@@ -2196,6 +2289,10 @@ impl SftpTransport {
             return Err(self.mirror_fail(OP, "these files were staged in a different staging mode"));
         }
         let staged_paths: Vec<&RelPath> = files.iter().map(|(path, _)| path).collect();
+        self.windows_paths(
+            OP,
+            staged_paths.iter().copied().chain(delete_set.files.iter()),
+        )?;
         validate_mirror_paths(&staged_paths, delete_set)
             .and_then(|()| {
                 validate_staging_root_for(&setup.staging, &self.resources_display(), self.windows)
@@ -4451,10 +4548,11 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
 
     #[test]
     fn account_home_answers_are_validated() {
+        // a Windows host reports /X:/...; a POSIX path is not one
         for (answer, ok) in [
             ("/C:/Users/svc", true),
             ("/C:/Users/svc/", true),
-            ("/home/svc", true),
+            ("/home/svc", false),
             ("relative", false),
             ("/C:/Users/../x", false),
             ("/C:/Users/s*c", false),
@@ -4462,12 +4560,21 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         ] {
             let fake = windows_fake();
             fake.knobs().home = Some(answer.to_string());
-            let got = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("runtime")
-                .block_on(windows_transport(&fake).account_home());
-            assert_eq!(got.is_ok(), ok, "{answer}: {got:?}");
+            let got = block_on(windows_transport(&fake).account_home());
+            assert_eq!(got.is_ok(), ok, "windows {answer}: {got:?}");
+        }
+        for (answer, ok) in [
+            ("/home/svc", true),
+            ("/home/svc/", true),
+            ("relative", false),
+            ("/home/../x", false),
+            ("/home/s*c", false),
+            ("/", false),
+        ] {
+            let fake = FakeSftp::new();
+            fake.knobs().home = Some(answer.to_string());
+            let got = block_on(transport(&fake).account_home());
+            assert_eq!(got.is_ok(), ok, "posix {answer}: {got:?}");
         }
     }
 
@@ -4741,5 +4848,321 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
                 .unwrap_or_else(|| panic!("{root} refused"));
             assert!(err.contains("staging root"), "{root}: {err}");
         }
+    }
+
+    // ---- post-review: path gate parity and component boundaries ----------------
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn windows_listing_names_pass_the_windows_gate() {
+        let one = vec!["/C:/d".to_string()];
+        let listing = |name: &str| {
+            format!(
+                "Remote working directory: /C:/h\n-rw-******    1 -        -   8 Oct 15 02:35 {name}\n"
+            )
+        };
+        for bad in [
+            "a:b",
+            "name:stream",
+            "trail.",
+            "trail ",
+            "NUL",
+            "aux.txt",
+            "a<b",
+            "a|b",
+        ] {
+            let text = listing(bad);
+            assert!(
+                parse_batch_listing_as(
+                    ListFormat::Marked,
+                    NameRule::Refuse,
+                    &one,
+                    text.as_bytes(),
+                    100
+                )
+                .is_err(),
+                "{bad:?} must be refused"
+            );
+            let kept = parse_batch_listing_as(
+                ListFormat::Marked,
+                NameRule::Skip,
+                &one,
+                text.as_bytes(),
+                100,
+            )
+            .expect("skip")
+            .remove(0);
+            assert!(kept.is_empty(), "{bad:?} must be skipped, not kept");
+        }
+        // one directory cannot hold two names that differ only by case
+        let twice = "Remote working directory: /C:/h\n\
+-rw-******    1 -        -   8 Oct 15 02:35 Config.json\n\
+-rw-******    1 -        -   9 Oct 15 02:35 config.JSON\n";
+        assert!(
+            parse_batch_listing_as(
+                ListFormat::Marked,
+                NameRule::Refuse,
+                &one,
+                twice.as_bytes(),
+                100
+            )
+            .is_err()
+        );
+        // the POSIX format keeps its rules: a colon is an ordinary name there
+        let posix = "-rw-r--r--    ? svc staff 8 Oct 14 10:21 /d/a:b\n";
+        assert!(parse_batch_listing(&["/d".to_string()], posix.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn windows_home_and_staging_roots_pass_the_windows_path_gate() {
+        for answer in [
+            "/C:/Users/svc/D:/x",
+            "/Users/svc",
+            "/C:/Users/svc.",
+            "/C:/Users/svc/NUL",
+            "/C:/Users/svc/a:stream",
+            "/C:",
+        ] {
+            let fake = windows_fake();
+            fake.knobs().home = Some(answer.to_string());
+            let got = block_on(windows_transport(&fake).account_home());
+            assert!(got.is_err(), "{answer}: {got:?}");
+        }
+        // the POSIX transport is untouched by the Windows gate
+        let fake = FakeSftp::new();
+        fake.knobs().home = Some("/home/svc:1".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/svc:1".to_string());
+        assert!(block_on(transport(&fake).account_home()).is_ok());
+
+        let fake = windows_fake();
+        for root in [
+            "/C:/Users/svc/D:/x",
+            "/C:/Users/svc/x:stream",
+            "/C:/Users/svc/NUL",
+            "/C:/Users/svc/staging.",
+            "/C:/Users/../x",
+            "/Users/svc/staging",
+        ] {
+            let got = windows_transport(&fake).with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: root.to_string(),
+                },
+            );
+            assert!(got.is_err(), "{root} must be refused");
+        }
+        // a sibling is not the thing it is next to, whatever its case
+        for root in [
+            "/C:/gw/data/config/resources2/staging",
+            "/c:/GW/DATA/config/Resources-evil/staging",
+            "/C:/gw/data2/staging",
+            "/C:/gw/data-staging/x",
+        ] {
+            let got = windows_transport(&fake).with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: root.to_string(),
+                },
+            );
+            assert!(
+                got.is_ok(),
+                "{root} is a sibling, not inside: {:?}",
+                got.err()
+            );
+        }
+        // and the real thing is inside, whatever its case and separators
+        for root in [
+            "/c:/GW/Data/CONFIG/resources/x/y",
+            "/C:/gw/data/config/resources/",
+        ] {
+            let got = windows_transport(&fake).with_mirror(
+                "production",
+                StagingMode::Separate {
+                    root: root.to_string(),
+                },
+            );
+            assert!(got.is_err(), "{root} is inside config/resources");
+        }
+    }
+
+    #[test]
+    fn windows_components_pass_the_windows_gate_before_any_session() {
+        let fake = windows_fake();
+        let t = windows_transport(&fake);
+        for (mode, provider, module, ty) in [
+            ("prod:x", None, "ignition", "database-connection"),
+            ("production.", None, "ignition", "database-connection"),
+            ("production", Some("p:q"), "ignition", "database-connection"),
+            ("production", Some("NUL"), "ignition", "database-connection"),
+            ("production", None, "ignition:x", "database-connection"),
+            ("production", None, "ignition", "con"),
+            ("production", None, "ignition", "type "),
+        ] {
+            let scope = Scope {
+                mode: mode.to_string(),
+                types: vec![(module.to_string(), ty.to_string())],
+                tag_providers: provider.map(|p| vec![p.to_string()]).unwrap_or_default(),
+            };
+            assert!(
+                block_on(t.read(&scope)).is_err(),
+                "{mode}/{provider:?}/{module}/{ty}"
+            );
+        }
+        assert!(block_on(t.list_types("core:x")).is_err());
+        assert!(
+            fake.session_lines().is_empty(),
+            "refused before any process was spawned"
+        );
+        // the ledger: gateway and mode
+        for (gateway, mode) in [("gw:x", "production"), ("gw", "NUL"), ("gw.", "production")] {
+            let err = block_on(t.read_ledger(gateway, mode)).expect_err(gateway);
+            assert!(
+                matches!(err, CoreError::DeployLedgerInvalid { .. }),
+                "{err:?}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        // the default staging: gateway, mode and run id
+        for (gateway, mode, run) in [
+            ("gw:x", "production", "r"),
+            ("gw", "NUL", "r"),
+            ("gw", "production", "r:1"),
+            ("gw", "production", "run."),
+            ("gw", "production", "CON"),
+        ] {
+            assert!(
+                block_on(t.default_staging(gateway, mode, run)).is_err(),
+                "{gateway}/{mode}/{run}"
+            );
+        }
+        assert!(fake.session_lines().is_empty());
+        // a mirror for a mode the host cannot name
+        assert!(
+            windows_transport(&fake)
+                .with_mirror("production.", StagingMode::InPlace)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_staged_and_deleted_paths_pass_the_windows_gate_and_write_nothing() {
+        let fake = windows_fake();
+        fixture_collection(&fake);
+        let m = mirror(&fake);
+        for bad in [
+            format!("{DC}/NUL/config.json"),
+            format!("{DC}/a:stream/config.json"),
+            format!("{DC}/trail./config.json"),
+            format!("{DC}/x/aux.json"),
+        ] {
+            let staged = m.stage(&win_tree_of(&[(&bad, "{}")])).await;
+            assert!(staged.is_err(), "{bad} must not be staged");
+        }
+        let staged = m
+            .stage(&win_tree_of(&[(
+                &format!("{DC}/Keep/config.json"),
+                "{\"k\":3}",
+            )]))
+            .await
+            .expect("a clean path stages");
+        let err = m
+            .commit(
+                &staged,
+                &DeleteSet {
+                    files: vec![rel(&format!("{DC}/NUL/config.json"))],
+                },
+            )
+            .await
+            .expect_err("a delete-set path the host cannot name");
+        assert!(matches!(err, CoreError::TransportFailed { .. }));
+        let fs = fake.fs.lock().expect("fs");
+        assert!(matches!(
+            fs.get(&format!("{WRES}/production/{DC}/Keep/config.json")),
+            Some(Node::File(b)) if b == b"{\"keep\":1}"
+        ));
+    }
+
+    #[test]
+    fn windows_cross_check_does_not_let_a_sibling_satisfy_another() {
+        let two_types = || Scope {
+            mode: "production".to_string(),
+            types: vec![
+                ("ignition".to_string(), "database-connection".to_string()),
+                ("ignition".to_string(), "database-connection2".to_string()),
+            ],
+            tag_providers: Vec::new(),
+        };
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(
+            &format!("{WRES}/production/ignition/database-connection2/Other/config.json"),
+            "{\"o\":1}",
+        );
+        let ok = block_on(windows_transport(&fake).read(&two_types())).expect("siblings read");
+        assert_eq!(
+            ok.mode.len(),
+            4,
+            "3 files of the first type, 1 of its sibling"
+        );
+
+        // an entry the host holds in the SIBLING type that sftp dropped is not
+        // covered by the first type's listing
+        let fake = windows_fake();
+        windows_tree(&fake);
+        fake.file(
+            &format!("{WRES}/production/ignition/database-connection2/Other/config.json"),
+            "{\"o\":1}",
+        );
+        fake.knobs().hidden.push(format!(
+            "{WRES}/production/ignition/database-connection2/Other/config.json"
+        ));
+        let err = block_on(windows_transport(&fake).read(&two_types())).expect_err("hidden");
+        let why = detail(err);
+        assert!(
+            why.contains("database-connection2/Other/config.json"),
+            "{why}"
+        );
+
+        // a host entry whose name differs only in case or by a suffix is a
+        // different entry: it is reported, not matched
+        for sibling in [
+            "mes db,1/config.json",
+            "MES db,10/config.json",
+            "MES db,1/config.json2",
+        ] {
+            let fake = windows_fake();
+            windows_tree(&fake);
+            fake.knobs().enum_extra.push((
+                format!("{WRES}/production/ignition/database-connection/{sibling}"),
+                false,
+                9,
+            ));
+            let why = windows_read_failure(&fake);
+            assert!(why.contains(sibling), "{sibling}: {why}");
+        }
+    }
+
+    #[test]
+    fn shown_paths_respect_the_data_dir_component_boundary() {
+        let fake = windows_fake();
+        let t = windows_transport(&fake);
+        assert_eq!(t.shown("/C:/gw/data/config"), "config");
+        assert_eq!(t.shown("/C:/gw/data"), ".");
+        assert_eq!(
+            t.shown("/C:/gw/data-evil/config"),
+            ".",
+            "a sibling is not below data_dir"
+        );
+        assert_eq!(t.shown("/C:/gw/data2"), ".");
     }
 }
