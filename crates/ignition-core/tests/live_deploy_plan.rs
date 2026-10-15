@@ -1,7 +1,9 @@
 //! Phase 22's rig gates against a real Ignition 8.3.6 gateway whose
 //! `config/resources` is bind-mounted: "pull, render, plan is empty" and a
-//! check that `plan` takes no scan-lock (22-09), and `deploy verify` green
-//! then red (22-10).
+//! check that `plan` takes no scan-lock (22-09), `deploy verify` green
+//! then red (22-10), and `pull_then_verify_is_green_live`: a tree made by
+//! `deploy pull` verifies green against the gateway it came from, and one
+//! edited null member turns it red (22-15, G-22-2).
 //!
 //! `deploy_pull` reads the live master through `LocalFsTransport` (the same
 //! `TreeReader` `plan` uses) into a temp repo, `load_declared` renders that
@@ -496,4 +498,152 @@ async fn verify_green_then_red_live() {
         "expected unloaded_resource or resource_missing for {NOUUID_DB}, got {codes:?}"
     );
     eprintln!("PASS verify_green_then_red_live");
+}
+
+// ---- pull then verify (22-15, G-22-2) ---------------------------------------------
+
+const COBRANDING: &str = "ignition/cobranding";
+
+/// The pulled `ignition/cobranding/config.json` under `dir`, wherever the
+/// pull put it (core `resources/` or the mode collection).
+fn find_cobranding(dir: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if let Some(found) = find_cobranding(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|n| n == "config.json")
+            && path
+                .parent()
+                .is_some_and(|p| p.ends_with("ignition/cobranding"))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn first_null_member(config: &serde_json::Value) -> Option<String> {
+    config
+        .as_object()?
+        .iter()
+        .find(|(_, v)| v.is_null())
+        .map(|(k, _)| k.clone())
+}
+
+#[tokio::test]
+#[ignore = "live: needs the ign-deploy-rig fixture and IGNITION_LIVE_DEPLOY=1"]
+async fn pull_then_verify_is_green_live() {
+    let Some(rig) = rig().await else { return };
+
+    // (a) The gate is vacuous unless REST reports unset members as null.
+    let record = DeployApi::resource_singleton(&rig.api, "ignition", "cobranding", None)
+        .await
+        .expect("cobranding singleton read");
+    let rest_nulls = record
+        .config
+        .as_object()
+        .map_or(0, |m| m.values().filter(|v| v.is_null()).count());
+    eprintln!("REST cobranding: {rest_nulls} null member(s)");
+    assert!(
+        rest_nulls > 0,
+        "the REST cobranding config has no null member; this gate would pass vacuously"
+    );
+
+    // (b) Pull into a temp repo and find the pulled cobranding config.
+    let repo = empty_repo(&rig);
+    let reader = reader(repo.path());
+    let pulled = deploy_pull(repo.path(), ENV, reader.as_ref(), false)
+        .await
+        .expect("deploy pull from the live data dir");
+    eprintln!("pull: {} files written", pulled.files_written);
+    let cobranding_file = find_cobranding(&repo.path().join("gateways").join(GATEWAY_DIR))
+        .expect("the pull wrote ignition/cobranding/config.json");
+    eprintln!(
+        "pulled cobranding at {}",
+        cobranding_file
+            .strip_prefix(repo.path())
+            .unwrap_or(&cobranding_file)
+            .display()
+    );
+    let mut file_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cobranding_file).expect("read pulled file"))
+            .expect("pulled config is JSON");
+    let member = first_null_member(&file_config)
+        .expect("the pulled cobranding config holds at least one null member");
+
+    // (c) Green: the pulled tree verifies against the gateway it came from.
+    let declared = load_declared(repo.path(), ENV).expect("render of the pulled repo");
+    let expected = ignition_core::deploy::verify::Expected::from_render(
+        &declared.target.mode,
+        &declared.outcome,
+        &declared.manifest,
+    );
+    assert!(
+        expected.resources.iter().any(|r| r.key == COBRANDING),
+        "{COBRANDING} must be among the compared resources"
+    );
+    let opts = VerifyOptions::default();
+    let green = deploy_verify(
+        &declared,
+        "ign-cli",
+        &rig.api,
+        &rig.api,
+        reader.as_ref(),
+        &opts,
+    )
+    .await
+    .expect("verdict on the pulled tree");
+    print_verdict("pulled", &green);
+    assert!(green.ok, "a pulled tree must verify green: {green:#?}");
+    assert_eq!(green.failure_exit_code(), None);
+    let read_back = green
+        .checks
+        .iter()
+        .find(|c| c.id == ignition_core::deploy::verify::CheckId::ReadBack)
+        .expect("read_back check");
+    assert_eq!(read_back.status, CheckStatus::Pass);
+    assert!(green.resources_checked > 0);
+    assert!(
+        green
+            .checks
+            .iter()
+            .flat_map(|c| c.findings.iter())
+            .all(|f| f.subject != COBRANDING),
+        "no finding may name {COBRANDING}"
+    );
+
+    // (d) Red, by a repo-side edit only: one null member becomes a string.
+    file_config[&member] = serde_json::Value::String("g22-2-live".to_string());
+    std::fs::write(
+        &cobranding_file,
+        serde_json::to_vec_pretty(&file_config).expect("serialize"),
+    )
+    .expect("edit the temp repo's pulled cobranding config");
+    let declared = load_declared(repo.path(), ENV).expect("render of the edited repo");
+    let red = deploy_verify(
+        &declared,
+        "ign-cli",
+        &rig.api,
+        &rig.api,
+        reader.as_ref(),
+        &opts,
+    )
+    .await
+    .expect("verdict on the edited tree");
+    print_verdict("edited", &red);
+    assert!(!red.ok, "one edited member must turn the verdict red");
+    assert_eq!(red.slug, Some(VERIFY_FAILED_SLUG));
+    assert_eq!(red.failure_exit_code(), Some(6));
+    assert!(
+        red.checks
+            .iter()
+            .flat_map(|c| c.findings.iter())
+            .any(|f| f.code == "resource_differs"
+                && f.subject == COBRANDING
+                && f.detail.contains(&member)),
+        "expected resource_differs at {member} for {COBRANDING}"
+    );
+    eprintln!("PASS pull_then_verify_is_green_live");
 }
