@@ -1331,7 +1331,10 @@ mod tests {
         assert_eq!(held.len(), 6);
 
         // Swap the file for a symlink to an outside file after the check.
-        std::fs::remove_file(&inside).expect("remove");
+        // Rename the original aside rather than delete it: a freed inode
+        // number can be handed to the next file created (Linux does), which
+        // would give the replacement below the checked file's (dev, ino).
+        std::fs::rename(&inside, dir.path().join("original")).expect("rename");
         std::os::unix::fs::symlink(&secret, &inside).expect("symlink");
         assert!(matches!(
             open_regular_file(dir.path(), Path::new("f"), &before),
