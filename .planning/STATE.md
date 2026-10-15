@@ -5,14 +5,14 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-12-PLAN.md
-last_updated: "2026-10-15T03:24:24.101Z"
-last_activity: 2026-10-14
+stopped_at: Completed 22-13-PLAN.md
+last_updated: "2026-10-15T12:03:38.435Z"
+last_activity: 2026-10-15
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 27
+  completed_plans: 28
   percent: 33
 ---
 
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 13 of 14
+Plan: 14 of 14
 Status: Ready to execute
-Last activity: 2026-10-14
+Last activity: 2026-10-15
 
-Progress: [█████████░] 93%
+Progress: [██████████] 97%
 
 ## Performance Metrics
 
@@ -72,6 +72,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P10 | 70min | 3 tasks | 7 files |
 | Phase 22 P11 | 60min | 2 tasks | 10 files |
 | Phase 22 P12 | 75min | 3 tasks | 3 files |
+| Phase 22 P13 | 3h | 2 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -105,8 +106,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-15T03:24:24.083Z
-**Stopped At:** Completed 22-12-PLAN.md
+**Last session:** 2026-10-15T12:03:38.421Z
+**Stopped At:** Completed 22-13-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -157,3 +158,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-10: deploy_verify_failed stays a constant in verify.rs (not a CoreError, not in DEPLOY_SLUGS); an unreachable gateway or transport is a CoreError, a refused log or tag source is the check's unavailable input carrying only the slug
 - [Phase ?]: 22-11: deploy verify keeps the CORE-01 profile header; README must not repeat the literal '## Exit codes' before the real section (readme_exit_table_agreement splits on it)
 - [Phase ?]: 22-12 Decision B = B(i): home-relative staging; ledger and journal at ign-deploy/<gateway>/<mode>/ in the service account home on ssh nodes (LocalFs keeps data_dir/ign-deploy); spec section 9 amendment still to do; account needs Modify on each mode collection
+- [Phase ?]: 22-13: Windows listings are marked with pwd and every Windows read is cross-checked against a PowerShell \\?\ walk; ssh ledgers and staging live in the account home (B(i))

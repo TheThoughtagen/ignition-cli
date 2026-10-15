@@ -293,7 +293,7 @@ Plans:
 **Capture first**: C6 (can `svc-ignition-deploy` write a home-relative staging directory outside `data/config/`, and is that directory ever read as a collection; this decides Decision B); C7a (Win32-OpenSSH sftp path form `/C:/` vs `C:/`, quoting, key ACL, the stdin hang, CLIXML on stderr, sftp-server long paths; all INFERRED until captured); OQ5 (real-transport write and scan timings from WFLWVM01 with a prod-sized tree, setting the `holdTimeout` p95 and margin and the Defender-exclusion decision). All three block Phase 23 planning.
 **Exit gate before Phase 23 is planned**: Decision B is recorded from C6, and the hold budget measured under OQ5 (p95, floored, ceilinged) replaces the spec's 5 s figure, which came from a local `docker cp`.
 **Constraints**: Decision A governs the verify verdict (`ok:true`, `data.ok=false`, slug in `data`, exit 6; verdict slugs never appear in exit tables). `plan` always exits 0; no `--detailed-exitcode` (SF-2). `--base` is the three-way drift input (SF-4); the apply-side drift gate is Phase 23. `pull` is in scope; a core-strip command is not (SF-5). System `ssh`/`sftp` only, with no SSH library crate. One layered seam: `RemoteShell` under `FileTransport` (`SftpTransport`, `LocalFsTransport`). `robocopy /MIR` is rejected; deletes come only from the bounded list. Snapshots and staging never go inside `data/config/resources/`, and nothing dot-named is created there (Designer `NameInvalidException`).
-**Plans**: 12/14 plans executed (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14)
+**Plans**: 13/14 plans executed (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14)
 
 Plans:
 **Wave 1**
@@ -343,7 +343,7 @@ Plans:
 
 **Wave 12** *(blocked on Wave 11 completion)*
 
-- [ ] 22-13-PLAN.md — Windows transport code from C7a (path form, rename, PowerShell `-EncodedCommand`), Decision B ledger location; live proof on WFLWVM01 (SC-1)
+- [x] 22-13-PLAN.md — Windows transport code from C7a (path form, rename, PowerShell `-EncodedCommand`), Decision B ledger location; live proof on WFLWVM01 (SC-1)
 
 **Wave 13** *(blocked on Wave 12 completion)*
 
@@ -424,7 +424,7 @@ Plans:
 | 19. Module Uninstall on Undeclare | v1.3 | 3/3 | Complete (SC-1, SC-4 proven live) | 2026-09-28 |
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
-| 22. Transport, Plan, Pull & Verify | v1.6 | 12/14 | In Progress|  |
+| 22. Transport, Plan, Pull & Verify | v1.6 | 13/14 | In Progress|  |
 | 23. Guarded Apply & Rollback | v1.6 | 0/? | Not started | — |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |

@@ -40,7 +40,7 @@ Numbering: new categories. **47 requirements.**
 
 ### Transport, Plan, Pull, Verify (read-only)
 
-- [ ] **DPLN-01**: `ign` reads and writes a gateway's config tree over system OpenSSH to a Windows OpenSSH host (and over the local filesystem for rigs and tests) with batch mode, a pinned host key, per-call timeouts and argv-only invocation; file hashes are computed client-side
+- [x] **DPLN-01**: `ign` reads and writes a gateway's config tree over system OpenSSH to a Windows OpenSSH host (and over the local filesystem for rigs and tests) with batch mode, a pinned host key, per-call timeouts and argv-only invocation; file hashes are computed client-side
 - [x] **DPLN-02**: User can run `ign deploy plan` to see each resource as added, changed, removed or same against the live master, with zero writes and zero locks, exit 0, `data.summary.has_changes`, and a `plan_sha256` (Phase 22 D-06: a fifth status, `unmanaged`, lists live allowlisted resources that are neither rendered nor in the delete set; never deleted, never counted in has_changes)
 - [x] **DPLN-03**: The plan classifies every entry's relation to `core` (none, identical, differs, hidden, shadows_removal) and flags destructive and lockout-risk entries
 - [x] **DPLN-04**: The plan states the exact delete set — previously declared names minus rendered names — which never includes `config-mode.json` or an undeclared resource
@@ -131,7 +131,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DRND-06 | Phase 21 | Complete |
 | DRND-07 | Phase 21 | Complete |
 | DRND-08 | Phase 21 | Complete |
-| DPLN-01 | Phase 22 | Pending |
+| DPLN-01 | Phase 22 | Complete |
 | DPLN-02 | Phase 22 | Complete |
 | DPLN-03 | Phase 22 | Complete |
 | DPLN-04 | Phase 22 | Complete |
