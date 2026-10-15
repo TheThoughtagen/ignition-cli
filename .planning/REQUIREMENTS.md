@@ -45,7 +45,7 @@ Numbering: new categories. **47 requirements.**
 - [x] **DPLN-03**: The plan classifies every entry's relation to `core` (none, identical, differs, hidden, shadows_removal) and flags destructive and lockout-risk entries
 - [x] **DPLN-04**: The plan states the exact delete set — previously declared names minus rendered names — which never includes `config-mode.json` or an undeclared resource
 - [x] **DPLN-05**: User can pass `--base <previous render>` to mark entries the live gateway changed outside the pipeline as drift
-- [ ] **DPLN-06**: User can run `ign deploy pull` to bootstrap a `gateways/<name>/` tree from a live gateway read-only, such that `render` then `plan` against that gateway is empty
+- [x] **DPLN-06**: User can run `ign deploy pull` to bootstrap a `gateways/<name>/` tree from a live gateway read-only, such that `render` then `plan` against that gateway is empty
 - [x] **DPLN-07**: User can run `ign deploy verify` against the master: scan complete, `deploymentMode` equals the target, every declared resource reads back equal in the effective view, and the gateway log has no "will not be loaded" entry for a declared resource
 - [x] **DPLN-08**: `verify` reads the manifest's `verify.tag_probes[]` and fails when a probed tag is not Good; an absent probe list is a warning, never a pass
 - [x] **DPLN-09**: A red `verify` returns the frozen envelope with findings in `data` and exit 6
@@ -136,7 +136,7 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DPLN-03 | Phase 22 | Complete |
 | DPLN-04 | Phase 22 | Complete |
 | DPLN-05 | Phase 22 | Complete |
-| DPLN-06 | Phase 22 | Pending |
+| DPLN-06 | Phase 22 | Complete |
 | DPLN-07 | Phase 22 | Complete |
 | DPLN-08 | Phase 22 | Complete |
 | DPLN-09 | Phase 22 | Complete |
