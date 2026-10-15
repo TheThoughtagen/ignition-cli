@@ -607,10 +607,15 @@ fn check_read_back(
                 checked += 1;
                 let mut paths = Vec::new();
                 match &res.compare {
-                    Compare::Exact(file) => diff_exact(&strip_nulls(file), rest, "", &mut paths),
-                    Compare::NameKeyedSubset(file) => {
-                        diff_subset(&strip_nulls(file), rest, "", &mut paths);
+                    Compare::Exact(file) => {
+                        let rest = strip_nulls(rest);
+                        diff_exact(&strip_nulls(file), &rest, "", &mut paths);
                     }
+                    Compare::NameKeyedSubset(file) => {
+                        let rest = strip_nulls(rest);
+                        diff_subset(&strip_nulls(file), &rest, "", &mut paths);
+                    }
+                    // the key lookup needs the RAW map (see `diff_attributes`)
                     Compare::Attributes(attrs) => diff_attributes(attrs, rest, &mut paths),
                 }
                 if !paths.is_empty() {
@@ -637,8 +642,9 @@ fn check_read_back(
     (finished(CheckId::ReadBack, detail, findings), checked)
 }
 
-/// The file value with every JSON `null` object member removed, at every
-/// depth (N1).
+/// `value` with every JSON `null` object member removed, at every depth (N1).
+/// Applied to the file value and to the REST value alike, so a null member
+/// equals an absent one on either side.
 fn strip_nulls(value: &Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
@@ -765,6 +771,10 @@ fn diff_subset(file: &Value, rest: &Value, path: &str, out: &mut Vec<String>) {
 }
 
 /// N3: the attribute keys the REST config also carries must be equal.
+///
+/// The key lookup is on the RAW REST map: a REST `null` for a declared key is
+/// a present key, so it is compared (and differs from a declared value), not
+/// skipped as absent. Only the values are null-stripped (N1).
 fn diff_attributes(attrs: &Map<String, Value>, rest: &Value, out: &mut Vec<String>) {
     let Some(rest) = rest.as_object() else {
         out.push("(root)".to_string());
@@ -773,7 +783,7 @@ fn diff_attributes(attrs: &Map<String, Value>, rest: &Value, out: &mut Vec<Strin
     for (key, expected) in attrs {
         if let Some(seen) = rest.get(key) {
             let mut inner = Vec::new();
-            diff_exact(&strip_nulls(expected), seen, "", &mut inner);
+            diff_exact(&strip_nulls(expected), &strip_nulls(seen), "", &mut inner);
             if !inner.is_empty() {
                 out.push(key.clone());
             }
