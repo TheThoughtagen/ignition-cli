@@ -991,7 +991,7 @@ impl RemoteShell {
             node: self.label.clone(),
             detail,
         };
-        let command = winps::encoded_command(script, COMMAND_BUDGET).map_err(&failure)?;
+        let command = winps::encoded_command(script, COMMAND_BUDGET).map_err(failure)?;
         let out = self
             .runner
             .run(

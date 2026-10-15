@@ -182,7 +182,7 @@ impl Ledger {
             )));
         }
         // Strict UTF-8, no BOM, no repeated key, bounded depth.
-        let (_, root) = node::classify(bytes).map_err(&bad)?;
+        let (_, root) = node::classify(bytes).map_err(bad)?;
         let Node::Obj(members) = &root else {
             return Err(bad("the top level is not a JSON object".to_string()));
         };
