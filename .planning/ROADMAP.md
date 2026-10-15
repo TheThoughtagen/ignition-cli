@@ -293,7 +293,7 @@ Plans:
 **Capture first**: C6 (can `svc-ignition-deploy` write a home-relative staging directory outside `data/config/`, and is that directory ever read as a collection; this decides Decision B); C7a (Win32-OpenSSH sftp path form `/C:/` vs `C:/`, quoting, key ACL, the stdin hang, CLIXML on stderr, sftp-server long paths; all INFERRED until captured); OQ5 (real-transport write and scan timings from WFLWVM01 with a prod-sized tree, setting the `holdTimeout` p95 and margin and the Defender-exclusion decision). All three block Phase 23 planning.
 **Exit gate before Phase 23 is planned**: Decision B is recorded from C6, and the hold budget measured under OQ5 (p95, floored, ceilinged) replaces the spec's 5 s figure, which came from a local `docker cp`.
 **Constraints**: Decision A governs the verify verdict (`ok:true`, `data.ok=false`, slug in `data`, exit 6; verdict slugs never appear in exit tables). `plan` always exits 0; no `--detailed-exitcode` (SF-2). `--base` is the three-way drift input (SF-4); the apply-side drift gate is Phase 23. `pull` is in scope; a core-strip command is not (SF-5). System `ssh`/`sftp` only, with no SSH library crate. One layered seam: `RemoteShell` under `FileTransport` (`SftpTransport`, `LocalFsTransport`). `robocopy /MIR` is rejected; deletes come only from the bounded list. Snapshots and staging never go inside `data/config/resources/`, and nothing dot-named is created there (Designer `NameInvalidException`).
-**Plans**: 14/14 plans executed (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14)
+**Plans**: 14/16 plans executed (waves: 1 = 22-01, 2 = 22-02, 3 = 22-03, 4 = 22-04, 5 = 22-05, 6 = 22-06, 7 = 22-07 ∥ 22-08, 8 = 22-09, 9 = 22-10, 10 = 22-11, 11 = 22-12, 12 = 22-13, 13 = 22-14; UAT gap closure: 1 = 22-15, 2 = 22-16)
 
 Plans:
 **Wave 1**
@@ -348,6 +348,14 @@ Plans:
 **Wave 13** *(blocked on Wave 12 completion)*
 
 - [x] 22-14-PLAN.md — OQ5 timings with and without a Defender exclusion, hold budget, D-04 defaults revisited, exit gate recorded in STATE/ROADMAP
+
+**UAT gap closure, wave 1** (G-22-2)
+
+- [ ] 22-15-PLAN.md — G-22-2: symmetric N1 null normalisation in verify `read_back` (cobranding false red), engine/action/binary regression tests, verify doc + README + CV2 table, live pull→verify on the 8.3.6 rig
+
+**UAT gap closure, wave 2** *(blocked on 22-15; the push carries both fixes)* (G-22-1)
+
+- [ ] 22-16-PLAN.md — G-22-1: drop the two needless borrows CI stable clippy denies, every CI step green locally under rustup stable, user push checkpoint, windows-latest green by name
 
 ### Phase 23: Guarded Apply & Rollback
 
