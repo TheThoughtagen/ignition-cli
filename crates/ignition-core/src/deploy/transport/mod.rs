@@ -183,10 +183,24 @@ fn node_access(
         )),
         (None, Some(local)) => {
             let configured = Path::new(&local.data_dir);
+            // A relative data_dir is relative to the repo, and `--repo` is
+            // `.` by default. The mirror validates its staging and resources
+            // roots as absolute paths, so the join is absolutized here.
             let data_dir = if configured.is_absolute() {
                 configured.to_path_buf()
             } else {
-                repo.join(configured)
+                std::path::absolute(repo.join(configured)).map_err(|e| {
+                    CoreError::deploy_tree_invalid(
+                        target_file,
+                        None,
+                        None,
+                        format!(
+                            "{label}.local.data_dir {:?}: cannot be made absolute ({:?})",
+                            local.data_dir,
+                            e.kind()
+                        ),
+                    )
+                })?
             };
             Ok(NodeAccess::Local(data_dir))
         }

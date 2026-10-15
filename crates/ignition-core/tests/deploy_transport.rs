@@ -2053,6 +2053,49 @@ mod default_staging {
     }
 
     #[tokio::test]
+    async fn a_relative_data_dir_stages_and_mirrors_with_a_relative_repo() {
+        // WR-03: `local.data_dir` is relative to the repo and `--repo`
+        // defaults to `.`; the staging root and the resources root are
+        // validated as absolute paths, so both must be absolutized.
+        let node = NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: Some(Local {
+                data_dir: "relative-data".to_string(),
+            }),
+        };
+        let mode = transport::default_staging_mode(
+            Path::new("."),
+            "targets/dev.yaml",
+            "nodes.master",
+            &node,
+            "gw",
+            "production",
+            "run-1",
+        )
+        .await
+        .expect("a relative data_dir stages");
+        let StagingMode::Separate { root } = &mode else {
+            panic!("a separate staging root");
+        };
+        assert_eq!(
+            Path::new(root),
+            std::env::current_dir()
+                .expect("cwd")
+                .join("relative-data/ign-deploy/gw/production/staging/run-1")
+        );
+        let built = transport::mirror_for_node(
+            Path::new("."),
+            "targets/dev.yaml",
+            "nodes.master",
+            &node,
+            "production",
+            mode,
+        );
+        assert!(built.is_ok(), "a relative data_dir builds a mirror");
+    }
+
+    #[tokio::test]
     async fn local_nodes_stage_below_the_data_dir_and_inputs_are_checked() {
         let data = tempfile::tempdir().expect("data");
         let node = local_node(data.path());
