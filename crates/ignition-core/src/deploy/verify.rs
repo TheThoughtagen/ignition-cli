@@ -26,9 +26,13 @@
 //!
 //! Equality is JSON value equality (key order ignored; `1` equals `1.0`).
 //!
-//! - **N1** members whose file value is JSON `null` are dropped from the file
-//!   value first, at every depth, for every type. A REST `null` member where
-//!   the file has none still differs.
+//! - **N1** members whose value is JSON `null` are dropped from the file value
+//!   and from the REST value, at every depth, for every type, before
+//!   comparing. A null member therefore equals an absent one on either side.
+//!   Some 8.3.6 types omit null members from REST (`database-translator`) and
+//!   others echo them (`ignition/cobranding`'s unset image members). A null on
+//!   one side against a non-null value on the other still differs, because
+//!   after the drop the key exists on one side only.
 //! - **N2** `ignition/security-levels`: the file must be a name-keyed subset
 //!   of the REST tree (the gateway merges its own levels in, and orders
 //!   differ).
@@ -215,7 +219,7 @@ pub struct VerifyReport {
 /// How one declared resource's `config.json` is compared.
 #[derive(Clone, PartialEq)]
 pub enum Compare {
-    /// Equal after N1.
+    /// Equal after N1 (both sides).
     Exact(Value),
     /// N2: the file value is a name-keyed subset of the REST value.
     NameKeyedSubset(Value),

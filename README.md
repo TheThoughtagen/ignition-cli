@@ -2933,8 +2933,11 @@ the check is `warn` (not observed). A log that cannot be read, or that fills
 all 5 pages, is `fail` with `logs_unavailable`.
 
 **The read-back comparison (CV2).** Equality is JSON value equality (key
-order is ignored, `1` equals `1.0`). Members that are `null` in the file are
-dropped before comparing (N1). `ignition/security-levels` compares by `name`:
+order is ignored, `1` equals `1.0`). A `null` member counts as absent on both
+sides: nulls are dropped from the file and from the REST value before
+comparing (N1). `ignition/cobranding` is the type whose REST view reports
+its unset members as explicit `null`; a `null` on one side against a value on
+the other still differs. `ignition/security-levels` compares by `name`:
 every level of the file must appear in REST with its members, extra REST
 levels are fine (N2). A unit with no `config.json` compares only the
 attribute keys REST also carries (N3). A REST item whose effective collection
