@@ -604,7 +604,7 @@ fn require_success_maps_every_failure_shape() {
             .require_success("ls", out("", -1, true))
             .expect_err("timeout"),
     );
-    assert!(detail.contains("timed out after 120s"), "{detail}");
+    assert!(detail.contains("timed out after 1050s"), "{detail}");
 
     let detail = transport_failed_detail(
         shell

@@ -103,10 +103,15 @@ pub struct Ssh {
     pub op_timeout_s: Option<u32>,
 }
 
-/// Default `ssh.connect_timeout_s`. Plan 22-14 revisits this from OQ5.
+/// Default `ssh.connect_timeout_s`. Kept at 10 by OQ5-4: the largest of 60
+/// measured sftp sessions (runs A and B, 22-LIVE-CAPTURES.md) took 3.0 s.
 pub const DEFAULT_CONNECT_TIMEOUT_S: u32 = 10;
-/// Default `ssh.op_timeout_s`. Plan 22-14 revisits this from OQ5.
-pub const DEFAULT_OP_TIMEOUT_S: u32 = 120;
+/// Default `ssh.op_timeout_s`: 1050 s. OQ5-4 (22-LIVE-CAPTURES.md): at least
+/// three times the larger of the read p95 and the commit p95 over both OQ5
+/// runs (348.2 s, a 152-file commit), rounded up to 30 s. It was 120 s, which
+/// a measured 152-file commit (234 to 348 s) and read (155 to 221 s) both
+/// exceeded.
+pub const DEFAULT_OP_TIMEOUT_S: u32 = 1050;
 /// Accepted `ssh.connect_timeout_s` range.
 pub const CONNECT_TIMEOUT_RANGE_S: std::ops::RangeInclusive<u32> = 1..=120;
 /// Accepted `ssh.op_timeout_s` range.
@@ -393,7 +398,8 @@ mod tests {
         let ssh = t.nodes.master.ssh.expect("ssh");
         assert_eq!((ssh.connect_timeout_s, ssh.op_timeout_s), (None, None));
         assert_eq!(DEFAULT_CONNECT_TIMEOUT_S, 10);
-        assert_eq!(DEFAULT_OP_TIMEOUT_S, 120);
+        assert_eq!(DEFAULT_OP_TIMEOUT_S, 1050);
+        assert!(OP_TIMEOUT_RANGE_S.contains(&DEFAULT_OP_TIMEOUT_S));
         let t = Target::parse(
             "targets/x.yaml",
             ssh_yaml(
