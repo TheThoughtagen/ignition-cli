@@ -1251,6 +1251,26 @@ async fn scan_timed(api: &dyn DeployApi) -> Res<(f64, Option<i64>)> {
     }
 }
 
+/// `remove_tree` for the restore: a transient ssh failure (the host closing or
+/// timing out a connection) is retried, because a restore that gives up leaves
+/// the host changed.
+async fn remove_tree_retry(shell: &RemoteShell, path: &str) -> Res<bool> {
+    let mut last = String::new();
+    for attempt in 1..=5u64 {
+        match shell
+            .exec_powershell(&script("remove_tree", REMOVE_TREE, path_params(path)))
+            .await
+        {
+            Ok(value) => return Ok(value["gone"] == 1),
+            Err(e) => {
+                last = format!("{e:?}");
+                tokio::time::sleep(Duration::from_secs(10 * attempt)).await;
+            }
+        }
+    }
+    Err(format!("remove_tree of {path} failed 5 times: {last}"))
+}
+
 /// One entry of the production collection: `(is_dir, size, sha256 of a file)`.
 type Snapshot = BTreeMap<String, (bool, u64, String)>;
 
@@ -1668,10 +1688,17 @@ async fn oq5_timings() {
                 "OQ5 {}",
                 serde_json::json!({"label": label, "restore": {"removing_stray_dir": root}})
             );
-            remove_tree(&ctx.shell, &format!("{prod_native}\\{root}")).await;
+            remove_tree_retry(&ctx.shell, &format!("{prod_native}\\{root}")).await?;
         }
-        let (a, _) = cleanup_scratch(&ctx.shell, &staging_native, &staging_native, &home_native)
-            .await;
+        let a = remove_tree_retry(&ctx.shell, &staging_native).await?;
+        ctx.shell
+            .exec_powershell(&script(
+                "remove_if_empty",
+                REMOVE_IF_EMPTY,
+                path_params(&format!("{home_native}\\ign-deploy")),
+            ))
+            .await
+            .map_err(err_s)?;
         println!(
             "OQ5 {}",
             serde_json::json!({"label": label, "restore": {"staging_gone": a}})
