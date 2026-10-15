@@ -5,14 +5,14 @@ milestone_name: Declared Gateway Deploy
 current_phase: 22
 current_phase_name: transport-plan-pull-verify
 status: executing
-stopped_at: Completed 22-11-PLAN.md
-last_updated: "2026-10-14T22:11:06.142Z"
+stopped_at: Completed 22-12-PLAN.md
+last_updated: "2026-10-15T03:24:24.101Z"
 last_activity: 2026-10-14
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 29
-  completed_plans: 26
+  completed_plans: 27
   percent: 33
 ---
 
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 12 of 14
+Plan: 13 of 14
 Status: Ready to execute
 Last activity: 2026-10-14
 
-Progress: [█████████░] 90%
+Progress: [█████████░] 93%
 
 ## Performance Metrics
 
@@ -71,6 +71,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P09 | 95min | 2 tasks | 3 files |
 | Phase 22 P10 | 70min | 3 tasks | 7 files |
 | Phase 22 P11 | 60min | 2 tasks | 10 files |
+| Phase 22 P12 | 75min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -89,6 +90,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Before Phase 23 planning] Decision B (staging location / svc-ignition-deploy write scope) is OPEN. Resolve in Phase 22 from capture C6 and record it; Phase 23 also needs the OQ5 measured hold budget.
 - [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
 - [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
+- 22-12: svc-ignition-deploy has no write on the Azure VM mode collection; the user-approved Modify grant was not made (permission classifier refused); needed for 22-13 live proof and 22-14 timings
 
 ### Quick Tasks Completed
 
@@ -103,8 +105,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-14T22:11:06.123Z
-**Stopped At:** Completed 22-11-PLAN.md
+**Last session:** 2026-10-15T03:24:24.083Z
+**Stopped At:** Completed 22-12-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -154,3 +156,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-10: LOG_WINDOW_SLACK_MS = 1000 and LOG_SETTLE_MS = 5000 per CV1; loaded answers warn while a scan runs and states in its detail that a clean log covers the last scan only
 - [Phase ?]: 22-10: deploy_verify_failed stays a constant in verify.rs (not a CoreError, not in DEPLOY_SLUGS); an unreachable gateway or transport is a CoreError, a refused log or tag source is the check's unavailable input carrying only the slug
 - [Phase ?]: 22-11: deploy verify keeps the CORE-01 profile header; README must not repeat the literal '## Exit codes' before the real section (readme_exit_table_agreement splits on it)
+- [Phase ?]: 22-12 Decision B = B(i): home-relative staging; ledger and journal at ign-deploy/<gateway>/<mode>/ in the service account home on ssh nodes (LocalFs keeps data_dir/ign-deploy); spec section 9 amendment still to do; account needs Modify on each mode collection

@@ -7589,3 +7589,22 @@ The rule (ROADMAP v1.6, Decision B): choose (i) home-relative staging when C6 co
   - **B(ii):** `<data_dir>\ign-deploy\<gateway>\<mode>\` (sftp `/C:/Program Files/Inductive Automation/Ignition/data/ign-deploy/<gateway>/<mode>/`), one location for every transport (the current `ledger_location`), requiring an administrator to create `data\ign-deploy\` and grant the account `Modify` on it. No staging directory: the mirror writes in place under the scan lock.
 - **Undo cost:** until Phase 23 ships, nothing writes a ledger or a journal on any host, so changing the choice now costs a plan edit (`ledger_location`, the default `StagingMode`, 22-13). After Phase 23 apply has written ledgers and journals on hosts, moving them is a one-way migration across runners and hosts (the ledger format v1 and its location are a contract read by every later plan, apply and rollback, D-05). B(i) also needs the design-spec section 9 amendment in whk-environment-orchestration (outside this repository) before it is implemented; B(ii) needs none but needs the `data\ign-deploy\` grant.
 - **Hold budget effect (measured in 22-14):** B(i) keeps the upload outside the scan lock, so the lock covers only the renames; B(ii) runs the whole transfer under the lock, so its hold timeout scales with tree size and link speed.
+
+### Decision B (recorded 2026-10-15 by the user at the Task 3 checkpoint): option B(i), home-relative staging
+
+**Decision B: B(i).** Phase 23 stages in the service account's home, outside every collection, and commits by renaming into the mode collection. This matches the computed recommendation above. It rests on `## C6` blocks C6-1 (home create, write, rename and remove succeed), C6-scan-before and C6-scan-after (scan state unchanged, no collection-read risk) and "is the data dir and the home on the same volume" (both on `C:`), and on `## C7a` C7a-4 (a file renamed over an existing file replaces it; a directory renamed over a non-empty directory fails; a same-path rename deletes the file; a held target fails with `Failure`).
+
+**Ledger and journal location (confirmed as proposed):**
+- ssh and sftp nodes: `ign-deploy/<gateway>/<mode>/` relative to the service account's home. On the Windows capture host that is `C:\Users\svc-ignition-deploy\ign-deploy\<gateway>\<mode>\`, sftp form `/C:/Users/svc-ignition-deploy/ign-deploy/<gateway>/<mode>/`.
+- Staging for a run: `ign-deploy/<gateway>/<mode>/staging/<run_id>/` in the same home (sftp form `/C:/Users/svc-ignition-deploy/ign-deploy/<gateway>/<mode>/staging/<run_id>/`).
+- LocalFs nodes keep `<data_dir>/ign-deploy/<gateway>/<mode>/`. `ledger_location` therefore returns a transport-specific root; the current data_dir-relative function is the LocalFs case only. 22-13 makes that change.
+- A ledger is per service account, not per gateway: a second deploy account on the same gateway does not see the first one's ledger.
+
+**Caveats recorded with the decision:**
+1. **The design-spec section 9 amendment in whk-environment-orchestration is still to do, and it is outside this repository.** Section 9 scopes `svc-ignition-deploy` to write `data/config/resources/<mode>` only; B(i) also needs the account to write `ign-deploy/` in its own home. That amendment must exist before Phase 23 implements the write flow.
+2. **The account needs `Modify` on each mode collection directory.** As provisioned (C6-2) it cannot write `production\`, and B(i)'s commit step (rename into the collection) is denied without that grant: staged file and directory renames into `production` answered `Permission denied`. An administrator must grant `Modify` on every mode collection a node uses.
+   - **Status of that grant on the Azure VM:** it had NOT been made when this entry was written; see the 22-12 SUMMARY for what happened. Until it is made and verified, the C6 answers above still describe the account as originally provisioned, which is the only state captured.
+
+**Commit-sequence rules inherited from C7a-4** (for 22-13 and Phase 23): replace files by renaming over them; never rename a path onto itself; rename a directory aside (or delete it) before renaming a new one into its place; retry a `Failure` rename a bounded number of times, then classify it.
+
+**Undo cost:** changing this now is a plan edit (`ledger_location`, the default `StagingMode`, 22-13). After Phase 23 writes ledgers and journals on hosts, moving them is a one-way migration across runners and hosts.
