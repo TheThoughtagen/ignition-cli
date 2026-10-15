@@ -541,10 +541,13 @@ fn open_beneath(root: &Path, rel: &Path) -> Result<std::fs::File, OpenError> {
     for part in parents {
         dir = openat(&dir, *part, dir_flags, Mode::empty()).map_err(map)?;
     }
+    // NONBLOCK: a FIFO swapped in after the caller's check must fail the
+    // fstat comparison, not block `open(2)` until a writer appears. A regular
+    // file is unaffected.
     let fd = openat(
         &dir,
         *last,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(map)?;
@@ -1316,6 +1319,34 @@ mod tests {
             open_regular_file(dir.path(), Path::new("f"), &before),
             Err(OpenError::Changed)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_does_not_block_on_a_swapped_in_fifo() {
+        // WR-04: a regular file replaced by a FIFO after the check must be
+        // refused, not waited on until a writer appears.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"regular").expect("write");
+        let before = std::fs::symlink_metadata(&path).expect("meta");
+        std::fs::remove_file(&path).expect("remove");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo");
+
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = open_regular_file(&root, Path::new("f"), &before).map(|_| ());
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO must not block");
+        assert!(matches!(outcome, Err(OpenError::Changed)), "{outcome:?}");
     }
 
     #[cfg(unix)]
