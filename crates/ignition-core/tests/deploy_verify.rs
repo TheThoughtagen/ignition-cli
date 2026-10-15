@@ -257,21 +257,122 @@ fn read_back_reports_paths_not_values() {
 }
 
 #[test]
-fn read_back_n1_null_members_of_the_file_are_dropped() {
+fn read_back_n1_null_equals_absent_on_both_sides() {
     let e = one_resource(Compare::Exact(
         json!({"keep": 1, "createAutoIncSequence": null, "nested": {"x": null, "y": 2}}),
     ));
+    // File null, REST absent.
     let ok = evaluate(&e, &read_back_with(json!({"keep": 1, "nested": {"y": 2}})));
     assert_eq!(check(&ok, CheckId::ReadBack).status, CheckStatus::Pass);
 
-    // A REST null member the file does not carry still differs.
-    let bad = evaluate(
+    // File null, REST echoing the same null (G-22-2): equal.
+    let echoed = evaluate(
         &e,
         &read_back_with(json!({"keep": 1, "nested": {"y": 2}, "createAutoIncSequence": null})),
     );
-    let c = check(&bad, CheckId::ReadBack);
-    assert_eq!(c.status, CheckStatus::Fail);
-    assert!(c.findings[0].detail.contains("createAutoIncSequence"));
+    assert_eq!(
+        check(&echoed, CheckId::ReadBack).status,
+        CheckStatus::Pass,
+        "{echoed:#?}"
+    );
+
+    // File lacks the key, REST carries it as null at a nested depth: equal.
+    let e = one_resource(Compare::Exact(json!({"keep": 1, "nested": {"y": 2}})));
+    let nested = evaluate(
+        &e,
+        &read_back_with(json!({"keep": 1, "nested": {"y": 2, "x": null}})),
+    );
+    assert_eq!(
+        check(&nested, CheckId::ReadBack).status,
+        CheckStatus::Pass,
+        "{nested:#?}"
+    );
+}
+
+const COBRANDING: &str = "ignition/cobranding";
+
+fn cobranding_with(logo_name: Value) -> Value {
+    json!({
+        "backgroundColor": "#ffffff",
+        "buttonColor": "#0000ff",
+        "buttonTextColor": "#ffffff",
+        "textColor": "#000000",
+        "enabled": false,
+        "appIcon": null,
+        "appIconName": null,
+        "appIconSize": null,
+        "favicon": null,
+        "faviconName": null,
+        "faviconSize": null,
+        "logo": null,
+        "logoName": logo_name,
+        "logoType": null,
+    })
+}
+
+fn cobranding_expected(file: Value) -> Expected {
+    let mut e = expected();
+    e.resources = vec![ExpectedResource::exact(
+        "ignition",
+        "cobranding",
+        None,
+        file,
+    )];
+    e
+}
+
+fn cobranding_observed(rest: Value) -> ObservedState {
+    let mut o = observed();
+    o.read_back
+        .insert(COBRANDING.to_string(), Remote::Config(rest));
+    o
+}
+
+#[test]
+fn read_back_n1_cobranding_rest_nulls_matching_the_file_pass() {
+    let file = cobranding_with(Value::Null);
+    let report = evaluate(
+        &cobranding_expected(file.clone()),
+        &cobranding_observed(file),
+    );
+    let c = check(&report, CheckId::ReadBack);
+    assert_eq!(c.status, CheckStatus::Pass, "{report:#?}");
+    assert!(c.findings.is_empty(), "{c:?}");
+    assert!(report.resources_checked >= 1, "{report:#?}");
+}
+
+#[test]
+fn read_back_n1_rest_null_against_a_file_value_fails() {
+    let file = cobranding_with(json!("brand-FILE-SECRET.png"));
+    let report = evaluate(
+        &cobranding_expected(file),
+        &cobranding_observed(cobranding_with(Value::Null)),
+    );
+    let c = check(&report, CheckId::ReadBack);
+    assert_eq!(c.status, CheckStatus::Fail, "{report:#?}");
+    assert_eq!(c.findings.len(), 1);
+    assert_eq!(c.findings[0].code, "resource_differs");
+    assert_eq!(c.findings[0].subject, COBRANDING);
+    assert!(c.findings[0].detail.contains("logoName"), "{c:?}");
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("brand-FILE-SECRET.png"), "{text}");
+    assert!(!format!("{report:?}").contains("brand-FILE-SECRET.png"));
+}
+
+#[test]
+fn read_back_n1_file_null_against_a_rest_value_fails() {
+    let report = evaluate(
+        &cobranding_expected(cobranding_with(Value::Null)),
+        &cobranding_observed(cobranding_with(json!("brand-REST-SECRET.png"))),
+    );
+    let c = check(&report, CheckId::ReadBack);
+    assert_eq!(c.status, CheckStatus::Fail, "{report:#?}");
+    assert_eq!(c.findings.len(), 1);
+    assert_eq!(c.findings[0].code, "resource_differs");
+    assert!(c.findings[0].detail.contains("logoName"), "{c:?}");
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("brand-REST-SECRET.png"), "{text}");
+    assert!(!format!("{report:?}").contains("brand-REST-SECRET.png"));
 }
 
 #[test]
@@ -994,6 +1095,68 @@ async fn verify_green_and_red_through_action() {
     assert_eq!(read_back.status, CheckStatus::Fail);
     assert_eq!(read_back.findings[0].code, "resource_missing");
     assert_eq!(read_back.findings[0].subject, NAMED);
+}
+
+/// The rendered `config.json` of `key` parsed with its null members KEPT:
+/// the shape a type that echoes unset members as explicit `null` reports
+/// (`ignition/cobranding`; the tracer translator's auto-increment members).
+fn rest_config_raw(declared: &Declared, key: &str) -> Value {
+    let path = RelPath::new(&format!("{key}/config.json")).unwrap();
+    let bytes = declared
+        .outcome
+        .tree
+        .files
+        .get(&path)
+        .expect("rendered config");
+    serde_json::from_slice(bytes).unwrap()
+}
+
+/// Like `seeded_fake(declared, true)`, but the REST view echoes null members.
+async fn seeded_fake_echoing_nulls(declared: &Declared) -> FakeGateway {
+    let fake = FakeGateway::new();
+    fake.set_deployment_mode(Some(MODE.to_string()));
+    let setup = fake.client("setup");
+    let mut create = ResourceCreate::new("POSTGRES", rest_config_raw(declared, NAMED));
+    create.collection = Some(MODE.to_string());
+    setup
+        .resource_create("ignition", "database-translator", &[create])
+        .await
+        .expect("seed named");
+    fake.seed_singleton(
+        "ignition",
+        "general-alarm-settings",
+        MODE,
+        record(rest_config_raw(declared, SINGLETON)),
+    );
+    fake
+}
+
+#[tokio::test]
+async fn verify_green_when_rest_echoes_file_nulls() {
+    let env = env();
+    // The shape precondition: the rendered files really do hold null members.
+    let has_null = |key: &str| {
+        rest_config_raw(&env.declared, key)
+            .as_object()
+            .is_some_and(|m| m.values().any(Value::is_null))
+    };
+    assert!(
+        has_null(NAMED) || has_null(SINGLETON),
+        "the tracer render carries no null member; the test would pass vacuously"
+    );
+    let server = wiremock::MockServer::start().await;
+    mount_logs(&server, Vec::new()).await;
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let fake = seeded_fake_echoing_nulls(&env.declared).await;
+    let result = run(&env, &fake, &api).await.expect("verdict");
+    let read_back = result
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::ReadBack)
+        .unwrap();
+    assert_eq!(read_back.status, CheckStatus::Pass, "{read_back:#?}");
+    assert_eq!(result.resources_checked, 2);
+    assert!(result.ok, "{result:#?}");
 }
 
 #[tokio::test]
