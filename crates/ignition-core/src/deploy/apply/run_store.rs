@@ -100,10 +100,11 @@ pub enum IgnoreStatus {
     Ignored,
     /// Git would commit it (exit 1): refuse, nothing written.
     NotIgnored,
-    /// The repo is not a git work tree (exit 128): allowed and recorded.
+    /// The repo is not a git work tree (exit 128, and no `.git` at or above
+    /// it): allowed and recorded.
     NotARepo,
-    /// git could not be run, or answered something else: refuse (fail
-    /// closed).
+    /// git could not be run, or answered something else (including exit 128
+    /// under a `.git` entry): refuse (fail closed).
     GitUnavailable,
 }
 
@@ -140,13 +141,24 @@ pub fn ignore_status_with(git: &OsStr, repo: &Path, rel: &str) -> IgnoreStatus {
     match status.map(|s| s.code()) {
         Ok(Some(0)) => IgnoreStatus::Ignored,
         Ok(Some(1)) => IgnoreStatus::NotIgnored,
-        Ok(Some(128)) => IgnoreStatus::NotARepo,
+        // 128 is "not a repo", but also "dubious ownership", a corrupt repo
+        // and other fatal errors. Only a directory with no `.git` at or above
+        // it is a genuine non-repo; under a `.git`, refuse.
+        Ok(Some(128)) if !has_git_entry(repo) => IgnoreStatus::NotARepo,
         _ => IgnoreStatus::GitUnavailable,
     }
 }
 
-fn has_git_entry(_start: &Path) -> bool {
-    false
+/// Whether `start` or any ancestor holds a `.git` entry (file or directory,
+/// not followed). An entry that cannot be inspected counts as present.
+fn has_git_entry(start: &Path) -> bool {
+    let start = std::path::absolute(start).unwrap_or_else(|_| start.to_path_buf());
+    start.ancestors().any(|dir| {
+        !matches!(
+            std::fs::symlink_metadata(dir.join(".git")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    })
 }
 
 /// A created run directory.
@@ -220,6 +232,13 @@ impl RunDir {
                 reason: format!("the gateway directory name {why}"),
             });
         }
+        // `component_problem` allows `:`, but on Windows `C:x` replaces the
+        // base path when pushed and `gw:stream` names an alternate data stream.
+        if gateway.contains(':') {
+            return Err(CoreError::InvalidInput {
+                reason: "the gateway directory name may not contain a colon".to_string(),
+            });
+        }
         let rel = run_dir_rel(gateway, run_id);
         let status = ignore_status_with(git, repo, &rel);
         let detail = match status {
@@ -256,7 +275,23 @@ impl RunDir {
                 Ok(()) => {
                     harden_dir(&path).map_err(|e| fail("restrict a run directory parent", &e))?
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // `git check-ignore` vetted the repo-relative path, so an
+                    // existing parent must be a real directory: a symlink
+                    // would send the run's files somewhere git never checked.
+                    let real_dir = std::fs::symlink_metadata(&path)
+                        .map(|m| m.file_type().is_dir())
+                        .unwrap_or(false);
+                    if !real_dir {
+                        return Err(CoreError::DeployRunInvalid {
+                            run_id: run_id.as_str().to_string(),
+                            problem: format!(
+                                "`{}` is a symlink or not a directory",
+                                path.strip_prefix(repo).unwrap_or(&path).display()
+                            ),
+                        });
+                    }
+                }
                 Err(e) => return Err(fail("create a run directory parent", &e)),
             }
         }
@@ -698,8 +733,11 @@ mod tests {
     /// "dubious ownership" and a corrupt repo, but the directory is a repo.
     fn broken_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(".git"), "gitdir: /definitely/not/a/gitdir\n")
-            .expect("write .git");
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /definitely/not/a/gitdir\n",
+        )
+        .expect("write .git");
         dir
     }
 
