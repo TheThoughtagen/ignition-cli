@@ -28,6 +28,7 @@ use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
 use ignition_core::deploy::apply::hold::{Clock, HoldModel, ManualClock, SystemClock};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
+use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::apply::record::{RecordState, RunRecord};
 use ignition_core::deploy::apply::{
     ApplyContext, ApplyEvent, ApplyObserver, ApplyOptions, NoObserver, OutcomeKind, RollbackCause,
@@ -200,6 +201,59 @@ struct Rig {
     _server: wiremock::MockServer,
 }
 
+/// The system name the rig's host and its REST answer share.
+const RIG_GATEWAY_NAME: &str = "rig-gw";
+
+/// Mounts the answers that let every preflight pass, at the lowest priority
+/// so that a test's own mock for the same route wins.
+async fn mount_passing_preflights(server: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/gateway-info"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            json!({"name": RIG_GATEWAY_NAME, "ignitionVersion": "8.3.6 (b2026042713)"}),
+        ))
+        .with_priority(250)
+        .mount(server)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/designers"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(designers_body(&[])))
+        .with_priority(250)
+        .mount(server)
+        .await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/data/api/v1/scan/projects"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .with_priority(250)
+        .mount(server)
+        .await;
+}
+
+/// The designers list body for `(user, project, address)` sessions.
+fn designers_body(sessions: &[(&str, &str, &str)]) -> Value {
+    let items: Vec<Value> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, (user, project, address))| {
+            json!({
+                "id": format!("d-{i}"),
+                "user": user,
+                "project": project,
+                "address": address,
+                "uptime": 1,
+                "lastcomm": 1,
+                "timeout": 1,
+                "memory": {},
+            })
+        })
+        .collect();
+    json!({
+        "items": items,
+        "metadata": {"total": items.len(), "matching": items.len(), "limit": -1, "offset": 0}
+    })
+}
+
 fn local_host(fx: &PlanFixture) -> LocalFsTransport {
     LocalFsTransport::new(fx.data_dir().to_path_buf(), "nodes.master")
         .with_apply(GATEWAY, MODE)
@@ -217,10 +271,15 @@ async fn rig_with_logs(
     fake: Option<FakeGateway>,
     items: Vec<Value>,
 ) -> Rig {
+    fx.core(
+        "ignition/system-properties/config.json",
+        json!({"systemName": RIG_GATEWAY_NAME}).to_string().as_bytes(),
+    );
     let (declared, reader) = fx.load("dev");
     let repo = fx.repo("dev");
     let fake = fake.unwrap_or_else(|| FakeGateway::with_data_dir(fx.data_dir(), MODE));
     let server = wiremock::MockServer::start().await;
+    mount_passing_preflights(&server).await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/data/api/v1/logs"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -288,6 +347,7 @@ fn options() -> ApplyOptions {
             probe_interval: Duration::from_millis(20),
             log_settle: Duration::ZERO,
         },
+        designers: DesignersPolicy::default(),
     }
 }
 
@@ -338,6 +398,7 @@ impl Rig {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
+            backup_deploy: None,
             clock,
             observer,
         };
@@ -520,6 +581,7 @@ async fn apply_happy_path_local() {
     assert_eq!(
         rig.host.calls(),
         [
+            "probe",
             "prepare",
             "commit",
             "fingerprint",
@@ -832,6 +894,7 @@ async fn fault_write_failed_mid_commit_restores() {
     assert_eq!(
         rig.host.calls(),
         [
+            "probe",
             "prepare",
             "commit",
             "restore",
@@ -1193,7 +1256,7 @@ async fn fault_pre_image_changed_is_plan_stale() {
     assert_eq!(rig.fake.lock_acquires(), 1);
     assert_eq!(
         rig.host.calls(),
-        ["prepare", "commit", "discard_interrupted"]
+        ["probe", "prepare", "commit", "discard_interrupted"]
     );
     assert_eq!(failed_error_code(rig), "plan_stale");
 }
@@ -1214,7 +1277,10 @@ async fn fault_competing_lock_is_scan_lock_held() {
     assert!(names(&rig.deploy_dir().join("staging")).is_empty());
     assert!(names(&rig.deploy_dir().join("snapshots")).is_empty());
     assert_eq!(rig.fake.scan_count(), 0);
-    assert_eq!(rig.host.calls(), ["prepare", "discard_interrupted"]);
+    assert_eq!(
+        rig.host.calls(),
+        ["probe", "prepare", "discard_interrupted"]
+    );
     assert_eq!(failed_error_code(rig), "scan_lock_held");
 }
 
@@ -1388,4 +1454,80 @@ async fn never_applied_when_red() {
             assert_ne!(doc["outcome"], "applied", "scenario {index}");
         }
     }
+}
+
+// ============================================================================
+// The preflights (23-07)
+// ============================================================================
+
+/// The run directory the one run of `rig` made.
+fn only_run_dir(rig: &Rig) -> PathBuf {
+    let gateway_dir = rig.repo.join(".ign").join("deploy").join(GATEWAY);
+    let runs = names(&gateway_dir);
+    assert_eq!(runs.len(), 1, "one run directory, got {runs:?}");
+    gateway_dir.join(&runs[0])
+}
+
+/// Mounts the designers list answering `sessions`, ahead of the default
+/// empty one.
+async fn mount_designers(rig: &Rig, sessions: &[(&str, &str, &str)]) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/designers"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(designers_body(sessions)),
+        )
+        .mount(&rig._server)
+        .await;
+}
+
+#[tokio::test]
+async fn preflight_mode_and_designers_reported_together() {
+    let rig = changing_rig().await;
+    // The master runs another mode than the target, and a Designer is open.
+    rig.fake.set_deployment_mode(Some("production".to_string()));
+    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("two failed checks refuse");
+
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("deploy_preflight_failed", 6),
+        "{err}"
+    );
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    let checks: Vec<&str> = failures.iter().map(|f| f.check.as_str()).collect();
+    assert_eq!(checks, ["mode_master", "designers"], "fixed order");
+    let shown = err.to_string();
+    assert!(
+        shown.find("mode_master") < shown.find("designers"),
+        "{shown}"
+    );
+    for part in ["alice", "PlantA", "10.0.0.5:52526"] {
+        assert!(shown.contains(part), "{part} in {shown}");
+    }
+
+    // Nothing was staged, locked, scanned or written.
+    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert!(!rig.fx.data_dir().join("ign-deploy").exists());
+
+    // The run directory records the refusal.
+    let run_dir = only_run_dir(&rig);
+    let result = json_file(&run_dir.join("result.json"));
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "deploy_preflight_failed");
+    let run = json_file(&run_dir.join("run.json"));
+    assert_eq!(run["designers"], "fail");
+    assert_eq!(
+        run["designers_seen"],
+        json!([{"user": "alice", "project": "PlantA", "host": "10.0.0.5:52526"}])
+    );
+    assert!(run_dir.join("events.ndjson").exists());
 }
