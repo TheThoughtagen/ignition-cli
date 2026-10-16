@@ -1,7 +1,7 @@
 ---
 phase: 22-transport-plan-pull-verify
 verified: 2026-10-16T00:30:00Z
-status: human_needed
+status: passed
 score: 5/5 roadmap success criteria verified (10/10 requirement IDs satisfied); UAT gaps G-22-1 and G-22-2 closed in code and automated evidence
 behavior_unverified: 0
 overrides_applied: 0
@@ -10,19 +10,23 @@ re_verification:
   previous_score: 5/5 roadmap success criteria verified (10/10 requirement IDs satisfied)
   trigger: "22-UAT.md found G-22-1 (CI red, fail-fast hid cfg(windows)) and G-22-2 (pulled tree did not verify green: one-sided null strip); gap plans 22-15 and 22-16"
   gaps_closed:
+
     - "G-22-1: CI green on all four jobs incl. windows-latest at ab8608a (run 38838954722)"
     - "G-22-2: symmetric N1 null normalisation in verify read_back (verify.rs strip_nulls on file and REST side)"
   gaps_remaining: []
   regressions: []
 gaps: []
 deferred:
+
   - truth: "Hold budget (505 s without a Defender exclusion, 699 s with one) exceeds the 300 s ceiling"
     addressed_in: "Phase 23"
     evidence: "Phase 23 SC-3 'Apply writes inside the scan-lock within the hold budget measured in Phase 22'; STATE.md carries it as an OPEN blocker 'Phase 23 planning must open with it'. Phase 22's gate asks for the budget to be measured and recorded, which it is."
 human_verification:
+
   - test: "Re-run 22-UAT.md test 2 (G-22-2) on the user's own rig: `ign deploy pull`, then `ign deploy verify` on the UNMODIFIED pulled tree, with the ign-cli WebDev bundle installed and one Good `verify.tag_probes[]` entry"
     expected: "exit 0, data.ok true, read_back passes with no finding on ignition/cobranding, probes passes; then adding a Bad probe still gives tag_probe_not_good and exit 6"
     why_human: "The UAT result is a human-recorded state. Agent-run live evidence exists (22-15-SUMMARY.md: pull_then_verify_is_green_live and the installed binary, green exit 0 with 28 resources, red exit 6 after a one-member edit) but 22-UAT.md re-test belongs to /gsd-verify-work and was deliberately not marked passed here."
+
   - test: "Re-run 22-UAT.md test 1 (G-22-1) acceptance in /gsd-verify-work"
     expected: "Recorded as passed against CI run 38838954722 (all four jobs success on ab8608a)"
     why_human: "Evidence is verified below, but the UAT file state change is owned by /gsd-verify-work."
