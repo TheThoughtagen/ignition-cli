@@ -410,9 +410,12 @@ impl LocalFsTransport {
         let _ = root.unlink(&lay.journal());
     }
 
+    /// `hang` is set when a [`ApplyFault::HangAfterMove`] stopped the commit
+    /// after its k-th move; the async caller then waits where a test can abort.
     pub(super) fn apply_commit_blocking(
         &self,
         prepared: &Prepared,
+        hang: &mut bool,
     ) -> Result<BatchReport, CoreError> {
         const OP: &str = "commit";
         let setup = self.apply_cfg(OP)?;
@@ -539,7 +542,7 @@ impl LocalFsTransport {
             }
         }
         report.phase = JournalPhase::Writing;
-        self.commit_moves(&root, &lay, &work, &journals, &mut report)?;
+        self.commit_moves(&root, &lay, &work, &journals, &mut report, hang)?;
         Ok(report)
     }
 
@@ -699,6 +702,7 @@ impl LocalFsTransport {
         work: &WorkList,
         journals: &BTreeMap<&'static str, Vec<u8>>,
         report: &mut BatchReport,
+        hang: &mut bool,
     ) -> Result<(), CoreError> {
         const OP: &str = "commit";
         let stop = |report: &mut BatchReport, why: String| -> Result<(), CoreError> {
@@ -765,6 +769,11 @@ impl LocalFsTransport {
                 );
             }
             report.moved.push(index);
+            if matches!(&self.fault, Some(ApplyFault::HangAfterMove(k, _)) if *k == report.moved.len())
+            {
+                *hang = true;
+                return Ok(());
+            }
         }
 
         // ---- 7. the delete set, then the directories the deletes emptied

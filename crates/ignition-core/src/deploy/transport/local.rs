@@ -1547,8 +1547,20 @@ impl ApplyHost for LocalFsTransport {
 
     async fn commit(&self, prepared: &ApplyPrepared) -> Result<BatchReport, CoreError> {
         let prepared = prepared.clone();
-        self.run_blocking(move |this| this.apply_commit_blocking(&prepared))
-            .await
+        let (report, hang) = self
+            .run_blocking(move |this| {
+                let mut hang = false;
+                let report = this.apply_commit_blocking(&prepared, &mut hang)?;
+                Ok((report, hang))
+            })
+            .await?;
+        if hang && let Some(ApplyFault::HangAfterMove(_, notify)) = &self.fault {
+            // The filesystem work above is done and the journal is on disk at
+            // `writing`; wait here, at an await point, until the test aborts.
+            notify.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(report)
     }
 
     async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
