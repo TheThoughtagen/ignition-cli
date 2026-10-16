@@ -1727,6 +1727,98 @@ mod tests {
         assert_eq!(reader.read_journal("gw", "dev").await.expect("read"), None);
     }
 
+    fn journal_dir(root: &Path) -> PathBuf {
+        ledger_dir(root).with_file_name("prod")
+    }
+
+    #[test]
+    fn read_journal_local() {
+        let invalid = |err: CoreError| {
+            assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+            assert_eq!(err.exit_code(), 6);
+            err.to_string()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let read = || transport.read_journal_blocking("gw", "prod");
+        let file = || journal_dir(dir.path()).join("journal.json");
+
+        // absent at every level
+        assert_eq!(read().expect("no ign-deploy"), None);
+        std::fs::create_dir(dir.path().join("ign-deploy")).expect("mkdir");
+        assert_eq!(read().expect("no gateway dir"), None);
+        std::fs::create_dir(dir.path().join("ign-deploy").join("gw")).expect("mkdir");
+        assert_eq!(read().expect("no mode dir"), None);
+        std::fs::create_dir(journal_dir(dir.path())).expect("mkdir");
+        assert_eq!(read().expect("no file"), None);
+
+        // present, and the ledger beside it is not what is read
+        std::fs::write(journal_dir(dir.path()).join("ledger.json"), b"ledger").expect("write");
+        std::fs::write(file(), b"journal").expect("write");
+        assert_eq!(read().expect("present"), Some(b"journal".to_vec()));
+
+        // a directory at the journal path
+        std::fs::remove_file(file()).expect("rm");
+        std::fs::create_dir(file()).expect("mkdir");
+        let text = invalid(read().expect_err("a directory is not a journal"));
+        assert!(text.contains("ign-deploy/gw/prod/journal.json"), "{text}");
+        assert!(text.contains("not a regular file"), "{text}");
+        std::fs::remove_dir(file()).expect("rm");
+
+        // over the cap, refused from the metadata
+        let big = std::fs::File::create(file()).expect("file");
+        big.set_len(JOURNAL_MAX_BYTES as u64 + 1).expect("sparse");
+        let text = invalid(read().expect_err("over the cap"));
+        assert!(text.contains("8388608"), "{text}");
+        assert!(text.contains("ign-deploy/gw/prod/journal.json"), "{text}");
+        std::fs::remove_file(file()).expect("rm");
+
+        // an unsafe target name
+        for (gateway, mode) in [("..", "prod"), ("gw", "a/b"), ("", "prod"), (".x", "prod")] {
+            let err = transport
+                .read_journal_blocking(gateway, mode)
+                .expect_err("a name that is not one safe component");
+            invalid(err);
+        }
+
+        // an unreadable host is not an absent journal
+        let missing = LocalFsTransport::new(dir.path().join("missing"), "nodes.master");
+        let err = missing
+            .read_journal_blocking("gw", "prod")
+            .expect_err("a missing data_dir");
+        assert_eq!(err.code(), "transport_failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_journal_local_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("journal.json"), b"outside-secret").expect("write");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+
+        // a symlinked journal file
+        std::fs::create_dir_all(journal_dir(dir.path())).expect("mkdir");
+        std::os::unix::fs::symlink(
+            outside.path().join("journal.json"),
+            journal_dir(dir.path()).join("journal.json"),
+        )
+        .expect("symlink");
+        let err = transport
+            .read_journal_blocking("gw", "prod")
+            .expect_err("a symlinked journal");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(!err.to_string().contains("outside-secret"), "{err}");
+
+        // a symlinked directory on the way
+        std::fs::remove_dir_all(dir.path().join("ign-deploy")).expect("remove");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("ign-deploy")).expect("symlink");
+        let err = transport
+            .read_journal_blocking("gw", "prod")
+            .expect_err("a symlinked directory");
+        assert_eq!(err.code(), "deploy_run_invalid");
+    }
+
     // ---- F7: the commit's mutations are descriptor-relative (unix) --------
 
     #[cfg(unix)]

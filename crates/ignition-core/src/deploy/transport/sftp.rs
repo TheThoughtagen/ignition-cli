@@ -2649,6 +2649,7 @@ impl TreeMirror for SftpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deploy::apply::journal::JOURNAL_FILE;
     use crate::deploy::ledger::LEDGER_FILE;
     use crate::deploy::transport::process::{ProcessOutput, ProcessRunner};
     use std::collections::HashSet;
@@ -3898,6 +3899,92 @@ mod tests {
             .read_ledger("gw", "production")
             .await
             .expect_err("stderr");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    // ---- read_journal (23-18) --------------------------------------------------
+
+    /// The journal is below the account home, beside the ledger (D-04).
+    fn journal_path() -> String {
+        format!("{HOME}/ign-deploy/gw/production/{JOURNAL_FILE}")
+    }
+
+    #[tokio::test]
+    async fn read_journal_sftp() {
+        let invalid = |err: CoreError| match err {
+            CoreError::DeployRunInvalid { problem, .. } => problem,
+            other => panic!("expected deploy_run_invalid, got {other:?}"),
+        };
+        let read = |fake: &Arc<FakeSftp>| {
+            let t = transport(fake);
+            async move { t.read_journal("gw", "production").await }
+        };
+
+        // absent at every level is None
+        let fake = FakeSftp::new();
+        assert_eq!(read(&fake).await.expect("none"), None);
+        fake.mkdirs(&format!("{HOME}/ign-deploy"));
+        assert_eq!(read(&fake).await.expect("none"), None);
+        fake.mkdirs(&format!("{HOME}/ign-deploy/gw/production"));
+        assert_eq!(read(&fake).await.expect("none"), None);
+
+        // present: the bytes, unvalidated; a ledger beside it is not read
+        fake.file(&journal_path(), "{\"schema_version\":1}");
+        fake.file(&ledger_path(), "other");
+        assert_eq!(
+            read(&fake).await.expect("journal"),
+            Some(b"{\"schema_version\":1}".to_vec())
+        );
+
+        // the journal is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&journal_path(), Node::Symlink);
+        let p = invalid(read(&fake).await.expect_err("link"));
+        assert!(p.contains("symlink"), "{p}");
+        assert!(p.contains("~/ign-deploy/gw/production/journal.json"), "{p}");
+        // a directory on the way is a symlink
+        let fake = FakeSftp::new();
+        fake.put(&format!("{HOME}/ign-deploy/gw"), Node::Symlink);
+        let p = invalid(read(&fake).await.expect_err("link"));
+        assert!(p.contains("symlink"), "{p}");
+        // a component that is a file
+        let fake = FakeSftp::new();
+        fake.file(&format!("{HOME}/ign-deploy/gw"), "x");
+        let p = invalid(read(&fake).await.expect_err("file"));
+        assert!(p.contains("not a directory"), "{p}");
+        // the journal is a directory
+        let fake = FakeSftp::new();
+        fake.mkdirs(&journal_path());
+        let p = invalid(read(&fake).await.expect_err("dir"));
+        assert!(p.contains("not a regular file"), "{p}");
+        // over the cap, from the listing, before a download
+        let fake = FakeSftp::new();
+        fake.file(&journal_path(), "{}");
+        fake.knobs().lie_size = Some((JOURNAL_FILE.to_string(), JOURNAL_MAX_BYTES as u64 + 1));
+        let p = invalid(read(&fake).await.expect_err("cap"));
+        assert!(p.contains("byte cap"), "{p}");
+        assert!(!fake.session_lines().pop().expect("last")[0].starts_with("get"));
+        // a hostile gateway name
+        let fake = FakeSftp::new();
+        let err = transport(&fake)
+            .read_journal("../x", "production")
+            .await
+            .expect_err("name");
+        assert!(invalid(err).contains("gateway"));
+        // an unreadable host is not an absent journal
+        let fake = FakeSftp::new();
+        fake.knobs().home = Some("/home/nope".to_string());
+        fake.listed
+            .lock()
+            .expect("listed")
+            .insert("/home/nope".to_string());
+        let err = read(&fake).await.expect_err("host");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // a failed download is not an absent journal
+        let fake = FakeSftp::new();
+        fake.file(&journal_path(), "{}");
+        fake.knobs().stderr_noise = true;
+        let err = read(&fake).await.expect_err("stderr");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
     }
 
