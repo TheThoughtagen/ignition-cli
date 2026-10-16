@@ -9,6 +9,7 @@ pub mod apicall;
 pub mod backup;
 pub mod connections;
 pub mod deploy;
+pub mod deploy_apply;
 pub mod diagnostics;
 pub mod doctor;
 pub mod e2e;
