@@ -145,6 +145,10 @@ pub fn ignore_status_with(git: &OsStr, repo: &Path, rel: &str) -> IgnoreStatus {
     }
 }
 
+fn has_git_entry(_start: &Path) -> bool {
+    false
+}
+
 /// A created run directory.
 #[derive(Debug)]
 pub struct RunDir {
@@ -688,6 +692,95 @@ mod tests {
         let dir = RunDir::create(plain.path(), "gw", &id("r1")).expect("create");
         assert_eq!(dir.git_status(), IgnoreStatus::NotARepo);
         assert!(dir.path().is_dir());
+    }
+
+    /// A `.git` entry that points nowhere: git exits 128 on it, as it does for
+    /// "dubious ownership" and a corrupt repo, but the directory is a repo.
+    fn broken_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".git"), "gitdir: /definitely/not/a/gitdir\n")
+            .expect("write .git");
+        dir
+    }
+
+    #[test]
+    fn git_fatal_inside_a_repo_is_not_a_non_repo() {
+        let rel = ".ign/deploy/gw/r1";
+        let broken = broken_repo();
+        assert_eq!(
+            ignore_status(broken.path(), rel),
+            IgnoreStatus::GitUnavailable,
+            "exit 128 under a `.git` entry must fail closed"
+        );
+        // A subdirectory of a repo is just as much a repo.
+        let sub = broken.path().join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        assert_eq!(ignore_status(&sub, rel), IgnoreStatus::GitUnavailable);
+
+        let err = RunDir::create(broken.path(), "gw", &id("r1")).expect_err("fail closed");
+        assert_eq!(err.code(), "deploy_preflight_failed");
+        assert!(
+            !broken.path().join(".ign").exists(),
+            "nothing may be written"
+        );
+
+        // No `.git` here or above: a genuine non-repo (skipped on a host whose
+        // temp dir sits inside a repo).
+        let plain = tempfile::tempdir().expect("tempdir");
+        if !has_git_entry(plain.path()) {
+            assert_eq!(ignore_status(plain.path(), rel), IgnoreStatus::NotARepo);
+        }
+    }
+
+    #[test]
+    fn has_git_entry_looks_at_the_directory_and_its_ancestors() {
+        let broken = broken_repo();
+        assert!(has_git_entry(broken.path()));
+        let deep = broken.path().join("a/b");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        assert!(has_git_entry(&deep));
+        let real = git_repo(None);
+        assert!(has_git_entry(real.path()));
+    }
+
+    #[test]
+    fn a_gateway_with_a_colon_is_refused_before_any_io() {
+        let repo = git_repo(Some(".ign/\n"));
+        for bad in ["C:evil", "gw:stream", "gw:", ":gw"] {
+            let err = RunDir::create(repo.path(), bad, &id("r1")).expect_err(bad);
+            assert_eq!(err.code(), "invalid_input", "{bad:?}");
+        }
+        assert!(!repo.path().join(".ign").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_is_refused_and_nothing_is_written_through_it() {
+        use std::os::unix::fs::symlink;
+        // `.ign`, `.ign/deploy` and `.ign/deploy/gw` each as the symlink.
+        for depth in 1..=3 {
+            let repo = tempfile::tempdir().expect("tempdir");
+            if has_git_entry(repo.path()) {
+                continue; // git would answer first; see the guard tests
+            }
+            let outside = tempfile::tempdir().expect("tempdir");
+            let parts = [".ign", "deploy", "gw"];
+            let mut at = repo.path().to_path_buf();
+            for part in &parts[..depth - 1] {
+                at.push(part);
+                std::fs::create_dir(&at).expect("mkdir");
+            }
+            symlink(outside.path(), at.join(parts[depth - 1])).expect("symlink");
+
+            let err = RunDir::create(repo.path(), "gw", &id("r1")).expect_err("symlink");
+            assert_eq!(err.code(), "deploy_run_invalid", "depth {depth}: {err}");
+            assert!(err.to_string().contains("symlink"), "{err}");
+            assert_eq!(
+                std::fs::read_dir(outside.path()).expect("ls").count(),
+                0,
+                "depth {depth}: nothing may be written through the symlink"
+            );
+        }
     }
 
     #[test]
