@@ -32,6 +32,7 @@
 
 pub mod batch;
 pub mod local;
+mod local_fs;
 pub mod process;
 pub mod remote;
 pub mod sftp;

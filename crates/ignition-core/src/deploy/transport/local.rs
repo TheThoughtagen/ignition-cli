@@ -27,6 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+mod apply_ops;
+
 use super::{
     CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
     READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
@@ -134,6 +136,17 @@ impl LocalFsTransport {
         CoreError::Internal(format!(
             "ApplyHost::{method} is not implemented yet (target {target})"
         ))
+    }
+
+    /// Run `work` on a blocking thread.
+    async fn run_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&LocalFsTransport) -> Result<T, CoreError> + Send + 'static,
+    ) -> Result<T, CoreError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || work(&this))
+            .await
+            .map_err(|e| self.mirror_fail("apply", format!("the local apply task failed: {e}")))?
     }
 
     /// Bind the write half to the `mode` collection with `staging`. Fails
@@ -1503,18 +1516,24 @@ impl ApplyHost for LocalFsTransport {
 
     async fn prepare(
         &self,
-        _spec: &BatchSpec,
-        _tree: &RenderedTree,
+        spec: &BatchSpec,
+        tree: &RenderedTree,
     ) -> Result<ApplyPrepared, CoreError> {
-        Err(self.not_built("prepare"))
+        let (spec, tree) = (spec.clone(), tree.clone());
+        self.run_blocking(move |this| this.prepare_blocking(&spec, &tree))
+            .await
     }
 
-    async fn commit(&self, _prepared: &ApplyPrepared) -> Result<BatchReport, CoreError> {
-        Err(self.not_built("commit"))
+    async fn commit(&self, prepared: &ApplyPrepared) -> Result<BatchReport, CoreError> {
+        let prepared = prepared.clone();
+        self.run_blocking(move |this| this.apply_commit_blocking(&prepared))
+            .await
     }
 
-    async fn restore(&self, _record: &RunRecord) -> Result<BatchReport, CoreError> {
-        Err(self.not_built("restore"))
+    async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
+        let record = record.clone();
+        self.run_blocking(move |this| this.restore_blocking(&record))
+            .await
     }
 
     async fn fingerprint(
