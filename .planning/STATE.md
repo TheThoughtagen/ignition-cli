@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-03-PLAN.md
-last_updated: "2026-10-16T16:05:23.963Z"
+stopped_at: Completed 23-18-PLAN.md
+last_updated: "2026-10-16T16:32:26.308Z"
 last_activity: 2026-10-16
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 34
+  completed_plans: 35
   percent: 50
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 4 of 21
+Plan: 5 of 21
 Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [███████░░░] 65%
+Progress: [███████░░░] 67%
 
 ## Performance Metrics
 
@@ -79,6 +79,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P01 | 27min | 3 tasks | 3 files |
 | Phase 23 P02 | 70min | 3 tasks | 6 files |
 | Phase 23 P03 | 55min | 2 tasks | 6 files |
+| Phase 23 P18 | 25min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -116,8 +117,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T16:05:23.932Z
-**Stopped At:** Completed 23-03-PLAN.md
+**Last session:** 2026-10-16T16:32:26.120Z
+**Stopped At:** Completed 23-18-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -175,3 +176,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: [23-01] Windows capture host recorded pending; stop point 23-08 Task 1; C-restart shape {pending:[string]} captured, no-token and no-level token get 401 HTML
 - [Phase ?]: 23-02: Phase 23 contract vocabulary confirmed as option-a (all ten items); eight deploy slugs landed, DEPLOY_SLUGS is 12; PreflightFailure uses Box<[T]> for clippy box_collection
 - [Phase ?]: 23-03: RunDir::create runs the git-ignore guard itself (NotIgnored and GitUnavailable refuse with nothing written); record.json always writes post_fingerprint and rolled_back_by (null when unset)
+- [Phase ?]: 23-18: a journal refusal is deploy_run_invalid (run_id unknown, problem prefixed by the location); read_ledger and read_journal share one private read helper per transport; journal_location and location_of live in ledger.rs

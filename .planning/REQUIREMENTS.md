@@ -59,8 +59,8 @@ Numbering: new categories. **47 requirements.**
 - [ ] **DAPL-05**: Before writing, apply snapshots the target collection (on the gateway host and in the run directory, with hashes) and downloads a `.gwbk` by default; `--skip-gwbk` is recorded; neither is ever uploaded off-prem
 - [ ] **DAPL-06**: Apply writes inside the scan-lock with a measured hold budget; if the lock expires or a write fails mid-way, apply restores the snapshot and scans, so no partial tree is ever loaded
 - [ ] **DAPL-07**: A master verify failure after apply triggers automatic rollback through the same engine and reports `deploy_rolled_back` with exit 6; a failed rollback reports `rollback_failed` with recovery guidance
-- [ ] **DAPL-08**: User can run `ign deploy rollback --run <id>` from a fresh process to restore that run's snapshot; it refuses when live state differs from the run's post-apply fingerprint unless `--discard-live-changes`
-- [ ] **DAPL-09**: An interrupted apply leaves an on-box journal, and plan, apply and rollback refuse while it is present until recovery runs
+- [x] **DAPL-08**: User can run `ign deploy rollback --run <id>` from a fresh process to restore that run's snapshot; it refuses when live state differs from the run's post-apply fingerprint unless `--discard-live-changes`
+- [x] **DAPL-09**: An interrupted apply leaves an on-box journal, and plan, apply and rollback refuse while it is present until recovery runs
 - [ ] **DAPL-10**: Every run, including failed ones, writes a private run directory (`run.json`, `result.json`, `plan.json`, `events.ndjson`); apply reports `restart_pending` and never restarts or fails over a gateway
 
 ### Redundant Pair
@@ -147,8 +147,8 @@ v1.6 only. The parked v1.3 requirements below keep their own section.
 | DAPL-05 | Phase 23 | Pending |
 | DAPL-06 | Phase 23 | Pending |
 | DAPL-07 | Phase 23 | Pending |
-| DAPL-08 | Phase 23 | Pending |
-| DAPL-09 | Phase 23 | Pending |
+| DAPL-08 | Phase 23 | Complete |
+| DAPL-09 | Phase 23 | Complete |
 | DAPL-10 | Phase 23 | Pending |
 | DPAIR-01 | Phase 24 | Pending |
 | DPAIR-02 | Phase 24 | Pending |
