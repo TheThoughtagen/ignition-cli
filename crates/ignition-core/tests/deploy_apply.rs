@@ -3500,13 +3500,17 @@ struct Killed {
 /// abort the task: what is left is what a `kill -9` there leaves.
 async fn killed_mid_write() -> Killed {
     let notify = Arc::new(tokio::sync::Notify::new());
-    let rig = Arc::new(
-        changing_rig_faulted(
-            Vec::new(),
-            Some(ApplyFault::HangAfterMove(1, notify.clone())),
-        )
-        .await,
-    );
+    let rig = changing_rig_faulted(
+        Vec::new(),
+        Some(ApplyFault::HangAfterMove(1, notify.clone())),
+    )
+    .await;
+    kill_apply(rig, notify).await
+}
+
+/// Run `rig`'s apply on a task until `notify` fires, then abort the task.
+async fn kill_apply(rig: Rig, notify: Arc<tokio::sync::Notify>) -> Killed {
+    let rig = Arc::new(rig);
     let before = collection_state(&rig);
     let plan_before = plan_hash(&rig).await;
     let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
@@ -3676,4 +3680,283 @@ async fn journal_corrupt_blocks() {
     only_reads(&fresh);
     assert_eq!(collection_state(&rig), before);
     assert!(!rig.repo.join(".ign").exists(), "no run was made");
+}
+
+fn snapshot_dir(rig: &Rig, run_id: &str) -> PathBuf {
+    rig.deploy_dir().join("snapshots").join(run_id)
+}
+
+fn write_journal_phase(rig: &Rig, phase: JournalPhase) {
+    let journal = Journal {
+        phase,
+        ..read_journal(rig)
+    };
+    std::fs::write(journal_path(rig), journal.to_bytes()).expect("rewrite the journal");
+}
+
+/// Put the pre-image of `path` back from the on-box snapshot: with the one
+/// file a killed apply had moved, the tree is as it was before the run.
+fn unmove(rig: &Rig, run_id: &str, path: &str) {
+    std::fs::copy(
+        snapshot_dir(rig, run_id).join("files").join(path),
+        rig.fx.collection_dir(MODE).join(path),
+    )
+    .expect("put the pre-image back");
+}
+
+/// Recover `run_id` from a fresh process: its prepare and run.
+async fn recover(rig: &Rig, run_id: &str) -> (Fresh, Result<DeployRollbackResult, CoreError>) {
+    let fresh = Fresh::new(rig).await;
+    let result = fresh.rollback(rig, run_id, false).await;
+    (fresh, result)
+}
+
+#[tokio::test]
+async fn journal_died_before_move_is_cleared() {
+    // D-10: no move began and the touched set is what it was before the run.
+    for phase in [JournalPhase::Ready, JournalPhase::Snapshotting] {
+        let killed = killed_mid_write().await;
+        let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+        unmove(&rig, &run_id, DB_CONFIG);
+        write_journal_phase(&rig, phase);
+        assert_eq!(collection_state(&rig), killed.before, "an untouched tree");
+
+        let fresh = Fresh::new(&rig).await;
+        let prepared = fresh.prepare(&rig, &run_id, false).await.expect("prepare");
+        assert!(prepared.prose.contains("interrupted"), "{}", prepared.prose);
+        let result = fresh
+            .run(&rig, prepared, &run_id, false)
+            .await
+            .expect("the run is cleared");
+
+        assert_eq!(result.outcome, RollbackKind::Cleared, "{phase:?}");
+        assert!(result.ok);
+        assert!(result.restored.is_empty() && result.deleted.is_empty());
+        assert_eq!(collection_state(&rig), killed.before, "left as it was");
+        assert!(!journal_path(&rig).exists(), "the journal is removed");
+        assert!(!snapshot_dir(&rig, &run_id).exists(), "and the snapshot");
+        assert!(
+            !rig.deploy_dir().join("staging").join(&run_id).exists(),
+            "and the staging"
+        );
+        let calls = fresh.host.calls();
+        assert!(
+            !calls.contains(&"restore") && !calls.contains(&"finalize"),
+            "no restore: {calls:?}"
+        );
+        assert!(calls.contains(&"discard_interrupted"), "{calls:?}");
+        assert_eq!(fresh.fake.scan_count(), 0, "no scan");
+        assert_eq!(fresh.fake.lock_acquires(), 0, "no lock");
+        let run_dir = PathBuf::from(&result.run_dir);
+        let found = event_lines(&run_dir, "interrupted_run");
+        assert_eq!(found[0]["action"], "clear", "{found:?}");
+        assert_eq!(found[0]["phase"], phase.as_str());
+        let result_json = json_file(&run_dir.join("result.json"));
+        assert_eq!(result_json["outcome"], "cleared");
+        assert_eq!(result_json["ok"], true);
+
+        // A cleared run leaves nothing to plan around.
+        assert_eq!(plan_hash(&rig).await, killed.plan_before);
+    }
+}
+
+#[tokio::test]
+async fn journal_before_move_but_changed_restores() {
+    // D-10 negative: no move began, but the touched set is not what it was.
+    let killed = killed_mid_write().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    unmove(&rig, &run_id, DB_CONFIG);
+    rig.fx.mode(DB_CONFIG, b"{\"edited\": \"by someone else\"}");
+    write_journal_phase(&rig, JournalPhase::Snapshotting);
+    assert_ne!(collection_state(&rig), killed.before);
+
+    let (fresh, result) = recover(&rig, &run_id).await;
+    let result = result.expect("a changed tree is restored, not cleared");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(
+        collection_state(&rig),
+        killed.before,
+        "the snapshot is back"
+    );
+    assert!(fresh.host.calls().contains(&"restore"));
+    assert_eq!(fresh.fake.scan_count(), 1);
+    assert!(!journal_path(&rig).exists());
+    let found = event_lines(&PathBuf::from(&result.run_dir), "interrupted_run");
+    assert_eq!(found[0]["action"], "restore", "{found:?}");
+}
+
+#[tokio::test]
+async fn journal_snapshot_lost_is_rollback_failed() {
+    // D-12.
+    let killed = killed_mid_write().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    let torn = collection_state(&rig);
+    std::fs::remove_file(snapshot_dir(&rig, &run_id).join("files").join(DB_CONFIG))
+        .expect("lose a snapshot file");
+
+    let (fresh, result) = recover(&rig, &run_id).await;
+    let err = result.expect_err("a lost snapshot cannot be restored from");
+    let CoreError::RollbackFailed(failure) = &err else {
+        panic!("expected rollback_failed, got {err:?}");
+    };
+    assert_eq!(failure.run_id, run_id);
+    assert!(failure.journal.ends_with("journal.json"), "{failure:?}");
+    let text = err.to_string();
+    assert!(text.contains(".gwbk"), "{text}");
+    assert!(text.contains("run-directory snapshot"), "{text}");
+    assert!(text.contains(&failure.journal), "{text}");
+    assert!(text.contains(DB_CONFIG), "the path is named: {text}");
+    assert_eq!(err.exit_code(), 6);
+
+    // The journal stays and nothing was half restored.
+    assert!(journal_path(&rig).is_file(), "the journal stays");
+    assert_eq!(read_journal(&rig).run_id, run_id);
+    assert_eq!(collection_state(&rig), torn);
+    assert!(!fresh.host.calls().contains(&"restore"), "no half restore");
+    assert_eq!(fresh.fake.scan_count(), 0);
+}
+
+/// A real apply whose `finalize` hangs once the verify was green, then
+/// killed: the journal is at `written` and the record still `applying`.
+async fn killed_before_finalize() -> Killed {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let rig = changing_rig().await;
+    let host = rig.host.clone().hang("finalize", 1, notify.clone());
+    kill_apply(Rig { host, ..rig }, notify).await
+}
+
+#[tokio::test]
+async fn journal_without_record_post_part_recovers() {
+    // Pitfall 14: the ledger was swapped and the record's post part never
+    // written; the journal and the snapshot are enough.
+    let killed = killed_before_finalize().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    assert_eq!(killed.journal.phase, JournalPhase::Written);
+    let record = rig.record(&run_id);
+    assert_eq!(record.state, RecordState::Applying);
+    assert_eq!(record.post_fingerprint, None);
+    let applied = collection_state(&rig);
+    assert_ne!(applied, killed.before, "the whole batch had been written");
+    assert_ne!(
+        applied.get(LEDGER_KEY),
+        killed.before.get(LEDGER_KEY),
+        "the ledger was swapped"
+    );
+
+    let (fresh, result) = recover(&rig, &run_id).await;
+    let result = result.expect("recovered");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(collection_state(&rig), killed.before, "files and ledger");
+    assert!(!journal_path(&rig).exists());
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    assert_eq!(fresh.fake.scan_count(), 1);
+}
+
+#[tokio::test]
+async fn journal_without_record_recovers() {
+    // Pitfall 14, the other half: the record itself is lost.
+    let killed = killed_mid_write().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    std::fs::remove_file(snapshot_dir(&rig, &run_id).join("record.json")).expect("lose the record");
+
+    let (fresh, result) = recover(&rig, &run_id).await;
+    let result = result.expect("recovered from the journal and the snapshot");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(collection_state(&rig), killed.before);
+    assert_eq!(
+        result.restored,
+        [DB_CONFIG.to_string()],
+        "the pre-images the snapshot holds"
+    );
+    assert_eq!(
+        result.deleted,
+        [ALARM_CONFIG.to_string(), ALARM_RESOURCE.to_string()]
+    );
+    assert!(!journal_path(&rig).exists());
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    assert_eq!(fresh.fake.scan_count(), 1);
+
+    // An incomplete snapshot cannot be told from a created file: with the
+    // record gone, the journal's pre-run fingerprint is the check.
+    let killed = killed_mid_write().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    std::fs::remove_file(snapshot_dir(&rig, &run_id).join("record.json")).expect("lose the record");
+    std::fs::remove_file(snapshot_dir(&rig, &run_id).join("files").join(DB_CONFIG))
+        .expect("lose a snapshot file");
+    let (_, result) = recover(&rig, &run_id).await;
+    let err = result.expect_err("an incomplete snapshot");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(journal_path(&rig).is_file());
+}
+
+#[tokio::test]
+async fn journal_after_green_verify_restores() {
+    // A9: killed between a green verify and finalize; recovery restores, the
+    // documented safe direction.
+    let killed = killed_before_finalize().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    let events = event_names(&PathBuf::from(
+        rig.repo.join(".ign/deploy").join(GATEWAY).join(&run_id),
+    ));
+    assert!(events.contains(&"verify_done".to_string()), "{events:?}");
+    assert!(!events.contains(&"finalized".to_string()), "{events:?}");
+    let verified = event_lines(
+        &rig.repo.join(".ign/deploy").join(GATEWAY).join(&run_id),
+        "verify_done",
+    );
+    assert_eq!(verified[0]["ok"], true, "the verify was green");
+
+    let (_, result) = recover(&rig, &run_id).await;
+    let result = result.expect("recovered");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(
+        collection_state(&rig),
+        killed.before,
+        "the good deploy is undone"
+    );
+    assert!(!journal_path(&rig).exists());
+}
+
+#[tokio::test]
+async fn journal_recover_twice_refuses() {
+    // Edge DAPL-09 idempotency.
+    let killed = killed_mid_write().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    let (_, first) = recover(&rig, &run_id).await;
+    let first = first.expect("the first recovery");
+    assert_eq!(collection_state(&rig), killed.before);
+    let record_after = std::fs::read(record_path(&rig, &run_id)).expect("record");
+
+    let second = Fresh::new(&rig).await;
+    let err = second
+        .rollback(&rig, &run_id, false)
+        .await
+        .expect_err("a second recovery refuses");
+    assert_invalid(
+        &err,
+        &run_id,
+        &format!("already rolled back by {}", first.run_id),
+    );
+    only_reads(&second);
+    assert_eq!(collection_state(&rig), killed.before, "nothing changed");
+    assert_eq!(
+        std::fs::read(record_path(&rig, &run_id)).expect("record"),
+        record_after
+    );
+
+    // After a clear there is no record at all.
+    let killed = killed_mid_write().await;
+    let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
+    unmove(&rig, &run_id, DB_CONFIG);
+    write_journal_phase(&rig, JournalPhase::Ready);
+    let (_, cleared) = recover(&rig, &run_id).await;
+    assert_eq!(cleared.expect("cleared").outcome, RollbackKind::Cleared);
+    let second = Fresh::new(&rig).await;
+    let err = second
+        .rollback(&rig, &run_id, false)
+        .await
+        .expect_err("nothing to recover");
+    assert_invalid(&err, &run_id, "record.json");
+    only_reads(&second);
+    assert_eq!(collection_state(&rig), killed.before);
 }

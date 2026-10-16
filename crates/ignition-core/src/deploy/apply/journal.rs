@@ -437,6 +437,67 @@ mod tests {
         assert!(!JournalPhase::Restoring.before_first_move());
     }
 
+    fn live(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(path, hash)| ((*path).to_string(), hash.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn recovery_action_clears_only_an_untouched_run() {
+        use super::super::fingerprint::fingerprint;
+        let pre = live(&[("mod/type/a.json", Some(HASH)), ("mod/type/b.json", None)]);
+        let journal = |phase| Journal {
+            phase,
+            pre_fingerprint: fingerprint(&pre),
+            touched: pre.keys().cloned().collect(),
+            ..good()
+        };
+        let other = live(&[
+            ("mod/type/a.json", Some(HASH)),
+            ("mod/type/b.json", Some(HASH)),
+        ]);
+        for (phase, cleared) in [
+            (JournalPhase::Snapshotting, true),
+            (JournalPhase::Ready, true),
+            (JournalPhase::Writing, false),
+            (JournalPhase::Written, false),
+            (JournalPhase::Restoring, false),
+        ] {
+            let j = journal(phase);
+            let same = recovery_action(&j, &pre);
+            let changed = recovery_action(&j, &other);
+            assert_eq!(
+                same,
+                if cleared {
+                    RecoveryAction::ClearWithoutRestore
+                } else {
+                    RecoveryAction::Restore
+                },
+                "{phase:?}, live equals the pre-run state"
+            );
+            assert_eq!(
+                changed,
+                RecoveryAction::Restore,
+                "{phase:?}, live differs from the pre-run state"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_location_follows_the_ledger_root() {
+        use crate::deploy::ledger::LedgerRoot;
+        assert_eq!(
+            journal_location(LedgerRoot::AccountHome, GW, MODE),
+            "~/ign-deploy/tracer-gw/dev/journal.json"
+        );
+        assert_eq!(
+            journal_location(LedgerRoot::DataDir, GW, MODE),
+            "ign-deploy/tracer-gw/dev/journal.json"
+        );
+    }
+
     #[test]
     fn refuses_an_empty_file() {
         assert!(refusal(b"").contains("empty"));
