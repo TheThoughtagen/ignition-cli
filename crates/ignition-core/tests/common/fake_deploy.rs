@@ -130,6 +130,8 @@ struct FakeState {
     scan_posts: usize,
     /// Lock acquire requests received, refused ones included.
     lock_attempts: usize,
+    /// Scan POSTs still to be swallowed (see [`FakeGateway::stall_scans`]).
+    stall_scans: usize,
 }
 
 impl FakeState {
@@ -304,6 +306,16 @@ impl FakeGateway {
     /// Lock acquire requests received so far, refused ones included.
     pub fn lock_acquires(&self) -> usize {
         self.state.lock().expect("fake state").lock_attempts
+    }
+
+    /// The next `n` scan POSTs are accepted and never complete: each is
+    /// counted and releases the lock (D4, D12) but loads nothing and leaves
+    /// `lastScanTimestamp` where it was, which is what a scan that never
+    /// advances reports (the `ScanOutcome::NotComplete` case). The POST after
+    /// them behaves as usual. Cited behaviour: C1i (a trigger answering 200 is
+    /// not proof of a completed scan).
+    pub fn stall_scans(&self, n: usize) {
+        self.state.lock().expect("fake state").stall_scans = n;
     }
 
     /// A client for the API token `token_name`. Its actor is
@@ -757,6 +769,11 @@ impl DeployApi for FakeDeploy {
     async fn scan_request(&self, kind: ScanKind) -> Result<(), CoreError> {
         let mut state = self.state();
         state.scan_posts += 1;
+        if state.stall_scans > 0 {
+            state.stall_scans -= 1;
+            *state.locks.get_mut(kind) = None;
+            return Ok(());
+        }
         if kind == ScanKind::Config {
             state.reload_from_disk();
         }

@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::fake_deploy::FakeGateway;
@@ -20,10 +20,11 @@ use ignition_core::actions::deploy::{
 use ignition_core::actions::deploy_apply::{
     ApplyPrepared, DeployApplyResult, PrepareOptions, deploy_apply_execute, deploy_apply_prepare,
 };
-use ignition_core::client::ReqwestGatewayApi;
+use ignition_core::client::scan::ScanKind;
+use ignition_core::client::{DeployApi, ReqwestGatewayApi};
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
-use ignition_core::deploy::apply::hold::{Clock, HoldModel, SystemClock};
+use ignition_core::deploy::apply::hold::{Clock, HoldModel, ManualClock, SystemClock};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
 use ignition_core::deploy::apply::record::{RecordState, RunRecord};
 use ignition_core::deploy::apply::{
@@ -699,31 +700,6 @@ fn failed_result(rig: &Rig) -> Value {
 }
 
 #[tokio::test]
-async fn a_lock_that_lapsed_before_the_scan_is_never_applied() {
-    let rig = changing_rig().await;
-    let fake = rig.fake.clone();
-    let host = rig.host.clone().after("commit", 1, move || {
-        let fake = fake.clone();
-        async move { fake.tick(HOLD_S as i64 + 1) }
-    });
-    let rig = Rig { host, ..rig };
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let err = rig
-        .run(prepared, &NoObserver)
-        .await
-        .expect_err("not applied");
-    assert_eq!(err.code(), "internal", "{err}");
-    assert!(err.to_string().contains("lock_expired"), "{err}");
-    assert_eq!(
-        rig.fake.scan_count(),
-        0,
-        "the scan is not triggered on a lapsed lock"
-    );
-    assert_eq!(failed_result(&rig)["ok"], false);
-}
-
-#[tokio::test]
 async fn a_red_verify_is_never_applied() {
     // A gateway that never loads the new files: its REST view stays empty.
     let fx = PlanFixture::new();
@@ -923,4 +899,226 @@ async fn fault_rerun_after_restore_plans_the_same() {
     };
     assert_eq!(second.plan_sha256, first.plan_sha256);
     assert_eq!(second.render_sha256, first.render_sha256);
+}
+
+/// The `error` code of the one `result.json` of a failed run.
+fn failed_error_code(rig: &Rig) -> String {
+    failed_result(rig)["error"]["code"]
+        .as_str()
+        .expect("an error code")
+        .to_string()
+}
+
+/// A rig whose next hook after `commit` runs `after`, and which records the
+/// scan count when `restore` returns.
+fn rig_with_hooks(
+    rig: Rig,
+    after_commit: impl Fn() + Send + Sync + 'static,
+) -> (Rig, Arc<Mutex<Vec<usize>>>) {
+    let fake = rig.fake.clone();
+    let scans_at_restore = Arc::new(Mutex::new(Vec::new()));
+    let seen = scans_at_restore.clone();
+    let host = rig
+        .host
+        .clone()
+        .after("commit", 1, move || {
+            after_commit();
+            async {}
+        })
+        .after("restore", 1, move || {
+            seen.lock().expect("seen").push(fake.scan_count());
+            async {}
+        });
+    (Rig { host, ..rig }, scans_at_restore)
+}
+
+#[tokio::test]
+async fn fault_lock_expired_before_scan_restores_then_scans() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let fake = rig.fake.clone();
+    let (rig, scans_at_restore) = rig_with_hooks(rig, move || fake.tick(HOLD_S as i64 + 1));
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("rolled back");
+
+    assert_rolled_back(&result, "lock_expired");
+    assert_eq!(collection_state(&rig), before);
+    assert_eq!(
+        *scans_at_restore.lock().expect("seen"),
+        [0],
+        "no scan ran before the restore"
+    );
+    assert_eq!(rig.fake.scan_count(), 1, "the restore's own scan");
+    assert_eq!(rig.fake.lock_acquires(), 2, "the restore took a fresh hold");
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        event_names(&run_dir),
+        [
+            "run_started",
+            "staged",
+            "lock_acquired",
+            "committed",
+            "lock_verdict",
+            "restore_started",
+            "lock_acquired",
+            "scan_done",
+            "restored"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn fault_local_clock_expired_restores_under_held_lock() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let clock = Arc::new(ManualClock::new());
+    let tick = clock.clone();
+    // The gateway still reports a large remaining; only the local count ran out.
+    let (rig, scans_at_restore) = rig_with_hooks(rig, move || {
+        tick.advance(Duration::from_secs(HOLD_S + 1));
+    });
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, clock.as_ref(), &options())
+        .await
+        .expect("rolled back");
+
+    assert_rolled_back(&result, "lock_expired");
+    assert_eq!(collection_state(&rig), before);
+    assert_eq!(
+        rig.fake.lock_acquires(),
+        1,
+        "no second acquire under a held lock"
+    );
+    assert_eq!(*scans_at_restore.lock().expect("seen"), [0]);
+    assert_eq!(rig.fake.scan_count(), 1);
+}
+
+#[tokio::test]
+async fn fault_short_remaining_waits_for_the_lapse_then_restores_under_a_fresh_lock() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let clock = Arc::new(ManualClock::new());
+    let fake = rig.fake.clone();
+    let tick = clock.clone();
+    // The local count ran out and the gateway has a few seconds left: not
+    // enough for the restore, so the restore waits for the lapse.
+    let (rig, scans_at_restore) = rig_with_hooks(rig, move || {
+        tick.advance(Duration::from_secs(HOLD_S + 1));
+        fake.tick(HOLD_S as i64 - 4);
+    });
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, clock.as_ref(), &options())
+        .await
+        .expect("rolled back");
+
+    assert_rolled_back(&result, "lock_expired");
+    assert_eq!(collection_state(&rig), before);
+    assert_eq!(rig.fake.lock_acquires(), 2);
+    assert_eq!(*scans_at_restore.lock().expect("seen"), [0]);
+    assert_eq!(rig.fake.scan_count(), 1);
+}
+
+#[tokio::test]
+async fn fault_scan_incomplete_restores() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    rig.fake.stall_scans(1);
+    let mut opts = options();
+    opts.poll.deadline = Duration::from_millis(300);
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &opts)
+        .await
+        .expect("rolled back");
+
+    assert_rolled_back(&result, "scan_incomplete");
+    assert_eq!(collection_state(&rig), before);
+    assert_eq!(
+        rig.fake.scan_count(),
+        2,
+        "the stalled scan and the restore's own"
+    );
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        event_names(&run_dir),
+        [
+            "run_started",
+            "staged",
+            "lock_acquired",
+            "committed",
+            "lock_verdict",
+            "restore_started",
+            "lock_acquired",
+            "scan_done",
+            "restored"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn fault_pre_image_changed_is_plan_stale() {
+    // Edges DAPL-01 and DAPL-05 concurrency: a mode-collection file changed
+    // between the plan and the lock.
+    let rig = changing_rig().await;
+    let target = rig.fx.collection_dir(MODE).join(DB_RESOURCE);
+    let mut edited = std::fs::read(&target).expect("live file");
+    edited.push(b'\n');
+    let mut expected = collection_state(&rig);
+    expected.insert(DB_RESOURCE.to_string(), sha256_hex(&edited));
+    let (path, bytes) = (target.clone(), edited.clone());
+    let host = rig.host.clone().after("prepare", 1, move || {
+        std::fs::write(&path, &bytes).expect("foreign edit");
+        async {}
+    });
+    let rig = Rig { host, ..rig };
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig.run(prepared, &NoObserver).await.expect_err("stale");
+
+    assert_eq!((err.code(), err.exit_code()), ("plan_stale", 6), "{err}");
+    assert_eq!(collection_state(&rig), expected, "nothing moved");
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(names(&rig.deploy_dir().join("snapshots")).is_empty());
+    assert!(names(&rig.deploy_dir().join("staging")).is_empty());
+    assert_eq!(rig.fake.scan_count(), 1, "one no-op scan releases the lock");
+    assert_eq!(rig.fake.lock_acquires(), 1);
+    assert_eq!(
+        rig.host.calls(),
+        ["prepare", "commit", "discard_interrupted"]
+    );
+    assert_eq!(failed_error_code(&rig), "plan_stale");
+}
+
+#[tokio::test]
+async fn fault_competing_lock_is_scan_lock_held() {
+    // Edge DAPL-06 concurrency: another actor holds the lock.
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    rig.fake
+        .client("b")
+        .scan_lock_acquire(ScanKind::Config, 0, 600)
+        .await
+        .expect("B takes the lock");
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig.run(prepared, &NoObserver).await.expect_err("refused");
+
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("scan_lock_held", 6),
+        "{err}"
+    );
+    assert_eq!(collection_state(&rig), before);
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(names(&rig.deploy_dir().join("staging")).is_empty());
+    assert!(names(&rig.deploy_dir().join("snapshots")).is_empty());
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert_eq!(rig.host.calls(), ["prepare", "discard_interrupted"]);
+    assert_eq!(failed_error_code(&rig), "scan_lock_held");
 }
