@@ -2297,3 +2297,402 @@ async fn snapshot_skip_gwbk_is_recorded() {
     assert!(event_lines(&run_dir, "gwbk_downloaded").is_empty());
     assert_eq!(json_file(&run_dir.join("result.json"))["skip_gwbk"], true);
 }
+
+// ============================================================================
+// Restart-pending, the run-directory snapshot and the run directory (23-09)
+// ============================================================================
+
+const PENDING_X: &str = "Module Enabled: x";
+
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+/// One applied run on the standard changing rig, the gateway listing
+/// `before` until the config scan and `after` from then on.
+async fn applied_with_pending(before: &[&str], after: &[&str]) -> (Rig, DeployApplyResult) {
+    let rig = changing_rig().await;
+    rig.fake
+        .set_restart_pending(strings(before), strings(after));
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    (rig, result)
+}
+
+#[tokio::test]
+async fn run_dir_restart_pending_reported() {
+    // Nothing before, one entry after: the post list and the new entry.
+    let (_, result) = applied_with_pending(&[], &[PENDING_X]).await;
+    assert_eq!(result.restart_pending, [PENDING_X]);
+    assert_eq!(result.restart_pending_new, [PENDING_X]);
+
+    // The same entry before and after: pending, not new.
+    let (_, result) = applied_with_pending(&[PENDING_X], &[PENDING_X]).await;
+    assert_eq!(result.restart_pending, [PENDING_X]);
+    assert!(result.restart_pending_new.is_empty(), "{result:?}");
+
+    // One old, one added by the run.
+    let (rig, result) = applied_with_pending(&["a"], &["a", "b"]).await;
+    assert_eq!(result.restart_pending, ["a", "b"]);
+    assert_eq!(result.restart_pending_new, ["b"]);
+    let doc = json_file(&rig.run_dir(&result).join("result.json"));
+    assert_eq!(doc["restart_pending"], json!(["a", "b"]));
+    assert_eq!(doc["restart_pending_new"], json!(["b"]));
+
+    // Edge DAPL-10 empty: both empty is [], never null, in the result and in
+    // result.json.
+    let (rig, result) = applied_with_pending(&[], &[]).await;
+    assert!(result.restart_pending.is_empty());
+    assert!(result.restart_pending_new.is_empty());
+    let envelope = serde_json::to_value(&result).expect("serializes");
+    assert_eq!(envelope["restart_pending"], json!([]));
+    assert_eq!(envelope["restart_pending_new"], json!([]));
+    let doc = json_file(&rig.run_dir(&result).join("result.json"));
+    assert_eq!(doc["restart_pending"], json!([]));
+    assert_eq!(doc["restart_pending_new"], json!([]));
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("restart_pending")),
+        "{:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn run_dir_restart_pending_unavailable_warns() {
+    let rig = changing_rig().await;
+    rig.fake.deny_restart_pending();
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect("a 403 on the pending list is never a failure");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    assert!(result.ok);
+    let warned: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.as_str() == "restart_pending_unavailable")
+        .collect();
+    assert_eq!(warned.len(), 1, "once per run: {:?}", result.warnings);
+    assert!(result.restart_pending.is_empty());
+    assert!(result.restart_pending_new.is_empty());
+}
+
+/// Every request the rig's gateway received that names a restart route.
+async fn restart_requests(rig: &Rig) -> Vec<String> {
+    rig._server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .into_iter()
+        .filter(|r| r.url.path().contains("restart"))
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+#[tokio::test]
+async fn run_dir_never_restarts() {
+    // An applied run.
+    let applied = changing_rig().await;
+    wiremock::Mock::given(wiremock::matchers::path(
+        "/data/api/v1/restart-tasks/restart",
+    ))
+    .respond_with(wiremock::ResponseTemplate::new(200))
+    .expect(0)
+    .mount(&applied._server)
+    .await;
+    let prepared = applied
+        .prepare(GateFlags::default())
+        .await
+        .expect("prepare");
+    let result = applied.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    assert!(restart_requests(&applied).await.is_empty());
+    applied._server.verify().await;
+
+    // A rolled-back run.
+    let rolled = failing_move_rig().await;
+    wiremock::Mock::given(wiremock::matchers::path(
+        "/data/api/v1/restart-tasks/restart",
+    ))
+    .respond_with(wiremock::ResponseTemplate::new(200))
+    .expect(0)
+    .mount(&rolled._server)
+    .await;
+    let prepared = rolled.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rolled
+        .run(prepared, &NoObserver)
+        .await
+        .expect("rolled back");
+    assert_rolled_back(&result, "write_failed");
+    assert!(restart_requests(&rolled).await.is_empty());
+    rolled._server.verify().await;
+}
+
+#[test]
+fn apply_source_never_names_the_restart_route() {
+    // T-23-39: the deploy path has no way to restart. The only restart text
+    // allowed is the read-only pending list.
+    fn walk(dir: &Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, hits);
+            } else if path
+                .extension()
+                .is_some_and(|e| e == "rs" || e == "sh" || e == "ps1")
+            {
+                let text = std::fs::read_to_string(&path).expect("source");
+                for needle in ["RESTART_PATH", "restart-tasks/restart", "failover"] {
+                    if text.contains(needle) {
+                        hits.push(format!("{} names {needle}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/deploy");
+    let mut hits = Vec::new();
+    walk(&root, &mut hits);
+    assert!(hits.is_empty(), "{hits:?}");
+}
+
+#[tokio::test]
+async fn snapshot_run_dir_hashes_equal_record() {
+    // Edge DAPL-05 adjacency: a created file has no pre-image.
+    let rig = changing_rig().await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    let run_id = result.run_id.clone().expect("run id");
+    let run_dir = rig.run_dir(&result);
+    let record = rig.record(&run_id);
+    let listed = json_file(&run_dir.join("result.json"))["snapshot_sha256"].clone();
+    let listed = listed.as_object().expect("result.json lists the hashes");
+
+    let mut with_pre = 0;
+    let mut created = 0;
+    for entry in &record.touched {
+        let key = if entry.path == LEDGER_KEY {
+            "ledger.json".to_string()
+        } else {
+            format!("files/{}", entry.path)
+        };
+        let copy = run_dir.join("snapshot").join(&key);
+        match &entry.pre_sha256 {
+            Some(pre) => {
+                with_pre += 1;
+                assert_eq!(
+                    sha256_hex(&std::fs::read(&copy).expect("pre-image copy")),
+                    *pre,
+                    "{key}"
+                );
+                assert_eq!(listed.get(&key), Some(&json!(pre)), "{key}");
+            }
+            None => {
+                created += 1;
+                assert!(!copy.exists(), "{key} was created, so it has no snapshot");
+                assert!(!listed.contains_key(&key), "{key}");
+            }
+        }
+    }
+    assert!(with_pre > 0 && created > 0, "{with_pre} / {created}");
+    assert!(
+        !result.warnings.iter().any(|w| w.starts_with("snapshot_")),
+        "{:?}",
+        result.warnings
+    );
+}
+
+#[tokio::test]
+async fn snapshot_create_only_run_has_an_empty_files_dir() {
+    // Edge DAPL-05 empty: a run that only creates files still has a record.
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.remove(MODE, ALARM_UNIT);
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.written.len(), 2, "{:?}", result.written);
+    let run_id = result.run_id.clone().expect("run id");
+    let record = rig.record(&run_id);
+    assert!(
+        record.touched.iter().any(|e| e.pre_sha256.is_none()),
+        "{record:?}"
+    );
+    let files = rig.run_dir(&result).join("snapshot").join("files");
+    let kept = files_below(&files);
+    assert!(kept.is_empty(), "no pre-image to copy: {kept:?}");
+    assert_eq!(rig.record(&run_id).state, RecordState::Applied);
+}
+
+#[tokio::test]
+async fn snapshot_two_runs_two_dirs() {
+    // Edge DAPL-05 idempotency (D-08): nothing prunes either run.
+    let rig = changing_rig().await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let first = rig.run(prepared, &NoObserver).await.expect("first");
+
+    // Change a file again and apply a second time.
+    let mut bytes = rig.fx.read(MODE, DB_CONFIG);
+    bytes.push(b' ');
+    rig.fx.mode(DB_CONFIG, &bytes);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare 2");
+    let second = rig.run(prepared, &NoObserver).await.expect("second");
+    assert_eq!(second.outcome, OutcomeKind::Applied);
+
+    let (a, b) = (
+        first.run_id.clone().expect("a"),
+        second.run_id.clone().expect("b"),
+    );
+    assert_ne!(a, b);
+    assert_ne!(rig.run_dir(&first), rig.run_dir(&second));
+    let on_box = names(&rig.deploy_dir().join("snapshots"));
+    assert_eq!(on_box.len(), 2, "{on_box:?}");
+    for result in [&first, &second] {
+        assert!(rig.run_dir(result).join("snapshot").is_dir());
+        assert!(rig.run_dir(result).join("run.json").is_file());
+    }
+    let runs = names(&rig.repo.join(".ign").join("deploy").join(GATEWAY));
+    assert_eq!(runs.len(), 2, "{runs:?}");
+}
+
+/// Every run-directory file is owner-only (unix) and the directory is 0700.
+#[cfg(unix)]
+fn assert_private(run_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(run_dir), 0o700, "{}", run_dir.display());
+    for file in files_below(run_dir) {
+        assert_eq!(mode(&run_dir.join(&file)), 0o600, "{file}");
+    }
+}
+
+/// The four files every run past the gates leaves.
+fn assert_run_files(run_dir: &Path) {
+    for file in ["run.json", "result.json", "plan.json", "events.ndjson"] {
+        assert!(
+            run_dir.join(file).is_file(),
+            "{file} in {}",
+            run_dir.display()
+        );
+    }
+    #[cfg(unix)]
+    assert_private(run_dir);
+}
+
+/// The one run directory a rig has.
+fn the_run_dir(rig: &Rig) -> PathBuf {
+    let root = rig.repo.join(".ign").join("deploy").join(GATEWAY);
+    let runs = names(&root);
+    assert_eq!(runs.len(), 1, "one run directory: {runs:?}");
+    root.join(&runs[0])
+}
+
+fn assert_no_ign_dir(rig: &Rig, what: &str) {
+    assert!(
+        !rig.repo.join(".ign").exists(),
+        "{what} must leave no run directory"
+    );
+}
+
+#[tokio::test]
+async fn run_dir_matrix() {
+    // Success.
+    let rig = changing_rig().await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_run_files(&rig.run_dir(&result));
+
+    // A preflight failure.
+    let rig = changing_rig().await;
+    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    assert_eq!(refused_checks(&rig).await, ["designers"]);
+    assert_run_files(&the_run_dir(&rig));
+
+    // A post-write failure that restored.
+    let rig = failing_move_rig().await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("rolled back");
+    assert_rolled_back(&result, "write_failed");
+    assert_run_files(&rig.run_dir(&result));
+
+    // A rollback_failed.
+    let run = scenario_restore_fails().await;
+    assert_eq!(run.error().code(), "rollback_failed");
+    assert_run_files(&the_run_dir(&run.rig));
+
+    // Refusals before the run directory leave none. A flag error:
+    let rig = changing_rig().await;
+    let err = rig
+        .prepare(with_hash("not a hash"))
+        .await
+        .expect_err("a malformed hash");
+    assert_eq!(err.code(), "invalid_input");
+    assert_no_ign_dir(&rig, "a flag error");
+    // A stale hash:
+    let err = rig
+        .prepare(with_hash(&"0".repeat(64)))
+        .await
+        .expect_err("stale");
+    assert_eq!(err.code(), "plan_stale");
+    assert_no_ign_dir(&rig, "plan_stale");
+    // A destructive change without its flag:
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let old = "ignition/database-translator/OLD";
+    fx.mode(&format!("{old}/config.json"), b"{}");
+    fx.mode(&format!("{old}/resource.json"), b"{}");
+    fx.ledger(
+        GATEWAY,
+        MODE,
+        &[
+            &format!("{old}/config.json"),
+            &format!("{old}/resource.json"),
+        ],
+    );
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+    let err = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect_err("destructive");
+    assert_eq!(err.code(), "destructive_change_refused");
+    assert_no_ign_dir(&rig, "destructive_change_refused");
+    // A no-op:
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let host = local_host(&fx);
+    let rig = rig_with(fx, host, None).await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    assert!(matches!(prepared, ApplyPrepared::Noop(_)));
+    let result = rig.run(prepared, &NoObserver).await.expect("noop");
+    assert_eq!(result.outcome, OutcomeKind::Noop);
+    assert_no_ign_dir(&rig, "a no-op");
+
+    // A repo that does not ignore .ign/: refused before the directory exists.
+    let rig = changing_rig().await;
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&rig.repo)
+        .status()
+        .expect("git runs");
+    assert!(git.success());
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("not ignored");
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    assert_eq!(failures[0].check, "run_dir_not_ignored");
+    assert_no_ign_dir(&rig, "run_dir_not_ignored");
+}
