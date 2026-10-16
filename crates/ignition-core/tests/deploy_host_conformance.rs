@@ -51,6 +51,16 @@ pub fn scenarios() -> Vec<Scenario> {
         row!(fetch_snapshot_copies_with_hashes),
         row!(read_record_absent_is_none),
         row!(probe_reports_writable_without_touching_the_collection),
+        row!(replace_file),
+        row!(delete_file_and_emptied_dirs),
+        row!(ledger_swap_and_restore),
+        row!(pre_image_mismatch_aborts_before_any_move),
+        row!(journal_present_refuses),
+        row!(self_move_refused),
+        row!(gateway_owned_file_refused),
+        row!(directory_where_file_goes_is_stale),
+        row!(symlinked_target_dir_is_refused),
+        row!(restore_twice_is_idempotent),
     ]
 }
 
@@ -608,6 +618,360 @@ fn rustix_is_root() -> bool {
         .unwrap_or(false)
 }
 
+// ---- commit and restore rule rows ----------------------------------------------
+
+const RUN2: &str = "20261016T100000Z-bbbbbb";
+
+/// A file that exists is replaced by moving the staged copy over it: the new
+/// bytes are live, the pre-image is in the snapshot, the collection holds no
+/// temp or backup entry, and restore puts the old bytes back.
+async fn replace_file(c: &Ctx) {
+    c.seed(FILE_A, b"old");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let batch = c.batch(RUN, &[(FILE_A, b"new")], &[], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert_eq!(report.moved, vec![0]);
+    assert!(report.failure.is_none() && !report.stale, "{report:?}");
+    assert_eq!(c.listing().get(FILE_A), Some(&sha256_hex(b"new")));
+    assert_eq!(
+        tree_names(&c.collection()),
+        before.1,
+        "no temp, backup or dot-named entry appears in the collection"
+    );
+    assert_eq!(
+        std::fs::read(c.snapshot_dir(RUN).join("files").join(FILE_A)).expect("pre-image"),
+        b"old"
+    );
+    let record = c.record(RUN).expect("record");
+    let entry = record
+        .touched
+        .iter()
+        .find(|e| e.path == FILE_A)
+        .expect("entry");
+    assert_eq!(entry.pre_sha256, Some(sha256_hex(b"old")));
+    assert_eq!(entry.post_sha256, Some(sha256_hex(b"new")));
+
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+}
+
+/// A delete removes the file and each directory it emptied, deepest first,
+/// but never `<module>/<type>`; restore recreates both.
+async fn delete_file_and_emptied_dirs(c: &Ctx) {
+    const DEEP: &str = "ignition/tag-provider/default/sub/deep.json";
+    const OTHER: &str = "ignition/tag-provider/other/keep.json";
+    const SIBLING: &str = "ignition/perspective/kept/stay.json";
+    c.seed(DEEP, b"deep");
+    c.seed(OTHER, b"other");
+    c.seed(SIBLING, b"sibling");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let batch = c.batch(RUN, &[], &[DEEP, OTHER], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert_eq!(report.deleted, vec![0, 1]);
+    assert_eq!(
+        report.removed_dirs,
+        vec![
+            "ignition/tag-provider/default".to_string(),
+            "ignition/tag-provider/default/sub".to_string(),
+            "ignition/tag-provider/other".to_string(),
+        ]
+    );
+    let names = tree_names(&c.collection());
+    assert!(
+        names.contains(&"ignition/tag-provider".to_string()),
+        "the <module>/<type> directory stays: {names:?}"
+    );
+    assert!(
+        names.contains(&SIBLING.to_string()),
+        "an untouched sibling stays: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("default") || n.contains("other"))
+    );
+
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+}
+
+/// A prior ledger is snapshotted, replaced by the new one, and put back by
+/// restore.
+async fn ledger_swap_and_restore(c: &Ctx) {
+    let prior = ledger_bytes("20261015T100000Z-cccccc", &[FILE_A]);
+    std::fs::create_dir_all(c.deploy_dir()).expect("deploy dir");
+    std::fs::write(c.deploy_dir().join("ledger.json"), &prior).expect("ledger");
+    c.seed(FILE_A, b"old");
+    let before = c.listing();
+    let next = ledger_bytes(RUN, &[FILE_A, FILE_B]);
+    let batch = c.batch(RUN, &[(FILE_A, b"new"), (FILE_B, b"b")], &[], Some(&next));
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert_eq!(c.ledger_bytes().as_deref(), Some(next.as_slice()));
+    assert_eq!(
+        std::fs::read(c.snapshot_dir(RUN).join("ledger.json")).expect("snapshot ledger"),
+        prior,
+        "the prior ledger is snapshotted"
+    );
+
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.ledger_bytes().as_deref(), Some(prior.as_slice()));
+    assert_eq!(c.listing(), before);
+}
+
+/// A live file that is not what the plan was made against aborts the commit
+/// before the first move: the report is `stale`, the journal and the partial
+/// snapshot are gone and the collection and ledger are untouched.
+async fn pre_image_mismatch_aborts_before_any_move(c: &Ctx) {
+    // A changed file.
+    c.seed(FILE_A, b"old");
+    let ledger = ledger_bytes(RUN, &[FILE_A, FILE_B]);
+    let batch = c.batch(RUN, &[(FILE_A, b"new"), (FILE_B, b"b")], &[], Some(&ledger));
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    c.seed(FILE_A, b"changed behind the plan");
+    let before = (c.listing(), tree_names(&c.collection()));
+
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert!(report.stale, "{report:?}");
+    assert!(
+        report.moved.is_empty() && report.deleted.is_empty(),
+        "{report:?}"
+    );
+    assert!(report.failure.is_some(), "{report:?}");
+    assert!(c.journal().is_none(), "the journal is removed");
+    assert!(
+        !c.snapshot_dir(RUN).exists(),
+        "the partial snapshot is removed"
+    );
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    assert_eq!(c.ledger_bytes(), None, "the ledger is untouched");
+
+    // A changed ledger.
+    let batch = c.batch(RUN, &[(FILE_A, b"new")], &[], Some(&ledger));
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let other = ledger_bytes("20261015T100000Z-dddddd", &[FILE_B]);
+    std::fs::create_dir_all(c.deploy_dir()).expect("deploy dir");
+    std::fs::write(c.deploy_dir().join("ledger.json"), &other).expect("ledger");
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert!(report.stale, "{report:?}");
+    assert!(c.journal().is_none() && !c.snapshot_dir(RUN).exists());
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    assert_eq!(c.ledger_bytes().as_deref(), Some(other.as_slice()));
+}
+
+/// A journal that already exists makes `commit` refuse before any write, so
+/// two runs against one mode collection cannot both proceed (DAPL-09).
+async fn journal_present_refuses(c: &Ctx) {
+    let first = c.batch(RUN, &[(FILE_A, b"a")], &[], None);
+    let report = c.apply(&first).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+
+    let second = c.batch(RUN2, &[(FILE_B, b"b")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&second.spec, &second.tree)
+        .await
+        .expect("prepare");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let journal_before =
+        std::fs::read(c.deploy_dir().join("journal.json")).expect("first run's journal");
+
+    let err = c
+        .host
+        .commit(&prepared)
+        .await
+        .expect_err("a second run is refused");
+    assert_eq!(err.code(), "deploy_journal_present", "{err}");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    assert_eq!(
+        std::fs::read(c.deploy_dir().join("journal.json")).expect("journal"),
+        journal_before,
+        "the first run's journal is not touched"
+    );
+    assert!(
+        !c.snapshot_dir(RUN2).exists(),
+        "nothing was snapshotted for the refused run"
+    );
+}
+
+/// A staged copy that is the very file it would replace is never moved onto
+/// itself (C7a-4: a self-rename deletes the file). Detecting it needs the
+/// inode, which the unix host has; the row is a no-op elsewhere.
+async fn self_move_refused(c: &Ctx) {
+    #[cfg(unix)]
+    {
+        c.seed(FILE_A, b"same bytes");
+        let batch = c.batch(RUN, &[(FILE_A, b"same bytes")], &[], None);
+        let prepared = c
+            .host
+            .prepare(&batch.spec, &batch.tree)
+            .await
+            .expect("prepare");
+        // The staged copy becomes a second name for the live file.
+        let staged = c.staging_dir(RUN).join("files").join(FILE_A);
+        std::fs::remove_file(&staged).expect("remove staged copy");
+        std::fs::hard_link(c.collection().join(FILE_A), &staged).expect("hard link");
+
+        let report = c.host.commit(&prepared).await.expect("commit");
+        assert_eq!(report.phase, JournalPhase::Writing, "{report:?}");
+        assert!(report.moved.is_empty(), "{report:?}");
+        let failure = report.failure.expect("a failure");
+        assert!(failure.contains("write 0"), "{failure}");
+        assert_eq!(
+            std::fs::read(c.collection().join(FILE_A)).expect("the file survives"),
+            b"same bytes"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = c;
+}
+
+/// A path the gateway owns, a dot-named component or a path with fewer than
+/// three components is refused before any I/O by `prepare` and `restore`
+/// (research Pitfall 21).
+async fn gateway_owned_file_refused(c: &Ctx) {
+    c.seed(FILE_A, b"live");
+    let before = (c.listing(), tree_names(&c.collection()));
+    for bad in [
+        "ignition/tag-provider/config-mode.json",
+        "ignition/tag-provider/.hidden/x.json",
+        "ignition/tag-provider",
+    ] {
+        let batch = c.batch(RUN, &[(bad, b"x")], &[], None);
+        let err = c
+            .host
+            .prepare(&batch.spec, &batch.tree)
+            .await
+            .expect_err("prepare refuses the path");
+        assert_eq!(err.code(), "transport_failed", "{bad}: {err}");
+        assert!(
+            !c.deploy_dir().exists(),
+            "{bad}: nothing was written before the refusal"
+        );
+        assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    }
+
+    // `restore` reads the paths from the record, so it refuses them too.
+    let good = c.batch(RUN, &[(FILE_B, b"b")], &[], None);
+    c.apply(&good).await;
+    let mut record = c.record(RUN).expect("record");
+    let journal_before = std::fs::read(c.deploy_dir().join("journal.json")).expect("journal");
+    let after_commit = (c.listing(), tree_names(&c.collection()));
+    record.touched[0].path = "ignition/tag-provider/config-mode.json".to_string();
+    let err = c
+        .host
+        .restore(&record)
+        .await
+        .expect_err("restore refuses the path");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert_eq!((c.listing(), tree_names(&c.collection())), after_commit);
+    assert_eq!(
+        std::fs::read(c.deploy_dir().join("journal.json")).expect("journal"),
+        journal_before,
+        "restore wrote nothing, not even its journal"
+    );
+}
+
+/// A directory where a file must go is a pre-image mismatch: the commit is
+/// `stale`, nothing moves and the directory stays.
+async fn directory_where_file_goes_is_stale(c: &Ctx) {
+    c.seed(FILE_B, b"other");
+    let batch = c.batch(RUN, &[(FILE_A, b"a"), (FILE_B, b"b")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    // After the plan was made, a directory appears where FILE_A goes.
+    c.seed(&format!("{FILE_A}/inner.json"), b"inner");
+    let before = (c.listing(), tree_names(&c.collection()));
+
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert!(report.stale, "{report:?}");
+    assert!(report.moved.is_empty(), "{report:?}");
+    assert!(c.journal().is_none() && !c.snapshot_dir(RUN).exists());
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    assert!(c.collection().join(FILE_A).is_dir(), "the directory stays");
+}
+
+/// A directory of the target path that became a symlink after the plan was
+/// made is not followed: the commit is `stale` and nothing is written through
+/// the link.
+async fn symlinked_target_dir_is_refused(c: &Ctx) {
+    #[cfg(unix)]
+    {
+        let batch = c.batch(RUN, &[(FILE_A, b"a")], &[], None);
+        let prepared = c
+            .host
+            .prepare(&batch.spec, &batch.tree)
+            .await
+            .expect("prepare");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), c.collection().join("ignition"))
+            .expect("symlink");
+
+        let report = c.host.commit(&prepared).await.expect("commit");
+        assert!(report.stale, "{report:?}");
+        assert!(report.moved.is_empty(), "{report:?}");
+        assert!(c.journal().is_none() && !c.snapshot_dir(RUN).exists());
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was written through the link"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = c;
+}
+
+/// Running `restore` twice for one run leaves byte-identical collection
+/// contents and ledger (DAPL-07 idempotency).
+async fn restore_twice_is_idempotent(c: &Ctx) {
+    let prior = ledger_bytes("20261015T100000Z-cccccc", &[FILE_A]);
+    std::fs::create_dir_all(c.deploy_dir()).expect("deploy dir");
+    std::fs::write(c.deploy_dir().join("ledger.json"), &prior).expect("ledger");
+    c.seed(FILE_A, b"old a");
+    c.seed(FILE_C, b"old c");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let next = ledger_bytes(RUN, &[FILE_A, FILE_B]);
+    let batch = c.batch(
+        RUN,
+        &[(FILE_A, b"new a"), (FILE_B, b"new b")],
+        &[FILE_C],
+        Some(&next),
+    );
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN).expect("record");
+
+    let first = c.host.restore(&record).await.expect("first restore");
+    assert!(first.failure.is_none(), "{first:?}");
+    let once = (c.listing(), tree_names(&c.collection()), c.ledger_bytes());
+    assert_eq!((once.0.clone(), once.1.clone()), before);
+    assert_eq!(once.2.as_deref(), Some(prior.as_slice()));
+
+    let second = c.host.restore(&record).await.expect("second restore");
+    assert!(second.failure.is_none(), "{second:?}");
+    let twice = (c.listing(), tree_names(&c.collection()), c.ledger_bytes());
+    assert_eq!(twice, once, "a second restore changes nothing");
+    assert_eq!(c.journal().expect("journal").phase, JournalPhase::Restoring);
+}
+
 // ---- the local host --------------------------------------------------------
 
 async fn run_local(name: &str) {
@@ -652,6 +1016,56 @@ async fn conformance_local_read_record_absent_is_none() {
 #[tokio::test]
 async fn conformance_local_probe_reports_writable_without_touching_the_collection() {
     run_local("probe_reports_writable_without_touching_the_collection").await;
+}
+
+#[tokio::test]
+async fn conformance_local_replace_file() {
+    run_local("replace_file").await;
+}
+
+#[tokio::test]
+async fn conformance_local_delete_file_and_emptied_dirs() {
+    run_local("delete_file_and_emptied_dirs").await;
+}
+
+#[tokio::test]
+async fn conformance_local_ledger_swap_and_restore() {
+    run_local("ledger_swap_and_restore").await;
+}
+
+#[tokio::test]
+async fn conformance_local_pre_image_mismatch_aborts_before_any_move() {
+    run_local("pre_image_mismatch_aborts_before_any_move").await;
+}
+
+#[tokio::test]
+async fn conformance_local_journal_present_refuses() {
+    run_local("journal_present_refuses").await;
+}
+
+#[tokio::test]
+async fn conformance_local_self_move_refused() {
+    run_local("self_move_refused").await;
+}
+
+#[tokio::test]
+async fn conformance_local_gateway_owned_file_refused() {
+    run_local("gateway_owned_file_refused").await;
+}
+
+#[tokio::test]
+async fn conformance_local_directory_where_file_goes_is_stale() {
+    run_local("directory_where_file_goes_is_stale").await;
+}
+
+#[tokio::test]
+async fn conformance_local_symlinked_target_dir_is_refused() {
+    run_local("symlinked_target_dir_is_refused").await;
+}
+
+#[tokio::test]
+async fn conformance_local_restore_twice_is_idempotent() {
+    run_local("restore_twice_is_idempotent").await;
 }
 
 // ---- fault rows (local host only) ---------------------------------------------
