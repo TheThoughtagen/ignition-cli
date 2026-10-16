@@ -240,8 +240,8 @@ async fn mount_passing_preflights(server: &wiremock::MockServer) {
 fn gwbk_zip() -> Vec<u8> {
     use std::io::Write as _;
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     writer
         .start_file("data.bin", options)
         .expect("member starts");
@@ -968,7 +968,7 @@ async fn fault_write_failed_mid_commit_restores() {
     assert_eq!(doc["cause"], "write_failed");
     let seen = recorder.0.lock().expect("events");
     assert!(matches!(
-        seen[4],
+        seen[5],
         ApplyEvent::RestoreStarted {
             cause: RollbackCause::WriteFailed
         }
@@ -2173,7 +2173,10 @@ async fn snapshot_gwbk_downloaded_private() {
     let run_id = result.run_id.clone().expect("run id");
     let run_dir = rig.run_dir(&result);
     let file = run_dir.join(format!("{run_id}.gwbk"));
-    assert_eq!(result.gwbk.as_deref(), Some(format!("{run_id}.gwbk").as_str()));
+    assert_eq!(
+        result.gwbk.as_deref(),
+        Some(format!("{run_id}.gwbk").as_str())
+    );
     assert!(!result.skip_gwbk);
     assert_eq!(std::fs::read(&file).expect("the .gwbk"), gwbk_zip());
     #[cfg(unix)]
@@ -2207,7 +2210,10 @@ async fn gwbk_refusal(rig: &Rig) -> (String, PathBuf) {
         .run(prepared, &NoObserver)
         .await
         .expect_err("the .gwbk is refused");
-    assert_eq!((err.code(), err.exit_code()), ("deploy_preflight_failed", 6));
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("deploy_preflight_failed", 6)
+    );
     let CoreError::DeployPreflightFailed { failures } = &err else {
         panic!("expected DeployPreflightFailed, got {err:?}");
     };

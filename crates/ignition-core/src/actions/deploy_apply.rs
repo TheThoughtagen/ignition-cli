@@ -77,6 +77,12 @@ pub struct DeployApplyResult {
     pub deleted: Vec<String>,
     /// Plan and engine warnings.
     pub warnings: Vec<String>,
+    /// The `.gwbk` file name in the run directory; null for a no-op or
+    /// `--skip-gwbk`.
+    pub gwbk: Option<String>,
+    /// Whether the run was started with `--skip-gwbk` (always false for a
+    /// no-op, which takes no options).
+    pub skip_gwbk: bool,
 }
 
 impl DeployApplyResult {
@@ -106,6 +112,8 @@ fn base_result(plan: &DeployPlanResult, outcome: OutcomeKind) -> DeployApplyResu
         written: Vec::new(),
         deleted: Vec::new(),
         warnings: plan.warnings.clone(),
+        gwbk: None,
+        skip_gwbk: false,
     }
 }
 
@@ -161,5 +169,7 @@ pub async fn deploy_apply_execute(
     result.written = outcome.written;
     result.deleted = outcome.deleted;
     result.warnings.extend(outcome.warnings);
+    result.gwbk = outcome.gwbk;
+    result.skip_gwbk = outcome.skip_gwbk;
     Ok(result)
 }

@@ -18,7 +18,11 @@
 //! 2. the [`WriteSet`];
 //! 3. the preflights ([`preflight::run_preflights`], 23-07): every failure
 //!    in one `deploy_preflight_failed` refusal, nothing staged or locked;
-//!    then `run.json` (once, pass or fail) and `plan.json`;
+//!    then `run.json` (once, pass or fail) and `plan.json`; then the `.gwbk`
+//!    (23-09, D-13), downloaded into the run directory before anything is
+//!    staged or locked so that it never spends hold budget: a failed, empty
+//!    or truncated one is `deploy_preflight_failed` check `gwbk`, and only
+//!    `--skip-gwbk` (recorded in `run.json`) bypasses it;
 //! 4. the new ledger, validated with `Ledger::parse`;
 //! 5. `ApplyHost::prepare`, outside the lock;
 //! 6. [`hold::HeldLock::acquire`];
@@ -46,8 +50,7 @@
 //! A host that refuses a commit before it wrote anything (a journal of
 //! another run, an invalid spec) is returned as its own typed error and the
 //! lock is left to lapse: a scan there could load another run's partial
-//! state. Added by later plans: `.gwbk` and restart-pending (23-09), the
-//! journal refusal (23-12).
+//! state. Added by later plans: the journal refusal (23-12).
 //!
 //! Once the run directory exists, `run_apply` leaves through one exit point
 //! that writes `result.json` once.
@@ -62,15 +65,17 @@ pub mod record;
 pub mod run_store;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::actions::backup::backup_download;
 use crate::actions::deploy::{
     Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, deploy_verify,
 };
 use crate::actions::workspace::rfc3339_now_utc;
+use crate::client::backup::BackupType;
 use crate::client::deploy_api::scan_and_wait;
 use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
@@ -79,7 +84,7 @@ use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_locatio
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::transport::TreeReader;
 use crate::deploy::tree::sha256_hex;
-use crate::error::{CoreError, RollbackFailure};
+use crate::error::{CoreError, PreflightFailure, RollbackFailure};
 use crate::poll::PollConfig;
 
 use self::fingerprint::{LEDGER_KEY, fingerprint};
@@ -99,6 +104,9 @@ use self::run_store::{EventLog, RunDir, RunId};
 /// exit table. It follows the `deploy_verify_failed` precedent
 /// ([`crate::deploy::verify::VERIFY_FAILED_SLUG`]).
 pub const ROLLED_BACK_SLUG: &str = "deploy_rolled_back";
+
+/// The preflight check id of the `.gwbk` step (23-02 item 8).
+const GWBK_CHECK: &str = "gwbk";
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -380,6 +388,13 @@ pub enum ApplyEvent {
         /// `(user, project, host)` of each open session.
         sessions: Vec<preflight::DesignerSeen>,
     },
+    /// The `.gwbk` was downloaded and read as a ZIP (23-09).
+    GwbkDownloaded {
+        /// Its size in bytes.
+        bytes: u64,
+    },
+    /// `--skip-gwbk`: no `.gwbk` was taken (23-09).
+    GwbkSkipped,
     /// The run failed.
     Failed {
         /// The error code slug.
@@ -405,6 +420,8 @@ impl ApplyEvent {
             ApplyEvent::PreflightChecks { .. } => "preflight_checks",
             ApplyEvent::DesignersPoll { .. } => "designers_poll",
             ApplyEvent::DesignersProceed { .. } => "designers_proceed",
+            ApplyEvent::GwbkDownloaded { .. } => "gwbk_downloaded",
+            ApplyEvent::GwbkSkipped => "gwbk_skipped",
             ApplyEvent::Failed { .. } => "failed",
         }
     }
@@ -444,8 +461,12 @@ impl ApplyEvent {
                     .collect::<Vec<_>>(),
             }),
             ApplyEvent::RestoreStarted { cause } => json!({"cause": cause.as_str()}),
+            ApplyEvent::GwbkDownloaded { bytes } => json!({"bytes": bytes}),
             ApplyEvent::Failed { code } => json!({"code": code}),
-            ApplyEvent::ScanDone | ApplyEvent::Finalized | ApplyEvent::Restored => Value::Null,
+            ApplyEvent::ScanDone
+            | ApplyEvent::Finalized
+            | ApplyEvent::Restored
+            | ApplyEvent::GwbkSkipped => Value::Null,
         }
     }
 }
@@ -504,6 +525,8 @@ pub struct ApplyOptions {
     pub verify: VerifyOptions,
     /// What to do about open Designer sessions (D-14, D-15).
     pub designers: DesignersPolicy,
+    /// `--skip-gwbk`: take no `.gwbk` (D-13). Recorded in `run.json`.
+    pub skip_gwbk: bool,
 }
 
 /// How a run ended and what it did.
@@ -530,6 +553,11 @@ pub struct ApplyOutcome {
     pub post_fingerprint: Option<String>,
     /// Non-failing notes of the engine.
     pub warnings: Vec<String>,
+    /// The `.gwbk` file name in the run directory; absent for a no-op, for
+    /// `--skip-gwbk` and for a rolled-back run that never took one.
+    pub gwbk: Option<String>,
+    /// Whether the run was started with `--skip-gwbk`.
+    pub skip_gwbk: bool,
 }
 
 /// Apply `plan` (see the module doc for the order).
@@ -556,6 +584,8 @@ pub async fn run_apply(
             deleted: Vec::new(),
             post_fingerprint: None,
             warnings: Vec::new(),
+            gwbk: None,
+            skip_gwbk: false,
         });
     }
     let (run_id, run_dir) = RunDir::create_fresh(ctx.repo, &plan.gateway)?;
@@ -693,6 +723,7 @@ async fn drive(
             "hold_s": opts.hold.hold_s,
             "allow_destructive": opts.gates.allow_destructive,
             "allow_drift": opts.gates.allow_drift,
+            "skip_gwbk": opts.skip_gwbk,
             "designers": opts.designers.mode.as_str(),
             "designers_timeout_s": opts.designers.timeout.as_secs(),
             "designers_seen": seen.map(|r| r.designers_seen
@@ -719,6 +750,10 @@ async fn drive(
             failures: preflights.failures().into(),
         });
     }
+
+    // The `.gwbk`, before staging and the lock so that it never spends hold
+    // budget (D-13). A refusal here leaves the run record and writes nothing.
+    let gwbk = take_gwbk(ctx, opts, run_id, run_dir, steps).await?;
 
     // The ledger: what it lists now, and what it will list.
     let old_bytes = ctx.reader.read_ledger(gateway, mode).await?;
@@ -764,6 +799,7 @@ async fn drive(
         plan,
         run_id,
         run_dir,
+        gwbk: gwbk.as_deref(),
         record: &spec.record,
     };
 
@@ -914,7 +950,83 @@ async fn drive(
             .collect(),
         post_fingerprint: Some(post_fingerprint),
         warnings,
+        gwbk,
+        skip_gwbk: opts.skip_gwbk,
     })
+}
+
+/// The `.gwbk` step (23-09, D-13, SF-6): unless `--skip-gwbk`, download the
+/// gateway backup into `<run id>.gwbk` in the run directory and judge that it
+/// is whole. Returns the file name, or `None` when skipped.
+///
+/// The file is created exclusively at 0600 before a byte is written, so it is
+/// never readable by anyone else even for a moment (the download opens an
+/// existing file and keeps its mode). `BackupType::All` because the archive is
+/// a restore point for this same gateway (FA-23-06). It goes from the gateway
+/// to the run directory and nowhere else.
+///
+/// Whole means: the ZIP central directory reads and has an entry (C-gwbk: the
+/// gateway sends no Content-Length, and a cut copy has no central
+/// directory). Where the gateway does send a length, the HTTP stack already
+/// fails a body that stops short, which surfaces here as a failed download.
+/// Any failure removes the file (it is useless and holds secrets) and is
+/// `deploy_preflight_failed` with check `gwbk`; the detail names no content.
+async fn take_gwbk(
+    ctx: &ApplyContext<'_>,
+    opts: &ApplyOptions,
+    run_id: &RunId,
+    run_dir: &RunDir,
+    steps: &mut Steps<'_>,
+) -> Result<Option<String>, CoreError> {
+    if opts.skip_gwbk {
+        steps.emit(ApplyEvent::GwbkSkipped)?;
+        return Ok(None);
+    }
+    let refuse = |detail: String| CoreError::DeployPreflightFailed {
+        failures: vec![PreflightFailure {
+            check: GWBK_CHECK.to_string(),
+            detail,
+        }]
+        .into(),
+    };
+    let name = format!("{}.gwbk", run_id.as_str());
+    drop(run_dir.create_private_file(&name)?);
+    let path = run_dir.path().join(&name);
+    let verdict = match backup_download(ctx.gateway, Some(&path), "", BackupType::All).await {
+        Ok(_) => validate_gwbk(&path),
+        Err(e) => Err(format!("the .gwbk was not downloaded ({})", e.code())),
+    };
+    match verdict {
+        Ok(bytes) => {
+            steps.emit(ApplyEvent::GwbkDownloaded { bytes })?;
+            Ok(Some(name))
+        }
+        Err(detail) => {
+            let _ = std::fs::remove_file(&path);
+            Err(refuse(detail))
+        }
+    }
+}
+
+/// Judge a downloaded `.gwbk` by the file itself (C-gwbk): not empty, a ZIP
+/// whose central directory reads, at least one entry. Returns its size.
+fn validate_gwbk(path: &Path) -> Result<u64, String> {
+    let bytes = std::fs::metadata(path)
+        .map_err(|_| "the downloaded .gwbk cannot be read back".to_string())?
+        .len();
+    if bytes == 0 {
+        return Err("the downloaded .gwbk is empty".to_string());
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|_| "the downloaded .gwbk cannot be read back".to_string())?;
+    let archive = zip::ZipArchive::new(file).map_err(|_| {
+        "the downloaded .gwbk is not a readable ZIP (no central directory), so the download is incomplete"
+            .to_string()
+    })?;
+    if archive.is_empty() {
+        return Err("the downloaded .gwbk is a ZIP with no entries".to_string());
+    }
+    Ok(bytes)
 }
 
 /// What an abort needs to know about the run that is being undone.
@@ -922,6 +1034,8 @@ struct RunScope<'a> {
     plan: &'a DeployPlanResult,
     run_id: &'a RunId,
     run_dir: &'a RunDir,
+    /// The `.gwbk` taken before staging, if any.
+    gwbk: Option<&'a str>,
     /// The record at state `applying`: its pre-images are what the restore
     /// puts back.
     record: &'a RunRecord,
@@ -963,6 +1077,8 @@ async fn roll_back(
         deleted: Vec::new(),
         post_fingerprint: Some(scope.record.pre_fingerprint.clone()),
         warnings,
+        gwbk: scope.gwbk.map(str::to_string),
+        skip_gwbk: opts.skip_gwbk,
     })
 }
 
