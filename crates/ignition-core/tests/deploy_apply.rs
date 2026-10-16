@@ -3245,8 +3245,8 @@ async fn rollback_run_dir_mismatch() {
 
     // run.json names another plan.
     let run_json = dir.join("run.json");
-    let original = std::fs::read(&run_json).expect("run.json");
-    let mut doc: Value = serde_json::from_slice(&original).expect("json");
+    let run_json_original = std::fs::read(&run_json).expect("run.json");
+    let mut doc: Value = serde_json::from_slice(&run_json_original).expect("json");
     doc["plan_sha256"] = json!("0".repeat(64));
     std::fs::write(&run_json, serde_json::to_vec_pretty(&doc).expect("json")).expect("edit");
     let fresh = Fresh::new(&rig).await;
@@ -3257,7 +3257,7 @@ async fn rollback_run_dir_mismatch() {
     assert_invalid(&err, &run, "plan_sha256");
     assert!(err.to_string().contains("run.json"), "{err}");
     only_reads(&fresh);
-    std::fs::write(&run_json, &original).expect("put run.json back");
+    std::fs::write(&run_json, &run_json_original).expect("put run.json back");
 
     // plan.json names another render.
     let plan_json = dir.join("plan.json");
@@ -3286,7 +3286,7 @@ async fn rollback_run_dir_mismatch() {
         .await
         .expect_err("a rollback's run directory");
     assert_invalid(&err, &run, "rollback");
-    std::fs::write(&run_json, &original).expect("put run.json back");
+    std::fs::write(&run_json, &run_json_original).expect("put run.json back");
 
     assert_eq!(collection_state(&rig), before);
     let fresh = Fresh::new(&rig).await;

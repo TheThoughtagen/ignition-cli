@@ -66,6 +66,7 @@ use super::{
 use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::scan::ScanKind;
 use crate::client::{DeployApi, GatewayApi};
+use crate::deploy::component_problem;
 use crate::deploy::ledger::{LedgerRoot, journal_location};
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
@@ -218,20 +219,42 @@ pub async fn check_rollback(
     }
 
     // 3. The record.
-    let Some(record) = host.read_record(run_id).await? else {
+    // A record too damaged to name its run is still this run's problem.
+    let read = host.read_record(run_id).await.map_err(|e| match e {
+        CoreError::DeployRunInvalid { problem, .. } => invalid(id, problem),
+        other => other,
+    })?;
+    let Some(record) = read else {
         return Err(invalid(
             id,
             format!("the host has no {RECORD_FILE} for this run (snapshots/{id}/{RECORD_FILE})"),
         ));
     };
-    if record.run_id != id || record.gateway != target.gateway || record.mode != target.mode {
-        return Err(invalid(
-            id,
-            "the record is for another run, gateway or mode",
-        ));
+    validate_record(&record, target, run_id)?;
+
+    // 4. The local run directory, when there is one.
+    cross_check_local(repo, &record)?;
+
+    // 5. Live state against the record's post-run hashes.
+    let touched: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
+    let live = host.fingerprint(&touched).await?;
+    let live_changed: Vec<String> = record
+        .post_map()
+        .into_iter()
+        .filter(|(path, hash)| live.get(path) != Some(hash))
+        .map(|(path, _)| path)
+        .collect();
+    if !live_changed.is_empty() && !discard_live_changes {
+        return Err(CoreError::DeployLiveChanged {
+            run_id: id.to_string(),
+            paths: live_changed
+                .iter()
+                .take(APPLY_LIST_SHOWN)
+                .cloned()
+                .collect(),
+            count: live_changed.len(),
+        });
     }
-    let _ = (repo, discard_live_changes);
-    let live_changed = Vec::new();
     Ok(RollbackChecked {
         record,
         live_changed,
@@ -326,6 +349,12 @@ fn read_local_json(
 fn cross_check_local(repo: &Path, record: &RunRecord) -> Result<(), CoreError> {
     let id = record.run_id.as_str();
     let run_id = RunId::parse(id)?;
+    if component_problem(&record.gateway).is_some() || record.gateway.contains(':') {
+        return Err(invalid(
+            id,
+            "the record's gateway is not a plain directory name",
+        ));
+    }
     let rel = run_dir_rel(&record.gateway, &run_id);
     let dir = rel
         .split('/')

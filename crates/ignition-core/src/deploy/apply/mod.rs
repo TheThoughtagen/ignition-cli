@@ -63,6 +63,14 @@
 //!
 //! Once the run directory exists, `run_apply` leaves through one exit point
 //! that writes `result.json` once.
+//!
+//! # Manual rollback (23-11)
+//!
+//! [`run_rollback`] undoes a past run from its on-box record alone, through
+//! the same [`restore_snapshot`]; see the [`rollback`] module doc for the
+//! checks and the run it makes. It needs no declared repo, which is why
+//! [`restore_snapshot`] takes a [`RestoreContext`] and not an
+//! [`ApplyContext`].
 
 pub mod fingerprint;
 pub mod gates;
