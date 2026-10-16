@@ -91,6 +91,55 @@ fn ssh_g(argv: &[OsString]) -> Vec<String> {
         .collect()
 }
 
+/// The null device `ssh -G` reports for `GlobalKnownHostsFile`: the product
+/// passes `NUL` on a Windows runner and `/dev/null` elsewhere.
+fn reported_null_device(windows_runner: bool) -> &'static str {
+    if windows_runner { "NUL" } else { "/dev/null" }
+}
+
+/// How `ssh -G` reports a file option the product passed through
+/// `hardened_options`: the path text, with every `\` written `/` on a
+/// Windows runner (the product converts there; ssh echoes the value). A path
+/// given with `-i` is not converted, so `identityfile` keeps the raw text.
+fn reported_path_text(text: &str, windows_runner: bool) -> String {
+    if windows_runner {
+        text.replace('\\', "/")
+    } else {
+        text.to_string()
+    }
+}
+
+fn reported_path(path: &Path) -> String {
+    reported_path_text(&path.display().to_string(), cfg!(windows))
+}
+
+#[test]
+fn reported_spellings_match_the_windows_runner_observation() {
+    // Lines `ssh -G` printed on windows-latest (CI run 38836275411) for the
+    // paths the tests built there.
+    assert_eq!(reported_null_device(true), "NUL");
+    assert_eq!(
+        reported_path_text(
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\ign-ssh-8x7x7N\known_hosts",
+            true
+        ),
+        "C:/Users/RUNNER~1/AppData/Local/Temp/ign-ssh-8x7x7N/known_hosts"
+    );
+    assert_eq!(
+        reported_path_text(
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\ign odd %h RpQF5u\known hosts",
+            true
+        ),
+        "C:/Users/RUNNER~1/AppData/Local/Temp/ign odd %h RpQF5u/known hosts"
+    );
+    // Unix runners report the path text as given.
+    assert_eq!(reported_null_device(false), "/dev/null");
+    assert_eq!(
+        reported_path_text("/tmp/ign odd %h x/known hosts", false),
+        "/tmp/ign odd %h x/known hosts"
+    );
+}
+
 fn assert_reports(config: &[String], expected: &[&str]) {
     for want in expected {
         assert!(
@@ -129,8 +178,14 @@ fn ssh_g_reports_pinned_options() {
             "port 2222",
             "user svc",
             "hostname gw.example.test",
-            "globalknownhostsfile /dev/null",
         ],
+    );
+    assert_reports(
+        &config,
+        &[&format!(
+            "globalknownhostsfile {}",
+            reported_null_device(cfg!(windows))
+        )],
     );
     // `ControlPath=none` is reported as no `controlpath` line at all by
     // OpenSSH 10.3 (the value is unset); any other value would mean the
@@ -142,7 +197,13 @@ fn ssh_g_reports_pinned_options() {
         );
     }
     let known_hosts = shell.known_hosts_copy().display().to_string();
-    assert_reports(&config, &[&format!("userknownhostsfile {known_hosts}")]);
+    assert_reports(
+        &config,
+        &[&format!(
+            "userknownhostsfile {}",
+            reported_path(shell.known_hosts_copy())
+        )],
+    );
     for line in &config {
         if let Some(files) = line.strip_prefix("userknownhostsfile ") {
             assert!(
@@ -200,7 +261,10 @@ fn ssh_g_keeps_odd_paths_literal() {
     let config = ssh_g(&argv);
     assert_reports(
         &config,
-        &[&format!("userknownhostsfile {}", known_hosts.display())],
+        &[&format!(
+            "userknownhostsfile {}",
+            reported_path(&known_hosts)
+        )],
     );
 }
 
