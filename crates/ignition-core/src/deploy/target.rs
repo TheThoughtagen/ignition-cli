@@ -55,6 +55,12 @@ pub struct NodeTarget {
     /// Mutually exclusive with `ssh`; selects the local-filesystem transport.
     #[serde(default)]
     pub local: Option<Local>,
+    /// The gateway's system name, when the target should pin it (23-07). The
+    /// `wrong_target` preflight refuses an apply whose REST gateway name is
+    /// not this value. Optional: without it the REST name is still bound to
+    /// the host's `systemName`.
+    #[serde(default)]
+    pub gateway_name: Option<String>,
 }
 
 /// Local-filesystem access to a node's gateway data directory (D-02).
@@ -172,6 +178,15 @@ impl Target {
                 && local.data_dir.is_empty()
             {
                 push(format!("{label}.local.data_dir: must not be empty"));
+            }
+            if let Some(name) = &node.gateway_name {
+                if name.trim().is_empty() {
+                    push(format!("{label}.gateway_name: must not be empty"));
+                } else if name.chars().any(char::is_control) {
+                    push(format!(
+                        "{label}.gateway_name: must not contain control characters"
+                    ));
+                }
             }
             let Some(ssh) = &node.ssh else { continue };
             for (field, value) in [

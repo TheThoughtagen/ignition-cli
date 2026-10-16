@@ -825,6 +825,7 @@ mod tests {
                 op_timeout_s: None,
             }),
             local: None,
+            gateway_name: None,
         }
     }
 

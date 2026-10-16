@@ -31,13 +31,16 @@
 use std::time::Duration;
 
 use super::Steps;
-use super::hold::{Clock, HoldModel};
+use serde_json::Value;
+
+use super::hold::{Clock, HoldModel, hold_for};
 use super::host::ApplyHost;
 use crate::client::mode::normalize_deployment_mode;
 use crate::client::query::ListQuery;
 use crate::client::{DeployApi, GatewayApi};
+use crate::deploy::layout::RelPath;
 use crate::deploy::target::Target;
-use crate::deploy::transport::TreeReader;
+use crate::deploy::transport::{Scope, TreeReader};
 use crate::error::{APPLY_LIST_SHOWN, CoreError, PreflightFailure};
 
 /// Seconds between two reads of the Designer list under `--designers wait`
@@ -49,6 +52,9 @@ pub const DESIGNERS_TIMEOUT_DEFAULT_S: u64 = 600;
 
 /// The longest a name from the gateway is shown in a detail.
 const SHOWN_NAME_CHARS: usize = 64;
+
+/// The singleton whose `systemName` names the gateway on its host.
+const SYSTEM_PROPERTIES_UNIT: &str = "ignition/system-properties";
 
 /// One preflight check, by the id it is reported under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,18 +247,32 @@ pub async fn run_preflights(
     _steps: &mut Steps<'_>,
 ) -> Result<PreflightReport, CoreError> {
     let mut findings = Vec::with_capacity(PreflightCheck::ALL.len());
+    let mode = input.target.mode.as_str();
+
     findings.push(
         mode_finding(
             PreflightCheck::ModeMaster,
             "master",
             Some(input.master),
-            &input.target.mode,
+            mode,
         )
         .await?,
     );
+    findings.push(if input.target.nodes.backup.is_some() {
+        mode_finding(PreflightCheck::ModeBackup, "backup", input.backup, mode).await?
+    } else {
+        PreflightFinding {
+            check: PreflightCheck::ModeBackup,
+            status: FindingStatus::Skipped,
+            detail: "the target has no backup node".to_string(),
+        }
+    });
+    findings.push(wrong_target_finding(input).await?);
+    findings.push(write_rest_finding(input.gateway).await?);
     findings.push(write_host_finding(input.host).await?);
     let (designers, designers_seen) = designers_finding(input).await?;
     findings.push(designers);
+    findings.push(hold_budget_finding(input.hold, input.touched_files));
 
     Ok(PreflightReport {
         findings,
@@ -317,6 +337,105 @@ async fn mode_finding(
         ),
     };
     Ok(finding(check, ok, detail))
+}
+
+// ---- wrong_target -----------------------------------------------------------
+
+/// The host's `systemName`, or why it cannot be read.
+async fn host_system_name(
+    reader: &dyn TreeReader,
+    mode: &str,
+) -> Result<Result<String, &'static str>, CoreError> {
+    let (module, ty) = SYSTEM_PROPERTIES_UNIT
+        .split_once('/')
+        .unwrap_or((SYSTEM_PROPERTIES_UNIT, ""));
+    let observed = reader
+        .read(&Scope {
+            mode: mode.to_string(),
+            types: vec![(module.to_string(), ty.to_string())],
+            tag_providers: Vec::new(),
+        })
+        .await?;
+    // The gateway lets `local` override the mode collection and the mode
+    // collection override `core`; only the bytes of the last two are read.
+    if observed
+        .local_units
+        .iter()
+        .any(|u| u == SYSTEM_PROPERTIES_UNIT)
+    {
+        return Ok(Err("it is overridden in the local collection"));
+    }
+    let path = RelPath::new(&format!("{SYSTEM_PROPERTIES_UNIT}/config.json"))
+        .map_err(|why| CoreError::Internal(format!("system-properties path: {why}")))?;
+    let Some(blob) = observed
+        .mode
+        .get(&path)
+        .or_else(|| observed.core.get(&path))
+    else {
+        return Ok(Err("the host has no system-properties file"));
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&blob.bytes) else {
+        return Ok(Err("the system-properties file is not JSON"));
+    };
+    match doc.get("systemName").and_then(Value::as_str) {
+        Some(name) if !name.trim().is_empty() => Ok(Ok(name.to_string())),
+        _ => Ok(Err("the system-properties file has no systemName")),
+    }
+}
+
+async fn wrong_target_finding(input: &PreflightInput<'_>) -> Result<PreflightFinding, CoreError> {
+    let check = PreflightCheck::WrongTarget;
+    let rest = input
+        .gateway
+        .gateway_info()
+        .await?
+        .name
+        .filter(|n| !n.trim().is_empty());
+    let host = host_system_name(input.reader, &input.target.mode).await?;
+    let declared = input.target.nodes.master.gateway_name.as_deref();
+
+    let mut problems: Vec<String> = Vec::new();
+    match (&rest, &host) {
+        (None, _) => problems.push("the gateway reports no name over REST".to_string()),
+        (Some(_), Err(why)) => problems.push(format!("the host's systemName is unreadable: {why}")),
+        (Some(rest), Ok(host)) if rest != host => {
+            problems.push("the gateway's REST name is not the host's systemName".to_string())
+        }
+        (Some(_), Ok(_)) => {}
+    }
+    if let (Some(rest), Some(declared)) = (&rest, declared)
+        && rest != declared
+    {
+        problems.push("the gateway's REST name is not nodes.master.gateway_name".to_string());
+    }
+    if problems.is_empty() {
+        Ok(finding(
+            check,
+            true,
+            "the REST name matches the host's systemName".to_string(),
+        ))
+    } else {
+        Ok(finding(check, false, problems.join("; ")))
+    }
+}
+
+// ---- write_rest ---------------------------------------------------------------
+
+async fn write_rest_finding(gateway: &dyn GatewayApi) -> Result<PreflightFinding, CoreError> {
+    let check = PreflightCheck::WriteRest;
+    match gateway.scan_projects().await {
+        Ok(()) => Ok(finding(
+            check,
+            true,
+            "the project scan was accepted".to_string(),
+        )),
+        Err(CoreError::Auth { status: 403, .. }) => Ok(finding(
+            check,
+            false,
+            "the token is read-only (HTTP 403 on the project scan)".to_string(),
+        )),
+        Err(other) => Err(other),
+    }
 }
 
 // ---- write_host -------------------------------------------------------------
@@ -394,6 +513,19 @@ async fn designers_finding(
     Ok((found, open))
 }
 
+// ---- hold_budget ------------------------------------------------------------
+
+fn hold_budget_finding(hold: &HoldModel, files: usize) -> PreflightFinding {
+    let estimate = hold.estimate_commit_s(files);
+    let needed = hold_for(estimate, hold.p95_scan_s);
+    let detail = format!(
+        "{files} file(s): estimated commit {estimate:.1} s and scan {:.1} s need a hold of {needed} s; \
+         the budget is {} s",
+        hold.p95_scan_s, hold.hold_s
+    );
+    finding(PreflightCheck::HoldBudget, needed <= hold.hold_s, detail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +578,29 @@ mod tests {
         assert_eq!(printable("a\nb\u{1b}c"), "abc");
         let long = "x".repeat(SHOWN_NAME_CHARS + 5);
         assert_eq!(printable(&long).len(), SHOWN_NAME_CHARS + 3);
+    }
+
+    #[test]
+    fn hold_budget_boundary_is_inclusive() {
+        // need(n) = ceil(2 x (1 + 0.5 n + 1) + 1) = 5 + n.
+        let hold = |hold_s| HoldModel {
+            hold_s,
+            commit_fixed_s: 1.0,
+            commit_per_file_s: 0.5,
+            p95_scan_s: 1.0,
+        };
+        assert_eq!(
+            hold_budget_finding(&hold(14), 9).status,
+            FindingStatus::Pass
+        );
+        let over = hold_budget_finding(&hold(14), 10);
+        assert_eq!(over.status, FindingStatus::Fail);
+        assert!(over.detail.contains("hold of 15 s"), "{}", over.detail);
+        assert!(over.detail.contains("budget is 14 s"), "{}", over.detail);
+        assert!(
+            over.detail.contains("estimated commit 6.0 s"),
+            "{}",
+            over.detail
+        );
     }
 }

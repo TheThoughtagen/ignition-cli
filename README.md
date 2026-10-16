@@ -2128,6 +2128,7 @@ followed.
 | `nodes.*.ssh.known_hosts` | required: a repo-relative path (no leading `/`, no `..`, no backslash) to the reviewed `known_hosts` file that pins the host key. `ign` copies it into a private temp directory and gives ssh that copy with `StrictHostKeyChecking=yes`; the runner's own `~/.ssh/known_hosts` is never read |
 | `nodes.*.ssh.connect_timeout_s` | optional, `1`..`120`, default `10`: ssh `ConnectTimeout` in seconds |
 | `nodes.*.ssh.op_timeout_s` | optional, `1`..`3600`, default `1050`: one ssh or sftp call may run this long before it is killed (`transport_failed`). The default is three times the larger p95 of a measured read and commit of a 152-file tree over the internet to a Windows host (348 s), rounded up to 30 s; a tree ten times that size needs a larger value and is not covered by the default |
+| `nodes.*.gateway_name` | optional: the gateway's system name. When set, `deploy apply` refuses (`deploy_preflight_failed`, check `wrong_target`) unless the gateway's REST name equals it; on the master the REST name must also equal the host's `systemName` whether or not this is set. Not empty, no control characters |
 | `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
 
 **The allowlist (D-02).** Only the `module/type` directories listed in the

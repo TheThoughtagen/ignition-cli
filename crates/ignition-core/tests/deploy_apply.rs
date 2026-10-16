@@ -1601,6 +1601,15 @@ async fn mount_scan_projects(rig: &Rig, status: u16) {
         .await;
 }
 
+/// A refused run only ever probed the host: nothing was staged or committed.
+fn assert_only_probes(rig: &Rig) {
+    let calls = rig.host.calls();
+    assert!(
+        !calls.is_empty() && calls.iter().all(|c| *c == "probe"),
+        "only probe calls, got {calls:?}"
+    );
+}
+
 /// Runs a prepared apply and returns the preflight refusal's failed check
 /// ids, in the order the refusal lists them.
 async fn refused_checks(rig: &Rig) -> Vec<String> {
@@ -1739,7 +1748,7 @@ async fn preflight_wrong_target() {
         !detail.contains("some-other-gateway") && !detail.contains(RIG_GATEWAY_NAME),
         "the detail names sources, not values: {detail}"
     );
-    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_only_probes(&rig);
     assert_eq!(rig.fake.lock_acquires(), 0);
 }
 
@@ -1841,7 +1850,7 @@ async fn preflight_hold_budget_boundary() {
         .expect_err("a hold that is too short refuses");
     assert_eq!(err.code(), "deploy_preflight_failed", "{err}");
     assert_eq!(rig.fake.lock_acquires(), 0);
-    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_only_probes(&rig);
 }
 
 #[tokio::test]

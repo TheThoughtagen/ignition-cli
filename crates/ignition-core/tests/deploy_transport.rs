@@ -2008,6 +2008,7 @@ mod mirror {
             local: Some(Local {
                 data_dir: sc.data.display().to_string(),
             }),
+            gateway_name: None,
         };
         let m = transport::mirror_for_node(
             Path::new("."),
@@ -2042,6 +2043,7 @@ mod mirror {
             profile: "p".to_string(),
             ssh: Some(ssh),
             local: None,
+            gateway_name: None,
         };
         let built = transport::mirror_for_node(
             repo.path(),
@@ -2115,6 +2117,7 @@ mod default_staging {
             local: Some(Local {
                 data_dir: data_dir.display().to_string(),
             }),
+            gateway_name: None,
         }
     }
 
@@ -2129,6 +2132,7 @@ mod default_staging {
             local: Some(Local {
                 data_dir: "relative-data".to_string(),
             }),
+            gateway_name: None,
         };
         let mode = transport::default_staging_mode(
             Path::new("."),
@@ -2210,6 +2214,7 @@ mod default_staging {
             profile: "p".to_string(),
             ssh: None,
             local: None,
+            gateway_name: None,
         };
         assert!(
             transport::default_staging_mode(

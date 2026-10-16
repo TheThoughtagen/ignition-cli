@@ -475,6 +475,7 @@ mod tests {
                 op_timeout_s: None,
             }),
             local: None,
+            gateway_name: None,
         };
         let local = NodeTarget {
             profile: "p".to_string(),
@@ -482,6 +483,7 @@ mod tests {
             local: Some(Local {
                 data_dir: "/data".to_string(),
             }),
+            gateway_name: None,
         };
         assert_eq!(LedgerRoot::for_node(&ssh), LedgerRoot::AccountHome);
         assert_eq!(LedgerRoot::for_node(&local), LedgerRoot::DataDir);
