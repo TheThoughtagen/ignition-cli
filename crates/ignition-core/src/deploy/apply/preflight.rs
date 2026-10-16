@@ -603,4 +603,59 @@ mod tests {
             over.detail
         );
     }
+
+    fn policy(timeout_ms: u64, interval_ms: u64) -> DesignersPolicy {
+        DesignersPolicy {
+            mode: DesignersMode::Wait,
+            timeout: Duration::from_millis(timeout_ms),
+            interval: Duration::from_millis(interval_ms),
+        }
+    }
+
+    #[test]
+    fn wait_with_nothing_open_is_clear_at_any_time() {
+        let p = policy(1000, 100);
+        assert_eq!(wait_step(0, Duration::ZERO, &p), WaitStep::Clear);
+        assert_eq!(wait_step(0, Duration::from_secs(99), &p), WaitStep::Clear);
+    }
+
+    #[test]
+    fn wait_timeout_equal_to_the_elapsed_time_has_passed() {
+        // Edge DAPL-04 adjacency.
+        let p = policy(1000, 100);
+        assert_eq!(
+            wait_step(1, Duration::from_millis(999), &p),
+            WaitStep::Sleep(Duration::from_millis(1))
+        );
+        assert_eq!(
+            wait_step(1, Duration::from_millis(1000), &p),
+            WaitStep::TimedOut
+        );
+        assert_eq!(
+            wait_step(1, Duration::from_millis(1001), &p),
+            WaitStep::TimedOut
+        );
+    }
+
+    #[test]
+    fn wait_sleeps_one_interval_unless_the_timeout_is_nearer() {
+        let p = policy(1000, 100);
+        assert_eq!(
+            wait_step(2, Duration::ZERO, &p),
+            WaitStep::Sleep(Duration::from_millis(100))
+        );
+        assert_eq!(
+            wait_step(2, Duration::from_millis(950), &p),
+            WaitStep::Sleep(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn a_zero_interval_never_spins() {
+        let p = policy(1000, 0);
+        assert_eq!(
+            wait_step(1, Duration::ZERO, &p),
+            WaitStep::Sleep(Duration::from_millis(1))
+        );
+    }
 }

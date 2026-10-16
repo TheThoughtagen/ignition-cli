@@ -29,7 +29,7 @@ use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates
 use ignition_core::deploy::apply::hold::{Clock, HoldModel, ManualClock, SystemClock};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
 use ignition_core::deploy::apply::preflight::{
-    DesignersPolicy, PreflightInput, PreflightReport, run_preflights,
+    DesignersMode, DesignersPolicy, PreflightInput, PreflightReport, run_preflights,
 };
 use ignition_core::deploy::apply::record::{RecordState, RunRecord};
 use ignition_core::deploy::apply::{
@@ -1971,4 +1971,140 @@ async fn preflight_is_idempotent() {
     assert_eq!(runs.len(), 2, "one run directory each: {runs:?}");
     assert_eq!(rig.fake.lock_acquires(), 0);
     assert_eq!(rig.fake.scan_count(), 0);
+}
+
+/// `options()` with `mode` and a short wait.
+fn designers_options(mode: DesignersMode, timeout_ms: u64) -> ApplyOptions {
+    ApplyOptions {
+        designers: DesignersPolicy {
+            mode,
+            timeout: Duration::from_millis(timeout_ms),
+            interval: Duration::from_millis(20),
+        },
+        ..options()
+    }
+}
+
+/// The lines of `events.ndjson` named `event`.
+fn event_lines(run_dir: &Path, event: &str) -> Vec<Value> {
+    std::fs::read_to_string(run_dir.join("events.ndjson"))
+        .expect("events")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("line"))
+        .filter(|line| line["event"] == event)
+        .collect()
+}
+
+#[tokio::test]
+async fn preflight_designers_wait_clears() {
+    let rig = changing_rig().await;
+    // One session for the first two reads, none after.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/designers"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(designers_body(&[(
+                "alice",
+                "PlantA",
+                "10.0.0.5:52526",
+            )])),
+        )
+        .up_to_n_times(2)
+        .mount(&rig._server)
+        .await;
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let opts = designers_options(DesignersMode::Wait, 30_000);
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &opts)
+        .await
+        .expect("the wait clears and the apply goes ahead");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+
+    let run_dir = rig.run_dir(&result);
+    let polls: Vec<u64> = event_lines(&run_dir, "designers_poll")
+        .iter()
+        .map(|line| line["open"].as_u64().expect("open"))
+        .collect();
+    assert_eq!(polls, [1, 1, 0], "one event per read");
+    let run = json_file(&run_dir.join("run.json"));
+    assert_eq!(run["designers"], "wait");
+    assert_eq!(run["designers_seen"], json!([]), "nothing open at the end");
+}
+
+#[tokio::test]
+async fn preflight_designers_wait_times_out() {
+    // Edge DAPL-04 adjacency: the wait ends at the timeout with the same
+    // detail `fail` gives.
+    let rig = changing_rig().await;
+    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+
+    let failed = preflights(&rig, &designers_options(DesignersMode::Wait, 200), 4)
+        .await
+        .expect("preflights")
+        .failures();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].check, "designers");
+
+    let fail_mode = preflights(&rig, &designers_options(DesignersMode::Fail, 200), 4)
+        .await
+        .expect("preflights")
+        .failures();
+    assert_eq!(failed, fail_mode, "wait ends with fail's list");
+    assert!(
+        failed[0]
+            .detail
+            .contains("alice on PlantA from 10.0.0.5:52526"),
+        "{}",
+        failed[0].detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_designers_proceed_records_sessions() {
+    let rig = changing_rig().await;
+    mount_designers(
+        &rig,
+        &[
+            ("alice", "PlantA", "10.0.0.5:52526"),
+            ("bob", "PlantB", "10.0.0.6:50001"),
+        ],
+    )
+    .await;
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let opts = designers_options(DesignersMode::Proceed, 200);
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &opts)
+        .await
+        .expect("proceed goes ahead");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+
+    let sessions = json!([
+        {"user": "alice", "project": "PlantA", "host": "10.0.0.5:52526"},
+        {"user": "bob", "project": "PlantB", "host": "10.0.0.6:50001"},
+    ]);
+    let run_dir = rig.run_dir(&result);
+    let run = json_file(&run_dir.join("run.json"));
+    assert_eq!(run["designers"], "proceed");
+    assert_eq!(run["designers_seen"], sessions);
+    let proceeded = event_lines(&run_dir, "designers_proceed");
+    assert_eq!(proceeded.len(), 1, "{proceeded:?}");
+    assert_eq!(proceeded[0]["sessions"], sessions);
+}
+
+#[tokio::test]
+async fn preflight_designers_none_pass_everywhere() {
+    // Edge DAPL-04 empty: no open session passes in every mode.
+    let rig = changing_rig().await;
+    for mode in [
+        DesignersMode::Fail,
+        DesignersMode::Wait,
+        DesignersMode::Proceed,
+    ] {
+        let report = preflights(&rig, &designers_options(mode, 200), 4)
+            .await
+            .expect("preflights");
+        assert!(report.passed(), "{mode:?}: {report:?}");
+        assert!(report.designers_seen.is_empty(), "{mode:?}");
+    }
 }
