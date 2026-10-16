@@ -372,7 +372,89 @@ Plans:
 
 **Capture first**: C2 (does the scan-lock block UI, Designer and API writes to the active mode collection; if not, the Designer preflight is the only guard against a write racing the apply); C7b (ACL after copy vs rename, sharing violation on a loaded JDBC jar under `ignition/database-driver/`, Defender cost, long paths; INFERRED until captured); C11 (single-scan ordering when a provider and its definitions arrive together)
 **Constraints**: Decision B must be recorded in Phase 22 before this phase is planned; the write flow and hold budget depend on it. Decision A for verdicts (`deploy_rolled_back` in `data`, exit 6, never an exit-table row). Decision C: CI and agent callers must pass `--plan-sha256`. Decision D: `apply` and `rollback` are not MCP tools in v1.6. The `.gwbk` default-on (SF-6) and the Designer preflight are in scope. Apply reports restarts and never performs them (SF-3). No `--force`, `--skip-verify` or `--no-rollback`. One `restore_snapshot(run)` serves abort, auto-rollback and manual rollback. Lock decisions use the gateway's `remaining` and a monotonic local clock, never gateway timestamps against the runner clock. Built on a single ephemeral 8.3.6 with `LocalFsTransport`, where fault injection is cheap; the both-nodes mode preflight is exercised against the stateful in-memory fake, and backup checks and backup-lag handling belong to Phase 24.
-**Plans**: TBD
+**Plans**: 21 plans (waves: 1 = 23-01, 2 = 23-02, 3 = 23-03, 4 = 23-18, 5 = 23-04, 6 = 23-19, 7 = 23-05 ∥ 23-06, 8 = 23-17, 9 = 23-07, 10 = 23-09, 11 = 23-11, 12 = 23-12, 13 = 23-08, 14 = 23-20, 15 = 23-10, 16 = 23-13, 17 = 23-21, 18 = 23-14, 19 = 23-15, 20 = 23-16; executed sequentially on the main checkout, no worktrees). Plan numbers are not execution order: 23-17 was split out of 23-05, 23-18 out of 23-03, 23-19 out of 23-04, 23-20 out of 23-08 and 23-21 out of 23-13, all for context budget, and the Windows-host lane (23-08, 23-20, 23-10) runs after every plan that needs no host. A `pending` or `unavailable` Windows host therefore stops the phase at a single point, the 23-08 precondition, with the outcomes fixed in 23-01 `## Windows host outcome routing`. A D-03a stop in 23-10 is fixed in 23-10 `## Phase outcome if D-03a stops execution`.
+
+Plans:
+**Wave 1**
+
+- [ ] 23-01-PLAN.md — Windows capture-host checkpoint with fixed routing for ready/pending/unavailable; capture first on a fresh 8.3.6 rig: C-sysname, C-restart, C2, C11, C-gwbk (`capture23.sh`, `23-LIVE-CAPTURES.md`)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 23-02-PLAN.md — Contract-vocabulary checkpoint; the eight Phase 23 slugs (four-place rule); pure gate order over a real plan (DAPL-01, DAPL-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 23-03-PLAN.md — Run id and private git-ignored run directory (D-05, D-06); journal v1, run record v1, touched-set fingerprint (D-04, D-07)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 23-18-PLAN.md — On-box paths for the journal, snapshot and run record (D-04, D-07); `TreeReader::read_journal` on the local and sftp transports, failing closed (DAPL-09)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 23-04-PLAN.md — `ApplyHost` write seam, `work.tsv`, native local host with all nine operations (D-01), opening rows of the shared host conformance table
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 23-19-PLAN.md — Commit and restore rule rows of the shared conformance table; fault seams `ApplyFault` and `FaultyHost` (DAPL-06, DAPL-07, DAPL-09)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 23-05-PLAN.md — Engine green path at library level: apply end to end under `HeldLock`, empty-plan no-op; hold layer with D-02's formula, floor and ceiling and no measured value (DAPL-01, DAPL-03, DAPL-06)
+- [ ] 23-06-PLAN.md — Linux ssh host: POSIX `commit.sh` behind a hash-checked stub, `exec_posix`, Linux mirror commit on the script (D-01)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [ ] 23-17-PLAN.md — One `restore_snapshot` for every abort (write failure, lapsed lock by either clock, incomplete scan), `plan_stale` and `scan_lock_held` refusals, auto-rollback on a red verify, `rollback_failed` (DAPL-01, DAPL-05, DAPL-06, DAPL-07)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [ ] 23-07-PLAN.md — Preflights reported together: modes on both nodes, wrong target, write probes, Designers fail/wait/proceed, hold-budget refusal (DAPL-04, D-03, D-14, D-15)
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
+- [ ] 23-09-PLAN.md — `.gwbk` default-on (D-13), run-dir snapshot hashes, `restart_pending` endpoint and report (SF-3), run directory on every run (DAPL-05, DAPL-10)
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
+- [ ] 23-11-PLAN.md — `rollback --run` from a fresh process off the on-box record, staleness refusal and `--discard-live-changes` (DAPL-08, D-07)
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
+- [ ] 23-12-PLAN.md — Journal recovery: refusals with the exact command, D-10 clear, D-11, D-12 guidance, crash simulation (DAPL-09)
+
+**Wave 13** *(blocked on Wave 12 completion; first plan that needs the Windows host)*
+
+- [ ] 23-08-PLAN.md — Windows ssh host, captured: C-script-run and C7b live, `commit.ps1` `commit` and `restore` behind a hash-checked stub, ACL step, held targets, snapshot path gate (D-01)
+
+**Wave 14** *(blocked on Wave 13 completion)*
+
+- [ ] 23-20-PLAN.md — Windows ssh host, complete: remaining `commit.ps1` ops, PowerShell conformance rows on windows-latest, Windows mirror commit on the script, then the Windows `apply_host_for_node` arm (D-01)
+
+**Wave 15** *(blocked on Wave 14 completion)*
+
+- [ ] 23-10-PLAN.md — OQ5 re-measured with the batched commit on the Windows host: `HOLD_S` and the per-file model (D-02, D-03), D-03a checkpoint if above 300 s, fixed phase outcome if it stops
+
+**Wave 16** *(blocked on Wave 15 completion)*
+
+- [ ] 23-13-PLAN.md — `ign deploy apply` verb: guarded, Decision C, confirmed apply with verdict exit 6, Commands and TUI rows, excluded from MCP (DAPL-01..03, DAPL-07, DSURF-02)
+
+**Wave 17** *(blocked on Wave 16 completion)*
+
+- [ ] 23-21-PLAN.md — `deploy apply` README section and dated rolled-back verdict exception; gate-exit matrix through the binary (DAPL-01, DAPL-02, DAPL-07)
+
+**Wave 18** *(blocked on Wave 17 completion)*
+
+- [ ] 23-14-PLAN.md — `ign deploy rollback` verb, journal recovery through the binary, MCP exclusion complete, amended `write_half_unreachable`, rollback README (DAPL-08, DAPL-09, DSURF-02)
+
+**Wave 19** *(blocked on Wave 18 completion)*
+
+- [ ] 23-15-PLAN.md — Secret canary over apply, rollback, run-dir files, events and on-box files; stdout purity (DSURF-03)
+
+**Wave 20** *(blocked on Wave 19 completion)*
+
+- [ ] 23-16-PLAN.md — Live gates: rig apply, kill, lapse and rollback; Windows binary apply and rollback; spec §9 amendment decision
 
 ### Phase 24: Redundant Pair
 
