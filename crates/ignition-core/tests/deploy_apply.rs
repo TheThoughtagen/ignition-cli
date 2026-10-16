@@ -2446,7 +2446,16 @@ fn apply_source_never_names_the_restart_route() {
                 .extension()
                 .is_some_and(|e| e == "rs" || e == "sh" || e == "ps1")
             {
-                let text = std::fs::read_to_string(&path).expect("source");
+                // Code only: a comment may say what the engine never does.
+                let text: String = std::fs::read_to_string(&path)
+                    .expect("source")
+                    .lines()
+                    .filter(|l| {
+                        let l = l.trim_start();
+                        !(l.starts_with("//") || l.starts_with('#'))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 for needle in ["RESTART_PATH", "restart-tasks/restart", "failover"] {
                     if text.contains(needle) {
                         hits.push(format!("{} names {needle}", path.display()));

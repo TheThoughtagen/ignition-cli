@@ -32,7 +32,16 @@
 //!    definitions load in one scan);
 //! 10. `deploy_verify`, which must be green;
 //! 11. the post fingerprint, then `ApplyHost::finalize`;
-//! 12. the snapshot download into the run directory (a failure is a warning).
+//! 12. the snapshot download into the run directory (a failure is a warning;
+//!     each copied file's SHA-256 is checked against the record's pre-image,
+//!     and a difference is a warning naming the path).
+//!
+//! The pending-restart list is read before staging and again after the
+//! run (23-09, DAPL-10): [`ApplyOutcome::restart_pending`] is the list
+//! after, [`ApplyOutcome::restart_pending_new`] what was not there before.
+//! Reading is all it does: no restart or failover route is called under any
+//! outcome (SF-3), and an unreadable list is the warning
+//! `restart_pending_unavailable`, never a failure.
 //!
 //! Only a green verify makes the outcome `applied`. Every other way the
 //! under-lock window can end (23-17):
@@ -107,6 +116,10 @@ pub const ROLLED_BACK_SLUG: &str = "deploy_rolled_back";
 
 /// The preflight check id of the `.gwbk` step (23-02 item 8).
 const GWBK_CHECK: &str = "gwbk";
+
+/// The warning for a pending-restart list that could not be read (23-02
+/// item 9).
+const RESTART_UNAVAILABLE: &str = "restart_pending_unavailable";
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -558,6 +571,14 @@ pub struct ApplyOutcome {
     pub gwbk: Option<String>,
     /// Whether the run was started with `--skip-gwbk`.
     pub skip_gwbk: bool,
+    /// The pending restarts after the run (`[]` when none or unreadable).
+    pub restart_pending: Vec<String>,
+    /// The pending restarts the run added: those not listed before it.
+    pub restart_pending_new: Vec<String>,
+    /// SHA-256 of each file copied into the run directory's `snapshot/`,
+    /// keyed by its path below it (`files/<path>`, `ledger.json`,
+    /// `record.json`).
+    pub snapshot_sha256: BTreeMap<String, String>,
 }
 
 /// Apply `plan` (see the module doc for the order).
@@ -586,6 +607,9 @@ pub async fn run_apply(
             warnings: Vec::new(),
             gwbk: None,
             skip_gwbk: false,
+            restart_pending: Vec::new(),
+            restart_pending_new: Vec::new(),
+            snapshot_sha256: BTreeMap::new(),
         });
     }
     let (run_id, run_dir) = RunDir::create_fresh(ctx.repo, &plan.gateway)?;
@@ -755,6 +779,11 @@ async fn drive(
     // budget (D-13). A refusal here leaves the run record and writes nothing.
     let gwbk = take_gwbk(ctx, opts, run_id, run_dir, steps).await?;
 
+    // What is already waiting for a restart, so the run's own additions can
+    // be told apart afterwards (an entry persists until the gateway restarts,
+    // C-restart). Unreadable is `None`.
+    let restart_before = ctx.deploy.restart_pending().await.ok();
+
     // The ledger: what it lists now, and what it will list.
     let old_bytes = ctx.reader.read_ledger(gateway, mode).await?;
     let old_ledger = match &old_bytes {
@@ -800,6 +829,7 @@ async fn drive(
         run_id,
         run_dir,
         gwbk: gwbk.as_deref(),
+        restart_before: restart_before.as_deref(),
         record: &spec.record,
     };
 
@@ -928,8 +958,15 @@ async fn drive(
     steps.emit(ApplyEvent::Finalized)?;
 
     let mut warnings = verify.warnings;
-    if let Err(e) = ctx.host.fetch_snapshot(run_id, run_dir.path()).await {
-        warnings.push(format!("snapshot_download_failed ({})", e.code()));
+    let (restart_pending, restart_pending_new) =
+        restart_report(ctx, restart_before.as_deref(), &mut warnings).await;
+    let mut snapshot_sha256 = BTreeMap::new();
+    match ctx.host.fetch_snapshot(run_id, run_dir.path()).await {
+        Ok(hashes) => {
+            warnings.extend(snapshot_warnings(&spec.record, &hashes));
+            snapshot_sha256 = hashes;
+        }
+        Err(e) => warnings.push(format!("snapshot_download_failed ({})", e.code())),
     }
     Ok(ApplyOutcome {
         kind: OutcomeKind::Applied,
@@ -952,7 +989,54 @@ async fn drive(
         warnings,
         gwbk,
         skip_gwbk: opts.skip_gwbk,
+        restart_pending,
+        restart_pending_new,
+        snapshot_sha256,
     })
+}
+
+/// Read the pending restarts again and compare with what was pending before
+/// the run. Returns `(pending now, pending that were not there before)`, both
+/// `[]` when there are none. A list that could not be read, before or now, is
+/// the one warning `restart_pending_unavailable`: an unreadable "before" is
+/// treated as empty, so everything now pending is reported as new rather than
+/// hidden. Read only (SF-3).
+async fn restart_report(
+    ctx: &ApplyContext<'_>,
+    before: Option<&[String]>,
+    warnings: &mut Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let after = ctx.deploy.restart_pending().await.ok();
+    if before.is_none() || after.is_none() {
+        warnings.push(RESTART_UNAVAILABLE.to_string());
+    }
+    let pending = after.unwrap_or_default();
+    let known = before.unwrap_or_default();
+    let added = pending
+        .iter()
+        .filter(|entry| !known.contains(entry))
+        .cloned()
+        .collect();
+    (pending, added)
+}
+
+/// Warnings for the paths whose copy in the run directory is not the
+/// pre-image the record holds (the on-box snapshot stays authoritative,
+/// D-04). A created path has no pre-image and no copy, so it never counts.
+fn snapshot_warnings(record: &RunRecord, copied: &BTreeMap<String, String>) -> Vec<String> {
+    record
+        .pre_map()
+        .into_iter()
+        .filter_map(|(path, pre)| {
+            let pre = pre?;
+            let key = if path == LEDGER_KEY {
+                "ledger.json".to_string()
+            } else {
+                format!("files/{path}")
+            };
+            (copied.get(&key) != Some(&pre)).then(|| format!("snapshot_copy_differs ({path})"))
+        })
+        .collect()
 }
 
 /// The `.gwbk` step (23-09, D-13, SF-6): unless `--skip-gwbk`, download the
@@ -1036,6 +1120,8 @@ struct RunScope<'a> {
     run_dir: &'a RunDir,
     /// The `.gwbk` taken before staging, if any.
     gwbk: Option<&'a str>,
+    /// The pending restarts read before staging; `None` when unreadable.
+    restart_before: Option<&'a [String]>,
     /// The record at state `applying`: its pre-images are what the restore
     /// puts back.
     record: &'a RunRecord,
@@ -1066,6 +1152,8 @@ async fn roll_back(
     )
     .await?;
     warnings.extend(restored.warnings);
+    let (restart_pending, restart_pending_new) =
+        restart_report(ctx, scope.restart_before, &mut warnings).await;
     Ok(ApplyOutcome {
         kind: OutcomeKind::RolledBack,
         run_id: Some(scope.run_id.as_str().to_string()),
@@ -1079,6 +1167,9 @@ async fn roll_back(
         warnings,
         gwbk: scope.gwbk.map(str::to_string),
         skip_gwbk: opts.skip_gwbk,
+        restart_pending,
+        restart_pending_new,
+        snapshot_sha256: restored.snapshot_sha256,
     })
 }
 
@@ -1111,6 +1202,9 @@ pub struct RestoreReport {
     pub fresh_lock: bool,
     /// Non-failing notes.
     pub warnings: Vec<String>,
+    /// SHA-256 of each file copied into the run directory's `snapshot/`,
+    /// keyed by its path below it.
+    pub snapshot_sha256: BTreeMap<String, String>,
 }
 
 /// The one restore path (abort, auto-rollback and, from 23-11, manual
@@ -1265,14 +1359,19 @@ async fn restore_steps(
     steps.emit(ApplyEvent::Restored).map_err(event)?;
 
     let mut warnings = Vec::new();
+    let mut snapshot_sha256 = BTreeMap::new();
     match RunId::parse(&record.run_id) {
         Ok(restored_run) => {
-            if let Err(e) = ctx
+            match ctx
                 .host
                 .fetch_snapshot(&restored_run, input.run_dir.path())
                 .await
             {
-                warnings.push(format!("snapshot_download_failed ({})", e.code()));
+                Ok(hashes) => {
+                    warnings.extend(snapshot_warnings(record, &hashes));
+                    snapshot_sha256 = hashes;
+                }
+                Err(e) => warnings.push(format!("snapshot_download_failed ({})", e.code())),
             }
         }
         Err(e) => warnings.push(format!("snapshot_download_failed ({})", e.code())),
@@ -1282,6 +1381,7 @@ async fn restore_steps(
         removed: report.deleted.len(),
         fresh_lock: !reuse,
         warnings,
+        snapshot_sha256,
     })
 }
 
@@ -1327,5 +1427,64 @@ async fn plan_stale(
         actual,
         detail: "a live file changed between the plan and the lock; nothing was written"
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(touched: &[(&str, Option<&str>)]) -> RunRecord {
+        let touched: Vec<TouchedEntry> = touched
+            .iter()
+            .map(|(path, pre)| TouchedEntry {
+                path: (*path).to_string(),
+                pre_sha256: pre.map(str::to_string),
+                post_sha256: Some("f".repeat(64)),
+            })
+            .collect();
+        RunRecord {
+            schema_version: 1,
+            run_id: "20261016T000000Z-aaaaaa".to_string(),
+            gateway: "gw".to_string(),
+            mode: "dev".to_string(),
+            render_sha256: "a".repeat(64),
+            plan_sha256: "b".repeat(64),
+            state: RecordState::Applying,
+            rolled_back_by: None,
+            touched,
+            pre_fingerprint: "c".repeat(64),
+            post_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_warnings_name_a_differing_or_missing_copy_and_skip_created_paths() {
+        let (h1, h2) = ("1".repeat(64), "2".repeat(64));
+        let rec = record(&[
+            ("a/config.json", Some(&h1)),
+            ("b/config.json", Some(&h1)),
+            ("c/config.json", None),
+            (LEDGER_KEY, Some(&h2)),
+        ]);
+        let mut copied = BTreeMap::new();
+        copied.insert("files/a/config.json".to_string(), h1.clone());
+        copied.insert("files/b/config.json".to_string(), h2.clone());
+        copied.insert("ledger.json".to_string(), h2);
+        // a matches, b differs, c was created (no copy needed), the ledger
+        // matches.
+        assert_eq!(
+            snapshot_warnings(&rec, &copied),
+            ["snapshot_copy_differs (b/config.json)"]
+        );
+        // A copy that is missing counts as different.
+        copied.remove("files/a/config.json");
+        assert_eq!(
+            snapshot_warnings(&rec, &copied),
+            [
+                "snapshot_copy_differs (a/config.json)",
+                "snapshot_copy_differs (b/config.json)"
+            ]
+        );
     }
 }

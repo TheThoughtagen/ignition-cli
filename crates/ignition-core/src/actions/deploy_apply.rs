@@ -83,6 +83,10 @@ pub struct DeployApplyResult {
     /// Whether the run was started with `--skip-gwbk` (always false for a
     /// no-op, which takes no options).
     pub skip_gwbk: bool,
+    /// The pending restarts after the run; `[]` when none (never null).
+    pub restart_pending: Vec<String>,
+    /// The pending restarts the run added; `[]` when none (never null).
+    pub restart_pending_new: Vec<String>,
 }
 
 impl DeployApplyResult {
@@ -114,6 +118,8 @@ fn base_result(plan: &DeployPlanResult, outcome: OutcomeKind) -> DeployApplyResu
         warnings: plan.warnings.clone(),
         gwbk: None,
         skip_gwbk: false,
+        restart_pending: Vec::new(),
+        restart_pending_new: Vec::new(),
     }
 }
 
@@ -171,5 +177,7 @@ pub async fn deploy_apply_execute(
     result.warnings.extend(outcome.warnings);
     result.gwbk = outcome.gwbk;
     result.skip_gwbk = outcome.skip_gwbk;
+    result.restart_pending = outcome.restart_pending;
+    result.restart_pending_new = outcome.restart_pending_new;
     Ok(result)
 }
