@@ -58,12 +58,12 @@ use crate::client::deploy_api::scan_and_wait;
 use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
-use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
+use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::transport::TreeReader;
 use crate::deploy::tree::sha256_hex;
 use crate::deploy::verify::CheckStatus;
-use crate::error::CoreError;
+use crate::error::{CoreError, RollbackFailure};
 use crate::poll::PollConfig;
 
 use self::fingerprint::{LEDGER_KEY, fingerprint};
@@ -494,10 +494,7 @@ pub async fn run_apply(
         });
     }
     let (run_id, run_dir) = RunDir::create_fresh(ctx.repo, &plan.gateway)?;
-    let mut steps = Steps {
-        log: None,
-        observer: ctx.observer,
-    };
+    let mut steps = Steps::new(None, ctx.observer);
     let result = drive(ctx, plan, opts, &run_id, &run_dir, &mut steps).await;
 
     // The one exit point.
@@ -510,6 +507,9 @@ pub async fn run_apply(
         Ok(outcome) => {
             let mut doc = serde_json::to_value(outcome).unwrap_or(Value::Null);
             doc["ok"] = Value::Bool(outcome.kind != OutcomeKind::RolledBack);
+            if outcome.kind == OutcomeKind::RolledBack {
+                doc["slug"] = Value::String(ROLLED_BACK_SLUG.to_string());
+            }
             doc
         }
         Err(e) => json!({
@@ -532,13 +532,19 @@ pub async fn run_apply(
 
 /// The run's events: appended to `events.ndjson` once it is open, and told
 /// to the observer.
-struct Steps<'a> {
+pub struct Steps<'a> {
     log: Option<EventLog>,
     observer: &'a dyn ApplyObserver,
 }
 
-impl Steps<'_> {
-    fn emit(&mut self, event: ApplyEvent) -> Result<(), CoreError> {
+impl<'a> Steps<'a> {
+    /// Events go to `log` (when open) and to `observer`.
+    pub fn new(log: Option<EventLog>, observer: &'a dyn ApplyObserver) -> Self {
+        Steps { log, observer }
+    }
+
+    /// Report one step.
+    pub fn emit(&mut self, event: ApplyEvent) -> Result<(), CoreError> {
         self.observer.event(&event);
         match &mut self.log {
             Some(log) => log.append(event.name(), event.fields()),
@@ -644,6 +650,13 @@ async fn drive(
         )));
     }
 
+    let scope = RunScope {
+        plan,
+        run_id,
+        run_dir,
+        record: &spec.record,
+    };
+
     // Stage outside the lock, then hold the lock for the one commit.
     let prepared = ctx
         .host
@@ -673,11 +686,19 @@ async fn drive(
                 .to_string(),
         ));
     }
-    if let Some(failure) = &report.failure {
-        return Err(CoreError::Internal(format!(
-            "apply stopped (write_failed): the commit failed after it moved files ({failure}); \
-             the tree is partial and was not restored"
-        )));
+    if report.failure.is_some() {
+        // The failure names an entry by index and never its content; the
+        // restore puts back every touched path from the snapshot.
+        return roll_back(
+            ctx,
+            opts,
+            &scope,
+            Some(&lock),
+            RollbackCause::WriteFailed,
+            steps,
+            Vec::new(),
+        )
+        .await;
     }
 
     // Only a lock still held, with the margin left, may be followed by a scan.
@@ -760,4 +781,266 @@ async fn drive(
         post_fingerprint: Some(post_fingerprint),
         warnings,
     })
+}
+
+/// What an abort needs to know about the run that is being undone.
+struct RunScope<'a> {
+    plan: &'a DeployPlanResult,
+    run_id: &'a RunId,
+    run_dir: &'a RunDir,
+    /// The record at state `applying`: its pre-images are what the restore
+    /// puts back.
+    record: &'a RunRecord,
+}
+
+/// End a run that must not stay applied: restore the snapshot through
+/// [`restore_snapshot`] and report the cause. Never `applied`.
+async fn roll_back(
+    ctx: &ApplyContext<'_>,
+    opts: &ApplyOptions,
+    scope: &RunScope<'_>,
+    held: Option<&HeldLock>,
+    cause: RollbackCause,
+    steps: &mut Steps<'_>,
+    mut warnings: Vec<String>,
+) -> Result<ApplyOutcome, CoreError> {
+    let restored = restore_snapshot(
+        ctx,
+        &RestoreInput {
+            run_id: scope.run_id,
+            run_dir: scope.run_dir,
+            record: scope.record,
+            held,
+            cause,
+        },
+        opts,
+        steps,
+    )
+    .await?;
+    warnings.extend(restored.warnings);
+    Ok(ApplyOutcome {
+        kind: OutcomeKind::RolledBack,
+        run_id: Some(scope.run_id.as_str().to_string()),
+        run_dir: Some(scope.run_dir.path().to_string_lossy().into_owned()),
+        cause: Some(cause),
+        render_sha256: scope.plan.render_sha256.clone(),
+        plan_sha256: scope.plan.plan_sha256.clone(),
+        written: Vec::new(),
+        deleted: Vec::new(),
+        post_fingerprint: Some(scope.record.pre_fingerprint.clone()),
+        warnings,
+    })
+}
+
+/// What [`restore_snapshot`] is asked to undo.
+pub struct RestoreInput<'a> {
+    /// The run doing the restoring: for an abort or an auto-rollback the run
+    /// itself, for a manual rollback the rollback run (it becomes the
+    /// record's `rolled_back_by`).
+    pub run_id: &'a RunId,
+    /// That run's directory (named in `rollback_failed`; the snapshot copy
+    /// is downloaded into it).
+    pub run_dir: &'a RunDir,
+    /// The record of the run being undone: its touched set and pre-images.
+    pub record: &'a RunRecord,
+    /// The scan-lock this engine still holds, when it does.
+    pub held: Option<&'a HeldLock>,
+    /// Why the restore runs.
+    pub cause: RollbackCause,
+}
+
+/// What a finished restore did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Paths put back from the snapshot.
+    pub restored: usize,
+    /// Files this run created that the restore removed.
+    pub removed: usize,
+    /// Whether the restore took a fresh scan-lock instead of reusing the
+    /// held one.
+    pub fresh_lock: bool,
+    /// Non-failing notes.
+    pub warnings: Vec<String>,
+}
+
+/// The one restore path (abort, auto-rollback and, from 23-11, manual
+/// rollback). In this order:
+///
+/// 1. `restore_started`;
+/// 2. the lock: the held one is reused when the gateway says it is still
+///    ours with the restore's estimated time plus [`LOCK_MARGIN_S`] left (the
+///    local clock is not consulted: it can only read shorter); if it is
+///    ours but too short the restore waits for it to lapse; then, or when
+///    there is no held lock, a fresh hold is taken (a holder's own
+///    re-acquire is a 409, C1d, so it is never tried while the hold is still
+///    ours);
+/// 3. exactly one `ApplyHost::restore`;
+/// 4. exactly one config scan, only now (research Pitfall 1);
+/// 5. the restore check: the touched set's live hashes equal the record's
+///    pre-images, the scan completed, `deploymentMode` is the target's.
+///    Never `deploy_verify`: after a restore the declared tree is no longer
+///    the expected state (research Pitfall 9);
+/// 6. the record to `rolled_back`, `ApplyHost::finalize` (installs it, drops
+///    the journal and staging), `restored`, and the snapshot copy into the
+///    run directory (a failure is a warning).
+///
+/// Any failure is [`CoreError::RollbackFailed`] naming the run, its
+/// directory and the on-box journal, which stays (D-12).
+pub async fn restore_snapshot(
+    ctx: &ApplyContext<'_>,
+    input: &RestoreInput<'_>,
+    opts: &ApplyOptions,
+    steps: &mut Steps<'_>,
+) -> Result<RestoreReport, CoreError> {
+    let record = input.record;
+    match restore_steps(ctx, input, opts, steps).await {
+        Ok(report) => Ok(report),
+        Err(cause) => Err(CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: record.run_id.clone(),
+            run_dir: Some(input.run_dir.path().to_string_lossy().into_owned()),
+            journal: journal_location(
+                LedgerRoot::for_node(&ctx.declared.target.nodes.master),
+                &record.gateway,
+                &record.mode,
+            ),
+            cause,
+        }))),
+    }
+}
+
+/// The steps of [`restore_snapshot`]; an `Err` is a value-free reason.
+async fn restore_steps(
+    ctx: &ApplyContext<'_>,
+    input: &RestoreInput<'_>,
+    opts: &ApplyOptions,
+    steps: &mut Steps<'_>,
+) -> Result<RestoreReport, String> {
+    // A gateway error is named by its code only; a host error already names
+    // entries by index and never their content.
+    let gw = |step: &'static str| move |e: CoreError| format!("{step}: {}", e.code());
+    let host = |step: &'static str| move |e: CoreError| format!("{step}: {e}");
+    let event = |e: CoreError| format!("events: {}", e.code());
+
+    let record = input.record;
+    let deploy = ctx.deploy;
+    steps
+        .emit(ApplyEvent::RestoreStarted { cause: input.cause })
+        .map_err(event)?;
+
+    // The lock.
+    let need_s = opts.hold.estimate_commit_s(record.touched.len()).ceil() as i64 + LOCK_MARGIN_S;
+    let reuse = match input.held {
+        Some(lock) => match lock
+            .check_gateway(deploy, need_s)
+            .await
+            .map_err(gw("checking the scan-lock"))?
+        {
+            LockVerdict::Held { .. } => true,
+            LockVerdict::Expiring { .. } => {
+                lock.wait_for_lapse(deploy, opts.poll.interval)
+                    .await
+                    .map_err(gw("waiting for the scan-lock to lapse"))?;
+                false
+            }
+            LockVerdict::NotHeld => false,
+        },
+        None => false,
+    };
+    if !reuse {
+        HeldLock::acquire(deploy, ScanKind::Config, opts.hold.hold_s, ctx.clock)
+            .await
+            .map_err(gw("taking the scan-lock"))?;
+        steps
+            .emit(ApplyEvent::LockAcquired {
+                hold_s: opts.hold.hold_s,
+            })
+            .map_err(event)?;
+    }
+
+    // One restore call, then one scan.
+    let report = ctx.host.restore(record).await.map_err(host("restore"))?;
+    if let Some(failure) = &report.failure {
+        return Err(format!("restore: {failure}"));
+    }
+    if report.stale {
+        return Err("restore: the host reported a stale pre-image".to_string());
+    }
+    match scan_and_wait(deploy, ScanKind::Config, opts.poll.clone())
+        .await
+        .map_err(gw("the scan after the restore"))?
+    {
+        ScanOutcome::Complete(_) => steps.emit(ApplyEvent::ScanDone).map_err(event)?,
+        ScanOutcome::NotComplete { .. } => {
+            return Err("the scan after the restore did not complete".to_string());
+        }
+    }
+
+    // The restore check (Pitfall 9).
+    let touched: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
+    let live = ctx
+        .host
+        .fingerprint(&touched)
+        .await
+        .map_err(host("reading the restored files"))?;
+    let pre = record.pre_map();
+    let differing: Vec<String> = pre
+        .iter()
+        .filter(|(path, hash)| live.get(*path) != Some(*hash))
+        .map(|(path, _)| path.clone())
+        .collect();
+    if !differing.is_empty() {
+        return Err(format!(
+            "{} restored path(s) differ from the snapshot: {}",
+            differing.len(),
+            listed(&differing)
+        ));
+    }
+    let mode = deploy
+        .deployment_mode()
+        .await
+        .map_err(gw("reading the deployment mode"))?;
+    if mode.as_deref() != Some(record.mode.as_str()) {
+        return Err("the gateway's deployment mode is not the target's".to_string());
+    }
+
+    // Done: install the final record, drop the journal and the staging.
+    let mut rolled_back = record.clone();
+    rolled_back.state = RecordState::RolledBack;
+    rolled_back.rolled_back_by = Some(input.run_id.as_str().to_string());
+    rolled_back.post_fingerprint = Some(record.pre_fingerprint.clone());
+    ctx.host
+        .finalize(&rolled_back)
+        .await
+        .map_err(host("finalize"))?;
+    steps.emit(ApplyEvent::Restored).map_err(event)?;
+
+    let mut warnings = Vec::new();
+    match RunId::parse(&record.run_id) {
+        Ok(restored_run) => {
+            if let Err(e) = ctx
+                .host
+                .fetch_snapshot(&restored_run, input.run_dir.path())
+                .await
+            {
+                warnings.push(format!("snapshot_download_failed ({})", e.code()));
+            }
+        }
+        Err(e) => warnings.push(format!("snapshot_download_failed ({})", e.code())),
+    }
+    Ok(RestoreReport {
+        restored: report.moved.len(),
+        removed: report.deleted.len(),
+        fresh_lock: !reuse,
+        warnings,
+    })
+}
+
+/// Up to [`crate::error::APPLY_LIST_SHOWN`] paths, then `and N more`.
+fn listed(paths: &[String]) -> String {
+    let shown = paths.len().min(crate::error::APPLY_LIST_SHOWN);
+    let mut out = paths[..shown].join(", ");
+    if paths.len() > shown {
+        out.push_str(&format!(" and {} more", paths.len() - shown));
+    }
+    out
 }

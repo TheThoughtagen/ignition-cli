@@ -36,12 +36,24 @@
 //! lock by the gateway's `remaining` and by its own monotonic [`Instant`],
 //! taken before the acquire request; either one saying the lock is
 //! expiring makes it expired.
+//!
+//! # Whose lock
+//!
+//! The gateway frees a lapsed lock and grants it to the next actor, so a
+//! held lock after our hold lapsed is not proof that it is still ours
+//! (23-17, DAPL-07). [`HeldLock::acquire`] reads the lock once right after
+//! the grant and remembers its `timestamp` and `actor`; C1c and D9 show the
+//! `timestamp` is unchanged across reads of one hold and different for each
+//! new hold. A later reading with another `timestamp` or `actor` is another
+//! actor's lock and reads as [`LockVerdict::NotHeld`]. The two readings come
+//! from the same gateway and are only compared with each other, never with a
+//! clock.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::client::DeployApi;
-use crate::client::scan::{LockVerdict, ScanKind, lock_verdict};
+use crate::client::scan::{LockObservation, LockVerdict, ScanKind, ScanLockInfo, lock_verdict};
 use crate::error::CoreError;
 
 /// D-02's floor: the shortest hold the engine ever requests, in seconds.
@@ -117,18 +129,38 @@ impl Clock for SystemClock {
     }
 }
 
+/// What tells one hold from another on the gateway (C1c, D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockIdentity {
+    timestamp: Option<i64>,
+    actor: Option<String>,
+}
+
+impl LockIdentity {
+    fn of(info: &ScanLockInfo) -> Self {
+        LockIdentity {
+            timestamp: info.timestamp,
+            actor: info.actor.clone(),
+        }
+    }
+}
+
 /// A scan-lock this run took.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HeldLock {
     kind: ScanKind,
     hold_s: u64,
     acquired: Instant,
+    /// The hold as the gateway showed it right after the grant; `None` when
+    /// the lock read free then, in which case no later lock is ours.
+    identity: Option<LockIdentity>,
 }
 
 impl HeldLock {
     /// Take the lock for `hold_s` seconds. The local instant is taken
     /// before the request, so the local clock never reads later than the
-    /// gateway's own count of the hold (research Pattern 6).
+    /// gateway's own count of the hold (research Pattern 6). One read right
+    /// after the grant remembers which hold is ours (see the module doc).
     pub async fn acquire(
         deploy: &dyn DeployApi,
         kind: ScanKind,
@@ -137,10 +169,15 @@ impl HeldLock {
     ) -> Result<HeldLock, CoreError> {
         let acquired = clock.now();
         deploy.scan_lock_acquire(kind, 0, hold_s).await?;
+        let identity = match deploy.scan_lock_info(kind).await? {
+            LockObservation::Held(info) => Some(LockIdentity::of(&info)),
+            LockObservation::Free => None,
+        };
         Ok(HeldLock {
             kind,
             hold_s,
             acquired,
+            identity,
         })
     }
 
@@ -164,26 +201,71 @@ impl HeldLock {
             .saturating_sub(i64::try_from(elapsed_s).unwrap_or(i64::MAX))
     }
 
+    /// Whether `info` is the hold this value took.
+    fn is_ours(&self, info: &ScanLockInfo) -> bool {
+        self.identity.as_ref() == Some(&LockIdentity::of(info))
+    }
+
+    /// The gateway's side of the judgement alone: [`lock_verdict`] on its
+    /// `remaining`, where a lock that is not ours reads as
+    /// [`LockVerdict::NotHeld`]. This is the only call that asks the gateway.
+    pub async fn check_gateway(
+        &self,
+        deploy: &dyn DeployApi,
+        margin_s: i64,
+    ) -> Result<LockVerdict, CoreError> {
+        let observed = deploy.scan_lock_info(self.kind).await?;
+        Ok(match &observed {
+            LockObservation::Held(info) if !self.is_ours(info) => LockVerdict::NotHeld,
+            _ => lock_verdict(&observed, margin_s),
+        })
+    }
+
     /// Judge the lock now, by both clocks: the gateway's `remaining`
-    /// through [`lock_verdict`], and the local count of the hold. Either one
-    /// saying the lock has less than `margin_s` left makes the answer
-    /// [`LockVerdict::Expiring`]; a free lock is [`LockVerdict::NotHeld`].
-    /// `timestamp` and `lastScanTimestamp` are never compared with the
-    /// runner's clock (Pitfall 15).
+    /// through [`HeldLock::check_gateway`], and the local count of the hold.
+    /// Either one saying the lock has less than `margin_s` left makes the
+    /// answer [`LockVerdict::Expiring`]; a free lock, or one that is another
+    /// actor's, is [`LockVerdict::NotHeld`]. `timestamp` and
+    /// `lastScanTimestamp` are never compared with the runner's clock
+    /// (Pitfall 15).
     pub async fn check(
         &self,
         deploy: &dyn DeployApi,
         margin_s: i64,
         clock: &dyn Clock,
     ) -> Result<LockVerdict, CoreError> {
-        let observed = deploy.scan_lock_info(self.kind).await?;
         let local_s = self.local_remaining_s(clock);
-        Ok(match lock_verdict(&observed, margin_s) {
+        Ok(match self.check_gateway(deploy, margin_s).await? {
             LockVerdict::Held { remaining_s } if local_s < margin_s => LockVerdict::Expiring {
                 remaining_s: remaining_s.min(local_s),
             },
             verdict => verdict,
         })
+    }
+
+    /// Wait until the gateway no longer shows this hold: it lapsed, a scan
+    /// released it, or another actor holds the lock now. A scan is never
+    /// the way to end it, because a scan loads whatever is on disk. Polls
+    /// every `interval` and gives up after the hold plus a margin of real
+    /// time.
+    pub async fn wait_for_lapse(
+        &self,
+        deploy: &dyn DeployApi,
+        interval: Duration,
+    ) -> Result<(), CoreError> {
+        let limit = Duration::from_secs(self.hold_s.saturating_add(LOCK_MARGIN_S as u64 + 3));
+        let started = tokio::time::Instant::now();
+        loop {
+            if self.check_gateway(deploy, 0).await? == LockVerdict::NotHeld {
+                return Ok(());
+            }
+            if started.elapsed() >= limit {
+                return Err(CoreError::Internal(
+                    "the scan-lock did not lapse within its hold".to_string(),
+                ));
+            }
+            tokio::time::sleep(interval).await;
+        }
     }
 }
 
@@ -515,6 +597,89 @@ mod tests {
                 .iter()
                 .all(|v| *v == LockVerdict::Held { remaining_s: 30 })
         );
+    }
+
+    fn held_by(timestamp: i64, actor: &str, remaining: i64) -> LockObservation {
+        LockObservation::Held(ScanLockInfo {
+            timestamp: Some(timestamp),
+            remaining,
+            actor: Some(actor.to_string()),
+            extra: BTreeMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn held_lock_another_actors_hold_is_not_ours() {
+        let gateway = LockGateway::holding(30, Some(100));
+        let clock = ManualClock::new();
+        let lock = lock_on(&gateway, &clock).await;
+        // The same actor name, a new hold: the timestamp tells them apart.
+        *gateway.info.lock().expect("info") = held_by(200, "api-token:t:127.0.0.1", 59);
+        assert_eq!(
+            lock.check(&gateway, LOCK_MARGIN_S, &clock)
+                .await
+                .expect("check"),
+            LockVerdict::NotHeld
+        );
+        // Another actor with the very same timestamp is not ours either.
+        *gateway.info.lock().expect("info") = held_by(100, "api-token:other:127.0.0.1", 59);
+        assert_eq!(
+            lock.check_gateway(&gateway, 0).await.expect("check"),
+            LockVerdict::NotHeld
+        );
+        // And our own hold reads as held again.
+        *gateway.info.lock().expect("info") = held_by(100, "api-token:t:127.0.0.1", 29);
+        assert_eq!(
+            lock.check_gateway(&gateway, 0).await.expect("check"),
+            LockVerdict::Held { remaining_s: 29 }
+        );
+    }
+
+    #[tokio::test]
+    async fn held_lock_unseen_after_the_grant_owns_no_later_lock() {
+        // The lock read free right after the grant, so a lock seen later was
+        // taken by someone else.
+        let gateway = LockGateway::free();
+        let clock = ManualClock::new();
+        let lock = lock_on(&gateway, &clock).await;
+        *gateway.info.lock().expect("info") = held_by(5, "api-token:t:127.0.0.1", 59);
+        assert_eq!(
+            lock.check(&gateway, LOCK_MARGIN_S, &clock)
+                .await
+                .expect("check"),
+            LockVerdict::NotHeld
+        );
+    }
+
+    #[tokio::test]
+    async fn held_lock_check_gateway_ignores_the_local_clock() {
+        let gateway = LockGateway::holding(30, Some(100));
+        let clock = ManualClock::new();
+        let lock = lock_on(&gateway, &clock).await;
+        clock.advance(Duration::from_secs(HOLD * 2));
+        assert!(lock.local_remaining_s(&clock) < 0);
+        assert_eq!(
+            lock.check_gateway(&gateway, LOCK_MARGIN_S)
+                .await
+                .expect("check"),
+            LockVerdict::Held { remaining_s: 30 }
+        );
+    }
+
+    #[tokio::test]
+    async fn held_lock_wait_for_lapse_returns_when_the_hold_is_gone() {
+        let gateway = LockGateway::holding(30, Some(100));
+        let clock = ManualClock::new();
+        let lock = lock_on(&gateway, &clock).await;
+        // Another actor's lock ends the wait at once: it is not ours to wait for.
+        *gateway.info.lock().expect("info") = held_by(7, "api-token:other:127.0.0.1", 59);
+        lock.wait_for_lapse(&gateway, Duration::from_millis(1))
+            .await
+            .expect("not ours");
+        *gateway.info.lock().expect("info") = LockObservation::Free;
+        lock.wait_for_lapse(&gateway, Duration::from_millis(1))
+            .await
+            .expect("free");
     }
 
     #[test]
