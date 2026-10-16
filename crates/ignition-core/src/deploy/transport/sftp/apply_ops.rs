@@ -34,7 +34,9 @@ use serde_json::Value;
 
 use super::{SftpTransport, Seen};
 use crate::deploy::apply::fingerprint::LEDGER_KEY;
-use crate::deploy::apply::host::{ApplyHost, BatchReport, BatchSpec, Prepared, ProbeReport};
+use crate::deploy::apply::host::{
+    ApplyHost, BatchReport, BatchSpec, Prepared, ProbeReport, restoring_journal,
+};
 use crate::deploy::apply::journal::{Journal, JournalPhase};
 use crate::deploy::apply::record::RunRecord;
 use crate::deploy::apply::run_store::RunId;
@@ -42,8 +44,8 @@ use crate::deploy::ledger::{
     LEDGER_FILE, LedgerRoot, journal_location, staging_rel,
 };
 use crate::deploy::transport::batch::{
-    POSIX_STUB, SCRIPT_SH, SCRIPT_SH_FILE, WORK_FILE, WorkList, journal_file, record_file,
-    script_sh_sha256,
+    POSIX_STUB, SCRIPT_SH, SCRIPT_SH_FILE, SeenJournal, WORK_FILE, WorkList, WorkOp, journal_file,
+    record_file, script_sh_sha256,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
 use crate::deploy::transport::{
@@ -377,16 +379,54 @@ impl SftpTransport {
         }
     }
 
-    /// The report of a commit result.
-    fn commit_report(&self, value: &Value, work: &WorkList) -> Result<BatchReport, CoreError> {
-        const OP: &str = "commit";
-        let malformed = |what: &str| self.mirror_fail(OP, format!("the script result is malformed ({what})"));
+    /// The journal in place, as the work list names it: absent, or the hash of
+    /// the one that belongs to `run_id`. A journal of another run is
+    /// `deploy_journal_present`; it is never overwritten or removed.
+    async fn journal_of_run(&self, run_id: &str) -> Result<SeenJournal, CoreError> {
+        let Some(setup) = &self.apply else {
+            return Err(self.mirror_fail("journal", "this transport has no apply half"));
+        };
+        let location = journal_location(LedgerRoot::AccountHome, &setup.gateway, &setup.mode);
+        match self.read_journal(&setup.gateway, &setup.mode).await? {
+            None => Ok(SeenJournal::Absent),
+            Some(bytes) => {
+                let theirs = Journal::parse(&location, &bytes, &setup.gateway, &setup.mode)?;
+                if theirs.run_id != run_id {
+                    return Err(CoreError::DeployJournalPresent {
+                        run_id: theirs.run_id,
+                        env: "<env>".to_string(),
+                        location,
+                    });
+                }
+                Ok(SeenJournal::Hash(sha256_hex(&bytes)))
+            }
+        }
+    }
+
+    /// The report of a commit or restore result; its indices point into
+    /// `work`.
+    fn batch_report(
+        &self,
+        op: &str,
+        value: &Value,
+        work: &WorkList,
+    ) -> Result<BatchReport, CoreError> {
+        let restoring = work.op == WorkOp::Restore;
+        let malformed = |what: &str| {
+            self.mirror_fail(op, format!("the script result is malformed ({what})"))
+        };
         let phase = match value.get("phase").and_then(Value::as_str) {
             Some("snapshotting") => JournalPhase::Snapshotting,
             Some("ready") => JournalPhase::Ready,
             Some("writing") => JournalPhase::Writing,
             Some("written") => JournalPhase::Written,
+            Some("restoring") => JournalPhase::Restoring,
             _ => return Err(malformed("phase")),
+        };
+        let (moved_limit, deleted_limit) = if restoring {
+            (work.restores.len(), work.restores.len())
+        } else {
+            (work.writes.len(), work.deletes.len())
         };
         let indices = |key: &str, limit: usize| -> Result<Vec<usize>, CoreError> {
             let items = value
@@ -404,8 +444,8 @@ impl SftpTransport {
             }
             Ok(out)
         };
-        let moved = indices("moved", work.writes.len())?;
-        let deleted = indices("deleted", work.deletes.len())?;
+        let moved = indices("moved", moved_limit)?;
+        let deleted = indices("deleted", deleted_limit)?;
         let mut removed = std::collections::BTreeSet::new();
         for pair in value
             .get("dirs")
@@ -416,9 +456,13 @@ impl SftpTransport {
             let index = pair[0]
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n < work.deletes.len())
+                .filter(|n| *n < deleted_limit)
                 .ok_or_else(|| malformed("dirs"))?;
-            let path = work.deletes[index].path.as_str();
+            let path = if restoring {
+                work.restores[index].path.as_str()
+            } else {
+                work.deletes[index].path.as_str()
+            };
             let levels = pair[1]
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
@@ -503,16 +547,165 @@ impl ApplyHost for SftpTransport {
         Err(self.mirror_fail("probe", "not built yet"))
     }
 
-    async fn prepare(&self, _spec: &BatchSpec, _tree: &RenderedTree) -> Result<Prepared, CoreError> {
-        Err(self.mirror_fail("prepare", "not built yet"))
+    async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
+        const OP: &str = "prepare";
+        let setup = self.apply_setup(OP)?;
+        if spec.gateway != setup.gateway || spec.mode != setup.mode {
+            return Err(self.mirror_fail(
+                OP,
+                "the spec names a different gateway or mode than this host",
+            ));
+        }
+        if let Some(problem) = spec.problem() {
+            return Err(self.mirror_fail(OP, format!("the batch is not valid: {problem}")));
+        }
+        let work = WorkList::from_spec(spec).map_err(|why| self.mirror_fail(OP, why))?;
+        let mut total: u64 = 0;
+        for op in &spec.writes {
+            let Some(bytes) = tree.files.get(&op.path) else {
+                return Err(
+                    self.mirror_fail(OP, format!("{} is not in the rendered tree", op.path))
+                );
+            };
+            if bytes.len() as u64 > READ_MAX_FILE_BYTES || sha256_hex(bytes) != op.sha256 {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!(
+                        "the rendered bytes of {} are over the cap or do not match the spec",
+                        op.path
+                    ),
+                ));
+            }
+            total = total.saturating_add(bytes.len() as u64);
+            if total > READ_MAX_TOTAL_BYTES {
+                return Err(self.mirror_fail(OP, "the batch exceeds the total size cap"));
+            }
+        }
+        let (home, deploy, coll) = self.apply_roots(OP).await?;
+        let staging = self.staging_abs(&home, spec.run_id.as_str())?;
+        let lines = work.to_lines();
+        let work_sha = sha256_hex(&lines);
+
+        // everything the staging directory holds, built locally first
+        let mut files: Vec<(String, Vec<u8>)> = vec![
+            (SCRIPT_SH_FILE.to_string(), SCRIPT_SH.as_bytes().to_vec()),
+            (WORK_FILE.to_string(), lines),
+        ];
+        for phase in crate::deploy::apply::host::PRERENDERED_PHASES {
+            files.push((journal_file(phase), spec.journal_at(phase).to_bytes()));
+        }
+        files.push((
+            record_file(crate::deploy::apply::record::RecordState::Applying),
+            spec.record.to_bytes(),
+        ));
+        if let Some(ledger) = &spec.ledger_new {
+            files.push((LEDGER_FILE.to_string(), ledger.clone()));
+        }
+        for op in &spec.writes {
+            files.push((format!("files/{}", op.path), tree.files[&op.path].clone()));
+        }
+        let temp = tempfile::Builder::new()
+            .prefix("ign-apply-")
+            .tempdir()
+            .map_err(|e| self.mirror_fail(OP, format!("cannot create a temp dir ({:?})", e.kind())))?;
+        let mut entries: Vec<(String, u64)> = Vec::with_capacity(files.len());
+        for (rel, bytes) in &files {
+            let target = rel
+                .split('/')
+                .fold(temp.path().to_path_buf(), |path, part| path.join(part));
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    self.mirror_fail(OP, format!("cannot stage {rel} ({:?})", e.kind()))
+                })?;
+            }
+            std::fs::write(&target, bytes)
+                .map_err(|e| self.mirror_fail(OP, format!("cannot stage {rel} ({:?})", e.kind())))?;
+            entries.push((rel.clone(), bytes.len() as u64));
+        }
+
+        // A stale staging directory of this run (an earlier attempt) is
+        // replaced.
+        if !self.put_tree(OP, &staging, temp.path(), &entries, true).await? {
+            let unstage = WorkList::for_unstage(spec.run_id.as_str(), &spec.gateway, &spec.mode)
+                .map_err(|why| self.mirror_fail(OP, why))?;
+            let value = self.run_ctl("unstage", &unstage, &[], &coll, &deploy).await?;
+            if !self.result_ok(OP, &value)? {
+                return Err(self.refusal(OP, &value, None).await);
+            }
+            if !self.put_tree(OP, &staging, temp.path(), &entries, true).await? {
+                return Err(self.mirror_fail(OP, "a stale staging directory could not be removed"));
+            }
+        }
+
+        // The upload is checked on the host before the lock is taken.
+        let value = self
+            .exec_script("verify", &staging, &coll, &deploy, &work_sha)
+            .await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.refusal(OP, &value, Some(&work)).await);
+        }
+        self.lists
+            .lock()
+            .map_err(|_| self.mirror_fail(OP, "the prepared batches are unavailable"))?
+            .insert(work_sha.clone(), work);
+        Ok(Prepared::new(spec.run_id.clone(), staging, work_sha))
     }
 
-    async fn commit(&self, _prepared: &Prepared) -> Result<BatchReport, CoreError> {
-        Err(self.mirror_fail("commit", "not built yet"))
+    async fn commit(&self, prepared: &Prepared) -> Result<BatchReport, CoreError> {
+        const OP: &str = "commit";
+        self.apply_setup(OP)?;
+        let (home, deploy, coll) = self.apply_roots(OP).await?;
+        let staging = self.staging_abs(&home, prepared.run_id().as_str())?;
+        if prepared.staging() != staging {
+            return Err(self.mirror_fail(OP, "the prepared batch was staged for a different host"));
+        }
+        let work = self
+            .lists
+            .lock()
+            .map_err(|_| self.mirror_fail(OP, "the prepared batches are unavailable"))?
+            .get(prepared.work_sha256())
+            .cloned()
+            .ok_or_else(|| {
+                self.mirror_fail(
+                    OP,
+                    "the prepared batch was staged by a different host handle",
+                )
+            })?;
+        let value = self
+            .exec_script(OP, &staging, &coll, &deploy, prepared.work_sha256())
+            .await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.refusal(OP, &value, Some(&work)).await);
+        }
+        self.batch_report(OP, &value, &work)
     }
 
-    async fn restore(&self, _record: &RunRecord) -> Result<BatchReport, CoreError> {
-        Err(self.mirror_fail("restore", "not built yet"))
+    async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
+        const OP: &str = "restore";
+        let setup = self.apply_setup(OP)?;
+        if record.gateway != setup.gateway || record.mode != setup.mode {
+            return Err(self.mirror_fail(
+                OP,
+                "the record names a different gateway or mode than this host",
+            ));
+        }
+        let mut work = WorkList::for_restore(record).map_err(|why| self.mirror_fail(OP, why))?;
+        let (_, deploy, coll) = self.apply_roots(OP).await?;
+        work.journal_seen = Some(self.journal_of_run(&record.run_id).await?);
+        let journal = restoring_journal(record).to_bytes();
+        let value = self
+            .run_ctl(
+                OP,
+                &work,
+                &[(journal_file(JournalPhase::Restoring), journal)],
+                &coll,
+                &deploy,
+            )
+            .await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.refusal(OP, &value, Some(&work)).await);
+        }
+        self.batch_report(OP, &value, &work)
     }
 
     async fn fingerprint(

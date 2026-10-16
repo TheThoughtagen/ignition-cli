@@ -966,6 +966,34 @@ mod tests {
     }
 
     #[test]
+    fn the_script_and_the_stub_agree_on_what_is_hashed() {
+        // the stub hashes `$(cat script)` plus one newline, so the script must
+        // end with exactly one newline and hold no NUL
+        assert!(SCRIPT_SH.ends_with('\n') && !SCRIPT_SH.ends_with("\n\n"));
+        assert!(!SCRIPT_SH.contains('\0'));
+        assert!(SCRIPT_SH.contains("IGN-RESULT:"));
+        // the stub is one line without a control character, so it passes
+        // RemoteCommand::posix, and carries no path
+        assert!(!POSIX_STUB.chars().any(char::is_control), "{POSIX_STUB:?}");
+        assert!(!POSIX_STUB.contains('/') || !POSIX_STUB.contains("ign-deploy"));
+        let command = crate::deploy::transport::remote::RemoteCommand::posix(&[
+            "sh",
+            "-c",
+            POSIX_STUB,
+            "ign-stub",
+            "/h/commit.sh",
+            "commit",
+            "/h/staging",
+            "/d/config/resources/dev",
+            "/h/ign-deploy/gw/dev",
+            &script_sh_sha256(),
+            H1,
+        ])
+        .expect("the stub passes the quoting rules");
+        assert!(command.as_str().starts_with("'sh' '-c' '"));
+    }
+
+    #[test]
     fn pre_rendered_names_are_fixed() {
         assert_eq!(
             journal_file(JournalPhase::Snapshotting),

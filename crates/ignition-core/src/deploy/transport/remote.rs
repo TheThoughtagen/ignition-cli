@@ -1893,6 +1893,89 @@ mod tests {
         }
     }
 
+    fn posix_command() -> RemoteCommand {
+        RemoteCommand::posix(&["sh", "-c", "echo hi", "ign-stub", "/h/commit.sh", "commit"])
+            .expect("command")
+    }
+
+    #[tokio::test]
+    async fn exec_posix_runs_ssh_with_the_quoted_command_and_parses_the_sentinel() {
+        let (runner, shell) = exec_shell(ProcessOutput {
+            stdout: b"noise\nIGN-RESULT:{\"ok\":1}\n".to_vec(),
+            stderr: Vec::new(),
+            code: 0,
+            timed_out: false,
+        });
+        let value = shell
+            .exec_posix("commit", &posix_command())
+            .await
+            .expect("exec");
+        assert_eq!(value["ok"], 1);
+        let argv = runner.argv.lock().expect("argv");
+        assert_eq!(argv[0].0, "ssh");
+        let last = argv[0].1.last().expect("remote command");
+        assert_eq!(last, posix_command().as_str());
+        assert!(argv[0].1.iter().any(|a| a == "--"));
+    }
+
+    #[tokio::test]
+    async fn exec_posix_failures_are_transport_failed() {
+        let ok = |stdout: &[u8], stderr: &[u8], code: i32, timed_out: bool| ProcessOutput {
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            code,
+            timed_out,
+        };
+        let cases = [
+            (
+                "non-zero exit",
+                ok(b"IGN-RESULT:{\"ok\":1}\n", b"boom\n", 1, false),
+                "exit code 1: boom",
+            ),
+            (
+                "the stub refuses",
+                ok(b"", b"ign: the staged script or work list does not match its hash\n", 97, false),
+                "does not match its hash",
+            ),
+            (
+                "exit 0 with no sentinel",
+                ok(b"SECRETSTDOUT hello\n", b"", 0, false),
+                "IGN-RESULT:",
+            ),
+            (
+                "two sentinel lines",
+                ok(b"IGN-RESULT:{\"ok\":1}\nIGN-RESULT:{\"ok\":1}\n", b"", 0, false),
+                "more than one",
+            ),
+            ("a timeout", ok(b"", b"", -1, true), "timed out after 3s"),
+            (
+                "non-JSON after the sentinel",
+                ok(b"IGN-RESULT:SECRETSTDOUT\n", b"", 0, false),
+                "not valid JSON",
+            ),
+        ];
+        for (name, out, needle) in cases {
+            let (_runner, shell) = exec_shell(out);
+            let err = shell
+                .exec_posix("commit", &posix_command())
+                .await
+                .expect_err(name);
+            let CoreError::TransportFailed {
+                operation, detail, ..
+            } = err
+            else {
+                panic!("{name}: not transport_failed");
+            };
+            assert_eq!(operation, "exec", "{name}");
+            assert!(detail.starts_with("commit: "), "{name}: {detail}");
+            assert!(detail.contains(needle), "{name}: {detail}");
+            assert!(
+                !detail.contains("SECRETSTDOUT"),
+                "{name}: stdout must never be echoed: {detail}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn exec_powershell_over_budget_never_spawns() {
         // an over-budget command is refused before the runner is called: the
