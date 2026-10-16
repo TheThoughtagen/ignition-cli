@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-19-PLAN.md
-last_updated: "2026-10-16T17:53:17.451Z"
+stopped_at: Completed 23-05-PLAN.md
+last_updated: "2026-10-16T18:34:27.590Z"
 last_activity: 2026-10-16
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 37
+  completed_plans: 38
   percent: 50
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 7 of 21
+Plan: 8 of 21
 Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [███████░░░] 71%
+Progress: [███████░░░] 73%
 
 ## Performance Metrics
 
@@ -82,6 +82,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P18 | 25min | 2 tasks | 6 files |
 | Phase 23 P04 | ~2h | 2 tasks | 9 files |
 | Phase 23 P19 | 1h45m | 3 tasks | 5 files |
+| Phase 23 P05 | 2h50m | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -119,8 +120,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T17:53:17.411Z
-**Stopped At:** Completed 23-19-PLAN.md
+**Last session:** 2026-10-16T18:34:27.572Z
+**Stopped At:** Completed 23-05-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -183,3 +184,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 23-04: DeployJournalPresent raised by a host carries env '<env>'; the engine (23-05) and verbs own the real --env value
 - [Phase ?]: 23-19: HangAfterMove stops the blocking commit after the k-th move and the async commit awaits pending(), so an abort is a faithful kill -9 and no blocking thread lingers
 - [Phase ?]: 23-19: FaultyHost counts invocations from 1 per call name; fail and hang never reach the inner host; after-hooks run also when the inner call errored
+- [Phase 23]: 23-05: a scan runs once (C11: provider and definitions load in one scan); a host Err that wrote nothing is returned typed with the engine filling deploy_journal_present's env; stale and a post-move commit failure are Internal until 23-17; no lock release or discard in failing branches until 23-17
+- [Phase 23]: 23-05: hold.rs carries D-02's formula, floor 10 and ceiling 300 only; hold_for is unclamped, hold_clamped separate; no measured constant until 23-10
