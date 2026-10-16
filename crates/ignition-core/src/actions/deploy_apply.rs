@@ -6,9 +6,13 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::actions::deploy::{Declared, DeployPlanResult};
-use crate::deploy::apply::gates::GateFlags;
-use crate::deploy::apply::{ApplyContext, ApplyOptions, OutcomeKind, RollbackCause};
+use crate::actions::deploy::{Declared, DeployPlanResult, PlanOptions, deploy_plan};
+use crate::deploy::apply::gates::{
+    GateFlags, GateOutcome, evaluate_gates, validate_drift_reason, validate_plan_sha256,
+};
+use crate::deploy::apply::{
+    ApplyContext, ApplyOptions, OutcomeKind, ROLLED_BACK_SLUG, RollbackCause, run_apply,
+};
 use crate::deploy::plan::PlanSummary;
 use crate::deploy::transport::TreeReader;
 use crate::error::CoreError;
@@ -82,24 +86,80 @@ impl DeployApplyResult {
     }
 }
 
-/// Validate the flags, re-plan against the host and evaluate the gates.
-pub async fn deploy_apply_prepare(
-    _declared: &Declared,
-    _reader: &dyn TreeReader,
-    _opts: &PrepareOptions,
-) -> Result<ApplyPrepared, CoreError> {
-    Err(CoreError::Internal(
-        "deploy_apply_prepare is not built".into(),
-    ))
+/// The result of a run that did nothing: counts and hashes of `plan`.
+fn base_result(plan: &DeployPlanResult, outcome: OutcomeKind) -> DeployApplyResult {
+    DeployApplyResult {
+        env: plan.env.clone(),
+        gateway: plan.gateway.clone(),
+        mode: plan.mode.clone(),
+        node: plan.node.clone(),
+        transport: plan.transport.clone(),
+        run_id: None,
+        run_dir: None,
+        outcome,
+        ok: outcome != OutcomeKind::RolledBack,
+        slug: (outcome == OutcomeKind::RolledBack).then_some(ROLLED_BACK_SLUG),
+        cause: None,
+        plan_sha256: plan.plan_sha256.clone(),
+        render_sha256: plan.render_sha256.clone(),
+        summary: plan.summary.clone(),
+        written: Vec::new(),
+        deleted: Vec::new(),
+        warnings: plan.warnings.clone(),
+    }
 }
 
-/// Run a prepared apply.
+/// Validate the flags, re-plan against the host and evaluate the gates.
+///
+/// Reads the host (through `reader`) and nothing else: no gateway session,
+/// no lock, no scan, no run directory. An empty plan is
+/// [`ApplyPrepared::Noop`] with outcome `noop` (DAPL-03); a refused gate is
+/// its error.
+pub async fn deploy_apply_prepare(
+    declared: &Declared,
+    reader: &dyn TreeReader,
+    opts: &PrepareOptions,
+) -> Result<ApplyPrepared, CoreError> {
+    // A malformed flag is invalid_input before any host contact.
+    if let Some(hash) = &opts.gates.plan_sha256 {
+        validate_plan_sha256(hash)?;
+    }
+    if let Some(reason) = &opts.gates.allow_drift {
+        validate_drift_reason(reason)?;
+    }
+    let plan = deploy_plan(
+        declared,
+        reader,
+        &PlanOptions {
+            base: opts.base.clone(),
+            diff: false,
+        },
+    )
+    .await?;
+    match evaluate_gates(&plan, &opts.gates)? {
+        GateOutcome::Noop => Ok(ApplyPrepared::Noop(base_result(&plan, OutcomeKind::Noop))),
+        GateOutcome::Ready { prose } => Ok(ApplyPrepared::Ready { plan, prose }),
+    }
+}
+
+/// Run a prepared apply: a no-op is returned as it is, a ready plan goes
+/// through [`run_apply`].
 pub async fn deploy_apply_execute(
-    _prepared: ApplyPrepared,
-    _ctx: &ApplyContext<'_>,
-    _opts: &ApplyOptions,
+    prepared: ApplyPrepared,
+    ctx: &ApplyContext<'_>,
+    opts: &ApplyOptions,
 ) -> Result<DeployApplyResult, CoreError> {
-    Err(CoreError::Internal(
-        "deploy_apply_execute is not built".into(),
-    ))
+    let plan = match prepared {
+        ApplyPrepared::Noop(result) => return Ok(result),
+        ApplyPrepared::Ready { plan, .. } => plan,
+    };
+    let outcome = run_apply(ctx, &plan, opts).await?;
+    let mut result = base_result(&plan, outcome.kind);
+    result.run_id = outcome.run_id;
+    result.run_dir = outcome.run_dir;
+    result.cause = outcome.cause;
+    result.written = outcome.written;
+    result.deleted = outcome.deleted;
+    result.warnings.extend(outcome.warnings);
+    Ok(result)
 }

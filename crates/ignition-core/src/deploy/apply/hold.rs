@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use crate::client::DeployApi;
-use crate::client::scan::{LockVerdict, ScanKind};
+use crate::client::scan::{LockVerdict, ScanKind, lock_verdict};
 use crate::error::CoreError;
 
 /// Seconds of margin a lock needs left at a check: one REST round trip from
@@ -53,24 +53,63 @@ pub struct HeldLock {
 }
 
 impl HeldLock {
-    /// Take the lock for `hold_s` seconds.
+    /// Take the lock for `hold_s` seconds. The local instant is taken
+    /// before the request, so the local clock never reads later than the
+    /// gateway's own count of the hold (research Pattern 6).
     pub async fn acquire(
-        _deploy: &dyn DeployApi,
-        _kind: ScanKind,
-        _hold_s: u64,
-        _clock: &dyn Clock,
+        deploy: &dyn DeployApi,
+        kind: ScanKind,
+        hold_s: u64,
+        clock: &dyn Clock,
     ) -> Result<HeldLock, CoreError> {
-        Err(CoreError::Internal("HeldLock::acquire is not built".into()))
+        let acquired = clock.now();
+        deploy.scan_lock_acquire(kind, 0, hold_s).await?;
+        Ok(HeldLock {
+            kind,
+            hold_s,
+            acquired,
+        })
     }
 
-    /// The lock's verdict now.
+    /// The scan kind this lock covers.
+    pub fn kind(&self) -> ScanKind {
+        self.kind
+    }
+
+    /// The hold that was requested, in seconds.
+    pub fn hold_s(&self) -> u64 {
+        self.hold_s
+    }
+
+    /// Seconds left by the local monotonic clock: the hold minus the whole
+    /// seconds since the request, rounded up so the answer errs short.
+    pub fn local_remaining_s(&self, clock: &dyn Clock) -> i64 {
+        let elapsed = clock.now().saturating_duration_since(self.acquired);
+        let elapsed_s = elapsed.as_secs() + u64::from(elapsed.subsec_nanos() > 0);
+        i64::try_from(self.hold_s)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(elapsed_s).unwrap_or(i64::MAX))
+    }
+
+    /// Judge the lock now, by both clocks: the gateway's `remaining`
+    /// through [`lock_verdict`], and the local count of the hold. Either one
+    /// saying the lock has less than `margin_s` left makes the answer
+    /// [`LockVerdict::Expiring`]; a free lock is [`LockVerdict::NotHeld`].
+    /// `timestamp` and `lastScanTimestamp` are never compared with the
+    /// runner's clock (Pitfall 15).
     pub async fn check(
         &self,
-        _deploy: &dyn DeployApi,
-        _margin_s: i64,
-        _clock: &dyn Clock,
+        deploy: &dyn DeployApi,
+        margin_s: i64,
+        clock: &dyn Clock,
     ) -> Result<LockVerdict, CoreError> {
-        let _ = (self.kind, self.hold_s, self.acquired);
-        Err(CoreError::Internal("HeldLock::check is not built".into()))
+        let observed = deploy.scan_lock_info(self.kind).await?;
+        let local_s = self.local_remaining_s(clock);
+        Ok(match lock_verdict(&observed, margin_s) {
+            LockVerdict::Held { remaining_s } if local_s < margin_s => LockVerdict::Expiring {
+                remaining_s: remaining_s.min(local_s),
+            },
+            verdict => verdict,
+        })
     }
 }

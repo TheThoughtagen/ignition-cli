@@ -576,10 +576,15 @@ async fn stale_hash_stops_before_any_host_write() {
 #[tokio::test]
 async fn write_set_pre_images_follow_where_the_live_copy_is() {
     // The alarm settings exist in `core` only; POSTGRES in the mode
-    // collection; one rendered file of a third unit is live nowhere.
+    // collection.
     let fx = PlanFixture::new();
     let (declared, _) = fx.load("dev");
     fx.live_render("core", &declared);
+    // The core copy of the alarm settings differs from the render, so the unit
+    // is `changed` although the mode collection holds none of it.
+    let mut core_alarm = fx.read("core", ALARM_CONFIG);
+    core_alarm.push(b' ');
+    fx.core(ALARM_CONFIG, &core_alarm);
     let mut bytes = fx.read("core", DB_CONFIG);
     bytes.push(b' ');
     fx.mode(DB_CONFIG, &bytes);

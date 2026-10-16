@@ -46,19 +46,33 @@ pub mod journal;
 pub mod record;
 pub mod run_store;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::Serialize;
+use serde_json::{Value, json};
 
-use crate::actions::deploy::{Declared, DeployPlanResult, VerifyOptions};
+use crate::actions::deploy::{Declared, DeployPlanResult, VerifyOptions, deploy_verify};
+use crate::actions::workspace::rfc3339_now_utc;
+use crate::client::deploy_api::scan_and_wait;
+use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
 use crate::client::{DeployApi, GatewayApi};
+use crate::deploy::layout::RelPath;
+use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
+use crate::deploy::plan::PlanStatus;
 use crate::deploy::transport::TreeReader;
+use crate::deploy::tree::sha256_hex;
+use crate::deploy::verify::CheckStatus;
 use crate::error::CoreError;
 use crate::poll::PollConfig;
 
+use self::fingerprint::{LEDGER_KEY, fingerprint};
 use self::gates::GateFlags;
-use self::hold::{Clock, HoldModel};
-use self::host::{ApplyHost, DeleteOp, WriteOp};
+use self::hold::{Clock, HeldLock, HoldModel, LOCK_MARGIN_S};
+use self::host::{ApplyHost, BatchSpec, DeleteOp, WriteOp};
+use self::journal::{Journal, JournalPhase};
+use self::record::{RecordState, RunRecord, TouchedEntry};
+use self::run_store::{EventLog, RunDir, RunId};
 
 /// The slug of the rolled-back apply verdict.
 ///
@@ -116,9 +130,167 @@ pub struct WriteSet {
     pub deletes: Vec<DeleteOp>,
 }
 
-/// The write set of `plan`.
-pub fn write_set(_plan: &DeployPlanResult, _declared: &Declared) -> Result<WriteSet, CoreError> {
-    Err(CoreError::Internal("write_set is not built".into()))
+/// The write set of `plan` (research Pattern 3).
+///
+/// Every rendered file of every `added` or `changed` unit is written, whole
+/// units and never a partial one in the mode collection; `same` and
+/// `unmanaged` units are never written. The deletes are the plan's delete
+/// set. Each touched path carries the hash the plan saw in the MODE
+/// collection: `live_sha256` where the entry is live in `mode`, else none
+/// (a copy that only `core` holds is not a file of the mode collection). A
+/// delete without such a hash, or a rendered file whose bytes are not the
+/// ones the plan hashed, is a defect, reported as
+/// [`CoreError::Internal`].
+pub fn write_set(plan: &DeployPlanResult, declared: &Declared) -> Result<WriteSet, CoreError> {
+    let defect = |why: String| CoreError::Internal(format!("write set: {why}"));
+    let mut writes = Vec::new();
+    // Path to (live in the mode collection, effective live hash).
+    let mut live: BTreeMap<&str, (bool, Option<&str>)> = BTreeMap::new();
+    for entry in &plan.entries {
+        let in_mode = entry.live_in.iter().any(|c| c == "mode");
+        for file in &entry.files {
+            live.insert(file.path.as_str(), (in_mode, file.live_sha256.as_deref()));
+        }
+        if !matches!(entry.status, PlanStatus::Added | PlanStatus::Changed) {
+            continue;
+        }
+        for file in &entry.files {
+            let Some(desired) = &file.desired_sha256 else {
+                continue;
+            };
+            let path = RelPath::new(&file.path)
+                .map_err(|why| defect(format!("the plan names an invalid path ({why})")))?;
+            let bytes =
+                declared.outcome.tree.files.get(&path).ok_or_else(|| {
+                    defect(format!("{path} is in the plan but not in the render"))
+                })?;
+            if sha256_hex(bytes) != *desired {
+                return Err(defect(format!(
+                    "{path} was rendered differently from the plan"
+                )));
+            }
+            writes.push(WriteOp {
+                path,
+                sha256: desired.clone(),
+                pre: if in_mode {
+                    file.live_sha256.clone()
+                } else {
+                    None
+                },
+            });
+        }
+    }
+    let mut deletes = Vec::new();
+    for path in &plan.delete_set.files {
+        let Some((true, Some(pre))) = live.get(path.as_str()) else {
+            return Err(defect(format!(
+                "{path} is in the delete set without a pre-image in the plan"
+            )));
+        };
+        deletes.push(DeleteOp {
+            path: path.clone(),
+            pre: (*pre).to_string(),
+        });
+    }
+    writes.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+    deletes.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+    Ok(WriteSet { writes, deletes })
+}
+
+/// The ledger after this run: the old files minus the delete set, plus the
+/// written files, byte-sorted (the ledger swap is the last move).
+fn new_ledger(
+    plan: &DeployPlanResult,
+    old: Option<&Ledger>,
+    set: &WriteSet,
+    run_id: &RunId,
+) -> Ledger {
+    let mut files: BTreeSet<String> = old
+        .map(|ledger| ledger.files.iter().cloned().collect())
+        .unwrap_or_default();
+    for op in &set.deletes {
+        files.remove(op.path.as_str());
+    }
+    for op in &set.writes {
+        files.insert(op.path.as_str().to_string());
+    }
+    Ledger {
+        schema_version: 1,
+        gateway: plan.gateway.clone(),
+        mode: plan.mode.clone(),
+        render_sha256: plan.render_sha256.clone(),
+        run_id: run_id.as_str().to_string(),
+        files: files.into_iter().collect(),
+    }
+}
+
+/// The batch the host will commit: the writes, the deletes, the new ledger
+/// and the journal and record that describe exactly them.
+fn batch_spec(
+    plan: &DeployPlanResult,
+    run_id: &RunId,
+    set: &WriteSet,
+    ledger_new: Vec<u8>,
+    ledger_pre: Option<String>,
+) -> BatchSpec {
+    let mut touched: Vec<TouchedEntry> = set
+        .writes
+        .iter()
+        .map(|w| TouchedEntry {
+            path: w.path.as_str().to_string(),
+            pre_sha256: w.pre.clone(),
+            post_sha256: Some(w.sha256.clone()),
+        })
+        .chain(set.deletes.iter().map(|d| TouchedEntry {
+            path: d.path.as_str().to_string(),
+            pre_sha256: Some(d.pre.clone()),
+            post_sha256: None,
+        }))
+        .collect();
+    touched.push(TouchedEntry {
+        path: LEDGER_KEY.to_string(),
+        pre_sha256: ledger_pre.clone(),
+        post_sha256: Some(sha256_hex(&ledger_new)),
+    });
+    touched.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    let pre_fingerprint = fingerprint(
+        &touched
+            .iter()
+            .map(|e| (e.path.clone(), e.pre_sha256.clone()))
+            .collect(),
+    );
+    let run = run_id.as_str().to_string();
+    BatchSpec {
+        run_id: run_id.clone(),
+        gateway: plan.gateway.clone(),
+        mode: plan.mode.clone(),
+        writes: set.writes.clone(),
+        deletes: set.deletes.clone(),
+        ledger_new: Some(ledger_new),
+        ledger_pre,
+        journal: Journal {
+            schema_version: 1,
+            run_id: run.clone(),
+            gateway: plan.gateway.clone(),
+            mode: plan.mode.clone(),
+            phase: JournalPhase::Snapshotting,
+            pre_fingerprint: pre_fingerprint.clone(),
+            touched: touched.iter().map(|e| e.path.clone()).collect(),
+        },
+        record: RunRecord {
+            schema_version: 1,
+            run_id: run,
+            gateway: plan.gateway.clone(),
+            mode: plan.mode.clone(),
+            render_sha256: plan.render_sha256.clone(),
+            plan_sha256: plan.plan_sha256.clone(),
+            state: RecordState::Applying,
+            rolled_back_by: None,
+            touched,
+            pre_fingerprint,
+            post_fingerprint: None,
+        },
+    }
 }
 
 /// One step of a run, value-free: ids, counts and flags only.
@@ -176,6 +348,46 @@ pub enum ApplyEvent {
         /// The error code slug.
         code: String,
     },
+}
+
+impl ApplyEvent {
+    /// The event's name in `events.ndjson`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ApplyEvent::RunStarted { .. } => "run_started",
+            ApplyEvent::Staged { .. } => "staged",
+            ApplyEvent::LockAcquired { .. } => "lock_acquired",
+            ApplyEvent::Committed { .. } => "committed",
+            ApplyEvent::LockVerdict { .. } => "lock_verdict",
+            ApplyEvent::ScanDone => "scan_done",
+            ApplyEvent::VerifyDone { .. } => "verify_done",
+            ApplyEvent::Finalized => "finalized",
+            ApplyEvent::RestoreStarted { .. } => "restore_started",
+            ApplyEvent::Restored => "restored",
+            ApplyEvent::Failed { .. } => "failed",
+        }
+    }
+
+    /// The event's fields: ids, counts and flags, never a value.
+    pub fn fields(&self) -> Value {
+        match self {
+            ApplyEvent::RunStarted {
+                run_id,
+                writes,
+                deletes,
+            } => json!({"run_id": run_id, "writes": writes, "deletes": deletes}),
+            ApplyEvent::Staged { files } => json!({"files": files}),
+            ApplyEvent::LockAcquired { hold_s } => json!({"hold_s": hold_s}),
+            ApplyEvent::Committed { moved, deleted } => {
+                json!({"moved": moved, "deleted": deleted})
+            }
+            ApplyEvent::LockVerdict { held } => json!({"held": held}),
+            ApplyEvent::VerifyDone { ok } => json!({"ok": ok}),
+            ApplyEvent::RestoreStarted { cause } => json!({"cause": cause.as_str()}),
+            ApplyEvent::Failed { code } => json!({"code": code}),
+            ApplyEvent::ScanDone | ApplyEvent::Finalized | ApplyEvent::Restored => Value::Null,
+        }
+    }
 }
 
 /// Hears each [`ApplyEvent`] as it happens.
@@ -256,10 +468,296 @@ pub struct ApplyOutcome {
 }
 
 /// Apply `plan` (see the module doc for the order).
+///
+/// An empty plan returns [`OutcomeKind::Noop`] before anything is touched:
+/// no run directory, no host call, no lock, no scan. Otherwise the run
+/// directory is created first (the git-ignore guard is part of that), and
+/// from then on every way out passes through the one exit point at the end
+/// of this function, which writes `result.json` once.
 pub async fn run_apply(
-    _ctx: &ApplyContext<'_>,
-    _plan: &DeployPlanResult,
-    _opts: &ApplyOptions,
+    ctx: &ApplyContext<'_>,
+    plan: &DeployPlanResult,
+    opts: &ApplyOptions,
 ) -> Result<ApplyOutcome, CoreError> {
-    Err(CoreError::Internal("run_apply is not built".into()))
+    if !plan.summary.has_changes {
+        return Ok(ApplyOutcome {
+            kind: OutcomeKind::Noop,
+            run_id: None,
+            run_dir: None,
+            cause: None,
+            render_sha256: plan.render_sha256.clone(),
+            plan_sha256: plan.plan_sha256.clone(),
+            written: Vec::new(),
+            deleted: Vec::new(),
+            post_fingerprint: None,
+            warnings: Vec::new(),
+        });
+    }
+    let (run_id, run_dir) = RunDir::create_fresh(ctx.repo, &plan.gateway)?;
+    let mut steps = Steps {
+        log: None,
+        observer: ctx.observer,
+    };
+    let result = drive(ctx, plan, opts, &run_id, &run_dir, &mut steps).await;
+
+    // The one exit point.
+    if let Err(e) = &result {
+        let _ = steps.emit(ApplyEvent::Failed {
+            code: e.code().to_string(),
+        });
+    }
+    let doc = match &result {
+        Ok(outcome) => {
+            let mut doc = serde_json::to_value(outcome).unwrap_or(Value::Null);
+            doc["ok"] = Value::Bool(outcome.kind != OutcomeKind::RolledBack);
+            doc
+        }
+        Err(e) => json!({
+            "ok": false,
+            "run_id": run_id.as_str(),
+            "error": {"code": e.code(), "message": e.to_string()},
+        }),
+    };
+    let written = run_dir.write_json("result.json", &doc);
+    match result {
+        Ok(mut outcome) => {
+            if written.is_err() {
+                outcome.warnings.push("result_json_unwritable".to_string());
+            }
+            Ok(outcome)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The run's events: appended to `events.ndjson` once it is open, and told
+/// to the observer.
+struct Steps<'a> {
+    log: Option<EventLog>,
+    observer: &'a dyn ApplyObserver,
+}
+
+impl Steps<'_> {
+    fn emit(&mut self, event: ApplyEvent) -> Result<(), CoreError> {
+        self.observer.event(&event);
+        match &mut self.log {
+            Some(log) => log.append(event.name(), event.fields()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A host cannot know the `--env` name; the engine does.
+fn with_env(err: CoreError, env: &str) -> CoreError {
+    match err {
+        CoreError::DeployJournalPresent {
+            run_id, location, ..
+        } => CoreError::DeployJournalPresent {
+            run_id,
+            env: env.to_string(),
+            location,
+        },
+        other => other,
+    }
+}
+
+/// The steps of the module doc, in order. Returns `Ok` only for a verified,
+/// finalized deploy.
+async fn drive(
+    ctx: &ApplyContext<'_>,
+    plan: &DeployPlanResult,
+    opts: &ApplyOptions,
+    run_id: &RunId,
+    run_dir: &RunDir,
+    steps: &mut Steps<'_>,
+) -> Result<ApplyOutcome, CoreError> {
+    let declared = ctx.declared;
+    let env = declared.env.as_str();
+    let (gateway, mode) = (plan.gateway.as_str(), plan.mode.as_str());
+
+    run_dir.write_json(
+        "run.json",
+        &json!({
+            "schema_version": 1,
+            "run_id": run_id.as_str(),
+            "env": env,
+            "gateway": gateway,
+            "mode": mode,
+            "node": plan.node,
+            "transport": plan.transport,
+            "started_at": rfc3339_now_utc(),
+            "run_dir_git": run_dir.git_status().as_record(),
+            "render_sha256": plan.render_sha256,
+            "plan_sha256": plan.plan_sha256,
+            "hold_s": opts.hold.hold_s,
+            "allow_destructive": opts.gates.allow_destructive,
+            "allow_drift": opts.gates.allow_drift,
+        }),
+    )?;
+    run_dir.write_json("plan.json", plan)?;
+    steps.log = Some(EventLog::open(run_dir)?);
+
+    let set = write_set(plan, declared)?;
+    steps.emit(ApplyEvent::RunStarted {
+        run_id: run_id.as_str().to_string(),
+        writes: set.writes.len(),
+        deletes: set.deletes.len(),
+    })?;
+
+    // The ledger: what it lists now, and what it will list.
+    let old_bytes = ctx.reader.read_ledger(gateway, mode).await?;
+    let old_ledger = match &old_bytes {
+        Some(bytes) => Some(Ledger::parse(
+            &ledger_location(
+                LedgerRoot::for_node(&declared.target.nodes.master),
+                gateway,
+                mode,
+            ),
+            bytes,
+            gateway,
+            mode,
+        )?),
+        None => None,
+    };
+    let ledger = new_ledger(plan, old_ledger.as_ref(), &set, run_id);
+    let ledger_bytes = ledger.to_bytes();
+    Ledger::parse(
+        &ledger_location(
+            LedgerRoot::for_node(&declared.target.nodes.master),
+            gateway,
+            mode,
+        ),
+        &ledger_bytes,
+        gateway,
+        mode,
+    )?;
+    let spec = batch_spec(
+        plan,
+        run_id,
+        &set,
+        ledger_bytes,
+        old_bytes.as_deref().map(sha256_hex),
+    );
+    if let Some(problem) = spec.problem() {
+        return Err(CoreError::Internal(format!(
+            "the batch the engine built is invalid: {problem}"
+        )));
+    }
+
+    // Stage outside the lock, then hold the lock for the one commit.
+    let prepared = ctx
+        .host
+        .prepare(&spec, &declared.outcome.tree)
+        .await
+        .map_err(|e| with_env(e, env))?;
+    steps.emit(ApplyEvent::Staged {
+        files: set.writes.len(),
+    })?;
+    let lock = HeldLock::acquire(ctx.deploy, ScanKind::Config, opts.hold.hold_s, ctx.clock).await?;
+    steps.emit(ApplyEvent::LockAcquired {
+        hold_s: opts.hold.hold_s,
+    })?;
+    let report = ctx
+        .host
+        .commit(&prepared)
+        .await
+        .map_err(|e| with_env(e, env))?;
+    steps.emit(ApplyEvent::Committed {
+        moved: report.moved.len(),
+        deleted: report.deleted.len(),
+    })?;
+    if report.stale {
+        return Err(CoreError::Internal(
+            "apply stopped (stale_pre_image): a live file differs from the plan's pre-image; \
+             nothing was moved"
+                .to_string(),
+        ));
+    }
+    if let Some(failure) = &report.failure {
+        return Err(CoreError::Internal(format!(
+            "apply stopped (write_failed): the commit failed after it moved files ({failure}); \
+             the tree is partial and was not restored"
+        )));
+    }
+
+    // Only a lock still held, with the margin left, may be followed by a scan.
+    let verdict = lock.check(ctx.deploy, LOCK_MARGIN_S, ctx.clock).await?;
+    let held = matches!(verdict, LockVerdict::Held { .. });
+    steps.emit(ApplyEvent::LockVerdict { held })?;
+    if !held {
+        return Err(CoreError::Internal(
+            "apply stopped (lock_expired): the scan-lock was not held with the margin left after \
+             the commit; the files moved, no scan ran and they were not restored"
+                .to_string(),
+        ));
+    }
+    // C11: a tag provider and its definitions load in one scan.
+    match scan_and_wait(ctx.deploy, ScanKind::Config, opts.poll.clone()).await? {
+        ScanOutcome::Complete(_) => steps.emit(ApplyEvent::ScanDone)?,
+        ScanOutcome::NotComplete { .. } => {
+            return Err(CoreError::Internal(
+                "apply stopped (scan_incomplete): the config scan did not complete in time; the \
+                 files moved and were not restored"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let verify = deploy_verify(
+        declared,
+        &opts.project,
+        ctx.deploy,
+        ctx.gateway,
+        ctx.reader,
+        &opts.verify,
+    )
+    .await?;
+    steps.emit(ApplyEvent::VerifyDone { ok: verify.ok })?;
+    if !verify.ok {
+        let failed: Vec<String> = verify
+            .checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Fail)
+            .map(|c| format!("{:?}", c.id))
+            .collect();
+        return Err(CoreError::Internal(format!(
+            "apply stopped (verify_failed): the post-apply verify failed ({}); the files moved \
+             and were not restored",
+            failed.join(", ")
+        )));
+    }
+
+    // Green: record what is live now, finalize, keep the snapshot locally.
+    let post = ctx.host.fingerprint(&spec.touched_paths()).await?;
+    let post_fingerprint = fingerprint(&post);
+    let mut record = spec.record.clone();
+    record.state = RecordState::Applied;
+    record.post_fingerprint = Some(post_fingerprint.clone());
+    ctx.host.finalize(&record).await?;
+    steps.emit(ApplyEvent::Finalized)?;
+
+    let mut warnings = verify.warnings;
+    if let Err(e) = ctx.host.fetch_snapshot(run_id, run_dir.path()).await {
+        warnings.push(format!("snapshot_download_failed ({})", e.code()));
+    }
+    Ok(ApplyOutcome {
+        kind: OutcomeKind::Applied,
+        run_id: Some(run_id.as_str().to_string()),
+        run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
+        cause: None,
+        render_sha256: plan.render_sha256.clone(),
+        plan_sha256: plan.plan_sha256.clone(),
+        written: set
+            .writes
+            .iter()
+            .map(|w| w.path.as_str().to_string())
+            .collect(),
+        deleted: set
+            .deletes
+            .iter()
+            .map(|d| d.path.as_str().to_string())
+            .collect(),
+        post_fingerprint: Some(post_fingerprint),
+        warnings,
+    })
 }
