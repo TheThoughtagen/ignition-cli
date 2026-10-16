@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-09-PLAN.md
-last_updated: "2026-10-16T23:06:18.574Z"
+stopped_at: Completed 23-11-PLAN.md
+last_updated: "2026-10-16T23:32:10.885Z"
 last_activity: 2026-10-16
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 42
+  completed_plans: 43
   percent: 50
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 12 of 21
+Plan: 13 of 21
 Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [████████░░] 81%
+Progress: [████████░░] 83%
 
 ## Performance Metrics
 
@@ -87,6 +87,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P17 | 1h | 3 tasks | 4 files |
 | Phase 23 P07 | 2h | 3 tasks | 8 files |
 | Phase 23 P09 | 2h | 3 tasks | 10 files |
+| Phase 23 P11 | ~40min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -124,8 +125,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T23:06:18.520Z
-**Stopped At:** Completed 23-09-PLAN.md
+**Last session:** 2026-10-16T23:32:10.867Z
+**Stopped At:** Completed 23-11-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -196,3 +197,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 23]: 23-07: NodeTarget.gateway_name added (optional, validated); wrong_target compares the master only, backup value validated but unused
 - [Phase 23]: 23-07: an unanswerable preflight (network_error, transport_failed) aborts after run.json and result.json are written; it is never folded into deploy_preflight_failed
 - [Phase 23]: 23-09: .gwbk completeness is the ZIP central directory (gateway sends no Content-Length); a refused .gwbk is deleted; unreadable restart-pending 'before' reports all pending as new plus restart_pending_unavailable
+- [Phase 23]: 23-11: manual rollback cause is Option<RollbackCause> (None = manual); restore_snapshot takes a RestoreContext; rollback result carries restart_pending and restart_pending_new; run_rollback re-runs check_rollback
