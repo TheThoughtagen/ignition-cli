@@ -1021,7 +1021,7 @@ mod tests {
     /// The rows copied from the 20-LIVE-CAPTURES Endpoint shapes table.
     #[test]
     fn endpoint_rows_match_the_capture_table() {
-        let expected: [(&str, &str, &str, ResponseShape, &str); 13] = [
+        let expected: [(&str, &str, &str, ResponseShape, &str); 14] = [
             (
                 "resource_names",
                 "GET",
@@ -1113,6 +1113,13 @@ mod tests {
                 ResponseShape::Json,
                 "C-null",
             ),
+            (
+                "restart_pending",
+                "GET",
+                "/data/api/v1/restart-tasks/pending",
+                ResponseShape::Json,
+                "C-restart",
+            ),
         ];
         assert_eq!(DEPLOY_ENDPOINTS.len(), expected.len());
         for (id, method, template, shape, capture) in expected {
@@ -1142,12 +1149,13 @@ mod tests {
             "modes",
             "mode_create",
             "deployment_mode",
+            "restart_pending",
         ] {
             assert!(decl(id).is_ok(), "{id}");
         }
     }
 
-    /// DAPI-06: the table is closed. Thirteen rows, in trait declaration
+    /// DAPI-06: the table is closed. Fourteen rows, in trait declaration
     /// order, unique ids, every row backed by a capture block, every verb
     /// one of GET, POST and PUT.
     #[test]
@@ -1169,9 +1177,10 @@ mod tests {
                 "modes",
                 "mode_create",
                 "deployment_mode",
+                "restart_pending",
             ]
         );
-        assert_eq!(DEPLOY_ENDPOINTS.len(), 13);
+        assert_eq!(DEPLOY_ENDPOINTS.len(), 14);
         let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "ids are unique");
         for row in DEPLOY_ENDPOINTS {
@@ -1183,6 +1192,75 @@ mod tests {
                 row.method
             );
         }
+    }
+
+    /// C-restart: the recorded bodies. An empty list, and the entry the rig
+    /// produced after a module was disabled (`Module <State>: <module id>`).
+    #[tokio::test]
+    async fn restart_pending_parses_the_captured_shape() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pending = "/data/api/v1/restart-tasks/pending";
+        let one = r#"{"pending":["Module Disabled: com.inductiveautomation.sfc"]}"#;
+        let cases = [
+            (
+                ResponseTemplate::new(200).set_body_string(r#"{"pending":[]}"#),
+                Ok(vec![]),
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string(one),
+                Ok(vec![
+                    "Module Disabled: com.inductiveautomation.sfc".to_string(),
+                ]),
+            ),
+            (ResponseTemplate::new(403), Err("auth")),
+            (ResponseTemplate::new(401), Err("auth")),
+            (
+                ResponseTemplate::new(200).set_body_string("{}"),
+                Err("internal"),
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string(r#"{"pending":null}"#),
+                Err("internal"),
+            ),
+        ];
+        for (answer, want) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(pending))
+                .respond_with(answer)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+            let got = api.restart_pending().await;
+            match (got, want) {
+                (Ok(list), Ok(expected)) => assert_eq!(list, expected),
+                (Err(err), Err(code)) => assert_eq!(err.code(), code, "{err}"),
+                (got, want) => panic!("got {got:?}, wanted {want:?}"),
+            }
+        }
+    }
+
+    /// A 403 keeps its status in the typed error.
+    #[tokio::test]
+    async fn restart_pending_403_is_auth_with_the_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data/api/v1/restart-tasks/pending"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+        let err = api.restart_pending().await.expect_err("403");
+        assert!(
+            matches!(err, CoreError::Auth { status: 403, .. }),
+            "{err:?}"
+        );
     }
 
     /// T-20-15: the client waits at least as long as the gateway may.
