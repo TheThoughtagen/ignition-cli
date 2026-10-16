@@ -112,6 +112,12 @@ pub fn confirmation_prose(plan: &DeployPlanResult) -> String {
     out
 }
 
+/// `--allow-drift` needs a non-empty reason of at most
+/// [`DRIFT_REASON_MAX_CHARS`] characters and no control characters.
+pub fn validate_drift_reason(_reason: &str) -> Result<(), CoreError> {
+    Ok(())
+}
+
 /// `--plan-sha256` must be 64 lowercase hex characters.
 pub fn validate_plan_sha256(value: &str) -> Result<(), CoreError> {
     let ok = value.len() == 64
@@ -131,7 +137,87 @@ pub fn validate_plan_sha256(value: &str) -> Result<(), CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_plan_sha256;
+    use super::{
+        DRIFT_REASON_MAX_CHARS, GateFlags, GateOutcome, confirmation_prose, evaluate_gates,
+        validate_drift_reason, validate_plan_sha256,
+    };
+    use crate::actions::deploy::DeployPlanResult;
+    use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus, PlanSummary};
+    use crate::deploy::transport::DeleteSet;
+
+    const HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+    fn entry(key: &str, status: PlanStatus) -> PlanEntry {
+        PlanEntry {
+            key: key.to_string(),
+            module: "ignition".to_string(),
+            ty: "database-translator".to_string(),
+            name: None,
+            status,
+            live_in: Vec::new(),
+            core: CoreRelation::None,
+            destructive: false,
+            destructive_reason: None,
+            lockout_risk: false,
+            drift: None,
+            files: Vec::new(),
+            diff: None,
+        }
+    }
+
+    fn plan_of(entries: Vec<PlanEntry>) -> DeployPlanResult {
+        let mut summary = PlanSummary::default();
+        for e in &entries {
+            match e.status {
+                PlanStatus::Added => summary.added += 1,
+                PlanStatus::Changed => summary.changed += 1,
+                PlanStatus::Removed => summary.removed += 1,
+                PlanStatus::Same => summary.same += 1,
+                PlanStatus::Unmanaged => summary.unmanaged += 1,
+            }
+        }
+        summary.has_changes = summary.added + summary.changed + summary.removed > 0;
+        DeployPlanResult {
+            env: "prod".to_string(),
+            gateway: "gw".to_string(),
+            mode: "production".to_string(),
+            node: "master".to_string(),
+            transport: "local".to_string(),
+            render_sha256: "0".repeat(64),
+            plan_sha256: HASH.to_string(),
+            summary,
+            entries,
+            delete_set: DeleteSet::default(),
+            base: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn destructive(key: &str) -> PlanEntry {
+        let mut e = entry(key, PlanStatus::Removed);
+        e.destructive = true;
+        e.destructive_reason = Some("removes a resource".to_string());
+        e
+    }
+
+    fn drifted(key: &str) -> PlanEntry {
+        let mut e = entry(key, PlanStatus::Changed);
+        e.drift = Some(true);
+        e
+    }
+
+    fn flags(destructive: bool, drift: Option<&str>) -> GateFlags {
+        GateFlags {
+            plan_sha256: None,
+            allow_destructive: destructive,
+            allow_drift: drift.map(str::to_string),
+        }
+    }
+
+    fn refusal(plan: &DeployPlanResult, flags: &GateFlags) -> (String, u8, String) {
+        let err = evaluate_gates(plan, flags).expect_err("the gates refuse");
+        (err.code().to_string(), err.exit_code(), err.to_string())
+    }
 
     #[test]
     fn plan_sha256_accepts_64_lowercase_hex() {
@@ -152,5 +238,199 @@ mod tests {
             assert_eq!(err.code(), "invalid_input", "{bad:?}");
             assert_eq!(err.exit_code(), 2);
         }
+    }
+
+    #[test]
+    fn order_stale_beats_noop() {
+        let plan = plan_of(vec![entry("ignition/a/x", PlanStatus::Same)]);
+        let mut f = flags(false, None);
+        f.plan_sha256 = Some("1".repeat(64));
+        let (code, exit, _) = refusal(&plan, &f);
+        assert_eq!((code.as_str(), exit), ("plan_stale", 6));
+    }
+
+    #[test]
+    fn order_stale_beats_the_destructive_gate() {
+        let plan = plan_of(vec![destructive("ignition/a/x")]);
+        let mut f = flags(false, None);
+        f.plan_sha256 = Some("1".repeat(64));
+        assert_eq!(refusal(&plan, &f).0, "plan_stale");
+    }
+
+    #[test]
+    fn order_empty_plan_is_noop() {
+        let plan = plan_of(vec![
+            entry("ignition/a/x", PlanStatus::Same),
+            entry("ignition/a/y", PlanStatus::Unmanaged),
+        ]);
+        assert_eq!(
+            evaluate_gates(&plan, &flags(false, None)).expect("noop"),
+            GateOutcome::Noop
+        );
+        let mut matching = flags(false, None);
+        matching.plan_sha256 = Some(HASH.to_string());
+        assert_eq!(
+            evaluate_gates(&plan, &matching).expect("noop with its own hash"),
+            GateOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn order_shadows_removal_blocks_even_with_both_flags() {
+        let mut shadowed = destructive("ignition/a/x");
+        shadowed.core = CoreRelation::ShadowsRemoval;
+        let plan = plan_of(vec![shadowed, entry("ignition/a/y", PlanStatus::Added)]);
+        let (code, exit, shown) = refusal(&plan, &flags(true, Some("reviewed drift")));
+        assert_eq!((code.as_str(), exit), ("deploy_blocked", 6));
+        assert!(shown.contains("ignition/a/x"), "{shown}");
+        assert!(!shown.contains("ignition/a/y"), "{shown}");
+    }
+
+    #[test]
+    fn order_shadows_removal_beats_the_destructive_gate() {
+        let mut shadowed = destructive("ignition/a/x");
+        shadowed.core = CoreRelation::ShadowsRemoval;
+        let plan = plan_of(vec![shadowed]);
+        assert_eq!(refusal(&plan, &flags(false, None)).0, "deploy_blocked");
+    }
+
+    #[test]
+    fn order_destructive_without_the_flag_is_refused() {
+        let plan = plan_of(vec![destructive("ignition/a/x")]);
+        let (code, exit, shown) = refusal(&plan, &flags(false, None));
+        assert_eq!((code.as_str(), exit), ("destructive_change_refused", 2));
+        assert!(shown.contains("destructive"), "{shown}");
+        assert!(shown.contains("ignition/a/x"), "{shown}");
+    }
+
+    #[test]
+    fn order_drift_without_the_reason_is_refused() {
+        let plan = plan_of(vec![drifted("ignition/a/x")]);
+        let (code, exit, shown) = refusal(&plan, &flags(true, None));
+        assert_eq!((code.as_str(), exit), ("destructive_change_refused", 2));
+        assert!(shown.contains("drift"), "{shown}");
+        assert!(shown.contains("ignition/a/x"), "{shown}");
+    }
+
+    #[test]
+    fn order_destructive_is_judged_before_drift() {
+        let plan = plan_of(vec![drifted("ignition/a/d"), destructive("ignition/a/x")]);
+        let (_, _, shown) = refusal(&plan, &flags(false, None));
+        assert!(shown.contains("ignition/a/x"), "{shown}");
+        assert!(!shown.contains("ignition/a/d"), "{shown}");
+        let (_, _, shown) = refusal(&plan, &flags(true, None));
+        assert!(shown.contains("ignition/a/d"), "{shown}");
+    }
+
+    #[test]
+    fn order_both_flags_make_it_ready() {
+        let plan = plan_of(vec![destructive("ignition/a/x"), drifted("ignition/a/y")]);
+        let outcome = evaluate_gates(&plan, &flags(true, Some("reviewed on the gateway")))
+            .expect("both flags");
+        assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn unmanaged_entries_never_gate() {
+        let mut odd = entry("ignition/a/u", PlanStatus::Unmanaged);
+        odd.destructive = true;
+        odd.drift = Some(true);
+        odd.core = CoreRelation::ShadowsRemoval;
+        let plan = plan_of(vec![odd, entry("ignition/a/x", PlanStatus::Added)]);
+        let outcome = evaluate_gates(&plan, &flags(false, None)).expect("ready");
+        assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn drift_none_and_false_never_gate() {
+        let mut no_drift = entry("ignition/a/x", PlanStatus::Changed);
+        no_drift.drift = Some(false);
+        let plan = plan_of(vec![no_drift, entry("ignition/a/y", PlanStatus::Added)]);
+        let outcome = evaluate_gates(&plan, &flags(false, None)).expect("ready");
+        assert!(matches!(outcome, GateOutcome::Ready { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn refusal_keys_are_byte_sorted_and_capped_at_ten() {
+        let mut entries: Vec<PlanEntry> = (0..12)
+            .rev()
+            .map(|i| destructive(&format!("ignition/a/k{i:02}")))
+            .collect();
+        entries.push(entry("ignition/a/zz", PlanStatus::Added));
+        let plan = plan_of(entries);
+        let (_, _, shown) = refusal(&plan, &flags(false, None));
+        assert!(shown.contains("12"), "{shown}");
+        assert!(shown.contains("and 2 more"), "{shown}");
+        let first = shown.find("ignition/a/k00").expect("k00 shown");
+        let tenth = shown.find("ignition/a/k09").expect("k09 shown");
+        assert!(first < tenth, "{shown}");
+        assert!(!shown.contains("ignition/a/k10"), "{shown}");
+        assert!(!shown.contains("ignition/a/zz"), "{shown}");
+    }
+
+    #[test]
+    fn a_malformed_review_hash_is_invalid_input_not_stale() {
+        let plan = plan_of(vec![entry("ignition/a/x", PlanStatus::Added)]);
+        let mut f = flags(false, None);
+        f.plan_sha256 = Some("NOT-A-HASH".to_string());
+        let (code, exit, _) = refusal(&plan, &f);
+        assert_eq!((code.as_str(), exit), ("invalid_input", 2));
+    }
+
+    #[test]
+    fn drift_reason_is_validated_on_every_evaluation() {
+        let plan = plan_of(vec![entry("ignition/a/x", PlanStatus::Added)]);
+        for bad in ["", "two\nlines", "nul\0byte"] {
+            let (code, exit, _) = refusal(&plan, &flags(false, Some(bad)));
+            assert_eq!((code.as_str(), exit), ("invalid_input", 2), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn drift_reason_rules() {
+        assert!(validate_drift_reason(&"r".repeat(200)).is_ok());
+        assert!(validate_drift_reason(&"r".repeat(DRIFT_REASON_MAX_CHARS)).is_ok());
+        for bad in [
+            String::new(),
+            "r".repeat(DRIFT_REASON_MAX_CHARS + 1),
+            "a\nb".to_string(),
+            "a\rb".to_string(),
+            "a\0b".to_string(),
+            "a\u{1b}[31mb".to_string(),
+        ] {
+            let err = validate_drift_reason(&bad).expect_err(&bad);
+            assert_eq!(err.code(), "invalid_input", "{bad:?}");
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn drift_reason_length_counts_characters_not_bytes() {
+        assert!(validate_drift_reason(&"\u{e9}".repeat(DRIFT_REASON_MAX_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn prose_is_stable_and_carries_no_content() {
+        let mut d = destructive("ignition/a/x");
+        d.diff = Some("SECRET-DIFF-BYTES".to_string());
+        let plan = plan_of(vec![
+            entry("ignition/a/y", PlanStatus::Added),
+            d,
+            entry("ignition/a/s", PlanStatus::Same),
+        ]);
+        let one = confirmation_prose(&plan);
+        assert_eq!(one, confirmation_prose(&plan));
+        assert!(one.contains(HASH), "{one}");
+        assert!(one.contains("prod") && one.contains("gw") && one.contains("production"));
+        assert!(
+            one.contains("ignition/a/y") && one.contains("ignition/a/x"),
+            "{one}"
+        );
+        assert!(
+            !one.contains("ignition/a/s"),
+            "same entries are not listed: {one}"
+        );
+        assert!(!one.contains("SECRET-DIFF-BYTES"), "{one}");
+        assert!(one.contains("--yes"), "{one}");
     }
 }
