@@ -12,7 +12,7 @@
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale` (23-02)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -837,6 +837,20 @@ pub enum CoreError {
         /// What is wrong; names fields and listed paths, never file content.
         problem: String,
     },
+
+    /// The plan the caller reviewed is no longer the plan (23-02, DAPL-02):
+    /// `--plan-sha256` differs from the recomputed `plan_sha256`, or the
+    /// on-box pre-image changed under the scan lock. Exit 6 - target_state
+    /// class: the gateway moved since the review. Carries hashes only.
+    #[error("plan changed since review: expected plan_sha256 {expected}, now {actual} ({detail})")]
+    PlanStale {
+        /// The `plan_sha256` the caller reviewed.
+        expected: String,
+        /// The `plan_sha256` of the plan as it is now.
+        actual: String,
+        /// Where the mismatch was found, e.g. `review hash`; no file content.
+        detail: String,
+    },
 }
 
 /// Findings shown inline by the deploy error Displays; the rest collapse
@@ -1070,6 +1084,7 @@ impl CoreError {
             Self::EmbeddedSecret(..) => "embedded_secret",
             Self::TransportFailed { .. } => "transport_failed",
             Self::DeployLedgerInvalid { .. } => "deploy_ledger_invalid",
+            Self::PlanStale { .. } => "plan_stale",
         }
     }
 
@@ -1128,7 +1143,8 @@ impl CoreError {
             | Self::ResourceSignatureRejected { .. }
             | Self::ResourceExists { .. }
             | Self::ModeExists { .. }
-            | Self::DeployLedgerInvalid { .. } => 6,
+            | Self::DeployLedgerInvalid { .. }
+            | Self::PlanStale { .. } => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1518,6 +1534,11 @@ impl CoreError {
                  restore the ledger file named above (only an apply writes it) and rerun"
                     .to_string(),
             ),
+            Self::PlanStale { .. } => Some(
+                "the plan changed after it was reviewed; review the new plan and rerun \
+                 with its plan_sha256, nothing was written"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1566,6 +1587,7 @@ impl CoreError {
         "embedded_secret",
         "transport_failed",
         "deploy_ledger_invalid",
+        "plan_stale",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -2134,6 +2156,15 @@ mod tests {
                 6,
                 "deploy_ledger_invalid",
             ),
+            (
+                CoreError::PlanStale {
+                    expected: "a".repeat(64),
+                    actual: "b".repeat(64),
+                    detail: "review hash".into(),
+                },
+                6,
+                "plan_stale",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2203,6 +2234,7 @@ mod tests {
         (6, "resource_exists"),
         (6, "mode_exists"),
         (6, "deploy_ledger_invalid"),
+        (6, "plan_stale"),
         (7, "rig_error"),
     ];
 
@@ -2931,6 +2963,14 @@ mod tests {
                 CoreError::DeployLedgerInvalid {
                     location: "ign-deploy/gw/dev/ledger.json".into(),
                     problem: "the file is empty".into(),
+                },
+                6,
+            ),
+            (
+                CoreError::PlanStale {
+                    expected: "a".repeat(64),
+                    actual: "b".repeat(64),
+                    detail: "review hash".into(),
                 },
                 6,
             ),

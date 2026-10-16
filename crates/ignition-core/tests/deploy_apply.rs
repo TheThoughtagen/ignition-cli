@@ -7,6 +7,7 @@ mod common;
 use common::plan_fixture::PlanFixture;
 use ignition_core::actions::deploy::{DeployPlanResult, PlanOptions, deploy_plan};
 use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
+use ignition_core::error::CoreError;
 
 const DB_CONFIG: &str = "ignition/database-translator/POSTGRES/config.json";
 const DB_UNIT: &str = "ignition/database-translator/POSTGRES";
@@ -38,6 +39,7 @@ async fn gates_stale_hash_refuses_over_a_real_plan() {
     let err = evaluate_gates(&plan, &with_hash(&zeros)).expect_err("a stale hash refuses");
     assert_eq!(err.code(), "plan_stale", "{err}");
     assert_eq!(err.exit_code(), 6);
+    assert!(matches!(err, CoreError::PlanStale { .. }), "{err:?}");
     let shown = err.to_string();
     assert!(shown.contains(&zeros), "expected hash in {shown}");
     assert!(shown.contains(&plan.plan_sha256), "actual hash in {shown}");
