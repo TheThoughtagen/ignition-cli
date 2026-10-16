@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
+
+use tokio::sync::Notify;
 
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::host::{ApplyHost, BatchReport, BatchSpec, DeleteOp, WriteOp};
@@ -1139,6 +1142,47 @@ async fn fail_restore_at_reports_the_index() {
     let restored = clean.restore(&record).await.expect("restore");
     assert!(restored.failure.is_none(), "{restored:?}");
     assert_eq!(c.listing(), before, "the second restore finishes the job");
+}
+
+/// A commit that hangs after its first move is an await point a test can
+/// abort. What is left on disk is what a `kill -9` there leaves: the journal
+/// at `writing`, one file moved, nothing else changed.
+#[tokio::test]
+async fn hang_after_move_can_be_aborted() {
+    let c = Ctx::local();
+    let batch = three_writes(&c);
+    let before = c.listing();
+    let notify = Arc::new(Notify::new());
+    let host = Arc::new(
+        c.clean_host()
+            .with_apply_fault(ApplyFault::HangAfterMove(1, notify.clone())),
+    );
+    let prepared = host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let task = tokio::spawn({
+        let host = host.clone();
+        async move { host.commit(&prepared).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), notify.notified())
+        .await
+        .expect("the commit reached the hang");
+    task.abort();
+    assert!(task.await.expect_err("aborted").is_cancelled());
+
+    assert_eq!(c.journal().expect("journal").phase, JournalPhase::Writing);
+    let after = c.listing();
+    assert_eq!(after.get(FILE_A), Some(&sha256_hex(b"new a")), "one moved");
+    assert_eq!(after.get(FILE_B), Some(&sha256_hex(b"old b")));
+    assert_eq!(after.get(FILE_C), None);
+    assert!(c.snapshot_dir(RUN).join("record.json").is_file());
+
+    // Recovery from the aborted run is a restore.
+    let record = c.record(RUN).expect("record.json");
+    let restored = c.clean_host().restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before);
 }
 
 /// Every row has a test above, so adding a row without wiring it fails here.

@@ -80,6 +80,11 @@ pub enum ApplyFault {
     FailMoveAt(usize),
     /// The restore of this index (into the record's touched entries) fails.
     FailRestoreAt(usize),
+    /// After this many writes have moved, `commit` signals the `Notify` and
+    /// then waits forever at an await point, so a test can abort the task.
+    /// The engine keeps no `Drop`-based cleanup, so an abort is faithful to a
+    /// `kill -9`: the journal is on disk at `writing` and nothing else moved.
+    HangAfterMove(usize, std::sync::Arc<tokio::sync::Notify>),
 }
 
 /// What the apply half needs: the target gateway and mode.
