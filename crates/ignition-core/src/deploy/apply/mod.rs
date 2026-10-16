@@ -11,6 +11,7 @@
 
 pub mod fingerprint;
 pub mod gates;
+pub mod host;
 pub mod journal;
 pub mod record;
 pub mod run_store;

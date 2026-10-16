@@ -1708,8 +1708,7 @@ struct MirrorSetup {
     staging: StagingMode,
 }
 
-/// A `rename` refused with `Failure` is retried this many times (Windows).
-const RENAME_RETRIES: u32 = 3;
+use super::batch::RENAME_RETRIES;
 /// The pause before the first retry; it grows with each attempt.
 const RENAME_RETRY_PAUSE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(1)

@@ -33,7 +33,12 @@ use super::{
     copy_to_temp, mirror_mode_problem, read_staged_copy, validate_mirror_inputs,
     validate_mirror_paths, validate_staging_root,
 };
+use crate::deploy::apply::host::{
+    ApplyHost, BatchReport, BatchSpec, Prepared as ApplyPrepared, ProbeReport,
+};
 use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
+use crate::deploy::apply::record::RunRecord;
+use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
 use crate::deploy::ledger::{
@@ -54,6 +59,14 @@ pub struct LocalFsTransport {
     data_dir: PathBuf,
     label: String,
     mirror: Option<MirrorSetup>,
+    apply: Option<ApplySetup>,
+}
+
+/// What the apply half needs: the target gateway and mode.
+#[derive(Debug, Clone)]
+struct ApplySetup {
+    gateway: String,
+    mode: String,
 }
 
 /// What the write half needs: the mode collection and the staging mode.
@@ -91,7 +104,36 @@ impl LocalFsTransport {
             data_dir,
             label: label.into(),
             mirror: None,
+            apply: None,
         }
+    }
+
+    /// Bind the apply half ([`ApplyHost`]) to `gateway` and `mode`. Fails when
+    /// either is not a name a run may write under, so a misconfigured host
+    /// cannot be built.
+    pub fn with_apply(mut self, gateway: &str, mode: &str) -> Result<Self, String> {
+        if let Some(why) = component_problem(gateway) {
+            return Err(format!("the gateway {why}"));
+        }
+        if let Some(why) = mirror_mode_problem(mode) {
+            return Err(why);
+        }
+        self.apply = Some(ApplySetup {
+            gateway: gateway.to_string(),
+            mode: mode.to_string(),
+        });
+        Ok(self)
+    }
+
+    /// The error a not-yet-built `ApplyHost` method returns (23-04 Task 1).
+    fn not_built(&self, method: &str) -> CoreError {
+        let target = self
+            .apply
+            .as_ref()
+            .map_or("none".to_string(), |a| format!("{}/{}", a.gateway, a.mode));
+        CoreError::Internal(format!(
+            "ApplyHost::{method} is not implemented yet (target {target})"
+        ))
     }
 
     /// Bind the write half to the `mode` collection with `staging`. Fails
@@ -1450,6 +1492,56 @@ impl TreeMirror for LocalFsTransport {
         })
         .await
         .map_err(|e| CoreError::Internal(format!("local commit task failed: {e}")))?
+    }
+}
+
+#[async_trait::async_trait]
+impl ApplyHost for LocalFsTransport {
+    async fn probe(&self) -> Result<ProbeReport, CoreError> {
+        Err(self.not_built("probe"))
+    }
+
+    async fn prepare(
+        &self,
+        _spec: &BatchSpec,
+        _tree: &RenderedTree,
+    ) -> Result<ApplyPrepared, CoreError> {
+        Err(self.not_built("prepare"))
+    }
+
+    async fn commit(&self, _prepared: &ApplyPrepared) -> Result<BatchReport, CoreError> {
+        Err(self.not_built("commit"))
+    }
+
+    async fn restore(&self, _record: &RunRecord) -> Result<BatchReport, CoreError> {
+        Err(self.not_built("restore"))
+    }
+
+    async fn fingerprint(
+        &self,
+        _paths: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
+        Err(self.not_built("fingerprint"))
+    }
+
+    async fn finalize(&self, _record: &RunRecord) -> Result<(), CoreError> {
+        Err(self.not_built("finalize"))
+    }
+
+    async fn read_record(&self, _run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
+        Err(self.not_built("read_record"))
+    }
+
+    async fn fetch_snapshot(
+        &self,
+        _run_id: &RunId,
+        _dest: &Path,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        Err(self.not_built("fetch_snapshot"))
+    }
+
+    async fn discard_interrupted(&self, _run_id: &RunId) -> Result<(), CoreError> {
+        Err(self.not_built("discard_interrupted"))
     }
 }
 

@@ -30,6 +30,7 @@
 //! is cross-checked against a PowerShell enumeration ([`winps`]) before it is
 //! reported complete.
 
+pub mod batch;
 pub mod local;
 pub mod process;
 pub mod remote;
@@ -42,6 +43,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use super::apply::host::ApplyHost;
 use super::layout::{RelPath, TAG_TYPES};
 use super::manifest::Manifest;
 use super::rules::GATEWAY_OWNED_FILES;
@@ -414,6 +416,40 @@ pub fn mirror_for_node(
                 .with_mirror(mode, staging)
                 .map_err(|why| invalid(format!("{label}: {why}")))?,
         ),
+    })
+}
+
+/// The apply half ([`ApplyHost`](super::apply::host::ApplyHost)) for `node`'s
+/// `mode` collection, for the target `gateway`.
+///
+/// `local` builds the local-filesystem host. An `ssh` node is refused as
+/// `deploy_tree_invalid` naming the node: apply over ssh is not supported by
+/// this build yet (23-06 replaces the Linux arm and 23-20 the Windows arm; no
+/// verb exposes apply before 23-13, so the refusal is never user-visible).
+/// `gateway` and `mode` must be names a run may write under.
+pub fn apply_host_for_node(
+    repo: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+    gateway: &str,
+    mode: &str,
+) -> Result<Box<dyn ApplyHost>, CoreError> {
+    let invalid = |detail: String| CoreError::deploy_tree_invalid(target_file, None, None, detail);
+    if let Some(why) = mirror_mode_problem(mode) {
+        return Err(invalid(format!("{label}: {why}")));
+    }
+    Ok(match node_access(repo, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Box::new(
+            local::LocalFsTransport::new(data_dir, label)
+                .with_apply(gateway, mode)
+                .map_err(|why| invalid(format!("{label}: {why}")))?,
+        ),
+        NodeAccess::Ssh { .. } => {
+            return Err(invalid(format!(
+                "{label}: apply over ssh is not supported by this build"
+            )));
+        }
     })
 }
 
