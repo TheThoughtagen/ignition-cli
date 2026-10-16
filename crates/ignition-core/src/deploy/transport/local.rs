@@ -127,17 +127,6 @@ impl LocalFsTransport {
         Ok(self)
     }
 
-    /// The error a not-yet-built `ApplyHost` method returns (23-04 Task 1).
-    fn not_built(&self, method: &str) -> CoreError {
-        let target = self
-            .apply
-            .as_ref()
-            .map_or("none".to_string(), |a| format!("{}/{}", a.gateway, a.mode));
-        CoreError::Internal(format!(
-            "ApplyHost::{method} is not implemented yet (target {target})"
-        ))
-    }
-
     /// Run `work` on a blocking thread.
     async fn run_blocking<T: Send + 'static>(
         &self,
@@ -1511,7 +1500,7 @@ impl TreeMirror for LocalFsTransport {
 #[async_trait::async_trait]
 impl ApplyHost for LocalFsTransport {
     async fn probe(&self) -> Result<ProbeReport, CoreError> {
-        Err(self.not_built("probe"))
+        self.run_blocking(|this| this.probe_blocking()).await
     }
 
     async fn prepare(
@@ -1538,29 +1527,39 @@ impl ApplyHost for LocalFsTransport {
 
     async fn fingerprint(
         &self,
-        _paths: &[String],
+        paths: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
-        Err(self.not_built("fingerprint"))
+        let paths = paths.to_vec();
+        self.run_blocking(move |this| this.fingerprint_blocking(&paths))
+            .await
     }
 
-    async fn finalize(&self, _record: &RunRecord) -> Result<(), CoreError> {
-        Err(self.not_built("finalize"))
+    async fn finalize(&self, record: &RunRecord) -> Result<(), CoreError> {
+        let record = record.clone();
+        self.run_blocking(move |this| this.finalize_blocking(&record))
+            .await
     }
 
-    async fn read_record(&self, _run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
-        Err(self.not_built("read_record"))
+    async fn read_record(&self, run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
+        let run_id = run_id.clone();
+        self.run_blocking(move |this| this.read_record_blocking(&run_id))
+            .await
     }
 
     async fn fetch_snapshot(
         &self,
-        _run_id: &RunId,
-        _dest: &Path,
+        run_id: &RunId,
+        dest: &Path,
     ) -> Result<BTreeMap<String, String>, CoreError> {
-        Err(self.not_built("fetch_snapshot"))
+        let (run_id, dest) = (run_id.clone(), dest.to_path_buf());
+        self.run_blocking(move |this| this.fetch_snapshot_blocking(&run_id, &dest))
+            .await
     }
 
-    async fn discard_interrupted(&self, _run_id: &RunId) -> Result<(), CoreError> {
-        Err(self.not_built("discard_interrupted"))
+    async fn discard_interrupted(&self, run_id: &RunId) -> Result<(), CoreError> {
+        let run_id = run_id.clone();
+        self.run_blocking(move |this| this.discard_blocking(&run_id))
+            .await
     }
 }
 

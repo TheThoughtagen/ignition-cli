@@ -373,7 +373,6 @@ mod unix {
         }
 
         /// Whether this process may write into the directory (`access(2)`).
-        #[allow(dead_code)] // used by probe, which lands with the other six methods
         pub(in crate::deploy::transport) fn writable(&self) -> bool {
             rustix::fs::accessat(
                 &self.fd,
@@ -656,7 +655,6 @@ mod portable {
             Ok(())
         }
 
-        #[allow(dead_code)] // used by probe, which lands with the other six methods
         pub(in crate::deploy::transport) fn writable(&self) -> bool {
             std::fs::metadata(&self.path)
                 .map(|m| !m.permissions().readonly())

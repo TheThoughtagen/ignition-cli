@@ -344,7 +344,7 @@ fn tree_names(dir: &Path) -> Vec<String> {
 async fn fingerprint_is_read_only(c: &Ctx) {
     c.seed(FILE_A, b"one");
     c.seed(FILE_B, b"two");
-    let before = (c.listing(), tree_names(&c.root().to_path_buf()));
+    let before = (c.listing(), tree_names(c.root()));
     let paths = vec![
         FILE_A.to_string(),
         "ignition/tag-provider/default/absent.json".to_string(),
@@ -357,7 +357,7 @@ async fn fingerprint_is_read_only(c: &Ctx) {
         Some(&None)
     );
     assert_eq!(got.get(LEDGER_KEY), Some(&None), "no ledger yet");
-    assert_eq!((c.listing(), tree_names(&c.root().to_path_buf())), before);
+    assert_eq!((c.listing(), tree_names(c.root())), before);
 
     // A directory where a file should be is an error, never `None`.
     let err = c

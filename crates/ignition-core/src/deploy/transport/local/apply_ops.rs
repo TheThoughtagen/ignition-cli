@@ -17,25 +17,35 @@
 //! Nothing here writes a temp, backup or dot-named entry inside the
 //! collection.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
 use super::{ApplySetup, LocalFsTransport};
 use crate::deploy::apply::fingerprint::LEDGER_KEY;
 use crate::deploy::apply::host::{
-    BatchReport, BatchSpec, PRERENDERED_PHASES, Prepared, restoring_journal,
+    BatchReport, BatchSpec, PRERENDERED_PHASES, Prepared, ProbeReport, restoring_journal,
 };
 use crate::deploy::apply::journal::{JOURNAL_FILE, JOURNAL_MAX_BYTES, Journal, JournalPhase};
 use crate::deploy::apply::record::{RECORD_FILE, RECORD_MAX_BYTES, RecordState, RunRecord};
+use crate::deploy::apply::run_store::RunId;
+use crate::deploy::component_problem;
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{
-    LEDGER_FILE, LEDGER_MAX_BYTES, LedgerRoot, journal_location, staging_rel,
+    LEDGER_FILE, LEDGER_MAX_BYTES, LedgerRoot, journal_location, location_of, record_rel,
+    staging_rel,
 };
 use crate::deploy::transport::batch::{
     RENAME_RETRIES, WORK_FILE, WorkList, WorkOp, journal_file, record_file,
 };
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind, Visibility, shown};
-use crate::deploy::transport::{MIRROR_MIN_COMPONENTS, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES};
+use crate::deploy::transport::{
+    MIRROR_MIN_COMPONENTS, READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES,
+    mirror_path_problem,
+};
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::CoreError;
-use std::collections::{BTreeMap, BTreeSet};
 
 /// The largest work list read back (64 MiB).
 const WORK_MAX_BYTES: u64 = 67_108_864;
@@ -212,6 +222,60 @@ impl LocalFsTransport {
                 other => return other,
             }
         }
+    }
+
+    // ---- probe -----------------------------------------------------------
+
+    pub(super) fn probe_blocking(&self) -> Result<ProbeReport, CoreError> {
+        const OP: &str = "probe";
+        let setup = self.apply_cfg(OP)?;
+        let root = self.data_root(OP)?;
+        let mut problems = Vec::new();
+        match root.open(&["config", "resources"]) {
+            Ok(resources) => match resources.open(&[setup.mode.as_str()]) {
+                Ok(coll) => {
+                    if !coll.writable() {
+                        problems.push("the mode collection is not writable".to_string());
+                    }
+                }
+                Err(FsError::Missing) => {
+                    if !resources.writable() {
+                        problems.push(
+                            "config/resources is not writable, so the mode collection cannot be created"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(e) => problems.push(format!(
+                    "the mode collection cannot be used: {}",
+                    e.describe()
+                )),
+            },
+            Err(e) => problems.push(format!("config/resources cannot be used: {}", e.describe())),
+        }
+        match root.ensure(&["ign-deploy", &setup.gateway, &setup.mode]) {
+            Ok(dir) => {
+                let name = format!("probe-{}.tmp", std::process::id());
+                let _ = dir.unlink(&[&name]);
+                match dir.create_new(&[&name], b"", Visibility::Private) {
+                    Ok(()) => {
+                        let _ = dir.unlink(&[&name]);
+                    }
+                    Err(e) => problems.push(format!(
+                        "the ign-deploy directory is not writable: {}",
+                        e.describe()
+                    )),
+                }
+            }
+            Err(e) => problems.push(format!(
+                "the ign-deploy directory cannot be created or opened: {}",
+                e.describe()
+            )),
+        }
+        Ok(ProbeReport {
+            writable: problems.is_empty(),
+            problems,
+        })
     }
 
     // ---- prepare ---------------------------------------------------------
@@ -1021,6 +1085,246 @@ impl LocalFsTransport {
             _ => Err("the restored file does not match its recorded hash".to_string()),
         }
     }
+
+    // ---- fingerprint -----------------------------------------------------
+
+    pub(super) fn fingerprint_blocking(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
+        const OP: &str = "fingerprint";
+        let setup = self.apply_cfg(OP)?;
+        let lay = Layout::new(setup, "-");
+        let root = self.data_root(OP)?;
+        let coll = self.collection(OP, &root, &lay.mode, false)?;
+        let mut out = BTreeMap::new();
+        for path in paths {
+            let hash = if path == LEDGER_KEY {
+                match self.live_ledger(OP, &root, &lay)? {
+                    Live::Absent => None,
+                    Live::Hash(h) => Some(h),
+                    Live::Unsafe => {
+                        return Err(self.mirror_fail(OP, "the ledger is not a regular file"));
+                    }
+                }
+            } else {
+                let rel = RelPath::new(path).map_err(|why| self.mirror_fail(OP, why))?;
+                if let Some(why) = mirror_path_problem(&rel) {
+                    return Err(self.mirror_fail(OP, why));
+                }
+                match self.live_file(OP, coll.as_ref(), &rel)? {
+                    Live::Absent => None,
+                    Live::Hash(h) => Some(h),
+                    Live::Unsafe => {
+                        return Err(self.mirror_fail(OP, format!("{rel} is not a regular file")));
+                    }
+                }
+            };
+            out.insert(path.clone(), hash);
+        }
+        Ok(out)
+    }
+
+    // ---- finalize, read_record, discard ----------------------------------
+
+    pub(super) fn finalize_blocking(&self, record: &RunRecord) -> Result<(), CoreError> {
+        const OP: &str = "finalize";
+        let setup = self.apply_cfg(OP)?;
+        if record.gateway != setup.gateway || record.mode != setup.mode {
+            return Err(self.mirror_fail(
+                OP,
+                "the record names a different gateway or mode than this host",
+            ));
+        }
+        RunId::parse(&record.run_id)?;
+        RunRecord::parse(
+            "record",
+            &record.to_bytes(),
+            &lay_gateway(setup),
+            &lay_mode(setup),
+        )?;
+        let lay = Layout::new(setup, &record.run_id);
+        if let Some(existing) = self.read_journal_blocking(&lay.gateway, &lay.mode)? {
+            let theirs = Journal::parse(
+                &journal_location(LedgerRoot::DataDir, &lay.gateway, &lay.mode),
+                &existing,
+                &lay.gateway,
+                &lay.mode,
+            )?;
+            if theirs.run_id != lay.run {
+                return Err(self.journal_present(&lay, &existing));
+            }
+        }
+        let root = self.data_root(OP)?;
+        root.replace(&lay.snapshot(&[RECORD_FILE]), &record.to_bytes())
+            .map_err(|e| self.fs_fail(OP, "installing the run record", &e))?;
+        match root.unlink(&lay.journal()) {
+            Ok(()) | Err(FsError::Missing) => {}
+            Err(e) => return Err(self.fs_fail(OP, "removing the journal", &e)),
+        }
+        root.remove_tree(&lay.stage(&[]))
+            .map_err(|e| self.fs_fail(OP, "removing the staging directory", &e))
+    }
+
+    pub(super) fn read_record_blocking(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<RunRecord>, CoreError> {
+        const OP: &str = "read_record";
+        let setup = self.apply_cfg(OP)?;
+        let lay = Layout::new(setup, run_id.as_str());
+        let location = location_of(
+            LedgerRoot::DataDir,
+            &record_rel(&lay.gateway, &lay.mode, &lay.run),
+        );
+        let invalid = |problem: String| CoreError::DeployRunInvalid {
+            run_id: lay.run.clone(),
+            problem: format!("{location}: {problem}"),
+        };
+        let root = Dir::root(&self.data_dir).map_err(|e| self.fs_fail(OP, "data_dir", &e))?;
+        let bytes = match root.read(&lay.snapshot(&[RECORD_FILE]), RECORD_MAX_BYTES as u64) {
+            Ok(None) => return Ok(None),
+            Ok(Some(bytes)) => bytes,
+            Err(e) => return Err(invalid(e.describe())),
+        };
+        let record = RunRecord::parse(&location, &bytes, &lay.gateway, &lay.mode)?;
+        if record.run_id != lay.run {
+            return Err(invalid("the record names a different run".to_string()));
+        }
+        Ok(Some(record))
+    }
+
+    pub(super) fn discard_blocking(&self, run_id: &RunId) -> Result<(), CoreError> {
+        const OP: &str = "discard";
+        let setup = self.apply_cfg(OP)?;
+        let lay = Layout::new(setup, run_id.as_str());
+        let root = self.data_root(OP)?;
+        let mut has_journal = false;
+        if let Some(existing) = self.read_journal_blocking(&lay.gateway, &lay.mode)? {
+            let journal = Journal::parse(
+                &journal_location(LedgerRoot::DataDir, &lay.gateway, &lay.mode),
+                &existing,
+                &lay.gateway,
+                &lay.mode,
+            )?;
+            if journal.run_id != lay.run {
+                return Err(self.journal_present(&lay, &existing));
+            }
+            if !journal.phase.before_first_move() {
+                return Err(CoreError::DeployRunInvalid {
+                    run_id: lay.run.clone(),
+                    problem: "the run may have moved files; restore it instead of discarding it"
+                        .to_string(),
+                });
+            }
+            has_journal = true;
+        }
+        root.remove_tree(&lay.snapshot(&[]))
+            .map_err(|e| self.fs_fail(OP, "removing the snapshot", &e))?;
+        root.remove_tree(&lay.stage(&[]))
+            .map_err(|e| self.fs_fail(OP, "removing the staging directory", &e))?;
+        if has_journal {
+            match root.unlink(&lay.journal()) {
+                Ok(()) | Err(FsError::Missing) => {}
+                Err(e) => return Err(self.fs_fail(OP, "removing the journal", &e)),
+            }
+        }
+        Ok(())
+    }
+
+    // ---- fetch_snapshot --------------------------------------------------
+
+    pub(super) fn fetch_snapshot_blocking(
+        &self,
+        run_id: &RunId,
+        dest: &Path,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        const OP: &str = "fetch_snapshot";
+        let setup = self.apply_cfg(OP)?;
+        let lay = Layout::new(setup, run_id.as_str());
+        let root = self.data_root(OP)?;
+        let snapshot = root.open(&lay.snapshot(&[])).map_err(|e| match e {
+            FsError::Missing => {
+                self.mirror_fail(OP, format!("run {} has no snapshot on this host", lay.run))
+            }
+            other => self.fs_fail(OP, "the snapshot directory", &other),
+        })?;
+        let out_dir = dest.join("snapshot");
+        std::fs::create_dir(&out_dir).map_err(|e| {
+            self.mirror_fail(
+                OP,
+                format!("cannot create the snapshot copy directory ({})", e.kind()),
+            )
+        })?;
+        let mut hashes = BTreeMap::new();
+        let mut budget = (0usize, 0u64);
+        self.copy_snapshot_dir(OP, &snapshot, &[], &out_dir, "", &mut hashes, &mut budget)?;
+        Ok(hashes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_snapshot_dir(
+        &self,
+        op: &str,
+        dir: &Dir,
+        parts: &[&str],
+        out: &Path,
+        prefix: &str,
+        hashes: &mut BTreeMap<String, String>,
+        budget: &mut (usize, u64),
+    ) -> Result<(), CoreError> {
+        for (name, kind) in dir
+            .list(parts)
+            .map_err(|e| self.fs_fail(op, "listing the snapshot", &e))?
+        {
+            if let Some(why) = component_problem(&name) {
+                return Err(self.mirror_fail(op, format!("a snapshot entry name {why}")));
+            }
+            budget.0 += 1;
+            if budget.0 > READ_MAX_ENTRIES {
+                return Err(self.mirror_fail(op, "the snapshot has too many entries"));
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let mut child: Vec<&str> = parts.to_vec();
+            child.push(&name);
+            match kind {
+                Kind::Dir => {
+                    let target = out.join(&name);
+                    std::fs::create_dir(&target).map_err(|e| {
+                        self.mirror_fail(op, format!("cannot create {rel} ({})", e.kind()))
+                    })?;
+                    self.copy_snapshot_dir(op, dir, &child, &target, &rel, hashes, budget)?;
+                }
+                Kind::File => {
+                    let bytes = dir
+                        .read(&child, READ_MAX_FILE_BYTES)
+                        .map_err(|e| self.fs_fail(op, &format!("reading {rel}"), &e))?
+                        .ok_or_else(|| {
+                            self.mirror_fail(op, format!("{rel} vanished while it was copied"))
+                        })?;
+                    budget.1 = budget.1.saturating_add(bytes.len() as u64);
+                    if budget.1 > READ_MAX_TOTAL_BYTES {
+                        return Err(self.mirror_fail(op, "the snapshot exceeds the total size cap"));
+                    }
+                    write_private(&out.join(&name), &bytes).map_err(|e| {
+                        self.mirror_fail(op, format!("cannot write {rel} ({})", e.kind()))
+                    })?;
+                    hashes.insert(rel, format!("{:x}", Sha256::digest(&bytes)));
+                }
+                _ => {
+                    return Err(self.mirror_fail(
+                        op,
+                        format!("{rel} in the snapshot is not a regular file or directory"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What `restore_one` did.
@@ -1037,4 +1341,25 @@ fn phase_key(phase: JournalPhase) -> &'static str {
         JournalPhase::Written => "written",
         JournalPhase::Restoring => "restoring",
     }
+}
+
+fn lay_gateway(setup: &ApplySetup) -> String {
+    setup.gateway.clone()
+}
+
+fn lay_mode(setup: &ApplySetup) -> String {
+    setup.mode.clone()
+}
+
+/// Create `path` (which must not exist) owner-only and write `bytes`.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
