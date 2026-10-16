@@ -43,7 +43,15 @@ macro_rules! row {
 
 /// Every row. A host passes when each one passes against it.
 pub fn scenarios() -> Vec<Scenario> {
-    vec![row!(add_one_file)]
+    vec![
+        row!(add_one_file),
+        row!(fingerprint_is_read_only),
+        row!(finalize_removes_journal_and_staging_keeps_snapshot),
+        row!(discard_interrupted_touches_no_collection_file),
+        row!(fetch_snapshot_copies_with_hashes),
+        row!(read_record_absent_is_none),
+        row!(probe_reports_writable_without_touching_the_collection),
+    ]
 }
 
 /// A host and the data directory it works on.
@@ -303,6 +311,281 @@ async fn add_one_file(c: &Ctx) {
     assert!(c.snapshot_dir(RUN).is_dir(), "the snapshot stays");
 }
 
+const FILE_B: &str = "ignition/tag-provider/default/other.json";
+
+/// Every entry of the collection, directories included, so a stray directory
+/// or temp file shows.
+fn tree_names(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read {
+            let path = entry.expect("entry").path();
+            out.push(
+                path.strip_prefix(base)
+                    .expect("prefix")
+                    .display()
+                    .to_string(),
+            );
+            if path.is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// `fingerprint` reports each path's live hash, `None` for an absent path and
+/// the ledger by its key, and changes nothing.
+async fn fingerprint_is_read_only(c: &Ctx) {
+    c.seed(FILE_A, b"one");
+    c.seed(FILE_B, b"two");
+    let before = (c.listing(), tree_names(&c.root().to_path_buf()));
+    let paths = vec![
+        FILE_A.to_string(),
+        "ignition/tag-provider/default/absent.json".to_string(),
+        LEDGER_KEY.to_string(),
+    ];
+    let got = c.host.fingerprint(&paths).await.expect("fingerprint");
+    assert_eq!(got.get(FILE_A), Some(&Some(sha256_hex(b"one"))));
+    assert_eq!(
+        got.get("ignition/tag-provider/default/absent.json"),
+        Some(&None)
+    );
+    assert_eq!(got.get(LEDGER_KEY), Some(&None), "no ledger yet");
+    assert_eq!((c.listing(), tree_names(&c.root().to_path_buf())), before);
+
+    // A directory where a file should be is an error, never `None`.
+    let err = c
+        .host
+        .fingerprint(&["ignition/tag-provider/default".to_string()])
+        .await
+        .expect_err("a two-component path is not a collection path");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    std::fs::create_dir_all(
+        c.collection()
+            .join("ignition/tag-provider/dirnamed/config.json"),
+    )
+    .expect("dir");
+    let err = c
+        .host
+        .fingerprint(&["ignition/tag-provider/dirnamed/config.json".to_string()])
+        .await
+        .expect_err("a directory is not a regular file");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+
+    // With a ledger on disk it is reported by its hash.
+    let ledger = ledger_bytes(RUN, &[FILE_A]);
+    std::fs::create_dir_all(c.deploy_dir()).expect("deploy dir");
+    std::fs::write(c.deploy_dir().join("ledger.json"), &ledger).expect("ledger");
+    let got = c
+        .host
+        .fingerprint(&[LEDGER_KEY.to_string()])
+        .await
+        .expect("fingerprint");
+    assert_eq!(got.get(LEDGER_KEY), Some(&Some(sha256_hex(&ledger))));
+}
+
+/// `finalize` installs the final record and removes the journal and this
+/// run's staging; the snapshot stays.
+async fn finalize_removes_journal_and_staging_keeps_snapshot(c: &Ctx) {
+    let ledger = ledger_bytes(RUN, &[FILE_A]);
+    let batch = c.batch(RUN, &[(FILE_A, b"x")], &[], Some(&ledger));
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written);
+    assert!(
+        c.staging_dir(RUN).is_dir(),
+        "staging exists before finalize"
+    );
+    assert!(c.journal().is_some());
+
+    let mut record = c.record(RUN).expect("record");
+    record.state = RecordState::Applied;
+    let post: BTreeMap<String, Option<String>> = record.post_map();
+    record.post_fingerprint = Some(fingerprint(&post));
+    c.host.finalize(&record).await.expect("finalize");
+
+    assert!(c.journal().is_none(), "the journal is gone");
+    assert!(
+        !c.staging_dir(RUN).exists(),
+        "the staging directory is gone"
+    );
+    assert!(c.snapshot_dir(RUN).is_dir(), "the snapshot stays");
+    assert_eq!(c.record(RUN).expect("record").state, RecordState::Applied);
+    assert!(
+        c.listing().contains_key(FILE_A),
+        "the collection is untouched"
+    );
+}
+
+/// `discard_interrupted` drops a run that never moved a file and touches
+/// nothing in the collection; it refuses a run that may have.
+async fn discard_interrupted_touches_no_collection_file(c: &Ctx) {
+    c.seed(FILE_A, b"live");
+    let ledger = ledger_bytes(RUN, &[FILE_A]);
+    let batch = c.batch(RUN, &[(FILE_A, b"new")], &[], Some(&ledger));
+    // An interrupted run before its first move: staged, journal at ready,
+    // snapshot started.
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    std::fs::copy(
+        c.staging_dir(RUN).join("journal.ready.json"),
+        c.deploy_dir().join("journal.json"),
+    )
+    .expect("journal");
+    std::fs::create_dir_all(c.snapshot_dir(RUN).join("files")).expect("snapshot");
+    let _ = prepared;
+    let before = (c.listing(), tree_names(&c.collection()));
+
+    c.host
+        .discard_interrupted(&batch.spec.run_id)
+        .await
+        .expect("discard");
+    assert!(c.journal().is_none());
+    assert!(!c.snapshot_dir(RUN).exists());
+    assert!(!c.staging_dir(RUN).exists());
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    assert_eq!(c.ledger_bytes(), None, "the ledger is not touched");
+
+    // A run whose journal says writing may have moved files: refused.
+    let batch = c.batch(RUN, &[(FILE_A, b"new")], &[], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written);
+    let err = c
+        .host
+        .discard_interrupted(&batch.spec.run_id)
+        .await
+        .expect_err("a written run is restored, not discarded");
+    assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    assert!(c.journal().is_some() && c.snapshot_dir(RUN).is_dir());
+}
+
+/// `fetch_snapshot` copies the snapshot to the runner with each file's hash,
+/// owner-only on unix.
+async fn fetch_snapshot_copies_with_hashes(c: &Ctx) {
+    c.seed(FILE_A, b"old a");
+    let prior = ledger_bytes("20261015T100000Z-bbbbbb", &[FILE_A]);
+    std::fs::create_dir_all(c.deploy_dir()).expect("deploy dir");
+    std::fs::write(c.deploy_dir().join("ledger.json"), &prior).expect("ledger");
+    let next = ledger_bytes(RUN, &[FILE_A, FILE_B]);
+    let batch = c.batch(
+        RUN,
+        &[(FILE_A, b"new a"), (FILE_B, b"new b")],
+        &[],
+        Some(&next),
+    );
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+
+    let dest = tempfile::tempdir().expect("dest");
+    let hashes = c
+        .host
+        .fetch_snapshot(&batch.spec.run_id, dest.path())
+        .await
+        .expect("fetch");
+    let copy = dest.path().join("snapshot");
+    let old = std::fs::read(copy.join("files").join(FILE_A)).expect("pre-image");
+    assert_eq!(old, b"old a");
+    assert_eq!(
+        std::fs::read(copy.join("ledger.json")).expect("ledger"),
+        prior
+    );
+    assert!(copy.join("record.json").is_file());
+    assert!(
+        !copy.join("files").join(FILE_B).exists(),
+        "a new file has no pre-image"
+    );
+    assert_eq!(
+        hashes.get(&format!("files/{FILE_A}")),
+        Some(&sha256_hex(b"old a"))
+    );
+    assert_eq!(hashes.get("ledger.json"), Some(&sha256_hex(&prior)));
+    assert!(hashes.contains_key("record.json"));
+    assert_eq!(hashes.len(), 3, "{hashes:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for rel in [
+            format!("files/{FILE_A}"),
+            "ledger.json".to_string(),
+            "record.json".to_string(),
+        ] {
+            let mode = std::fs::metadata(copy.join(&rel))
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{rel} is owner-only");
+        }
+    }
+}
+
+/// `read_record` is `None` for a run with no snapshot, and the record once
+/// commit wrote it.
+async fn read_record_absent_is_none(c: &Ctx) {
+    let run = RunId::parse(RUN).expect("run");
+    assert!(c.host.read_record(&run).await.expect("read").is_none());
+    let batch = c.batch(RUN, &[(FILE_A, b"x")], &[], None);
+    c.apply(&batch).await;
+    let record = c
+        .host
+        .read_record(&run)
+        .await
+        .expect("read")
+        .expect("record");
+    assert_eq!(record.run_id, RUN);
+    assert_eq!(record.state, RecordState::Applying);
+    let other = RunId::parse("20261016T100000Z-bbbbbb").expect("run");
+    assert!(c.host.read_record(&other).await.expect("read").is_none());
+}
+
+/// `probe` writes nothing into the collection, and an unwritable ign-deploy
+/// root is reported.
+async fn probe_reports_writable_without_touching_the_collection(c: &Ctx) {
+    c.seed(FILE_A, b"live");
+    let before = (c.listing(), tree_names(&c.collection()));
+    let report = c.host.probe().await.expect("probe");
+    assert!(report.writable, "{report:?}");
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!((c.listing(), tree_names(&c.collection())), before);
+    let leftovers: Vec<String> = tree_names(&c.deploy_dir());
+    assert!(
+        leftovers.is_empty(),
+        "the probe file is removed: {leftovers:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Root ignores directory modes, so the unwritable case needs a user.
+        if !rustix_is_root() {
+            let dir = c.deploy_dir();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+            let report = c.host.probe().await.expect("probe");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod back");
+            assert!(!report.writable, "{report:?}");
+            assert!(!report.problems.is_empty());
+            assert_eq!((c.listing(), tree_names(&c.collection())), before);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn rustix_is_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| o.stdout == b"0\n")
+        .unwrap_or(false)
+}
+
 // ---- the local host --------------------------------------------------------
 
 async fn run_local(name: &str) {
@@ -317,4 +600,48 @@ async fn run_local(name: &str) {
 #[tokio::test]
 async fn conformance_local_add_one_file() {
     run_local("add_one_file").await;
+}
+
+#[tokio::test]
+async fn conformance_local_fingerprint_is_read_only() {
+    run_local("fingerprint_is_read_only").await;
+}
+
+#[tokio::test]
+async fn conformance_local_finalize_removes_journal_and_staging_keeps_snapshot() {
+    run_local("finalize_removes_journal_and_staging_keeps_snapshot").await;
+}
+
+#[tokio::test]
+async fn conformance_local_discard_interrupted_touches_no_collection_file() {
+    run_local("discard_interrupted_touches_no_collection_file").await;
+}
+
+#[tokio::test]
+async fn conformance_local_fetch_snapshot_copies_with_hashes() {
+    run_local("fetch_snapshot_copies_with_hashes").await;
+}
+
+#[tokio::test]
+async fn conformance_local_read_record_absent_is_none() {
+    run_local("read_record_absent_is_none").await;
+}
+
+#[tokio::test]
+async fn conformance_local_probe_reports_writable_without_touching_the_collection() {
+    run_local("probe_reports_writable_without_touching_the_collection").await;
+}
+
+/// Every row has a test above, so adding a row without wiring it fails here.
+#[test]
+fn every_row_runs_against_the_local_host() {
+    let source = include_str!("deploy_host_conformance.rs");
+    for row in scenarios() {
+        let wired = format!("run_local(\"{}\")", row.name);
+        assert!(
+            source.contains(&wired),
+            "row {} is not run locally",
+            row.name
+        );
+    }
 }
