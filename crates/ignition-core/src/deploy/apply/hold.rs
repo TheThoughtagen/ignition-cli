@@ -55,20 +55,21 @@ pub const HOLD_FLOOR_S: u64 = 10;
 pub const HOLD_CEILING_S: u64 = 300;
 
 /// D-02's formula, unclamped: `ceil(2 x (p95_commit_s + p95_scan_s) + 1)`.
-pub fn hold_for(_p95_commit_s: f64, _p95_scan_s: f64) -> u64 {
-    0
+pub fn hold_for(p95_commit_s: f64, p95_scan_s: f64) -> u64 {
+    // `as` saturates: a negative or NaN input reads as 0.
+    (2.0 * (p95_commit_s + p95_scan_s) + 1.0).ceil() as u64
 }
 
 /// `raw` held to D-02's floor and ceiling.
 pub fn hold_clamped(raw: u64) -> u64 {
-    raw
+    raw.clamp(HOLD_FLOOR_S, HOLD_CEILING_S)
 }
 
 /// Whether a run whose commit is estimated at `est_commit_s` and whose scan
 /// takes `p95_scan_s` fits in `hold_s`: the hold the formula asks for is at
 /// most `hold_s`.
-pub fn fits(_hold_s: u64, _est_commit_s: f64, _p95_scan_s: f64) -> bool {
-    false
+pub fn fits(hold_s: u64, est_commit_s: f64, p95_scan_s: f64) -> bool {
+    hold_for(est_commit_s, p95_scan_s) <= hold_s
 }
 
 /// Seconds of margin a lock needs left at a check: one REST round trip from
@@ -90,13 +91,13 @@ pub struct HoldModel {
 
 impl HoldModel {
     /// Seconds a commit of `files` files is estimated to take.
-    pub fn estimate_commit_s(&self, _files: usize) -> f64 {
-        0.0
+    pub fn estimate_commit_s(&self, files: usize) -> f64 {
+        self.commit_fixed_s + files as f64 * self.commit_per_file_s
     }
 
     /// Whether a run touching `files` files fits in this model's hold (D-03).
-    pub fn fits(&self, _files: usize) -> bool {
-        false
+    pub fn fits(&self, files: usize) -> bool {
+        fits(self.hold_s, self.estimate_commit_s(files), self.p95_scan_s)
     }
 }
 
@@ -210,13 +211,14 @@ impl ManualClock {
     }
 
     /// Move the clock forward.
-    pub fn advance(&self, _by: Duration) {}
+    pub fn advance(&self, by: Duration) {
+        *self.offset.lock().expect("manual clock") += by;
+    }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> Instant {
-        let _ = &self.offset;
-        self.base
+        self.base + *self.offset.lock().expect("manual clock")
     }
 }
 
