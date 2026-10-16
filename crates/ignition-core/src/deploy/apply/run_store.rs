@@ -12,37 +12,73 @@
 //! ([`RunDir::git_status`]).
 
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::error::CoreError;
+use crate::actions::workspace::{now_unix_ms, rfc3339_now_utc, utc_parts};
+use crate::deploy::component_problem;
+use crate::error::{CoreError, PreflightFailure};
 
 /// Where run directories live below the repo (D-05). Users' `.gitignore`
 /// files depend on this path.
 pub const RUN_DIR_ROOT: &str = ".ign/deploy";
 
-/// One run's identifier: `YYYYMMDDTHHMMSSZ-xxxxxx`.
+/// The check id a refused run directory is reported under (23-02, item 8).
+const RUN_DIR_CHECK: &str = "run_dir_not_ignored";
+
+/// How many ids are drawn before [`RunDir::create_fresh`] gives up.
+const CREATE_ATTEMPTS: usize = 3;
+
+/// The longest run id accepted (the staging rule).
+const RUN_ID_MAX: usize = 128;
+
+/// One run's identifier: a UTC timestamp `YYYYMMDDTHHMMSSZ`, `-` and six
+/// lowercase hex characters (`20261015T142233Z-a1b2c3`).
+///
+/// The fixed-width timestamp prefix makes ids sort by start time as strings;
+/// the random suffix separates two runs started in the same second. Any text
+/// matching the staging rule `[A-Za-z0-9._-]{1,128}` without a leading dot
+/// also parses, so an id read back from a record or a command line is held to
+/// the rule before it becomes a path component (T-23-10).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RunId(String);
 
 impl RunId {
     /// A fresh id for now.
     pub fn generate() -> RunId {
-        RunId(String::new())
+        Self::generate_at(now_unix_ms())
     }
 
     /// A fresh id for the instant `ms` (epoch milliseconds).
     #[doc(hidden)]
     pub fn generate_at(ms: i64) -> RunId {
-        let _ = ms;
-        RunId(String::new())
+        let (y, mo, d, h, mi, s) = utc_parts(ms);
+        let mut random = [0u8; 3];
+        getrandom::getrandom(&mut random).expect("the OS random source is available");
+        RunId(format!(
+            "{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z-{:02x}{:02x}{:02x}",
+            random[0], random[1], random[2]
+        ))
     }
 
     /// Validate `text` against the staging rule.
     pub fn parse(text: &str) -> Result<RunId, CoreError> {
-        let _ = text;
-        Err(CoreError::Internal("run store not built".to_string()))
+        let ok = (1..=RUN_ID_MAX).contains(&text.len())
+            && !text.starts_with('.')
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if ok {
+            Ok(RunId(text.to_string()))
+        } else {
+            Err(CoreError::InvalidInput {
+                reason: format!(
+                    "a run id is 1 to {RUN_ID_MAX} characters of [A-Za-z0-9._-] and does not start with a dot"
+                ),
+            })
+        }
     }
 
     /// The id text.
@@ -51,26 +87,40 @@ impl RunId {
     }
 }
 
-/// `.ign/deploy/<gateway>/<run-id>` below the repo.
+/// `.ign/deploy/<gateway>/<run-id>` below the repo. `gateway` must already
+/// be a single path component ([`RunDir::create`] checks it).
 pub fn run_dir_rel(gateway: &str, run_id: &RunId) -> String {
-    let _ = (gateway, run_id);
-    String::new()
+    format!("{RUN_DIR_ROOT}/{gateway}/{}", run_id.as_str())
 }
 
 /// What `git check-ignore` said about a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgnoreStatus {
-    /// Git would not commit it.
+    /// Git would not commit it (exit 0).
     Ignored,
-    /// Git would commit it: refuse.
+    /// Git would commit it (exit 1): refuse, nothing written.
     NotIgnored,
-    /// The repo is not a git work tree: allowed and recorded.
+    /// The repo is not a git work tree (exit 128): allowed and recorded.
     NotARepo,
-    /// git could not be run: refuse (fail closed).
+    /// git could not be run, or answered something else: refuse (fail
+    /// closed).
     GitUnavailable,
 }
 
-/// Whether git ignores `rel` below `repo`.
+impl IgnoreStatus {
+    /// The value recorded as `run_dir_git` in `run.json` (23-02, item 6).
+    pub fn as_record(self) -> &'static str {
+        match self {
+            IgnoreStatus::Ignored => "ignored",
+            IgnoreStatus::NotIgnored => "not_ignored",
+            IgnoreStatus::NotARepo => "not_a_repo",
+            IgnoreStatus::GitUnavailable => "git_unavailable",
+        }
+    }
+}
+
+/// Whether git ignores `rel` (a path below `repo`), by
+/// `git -C <repo> check-ignore -q -- <rel>`.
 pub fn ignore_status(repo: &Path, rel: &str) -> IgnoreStatus {
     ignore_status_with(OsStr::new("git"), repo, rel)
 }
@@ -78,8 +128,21 @@ pub fn ignore_status(repo: &Path, rel: &str) -> IgnoreStatus {
 /// [`ignore_status`] with the git program named (the test seam).
 #[doc(hidden)]
 pub fn ignore_status_with(git: &OsStr, repo: &Path, rel: &str) -> IgnoreStatus {
-    let _ = (git, repo, rel);
-    IgnoreStatus::GitUnavailable
+    let status = std::process::Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status.map(|s| s.code()) {
+        Ok(Some(0)) => IgnoreStatus::Ignored,
+        Ok(Some(1)) => IgnoreStatus::NotIgnored,
+        Ok(Some(128)) => IgnoreStatus::NotARepo,
+        _ => IgnoreStatus::GitUnavailable,
+    }
 }
 
 /// A created run directory.
@@ -89,8 +152,15 @@ pub struct RunDir {
     git: IgnoreStatus,
 }
 
+/// The result of one exclusive create: the directory, or `None` when the path
+/// was already taken.
+type Created = Result<Option<RunDir>, CoreError>;
+
 impl RunDir {
-    /// Create the run directory for `run_id`.
+    /// Create the run directory for `run_id`: the git-ignore guard first,
+    /// then the parents (0700 when new) and the directory itself
+    /// (exclusively, 0700). A path that already exists is
+    /// `deploy_run_invalid`; an existing run directory is never reused.
     pub fn create(repo: &Path, gateway: &str, run_id: &RunId) -> Result<RunDir, CoreError> {
         Self::create_with_git(OsStr::new("git"), repo, gateway, run_id)
     }
@@ -103,8 +173,10 @@ impl RunDir {
         gateway: &str,
         run_id: &RunId,
     ) -> Result<RunDir, CoreError> {
-        let _ = (git, repo, gateway, run_id);
-        Err(CoreError::Internal("run store not built".to_string()))
+        Self::try_create(git, repo, gateway, run_id)?.ok_or_else(|| CoreError::DeployRunInvalid {
+            run_id: run_id.as_str().to_string(),
+            problem: "the run directory already exists".to_string(),
+        })
     }
 
     /// Create a directory under a fresh id, drawing a new id when the path
@@ -122,8 +194,81 @@ impl RunDir {
         gateway: &str,
         mut next_id: impl FnMut() -> RunId,
     ) -> Result<(RunId, RunDir), CoreError> {
-        let _ = (git, repo, gateway, next_id());
-        Err(CoreError::Internal("run store not built".to_string()))
+        let mut last = String::new();
+        for _ in 0..CREATE_ATTEMPTS {
+            let id = next_id();
+            if let Some(dir) = Self::try_create(git, repo, gateway, &id)? {
+                return Ok((id, dir));
+            }
+            last = id.as_str().to_string();
+        }
+        Err(CoreError::DeployRunInvalid {
+            run_id: last,
+            problem: format!(
+                "every one of {CREATE_ATTEMPTS} run ids drawn already had a run directory"
+            ),
+        })
+    }
+
+    fn try_create(git: &OsStr, repo: &Path, gateway: &str, run_id: &RunId) -> Created {
+        if let Some(why) = component_problem(gateway) {
+            return Err(CoreError::InvalidInput {
+                reason: format!("the gateway directory name {why}"),
+            });
+        }
+        let rel = run_dir_rel(gateway, run_id);
+        let status = ignore_status_with(git, repo, &rel);
+        let detail = match status {
+            IgnoreStatus::NotIgnored => Some(format!(
+                "git would commit {rel}, which holds the pre-apply snapshot and the backup; add `.ign/` to .gitignore"
+            )),
+            IgnoreStatus::GitUnavailable => Some(
+                "git could not be run to check that the run directory is ignored, so none was created"
+                    .to_string(),
+            ),
+            IgnoreStatus::Ignored | IgnoreStatus::NotARepo => None,
+        };
+        if let Some(detail) = detail {
+            return Err(CoreError::DeployPreflightFailed {
+                failures: vec![PreflightFailure {
+                    check: RUN_DIR_CHECK.to_string(),
+                    detail,
+                }]
+                .into(),
+            });
+        }
+
+        let fail = |what: &str, e: &std::io::Error| CoreError::DeployRunInvalid {
+            run_id: run_id.as_str().to_string(),
+            problem: format!("could not {what} ({:?})", e.kind()),
+        };
+        // Every component below the repo, each created at 0700 when new.
+        let mut path = repo.to_path_buf();
+        let components: Vec<&str> = rel.split('/').collect();
+        let (leaf, parents) = components.split_last().expect("rel has components");
+        for part in parents {
+            path.push(part);
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    harden_dir(&path).map_err(|e| fail("restrict a run directory parent", &e))?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+                Err(e) => return Err(fail("create a run directory parent", &e)),
+            }
+        }
+        path.push(leaf);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(e) => return Err(fail("create the run directory", &e)),
+        }
+        // Explicit, so the umask cannot widen it.
+        if let Err(e) = harden_dir(&path) {
+            // Nothing was written into it yet; do not leave a loose directory.
+            let _ = std::fs::remove_dir(&path);
+            return Err(fail("restrict the run directory", &e));
+        }
+        Ok(Some(RunDir { path, git: status }))
     }
 
     /// The directory.
@@ -131,41 +276,137 @@ impl RunDir {
         &self.path
     }
 
-    /// What git said about this directory before it was created.
+    /// What git said about this directory before it was created
+    /// (`run_dir_git` in `run.json`).
     pub fn git_status(&self) -> IgnoreStatus {
         self.git
     }
 
-    /// Create `name` in the directory exclusively at mode 0600.
+    /// Create `name` in the directory exclusively at mode 0600 and return the
+    /// handle. `name` is a plain file name: no separator, not dot-led.
     pub fn create_private_file(&self, name: &str) -> Result<std::fs::File, CoreError> {
-        let _ = name;
-        Err(CoreError::Internal("run store not built".to_string()))
+        if component_problem(name).is_some() {
+            return Err(CoreError::InvalidInput {
+                reason: "a run directory file name is one plain name, with no separator and no leading dot"
+                    .to_string(),
+            });
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(self.path.join(name)).map_err(|e| {
+            let problem = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{name} already exists and is written once")
+            } else {
+                format!("could not create {name} ({:?})", e.kind())
+            };
+            CoreError::DeployRunInvalid {
+                run_id: self.run_id_text(),
+                problem,
+            }
+        })
     }
 
-    /// Write `value` as pretty JSON plus LF to `name`, once.
+    /// Write `value` as pretty JSON plus LF to `name`, once: a second write
+    /// of the same name fails and leaves the first untouched.
     pub fn write_json(&self, name: &str, value: &impl Serialize) -> Result<(), CoreError> {
-        let _ = (name, value);
-        Err(CoreError::Internal("run store not built".to_string()))
+        let mut bytes = serde_json::to_vec_pretty(value)
+            .map_err(|e| CoreError::Internal(format!("could not serialize {name}: {e}")))?;
+        bytes.push(b'\n');
+        let mut file = self.create_private_file(name)?;
+        file.write_all(&bytes)
+            .and_then(|()| file.flush())
+            .map_err(|e| CoreError::DeployRunInvalid {
+                run_id: self.run_id_text(),
+                problem: format!("could not write {name} ({:?})", e.kind()),
+            })
     }
+
+    fn run_id_text(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+/// Owner-only access for a directory this module just created.
+#[cfg(unix)]
+fn harden_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Owner-only access for a directory this module just created.
+#[cfg(not(unix))]
+fn harden_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The append-only `events.ndjson` of one run.
+///
+/// Lines carry value-free fields only: paths, hashes, ids, counts and check
+/// ids, never a file's content, a secret or a gateway response body (T-23-13).
+/// The caller owns that rule; the log cannot see what a field means.
 #[derive(Debug)]
 pub struct EventLog {
-    _file: Option<std::fs::File>,
+    file: std::fs::File,
+    seq: u64,
 }
 
 impl EventLog {
-    /// Create `events.ndjson` in `dir`.
+    /// Create `events.ndjson` in `dir` (once per run directory).
     pub fn open(dir: &RunDir) -> Result<EventLog, CoreError> {
-        let _ = dir;
-        Err(CoreError::Internal("run store not built".to_string()))
+        Ok(EventLog {
+            file: dir.create_private_file("events.ndjson")?,
+            seq: 0,
+        })
     }
 
-    /// Append one line `{"seq":N,"t":...,"event":...,<fields>}`.
+    /// Append one line `{"seq":N,"t":"<rfc3339>","event":"<event>",<fields>}`.
+    /// `seq` counts 1, 2, 3 in emission order. `fields` is a JSON object (or
+    /// null for none) and may not use the keys `seq`, `t` or `event`.
     pub fn append(&mut self, event: &str, fields: serde_json::Value) -> Result<(), CoreError> {
-        let _ = (event, fields);
-        Err(CoreError::Internal("run store not built".to_string()))
+        let extra = match fields {
+            serde_json::Value::Object(map) => map,
+            serde_json::Value::Null => serde_json::Map::new(),
+            _ => {
+                return Err(CoreError::Internal(
+                    "an event's fields are a JSON object".to_string(),
+                ));
+            }
+        };
+        let mut line = serde_json::Map::new();
+        line.insert("seq".to_string(), (self.seq + 1).into());
+        line.insert("t".to_string(), rfc3339_now_utc().into());
+        line.insert("event".to_string(), event.into());
+        for (key, value) in extra {
+            if line.contains_key(&key) {
+                return Err(CoreError::Internal(format!(
+                    "an event's fields may not use the reserved key `{key}`"
+                )));
+            }
+            line.insert(key, value);
+        }
+        let mut bytes = serde_json::to_vec(&serde_json::Value::Object(line))
+            .map_err(|e| CoreError::Internal(format!("could not serialize an event: {e}")))?;
+        bytes.push(b'\n');
+        self.file
+            .write_all(&bytes)
+            .and_then(|()| self.file.flush())
+            .map_err(|e| {
+                CoreError::Internal(format!(
+                    "could not append to the events log ({:?})",
+                    e.kind()
+                ))
+            })?;
+        self.seq += 1;
+        Ok(())
     }
 }
 
@@ -211,7 +452,12 @@ mod tests {
             "{s}"
         );
         assert_eq!(RunId::parse(s).expect("generated id parses"), generated);
-        for ok in ["20261015T142233Z-a1b2c3", "run_1.x-2", "a", &"a".repeat(128)] {
+        for ok in [
+            "20261015T142233Z-a1b2c3",
+            "run_1.x-2",
+            "a",
+            &"a".repeat(128),
+        ] {
             RunId::parse(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
         for bad in [
@@ -235,9 +481,21 @@ mod tests {
         let a = RunId::generate_at(1_792_074_153_000);
         let b = RunId::generate_at(1_792_074_154_000);
         let c = RunId::generate_at(1_792_160_553_000);
-        assert!(a.as_str().starts_with("20261015T142233Z-"), "{}", a.as_str());
-        assert!(b.as_str().starts_with("20261015T142234Z-"), "{}", b.as_str());
-        assert!(c.as_str().starts_with("20261016T142233Z-"), "{}", c.as_str());
+        assert!(
+            a.as_str().starts_with("20261015T142233Z-"),
+            "{}",
+            a.as_str()
+        );
+        assert!(
+            b.as_str().starts_with("20261015T142234Z-"),
+            "{}",
+            b.as_str()
+        );
+        assert!(
+            c.as_str().starts_with("20261016T142233Z-"),
+            "{}",
+            c.as_str()
+        );
         let mut ids = vec![c.clone(), a.clone(), b.clone()];
         ids.sort();
         assert_eq!(ids, vec![a, b, c]);
@@ -248,7 +506,11 @@ mod tests {
         let ids: std::collections::BTreeSet<String> = (0..64)
             .map(|_| RunId::generate_at(1_792_074_153_000).as_str().to_string())
             .collect();
-        assert!(ids.len() > 60, "six random hex digits collided: {}", ids.len());
+        assert!(
+            ids.len() > 60,
+            "six random hex digits collided: {}",
+            ids.len()
+        );
     }
 
     #[test]
@@ -289,7 +551,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), text);
 
         let mut log = EventLog::open(&dir).expect("open log");
-        log.append("started", json!({"count": 2})).expect("append 1");
+        log.append("started", json!({"count": 2}))
+            .expect("append 1");
         log.append("finished", json!({})).expect("append 2");
         let log_path = dir.path().join("events.ndjson");
         assert_eq!(mode(&log_path), 0o600);
@@ -365,7 +628,10 @@ mod tests {
         let err = RunDir::create_with_git(missing.as_os_str(), ignored.path(), "gw", &id("r1"))
             .expect_err("git unavailable");
         assert_eq!(err.code(), "deploy_preflight_failed");
-        assert!(!ignored.path().join(".ign").exists(), "nothing may be written");
+        assert!(
+            !ignored.path().join(".ign").exists(),
+            "nothing may be written"
+        );
     }
 
     #[test]
@@ -399,13 +665,11 @@ mod tests {
         assert_eq!(err.code(), "deploy_run_invalid");
 
         let mut ids = vec![id("20261015T142233Z-bbbbbb"), taken.clone()];
-        let (drawn, second) = RunDir::create_fresh_with(
-            OsStr::new("git"),
-            repo.path(),
-            "gw",
-            move || ids.pop().expect("an id"),
-        )
-        .expect("a new id is drawn");
+        let (drawn, second) =
+            RunDir::create_fresh_with(OsStr::new("git"), repo.path(), "gw", move || {
+                ids.pop().expect("an id")
+            })
+            .expect("a new id is drawn");
         assert_eq!(drawn.as_str(), "20261015T142233Z-bbbbbb");
         assert_ne!(second.path(), first.path());
         assert_eq!(
