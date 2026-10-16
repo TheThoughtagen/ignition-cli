@@ -1023,7 +1023,7 @@ async fn scenario_scan_incomplete() -> Ran {
     let before = collection_state(&rig);
     rig.fake.stall_scans(1);
     let mut opts = options();
-    opts.poll.deadline = Duration::from_millis(300);
+    opts.poll.deadline = Duration::from_secs(1);
     ran(rig, before, quiet_hook(), &SystemClock, &opts).await
 }
 

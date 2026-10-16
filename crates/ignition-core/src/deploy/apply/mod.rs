@@ -27,12 +27,23 @@
 //! 9. the post fingerprint, then `ApplyHost::finalize`;
 //! 10. the snapshot download into the run directory (a failure is a warning).
 //!
-//! Only a green verify makes the outcome `applied`. Every branch that would
-//! end elsewhere (a stale pre-image, a commit that failed after it moved
-//! files, a lapsed lock, an incomplete scan, a red verify, a failed lock
-//! acquire) returns [`crate::error::CoreError::Internal`] naming its cause in
-//! this plan; 23-17 replaces each with `restore_snapshot` or a precise
-//! refusal. Added by later plans: the preflights (23-07), `.gwbk` and
+//! Only a green verify makes the outcome `applied`. Every other way the
+//! under-lock window can end (23-17):
+//!
+//! | Branch | Ends as |
+//! |---|---|
+//! | the under-lock pre-image check finds a changed file (nothing moved) | the run's staging is dropped, one no-op scan releases the lock (D12), `plan_stale` |
+//! | the lock is refused (for example `scan_lock_held`) | the run's own staging is dropped, the refusal is returned, nothing was written |
+//! | the commit fails after it moved files | [`restore_snapshot`], outcome `rolled_back`, cause `write_failed` |
+//! | the lock is not ours or has no margin left after the commit (either clock) | [`restore_snapshot`], cause `lock_expired`, no scan before it |
+//! | the scan does not complete | [`restore_snapshot`], cause `scan_incomplete` |
+//! | the post-apply verify is red | [`restore_snapshot`], cause `verify_failed` |
+//! | a restore that cannot finish | `rollback_failed`, the journal stays on the box (D-12) |
+//!
+//! A host that refuses a commit before it wrote anything (a journal of
+//! another run, an invalid spec) is returned as its own typed error and the
+//! lock is left to lapse: a scan there could load another run's partial
+//! state. Added by later plans: the preflights (23-07), `.gwbk` and
 //! restart-pending (23-09), the journal refusal (23-12).
 //!
 //! Once the run directory exists, `run_apply` leaves through one exit point
@@ -64,7 +75,6 @@ use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_locatio
 use crate::deploy::plan::PlanStatus;
 use crate::deploy::transport::TreeReader;
 use crate::deploy::tree::sha256_hex;
-use crate::deploy::verify::CheckStatus;
 use crate::error::{CoreError, RollbackFailure};
 use crate::poll::PollConfig;
 
@@ -338,6 +348,11 @@ pub enum ApplyEvent {
     },
     /// The run was finalized.
     Finalized,
+    /// The checks of a red verdict, by id and status.
+    VerifyChecks {
+        /// `(check id, status)` in report order.
+        checks: Vec<(String, String)>,
+    },
     /// A restore began (23-17).
     RestoreStarted {
         /// Why.
@@ -363,6 +378,7 @@ impl ApplyEvent {
             ApplyEvent::LockVerdict { .. } => "lock_verdict",
             ApplyEvent::ScanDone => "scan_done",
             ApplyEvent::VerifyDone { .. } => "verify_done",
+            ApplyEvent::VerifyChecks { .. } => "verify_checks",
             ApplyEvent::Finalized => "finalized",
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
@@ -385,6 +401,12 @@ impl ApplyEvent {
             }
             ApplyEvent::LockVerdict { held } => json!({"held": held}),
             ApplyEvent::VerifyDone { ok } => json!({"ok": ok}),
+            ApplyEvent::VerifyChecks { checks } => json!({
+                "checks": checks
+                    .iter()
+                    .map(|(id, status)| json!({"id": id, "status": status}))
+                    .collect::<Vec<_>>(),
+            }),
             ApplyEvent::RestoreStarted { cause } => json!({"cause": cause.as_str()}),
             ApplyEvent::Failed { code } => json!({"code": code}),
             ApplyEvent::ScanDone | ApplyEvent::Finalized | ApplyEvent::Restored => Value::Null,
@@ -754,17 +776,24 @@ async fn drive(
     .await?;
     steps.emit(ApplyEvent::VerifyDone { ok: verify.ok })?;
     if !verify.ok {
-        let failed: Vec<String> = verify
-            .checks
-            .iter()
-            .filter(|c| c.status == CheckStatus::Fail)
-            .map(|c| format!("{:?}", c.id))
-            .collect();
-        return Err(CoreError::Internal(format!(
-            "apply stopped (verify_failed): the post-apply verify failed ({}); the files moved \
-             and were not restored",
-            failed.join(", ")
-        )));
+        // The verdict is kept in the log by check id and status only.
+        steps.emit(ApplyEvent::VerifyChecks {
+            checks: verify
+                .checks
+                .iter()
+                .map(|c| (c.id.word().to_string(), c.status.word().to_string()))
+                .collect(),
+        })?;
+        return roll_back(
+            ctx,
+            opts,
+            &scope,
+            Some(&lock),
+            RollbackCause::VerifyFailed,
+            steps,
+            verify.warnings,
+        )
+        .await;
     }
 
     // Green: record what is live now, finalize, keep the snapshot locally.
