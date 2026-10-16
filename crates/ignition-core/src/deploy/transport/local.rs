@@ -62,6 +62,24 @@ pub struct LocalFsTransport {
     label: String,
     mirror: Option<MirrorSetup>,
     apply: Option<ApplySetup>,
+    fault: Option<ApplyFault>,
+}
+
+/// A fault the local host injects into `commit` or `restore`, for the tests
+/// that drive the engine into a write-side failure (research Pattern 7).
+///
+/// The seam is `#[doc(hidden)]` and only [`LocalFsTransport::with_apply_fault`]
+/// sets it: no environment variable, flag or CLI path reaches it. A fault goes
+/// through the same failure path as a real one, so the report and the journal
+/// a test sees are the real ones.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum ApplyFault {
+    /// The write at this index (into the spec's byte-sorted writes) fails
+    /// after `RENAME_RETRIES` attempts; the writes before it have moved.
+    FailMoveAt(usize),
+    /// The restore of this index (into the record's touched entries) fails.
+    FailRestoreAt(usize),
 }
 
 /// What the apply half needs: the target gateway and mode.
@@ -107,7 +125,16 @@ impl LocalFsTransport {
             label: label.into(),
             mirror: None,
             apply: None,
+            fault: None,
         }
+    }
+
+    /// Inject `fault` into this host's `commit` or `restore` (tests only; see
+    /// [`ApplyFault`]).
+    #[doc(hidden)]
+    pub fn with_apply_fault(mut self, fault: ApplyFault) -> Self {
+        self.fault = Some(fault);
+        self
     }
 
     /// Bind the apply half ([`ApplyHost`]) to `gateway` and `mode`. Fails when

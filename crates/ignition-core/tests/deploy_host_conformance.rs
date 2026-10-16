@@ -18,7 +18,7 @@ use ignition_core::deploy::apply::record::{RecordState, RunRecord, TouchedEntry}
 use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::transport::local::LocalFsTransport;
+use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 
 const GW: &str = "conf-gw";
@@ -80,6 +80,28 @@ impl Ctx {
             host: Box::new(host),
             data,
         }
+    }
+
+    /// A local host as [`Ctx::local`] with `fault` injected.
+    pub fn local_faulty(fault: ApplyFault) -> Ctx {
+        let data = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(data.path().join("config/resources").join(MODE))
+            .expect("collection");
+        let host = LocalFsTransport::new(data.path().to_path_buf(), "nodes.conf")
+            .with_apply(GW, MODE)
+            .expect("apply host")
+            .with_apply_fault(fault);
+        Ctx {
+            host: Box::new(host),
+            data,
+        }
+    }
+
+    /// A second local host over the same data directory, with no fault.
+    pub fn clean_host(&self) -> LocalFsTransport {
+        LocalFsTransport::new(self.root().to_path_buf(), "nodes.conf")
+            .with_apply(GW, MODE)
+            .expect("apply host")
     }
 
     pub fn root(&self) -> &Path {
@@ -630,6 +652,79 @@ async fn conformance_local_read_record_absent_is_none() {
 #[tokio::test]
 async fn conformance_local_probe_reports_writable_without_touching_the_collection() {
     run_local("probe_reports_writable_without_touching_the_collection").await;
+}
+
+// ---- fault rows (local host only) ---------------------------------------------
+
+const FILE_C: &str = "ignition/tag-provider/default/third.json";
+
+/// Three writes, the middle one over an existing file, so a failure at index
+/// 1 leaves the first moved and the second still the pre-run bytes.
+fn three_writes(c: &Ctx) -> Batch {
+    c.seed(FILE_B, b"old b");
+    c.batch(
+        RUN,
+        &[(FILE_A, b"new a"), (FILE_B, b"new b"), (FILE_C, b"new c")],
+        &[],
+        None,
+    )
+}
+
+/// A move that fails mid-commit is reported by index at phase `writing`; the
+/// snapshot is complete, the journal says `writing`, and `restore` returns
+/// the collection to the pre-run listing.
+#[tokio::test]
+async fn fail_move_at_leaves_a_recoverable_partial_tree() {
+    let c = Ctx::local_faulty(ApplyFault::FailMoveAt(1));
+    let batch = three_writes(&c);
+    let before = c.listing();
+
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Writing, "{report:?}");
+    assert!(!report.stale, "{report:?}");
+    assert_eq!(report.moved, vec![0], "only the first write moved");
+    let failure = report.failure.clone().expect("a failure");
+    assert!(failure.contains("write 1"), "{failure}");
+
+    let after = c.listing();
+    assert_eq!(after.get(FILE_A), Some(&sha256_hex(b"new a")));
+    assert_eq!(after.get(FILE_B), Some(&sha256_hex(b"old b")), "not moved");
+    assert_eq!(after.get(FILE_C), None, "never reached");
+    assert_eq!(c.journal().expect("journal").phase, JournalPhase::Writing);
+    assert_eq!(
+        std::fs::read(c.snapshot_dir(RUN).join("files").join(FILE_B)).expect("pre-image"),
+        b"old b",
+        "the snapshot holds the pre-image"
+    );
+
+    let record = c.record(RUN).expect("record.json");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before, "restore returns the pre-run listing");
+}
+
+/// A restore that fails is reported by index with the journal left at
+/// `restoring`; a second restore on a clean host finishes the job.
+#[tokio::test]
+async fn fail_restore_at_reports_the_index() {
+    let c = Ctx::local_faulty(ApplyFault::FailRestoreAt(1));
+    let batch = three_writes(&c);
+    let before = c.listing();
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let record = c.record(RUN).expect("record.json");
+
+    let failed = c.host.restore(&record).await.expect("restore");
+    assert_eq!(failed.phase, JournalPhase::Restoring, "{failed:?}");
+    let failure = failed.failure.clone().expect("a failure");
+    assert!(failure.contains("restore 1"), "{failure}");
+    assert_eq!(c.journal().expect("journal").phase, JournalPhase::Restoring);
+    assert_ne!(c.listing(), before, "the restore stopped part way");
+
+    let clean = c.clean_host();
+    let restored = clean.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before, "the second restore finishes the job");
 }
 
 /// Every row has a test above, so adding a row without wiring it fails here.
