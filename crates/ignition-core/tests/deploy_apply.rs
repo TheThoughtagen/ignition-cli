@@ -232,6 +232,39 @@ async fn mount_passing_preflights(server: &wiremock::MockServer) {
         .with_priority(250)
         .mount(server)
         .await;
+    mount_gwbk(server, gwbk_zip(), 250).await;
+}
+
+/// A small valid ZIP standing in for a `.gwbk`: one stored member, so that
+/// cutting the file anywhere in the second half loses the central directory.
+fn gwbk_zip() -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file("data.bin", options)
+        .expect("member starts");
+    writer.write_all(&[7u8; 4096]).expect("member writes");
+    writer.finish().expect("finalizes").into_inner()
+}
+
+/// The gateway backup route answering `body`, at `priority` (lower wins).
+async fn mount_gwbk(server: &wiremock::MockServer, body: Vec<u8>, priority: u8) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("GET"))
+        .and(path("/data/api/v1/backup"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header(
+                    "content-type",
+                    "application/x-ignition-gateway-backup;charset=utf-8",
+                )
+                .set_body_bytes(body),
+        )
+        .with_priority(priority)
+        .mount(server)
+        .await;
 }
 
 /// The designers list body for `(user, project, address)` sessions.
@@ -355,6 +388,7 @@ fn options() -> ApplyOptions {
             log_settle: Duration::ZERO,
         },
         designers: DesignersPolicy::default(),
+        skip_gwbk: false,
     }
 }
 
@@ -543,16 +577,16 @@ async fn apply_happy_path_local() {
 
     // The run directory.
     let run_dir = rig.run_dir(&result);
-    assert_eq!(
-        names(&run_dir),
-        [
-            "events.ndjson",
-            "plan.json",
-            "result.json",
-            "run.json",
-            "snapshot"
-        ]
-    );
+    let mut expected_files = vec![
+        "events.ndjson".to_string(),
+        "plan.json".to_string(),
+        "result.json".to_string(),
+        "run.json".to_string(),
+        "snapshot".to_string(),
+        format!("{run_id}.gwbk"),
+    ];
+    expected_files.sort();
+    assert_eq!(names(&run_dir), expected_files);
     assert_eq!(
         json_file(&run_dir.join("result.json"))["outcome"],
         "applied"
@@ -598,6 +632,7 @@ async fn apply_happy_path_local() {
     );
     let expected = [
         "run_started",
+        "gwbk_downloaded",
         "staged",
         "lock_acquired",
         "committed",
@@ -617,8 +652,9 @@ async fn apply_happy_path_local() {
             ..
         }
     ));
-    assert!(matches!(seen[5], ApplyEvent::ScanDone));
-    assert!(matches!(seen[6], ApplyEvent::VerifyDone { ok: true }));
+    assert!(matches!(seen[1], ApplyEvent::GwbkDownloaded { .. }));
+    assert!(matches!(seen[6], ApplyEvent::ScanDone));
+    assert!(matches!(seen[7], ApplyEvent::VerifyDone { ok: true }));
 }
 
 #[tokio::test]
@@ -916,6 +952,7 @@ async fn fault_write_failed_mid_commit_restores() {
         event_names(&run_dir),
         [
             "run_started",
+            "gwbk_downloaded",
             "staged",
             "lock_acquired",
             "committed",
@@ -1183,8 +1220,9 @@ async fn scenario_lock_taken() -> Ran {
     ran(rig, before, quiet_hook(), &SystemClock, &options()).await
 }
 
-const LAPSED_EVENTS: [&str; 9] = [
+const LAPSED_EVENTS: [&str; 10] = [
     "run_started",
+    "gwbk_downloaded",
     "staged",
     "lock_acquired",
     "committed",
@@ -1316,6 +1354,7 @@ async fn auto_rollback_verify_red_restores() {
         events,
         [
             "run_started",
+            "gwbk_downloaded",
             "staged",
             "lock_acquired",
             "committed",
@@ -2107,4 +2146,148 @@ async fn preflight_designers_none_pass_everywhere() {
         assert!(report.passed(), "{mode:?}: {report:?}");
         assert!(report.designers_seen.is_empty(), "{mode:?}");
     }
+}
+
+// ============================================================================
+// The .gwbk before staging (23-09, DAPL-05, D-13)
+// ============================================================================
+
+/// The requests the rig's gateway received for `path`.
+async fn requests_for(rig: &Rig, route: &str) -> Vec<wiremock::Request> {
+    rig._server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .into_iter()
+        .filter(|r| r.url.path() == route)
+        .collect()
+}
+
+#[tokio::test]
+async fn snapshot_gwbk_downloaded_private() {
+    let rig = changing_rig().await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+
+    let run_id = result.run_id.clone().expect("run id");
+    let run_dir = rig.run_dir(&result);
+    let file = run_dir.join(format!("{run_id}.gwbk"));
+    assert_eq!(result.gwbk.as_deref(), Some(format!("{run_id}.gwbk").as_str()));
+    assert!(!result.skip_gwbk);
+    assert_eq!(std::fs::read(&file).expect("the .gwbk"), gwbk_zip());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the .gwbk is owner-only");
+    }
+
+    // The whole-gateway restore point: type=all, one request.
+    let requests = requests_for(&rig, "/data/api/v1/backup").await;
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].url.query(), Some("type=all"));
+
+    let run = json_file(&run_dir.join("run.json"));
+    assert_eq!(run["skip_gwbk"], false);
+    // The download came before the lock (event order).
+    let events = event_names(&run_dir);
+    let at = |name: &str| events.iter().position(|e| e == name).expect(name);
+    assert!(at("gwbk_downloaded") < at("staged"), "{events:?}");
+    assert!(at("gwbk_downloaded") < at("lock_acquired"), "{events:?}");
+    let downloaded = event_lines(&run_dir, "gwbk_downloaded");
+    assert_eq!(downloaded[0]["bytes"], gwbk_zip().len());
+}
+
+/// Runs the apply and returns its refusal, asserting that it is the `gwbk`
+/// preflight and that nothing was staged, locked or written.
+async fn gwbk_refusal(rig: &Rig) -> (String, PathBuf) {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the .gwbk is refused");
+    assert_eq!((err.code(), err.exit_code()), ("deploy_preflight_failed", 6));
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].check, "gwbk");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
+    assert_eq!(rig.host.calls(), ["probe"], "nothing staged or written");
+    let runs = rig.repo.join(".ign").join("deploy").join(GATEWAY);
+    let dirs = names(&runs);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let run_dir = runs.join(&dirs[0]);
+    for file in ["run.json", "plan.json", "events.ndjson", "result.json"] {
+        assert!(run_dir.join(file).is_file(), "{file}");
+    }
+    assert!(
+        !names(&run_dir).iter().any(|n| n.ends_with(".gwbk")),
+        "a refused .gwbk is not kept: {:?}",
+        names(&run_dir)
+    );
+    assert_eq!(
+        json_file(&run_dir.join("result.json"))["error"]["code"],
+        "deploy_preflight_failed"
+    );
+    (failures[0].detail.clone(), run_dir)
+}
+
+#[tokio::test]
+async fn snapshot_gwbk_truncated_is_refused() {
+    let rig = changing_rig().await;
+    let whole = gwbk_zip();
+    // The central directory is at the end: half a file cannot open as a ZIP.
+    mount_gwbk(&rig._server, whole[..whole.len() / 2].to_vec(), 5).await;
+    let (detail, _) = gwbk_refusal(&rig).await;
+    assert!(detail.contains("ZIP"), "{detail}");
+}
+
+#[tokio::test]
+async fn snapshot_gwbk_empty_is_refused() {
+    // Edge DAPL-05 empty: a zero-byte .gwbk is refused.
+    let rig = changing_rig().await;
+    mount_gwbk(&rig._server, Vec::new(), 5).await;
+    let (detail, _) = gwbk_refusal(&rig).await;
+    assert!(detail.contains("empty"), "{detail}");
+}
+
+#[tokio::test]
+async fn snapshot_gwbk_download_failure_is_refused() {
+    let rig = changing_rig().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/backup"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .with_priority(5)
+        .mount(&rig._server)
+        .await;
+    let (detail, _) = gwbk_refusal(&rig).await;
+    assert!(detail.contains("not downloaded"), "{detail}");
+}
+
+#[tokio::test]
+async fn snapshot_skip_gwbk_is_recorded() {
+    let rig = changing_rig().await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let opts = ApplyOptions {
+        skip_gwbk: true,
+        ..options()
+    };
+    let result = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &opts)
+        .await
+        .expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    assert!(result.skip_gwbk);
+    assert_eq!(result.gwbk, None);
+
+    assert!(requests_for(&rig, "/data/api/v1/backup").await.is_empty());
+    let run_dir = rig.run_dir(&result);
+    assert!(!names(&run_dir).iter().any(|n| n.ends_with(".gwbk")));
+    assert_eq!(json_file(&run_dir.join("run.json"))["skip_gwbk"], true);
+    assert_eq!(event_lines(&run_dir, "gwbk_skipped").len(), 1);
+    assert!(event_lines(&run_dir, "gwbk_downloaded").is_empty());
+    assert_eq!(json_file(&run_dir.join("result.json"))["skip_gwbk"], true);
 }
