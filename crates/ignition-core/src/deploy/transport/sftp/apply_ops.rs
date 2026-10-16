@@ -38,10 +38,10 @@ use crate::deploy::apply::host::{
     ApplyHost, BatchReport, BatchSpec, Prepared, ProbeReport, restoring_journal,
 };
 use crate::deploy::apply::journal::{Journal, JournalPhase};
-use crate::deploy::apply::record::RunRecord;
+use crate::deploy::apply::record::{RECORD_MAX_BYTES, RunRecord};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::ledger::{
-    LEDGER_FILE, LedgerRoot, journal_location, staging_rel,
+    LEDGER_FILE, LedgerRoot, journal_location, location_of, record_rel, staging_rel,
 };
 use crate::deploy::transport::batch::{
     POSIX_STUB, SCRIPT_SH, SCRIPT_SH_FILE, SeenJournal, WORK_FILE, WorkList, WorkOp, journal_file,
@@ -541,10 +541,227 @@ fn staged_name(item: &str, work: Option<&WorkList>) -> String {
         .unwrap_or_else(|| "a staged file".to_string())
 }
 
+/// What `probe` says for each problem word the script reports.
+fn probe_problem(code: &str) -> String {
+    match code {
+        "coll_symlink" => "the mode collection is a symlink",
+        "coll_unwritable" => "the mode collection is not writable",
+        "coll_not_dir" => "the mode collection is not a directory",
+        "resources_unwritable" => {
+            "config/resources is not writable, so the mode collection cannot be created"
+        }
+        "resources_missing" => "config/resources does not exist; is data_dir a gateway data directory?",
+        "deploy_symlink" => "the ign-deploy directory is or is below a symlink",
+        "deploy_not_dir" => "a level of the ign-deploy directory is not a directory",
+        "deploy_uncreatable" => "the ign-deploy directory cannot be created or opened",
+        "deploy_unwritable" => "the ign-deploy directory is not writable",
+        _ => "the host reported a problem this build does not know",
+    }
+    .to_string()
+}
+
+impl SftpTransport {
+    /// The path an index of a fingerprint list names.
+    fn fingerprint_hashes(
+        &self,
+        value: &Value,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
+        const OP: &str = "fingerprint";
+        let items = value
+            .get("hashes")
+            .and_then(Value::as_array)
+            .filter(|items| items.len() == paths.len())
+            .ok_or_else(|| self.mirror_fail(OP, "the script result is malformed (hashes)"))?;
+        let mut out = BTreeMap::new();
+        for (path, item) in paths.iter().zip(items) {
+            let text = item
+                .as_str()
+                .ok_or_else(|| self.mirror_fail(OP, "the script result is malformed (hash)"))?;
+            let hash = if text == "-" {
+                None
+            } else if text.len() == 64
+                && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                Some(text.to_string())
+            } else {
+                return Err(self.mirror_fail(OP, "the script result is malformed (hash)"));
+            };
+            out.insert(path.clone(), hash);
+        }
+        Ok(out)
+    }
+
+    /// Download the regular files below the host's directory `chain` (below
+    /// the account home) into `out`, level by level, and hash each one here.
+    /// Symlinks and special files are refused; the caps of the read side apply.
+    async fn download_snapshot(
+        &self,
+        op: &str,
+        remote: &str,
+        out: &Path,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        let mut hashes = BTreeMap::new();
+        let mut files: Vec<(String, u64)> = Vec::new();
+        let mut frontier: Vec<String> = vec![String::new()];
+        let mut budget = super::Budget::default();
+        let mut total: u64 = 0;
+        while !frontier.is_empty() {
+            let dirs: Vec<String> = frontier
+                .iter()
+                .map(|rel| {
+                    if rel.is_empty() {
+                        remote.to_string()
+                    } else {
+                        format!("{remote}/{rel}")
+                    }
+                })
+                .collect();
+            let listings = self.list_level_as(op, &dirs, &mut budget).await?;
+            let mut next = Vec::new();
+            for (rel, entries) in frontier.iter().zip(listings) {
+                for entry in entries {
+                    if let Some(why) = crate::deploy::component_problem(&entry.name) {
+                        return Err(self.mirror_fail(
+                            op,
+                            format!("a snapshot entry name {why}"),
+                        ));
+                    }
+                    let child = if rel.is_empty() {
+                        entry.name.clone()
+                    } else {
+                        format!("{rel}/{}", entry.name)
+                    };
+                    match entry.kind {
+                        super::EntryKind::Dir => {
+                            std::fs::create_dir(
+                                child
+                                    .split('/')
+                                    .fold(out.to_path_buf(), |path, part| path.join(part)),
+                            )
+                            .map_err(|e| {
+                                self.mirror_fail(
+                                    op,
+                                    format!("cannot create {child} ({})", e.kind()),
+                                )
+                            })?;
+                            next.push(child);
+                        }
+                        super::EntryKind::File => {
+                            if entry.size > READ_MAX_FILE_BYTES {
+                                return Err(self.mirror_fail(
+                                    op,
+                                    format!("{child} in the snapshot is over the file cap"),
+                                ));
+                            }
+                            total = total.saturating_add(entry.size);
+                            if total > READ_MAX_TOTAL_BYTES {
+                                return Err(self.mirror_fail(
+                                    op,
+                                    "the snapshot exceeds the total size cap",
+                                ));
+                            }
+                            files.push((child, entry.size));
+                        }
+                        _ => {
+                            return Err(self.mirror_fail(
+                                op,
+                                format!(
+                                    "{child} in the snapshot is not a regular file or directory"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let mut next = 0usize;
+        let mut downloaded = 0u64;
+        while next < files.len() {
+            let mut ops = Vec::new();
+            let mut chunk = 0u64;
+            let start = next;
+            while next < files.len() && ops.len() < super::DOWNLOAD_CHUNK_FILES {
+                let (rel, size) = &files[next];
+                if !ops.is_empty() && chunk + size > super::DOWNLOAD_CHUNK_BYTES {
+                    break;
+                }
+                ops.push(SftpOp::Get {
+                    remote: format!("{remote}/{rel}"),
+                    local: rel
+                        .split('/')
+                        .fold(out.to_path_buf(), |path, part| path.join(part)),
+                });
+                chunk += size;
+                next += 1;
+            }
+            let limit = downloaded + chunk + super::DOWNLOAD_SLACK_BYTES;
+            self.run_download(op, &ops, out, limit).await?;
+            let root = out.to_path_buf();
+            let wanted: Vec<(String, u64)> = files[start..next].to_vec();
+            let got = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
+                let mut got = Vec::new();
+                for (rel, size) in &wanted {
+                    let bytes = super::read_downloaded(
+                        &root,
+                        Path::new(rel),
+                        *size,
+                        READ_MAX_FILE_BYTES,
+                    )
+                    .map_err(|_| format!("{rel} could not be read back as listed"))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            root.join(rel),
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .map_err(|e| format!("cannot restrict {rel} ({})", e.kind()))?;
+                    }
+                    got.push((rel.clone(), sha256_hex(&bytes)));
+                }
+                Ok(got)
+            })
+            .await
+            .map_err(|e| CoreError::Internal(format!("sftp snapshot task failed: {e}")))?
+            .map_err(|why| self.mirror_fail(op, why))?;
+            hashes.extend(got);
+            downloaded = tokio::task::spawn_blocking({
+                let root = out.to_path_buf();
+                move || super::dir_bytes(&root)
+            })
+            .await
+            .map_err(|e| CoreError::Internal(format!("sftp snapshot task failed: {e}")))?;
+        }
+        Ok(hashes)
+    }
+}
+
 #[async_trait::async_trait]
 impl ApplyHost for SftpTransport {
     async fn probe(&self) -> Result<ProbeReport, CoreError> {
-        Err(self.mirror_fail("probe", "not built yet"))
+        const OP: &str = "probe";
+        let setup = self.apply_setup(OP)?;
+        let work = WorkList::for_probe(&setup.gateway, &setup.mode)
+            .map_err(|why| self.mirror_fail(OP, why))?;
+        let (_, deploy, coll) = self.apply_roots(OP).await?;
+        let value = self.run_ctl(OP, &work, &[], &coll, &deploy).await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.refusal(OP, &value, None).await);
+        }
+        let problems: Vec<String> = value
+            .get("problems")
+            .and_then(Value::as_array)
+            .ok_or_else(|| self.mirror_fail(OP, "the script result is malformed (problems)"))?
+            .iter()
+            .map(|item| item.as_str().map(probe_problem))
+            .collect::<Option<_>>()
+            .ok_or_else(|| self.mirror_fail(OP, "the script result is malformed (problems)"))?;
+        Ok(ProbeReport {
+            writable: problems.is_empty(),
+            problems,
+        })
     }
 
     async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
@@ -710,28 +927,168 @@ impl ApplyHost for SftpTransport {
 
     async fn fingerprint(
         &self,
-        _paths: &[String],
+        paths: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
-        Err(self.mirror_fail("fingerprint", "not built yet"))
+        const OP: &str = "fingerprint";
+        let setup = self.apply_setup(OP)?;
+        let work = WorkList::for_fingerprint(&setup.gateway, &setup.mode, paths)
+            .map_err(|why| self.mirror_fail(OP, why))?;
+        let (_, deploy, coll) = self.apply_roots(OP).await?;
+        let value = self.run_ctl(OP, &work, &[], &coll, &deploy).await?;
+        if !self.result_ok(OP, &value)? {
+            if value.get("err").and_then(Value::as_str) == Some("not_regular") {
+                let at = value
+                    .get("at")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .and_then(|n| work.restores.get(n));
+                return Err(match at {
+                    Some(entry) if entry.path == LEDGER_KEY => {
+                        self.mirror_fail(OP, "the ledger is not a regular file")
+                    }
+                    Some(entry) => {
+                        self.mirror_fail(OP, format!("{} is not a regular file", entry.path))
+                    }
+                    None => self.mirror_fail(OP, "a path is not a regular file"),
+                });
+            }
+            return Err(self.refusal(OP, &value, Some(&work)).await);
+        }
+        self.fingerprint_hashes(&value, paths)
     }
 
-    async fn finalize(&self, _record: &RunRecord) -> Result<(), CoreError> {
-        Err(self.mirror_fail("finalize", "not built yet"))
+    async fn finalize(&self, record: &RunRecord) -> Result<(), CoreError> {
+        const OP: &str = "finalize";
+        let setup = self.apply_setup(OP)?;
+        if record.gateway != setup.gateway || record.mode != setup.mode {
+            return Err(self.mirror_fail(
+                OP,
+                "the record names a different gateway or mode than this host",
+            ));
+        }
+        RunId::parse(&record.run_id)?;
+        RunRecord::parse("record", &record.to_bytes(), &setup.gateway, &setup.mode)?;
+        let seen = self.journal_of_run(&record.run_id).await?;
+        let work = WorkList::for_finalize(record, seen).map_err(|why| self.mirror_fail(OP, why))?;
+        let (_, deploy, coll) = self.apply_roots(OP).await?;
+        let value = self
+            .run_ctl(
+                OP,
+                &work,
+                &[(record_file(record.state), record.to_bytes())],
+                &coll,
+                &deploy,
+            )
+            .await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.refusal(OP, &value, Some(&work)).await);
+        }
+        Ok(())
     }
 
-    async fn read_record(&self, _run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
-        Err(self.mirror_fail("read_record", "not built yet"))
+    async fn read_record(&self, run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
+        const OP: &str = "read_record";
+        let setup = self.apply_setup(OP)?;
+        let location = location_of(
+            LedgerRoot::AccountHome,
+            &record_rel(&setup.gateway, &setup.mode, run_id.as_str()),
+        );
+        let invalid = |problem: String| CoreError::DeployRunInvalid {
+            run_id: run_id.as_str().to_string(),
+            problem: format!("{location}: {problem}"),
+        };
+        let bytes = self
+            .read_home_file(
+                &record_rel(&setup.gateway, &setup.mode, run_id.as_str()),
+                RECORD_MAX_BYTES,
+                "the run record",
+                (&setup.gateway, &setup.mode),
+                &invalid,
+            )
+            .await?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let record = RunRecord::parse(&location, &bytes, &setup.gateway, &setup.mode)?;
+        if record.run_id != run_id.as_str() {
+            return Err(invalid("the record names a different run".to_string()));
+        }
+        Ok(Some(record))
     }
 
     async fn fetch_snapshot(
         &self,
-        _run_id: &RunId,
-        _dest: &Path,
+        run_id: &RunId,
+        dest: &Path,
     ) -> Result<BTreeMap<String, String>, CoreError> {
-        Err(self.mirror_fail("fetch_snapshot", "not built yet"))
+        const OP: &str = "fetch_snapshot";
+        let setup = self.apply_setup(OP)?;
+        let home = self.account_home().await?;
+        let mut budget = super::Budget::lenient();
+        let found = self
+            .descend_from(
+                &home,
+                &["ign-deploy", &setup.gateway, &setup.mode, "snapshots", run_id.as_str()],
+                &mut budget,
+            )
+            .await
+            .map_err(|problem| match problem {
+                super::Descend::Failed(err) => err,
+                super::Descend::Symlink(_) => self.mirror_fail(
+                    OP,
+                    "a path component of the snapshot is a symlink; symlinks are refused",
+                ),
+                super::Descend::NotDir(_) => {
+                    self.mirror_fail(OP, "a path component of the snapshot is not a directory")
+                }
+            })?;
+        let Some((remote, entry)) = found else {
+            return Err(self.mirror_fail(
+                OP,
+                format!("run {} has no snapshot on this host", run_id.as_str()),
+            ));
+        };
+        if entry.kind != super::EntryKind::Dir {
+            return Err(self.mirror_fail(OP, "the snapshot is not a directory"));
+        }
+        safe_remote_path(&remote)
+            .map_err(|why| self.mirror_fail(OP, format!("the snapshot path is unsafe: {why}")))?;
+        let out = dest.join("snapshot");
+        std::fs::create_dir(&out).map_err(|e| {
+            self.mirror_fail(
+                OP,
+                format!("cannot create the snapshot copy directory ({})", e.kind()),
+            )
+        })?;
+        self.download_snapshot(OP, &remote, &out).await
     }
 
-    async fn discard_interrupted(&self, _run_id: &RunId) -> Result<(), CoreError> {
-        Err(self.mirror_fail("discard", "not built yet"))
+    async fn discard_interrupted(&self, run_id: &RunId) -> Result<(), CoreError> {
+        const OP: &str = "discard";
+        let setup = self.apply_setup(OP)?;
+        let seen = self.journal_of_run(run_id.as_str()).await?;
+        if let SeenJournal::Hash(_) = &seen {
+            let location = journal_location(LedgerRoot::AccountHome, &setup.gateway, &setup.mode);
+            let bytes = self
+                .read_journal(&setup.gateway, &setup.mode)
+                .await?
+                .ok_or_else(|| self.mirror_fail(OP, "the journal vanished while it was read"))?;
+            let journal = Journal::parse(&location, &bytes, &setup.gateway, &setup.mode)?;
+            if !journal.phase.before_first_move() {
+                return Err(CoreError::DeployRunInvalid {
+                    run_id: run_id.as_str().to_string(),
+                    problem: "the run may have moved files; restore it instead of discarding it"
+                        .to_string(),
+                });
+            }
+        }
+        let work = WorkList::for_discard(run_id.as_str(), &setup.gateway, &setup.mode, seen)
+            .map_err(|why| self.mirror_fail(OP, why))?;
+        let (_, deploy, coll) = self.apply_roots(OP).await?;
+        let value = self.run_ctl(OP, &work, &[], &coll, &deploy).await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.refusal(OP, &value, Some(&work)).await);
+        }
+        Ok(())
     }
 }

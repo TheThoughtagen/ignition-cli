@@ -223,14 +223,14 @@ has_entries() {
 
 # check_work: read work.tsv once, refuse anything that is not exactly what the
 # runner writes, and set RUN GW MD WOP RETRIES SRC JSEEN LNEW HAVE_L and
-# the counts NW ND NX NP NF.
+# the counts NW ND NX NP NF, HAVE_J and RECDOC (the staged record's name).
 check_work() {
   if [ ! -f "$WORK" ] || [ -L "$WORK" ]; then
     refuse bad_work "there is no work list"
   fi
   RUN='' GW='' MD='' WOP='' RETRIES=3 SRC='' JSEEN='-' LNEW=''
   HAVE_L=0 NW=0 ND=0 NX=0 NP=0 NF=0
-  _have_t=0 _have_j=0 _have_s=0
+  _have_t=0 _have_s=0 HAVE_J=0 RECDOC=''
   _first=1
   while IFS=$TAB read -r k a b c d; do
     if [ "$_first" -eq 1 ]; then
@@ -265,8 +265,8 @@ check_work() {
         RETRIES=$a
         ;;
       J)
-        [ "$_have_j" -eq 0 ] || refuse bad_work "a journal record is repeated"
-        _have_j=1
+        [ "$HAVE_J" -eq 0 ] || refuse bad_work "a journal record is repeated"
+        HAVE_J=1
         is_hex_or_dash "$a" || refuse bad_work "the journal hash is wrong"
         JSEEN=$a
         ;;
@@ -282,6 +282,9 @@ check_work() {
           *) refuse bad_work "a staged file name is wrong" ;;
         esac
         is_hex64 "$b" || refuse bad_work "a staged file hash is wrong"
+        case $a in
+          record.*) RECDOC=$a ;;
+        esac
         NF=$((NF + 1))
         ;;
       W)
@@ -329,7 +332,11 @@ check_work() {
   esac
   plain_name "$MD" || refuse bad_work "the mode is wrong"
   case $OP in
-    probe | fingerprint | mirror)
+    probe | fingerprint)
+      [ "$RUN" = '-' ] || refuse bad_work "this operation belongs to no run"
+      plain_name "$GW" || refuse bad_work "the gateway is wrong"
+      ;;
+    mirror)
       [ "$RUN" = '-' ] && [ "$GW" = '-' ] || refuse bad_work "this operation belongs to no run"
       ;;
     *)
@@ -338,6 +345,11 @@ check_work() {
         *[!A-Za-z0-9._-]*) refuse bad_work "the run id is wrong" ;;
       esac
       [ "${#RUN}" -le 128 ] || refuse bad_work "the run id is too long"
+      ;;
+  esac
+  case $OP in
+    restore | finalize | discard)
+      [ "$HAVE_J" -eq 1 ] || refuse bad_work "the work list does not say which journal was seen"
       ;;
   esac
 }
@@ -355,7 +367,7 @@ check_roots() {
     refuse unsafe "the mode collection is a symlink"
   fi
   case $OP in
-    commit | verify | restore | finalize | discard | unstage)
+    commit | verify | restore | finalize | discard | unstage | probe | fingerprint)
       case $DE in
         */ign-deploy/"$GW"/"$MD") ;;
         *) refuse bad_roots "the deploy directory is not this gateway and mode" ;;
@@ -934,6 +946,119 @@ op_restore() {
   report restoring
 }
 
+op_fingerprint() {
+  check_work
+  check_roots
+  _out=''
+  while IFS=$TAB read -r k a b c d; do
+    if [ "$k" = P ]; then
+      if [ "$c" = ledger.json ]; then
+        live "$DE" ledger.json
+      else
+        live "$CO" "$c"
+      fi
+      if [ "$LIVE" = '!' ]; then
+        refuse not_regular "a path is not a regular file" "\"at\":$a"
+      fi
+      _out=${_out:+$_out,}\"$LIVE\"
+    fi
+  done <"$WORK"
+  emit "{\"ok\":1,\"hashes\":[$_out]}"
+}
+
+op_probe() {
+  check_work
+  check_roots
+  _problems=''
+  _add() {
+    _problems=${_problems:+$_problems,}\"$1\"
+  }
+  if [ -L "$CO" ]; then
+    _add coll_symlink
+  elif [ -d "$CO" ]; then
+    [ -w "$CO" ] || _add coll_unwritable
+  elif [ -e "$CO" ]; then
+    _add coll_not_dir
+  else
+    _res=${CO%/*}
+    if [ -d "$_res" ] && [ ! -L "$_res" ]; then
+      [ -w "$_res" ] || _add resources_unwritable
+    else
+      _add resources_missing
+    fi
+  fi
+  _ok=1
+  for _d in "${DE%/*/*}" "${DE%/*}" "$DE"; do
+    if [ -L "$_d" ]; then
+      _add deploy_symlink
+      _ok=0
+      break
+    elif [ -d "$_d" ]; then
+      :
+    elif [ -e "$_d" ]; then
+      _add deploy_not_dir
+      _ok=0
+      break
+    elif ! mkdir -- "$_d" 2>/dev/null; then
+      _add deploy_uncreatable
+      _ok=0
+      break
+    fi
+  done
+  if [ "$_ok" -eq 1 ]; then
+    _pf=$DE/probe-$$.tmp
+    rm -f -- "$_pf"
+    if (
+      set -C
+      : >"$_pf"
+    ) 2>/dev/null; then
+      rm -f -- "$_pf"
+    else
+      _add deploy_unwritable
+    fi
+  fi
+  emit "{\"ok\":1,\"problems\":[$_problems]}"
+}
+
+op_finalize() {
+  check_work
+  check_roots
+  [ -n "$RECDOC" ] || refuse bad_work "the work list names no record"
+  if ! verify_staged; then
+    refuse staged "a staged file does not match the work list" "\"bad\":[$BAD]"
+  fi
+  if [ ! -d "$DE/snapshots/$RUN" ] || [ -L "$DE/snapshots" ] || [ -L "$DE/snapshots/$RUN" ]; then
+    refuse no_snapshot "the run has no snapshot on this host"
+  fi
+  journal_unchanged || refuse journal_changed "the journal changed since it was read"
+  if ! replace_with "$ST/$RECDOC" "$DE/snapshots/$RUN/record.json"; then
+    refuse record "the run record could not be installed"
+  fi
+  if [ "$JSEEN" != '-' ]; then
+    rm -f -- "$DE/journal.json" || refuse journal "the journal could not be removed"
+  fi
+  if [ -d "$DE/staging" ] && [ ! -L "$DE/staging" ]; then
+    rm -rf -- "$DE/staging/$RUN" || refuse staging "the staging directory could not be removed"
+  fi
+  emit '{"ok":1}'
+}
+
+op_discard() {
+  check_work
+  check_roots
+  journal_unchanged || refuse journal_changed "the journal changed since it was read"
+  if [ -d "$DE/snapshots" ] && [ ! -L "$DE/snapshots" ]; then
+    rm -rf -- "$DE/snapshots/$RUN" || refuse snapshot "the snapshot could not be removed"
+  fi
+  if [ -d "$DE/staging" ] && [ ! -L "$DE/staging" ]; then
+    rm -rf -- "$DE/staging/$RUN" || refuse staging "the staging directory could not be removed"
+  fi
+  if [ "$JSEEN" != '-' ]; then
+    rm -f -- "$DE/journal.json" || refuse journal "the journal could not be removed"
+  fi
+  emit '{"ok":1}'
+}
+
 op_verify() {
   check_work
   check_roots
@@ -1036,6 +1161,10 @@ op_commit() {
 case $OP in
   commit) op_commit ;;
   restore) op_restore ;;
+  fingerprint) op_fingerprint ;;
+  probe) op_probe ;;
+  finalize) op_finalize ;;
+  discard) op_discard ;;
   verify) op_verify ;;
   unstage) op_unstage ;;
   *) refuse bad_op "this script does not know the operation" ;;

@@ -24,8 +24,9 @@
 //! P<TAB><index><TAB><pre sha256 or -><TAB><path>                  (restore, fingerprint)
 //! ```
 //!
-//! `R` and `G` are `-` for the operations that belong to no run (`probe`,
-//! `fingerprint`, `mirror`). A `mirror` list's `W` records carry `-` as the
+//! `R` is `-` for the operations that belong to no run (`probe`,
+//! `fingerprint`, `mirror`) and `G` is `-` for `mirror`, which touches no
+//! gateway directory. A `mirror` list's `W` records carry `-` as the
 //! expected live hash, which the operation ignores (a mirror writes over
 //! whatever regular file is there).
 //!
@@ -141,9 +142,14 @@ impl WorkOp {
         .find(|op| op.word() == word)
     }
 
-    /// The operations that belong to no run: their `R` and `G` are `-`.
+    /// The operations that belong to no run: their `R` is `-`.
     fn is_runless(self) -> bool {
         matches!(self, WorkOp::Probe | WorkOp::Fingerprint | WorkOp::Mirror)
+    }
+
+    /// The operations that touch no gateway directory either: `G` is `-`.
+    fn is_gatewayless(self) -> bool {
+        self == WorkOp::Mirror
     }
 }
 
@@ -362,16 +368,21 @@ impl WorkList {
         Ok(list)
     }
 
-    /// The work list of a writability probe of the `mode` collection.
-    pub fn for_probe(mode: &str) -> Result<WorkList, String> {
-        let list = WorkList::empty(WorkOp::Probe, "-", "-", mode);
+    /// The work list of a writability probe of the `mode` collection and the
+    /// `ign-deploy` root of `gateway`.
+    pub fn for_probe(gateway: &str, mode: &str) -> Result<WorkList, String> {
+        let list = WorkList::empty(WorkOp::Probe, "-", gateway, mode);
         list.validate()?;
         Ok(list)
     }
 
     /// The work list that reads the live hash of each of `paths`.
-    pub fn for_fingerprint(mode: &str, paths: &[String]) -> Result<WorkList, String> {
-        let mut list = WorkList::empty(WorkOp::Fingerprint, "-", "-", mode);
+    pub fn for_fingerprint(
+        gateway: &str,
+        mode: &str,
+        paths: &[String],
+    ) -> Result<WorkList, String> {
+        let mut list = WorkList::empty(WorkOp::Fingerprint, "-", gateway, mode);
         list.restores = paths
             .iter()
             .map(|path| WorkRestore {
@@ -410,16 +421,18 @@ impl WorkList {
     /// The first thing wrong with the list, as a value-free problem.
     fn validate(&self) -> Result<(), String> {
         if self.op.is_runless() {
-            if self.run_id != "-" || self.gateway != "-" {
+            if self.run_id != "-" {
                 return Err("this operation belongs to no run".to_string());
             }
-        } else {
-            if RunId::parse(&self.run_id).is_err() {
-                return Err("the run id is not valid".to_string());
+        } else if RunId::parse(&self.run_id).is_err() {
+            return Err("the run id is not valid".to_string());
+        }
+        if self.op.is_gatewayless() {
+            if self.gateway != "-" {
+                return Err("this operation belongs to no gateway".to_string());
             }
-            if let Some(why) = crate::deploy::component_problem(&self.gateway) {
-                return Err(format!("the gateway {why}"));
-            }
+        } else if let Some(why) = crate::deploy::component_problem(&self.gateway) {
+            return Err(format!("the gateway {why}"));
         }
         if let Some(why) = super::mirror_mode_problem(&self.mode) {
             return Err(why);
@@ -962,6 +975,56 @@ mod tests {
             path: LEDGER_KEY.to_string(),
             pre: None,
         });
+        assert!(list.validate().is_err());
+    }
+
+    #[test]
+    fn the_other_operations_round_trip_and_refuse_foreign_records() {
+        let lists = [
+            WorkList::for_probe("gw", "dev").expect("probe"),
+            WorkList::for_fingerprint(
+                "gw",
+                "dev",
+                &[
+                    "ignition/type/a/config.json".to_string(),
+                    LEDGER_KEY.to_string(),
+                ],
+            )
+            .expect("fingerprint"),
+            WorkList::for_discard(RUN, "gw", "dev", SeenJournal::Hash(H1.to_string()))
+                .expect("discard"),
+            WorkList::for_discard(RUN, "gw", "dev", SeenJournal::Absent).expect("discard"),
+            WorkList::for_unstage(RUN, "gw", "dev").expect("unstage"),
+            WorkList::for_mirror(
+                "dev",
+                "/home/svc/stage",
+                &[(rel("ignition/type/a/config.json"), H1.to_string())],
+                &[rel("ignition/type/c/config.json")],
+            )
+            .expect("mirror"),
+        ];
+        for list in lists {
+            let bytes = list.to_lines();
+            assert_eq!(WorkList::parse_lines(&bytes).expect("parse"), list);
+        }
+        // a probe belongs to no run; a mirror to no gateway either
+        let mut bad = WorkList::empty(WorkOp::Probe, RUN, "gw", "dev");
+        assert!(bad.validate().is_err());
+        bad = WorkList::empty(WorkOp::Mirror, "-", "gw", "dev");
+        bad.source = Some("/a/b".to_string());
+        assert!(bad.validate().is_err());
+        // a mirror needs an absolute, plain source; only a mirror has one
+        assert!(WorkList::for_mirror("dev", "relative", &[], &[]).is_err());
+        assert!(WorkList::for_mirror("dev", "/a/../b", &[], &[]).is_err());
+        let mut list = commit_list();
+        list.source = Some("/a/b".to_string());
+        assert!(list.validate().is_err());
+        // a retry count over the limit and an unknown staged name are refused
+        let mut list = commit_list();
+        list.retries = 11;
+        assert!(list.validate().is_err());
+        let mut list = commit_list();
+        list.docs[0].name = "../journal.ready.json".to_string();
         assert!(list.validate().is_err());
     }
 
