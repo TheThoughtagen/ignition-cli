@@ -30,7 +30,7 @@
 
 use std::time::Duration;
 
-use super::Steps;
+use super::{ApplyEvent, Steps};
 use serde_json::Value;
 
 use super::hold::{Clock, HoldModel, hold_for};
@@ -244,7 +244,7 @@ impl PreflightReport {
 /// unreachable gateway or host is that call's own error, not a finding.
 pub async fn run_preflights(
     input: &PreflightInput<'_>,
-    _steps: &mut Steps<'_>,
+    steps: &mut Steps<'_>,
 ) -> Result<PreflightReport, CoreError> {
     let mut findings = Vec::with_capacity(PreflightCheck::ALL.len());
     let mode = input.target.mode.as_str();
@@ -270,7 +270,7 @@ pub async fn run_preflights(
     findings.push(wrong_target_finding(input).await?);
     findings.push(write_rest_finding(input.gateway).await?);
     findings.push(write_host_finding(input.host).await?);
-    let (designers, designers_seen) = designers_finding(input).await?;
+    let (designers, designers_seen) = designers_finding(input, steps).await?;
     findings.push(designers);
     findings.push(hold_budget_finding(input.hold, input.touched_files));
 
@@ -500,13 +500,71 @@ fn designers_detail(open: &[DesignerSeen]) -> String {
     text
 }
 
+/// What `wait` does next, given the sessions still open and the time spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitStep {
+    /// No session is open.
+    Clear,
+    /// Still open and the timeout has passed.
+    TimedOut,
+    /// Still open: sleep this long, then read again.
+    Sleep(Duration),
+}
+
+/// The decision of the `wait` loop. A timeout equal to the elapsed time has
+/// passed, and the last sleep never runs past the timeout.
+pub(crate) fn wait_step(open: usize, elapsed: Duration, policy: &DesignersPolicy) -> WaitStep {
+    if open == 0 {
+        WaitStep::Clear
+    } else if elapsed >= policy.timeout {
+        WaitStep::TimedOut
+    } else {
+        WaitStep::Sleep(
+            policy
+                .interval
+                .max(Duration::from_millis(1))
+                .min(policy.timeout - elapsed),
+        )
+    }
+}
+
 async fn designers_finding(
     input: &PreflightInput<'_>,
+    steps: &mut Steps<'_>,
 ) -> Result<(PreflightFinding, Vec<DesignerSeen>), CoreError> {
     let check = PreflightCheck::Designers;
-    let open = read_designers(input.gateway).await?;
+    let policy = input.designers;
+    let started = input.clock.now();
+    let mut open = read_designers(input.gateway).await?;
+    if policy.mode == DesignersMode::Wait {
+        loop {
+            steps.emit(ApplyEvent::DesignersPoll { open: open.len() })?;
+            let elapsed = input.clock.now().saturating_duration_since(started);
+            match wait_step(open.len(), elapsed, policy) {
+                WaitStep::Clear | WaitStep::TimedOut => break,
+                WaitStep::Sleep(pause) => {
+                    tokio::time::sleep(pause).await;
+                    open = read_designers(input.gateway).await?;
+                }
+            }
+        }
+    }
     let found = if open.is_empty() {
         finding(check, true, "no Designer session is open".to_string())
+    } else if policy.mode == DesignersMode::Proceed {
+        // D-15: going ahead is allowed only with the choice and the sessions
+        // on record (run.json and the events).
+        steps.emit(ApplyEvent::DesignersProceed {
+            sessions: open.clone(),
+        })?;
+        finding(
+            check,
+            true,
+            format!(
+                "{}; going ahead because --designers proceed was given",
+                designers_detail(&open)
+            ),
+        )
     } else {
         finding(check, false, designers_detail(&open))
     };

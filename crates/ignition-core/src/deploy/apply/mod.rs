@@ -370,6 +370,16 @@ pub enum ApplyEvent {
         /// `(check id, status)` in report order.
         checks: Vec<(String, String)>,
     },
+    /// The Designer list was read under `--designers wait`.
+    DesignersPoll {
+        /// Sessions open at this read.
+        open: usize,
+    },
+    /// `--designers proceed` went ahead over these open sessions (D-15).
+    DesignersProceed {
+        /// `(user, project, host)` of each open session.
+        sessions: Vec<preflight::DesignerSeen>,
+    },
     /// The run failed.
     Failed {
         /// The error code slug.
@@ -393,6 +403,8 @@ impl ApplyEvent {
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
             ApplyEvent::PreflightChecks { .. } => "preflight_checks",
+            ApplyEvent::DesignersPoll { .. } => "designers_poll",
+            ApplyEvent::DesignersProceed { .. } => "designers_proceed",
             ApplyEvent::Failed { .. } => "failed",
         }
     }
@@ -422,6 +434,13 @@ impl ApplyEvent {
                 "checks": checks
                     .iter()
                     .map(|(id, status)| json!({"id": id, "status": status}))
+                    .collect::<Vec<_>>(),
+            }),
+            ApplyEvent::DesignersPoll { open } => json!({"open": open}),
+            ApplyEvent::DesignersProceed { sessions } => json!({
+                "sessions": sessions
+                    .iter()
+                    .map(|(user, project, host)| json!({"user": user, "project": project, "host": host}))
                     .collect::<Vec<_>>(),
             }),
             ApplyEvent::RestoreStarted { cause } => json!({"cause": cause.as_str()}),
