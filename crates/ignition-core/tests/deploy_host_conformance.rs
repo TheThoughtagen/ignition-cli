@@ -1198,6 +1198,173 @@ async fn stub_refuses_a_tampered_work_list() {
     assert!(!c.snapshot_dir(RUN).exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_fingerprint_is_read_only() {
+    run_sh("fingerprint_is_read_only").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_finalize_removes_journal_and_staging_keeps_snapshot() {
+    run_sh("finalize_removes_journal_and_staging_keeps_snapshot").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_discard_interrupted_touches_no_collection_file() {
+    run_sh("discard_interrupted_touches_no_collection_file").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_fetch_snapshot_copies_with_hashes() {
+    run_sh("fetch_snapshot_copies_with_hashes").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_read_record_absent_is_none() {
+    run_sh("read_record_absent_is_none").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_probe_reports_writable_without_touching_the_collection() {
+    run_sh("probe_reports_writable_without_touching_the_collection").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_replace_file() {
+    run_sh("replace_file").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_delete_file_and_emptied_dirs() {
+    run_sh("delete_file_and_emptied_dirs").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_ledger_swap_and_restore() {
+    run_sh("ledger_swap_and_restore").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_pre_image_mismatch_aborts_before_any_move() {
+    run_sh("pre_image_mismatch_aborts_before_any_move").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_journal_present_refuses() {
+    run_sh("journal_present_refuses").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_self_move_refused() {
+    run_sh("self_move_refused").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_gateway_owned_file_refused() {
+    run_sh("gateway_owned_file_refused").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_directory_where_file_goes_is_stale() {
+    run_sh("directory_where_file_goes_is_stale").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_symlinked_target_dir_is_refused() {
+    run_sh("symlinked_target_dir_is_refused").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_restore_twice_is_idempotent() {
+    run_sh("restore_twice_is_idempotent").await;
+}
+
+/// A moved file is 0644 and a directory the commit created is 0755, even when
+/// the staged copy was 0600 (research A6; unproven against a live Linux
+/// gateway host, which the README states).
+#[cfg(unix)]
+#[tokio::test]
+async fn sh_moved_files_are_0644() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = Ctx::sh();
+    let batch = c.batch(RUN, &[(FILE_A, br#"{"a":1}"#)], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let staged = c.staging_dir(RUN).join("files").join(FILE_A);
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let mode = |rel: &str| {
+        std::fs::metadata(c.collection().join(rel))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(FILE_A), 0o644, "the moved file");
+    for dir in ["ignition", "ignition/tag-provider", "ignition/tag-provider/default"] {
+        assert_eq!(mode(dir), 0o755, "{dir}");
+    }
+}
+
+/// A target made unwritable after `prepare` fails the commit naming that
+/// entry's index at phase `writing`; `restore` returns the pre-run listing.
+#[cfg(unix)]
+#[tokio::test]
+async fn sh_failed_move_reports_index() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix_is_root() {
+        return; // root ignores directory modes
+    }
+    const A: &str = "ignition/tag-provider/a/config.json";
+    const B: &str = "ignition/tag-provider/b/config.json";
+    let c = Ctx::sh();
+    c.seed(A, b"old a");
+    c.seed(B, b"old b");
+    let before = c.listing();
+    let batch = c.batch(RUN, &[(A, b"new a"), (B, b"new b")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let locked = c.collection().join("ignition/tag-provider/b");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("lock");
+
+    let report = c.host.commit(&prepared).await.expect("commit");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+    assert_eq!(report.phase, JournalPhase::Writing, "{report:?}");
+    assert_eq!(report.moved, vec![0], "{report:?}");
+    let failure = report.failure.clone().expect("a failure");
+    assert!(failure.contains("write 1"), "{failure}");
+    assert!(!failure.contains("config.json"), "no path in the reason: {failure}");
+    assert_eq!(c.listing().get(A), Some(&sha256_hex(b"new a")));
+    assert_eq!(c.listing().get(B), Some(&sha256_hex(b"old b")));
+
+    let record = c.record(RUN).expect("record");
+    let restored = c.host.restore(&record).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before, "restore returns the pre-run listing");
+}
+
 // ---- fault rows (local host only) ---------------------------------------------
 
 const FILE_C: &str = "ignition/tag-provider/default/third.json";
@@ -1451,6 +1618,21 @@ async fn faulty_host_runs_a_hook_after_the_nth_call() {
         .expect("second prepare");
     assert_eq!(prepares.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(host.calls(), vec!["prepare", "commit", "prepare"]);
+}
+
+/// Every row also runs against the POSIX script host on unix.
+#[cfg(unix)]
+#[test]
+fn every_row_runs_against_the_sh_host() {
+    let source = include_str!("deploy_host_conformance.rs");
+    for row in scenarios() {
+        let wired = format!("run_sh(\"{}\")", row.name);
+        assert!(
+            source.contains(&wired),
+            "row {} is not run against the sh host",
+            row.name
+        );
+    }
 }
 
 /// Every row has a test above, so adding a row without wiring it fails here.
