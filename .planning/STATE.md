@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-17-PLAN.md
-last_updated: "2026-10-16T21:38:14.101Z"
+stopped_at: Completed 23-07-PLAN.md
+last_updated: "2026-10-16T22:36:29.740Z"
 last_activity: 2026-10-16
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 40
+  completed_plans: 41
   percent: 50
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 10 of 21
+Plan: 11 of 21
 Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [████████░░] 77%
+Progress: [████████░░] 79%
 
 ## Performance Metrics
 
@@ -85,6 +85,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P05 | 2h50m | 2 tasks | 6 files |
 | Phase 23 P06 | 5h | 3 tasks | 8 files |
 | Phase 23 P17 | 1h | 3 tasks | 4 files |
+| Phase 23 P07 | 2h | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -122,8 +123,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T21:38:14.077Z
-**Stopped At:** Completed 23-17-PLAN.md
+**Last session:** 2026-10-16T22:36:29.719Z
+**Stopped At:** Completed 23-07-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -191,3 +192,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 23-06: Linux ssh apply is one hash-checked POSIX sh call; operations with no staging directory use a throw-away .ign-ctl-* directory the script removes on exit; the journal hash seen outside the lock rides in the work list (J record)
 - [Phase ?]: 23-17: HeldLock remembers which hold is ours (timestamp and actor read once after the grant); another actor's lock reads as NotHeld, so the DAPL-07 lock-taken case ends rollback_failed
 - [Phase ?]: 23-17: restore_snapshot reuses the held lock on the gateway's remaining alone; the local clock can only read shorter, so it is not consulted
+- [Phase 23]: 23-07: NodeTarget.gateway_name added (optional, validated); wrong_target compares the master only, backup value validated but unused
+- [Phase 23]: 23-07: an unanswerable preflight (network_error, transport_failed) aborts after run.json and result.json are written; it is never folded into deploy_preflight_failed
