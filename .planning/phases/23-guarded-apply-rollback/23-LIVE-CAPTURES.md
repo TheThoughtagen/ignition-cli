@@ -356,6 +356,1520 @@ Content-Length: 60
 [curl http=200 total=0.024002s]
 ~~~
 
+## C2
+
+What the config scan-lock blocks (research Pitfall 1, Phase 20 D1/D2/D4/D8/D12). Token A holds the lock; token B and the host filesystem are the other actors. Sub-probes (a), (c), (d), (e); (b), a Designer or gateway-UI save under a held lock, is the manual section C2b. Each sub-probe restores the rig afterwards.
+
+### C2a — token A holds the lock (hold 60 s); token B creates a resource through the API
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:22:25Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:22:25 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160508037,
+  "lastScanDuration": 276
+}
+[curl http=200 total=0.005229s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:22:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:22:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160545746,
+  "lastScanDuration": 358
+}
+[curl http=200 total=0.004634s]
+~~~
+
+#### the request body of the write by token B
+
+`cat /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.NeNVhHDHE6/c2a-body.json ` @ 2026-10-16T14:22:26Z
+
+~~~
+[{"name":"C2_B_WRITE","config":{"connectURL":"jdbc:postgresql://mode-host:5432/spike","driver":"PostgreSQL","translator":"POSTGRES","username":"spike","validationQuery":"SELECT 1","poolMaxActive":8}}]
+[exit 0]
+~~~
+
+#### POST scan-lock/config by token A (acquire 5, hold 60)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/json --data {"acquireTimeout":5,"holdTimeout":60} '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:22:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:22:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "timestamp": 11148005,
+  "remaining": 59,
+  "actor": "api-token:cap-a:192.168.147.1"
+}
+[curl http=200 total=0.014621s]
+~~~
+
+#### GET scan-lock/config by token B, before its write
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_B] '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:22:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:22:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "timestamp": 11148005,
+  "remaining": 59,
+  "actor": "api-token:cap-a:192.168.147.1"
+}
+[curl http=200 total=0.009977s]
+~~~
+
+#### POST resources/ignition/database-connection by token B while A holds the lock
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_B] -H Content-Type: application/json --data @/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.NeNVhHDHE6/c2a-body.json '$BASE/data/api/v1/resources/ignition/database-connection'` @ 2026-10-16T14:22:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:22:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 263
+
+{
+  "success": true,
+  "changes": [
+    {
+      "name": "C2_B_WRITE",
+      "type": "ignition/database-connection",
+      "collection": "core",
+      "newSignature": "f857151f14ce1f1924531491e1ba15da7a294bd92094ba1463d52371665a17d1"
+    }
+  ],
+  "problem": null
+}
+[curl http=200 total=59.943446s]
+~~~
+
+#### GET scan-lock/config by token A, after the write
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:23:26Z
+
+~~~
+HTTP/1.1 204 No Content
+Date: Fri, 16 Oct 2026 14:23:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+
+
+[curl http=204 total=0.012304s]
+~~~
+
+#### GET resources/list/ignition/database-connection (is C2_B_WRITE in the view?)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/database-connection?limit=-1'` @ 2026-10-16T14:23:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 8363
+
+{"items":[{"type":"ignition/database-connection","name":"C2_B_WRITE","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"f857151f14ce1f1924531491e1ba15da7a294bd92094ba1463d52371665a17d1","config":{"driver":"PostgreSQL","translator":"POSTGRES","includeSchemaInTableName":false,"connectURL":"jdbc:postgresql://mode-host:5432/spike","username":"spike","connectionProps":"","connectionResetParams":"","defaultTransactionLevel":"DEFAULT","poolInitSize":0,"poolMaxActive":8,"poolMaxIdle":8,"poolMinIdle":0,"poolMaxWait":5000,"validationQuery":"SELECT 1","testOnBorrow":true,"testOnReturn":false,"testWhileIdle":false,"evictionRate":-1,"evictionTests":3,"evictionTime":1800000,"failoverMode":"STANDARD","slowQueryLogThreshold":60000,"validationSleepTime":10000},"data":["config.json"],"attributes":{"uuid":"ef0dc841-f5a9-4c8c-9cbb-a87a31e3d324","enabled":true},"metrics":{"active-connections":{"name":"databases.connection-C2_B_WRITE.active-connections","metric":{"value":0.0,"numerator":0.0,"denominator":8.0,"type":"ratio-gauge","description":"Active Connections","units":""}},"active-queries":{"name":"databases.connection-C2_B_WRITE.active-queries","metric":{"value":[],"type":"gauge","description":"Active Queries","units":"queries"}},"expensive-queries":{"name":"databases.connection-C2_B_WRITE.expensive-queries","metric":{"value":[],"type":"gauge","description":"Expensive Queries","units":"queries"}},"queries":{"name":"databases.connection-C2_B_WRITE.queries","metric":{"oneMinuteRate":0.0,"fiveMinuteRate":0.0,"fifteenMinuteRate":0.0,"count":0,"meanRate":0.0,"histogram":{"max":0.0,"min":0.0,"p50":0.0,"p75":0.0,"p95":0.0,"p98":0.0,"p99":0.0,"mean":0.0,"bucketSize":0.0,"buckets":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"type":"histogram","stdev":0.0},"type":"timer"}},"rows":{"name":"databases.connection-C2_B_WRITE.rows","metric":{"oneMinuteRate":0.0,"fiveMinuteRate":0.0,"fifteenMinuteRate":0.0,"count":0,"meanRate":0.0,"type":"meter"}},"throughput":{"name":"databases.connection-C2_B_WRITE.throughput","metric":{"value":-1.0,"type":"gauge","description":"","units":"queries/sec"}}},"healthchecks":{"status":{"name":"databases.connection-C2_B_WRITE.status","result":{"healthy":false,"time":1792160606587,"message":"Faulted","error":{"message":"Cannot create PoolableConnectionFactory (The connection attempt failed.)","stacktrace":["java.sql.SQLException: Cannot create PoolableConnectionFactory (The connection attempt failed.)","\tat org.apache.commons.dbcp2.BasicDataSource.createPoolableConnectionFactory(BasicDataSource.java:645)","\tat org.apache.commons.dbcp2.BasicDataSource.createDataSource(BasicDataSource.java:546)","\tat org.apache.commons.dbcp2.BasicDataSource.getConnection(BasicDataSource.java:723)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceImpl.getConnectionInternal(DatasourceImpl.java:373)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceImpl.runTest(DatasourceImpl.java:326)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceManagerImpl$FaultedDatasourceRetryer.lambda$newRetryRunnable$0(DatasourceManagerImpl.java:1233)","\tat com.inductiveautomation.ignition.common.execution.impl.BasicExecutionEngine$TrackedTask.run(BasicExecutionEngine.java:599)","\tat java.base/java.util.concurrent.Executors$RunnableAdapter.call(Unknown Source)","\tat java.base/java.util.concurrent.FutureTask.runAndReset(Unknown Source)","\tat java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(Unknown Source)","\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)","\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)","\tat java.base/java.lang.Thread.run(Unknown Source)","Caused by: org.postgresql.util.PSQLException: The connection attempt failed.","\tat org.postgresql.core.v3.ConnectionFactoryImpl.openConnectionImpl(ConnectionFactoryImpl.java:358)","\tat org.postgresql.core.ConnectionFactory.openConnection(ConnectionFactory.java:54)","\tat org.postgresql.jdbc.PgConnection.<init>(PgConnection.java:273)","\tat org.postgresql.Driver.makeConnection(Driver.java:446)","\tat org.postgresql.Driver.connect(Driver.java:298)","\tat org.apache.commons.dbcp2.DriverConnectionFactory.createConnection(DriverConnectionFactory.java:52)","\tat org.apache.commons.dbcp2.PoolableConnectionFactory.makeObject(PoolableConnectionFactory.java:481)","\tat org.apache.commons.dbcp2.BasicDataSource.validateConnectionFactory(BasicDataSource.java:114)","\tat org.apache.commons.dbcp2.BasicDataSource.createPoolableConnectionFactory(BasicDataSource.java:641)","\tat org.apache.commons.dbcp2.BasicDataSource.createDataSource(BasicDataSource.java:546)","\tat org.apache.commons.dbcp2.BasicDataSource.getConnection(BasicDataSource.java:723)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceImpl.getConnectionInternal(DatasourceImpl.java:373)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceImpl.runTest(DatasourceImpl.java:326)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceManagerImpl$FaultedDatasourceRetryer.lambda$newRetryRunnable$0(DatasourceManagerImpl.java:1233)","\tat com.inductiveautomation.ignition.common.execution.impl.BasicExecutionEngine$TrackedTask.run(BasicExecutionEngine.java:599)","\tat java.base/java.util.concurrent.Executors$RunnableAdapter.call(Unknown Source)","\tat java.base/java.util.concurrent.FutureTask.runAndReset(Unknown Source)","\tat java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(Unknown Source)","\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)","\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)","\tat java.base/java.lang.Thread.run(Unknown Source)","Caused by: java.net.UnknownHostException: mode-host","\tat java.base/sun.nio.ch.NioSocketImpl.connect(Unknown Source)","\tat java.base/java.net.SocksSocketImpl.connect(Unknown Source)","\tat java.base/java.net.Socket.connect(Unknown Source)","\tat org.postgresql.core.PGStream.createSocket(PGStream.java:243)","\tat org.postgresql.core.PGStream.<init>(PGStream.java:98)","\tat org.postgresql.core.v3.ConnectionFactoryImpl.tryConnect(ConnectionFactoryImpl.java:136)","\tat org.postgresql.core.v3.ConnectionFactoryImpl.openConnectionImpl(ConnectionFactoryImpl.java:262)","\tat org.postgresql.core.ConnectionFactory.openConnection(ConnectionFactory.java:54)","\tat org.postgresql.jdbc.PgConnection.<init>(PgConnection.java:273)","\tat org.postgresql.Driver.makeConnection(Driver.java:446)","\tat org.postgresql.Driver.connect(Driver.java:298)","\tat org.apache.commons.dbcp2.DriverConnectionFactory.createConnection(DriverConnectionFactory.java:52)","\tat org.apache.commons.dbcp2.PoolableConnectionFactory.makeObject(PoolableConnectionFactory.java:481)","\tat org.apache.commons.dbcp2.BasicDataSource.validateConnectionFactory(BasicDataSource.java:114)","\tat org.apache.commons.dbcp2.BasicDataSource.createPoolableConnectionFactory(BasicDataSource.java:641)","\tat org.apache.commons.dbcp2.BasicDataSource.createDataSource(BasicDataSource.java:546)","\tat org.apache.commons.dbcp2.BasicDataSource.getConnection(BasicDataSource.java:723)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceImpl.getConnectionInternal(DatasourceImpl.java:373)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceImpl.runTest(DatasourceImpl.java:326)","\tat com.inductiveautomation.ignition.gateway.datasource.DatasourceManagerImpl$FaultedDatasourceRetryer.lambda$newRetryRunnable$0(DatasourceManagerImpl.java:1233)","\tat com.inductiveautomation.ignition.common.execution.impl.BasicExecutionEngine$TrackedTask.run(BasicExecutionEngine.java:599)","\tat java.base/java.util.concurrent.Executors$RunnableAdapter.call(Unknown Source)","\tat java.base/java.util.concurrent.FutureTask.runAndReset(Unknown Source)","\tat java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(Unknown Source)","\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)","\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)","\tat java.base/java.lang.Thread.run(Unknown Source)"]}}}}}],"metadata":{"total":1,"matching":1,"limit":-1,"offset":0}}
+[curl http=200 total=0.038227s]
+~~~
+
+### C2a — restore: scan, remove C2_B_WRITE from the bind mount, scan, post-state
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:23:26Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:26 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160545746,
+  "lastScanDuration": 358
+}
+[curl http=200 total=0.005602s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:23:27Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:27 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160607061,
+  "lastScanDuration": 368
+}
+[curl http=200 total=0.005037s]
+~~~
+
+#### every path of C2_B_WRITE on the bind mount before removal
+
+`bash -c find\ .\ -path\ \"\*/database-connection/C2_B_WRITE\*\"\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:23:27Z
+
+~~~
+./core/ignition/database-connection/C2_B_WRITE
+./core/ignition/database-connection/C2_B_WRITE/config.json
+./core/ignition/database-connection/C2_B_WRITE/resource.json
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:23:27Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:27 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160607061,
+  "lastScanDuration": 368
+}
+[curl http=200 total=0.005257s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:23:28Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:28 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160607640,
+  "lastScanDuration": 164
+}
+[curl http=200 total=0.006196s]
+~~~
+
+#### GET scan-lock/config (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:23:28Z
+
+~~~
+HTTP/1.1 204 No Content
+Date: Fri, 16 Oct 2026 14:23:28 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+
+
+[curl http=204 total=0.003743s]
+~~~
+
+#### GET resources/list/ignition/database-connection (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/database-connection?limit=-1'` @ 2026-10-16T14:23:28Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:28 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.017069s]
+~~~
+
+### C2c — no lock: a resource written into production/ with no lock and no scan request (poll every 5 s for 120 s)
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:23:28Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:28 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160607640,
+  "lastScanDuration": 164
+}
+[curl http=200 total=0.010018s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:23:28Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:23:28 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160608501,
+  "lastScanDuration": 168
+}
+[curl http=200 total=0.004215s]
+~~~
+
+#### C2_NOLOCK written into production/ (relative paths)
+
+`bash -c find\ production\ -path\ \"\*C2_NOLOCK\*\"\ -type\ f\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:23:29Z
+
+~~~
+production/ignition/database-connection/C2_NOLOCK/config.json
+production/ignition/database-connection/C2_NOLOCK/resource.json
+[exit 0]
+~~~
+
+#### poll 120 s: lastScanTimestamp, scanActive, visibility, lock, no scan request sent
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-deploy/capture23.sh c2poll 120 C2_NOLOCK ` @ 2026-10-16T14:23:29Z
+
+~~~
+t+0s 2026-10-16T14:23:29Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+5s 2026-10-16T14:23:34Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+10s 2026-10-16T14:23:39Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+16s 2026-10-16T14:23:45Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+21s 2026-10-16T14:23:50Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+27s 2026-10-16T14:23:57Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+33s 2026-10-16T14:24:02Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+38s 2026-10-16T14:24:07Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+43s 2026-10-16T14:24:12Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+48s 2026-10-16T14:24:17Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+53s 2026-10-16T14:24:23Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+59s 2026-10-16T14:24:28Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+64s 2026-10-16T14:24:33Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+69s 2026-10-16T14:24:38Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+74s 2026-10-16T14:24:43Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+79s 2026-10-16T14:24:48Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+84s 2026-10-16T14:24:53Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+89s 2026-10-16T14:24:59Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+95s 2026-10-16T14:25:04Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+100s 2026-10-16T14:25:09Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+105s 2026-10-16T14:25:14Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+110s 2026-10-16T14:25:19Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+115s 2026-10-16T14:25:25Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+t+121s 2026-10-16T14:25:30Z lastScanTimestamp=1792160608501 scanActive=false in_rest_view=no scan_lock=free
+[exit 0]
+~~~
+
+### C2c — restore: scan, remove C2_NOLOCK from the bind mount, scan, post-state
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:25:30Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:30 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160608501,
+  "lastScanDuration": 168
+}
+[curl http=200 total=0.004437s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:25:31Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:31 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160730801,
+  "lastScanDuration": 413
+}
+[curl http=200 total=0.005087s]
+~~~
+
+#### every path of C2_NOLOCK on the bind mount before removal
+
+`bash -c find\ .\ -path\ \"\*/database-connection/C2_NOLOCK\*\"\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:25:31Z
+
+~~~
+./production/ignition/database-connection/C2_NOLOCK
+./production/ignition/database-connection/C2_NOLOCK/config.json
+./production/ignition/database-connection/C2_NOLOCK/resource.json
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:25:31Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:31 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160730801,
+  "lastScanDuration": 413
+}
+[curl http=200 total=0.006998s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:25:32Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:32 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160731888,
+  "lastScanDuration": 157
+}
+[curl http=200 total=0.004362s]
+~~~
+
+#### GET scan-lock/config (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:25:32Z
+
+~~~
+HTTP/1.1 204 No Content
+Date: Fri, 16 Oct 2026 14:25:32 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+
+
+[curl http=204 total=0.012024s]
+~~~
+
+#### GET resources/list/ignition/database-connection (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/database-connection?limit=-1'` @ 2026-10-16T14:25:32Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:32 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.008453s]
+~~~
+
+### C2d — the same while token A holds the lock (hold 150 s, covers the whole window)
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:25:32Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:32 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160731888,
+  "lastScanDuration": 157
+}
+[curl http=200 total=0.009894s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:25:33Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:33 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160732840,
+  "lastScanDuration": 175
+}
+[curl http=200 total=0.004898s]
+~~~
+
+#### POST scan-lock/config by token A (acquire 5, hold 150)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/json --data {"acquireTimeout":5,"holdTimeout":150} '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:25:33Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:25:33 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 91
+
+{
+  "timestamp": 11334938,
+  "remaining": 149,
+  "actor": "api-token:cap-a:192.168.147.1"
+}
+[curl http=200 total=0.009084s]
+~~~
+
+#### C2_HELD written into production/ while the lock is held (relative paths)
+
+`bash -c find\ production\ -path\ \"\*C2_HELD\*\"\ -type\ f\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:25:33Z
+
+~~~
+production/ignition/database-connection/C2_HELD/config.json
+production/ignition/database-connection/C2_HELD/resource.json
+[exit 0]
+~~~
+
+#### poll 120 s: lastScanTimestamp, scanActive, visibility, lock, no scan request sent
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-deploy/capture23.sh c2poll 120 C2_HELD ` @ 2026-10-16T14:25:33Z
+
+~~~
+t+0s 2026-10-16T14:25:33Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=149
+t+5s 2026-10-16T14:25:39Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=144
+t+11s 2026-10-16T14:25:44Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=139
+t+16s 2026-10-16T14:25:49Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=134
+t+21s 2026-10-16T14:25:54Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=128
+t+26s 2026-10-16T14:25:59Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=123
+t+31s 2026-10-16T14:26:05Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=117
+t+37s 2026-10-16T14:26:10Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=112
+t+42s 2026-10-16T14:26:15Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=107
+t+47s 2026-10-16T14:26:20Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=102
+t+52s 2026-10-16T14:26:26Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=97
+t+58s 2026-10-16T14:26:31Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=92
+t+63s 2026-10-16T14:26:36Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=87
+t+68s 2026-10-16T14:26:41Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=81
+t+73s 2026-10-16T14:26:47Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=76
+t+79s 2026-10-16T14:26:52Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=71
+t+84s 2026-10-16T14:26:57Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=66
+t+89s 2026-10-16T14:27:02Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=60
+t+94s 2026-10-16T14:27:08Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=55
+t+100s 2026-10-16T14:27:13Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=49
+t+105s 2026-10-16T14:27:18Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=44
+t+110s 2026-10-16T14:27:23Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=39
+t+115s 2026-10-16T14:27:28Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=34
+t+121s 2026-10-16T14:27:34Z lastScanTimestamp=1792160732840 scanActive=false in_rest_view=no scan_lock=held remaining=29
+[exit 0]
+~~~
+
+### C2d — restore: scan, remove C2_HELD from the bind mount, scan, post-state
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:27:34Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:34 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160732840,
+  "lastScanDuration": 175
+}
+[curl http=200 total=0.005540s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:27:34Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:34 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160854698,
+  "lastScanDuration": 464
+}
+[curl http=200 total=0.004454s]
+~~~
+
+#### every path of C2_HELD on the bind mount before removal
+
+`bash -c find\ .\ -path\ \"\*/database-connection/C2_HELD\*\"\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:27:34Z
+
+~~~
+./production/ignition/database-connection/C2_HELD
+./production/ignition/database-connection/C2_HELD/config.json
+./production/ignition/database-connection/C2_HELD/resource.json
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:27:35Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:35 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160854698,
+  "lastScanDuration": 464
+}
+[curl http=200 total=0.018154s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:27:35Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:35 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160855323,
+  "lastScanDuration": 272
+}
+[curl http=200 total=0.004463s]
+~~~
+
+#### GET scan-lock/config (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:27:35Z
+
+~~~
+HTTP/1.1 204 No Content
+Date: Fri, 16 Oct 2026 14:27:35 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+
+
+[curl http=204 total=0.005879s]
+~~~
+
+#### GET resources/list/ignition/database-connection (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/database-connection?limit=-1'` @ 2026-10-16T14:27:35Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:35 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.004792s]
+~~~
+
+### C2e — a lock lapses with an unscanned file (hold 15 s, no scan, poll 120 s)
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:27:36Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:36 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160855323,
+  "lastScanDuration": 272
+}
+[curl http=200 total=0.003853s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:27:36Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:36 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160856764,
+  "lastScanDuration": 743
+}
+[curl http=200 total=0.003668s]
+~~~
+
+#### POST scan-lock/config by token A (acquire 5, hold 15)
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] -H Content-Type: application/json --data {"acquireTimeout":5,"holdTimeout":15} '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:27:36Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:27:36 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "timestamp": 11458528,
+  "remaining": 14,
+  "actor": "api-token:cap-a:192.168.147.1"
+}
+[curl http=200 total=0.020236s]
+~~~
+
+#### C2_LAPSE written into production/ while the lock is held (relative paths)
+
+`bash -c find\ production\ -path\ \"\*C2_LAPSE\*\"\ -type\ f\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:27:37Z
+
+~~~
+production/ignition/database-connection/C2_LAPSE/config.json
+production/ignition/database-connection/C2_LAPSE/resource.json
+[exit 0]
+~~~
+
+#### poll 120 s across the lapse: lastScanTimestamp, scanActive, visibility, lock, no scan request sent
+
+`bash /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/live-rig-deploy/capture23.sh c2poll 120 C2_LAPSE ` @ 2026-10-16T14:27:37Z
+
+~~~
+t+0s 2026-10-16T14:27:37Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=held remaining=14
+t+5s 2026-10-16T14:27:42Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=held remaining=9
+t+10s 2026-10-16T14:27:47Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=held remaining=4
+t+15s 2026-10-16T14:27:52Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+20s 2026-10-16T14:27:58Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+26s 2026-10-16T14:28:03Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+31s 2026-10-16T14:28:08Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+36s 2026-10-16T14:28:13Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+41s 2026-10-16T14:28:18Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+46s 2026-10-16T14:28:23Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+51s 2026-10-16T14:28:28Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+56s 2026-10-16T14:28:34Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+62s 2026-10-16T14:28:39Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+67s 2026-10-16T14:28:44Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+72s 2026-10-16T14:28:49Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+77s 2026-10-16T14:28:54Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+82s 2026-10-16T14:29:00Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+88s 2026-10-16T14:29:05Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+93s 2026-10-16T14:29:10Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+99s 2026-10-16T14:29:16Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+104s 2026-10-16T14:29:21Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+109s 2026-10-16T14:29:26Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+114s 2026-10-16T14:29:31Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+119s 2026-10-16T14:29:37Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+t+125s 2026-10-16T14:29:42Z lastScanTimestamp=1792160856764 scanActive=false in_rest_view=no scan_lock=free
+[exit 0]
+~~~
+
+### C2e — restore: scan, remove C2_LAPSE from the bind mount, scan, post-state
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:42Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:42 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160856764,
+  "lastScanDuration": 743
+}
+[curl http=200 total=0.014371s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:43Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:43 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160983144,
+  "lastScanDuration": 814
+}
+[curl http=200 total=0.013296s]
+~~~
+
+#### every path of C2_LAPSE on the bind mount before removal
+
+`bash -c find\ .\ -path\ \"\*/database-connection/C2_LAPSE\*\"\ \|\ LC_ALL=C\ sort ` @ 2026-10-16T14:29:43Z
+
+~~~
+./production/ignition/database-connection/C2_LAPSE
+./production/ignition/database-connection/C2_LAPSE/config.json
+./production/ignition/database-connection/C2_LAPSE/resource.json
+[exit 0]
+~~~
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:43Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:44 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160983144,
+  "lastScanDuration": 814
+}
+[curl http=200 total=0.011101s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:44Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160984524,
+  "lastScanDuration": 501
+}
+[curl http=200 total=0.014377s]
+~~~
+
+#### GET scan-lock/config (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan-lock/config'` @ 2026-10-16T14:29:45Z
+
+~~~
+HTTP/1.1 204 No Content
+Date: Fri, 16 Oct 2026 14:29:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+
+
+[curl http=204 total=0.023025s]
+~~~
+
+#### GET resources/list/ignition/database-connection (post-state)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/database-connection?limit=-1'` @ 2026-10-16T14:29:45Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:45 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 70
+
+{"items":[],"metadata":{"total":0,"matching":0,"limit":-1,"offset":0}}
+[curl http=200 total=0.010798s]
+~~~
+
+## C2b (manual)
+
+NOT RUN BY THE DRIVER. A Designer or gateway-UI save under a held lock is an interactive session. Manual steps:
+
+1. With the rig up, hold the lock: `POST /data/api/v1/scan-lock/config` with `{"acquireTimeout":5,"holdTimeout":300}` as token A (source `~/.cache/ign-deploy-rig/tokens.env`; the header carries the token, never print it).
+
+2. Open the gateway web UI (http://localhost:18290, admin / the rig password in compose.yml) and save a change to a config resource in the production mode (for example edit a database connection description). Record whether the save succeeds, any refusal text, and the UTC time.
+
+3. If a Designer is available, repeat the save from the Designer and record the same.
+
+4. `GET /data/api/v1/scan-lock/config` after each save, then end the hold with one `POST /data/api/v1/scan/config` and remove what was saved.
+
+Result: PENDING (human check, owed to the user).
+
+## C11
+
+A tag provider and its tag definitions written together into `production/` by a plain file write (the Phase 21 captured CAP21 unit: tag-provider, tag-group, tag-type-definition, tag-definition with FolderA), then ONE config scan. Recorded: whether the provider and its tags are present after that scan, and, if not, after a wait with no scan and after a second scan.
+
+#### the CAP21 files written into production/ (relative paths)
+
+`bash -c mkdir\ -p\ production/ignition\;\ for\ t\ in\ tag-provider\ tag-group\ tag-type-definition\ tag-definition\;\ do\ cp\ -R\ \"\$1/ignition/\$t\"\ production/ignition/\;\ done\;\ find\ production\ -type\ f\ \|\ LC_ALL=C\ sort _ /Users/pmannion/whiskeyhouse/ignition-cli/crates/ignition-core/tests/fixtures/deploy/captured ` @ 2026-10-16T14:29:45Z
+
+~~~
+production/config-mode.json
+production/ignition/tag-definition/CAP21/FolderA/tags.json
+production/ignition/tag-definition/CAP21/FolderA/udts.json
+production/ignition/tag-definition/CAP21/FolderA/unary-resource.json
+production/ignition/tag-definition/CAP21/unary-resource.json
+production/ignition/tag-group/CAP21/Default Historical/config.json
+production/ignition/tag-group/CAP21/Default Historical/resource.json
+production/ignition/tag-group/CAP21/Default/config.json
+production/ignition/tag-group/CAP21/Default/resource.json
+production/ignition/tag-provider/CAP21/config.json
+production/ignition/tag-provider/CAP21/resource.json
+production/ignition/tag-type-definition/CAP21/udts.json
+production/ignition/tag-type-definition/CAP21/unary-resource.json
+[exit 0]
+~~~
+
+### C11a — one scan
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:46Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:46 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160984524,
+  "lastScanDuration": 501
+}
+[curl http=200 total=0.004683s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:46Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:46 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160986273,
+  "lastScanDuration": 174
+}
+[curl http=200 total=0.006740s]
+~~~
+
+#### GET resources/list/ignition/tag-provider
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/tag-provider?limit=-1'` @ 2026-10-16T14:29:46Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:46 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 2434
+
+{"items":[{"type":"ignition/tag-provider","name":"CAP21","description":null,"enabled":true,"version":1,"collection":"production","collections":["production"],"signature":"ca24b458efbd8656c1241b51a6ca5d16bc0d6bd47936409161d7a983fd1fe0e4","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}},"data":["config.json"],"attributes":{"uuid":"c6e25805-b786-4d44-ae77-6fe6685410fb","enabled":true},"metrics":{"tagCount":{"name":"tags.provider.CAP21.tagCount","metric":{"value":11,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.CAP21.status","result":{"healthy":true,"time":1792160986892,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"685d4b9111569d8f9288be581ecf1ddd8bf24146702a7c9c3802c9614e366ae7","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"510e694d-c48f-4b0b-be72-99104b2ba9c1"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":38,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1792160986912,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"3c2bec2d649f5e1485b98304a99597e8c83291f383e4208cfb80bd3adff22724","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"a16db799-ca7b-4d84-81c4-226d01b317b8"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1792160986920,"message":"Running"}}}}],"metadata":{"total":3,"matching":3,"limit":-1,"offset":0}}
+[curl http=200 total=0.054167s]
+~~~
+
+#### GET tags/export?provider=CAP21&type=json (the tags the gateway holds)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/tags/export?provider=CAP21&type=json'` @ 2026-10-16T14:29:46Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:47 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Cache-Control: no-cache, no-store
+Pragma: no-cache
+Content-Type: application/json
+Content-Disposition: attachment; filename=export.json
+Transfer-Encoding: chunked
+
+{
+  "name": "",
+  "tagType": "Provider",
+  "tags": [
+    {
+      "name": "FolderA",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "dataType": "Float8",
+          "defaultValue": 1.0E10,
+          "name": "F2",
+          "tagType": "AtomicTag",
+          "value": 1.0E10,
+          "valueSource": "memory"
+        },
+        {
+          "dataType": "Boolean",
+          "expression": "1 \u003c 2 \u0026\u0026 3 \u003e 2 \u0026\u0026 \u0027a\u0027 \u003d \u0027a\u0027",
+          "name": "Expr",
+          "tagType": "AtomicTag",
+          "valueSource": "expr"
+        },
+        {
+          "name": "Inst1",
+          "tagType": "UdtInstance",
+          "tags": [
+            {
+              "name": "M1",
+              "tagType": "AtomicTag"
+            }
+          ],
+          "typeId": "CAP21_Type"
+        },
+        {
+          "dataType": "String",
+          "defaultValue": "Température ✓",
+          "name": "Unicode",
+          "tagType": "AtomicTag",
+          "value": "Température ✓",
+          "valueSource": "memory"
+        },
+        {
+          "dataType": "Int8",
+          "defaultValue": 9007199254740993,
+          "name": "BigInt",
+          "tagType": "AtomicTag",
+          "value": 9007199254740993,
+          "valueSource": "memory"
+        },
+        {
+          "dataType": "Float8",
+          "defaultValue": 1.5,
+          "name": "F1",
+          "tagType": "AtomicTag",
+          "value": 1.5,
+          "valueSource": "memory"
+        }
+      ]
+    },
+    {
+      "name": "_types_",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "CAP21_Type",
+          "tagType": "UdtType",
+          "tags": [
+            {
+              "dataType": "Int4",
+              "name": "M1",
+              "tagType": "AtomicTag",
+              "value": 1,
+              "valueSource": "memory"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+[curl http=200 total=0.123116s]
+~~~
+
+Script reading after scan 1: provider CAP21 listed and tag BigInt exported: yes.
+
+Script verdict: provider and tags present = yes after 1 scan(s).
+
+### C11d — cleanup: the CAP21 files removed again, then a scan
+
+#### POST scan/config
+
+`curl -sS -g -i -X POST [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:47Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:47 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 89
+
+{
+  "scanActive": true,
+  "lastScanTimestamp": 1792160986273,
+  "lastScanDuration": 174
+}
+[curl http=200 total=0.006226s]
+~~~
+
+#### GET scan/config (after completion)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/scan/config'` @ 2026-10-16T14:29:48Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:48 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 90
+
+{
+  "scanActive": false,
+  "lastScanTimestamp": 1792160987548,
+  "lastScanDuration": 168
+}
+[curl http=200 total=0.005216s]
+~~~
+
+#### GET resources/list/ignition/tag-provider (CAP21 gone?)
+
+`curl -sS -g -i -X GET [token $IGN_TOKEN_CAP_A] '$BASE/data/api/v1/resources/list/ignition/tag-provider?limit=-1'` @ 2026-10-16T14:29:48Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:48 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/json
+Content-Length: 1628
+
+{"items":[{"type":"ignition/tag-provider","name":"System","description":null,"enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"685d4b9111569d8f9288be581ecf1ddd8bf24146702a7c9c3802c9614e366ae7","config":{"profile":{"type":"MANAGED","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"nonUseCount":0}},"data":["config.json"],"attributes":{"uuid":"510e694d-c48f-4b0b-be72-99104b2ba9c1"},"metrics":{"tagCount":{"name":"tags.provider.System.tagCount","metric":{"value":38,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.System.status","result":{"healthy":true,"time":1792160988075,"message":"Running"}}}},{"type":"ignition/tag-provider","name":"default","description":"Default tag provider","enabled":true,"version":1,"collection":"core","collections":["core"],"signature":"3c2bec2d649f5e1485b98304a99597e8c83291f383e4208cfb80bd3adff22724","config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":true},"settings":{"defaultDatasourceName":null,"readPermissions":{"type":"AllOf","securityLevels":[]},"readOnly":false,"writePermissions":{"type":"AllOf","securityLevels":[]},"editPermissions":{"type":"AllOf","securityLevels":[]},"valuePersistence":"Database"}},"data":["config.json"],"attributes":{"uuid":"a16db799-ca7b-4d84-81c4-226d01b317b8"},"metrics":{"tagCount":{"name":"tags.provider.default.tagCount","metric":{"value":1,"type":"gauge"}}},"healthchecks":{"status":{"name":"tags.provider.default.status","result":{"healthy":true,"time":1792160988076,"message":"Running"}}}}],"metadata":{"total":2,"matching":2,"limit":-1,"offset":0}}
+[curl http=200 total=0.009806s]
+~~~
+
+## C-gwbk
+
+A gateway backup downloaded from the rig into a temp directory outside the repo. Only size, time, hash, headers and the entry listing are recorded; the file is deleted afterwards and never enters the repo. `type=all` is the type D-13 uses.
+
+### C-gwbk-1 — the download route, response headers only (the body is discarded)
+
+#### curl of GET backup?type=all: response headers, status, bytes counted, time
+
+`bash -c curl\ -sS\ -m\ 300\ -D\ -\ -o\ /dev/null\ -w\ \"\[curl\ http=%\{http_code\}\ size_download=%\{size_download\}\ total=%\{time_total\}s\]\\n\"\ -H\ @\"\$0\"\ \"\$1/data/api/v1/backup\?type=all\" /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/tokhdr http://localhost:18290 ` @ 2026-10-16T14:29:48Z
+
+~~~
+HTTP/1.1 200 OK
+Date: Fri, 16 Oct 2026 14:29:48 GMT
+Referrer-Policy: strict-origin-when-cross-origin
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-XSS-Protection: 1; mode=block
+Content-Type: application/x-ignition-gateway-backup;charset=utf-8
+Content-Disposition: attachment; filename="ign-deploy-rig_Ignition-backup-20261016-1429.gwbk"
+Transfer-Encoding: chunked
+
+[curl http=200 size_download=3674513 total=1.127318s]
+[exit 0]
+~~~
+
+### C-gwbk-2 — ign backup download through a profile for the rig
+
+#### a throwaway ign config with a profile for the rig (token read from an env var)
+
+`ign profile add ign-deploy-rig http://localhost:18290 --token-env IGN_C23_TOKEN --active --json ` @ 2026-10-16T14:29:49Z
+
+~~~
+{
+  "ok": true,
+  "profile": "ign-deploy-rig",
+  "data": {
+    "name": "ign-deploy-rig",
+    "url": "http://localhost:18290/",
+    "auth_kind": "token_env",
+    "active": true
+  }
+}
+[exit 0]
+~~~
+
+#### ign backup download --type all, wall-clock time
+
+`bash -c s=\$\(perl\ -MTime::HiRes=time\ -e\ \"printf\ q\(%d\)\,\ time\*1000\"\)\;\ \"\$0\"\ backup\ download\ --profile\ ign-deploy-rig\ --type\ all\ -o\ \"\$1\"\ --json\;\ rc=\$\?\;\ e=\$\(perl\ -MTime::HiRes=time\ -e\ \"printf\ q\(%d\)\,\ time\*1000\"\)\;\ echo\ \"elapsed_ms=\$\(\(e\ -\ s\)\)\ ign_exit=\$rc\" ign /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk ` @ 2026-10-16T14:29:49Z
+
+~~~
+{
+  "ok": true,
+  "profile": "ign-deploy-rig",
+  "data": {
+    "file": "/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk",
+    "type": "all"
+  }
+}
+elapsed_ms=744 ign_exit=0
+[exit 0]
+~~~
+
+### C-gwbk-3 — what the file is
+
+#### size, first four bytes, type, sha256 of the original
+
+`bash -c f=\$1\;\ echo\ \"size_bytes=\$\(wc\ -c\ \<\ \"\$f\"\ \|\ tr\ -d\ \"\ \"\)\"\;\ echo\ \"first4=\$\(head\ -c\ 4\ \"\$f\"\ \|\ xxd\ -p\)\"\;\ file\ -b\ \"\$f\"\;\ shasum\ -a\ 256\ \"\$f\"\ \|\ cut\ -d\"\ \"\ -f1 _ /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+size_bytes=3674513
+first4=504b0304
+Zip archive data, at least v2.0 to extract, compression method=deflate
+14a1b1c0687c944319f287395b2c5b88b546db79297eac2f9984dfbed6a6f2d2
+[exit 0]
+~~~
+
+#### unzip -l: entry names and sizes (first 60 lines and the totals line)
+
+`bash -c unzip\ -l\ \"\$1\"\ \|\ \{\ head\ -60\;\ \}\ \;\ echo\ \"...\"\;\ unzip\ -l\ \"\$1\"\ \|\ tail\ -2 _ /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+Archive:  /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+  1355776  10-16-2026 14:29   db_backup_sqlite.idb
+      106  10-16-2026 14:29   config/resources/core/com.inductiveautomation.sfc/chart-settings/config.json
+      340  10-16-2026 14:29   config/resources/core/com.inductiveautomation.sfc/chart-settings/resource.json
+      174  10-16-2026 14:29   config/resources/core/config-mode.json
+       80  10-16-2026 14:29   config/resources/core/com.inductiveautomation.opcua/one-time/config.json
+      340  10-16-2026 14:29   config/resources/core/com.inductiveautomation.opcua/one-time/resource.json
+      578  10-16-2026 14:29   config/resources/core/com.inductiveautomation.opcua/server-config/config.json
+      340  10-16-2026 14:29   config/resources/core/com.inductiveautomation.opcua/server-config/resource.json
+      642  10-16-2026 14:29   config/resources/core/com.inductiveautomation.opcua/access-control/config.json
+      340  10-16-2026 14:29   config/resources/core/com.inductiveautomation.opcua/access-control/resource.json
+      596  10-16-2026 14:29   config/resources/core/com.inductiveautomation.eam/event-thresholds/config.json
+      340  10-16-2026 14:29   config/resources/core/com.inductiveautomation.eam/event-thresholds/resource.json
+      422  10-16-2026 14:29   config/resources/core/com.inductiveautomation.eam/module-settings/config.json
+      340  10-16-2026 14:29   config/resources/core/com.inductiveautomation.eam/module-settings/resource.json
+       97  10-16-2026 14:29   config/resources/core/ignition/edge-system-properties/config.json
+      340  10-16-2026 14:29   config/resources/core/ignition/edge-system-properties/resource.json
+     2839  10-16-2026 14:29   config/resources/core/ignition/security-properties/config.json
+      117  10-16-2026 14:29   config/resources/core/ignition/security-properties/resource.json
+      519  10-16-2026 14:29   config/resources/core/ignition/schedule/Example/config.json
+      287  10-16-2026 14:29   config/resources/core/ignition/schedule/Example/resource.json
+      471  10-16-2026 14:29   config/resources/core/ignition/tag-provider/default/config.json
+      232  10-16-2026 14:29   config/resources/core/ignition/tag-provider/default/resource.json
+      151  10-16-2026 14:29   config/resources/core/ignition/tag-provider/System/config.json
+      191  10-16-2026 14:29   config/resources/core/ignition/tag-provider/System/resource.json
+       89  10-16-2026 14:29   config/resources/core/ignition/general-alarm-settings/config.json
+      340  10-16-2026 14:29   config/resources/core/ignition/general-alarm-settings/resource.json
+      508  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/delete2.png/delete2.png
+      412  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/delete2.png/resource.json
+      744  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/lock_open.png/lock_open.png
+      414  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/lock_open.png/resource.json
+      990  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/warning.png/warning.png
+      412  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/warning.png/resource.json
+      590  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/document.png/document.png
+      413  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/document.png/resource.json
+      976  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/pie-chart.png/pie-chart.png
+      414  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/pie-chart.png/resource.json
+      809  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/stop.png/stop.png
+      409  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/stop.png/resource.json
+     1291  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/businessman.png/businessman.png
+      417  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/businessman.png/resource.json
+      578  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/export1.png/export1.png
+      412  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/export1.png/resource.json
+     1338  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/businessman_add.png/businessman_add.png
+      421  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/businessman_add.png/resource.json
+     1351  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/stopwatch.png/stopwatch.png
+      415  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/stopwatch.png/resource.json
+      634  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/clipboard.png/clipboard.png
+      414  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/clipboard.png/resource.json
+     1224  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/camera2.png/camera2.png
+      413  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/camera2.png/resource.json
+     1197  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/logic_not.png/logic_not.png
+      415  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/logic_not.png/resource.json
+     1304  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/trafficlight_red.png/trafficlight_red.png
+      422  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/trafficlight_red.png/resource.json
+     1309  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/trafficlight_green.png/trafficlight_green.png
+      424  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/trafficlight_green.png/resource.json
+      559  10-16-2026 14:29   config/resources/core/ignition/images/Builtin/icons/32/key1.png/key1.png
+...
+---------                     -------
+ 12085800                     1597 files
+[exit 0]
+~~~
+
+#### unzip -tq of the whole file
+
+`unzip -tq /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+No errors detected in compressed data of /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk.
+[exit 0]
+~~~
+
+#### python zipfile: is_zipfile, entry count, testzip (None means every CRC reads)
+
+`python3 -I -c import\ sys\,\ zipfile\;\ p\ =\ sys.argv\[1\]\;\ print\(\"is_zipfile\"\,\ zipfile.is_zipfile\(p\)\)\;\ z\ =\ zipfile.ZipFile\(p\)\;\ print\(\"entries\"\,\ len\(z.namelist\(\)\)\)\;\ print\(\"testzip\"\,\ z.testzip\(\)\) /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+is_zipfile True
+entries 1597
+testzip None
+[exit 0]
+~~~
+
+### C-gwbk-4 — a copy truncated to half its size
+
+#### head -c half of the original into trunc.gwbk, then its size
+
+`bash -c f=\$1\;\ n=\$\(\(\ \$\(wc\ -c\ \<\ \"\$f\"\)\ /\ 2\ \)\)\;\ head\ -c\ \"\$n\"\ \"\$f\"\ \>\ \"\$2\"\;\ echo\ \"truncated_to_bytes=\$\(wc\ -c\ \<\ \"\$2\"\ \|\ tr\ -d\ \"\ \"\)\" _ /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/rig.gwbk /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+truncated_to_bytes=1837256
+[exit 0]
+~~~
+
+#### unzip -tq of the truncated copy
+
+`unzip -tq /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+[/var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk]
+  End-of-central-directory signature not found.  Either this file is not
+  a zipfile, or it constitutes one disk of a multi-part archive.  In the
+  latter case the central directory and zipfile comment will be found on
+  the last disk(s) of this archive.
+unzip:  cannot find zipfile directory in one of /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk or
+        /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk.zip, and cannot find /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk.ZIP, period.
+[exit 9]
+~~~
+
+#### unzip -l of the truncated copy (first 5 lines)
+
+`bash -c unzip\ -l\ \"\$1\"\ 2\>\&1\ \|\ head\ -5 _ /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+Archive:  /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk
+  End-of-central-directory signature not found.  Either this file is not
+  a zipfile, or it constitutes one disk of a multi-part archive.  In the
+  latter case the central directory and zipfile comment will be found on
+  the last disk(s) of this archive.
+[exit 0]
+~~~
+
+#### python zipfile on the truncated copy: is_zipfile and the error ZipFile raises
+
+`python3 -I -c $'import sys, zipfile; p = sys.argv[1]; print("is_zipfile", zipfile.is_zipfile(p))\ntry:\n    zipfile.ZipFile(p)\n    print("opened")\nexcept Exception as e:\n    print(type(e).__name__, str(e))' /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk/trunc.gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+is_zipfile False
+BadZipFile File is not a zip file
+[exit 0]
+~~~
+
+### C-gwbk-5 — cleanup
+
+#### the temp directory after deletion
+
+`bash -c ls\ \"\$1\"\ 2\>\&1\ \|\|\ true _ /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk ` @ 2026-10-16T14:29:50Z
+
+~~~
+ls: /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk: No such file or directory
+[exit 0]
+~~~
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above, not a hypothesis. Later plans read these entries by id.
@@ -379,3 +1893,30 @@ Rests on `## C-restart`.
 - No permission: a token that holds no security level (`cap-ro`, loaded by the gateway and listed by `resources/names/ignition/api-token`) and a request with no token both get `401 Unauthorized`, a Jetty HTML page (`Content-Type: text/html;charset=iso-8859-1`, `Content-Length: 349`, `HTTP ERROR 401`), not JSON. The route is therefore not reached; `cap-ro` also gets 401 on `gateway-info`. A `403` from this route was not produced on this rig. The `restart_pending_unavailable` warning (23-02 checkpoint item 9) should treat any non-200 answer of the route (401, 403, other) as "unavailable", never as a failure.
 - Consequence for 23-09: a `DeployApi::restart_pending` method and a `DEPLOY_ENDPOINTS` row `restart_pending` may now be written; the declared shape is `{"pending": [string]}`, an HTML body on a refusal.
 - Rig state after this capture: SFC shows as disabled pending a restart. The rig is disposable.
+
+### C2
+
+Rests on `## C2` (sub-sections C2a, C2c, C2d, C2e) and `## C2b (manual)`. One answer per sub-probe:
+
+- (a) Token A held the lock (hold 60 s). Token B's `POST resources/ignition/database-connection` was not refused and did not fail fast: it blocked for 59.94 s (`total=59.943446s`) and answered `200` with `success: true` at about the moment the hold lapsed; the lock read free (`204`) right after. So the scan-lock does hold back an API resource write by another actor until the hold ends (timeout) or a scan runs; it queues the write, it does not return a refusal status. Token B could read the lock meanwhile (`200`, holder `api-token:cap-a:<ip>`). The write landed in collection `core`, not `production`.
+- (b) Not run. A Designer or gateway-UI save under a held lock is the interactive check in `## C2b (manual)`; its result is PENDING (human check, owed to the user). Until it is recorded, the Designer preflight stays the only assumed guard against a UI save during an apply.
+- (c) No lock, a valid resource directory written into `production/` by a plain file write, no scan request: not loaded. 24 polls over 120 s, `lastScanTimestamp` unchanged (1792160608501) at every poll, the resource never appeared in the REST view. The gateway does not scan on its own for a file dropped into a mode collection within 120 s.
+- (d) The same while token A held the lock (hold 150 s, remaining 149 at t+0 and 29 at t+121): not loaded, `lastScanTimestamp` unchanged (1792160732840) at all 24 polls, never in the REST view.
+- (e) A 15 s hold, a file written under it, no scan: the lock read free from t+15 s (remaining 14, 9, 4, then free); `lastScanTimestamp` stayed 1792160856764 at all 25 polls to t+120 s and the resource never appeared. A lapsing lock does not trigger a scan.
+
+Consequences for the engine (23-05, 23-17): the lock does not stop a filesystem write, and a file written without the engine's own scan stays unloaded (within 120 s) whether the lock is held, lapsed or never taken. So a fault that kills the engine, or a lock that lapses, after files moved leaves them on disk unloaded rather than applied; the next scan by any actor would load them (any actor's scan runs, Phase 20 D4), which is why rollback restores the disk and does not rely on the absence of a scan. The lock does queue other actors' API writes for up to the hold, so a hold sized for an apply delays a concurrent API writer for the whole window.
+
+### C11
+
+Rests on `## C11`. A tag provider and its tag definitions written together (the CAP21 unit: tag-provider, two tag-groups, tag-type-definition, tag-definition with FolderA) load in ONE config scan. Immediately after the first scan completed (Phase 20 rule), `resources/list/ignition/tag-provider` listed `CAP21` (collection `production`) and `tags/export?provider=CAP21&type=json` returned FolderA with its tags (`BigInt`, `Unicode`, `Expr`, `F1`, `F2`, `Inst1`) and the UDT type `CAP21_Type` under `_types_`. No wait and no second scan were needed, so the engine needs one scan for a provider and its definitions. Limit: six tags and one UDT; a large tree was not tried.
+
+### C-gwbk
+
+Rests on `## C-gwbk` (`type=all`, the type D-13 uses).
+
+- A `.gwbk` is a ZIP: first bytes `504b0304`, `file` reports "Zip archive data, deflate", `unzip -tq` reports no errors, Python `zipfile.is_zipfile` is True with 1597 entries and `testzip()` None (every CRC reads).
+- Size and time on the rig: 3,674,513 bytes (12,085,800 bytes uncompressed, 1597 files); `ign backup download` took 744 ms wall-clock, the raw `curl` of the route 1.13 s.
+- Content-Length is NOT sent. The download answers `200`, `Transfer-Encoding: chunked`, `Content-Type: application/x-ignition-gateway-backup;charset=utf-8` and `Content-Disposition: attachment; filename="<gateway>_Ignition-backup-<yyyymmdd>-<hhmm>.gwbk"`. A byte count cannot be compared with a header, so size alone is no completeness check.
+- A copy truncated to half (1,837,256 bytes) fails at once: `unzip -tq` exit 9 "End-of-central-directory signature not found", Python `is_zipfile` False and `ZipFile()` raises `BadZipFile: File is not a zip file`. The ZIP central directory sits at the end of the file, so a truncated download cannot read as a ZIP.
+- The completeness check for D-13: the downloaded file must open as a ZIP (end-of-central-directory record found, central directory readable) with at least one entry; a CRC walk (`testzip`) is cheap at this size and may be added. What `download_to_file` itself does when the connection dies mid-stream (a chunked body cut short) was not exercised here; the ZIP open is the check that does not depend on it.
+- Handling: the file was downloaded into a temp directory outside the repo and deleted afterwards (`ls` after deletion: no such directory); only size, time, headers, the entry listing (first 60 lines, totals) and the sha-256 of the original were recorded.

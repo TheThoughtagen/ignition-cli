@@ -471,7 +471,7 @@ c2poll() {
     list=$(curl -sS -m 20 -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE$RES/list/ignition/database-connection?limit=-1" || echo '{}')
     code=$(curl -sS -m 10 -o "$TMPD/lk" -w '%{http_code}' -H "X-Ignition-API-Token: $IGN_TOKEN_CAP_A" "$BASE$LOCK" || echo 000)
     if [ "$code" = 204 ]; then lk=free; else lk="held remaining=$(jq -r '.remaining // "?"' "$TMPD/lk" 2>/dev/null || echo '?')"; fi
-    echo "t+${t}s $(utc) lastScanTimestamp=$(jq -r '.lastScanTimestamp // "?"' <<<"$s" 2>/dev/null) scanActive=$(jq -r '.scanActive // "?"' <<<"$s" 2>/dev/null) in_rest_view=$(jq -r --arg n "$name" '[.items[]? | .name] | index($n) | if . == null then "no" else "yes" end' <<<"$list" 2>/dev/null || echo '?') scan_lock=$lk"
+    echo "t+${t}s $(utc) lastScanTimestamp=$(jq -r '.lastScanTimestamp // "?"' <<<"$s" 2>/dev/null) scanActive=$(jq -r '.scanActive | tostring' <<<"$s" 2>/dev/null || echo '?') in_rest_view=$(jq -r --arg n "$name" '[.items[]? | .name] | index($n) | if . == null then "no" else "yes" end' <<<"$list" 2>/dev/null || echo '?') scan_lock=$lk"
     [ "$t" -lt "$secs" ] || break
     sleep 5
   done
