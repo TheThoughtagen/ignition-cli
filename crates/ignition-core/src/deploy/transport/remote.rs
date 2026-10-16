@@ -496,6 +496,15 @@ pub enum SftpOp {
 impl SftpOp {
     /// The batch line for this op, or why a path cannot be placed in one.
     pub fn render(&self) -> Result<String, String> {
+        self.render_on(cfg!(windows))
+    }
+
+    /// [`render`](Self::render) as on a Windows runner or not, so both are
+    /// tested on every host. On a Windows runner a `\` in a LOCAL path is a
+    /// separator (no Windows file name can hold one) and becomes `/` before
+    /// [`safe_local_path`]; elsewhere it is refused. Either way no backslash
+    /// reaches the batch line. Remote paths are never rewritten.
+    fn render_on(&self, windows_runner: bool) -> Result<String, String> {
         let remote = |path: &str| -> Result<String, String> {
             safe_remote_path(path)?;
             refuse_leading_dash("remote", path)?;
@@ -505,7 +514,7 @@ impl SftpOp {
             let text = path
                 .to_str()
                 .ok_or_else(|| "a local path that is not valid UTF-8 cannot be used".to_string())?;
-            let text = if cfg!(windows) {
+            let text = if windows_runner {
                 text.replace('\\', "/")
             } else {
                 text.to_string()
@@ -1390,7 +1399,12 @@ mod tests {
                 SftpOp::Rmdir { path: bad.into() },
             ];
             for op in &remote_ops {
-                assert!(op.render().is_err(), "{op:?} must be refused");
+                for windows_runner in [false, true] {
+                    assert!(
+                        op.render_on(windows_runner).is_err(),
+                        "{op:?} must be refused (windows_runner {windows_runner})"
+                    );
+                }
             }
             let local_ops = [
                 SftpOp::Get {
@@ -1407,8 +1421,68 @@ mod tests {
                 },
             ];
             for op in &local_ops {
-                assert!(op.render().is_err(), "{op:?} must be refused");
+                for windows_runner in [false, true] {
+                    let rendered = op.render_on(windows_runner);
+                    if windows_runner && bad == "a\\b" {
+                        // G-22-1: on a Windows runner `\` in a local path is
+                        // a separator and becomes `/`; no backslash reaches
+                        // the line
+                        let line = rendered.expect("a Windows runner renders a\\b as a/b");
+                        assert!(line.contains("\"a/b\"") && !line.contains('\\'), "{line}");
+                    } else {
+                        assert!(
+                            rendered.is_err(),
+                            "{op:?} must be refused (windows_runner {windows_runner})"
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    /// G-22-1: a Windows runner's local paths (its `%TEMP%` is
+    /// `C:\Users\RUNNER~1\...`) reach the batch line with `/`; any other
+    /// runner refuses a `\`. Turning a separator into `/` never lets another
+    /// refused character through, and a remote `\` is refused everywhere.
+    #[test]
+    fn local_backslashes_are_separators_only_on_a_windows_runner() {
+        let get = |local: &str| SftpOp::Get {
+            remote: "/r".into(),
+            local: PathBuf::from(local),
+        };
+        for (local, line) in [
+            ("a\\b", "get \"/r\" \"a/b\""),
+            (
+                "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpAb1\\f.json",
+                "get \"/r\" \"C:/Users/RUNNER~1/AppData/Local/Temp/.tmpAb1/f.json\"",
+            ),
+            ("C:\\a b\\c\\", "get \"/r\" \"C:/a b/c/\""),
+        ] {
+            assert_eq!(
+                get(local).render_on(true).as_deref(),
+                Ok(line),
+                "{local:?} on a Windows runner"
+            );
+            assert!(
+                get(local).render_on(false).is_err(),
+                "{local:?} is refused off Windows"
+            );
+        }
+        for bad in [
+            "a\\b\"c",
+            "a\\*",
+            "C:\\x\\[1]",
+            "\\\\?\\C:\\x",
+            "-a\\b",
+            "a\\\nb",
+        ] {
+            assert!(get(bad).render_on(true).is_err(), "{bad:?}");
+        }
+        for windows_runner in [false, true] {
+            let rm = SftpOp::Rm {
+                path: "/r\\x".into(),
+            };
+            assert!(rm.render_on(windows_runner).is_err(), "{rm:?}");
         }
     }
 
