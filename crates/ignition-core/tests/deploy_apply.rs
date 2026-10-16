@@ -23,11 +23,12 @@ use ignition_core::actions::deploy_apply::{
 use ignition_core::client::ReqwestGatewayApi;
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
-use ignition_core::deploy::apply::hold::{HoldModel, SystemClock};
+use ignition_core::deploy::apply::hold::{Clock, HoldModel, SystemClock};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
 use ignition_core::deploy::apply::record::{RecordState, RunRecord};
 use ignition_core::deploy::apply::{
-    ApplyContext, ApplyEvent, ApplyObserver, ApplyOptions, NoObserver, OutcomeKind, write_set,
+    ApplyContext, ApplyEvent, ApplyObserver, ApplyOptions, NoObserver, OutcomeKind, RollbackCause,
+    write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::transport::TreeReader;
@@ -301,6 +302,17 @@ impl Rig {
         prepared: ApplyPrepared,
         observer: &dyn ApplyObserver,
     ) -> Result<DeployApplyResult, CoreError> {
+        self.run_with(prepared, observer, &SystemClock, &options())
+            .await
+    }
+
+    async fn run_with(
+        &self,
+        prepared: ApplyPrepared,
+        observer: &dyn ApplyObserver,
+        clock: &dyn Clock,
+        opts: &ApplyOptions,
+    ) -> Result<DeployApplyResult, CoreError> {
         let deploy = self.fake.client("apply");
         let ctx = ApplyContext {
             declared: &self.declared,
@@ -309,10 +321,10 @@ impl Rig {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
-            clock: &SystemClock,
+            clock,
             observer,
         };
-        deploy_apply_execute(prepared, &ctx, &options()).await
+        deploy_apply_execute(prepared, &ctx, opts).await
     }
 
     fn deploy_dir(&self) -> PathBuf {
@@ -674,7 +686,7 @@ async fn apply_deletes_what_the_ledger_lists_and_rewrites_the_ledger() {
     assert_eq!(gone.len(), 2, "{gone:?}");
 }
 
-// ---- the branches 23-17 will turn into restores ---------------------------
+// ---- the branches 23-17 turns into restores (the rest follow in Tasks 2 and 3) ---
 
 /// The one `result.json` of a failed run, which names the error code.
 fn failed_result(rig: &Rig) -> Value {
@@ -684,30 +696,6 @@ fn failed_result(rig: &Rig) -> Value {
     let dir = root.join(&runs[0]);
     assert_eq!(event_names(&dir).last().map(String::as_str), Some("failed"));
     json_file(&dir.join("result.json"))
-}
-
-#[tokio::test]
-async fn a_commit_that_fails_after_moving_is_never_applied() {
-    let fx = PlanFixture::new();
-    let (declared, _) = fx.load("dev");
-    fx.live_render(MODE, &declared);
-    let mut bytes = fx.read(MODE, DB_CONFIG);
-    bytes.push(b' ');
-    fx.mode(DB_CONFIG, &bytes);
-    fx.remove(MODE, ALARM_UNIT);
-    let host = local_host(&fx).with_apply_fault(ApplyFault::FailMoveAt(1));
-    let rig = rig_with(fx, host, None).await;
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let err = rig
-        .run(prepared, &NoObserver)
-        .await
-        .expect_err("not applied");
-    assert_eq!(err.code(), "internal", "{err}");
-    assert!(err.to_string().contains("write_failed"), "{err}");
-    // No scan ran over the partial tree.
-    assert_eq!(rig.fake.scan_count(), 0);
-    assert_eq!(failed_result(&rig)["ok"], false);
 }
 
 #[tokio::test]
@@ -784,4 +772,155 @@ async fn a_journal_of_another_run_names_the_real_env() {
     assert_eq!(run_id, "20261016T000000Z-ffffff");
     assert_eq!(env, "dev", "the engine fills the env the host cannot know");
     assert!(err.to_string().contains("--env dev"), "{err}");
+}
+
+// ============================================================================
+// Aborts and auto-rollback (23-17)
+// ============================================================================
+
+/// Every file of the mode collection (path to SHA-256) plus the ledger: the
+/// state an abort must give back.
+fn collection_state(rig: &Rig) -> BTreeMap<String, String> {
+    fn walk(dir: &Path, rel: &str, out: &mut BTreeMap<String, String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.filter_map(Result::ok) {
+            let name = entry.file_name().into_string().expect("utf-8 name");
+            let path = entry.path();
+            let key = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if path.is_dir() {
+                walk(&path, &key, out);
+            } else {
+                out.insert(key, sha256_hex(&std::fs::read(&path).expect("read")));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(&rig.fx.collection_dir(MODE), "", &mut out);
+    if let Ok(bytes) = std::fs::read(rig.deploy_dir().join("ledger.json")) {
+        out.insert(LEDGER_KEY.to_string(), sha256_hex(&bytes));
+    }
+    out
+}
+
+/// A rig whose commit fails after its first move.
+async fn failing_move_rig() -> Rig {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    let mut bytes = fx.read(MODE, DB_CONFIG);
+    bytes.push(b' ');
+    fx.mode(DB_CONFIG, &bytes);
+    fx.remove(MODE, ALARM_UNIT);
+    fx.ledger(GATEWAY, MODE, &[DB_CONFIG, DB_RESOURCE]);
+    let host = local_host(&fx).with_apply_fault(ApplyFault::FailMoveAt(1));
+    rig_with(fx, host, None).await
+}
+
+/// The words every rolled-back result carries.
+fn assert_rolled_back(result: &DeployApplyResult, cause: &str) {
+    assert_eq!(result.outcome, OutcomeKind::RolledBack, "{result:?}");
+    assert!(!result.ok);
+    assert_eq!(result.slug, Some("deploy_rolled_back"));
+    assert_eq!(
+        serde_json::to_value(result.cause).expect("cause"),
+        cause,
+        "{result:?}"
+    );
+    assert_eq!(result.failure_exit_code(), Some(6));
+    assert!(result.written.is_empty() && result.deleted.is_empty());
+}
+
+#[tokio::test]
+async fn fault_write_failed_mid_commit_restores() {
+    let rig = failing_move_rig().await;
+    let before = collection_state(&rig);
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let recorder = Recorder::default();
+    let result = rig
+        .run(prepared, &recorder)
+        .await
+        .expect("a rollback is a result, not an error");
+
+    assert_rolled_back(&result, "write_failed");
+    assert_eq!(collection_state(&rig), before, "the snapshot is back");
+    let run_id = result.run_id.clone().expect("run id");
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(!rig.deploy_dir().join("staging").join(&run_id).exists());
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    assert_eq!(
+        rig.record(&run_id).rolled_back_by.as_deref(),
+        Some(run_id.as_str())
+    );
+
+    // The restore reused the held lock; the one scan came after it.
+    assert_eq!(rig.fake.lock_acquires(), 1);
+    assert_eq!(rig.fake.scan_count(), 1);
+    assert_eq!(
+        rig.host.calls(),
+        [
+            "prepare",
+            "commit",
+            "restore",
+            "fingerprint",
+            "finalize",
+            "fetch_snapshot"
+        ]
+    );
+
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(
+        event_names(&run_dir),
+        [
+            "run_started",
+            "staged",
+            "lock_acquired",
+            "committed",
+            "restore_started",
+            "scan_done",
+            "restored"
+        ]
+    );
+    let doc = json_file(&run_dir.join("result.json"));
+    assert_eq!(doc["outcome"], "rolled_back");
+    assert_eq!(doc["ok"], false);
+    assert_eq!(doc["slug"], "deploy_rolled_back");
+    assert_eq!(doc["cause"], "write_failed");
+    let seen = recorder.0.lock().expect("events");
+    assert!(matches!(
+        seen[4],
+        ApplyEvent::RestoreStarted {
+            cause: RollbackCause::WriteFailed
+        }
+    ));
+}
+
+#[tokio::test]
+async fn fault_rerun_after_restore_plans_the_same() {
+    // Edge DAPL-06 idempotency.
+    let rig = failing_move_rig().await;
+    let ApplyPrepared::Ready { plan: first, .. } =
+        rig.prepare(GateFlags::default()).await.expect("prepare")
+    else {
+        panic!("expected Ready");
+    };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("rolled back");
+    assert_rolled_back(&result, "write_failed");
+
+    let ApplyPrepared::Ready { plan: second, .. } = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect("prepare again")
+    else {
+        panic!("expected Ready again");
+    };
+    assert_eq!(second.plan_sha256, first.plan_sha256);
+    assert_eq!(second.render_sha256, first.render_sha256);
 }
