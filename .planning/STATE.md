@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-04-PLAN.md
-last_updated: "2026-10-16T17:28:24.585Z"
+stopped_at: Completed 23-19-PLAN.md
+last_updated: "2026-10-16T17:53:17.451Z"
 last_activity: 2026-10-16
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 36
+  completed_plans: 37
   percent: 50
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 6 of 21
+Plan: 7 of 21
 Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [███████░░░] 69%
+Progress: [███████░░░] 71%
 
 ## Performance Metrics
 
@@ -81,6 +81,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P03 | 55min | 2 tasks | 6 files |
 | Phase 23 P18 | 25min | 2 tasks | 6 files |
 | Phase 23 P04 | ~2h | 2 tasks | 9 files |
+| Phase 23 P19 | 1h45m | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -118,8 +119,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T17:28:24.564Z
-**Stopped At:** Completed 23-04-PLAN.md
+**Last session:** 2026-10-16T17:53:17.411Z
+**Stopped At:** Completed 23-19-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -180,3 +181,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 23-18: a journal refusal is deploy_run_invalid (run_id unknown, problem prefixed by the location); read_ledger and read_journal share one private read helper per transport; journal_location and location_of live in ledger.rs
 - [Phase ?]: 23-04: commit refuses a staged copy and target that are the same inode (C7a-4 self-rename deletes); restore copies pre-images through a staged restore copy so the snapshot is never moved and a second restore writes nothing
 - [Phase ?]: 23-04: DeployJournalPresent raised by a host carries env '<env>'; the engine (23-05) and verbs own the real --env value
+- [Phase ?]: 23-19: HangAfterMove stops the blocking commit after the k-th move and the async commit awaits pending(), so an abort is a faithful kill -9 and no blocking thread lingers
+- [Phase ?]: 23-19: FaultyHost counts invocations from 1 per call name; fail and hang never reach the inner host; after-hooks run also when the inner call errored
