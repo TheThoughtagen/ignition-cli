@@ -2,19 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 23
-current_phase_name: Guarded Apply & Rollback
 status: executing
 stopped_at: Phase 23 context gathered
-last_updated: "2026-10-16T12:45:28.247Z"
-last_activity: 2026-10-15
-last_activity_desc: Phase 22 complete, transitioned to Phase 23
+last_updated: "2026-10-16T12:48:24.018Z"
+last_activity: 2026-10-16 -- Phase 23 execution started
 progress:
-  total_phases: 6
+  total_phases: 4
   completed_phases: 3
   total_plans: 52
   completed_plans: 31
-  percent: 50
+  percent: 60
 ---
 
 # Project State
@@ -24,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 23 — Guarded Apply & Rollback
+**Current focus:** Phase 23 — guarded-apply-rollback
 
 ## Current Position
 
-Phase: 23 — Guarded Apply & Rollback
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-10-15 — Phase 22 complete, transitioned to Phase 23
+Phase: 23 (guarded-apply-rollback) — EXECUTING
+Plan: 1 of 21
+Status: Executing Phase 23
+Last activity: 2026-10-16 -- Phase 23 execution started
 
 Progress: [██████████] 97%
 
@@ -91,6 +88,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ### Blockers
 
+- [OPEN 23-01, 2026-10-16] Windows capture host `pending` (`ign-win-836` / `rg-ign-cli-win-test` returns ResourceGroupNotFound; no `IGN_WINVM_*` or `IGN_WFLWVM01_*` set; the user said the host will come later). Stop point: the 23-08 Task 1 precondition. Plans that will not run until a host is recorded `ready` in 23-LIVE-CAPTURES.md `## Windows capture host (23-01)`: 23-08, 23-20, 23-10, 23-13, 23-21, 23-14, 23-15, 23-16. Phase 23 is paused, not complete; resume at 23-08 once the user exports the env and the Task 1 verification (`az vm show`, `ssh ... pwd`) passes.
 - [RESOLVED 22-14, exit gate] Decision B = B(i) (home-relative staging, recorded 22-12) and the OQ5 hold budget are recorded in 22-LIVE-CAPTURES.md (`## Decisions: OQ5 ...`). The hold budget `ceil(2 x (p95 commit + p95 scan) + 1)` measured at 152 files is 505 s (Defender exclusion off) and 699 s (on), both ABOVE the 300 s ceiling.
 - [OPEN, Phase 23 planning must open with it] Hold budget above the ceiling: a measured 152-file commit takes 234 to 348 s on the Windows host (per-file sftp renames), so a 300 s hold lapses mid-commit; a 1,520-file tree extrapolates (not measured) to roughly ten times that. Decide: shorten the locked window, raise the ceiling with the user, or budget the transfer separately (OQ5-2). `op_timeout_s` above 3600 would also be needed for such a tree (OQ5-4).
 - [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
