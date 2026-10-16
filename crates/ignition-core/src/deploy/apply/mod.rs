@@ -52,7 +52,9 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::actions::deploy::{Declared, DeployPlanResult, VerifyOptions, deploy_verify};
+use crate::actions::deploy::{
+    Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, deploy_verify,
+};
 use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::deploy_api::scan_and_wait;
 use crate::client::scan::{LockVerdict, ScanKind, ScanOutcome};
@@ -666,7 +668,17 @@ async fn drive(
     steps.emit(ApplyEvent::Staged {
         files: set.writes.len(),
     })?;
-    let lock = HeldLock::acquire(ctx.deploy, ScanKind::Config, opts.hold.hold_s, ctx.clock).await?;
+    let lock =
+        match HeldLock::acquire(ctx.deploy, ScanKind::Config, opts.hold.hold_s, ctx.clock).await {
+            Ok(lock) => lock,
+            Err(refused) => {
+                // Nothing was written into the collection. Drop this run's own
+                // staging and nothing else; a failed cleanup must not hide why
+                // the lock was refused.
+                let _ = ctx.host.discard_interrupted(run_id).await;
+                return Err(refused);
+            }
+        };
     steps.emit(ApplyEvent::LockAcquired {
         hold_s: opts.hold.hold_s,
     })?;
@@ -680,11 +692,7 @@ async fn drive(
         deleted: report.deleted.len(),
     })?;
     if report.stale {
-        return Err(CoreError::Internal(
-            "apply stopped (stale_pre_image): a live file differs from the plan's pre-image; \
-             nothing was moved"
-                .to_string(),
-        ));
+        return Err(plan_stale(ctx, plan, opts, run_id).await);
     }
     if report.failure.is_some() {
         // The failure names an entry by index and never its content; the
@@ -706,21 +714,32 @@ async fn drive(
     let held = matches!(verdict, LockVerdict::Held { .. });
     steps.emit(ApplyEvent::LockVerdict { held })?;
     if !held {
-        return Err(CoreError::Internal(
-            "apply stopped (lock_expired): the scan-lock was not held with the margin left after \
-             the commit; the files moved, no scan ran and they were not restored"
-                .to_string(),
-        ));
+        // No scan before the restore: a scan would load the partial tree.
+        return roll_back(
+            ctx,
+            opts,
+            &scope,
+            Some(&lock),
+            RollbackCause::LockExpired,
+            steps,
+            Vec::new(),
+        )
+        .await;
     }
     // C11: a tag provider and its definitions load in one scan.
     match scan_and_wait(ctx.deploy, ScanKind::Config, opts.poll.clone()).await? {
         ScanOutcome::Complete(_) => steps.emit(ApplyEvent::ScanDone)?,
         ScanOutcome::NotComplete { .. } => {
-            return Err(CoreError::Internal(
-                "apply stopped (scan_incomplete): the config scan did not complete in time; the \
-                 files moved and were not restored"
-                    .to_string(),
-            ));
+            return roll_back(
+                ctx,
+                opts,
+                &scope,
+                Some(&lock),
+                RollbackCause::ScanIncomplete,
+                steps,
+                Vec::new(),
+            )
+            .await;
         }
     }
 
@@ -1043,4 +1062,39 @@ fn listed(paths: &[String]) -> String {
         out.push_str(&format!(" and {} more", paths.len() - shown));
     }
     out
+}
+
+/// The pre-image check under the lock found a live file that is not what the
+/// plan was made against. The host moved nothing and removed its journal and
+/// partial snapshot; this drops the run's staging, issues one no-op scan to
+/// release the lock (D12) and names the plan as it reads now.
+async fn plan_stale(
+    ctx: &ApplyContext<'_>,
+    plan: &DeployPlanResult,
+    opts: &ApplyOptions,
+    run_id: &RunId,
+) -> CoreError {
+    // Best effort: the refusal below is the answer either way, and an
+    // unreleased lock lapses by itself.
+    let _ = ctx.host.discard_interrupted(run_id).await;
+    let _ = ctx.deploy.scan_request(ScanKind::Config).await;
+    let actual = match deploy_plan(
+        ctx.declared,
+        ctx.reader,
+        &PlanOptions {
+            base: opts.base.clone(),
+            diff: false,
+        },
+    )
+    .await
+    {
+        Ok(now) => now.plan_sha256,
+        Err(_) => "unavailable".to_string(),
+    };
+    CoreError::PlanStale {
+        expected: plan.plan_sha256.clone(),
+        actual,
+        detail: "a live file changed between the plan and the lock; nothing was written"
+            .to_string(),
+    }
 }
