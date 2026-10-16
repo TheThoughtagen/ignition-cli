@@ -10,6 +10,7 @@
 //! `## Checkpoint outcome`.
 
 pub mod gates;
+pub mod run_store;
 
 /// The slug of the rolled-back apply verdict.
 ///

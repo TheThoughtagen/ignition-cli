@@ -973,19 +973,24 @@ pub async fn workspace_push(
 /// (civil-from-days; the tags.rs hand-rolled-parser precedent) so
 /// the manifest carries a human-readable checkout timestamp with
 /// ZERO new dependencies.
-fn rfc3339_now_utc() -> String {
+pub(crate) fn rfc3339_now_utc() -> String {
+    unix_ms_to_rfc3339_utc(now_unix_ms())
+}
+
+/// Now, in epoch milliseconds.
+pub(crate) fn now_unix_ms() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is after the unix epoch");
-    unix_ms_to_rfc3339_utc(now.as_millis() as i64)
+    now.as_millis() as i64
 }
 
-/// Epoch milliseconds → `YYYY-MM-DDTHH:MM:SS.mmmZ` (Howard
-/// Hinnant's civil-from-days algorithm — the inverse of tags.rs's
-/// days-from-civil parser).
-fn unix_ms_to_rfc3339_utc(ms: i64) -> String {
+/// Epoch milliseconds → `(year, month, day, hour, minute, second)` in UTC
+/// (Howard Hinnant's civil-from-days algorithm — the inverse of tags.rs's
+/// days-from-civil parser). Shared by the RFC3339 formatter below and the
+/// deploy run id (23-03).
+pub(crate) fn utc_parts(ms: i64) -> (i64, u32, u32, u32, u32, u32) {
     let secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400); // seconds of day
     let z = days + 719_468;
@@ -997,12 +1002,21 @@ fn unix_ms_to_rfc3339_utc(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z",
-        hh = sod / 3600,
-        mm = (sod % 3600) / 60,
-        ss = sod % 60,
+    (
+        y,
+        m as u32,
+        d as u32,
+        (sod / 3600) as u32,
+        ((sod % 3600) / 60) as u32,
+        (sod % 60) as u32,
     )
+}
+
+/// Epoch milliseconds → `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fn unix_ms_to_rfc3339_utc(ms: i64) -> String {
+    let millis = ms.rem_euclid(1000);
+    let (y, m, d, hh, mm, ss) = utc_parts(ms);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
@@ -1147,6 +1161,16 @@ mod checkout_tests {
             unix_ms_to_rfc3339_utc(1_709_208_000_000),
             "2024-02-29T12:00:00.000Z"
         );
+    }
+
+    /// `utc_parts` splits epoch milliseconds into civil UTC fields (the
+    /// run id of 23-03 formats them).
+    #[test]
+    fn utc_parts_splits_known_instants() {
+        assert_eq!(utc_parts(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(utc_parts(1_792_074_153_000), (2026, 10, 15, 14, 22, 33));
+        assert_eq!(utc_parts(1_709_208_000_000), (2024, 2, 29, 12, 0, 0));
+        assert_eq!(utc_parts(-1), (1969, 12, 31, 23, 59, 59));
     }
 
     /// `rfc3339_now_utc` produces a well-formed, parseable-shaped
