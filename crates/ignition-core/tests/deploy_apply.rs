@@ -2963,3 +2963,478 @@ async fn rollback_bad_run_id_is_invalid_input() {
     assert!(!rig.repo.join(".ign").exists());
     assert!(!rig.deploy_dir().join("snapshots").exists());
 }
+
+/// One byte appended to a live file of the mode collection.
+fn edit_live(rig: &Rig, path: &str) {
+    let mut bytes = rig.fx.read(MODE, path);
+    bytes.extend_from_slice(b" ");
+    rig.fx.mode(path, &bytes);
+}
+
+fn record_path(rig: &Rig, run_id: &str) -> PathBuf {
+    rig.deploy_dir()
+        .join("snapshots")
+        .join(run_id)
+        .join("record.json")
+}
+
+/// The run directories of this rig's repo, byte-sorted.
+fn run_dirs(rig: &Rig) -> Vec<String> {
+    names(&rig.repo.join(".ign/deploy").join(GATEWAY))
+}
+
+/// The calls that wrote nothing: a refusal made before the lock is only ever
+/// made of these.
+fn only_reads(fresh: &Fresh) {
+    let calls = fresh.host.calls();
+    for write in [
+        "prepare",
+        "commit",
+        "restore",
+        "finalize",
+        "discard_interrupted",
+    ] {
+        assert!(!calls.contains(&write), "{write} was called: {calls:?}");
+    }
+    assert_eq!(fresh.fake.lock_acquires(), 0, "no lock was taken");
+    assert_eq!(fresh.fake.scan_count(), 0, "no scan was asked for");
+}
+
+#[tokio::test]
+async fn rollback_live_changed_refuses() {
+    let rig = changing_rig().await;
+    let target_run = apply_once(&rig).await;
+    edit_live(&rig, DB_CONFIG);
+    let edited = collection_state(&rig);
+
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect_err("a changed touched file refuses");
+    let CoreError::DeployLiveChanged {
+        run_id,
+        paths,
+        count,
+    } = &err
+    else {
+        panic!("expected deploy_live_changed, got {err:?}");
+    };
+    assert_eq!(run_id, &target_run);
+    assert_eq!(paths, &[DB_CONFIG.to_string()]);
+    assert_eq!(*count, 1);
+    assert_eq!(err.exit_code(), 6);
+    assert!(err.to_string().contains(DB_CONFIG), "{err}");
+
+    // The host is as it was, the record is still `applied`, no run was made.
+    assert_eq!(collection_state(&rig), edited);
+    assert_eq!(rig.record(&target_run).state, RecordState::Applied);
+    assert_eq!(run_dirs(&rig), [target_run.clone()]);
+    only_reads(&fresh);
+}
+
+#[tokio::test]
+async fn rollback_discard_live_changes_proceeds() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let target_run = apply_once(&rig).await;
+    edit_live(&rig, DB_CONFIG);
+
+    let fresh = Fresh::new(&rig).await;
+    let prepared = fresh
+        .prepare(&rig, &target_run, true)
+        .await
+        .expect("discarding makes it prepare");
+    assert_eq!(prepared.live_changed, [DB_CONFIG.to_string()]);
+    assert!(prepared.prose.contains(DB_CONFIG), "{}", prepared.prose);
+    let result = fresh
+        .run(&rig, prepared, &target_run, true)
+        .await
+        .expect("restored over the change");
+
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert_eq!(result.discarded_live_changes, [DB_CONFIG.to_string()]);
+    assert_eq!(collection_state(&rig), before, "the snapshot is back");
+
+    // The rollback run records what it overwrote.
+    let run_dir = PathBuf::from(&result.run_dir);
+    let run_json = json_file(&run_dir.join("run.json"));
+    assert_eq!(run_json["discard_live_changes"], true);
+    assert_eq!(run_json["discarded_live_changes"], json!([DB_CONFIG]));
+    let discarded = event_lines(&run_dir, "live_changes_discarded");
+    assert_eq!(discarded.len(), 1, "{discarded:?}");
+    assert_eq!(discarded[0]["paths"], json!([DB_CONFIG]));
+    assert_eq!(discarded[0]["count"], 1);
+    assert_eq!(
+        event_names(&run_dir),
+        [
+            "run_started",
+            "live_changes_discarded",
+            "lock_acquired",
+            "restore_started",
+            "scan_done",
+            "restored"
+        ]
+    );
+    assert_eq!(
+        json_file(&run_dir.join("result.json"))["discarded_live_changes"],
+        json!([DB_CONFIG])
+    );
+}
+
+#[tokio::test]
+async fn rollback_unrelated_edit_does_not_block() {
+    let rig = changing_rig().await;
+    let mut before = collection_state(&rig);
+    let target_run = apply_once(&rig).await;
+
+    // A file the run never touched: not part of the touched set (23-02).
+    let other = "ignition/not-ours/config.json";
+    rig.fx.mode(other, b"{}");
+    before.insert(other.to_string(), sha256_hex(b"{}"));
+
+    let fresh = Fresh::new(&rig).await;
+    let result = fresh
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect("an unrelated edit does not block");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.discarded_live_changes.is_empty());
+    assert_eq!(collection_state(&rig), before, "and it is left alone");
+}
+
+#[tokio::test]
+async fn rollback_older_run_behind_newer_refuses() {
+    let mut rig = changing_rig().await;
+    let run_a = apply_once(&rig).await;
+
+    // Run B changes the same file to something else.
+    let source = rig
+        .repo
+        .join("gateways")
+        .join(GATEWAY)
+        .join("resources")
+        .join(DB_CONFIG);
+    let text = std::fs::read_to_string(&source).expect("the source file");
+    assert!(text.contains("varchar(255)"));
+    std::fs::write(&source, text.replace("varchar(255)", "varchar(128)")).expect("edit the source");
+    let (declared, reader) = rig.fx.load("dev");
+    rig.declared = declared;
+    rig.reader = reader;
+    let run_b = apply_once(&rig).await;
+    assert_ne!(run_a, run_b);
+    let after_b = collection_state(&rig);
+
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &run_a, false)
+        .await
+        .expect_err("run A is behind run B");
+    let CoreError::DeployLiveChanged { paths, count, .. } = &err else {
+        panic!("expected deploy_live_changed, got {err:?}");
+    };
+    assert!(paths.contains(&DB_CONFIG.to_string()), "{paths:?}");
+    assert_eq!(*count, paths.len());
+    assert_eq!(collection_state(&rig), after_b);
+    only_reads(&fresh);
+
+    // The newest run still rolls back.
+    let result = fresh
+        .rollback(&rig, &run_b, false)
+        .await
+        .expect("run B rolls back");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+}
+
+/// Rewrite the on-box record of `run_id` with `edit`, run a rollback and
+/// return what it said; the original record is put back afterwards.
+async fn rollback_with_record(rig: &Rig, run_id: &str, edit: impl FnOnce(&mut Value)) -> CoreError {
+    let path = record_path(rig, run_id);
+    let original = std::fs::read(&path).expect("the record");
+    let mut doc: Value = serde_json::from_slice(&original).expect("record json");
+    edit(&mut doc);
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc).expect("json")).expect("rewrite");
+    let fresh = Fresh::new(rig).await;
+    let err = fresh
+        .rollback(rig, run_id, false)
+        .await
+        .expect_err("an unusable record refuses");
+    std::fs::write(&path, original).expect("put the record back");
+    only_reads(&fresh);
+    err
+}
+
+fn assert_invalid(err: &CoreError, run_id: &str, needle: &str) {
+    assert!(
+        matches!(err, CoreError::DeployRunInvalid { .. }),
+        "expected deploy_run_invalid, got {err:?}"
+    );
+    assert_eq!(err.code(), "deploy_run_invalid");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(text.contains(run_id), "the run id in {text}");
+    assert!(text.contains(needle), "{needle:?} in {text}");
+}
+
+#[tokio::test]
+async fn rollback_record_problems() {
+    let rig = changing_rig().await;
+    let run = apply_once(&rig).await;
+    let before = collection_state(&rig);
+
+    // No record: a run id the host has never seen.
+    let unknown = "20261016T000000Z-aaaaaa";
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, unknown, false)
+        .await
+        .expect_err("no record");
+    assert_invalid(&err, unknown, "record.json");
+    only_reads(&fresh);
+
+    // A record that is not JSON.
+    let path = record_path(&rig, &run);
+    let original = std::fs::read(&path).expect("the record");
+    std::fs::write(&path, b"{ not json").expect("corrupt");
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &run, false)
+        .await
+        .expect_err("a corrupt record");
+    std::fs::write(&path, &original).expect("put the record back");
+    assert_invalid(&err, &run, "record.json");
+    only_reads(&fresh);
+
+    // A record for another mode, and for another gateway.
+    let err = rollback_with_record(&rig, &run, |doc| doc["mode"] = json!("prod")).await;
+    assert_invalid(&err, &run, "mode");
+    let err = rollback_with_record(&rig, &run, |doc| doc["gateway"] = json!("other-gw")).await;
+    assert_invalid(&err, &run, "gateway");
+
+    // Still `applying`, and no journal on the box.
+    let err = rollback_with_record(&rig, &run, |doc| {
+        doc["state"] = json!("applying");
+        doc["post_fingerprint"] = Value::Null;
+    })
+    .await;
+    assert_invalid(&err, &run, "did not finish");
+
+    // A record that disagrees with itself.
+    let err = rollback_with_record(&rig, &run, |doc| {
+        doc["touched"][0]["post_sha256"] = json!("0".repeat(64));
+    })
+    .await;
+    assert_invalid(&err, &run, "post_fingerprint");
+
+    // Nothing was written by any of them, and the real record still works.
+    assert_eq!(collection_state(&rig), before);
+    assert_eq!(rig.record(&run).state, RecordState::Applied);
+    let fresh = Fresh::new(&rig).await;
+    fresh
+        .rollback(&rig, &run, false)
+        .await
+        .expect("the untouched record rolls back");
+}
+
+#[tokio::test]
+async fn rollback_run_dir_mismatch() {
+    let rig = changing_rig().await;
+    let run = apply_once(&rig).await;
+    let before = collection_state(&rig);
+    let dir = rig.repo.join(".ign/deploy").join(GATEWAY).join(&run);
+
+    // run.json names another plan.
+    let run_json = dir.join("run.json");
+    let original = std::fs::read(&run_json).expect("run.json");
+    let mut doc: Value = serde_json::from_slice(&original).expect("json");
+    doc["plan_sha256"] = json!("0".repeat(64));
+    std::fs::write(&run_json, serde_json::to_vec_pretty(&doc).expect("json")).expect("edit");
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &run, false)
+        .await
+        .expect_err("a run.json that disagrees");
+    assert_invalid(&err, &run, "plan_sha256");
+    assert!(err.to_string().contains("run.json"), "{err}");
+    only_reads(&fresh);
+    std::fs::write(&run_json, &original).expect("put run.json back");
+
+    // plan.json names another render.
+    let plan_json = dir.join("plan.json");
+    let original = std::fs::read(&plan_json).expect("plan.json");
+    let mut doc: Value = serde_json::from_slice(&original).expect("json");
+    doc["render_sha256"] = json!("1".repeat(64));
+    std::fs::write(&plan_json, serde_json::to_vec_pretty(&doc).expect("json")).expect("edit");
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &run, false)
+        .await
+        .expect_err("a plan.json that disagrees");
+    assert_invalid(&err, &run, "render_sha256");
+    assert!(err.to_string().contains("plan.json"), "{err}");
+    only_reads(&fresh);
+    std::fs::write(&plan_json, &original).expect("put plan.json back");
+
+    // The run directory of a rollback is not a deployment's.
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(&run_json).expect("run.json")).expect("json");
+    doc["kind"] = json!("rollback");
+    std::fs::write(&run_json, serde_json::to_vec_pretty(&doc).expect("json")).expect("edit");
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &run, false)
+        .await
+        .expect_err("a rollback's run directory");
+    assert_invalid(&err, &run, "rollback");
+    std::fs::write(&run_json, &original).expect("put run.json back");
+
+    assert_eq!(collection_state(&rig), before);
+    let fresh = Fresh::new(&rig).await;
+    fresh
+        .rollback(&rig, &run, false)
+        .await
+        .expect("with the files agreeing it rolls back");
+}
+
+#[tokio::test]
+async fn rollback_twice_refuses() {
+    // Edge DAPL-08 idempotency.
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let target_run = apply_once(&rig).await;
+    let first = Fresh::new(&rig)
+        .await
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect("the first rollback");
+    assert_eq!(collection_state(&rig), before);
+    let record_after_first = std::fs::read(record_path(&rig, &target_run)).expect("record");
+
+    let second = Fresh::new(&rig).await;
+    let err = second
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect_err("a second rollback of the same run refuses");
+    assert_invalid(
+        &err,
+        &target_run,
+        &format!("already rolled back by {}", first.run_id),
+    );
+    only_reads(&second);
+    assert_eq!(collection_state(&rig), before, "nothing was written");
+    assert_eq!(
+        std::fs::read(record_path(&rig, &target_run)).expect("record"),
+        record_after_first
+    );
+    assert_eq!(run_dirs(&rig).len(), 2, "no third run directory");
+}
+
+fn foreign_journal() -> Journal {
+    Journal {
+        schema_version: 1,
+        run_id: "20261016T000000Z-ffffff".to_string(),
+        gateway: GATEWAY.to_string(),
+        mode: MODE.to_string(),
+        phase: JournalPhase::Writing,
+        pre_fingerprint: "0".repeat(64),
+        touched: vec![DB_CONFIG.to_string()],
+    }
+}
+
+#[tokio::test]
+async fn rollback_other_journal_refuses() {
+    // Edge DAPL-08 concurrency.
+    let rig = changing_rig().await;
+    let target_run = apply_once(&rig).await;
+    let applied = collection_state(&rig);
+
+    // The journal is on the box before the rollback starts ...
+    std::fs::write(
+        rig.deploy_dir().join("journal.json"),
+        foreign_journal().to_bytes(),
+    )
+    .expect("journal");
+    let fresh = Fresh::new(&rig).await;
+    let err = fresh
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect_err("another run's journal refuses");
+    let CoreError::DeployJournalPresent { run_id, env, .. } = &err else {
+        panic!("expected deploy_journal_present, got {err:?}");
+    };
+    assert_eq!(run_id, "20261016T000000Z-ffffff");
+    assert_eq!(env, "dev");
+    assert!(err.to_string().contains("--env dev"), "{err}");
+    only_reads(&fresh);
+    assert_eq!(run_dirs(&rig), [target_run.clone()]);
+
+    // ... or appears between the preparation and the run.
+    std::fs::remove_file(rig.deploy_dir().join("journal.json")).expect("clear the journal");
+    let fresh = Fresh::new(&rig).await;
+    let prepared = fresh
+        .prepare(&rig, &target_run, false)
+        .await
+        .expect("prepared while the box is clear");
+    std::fs::write(
+        rig.deploy_dir().join("journal.json"),
+        foreign_journal().to_bytes(),
+    )
+    .expect("journal");
+    let err = fresh
+        .run(&rig, prepared, &target_run, false)
+        .await
+        .expect_err("the run looks again");
+    assert_eq!(err.code(), "deploy_journal_present", "{err}");
+    only_reads(&fresh);
+    assert_eq!(collection_state(&rig), applied);
+    assert_eq!(rig.record(&target_run).state, RecordState::Applied);
+}
+
+#[tokio::test]
+async fn rollback_lock_held_refuses() {
+    // Edge DAPL-08 concurrency.
+    let rig = changing_rig().await;
+    let target_run = apply_once(&rig).await;
+    let applied = collection_state(&rig);
+
+    let fresh = Fresh::new(&rig).await;
+    fresh
+        .fake
+        .client("b")
+        .scan_lock_acquire(ScanKind::Config, 0, 600)
+        .await
+        .expect("B takes the lock");
+    let err = fresh
+        .rollback(&rig, &target_run, false)
+        .await
+        .expect_err("another actor holds the scan-lock");
+    assert_eq!(err.code(), "scan_lock_held", "{err}");
+    assert_eq!(err.exit_code(), 6);
+
+    // No write, no scan; the record is untouched. The refusal is in the
+    // rollback run's result.
+    let calls = fresh.host.calls();
+    for write in ["prepare", "commit", "restore", "finalize"] {
+        assert!(!calls.contains(&write), "{write} was called: {calls:?}");
+    }
+    assert_eq!(fresh.fake.scan_count(), 0);
+    assert_eq!(collection_state(&rig), applied);
+    assert_eq!(rig.record(&target_run).state, RecordState::Applied);
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    let runs = run_dirs(&rig);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    let failed = runs
+        .iter()
+        .find(|r| **r != target_run)
+        .expect("rollback run");
+    let result = json_file(
+        &rig.repo
+            .join(".ign/deploy")
+            .join(GATEWAY)
+            .join(failed)
+            .join("result.json"),
+    );
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "scan_lock_held");
+    assert_eq!(result["target_run_id"], target_run.as_str());
+}
