@@ -26,6 +26,12 @@ use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
+#[cfg(unix)]
+use ignition_core::deploy::transport::process::TokioProcessRunner;
+#[cfg(unix)]
+use ignition_core::deploy::transport::remote::RemoteShell;
+#[cfg(unix)]
+use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
 
 const GW: &str = "conf-gw";
 const MODE: &str = "dev";
@@ -92,6 +98,22 @@ impl Ctx {
         let host = LocalFsTransport::new(data.path().to_path_buf(), "nodes.conf")
             .with_apply(GW, MODE)
             .expect("apply host");
+        Ctx {
+            host: Box::new(host),
+            data,
+        }
+    }
+
+    /// The POSIX script host over ssh, driven through the local `sftp-server`
+    /// and a local `sh` (the `local_exec` seam): the same gateway data
+    /// directory shape as [`Ctx::local`], with the account home being the data
+    /// directory so `ign-deploy` lands where the rows look for it.
+    #[cfg(unix)]
+    pub fn sh() -> Ctx {
+        let data = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(data.path().join("config/resources").join(MODE))
+            .expect("collection");
+        let host = sh_host(data.path());
         Ctx {
             host: Box::new(host),
             data,
@@ -296,6 +318,22 @@ impl Ctx {
             .expect("prepare");
         self.host.commit(&prepared).await.expect("commit")
     }
+}
+
+/// An `SftpTransport` over `root` as the data directory and the account home.
+#[cfg(unix)]
+pub fn sh_host(root: &Path) -> SftpTransport {
+    let shell = RemoteShell::local_sftp_server(
+        &common::sftp_server::sftp_server_path(),
+        Arc::new(TokioProcessRunner),
+        std::time::Duration::from_secs(120),
+    )
+    .local_exec();
+    let data_dir = posix_root(&root.display().to_string()).expect("posix root");
+    SftpTransport::new(shell, data_dir.clone(), "nodes.sh")
+        .with_home(&data_dir)
+        .with_apply(GW, MODE)
+        .expect("apply host")
 }
 
 /// A ledger for the test gateway that lists `files`.
@@ -1072,6 +1110,92 @@ async fn conformance_local_symlinked_target_dir_is_refused() {
 #[tokio::test]
 async fn conformance_local_restore_twice_is_idempotent() {
     run_local("restore_twice_is_idempotent").await;
+}
+
+// ---- the POSIX script host ---------------------------------------------------
+
+#[cfg(unix)]
+async fn run_sh(name: &str) {
+    let scenario = scenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no row named {name}"));
+    let ctx = Ctx::sh();
+    (scenario.run)(&ctx).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conformance_sh_add_one_file() {
+    run_sh("add_one_file").await;
+}
+
+/// One byte of the staged script is changed after upload: the stub exits
+/// before running anything, the call is `transport_failed` and the collection,
+/// the journal and the snapshots are untouched (T-23-25).
+#[cfg(unix)]
+#[tokio::test]
+async fn stub_refuses_a_tampered_script() {
+    let c = Ctx::sh();
+    c.seed(FILE_B, b"live");
+    let before = (c.listing(), tree_names(c.root()));
+    let batch = c.batch(RUN, &[(FILE_A, br#"{"a":1}"#)], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let script = c.staging_dir(RUN).join("commit.sh");
+    let mut bytes = std::fs::read(&script).expect("the script was uploaded");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    std::fs::write(&script, bytes).expect("tamper");
+    let staged = tree_names(c.root());
+
+    let err = c
+        .host
+        .commit(&prepared)
+        .await
+        .expect_err("a tampered script must not run");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("commit"), "names the op: {text}");
+    assert!(text.contains("does not match its hash"), "{text}");
+    assert_eq!(c.listing(), before.0, "the collection is untouched");
+    assert!(c.journal().is_none(), "no journal was written");
+    assert!(!c.snapshot_dir(RUN).exists(), "no snapshot was made");
+    assert_eq!(tree_names(c.root()), staged, "nothing else changed");
+}
+
+/// One byte of `work.tsv` is changed after upload: refused the same way.
+#[cfg(unix)]
+#[tokio::test]
+async fn stub_refuses_a_tampered_work_list() {
+    let c = Ctx::sh();
+    c.seed(FILE_B, b"live");
+    let before = c.listing();
+    let batch = c.batch(RUN, &[(FILE_A, br#"{"a":1}"#)], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let work = c.staging_dir(RUN).join("work.tsv");
+    let mut bytes = std::fs::read(&work).expect("the work list was uploaded");
+    let at = bytes.iter().position(|b| *b == b'a').expect("a letter");
+    bytes[at] = b'b';
+    std::fs::write(&work, bytes).expect("tamper");
+
+    let err = c
+        .host
+        .commit(&prepared)
+        .await
+        .expect_err("a tampered work list must not run");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(err.to_string().contains("does not match its hash"), "{err}");
+    assert_eq!(c.listing(), before, "the collection is untouched");
+    assert!(c.journal().is_none());
+    assert!(!c.snapshot_dir(RUN).exists());
 }
 
 // ---- fault rows (local host only) ---------------------------------------------

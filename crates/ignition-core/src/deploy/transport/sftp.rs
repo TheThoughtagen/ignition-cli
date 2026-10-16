@@ -52,7 +52,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod apply_ops;
 
 use super::remote::{RemoteShell, SftpFailure, SftpOp, classify_sftp_stderr, safe_remote_path};
 use super::winps::{
@@ -573,6 +576,13 @@ pub struct SftpTransport {
     /// The account's home directory as the server spells it, read once with
     /// `pwd`.
     home: std::sync::OnceLock<String>,
+    /// The apply half (23-06): the target gateway and mode.
+    apply: Option<apply_ops::ApplySetup>,
+    /// The work lists `prepare` staged, by the SHA-256 of their bytes, so
+    /// `commit` can name the entries a script result points at.
+    lists: Mutex<BTreeMap<String, super::batch::WorkList>>,
+    /// Numbers the throw-away control directories of this transport.
+    ctl_seq: AtomicUsize,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -597,6 +607,9 @@ impl SftpTransport {
             mirror: None,
             windows: false,
             home: std::sync::OnceLock::new(),
+            apply: None,
+            lists: Mutex::new(BTreeMap::new()),
+            ctl_seq: AtomicUsize::new(0),
         }
     }
 

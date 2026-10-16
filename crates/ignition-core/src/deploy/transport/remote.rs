@@ -650,6 +650,9 @@ pub struct RemoteShell {
     label: String,
     /// Replaces the network destination (the `-D <server>` test seam).
     destination_override: Option<Vec<OsString>>,
+    /// Runs a remote command with the local `sh -c` instead of `ssh` (the
+    /// test seam that pairs with `destination_override`).
+    local_exec: bool,
 }
 
 impl fmt::Debug for RemoteShell {
@@ -783,6 +786,7 @@ impl RemoteShell {
             op_timeout: Duration::from_secs(u64::from(op_timeout_s)),
             label: label.to_string(),
             destination_override: None,
+            local_exec: false,
         })
     }
 
@@ -807,7 +811,19 @@ impl RemoteShell {
             op_timeout,
             label: "nodes.test".to_string(),
             destination_override: Some(vec![OsString::from("-D"), server.as_os_str().to_owned()]),
+            local_exec: false,
         }
+    }
+
+    /// Test seam: run [`exec_posix`](Self::exec_posix) commands with the local
+    /// `sh -c <command text>` instead of `ssh`, so the script host is
+    /// exercised end to end without an sshd. Pair it with
+    /// [`local_sftp_server`](Self::local_sftp_server). Nothing in the binary
+    /// calls it.
+    #[doc(hidden)]
+    pub fn local_exec(mut self) -> RemoteShell {
+        self.local_exec = true;
+        self
     }
 
     /// The node label used in errors (`nodes.master`).
@@ -1013,7 +1029,68 @@ impl RemoteShell {
         winps::interpret_output(&out, self.op_timeout.as_secs(), self.temp_dir())
             .map_err(|detail| failure(format!("{}: {detail}", script.name)))
     }
+
+    /// Run one POSIX `command` (built by [`RemoteCommand::posix`]) on a Linux
+    /// host over ssh and return the JSON of its one `IGN-RESULT:` stdout
+    /// line. `op` names the script operation in every error. Success needs
+    /// exit 0 within the per-call timeout and exactly one sentinel line; a
+    /// non-zero exit, a timeout, a missing or doubled sentinel and text after
+    /// the sentinel that is not JSON are all [`CoreError::TransportFailed`]
+    /// naming `op`. The detail carries a scrubbed stderr tail and never the
+    /// stdout.
+    pub async fn exec_posix(
+        &self,
+        op: &str,
+        command: &RemoteCommand,
+    ) -> Result<serde_json::Value, CoreError> {
+        let failure = |detail: String| CoreError::TransportFailed {
+            operation: "exec".to_string(),
+            node: self.label.clone(),
+            detail: format!("{op}: {detail}"),
+        };
+        let out = if self.local_exec {
+            self.runner
+                .run(
+                    OsStr::new("sh"),
+                    &[OsString::from("-c"), OsString::from(command.as_str())],
+                    None,
+                    self.op_timeout,
+                )
+                .await
+        } else {
+            self.runner
+                .run(
+                    OsStr::new("ssh"),
+                    &self.ssh_argv(Some(command)),
+                    None,
+                    self.op_timeout,
+                )
+                .await
+        };
+        if out.timed_out {
+            return Err(failure(format!(
+                "timed out after {}s and was killed",
+                self.op_timeout.as_secs()
+            )));
+        }
+        if out.code != 0 {
+            let tail = scrub_stderr(&out.stderr, self.temp_dir());
+            let why = match out.code {
+                STUB_MISMATCH_EXIT => {
+                    "the staged script or work list does not match its hash; nothing ran".to_string()
+                }
+                code if tail.is_empty() => format!("exit code {code}"),
+                code => format!("exit code {code}: {tail}"),
+            };
+            return Err(failure(why));
+        }
+        winps::parse_ign_result(&out.stdout).map_err(failure)
+    }
 }
+
+/// The exit status of the fixed POSIX stub when the script or the work list
+/// it was asked to run does not hash to the value the runner computed.
+pub const STUB_MISMATCH_EXIT: i32 = 97;
 
 #[cfg(test)]
 mod tests {
