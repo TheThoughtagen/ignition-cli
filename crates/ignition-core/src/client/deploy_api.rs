@@ -21,6 +21,7 @@
 
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::client::config_resources::{
@@ -32,6 +33,7 @@ use crate::client::mode::{
     GatewayModeProbe, MODE_PATH, ModeCreate, ModeRecord, normalize_deployment_mode,
 };
 use crate::client::query::{ListEnvelope, ListQuery};
+use crate::client::restart::RESTART_PENDING_PATH;
 use crate::client::scan::{
     LockObservation, LockRequest, ScanKind, ScanLockInfo, ScanOutcome, ScanStatus, scan_complete,
     scan_lock_path, scan_path,
@@ -171,6 +173,13 @@ pub const DEPLOY_ENDPOINTS: &[EndpointDecl] = &[
         path_template: "/data/api/v1/gateway-info",
         shape: ResponseShape::Json,
         capture_ref: "C-null",
+    },
+    EndpointDecl {
+        id: "restart_pending",
+        method: "GET",
+        path_template: "/data/api/v1/restart-tasks/pending",
+        shape: ResponseShape::Json,
+        capture_ref: "C-restart",
     },
 ];
 
@@ -334,6 +343,24 @@ pub trait DeployApi: Send + Sync {
     /// or whitespace-only (no mode), else the name verbatim. Read through
     /// a private probe, so `GatewayInfo` is untouched.
     async fn deployment_mode(&self) -> Result<Option<String>, CoreError>;
+
+    /// The changes waiting for a gateway restart (`restart_pending`, capture
+    /// C-restart, DAPI-06): the strings of `{"pending": [...]}`, in gateway
+    /// order, free text of the form `Module <State>: <module id>`. An empty
+    /// list is Ok. A pending entry stays until the gateway restarts, so a
+    /// caller that wants the entries a run added compares two reads.
+    ///
+    /// Read only (SF-3): `apply` reports this list and never restarts or
+    /// fails over. A refused or unreadable answer (401 and 403 are Jetty
+    /// pages, not JSON) is the usual error; the caller decides that it is a
+    /// warning.
+    async fn restart_pending(&self) -> Result<Vec<String>, CoreError>;
+}
+
+/// The body of `restart-tasks/pending` (C-restart): one key, `pending`.
+#[derive(Deserialize)]
+struct RestartPendingBody {
+    pending: Vec<String>,
 }
 
 /// A 2xx body after the declared shape was enforced.
@@ -831,6 +858,22 @@ impl DeployApi for ReqwestGatewayApi {
             ))),
         }
     }
+
+    async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
+        let decl = decl("restart_pending")?;
+        let url = self.url_for(RESTART_PENDING_PATH);
+        let request = self.apply_auth(self.client.get(url.clone()));
+        match self.send_shaped(decl, request, &url).await? {
+            ShapedBody::Json(text) => {
+                let body: RestartPendingBody = parse_json(decl, &url, &text)?;
+                Ok(body.pending)
+            }
+            ShapedBody::Empty | ShapedBody::NoContent => Err(CoreError::Internal(format!(
+                "endpoint {} produced no body",
+                decl.id
+            ))),
+        }
+    }
 }
 
 /// The `collection` query pair, only when a collection was asked for.
@@ -1218,11 +1261,11 @@ mod tests {
             (ResponseTemplate::new(401), Err("auth")),
             (
                 ResponseTemplate::new(200).set_body_string("{}"),
-                Err("internal"),
+                Err("shape"),
             ),
             (
                 ResponseTemplate::new(200).set_body_string(r#"{"pending":null}"#),
-                Err("internal"),
+                Err("shape"),
             ),
         ];
         for (answer, want) in cases {
@@ -1237,7 +1280,8 @@ mod tests {
             let got = api.restart_pending().await;
             match (got, want) {
                 (Ok(list), Ok(expected)) => assert_eq!(list, expected),
-                (Err(err), Err(code)) => assert_eq!(err.code(), code, "{err}"),
+                (Err(CoreError::Auth { .. }), Err("auth")) => {}
+                (Err(CoreError::Internal(_)), Err("shape")) => {}
                 (got, want) => panic!("got {got:?}, wanted {want:?}"),
             }
         }

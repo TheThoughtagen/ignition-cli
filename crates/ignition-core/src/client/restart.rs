@@ -13,9 +13,13 @@
 //!   part 2: what the gateway's read/write permissions actually are)
 //!   and the WebDev route-presence probe root.
 //!
-//! Deliberately ABSENT: `restart-tasks/pending`. Research is explicit
-//! it is *required-restart* config (changes needing a restart), NOT
-//! active-restart status — never use it as a restart-progress signal.
+//! `restart-tasks/pending` is NOT a restart-progress signal. It lists
+//! *required-restart* changes (config that needs a restart to take
+//! effect), not an active restart, so nothing here polls it. It is read
+//! only by the deploy client as [`RESTART_PENDING_PATH`]
+//! (`DeployApi::restart_pending`, 23-09, capture C-restart): `apply`
+//! reports what is pending before and after a run and never calls the
+//! restart route, which stays out of the deploy path altogether (SF-3).
 
 use std::collections::BTreeMap;
 
@@ -23,6 +27,10 @@ use serde::{Deserialize, Serialize};
 
 /// POST path of the restart capability (query param `confirm=true`).
 pub(crate) const RESTART_PATH: &str = "/data/api/v1/restart-tasks/restart";
+
+/// GET path of the pending-restart list (`{"pending": [string]}`, C-restart).
+/// Read-only; the deploy client's `restart_pending` is its only user.
+pub(crate) const RESTART_PENDING_PATH: &str = "/data/api/v1/restart-tasks/pending";
 
 /// POST path of the project-scan write probe (doctor `--check-write`).
 pub(crate) const SCAN_PROJECTS_PATH: &str = "/data/api/v1/scan/projects";

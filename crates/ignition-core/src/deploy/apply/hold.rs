@@ -482,6 +482,9 @@ mod tests {
         async fn deployment_mode(&self) -> Result<Option<String>, CoreError> {
             unused()
         }
+        async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
+            unused()
+        }
     }
 
     const HOLD: u64 = 60;

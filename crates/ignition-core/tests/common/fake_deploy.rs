@@ -132,6 +132,14 @@ struct FakeState {
     lock_attempts: usize,
     /// Scan POSTs still to be swallowed (see [`FakeGateway::stall_scans`]).
     stall_scans: usize,
+    /// The pending-restart list before a config scan completes, and after
+    /// (see [`FakeGateway::set_restart_pending`]).
+    restart_before: Vec<String>,
+    restart_after: Vec<String>,
+    /// A config scan was triggered (the list switches to `restart_after`).
+    config_scanned: bool,
+    /// The pending-restart route answers 403.
+    restart_denied: bool,
 }
 
 impl FakeState {
@@ -316,6 +324,21 @@ impl FakeGateway {
     /// not proof of a completed scan).
     pub fn stall_scans(&self, n: usize) {
         self.state.lock().expect("fake state").stall_scans = n;
+    }
+
+    /// What `restart-tasks/pending` lists (C-restart): `before` until a config
+    /// scan has been triggered, `after_scan` from then on. A pending entry
+    /// persists until the gateway restarts, so a test models a change that
+    /// needs a restart by listing it only in `after_scan`.
+    pub fn set_restart_pending(&self, before: Vec<String>, after_scan: Vec<String>) {
+        let mut state = self.state.lock().expect("fake state");
+        state.restart_before = before;
+        state.restart_after = after_scan;
+    }
+
+    /// The pending-restart route answers 403 from now on.
+    pub fn deny_restart_pending(&self) {
+        self.state.lock().expect("fake state").restart_denied = true;
     }
 
     /// A client for the API token `token_name`. Its actor is
@@ -776,6 +799,7 @@ impl DeployApi for FakeDeploy {
         }
         if kind == ScanKind::Config {
             state.reload_from_disk();
+            state.config_scanned = true;
         }
         // D4: any actor's scan POST is accepted whether or not another
         // actor holds the lock; a second POST while one runs is a no-op.
@@ -827,5 +851,20 @@ impl DeployApi for FakeDeploy {
 
     async fn deployment_mode(&self) -> Result<Option<String>, CoreError> {
         Ok(self.state().active_mode())
+    }
+
+    async fn restart_pending(&self) -> Result<Vec<String>, CoreError> {
+        let state = self.state();
+        if state.restart_denied {
+            return Err(CoreError::Auth {
+                status: 403,
+                endpoint: endpoint("/data/api/v1/restart-tasks/pending"),
+            });
+        }
+        Ok(if state.config_scanned {
+            state.restart_after.clone()
+        } else {
+            state.restart_before.clone()
+        })
     }
 }
