@@ -28,11 +28,13 @@ use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
 use ignition_core::deploy::apply::hold::{Clock, HoldModel, ManualClock, SystemClock};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
-use ignition_core::deploy::apply::preflight::DesignersPolicy;
+use ignition_core::deploy::apply::preflight::{
+    DesignersPolicy, PreflightInput, PreflightReport, run_preflights,
+};
 use ignition_core::deploy::apply::record::{RecordState, RunRecord};
 use ignition_core::deploy::apply::{
     ApplyContext, ApplyEvent, ApplyObserver, ApplyOptions, NoObserver, OutcomeKind, RollbackCause,
-    write_set,
+    Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::transport::TreeReader;
@@ -198,6 +200,8 @@ struct Rig {
     fake: FakeGateway,
     api: ReqwestGatewayApi,
     host: FaultyHost<LocalFsTransport>,
+    /// The backup node's deploy surface, when the test gives the target one.
+    backup: Option<common::fake_deploy::FakeDeploy>,
     _server: wiremock::MockServer,
 }
 
@@ -299,6 +303,7 @@ async fn rig_with_logs(
         fake,
         api,
         host: FaultyHost::new(host),
+        backup: None,
         _server: server,
     }
 }
@@ -400,7 +405,7 @@ impl Rig {
             host: &self.host,
             deploy: &deploy,
             gateway: &self.api,
-            backup_deploy: None,
+            backup_deploy: self.backup.as_ref().map(|b| b as &dyn DeployApi),
             clock,
             observer,
         };
@@ -1557,4 +1562,404 @@ async fn preflight_mode_and_designers_reported_together() {
         json!([{"user": "alice", "project": "PlantA", "host": "10.0.0.5:52526"}])
     );
     assert!(run_dir.join("events.ndjson").exists());
+}
+
+/// Gives the target a backup node whose gateway runs `mode`.
+fn with_backup(rig: &mut Rig, mode: &str) {
+    let mut backup = rig.declared.target.nodes.master.clone();
+    backup.profile = "backup".to_string();
+    backup.local = None;
+    backup.gateway_name = None;
+    rig.declared.target.nodes.backup = Some(backup);
+    let gateway = FakeGateway::new();
+    gateway.set_deployment_mode(Some(mode.to_string()));
+    rig.backup = Some(gateway.client("backup"));
+}
+
+/// The gateway-info answer names the gateway `name`.
+async fn mount_gateway_name(rig: &Rig, name: &str) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/data/api/v1/gateway-info"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"name": name, "ignitionVersion": "8.3.6 (b2026042713)"})),
+        )
+        .mount(&rig._server)
+        .await;
+}
+
+/// The project-scan write probe answers `status` as the gateway's error page.
+async fn mount_scan_projects(rig: &Rig, status: u16) {
+    let route = "/data/api/v1/scan/projects";
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(route))
+        .respond_with(wiremock::ResponseTemplate::new(status).set_body_raw(
+            common::jetty_error_html(status, route),
+            "text/html;charset=iso-8859-1",
+        ))
+        .mount(&rig._server)
+        .await;
+}
+
+/// Runs a prepared apply and returns the preflight refusal's failed check
+/// ids, in the order the refusal lists them.
+async fn refused_checks(rig: &Rig) -> Vec<String> {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the preflights refuse");
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    failures.iter().map(|f| f.check.clone()).collect()
+}
+
+/// The refusal's detail for `check`.
+async fn refusal_detail(rig: &Rig, check: &str) -> String {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the preflights refuse");
+    let CoreError::DeployPreflightFailed { failures } = &err else {
+        panic!("expected DeployPreflightFailed, got {err:?}");
+    };
+    failures
+        .iter()
+        .find(|f| f.check == check)
+        .unwrap_or_else(|| panic!("no failure for {check} in {err}"))
+        .detail
+        .clone()
+}
+
+/// The preflights alone, over `rig`'s parts and the options' hold.
+async fn preflights(
+    rig: &Rig,
+    opts: &ApplyOptions,
+    touched_files: usize,
+) -> Result<PreflightReport, CoreError> {
+    let deploy = rig.fake.client("apply");
+    let mut steps = Steps::new(None, &NoObserver);
+    run_preflights(
+        &PreflightInput {
+            target: &rig.declared.target,
+            master: &deploy,
+            backup: rig.backup.as_ref().map(|b| b as &dyn DeployApi),
+            gateway: &rig.api,
+            reader: rig.reader.as_ref(),
+            host: &rig.host,
+            touched_files,
+            hold: &opts.hold,
+            designers: &opts.designers,
+            clock: &SystemClock,
+        },
+        &mut steps,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_backup_mode_mismatch() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, "production");
+    assert_eq!(refused_checks(&rig).await, ["mode_backup"]);
+    let detail = refusal_detail(&rig, "mode_backup").await;
+    assert!(
+        detail.contains("backup") && detail.contains("production"),
+        "{detail}"
+    );
+    assert_eq!(
+        rig.host.calls().iter().filter(|c| **c == "prepare").count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn preflight_backup_mode_matching_passes() {
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, MODE);
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let backup = &report.findings[1];
+    assert_eq!(backup.check.as_str(), "mode_backup");
+    assert_eq!(backup.status.as_str(), "pass");
+}
+
+#[tokio::test]
+async fn preflight_no_backup_node_is_skipped_not_passed() {
+    // Edge DAPL-04 empty: no backup node means `skipped`, never `pass`; no
+    // open Designer session passes in every mode.
+    let rig = changing_rig().await;
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+    let words: Vec<(&str, &str)> = report
+        .findings
+        .iter()
+        .map(|f| (f.check.as_str(), f.status.as_str()))
+        .collect();
+    assert_eq!(
+        words,
+        [
+            ("mode_master", "pass"),
+            ("mode_backup", "skipped"),
+            ("wrong_target", "pass"),
+            ("write_rest", "pass"),
+            ("write_host", "pass"),
+            ("designers", "pass"),
+            ("hold_budget", "pass"),
+        ]
+    );
+    assert!(report.designers_seen.is_empty());
+
+    // The applied run records the same in run.json.
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    let run = json_file(&rig.run_dir(&result).join("run.json"));
+    assert_eq!(run["designers"], "fail");
+    assert_eq!(run["designers_seen"], json!([]));
+    assert_eq!(
+        run["preflights"][1],
+        json!({"check": "mode_backup", "status": "skipped"})
+    );
+}
+
+#[tokio::test]
+async fn preflight_wrong_target() {
+    // The REST name is not the host's systemName.
+    let rig = changing_rig().await;
+    mount_gateway_name(&rig, "some-other-gateway").await;
+    assert_eq!(refused_checks(&rig).await, ["wrong_target"]);
+    let detail = refusal_detail(&rig, "wrong_target").await;
+    assert!(
+        detail.contains("REST name") && detail.contains("systemName"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("some-other-gateway") && !detail.contains(RIG_GATEWAY_NAME),
+        "the detail names sources, not values: {detail}"
+    );
+    assert_eq!(rig.host.calls(), ["probe"]);
+    assert_eq!(rig.fake.lock_acquires(), 0);
+}
+
+#[tokio::test]
+async fn preflight_wrong_target_declared_gateway_name() {
+    // REST and host agree, but nodes.master.gateway_name names another gateway.
+    let mut rig = changing_rig().await;
+    rig.declared.target.nodes.master.gateway_name = Some("the-other-site".to_string());
+    assert_eq!(refused_checks(&rig).await, ["wrong_target"]);
+    let detail = refusal_detail(&rig, "wrong_target").await;
+    assert!(detail.contains("gateway_name"), "{detail}");
+
+    // The same name on both sides passes.
+    rig.declared.target.nodes.master.gateway_name = Some(RIG_GATEWAY_NAME.to_string());
+    let report = preflights(&rig, &options(), 4).await.expect("preflights");
+    assert!(report.passed(), "{report:?}");
+}
+
+#[tokio::test]
+async fn preflight_wrong_target_host_without_a_system_name() {
+    let rig = changing_rig().await;
+    rig.fx.remove("core", "ignition/system-properties");
+    assert_eq!(refused_checks(&rig).await, ["wrong_target"]);
+    let detail = refusal_detail(&rig, "wrong_target").await;
+    assert!(detail.contains("unreadable"), "{detail}");
+}
+
+#[tokio::test]
+async fn preflight_write_rest_403() {
+    let rig = changing_rig().await;
+    mount_scan_projects(&rig, 403).await;
+    assert_eq!(refused_checks(&rig).await, ["write_rest"]);
+    let detail = refusal_detail(&rig, "write_rest").await;
+    assert!(detail.contains("403"), "{detail}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn preflight_write_host_unwritable() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = changing_rig().await;
+    let dir = rig.deploy_dir();
+    std::fs::create_dir_all(&dir).expect("ign-deploy dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    // A process that ignores permission bits (root) cannot be refused this way.
+    let enforced = std::fs::write(dir.join("enforced.tmp"), b"").is_err();
+    let checks = if enforced {
+        Some(refused_checks(&rig).await)
+    } else {
+        None
+    };
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+    if let Some(checks) = checks {
+        assert_eq!(checks, ["write_host"]);
+        assert_eq!(rig.fake.lock_acquires(), 0);
+        assert_eq!(rig.host.calls(), ["probe"]);
+    }
+}
+
+#[tokio::test]
+async fn preflight_hold_budget_boundary() {
+    // Edge DAPL-04 adjacency. need(n files) = ceil(2 x (1 + 0.5 n + 1) + 1).
+    let rig = changing_rig().await;
+    let model = |hold_s| ApplyOptions {
+        hold: HoldModel {
+            hold_s,
+            commit_fixed_s: 1.0,
+            commit_per_file_s: 0.5,
+            p95_scan_s: 1.0,
+        },
+        ..options()
+    };
+    // Four files need exactly 9 s.
+    let report = preflights(&rig, &model(9), 4).await.expect("equal passes");
+    assert!(report.passed(), "{report:?}");
+    // One more file needs 10 s: one second over.
+    let report = preflights(&rig, &model(9), 5).await.expect("preflights");
+    let failures = report.failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].check, "hold_budget");
+    let detail = &failures[0].detail;
+    assert!(detail.contains("5 file(s)"), "{detail}");
+    assert!(detail.contains("estimated commit 3.5 s"), "{detail}");
+    assert!(detail.contains("hold of 10 s"), "{detail}");
+    assert!(detail.contains("budget is 9 s"), "{detail}");
+
+    // Through the engine the run is refused and never clamped to fit.
+    let mut tight = options();
+    tight.hold = HoldModel {
+        hold_s: 8,
+        commit_fixed_s: 1.0,
+        commit_per_file_s: 0.5,
+        p95_scan_s: 1.0,
+    };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run_with(prepared, &NoObserver, &SystemClock, &tight)
+        .await
+        .expect_err("a hold that is too short refuses");
+    assert_eq!(err.code(), "deploy_preflight_failed", "{err}");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.host.calls(), ["probe"]);
+}
+
+#[tokio::test]
+async fn preflight_all_fail_in_fixed_order() {
+    // Edge DAPL-04 ordering: every check failing at once, in the fixed order.
+    let mut rig = changing_rig().await;
+    with_backup(&mut rig, "production");
+    rig.fake.set_deployment_mode(Some("production".to_string()));
+    mount_gateway_name(&rig, "some-other-gateway").await;
+    mount_scan_projects(&rig, 403).await;
+    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    let mut opts = options();
+    opts.hold.hold_s = 1;
+
+    // The host check needs an unwritable ign-deploy directory.
+    #[cfg(unix)]
+    let restore = {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = rig.deploy_dir();
+        std::fs::create_dir_all(&dir).expect("ign-deploy dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        dir
+    };
+    let report = preflights(&rig, &opts, 4).await.expect("preflights");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+    }
+    let failed: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.status.as_str() == "fail")
+        .map(|f| f.check.as_str())
+        .collect();
+    let expected = [
+        "mode_master",
+        "mode_backup",
+        "wrong_target",
+        "write_rest",
+        "write_host",
+        "designers",
+        "hold_budget",
+    ];
+    // Without permission enforcement (root) the host check cannot fail.
+    if failed.len() == expected.len() {
+        assert_eq!(failed, expected);
+    } else {
+        let without_host: Vec<&str> = expected
+            .iter()
+            .copied()
+            .filter(|c| *c != "write_host")
+            .collect();
+        assert_eq!(failed, without_host);
+    }
+    let all: Vec<&str> = report.findings.iter().map(|f| f.check.as_str()).collect();
+    assert_eq!(all, expected, "one finding per check, in the fixed order");
+}
+
+#[tokio::test]
+async fn preflight_unreachable_gateway_is_network_error() {
+    let mut rig = changing_rig().await;
+    // Nothing listens on port 1.
+    rig.api = ReqwestGatewayApi::for_tests("http://127.0.0.1:1", None);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("an unreachable gateway aborts");
+    assert_eq!((err.code(), err.exit_code()), ("network_error", 4), "{err}");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    let run_dir = only_run_dir(&rig);
+    let result = json_file(&run_dir.join("result.json"));
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "network_error");
+    assert!(run_dir.join("run.json").exists());
+}
+
+#[tokio::test]
+async fn preflight_unreachable_host_is_transport_failed() {
+    let mut rig = changing_rig().await;
+    rig.host = rig.host.clone().fail("probe", 1);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("an unreachable host aborts");
+    assert_eq!(
+        (err.code(), err.exit_code()),
+        ("transport_failed", 4),
+        "{err}"
+    );
+    let result = json_file(&only_run_dir(&rig).join("result.json"));
+    assert_eq!(result["error"]["code"], "transport_failed");
+}
+
+#[tokio::test]
+async fn preflight_is_idempotent() {
+    // Edge DAPL-04 idempotency: the same failing state gives the same
+    // failures, each run writes its own run directory and nothing else.
+    let rig = changing_rig().await;
+    rig.fake.set_deployment_mode(Some("production".to_string()));
+    mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    let host_before = files_below(rig.fx.data_dir());
+
+    let first = refused_checks(&rig).await;
+    let second = refused_checks(&rig).await;
+    assert_eq!(first, second);
+    assert_eq!(first, ["mode_master", "designers"]);
+
+    assert_eq!(
+        files_below(rig.fx.data_dir()),
+        host_before,
+        "the gateway host is unchanged"
+    );
+    let runs = names(&rig.repo.join(".ign").join("deploy").join(GATEWAY));
+    assert_eq!(runs.len(), 2, "one run directory each: {runs:?}");
+    assert_eq!(rig.fake.lock_acquires(), 0);
+    assert_eq!(rig.fake.scan_count(), 0);
 }
