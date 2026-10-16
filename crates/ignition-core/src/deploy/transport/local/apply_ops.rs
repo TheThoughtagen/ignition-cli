@@ -22,7 +22,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::{ApplySetup, LocalFsTransport};
+use super::{ApplyFault, ApplySetup, LocalFsTransport};
 use crate::deploy::apply::fingerprint::LEDGER_KEY;
 use crate::deploy::apply::host::{
     BatchReport, BatchSpec, PRERENDERED_PHASES, Prepared, ProbeReport, restoring_journal,
@@ -211,10 +211,18 @@ impl LocalFsTransport {
         from: &[&str],
         dst: &Dir,
         to: &[&str],
+        inject: bool,
     ) -> Result<(), FsError> {
         let mut attempt = 0;
         loop {
-            match src.rename(from, dst, to) {
+            // An injected fault refuses every attempt the way a held target
+            // does, so it takes the retry path and ends in the real failure.
+            let result = if inject {
+                Err(FsError::Io(std::io::Error::other("injected move fault")))
+            } else {
+                src.rename(from, dst, to)
+            };
+            match result {
                 Err(FsError::Io(_)) if attempt < RENAME_RETRIES => {
                     attempt += 1;
                     sleep_for(attempt);
@@ -746,7 +754,8 @@ impl LocalFsTransport {
                     format!("write {index}: the staged copy is the target itself"),
                 );
             }
-            if let Err(e) = self.move_with_retry(root, &staged, &coll, &target) {
+            let inject = matches!(self.fault, Some(ApplyFault::FailMoveAt(k)) if k == index);
+            if let Err(e) = self.move_with_retry(root, &staged, &coll, &target, inject) {
                 return stop(
                     report,
                     format!(
@@ -924,14 +933,19 @@ impl LocalFsTransport {
         for index in order {
             let entry = &work.restores[index];
             let is_ledger = entry.path == LEDGER_KEY;
-            let outcome = self.restore_one(
-                &root,
-                &mut coll,
-                &lay,
-                entry.path.as_str(),
-                entry.pre.as_deref(),
-                is_ledger,
-            );
+            let outcome = if matches!(self.fault, Some(ApplyFault::FailRestoreAt(k)) if k == index)
+            {
+                Err("cannot move the file into place: injected restore fault".to_string())
+            } else {
+                self.restore_one(
+                    &root,
+                    &mut coll,
+                    &lay,
+                    entry.path.as_str(),
+                    entry.pre.as_deref(),
+                    is_ledger,
+                )
+            };
             match outcome {
                 Ok(Restored::Put) => report.moved.push(index),
                 Ok(Restored::Removed) => {
@@ -1077,7 +1091,7 @@ impl LocalFsTransport {
             }
             root.create_new(&staged, &bytes, Visibility::Shared)
                 .map_err(|e| format!("cannot stage the restore copy: {}", e.describe()))?;
-            self.move_with_retry(root, &staged, live_dir, to)
+            self.move_with_retry(root, &staged, live_dir, to, false)
                 .map_err(|e| format!("cannot move the file into place: {}", e.describe()))?;
         }
         match live_dir.read(to, cap) {
