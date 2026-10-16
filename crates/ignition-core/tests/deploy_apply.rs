@@ -3029,7 +3029,7 @@ async fn rollback_live_changed_refuses() {
     // The host is as it was, the record is still `applied`, no run was made.
     assert_eq!(collection_state(&rig), edited);
     assert_eq!(rig.record(&target_run).state, RecordState::Applied);
-    assert_eq!(run_dirs(&rig), [target_run.clone()]);
+    assert_eq!(run_dirs(&rig), std::slice::from_ref(&target_run));
     only_reads(&fresh);
 }
 
@@ -3366,7 +3366,7 @@ async fn rollback_other_journal_refuses() {
     assert_eq!(env, "dev");
     assert!(err.to_string().contains("--env dev"), "{err}");
     only_reads(&fresh);
-    assert_eq!(run_dirs(&rig), [target_run.clone()]);
+    assert_eq!(run_dirs(&rig), std::slice::from_ref(&target_run));
 
     // ... or appears between the preparation and the run.
     std::fs::remove_file(rig.deploy_dir().join("journal.json")).expect("clear the journal");
