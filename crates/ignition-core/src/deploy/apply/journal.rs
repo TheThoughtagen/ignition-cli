@@ -32,9 +32,13 @@ use serde::{Deserialize, Serialize};
 use super::fingerprint::LEDGER_KEY;
 use super::run_store::RunId;
 use crate::deploy::layout::RelPath;
+use crate::deploy::ledger::LedgerRoot;
 use crate::deploy::node::{self, Node};
-use crate::deploy::transport::mirror_path_problem;
+use crate::deploy::target::NodeTarget;
+use crate::deploy::transport::{TreeReader, mirror_path_problem};
 use crate::error::CoreError;
+
+pub use crate::deploy::ledger::journal_location;
 
 /// File name of the journal.
 pub const JOURNAL_FILE: &str = "journal.json";
@@ -65,6 +69,17 @@ impl JournalPhase {
     pub fn before_first_move(self) -> bool {
         matches!(self, JournalPhase::Snapshotting | JournalPhase::Ready)
     }
+
+    /// The phase's name as the journal file spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JournalPhase::Snapshotting => "snapshotting",
+            JournalPhase::Ready => "ready",
+            JournalPhase::Writing => "writing",
+            JournalPhase::Written => "written",
+            JournalPhase::Restoring => "restoring",
+        }
+    }
 }
 
 /// The only schema version this build reads and writes.
@@ -82,7 +97,7 @@ const FIELDS: [&str; 7] = [
 ];
 
 /// The journal.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Journal {
     /// Always 1.
@@ -141,6 +156,40 @@ impl Journal {
     /// The canonical bytes: pretty JSON in field order plus one LF.
     pub fn to_bytes(&self) -> Vec<u8> {
         canonical_bytes(self)
+    }
+}
+
+/// The journal on the box of `gateway` and `mode`, read through `reader` and
+/// parsed strictly (DAPL-09, D-09). `None` means no interrupted run. A journal
+/// that cannot be read or parsed is `deploy_run_invalid` naming the location:
+/// plan, apply and rollback never go on as if it were absent.
+pub async fn journal_on_box(
+    reader: &dyn TreeReader,
+    node: &NodeTarget,
+    gateway: &str,
+    mode: &str,
+) -> Result<Option<Journal>, CoreError> {
+    let Some(bytes) = reader.read_journal(gateway, mode).await? else {
+        return Ok(None);
+    };
+    let location = journal_location(LedgerRoot::for_node(node), gateway, mode);
+    Journal::parse(&location, &bytes, gateway, mode).map(Some)
+}
+
+/// The refusal for `journal`: `deploy_journal_present` naming its run, the
+/// location and (through its message) `ign deploy rollback --run <id> --env
+/// <env>`.
+pub fn journal_present(
+    journal: &Journal,
+    env: &str,
+    node: &NodeTarget,
+    gateway: &str,
+    mode: &str,
+) -> CoreError {
+    CoreError::DeployJournalPresent {
+        run_id: journal.run_id.clone(),
+        env: env.to_string(),
+        location: journal_location(LedgerRoot::for_node(node), gateway, mode),
     }
 }
 

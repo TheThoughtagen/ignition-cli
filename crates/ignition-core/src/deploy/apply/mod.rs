@@ -116,8 +116,8 @@ use self::record::{RecordState, RunRecord, TouchedEntry};
 use self::run_store::{EventLog, RunDir, RunId};
 
 pub use self::rollback::{
-    RollbackChecked, RollbackContext, RollbackKind, RollbackOptions, RollbackOutcome,
-    check_rollback, restore_set, run_rollback,
+    InterruptedRun, RollbackChecked, RollbackContext, RollbackKind, RollbackOptions,
+    RollbackOutcome, check_rollback, restore_set, run_rollback,
 };
 
 /// The slug of the rolled-back apply verdict.
@@ -410,6 +410,17 @@ pub enum ApplyEvent {
     },
     /// The restore finished (23-17).
     Restored,
+    /// A rollback found that the run it recovers was interrupted (23-12,
+    /// D-09, D-11): the journal's phase, what recovery will do and the live
+    /// hash of each path of the journal's touched list (`None` when absent).
+    InterruptedRun {
+        /// The journal's phase.
+        phase: &'static str,
+        /// `restore` or `clear`.
+        action: &'static str,
+        /// Path to live hash.
+        hashes: BTreeMap<String, Option<String>>,
+    },
     /// The preflights found a failed check; every verdict, by id and status.
     PreflightChecks {
         /// `(check id, status)` in report order.
@@ -454,6 +465,7 @@ impl ApplyEvent {
             ApplyEvent::Finalized => "finalized",
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
+            ApplyEvent::InterruptedRun { .. } => "interrupted_run",
             ApplyEvent::LiveChangesDiscarded { .. } => "live_changes_discarded",
             ApplyEvent::PreflightChecks { .. } => "preflight_checks",
             ApplyEvent::DesignersPoll { .. } => "designers_poll",
@@ -504,6 +516,16 @@ impl ApplyEvent {
             ApplyEvent::LiveChangesDiscarded { count, paths } => {
                 json!({"count": count, "paths": paths})
             }
+            ApplyEvent::InterruptedRun {
+                phase,
+                action,
+                hashes,
+            } => json!({
+                "phase": phase,
+                "action": action,
+                "touched": hashes.len(),
+                "hashes": hashes,
+            }),
             ApplyEvent::GwbkDownloaded { bytes } => json!({"bytes": bytes}),
             ApplyEvent::Failed { code } => json!({"code": code}),
             ApplyEvent::ScanDone

@@ -79,6 +79,7 @@ use crate::client::mode::normalize_deployment_mode;
 use crate::client::query::ListQuery;
 use crate::client::scan::{ScanKind, ScanStatus};
 use crate::client::{DeployApi, GatewayApi};
+use crate::deploy::apply::journal::{journal_on_box, journal_present};
 use crate::deploy::component_problem;
 use crate::deploy::ledger::{Ledger, LedgerRoot, ledger_location};
 use crate::deploy::manifest::Manifest;
@@ -302,6 +303,26 @@ pub async fn deploy_plan(
         }
         None => None,
     };
+    // An interrupted apply left its journal: the tree may be torn, so nothing
+    // is read or planned until `rollback --run` recovers it (DAPL-09, D-09).
+    // An unreadable journal blocks the same way. Checked after the base (a
+    // bad one costs no transport work) and before the collections are read.
+    if let Some(journal) = journal_on_box(
+        reader,
+        node,
+        &declared.target.gateway,
+        &declared.target.mode,
+    )
+    .await?
+    {
+        return Err(journal_present(
+            &journal,
+            &declared.env,
+            node,
+            &declared.target.gateway,
+            &declared.target.mode,
+        ));
+    }
     let scope = Scope::from_manifest(&declared.manifest, &declared.target.mode);
     let observed = reader.read(&scope).await?;
     let gateway = &declared.target.gateway;

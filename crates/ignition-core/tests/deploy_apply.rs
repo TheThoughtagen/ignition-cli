@@ -837,6 +837,10 @@ fn failed_result(rig: &Rig) -> Value {
 async fn a_journal_of_another_run_names_the_real_env() {
     let rig = changing_rig().await;
     let dir = rig.deploy_dir();
+    // The plan refuses over a journal (23-12), so the journal appears between
+    // the preparation and the run: the host's own refusal is what the engine
+    // sees, and it fills the env.
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
     std::fs::create_dir_all(&dir).expect("deploy dir");
     let journal = Journal {
         schema_version: 1,
@@ -849,7 +853,6 @@ async fn a_journal_of_another_run_names_the_real_env() {
     };
     std::fs::write(dir.join("journal.json"), journal.to_bytes()).expect("journal");
 
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
     let err = rig.run(prepared, &NoObserver).await.expect_err("refused");
     let CoreError::DeployJournalPresent { run_id, env, .. } = &err else {
         panic!("expected deploy_journal_present, got {err:?}");

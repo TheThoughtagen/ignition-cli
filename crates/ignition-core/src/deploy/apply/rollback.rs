@@ -14,8 +14,10 @@
 //!
 //! 1. the run id is a valid [`RunId`] (checked by the caller before any host
 //!    contact; the id selects a path on the box);
-//! 2. no journal is on the box: any journal is `deploy_journal_present`
-//!    naming its run (23-12 adds the recovery of the run's own journal);
+//! 2. no journal of another run is on the box: such a journal is
+//!    `deploy_journal_present` naming its run and the recovery command. The
+//!    run's own journal is not a refusal: this is its recovery (23-12, D-09),
+//!    which skips the staleness check of step 5 (D-11);
 //! 3. the on-box record exists and parses (`RunRecord::parse`, strict) for
 //!    this target's gateway and mode; it is at state `applied` (a record at
 //!    `applying` without a journal and a record already `rolled_back` are
@@ -55,7 +57,7 @@ use serde_json::{Value, json};
 use super::fingerprint::{LEDGER_KEY, fingerprint};
 use super::hold::{Clock, HeldLock, HoldModel};
 use super::host::ApplyHost;
-use super::journal::Journal;
+use super::journal::{Journal, journal_on_box, journal_present};
 use super::preflight::{DesignersPolicy, PreflightInput, run_preflights};
 use super::record::{RECORD_FILE, RecordState, RunRecord};
 use super::run_store::{EventLog, RunDir, RunId, run_dir_rel};
@@ -67,7 +69,6 @@ use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::scan::ScanKind;
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
-use crate::deploy::ledger::{LedgerRoot, journal_location};
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
 use crate::error::{APPLY_LIST_SHOWN, CoreError};
@@ -131,11 +132,26 @@ pub struct RollbackOptions {
 /// that changed since the run (empty unless discarding).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackChecked {
-    /// The on-box record of the run, at state `applied`.
+    /// The on-box record of the run: at state `applied` for a rollback, at
+    /// any state for the recovery of an interrupted run.
     pub record: RunRecord,
     /// Touched paths whose live hash is not the record's post-run hash,
     /// byte-sorted. Only ever non-empty when the caller discards them.
     pub live_changed: Vec<String>,
+    /// Set when the run's own journal is on the box: this is a recovery, not
+    /// a rollback of a completed run.
+    pub interrupted: Option<InterruptedRun>,
+}
+
+/// What a recovery found on the box (23-12, D-09 to D-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedRun {
+    /// The run's journal.
+    pub journal: Journal,
+    /// The live hash of each path in the journal's touched list when the
+    /// recovery looked (`None` when absent): the torn state, recorded in the
+    /// recovery run's events (D-11).
+    pub live: BTreeMap<String, Option<String>>,
 }
 
 /// How a manual rollback ended and what it did.
@@ -207,24 +223,18 @@ pub async fn check_rollback(
     let (gateway, mode) = (target.gateway.as_str(), target.mode.as_str());
     let id = run_id.as_str();
 
-    // 2. A journal on the box means a run is unfinished.
-    if let Some(bytes) = reader.read_journal(gateway, mode).await? {
-        let location = journal_location(LedgerRoot::for_node(&target.nodes.master), gateway, mode);
-        let journal = Journal::parse(&location, &bytes, gateway, mode)?;
-        return Err(CoreError::DeployJournalPresent {
-            run_id: journal.run_id,
-            env: env.to_string(),
-            location,
-        });
+    // 2. A journal on the box means a run is unfinished: only the rollback of
+    // that very run goes on, as its recovery.
+    let master = &target.nodes.master;
+    if let Some(journal) = journal_on_box(reader, master, gateway, mode).await? {
+        if journal.run_id != id {
+            return Err(journal_present(&journal, env, master, gateway, mode));
+        }
+        return check_interrupted(repo, target, host, run_id, journal).await;
     }
 
     // 3. The record.
-    // A record too damaged to name its run is still this run's problem.
-    let read = host.read_record(run_id).await.map_err(|e| match e {
-        CoreError::DeployRunInvalid { problem, .. } => invalid(id, problem),
-        other => other,
-    })?;
-    let Some(record) = read else {
+    let Some(record) = read_run_record(host, run_id).await? else {
         return Err(invalid(
             id,
             format!("the host has no {RECORD_FILE} for this run (snapshots/{id}/{RECORD_FILE})"),
@@ -258,12 +268,68 @@ pub async fn check_rollback(
     Ok(RollbackChecked {
         record,
         live_changed,
+        interrupted: None,
     })
 }
 
-/// The record is for this run, this gateway and mode, is at state `applied`
-/// and agrees with itself. Names the problem and never a content.
-fn validate_record(record: &RunRecord, target: &Target, run_id: &RunId) -> Result<(), CoreError> {
+/// The on-box record of `run_id`; `None` when the host has none. A record too
+/// damaged to name its run is still this run's problem.
+async fn read_run_record(
+    host: &dyn ApplyHost,
+    run_id: &RunId,
+) -> Result<Option<RunRecord>, CoreError> {
+    host.read_record(run_id).await.map_err(|e| match e {
+        CoreError::DeployRunInvalid { problem, .. } => invalid(run_id.as_str(), problem),
+        other => other,
+    })
+}
+
+/// The recovery of the run whose own journal is on the box (D-09, D-11).
+///
+/// The tree may be partial, so the post-apply staleness check is skipped:
+/// there is no post-apply fingerprint to compare with and nothing is refused
+/// for live changes. The record may be at `applying` (the usual case), the
+/// journal's touched list and the record must agree.
+async fn check_interrupted(
+    repo: &Path,
+    target: &Target,
+    host: &dyn ApplyHost,
+    run_id: &RunId,
+    journal: Journal,
+) -> Result<RollbackChecked, CoreError> {
+    let id = run_id.as_str();
+    let Some(record) = read_run_record(host, run_id).await? else {
+        return Err(invalid(
+            id,
+            format!("the host has no {RECORD_FILE} for this run (snapshots/{id}/{RECORD_FILE})"),
+        ));
+    };
+    validate_identity(&record, target, run_id)?;
+    validate_pre(&record)?;
+    if journal.pre_fingerprint != record.pre_fingerprint
+        || journal.touched
+            != record
+                .touched
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>()
+    {
+        return Err(invalid(
+            id,
+            "the journal and the record do not describe the same run",
+        ));
+    }
+    cross_check_local(repo, &record)?;
+    let live = host.fingerprint(&journal.touched).await?;
+    Ok(RollbackChecked {
+        record,
+        live_changed: Vec::new(),
+        interrupted: Some(InterruptedRun { journal, live }),
+    })
+}
+
+/// The record is for this run, this gateway and this mode.
+fn validate_identity(record: &RunRecord, target: &Target, run_id: &RunId) -> Result<(), CoreError> {
     let id = run_id.as_str();
     if record.run_id != id {
         return Err(invalid(id, "the record names a different run"));
@@ -280,6 +346,25 @@ fn validate_record(record: &RunRecord, target: &Target, run_id: &RunId) -> Resul
             "the record is for another mode than the target's",
         ));
     }
+    Ok(())
+}
+
+/// The record's pre-run fingerprint is the fingerprint of its pre-images.
+fn validate_pre(record: &RunRecord) -> Result<(), CoreError> {
+    if record.pre_fingerprint != fingerprint(&record.pre_map()) {
+        return Err(invalid(
+            &record.run_id,
+            "the record's pre_fingerprint is not the fingerprint of its touched set",
+        ));
+    }
+    Ok(())
+}
+
+/// The record is for this run, this gateway and mode, is at state `applied`
+/// and agrees with itself. Names the problem and never a content.
+fn validate_record(record: &RunRecord, target: &Target, run_id: &RunId) -> Result<(), CoreError> {
+    let id = run_id.as_str();
+    validate_identity(record, target, run_id)?;
     match record.state {
         RecordState::Applied => {}
         RecordState::Applying => {
@@ -295,12 +380,7 @@ fn validate_record(record: &RunRecord, target: &Target, run_id: &RunId) -> Resul
             return Err(invalid(id, format!("already rolled back by {by}")));
         }
     }
-    if record.pre_fingerprint != fingerprint(&record.pre_map()) {
-        return Err(invalid(
-            id,
-            "the record's pre_fingerprint is not the fingerprint of its touched set",
-        ));
-    }
+    validate_pre(record)?;
     if record.post_fingerprint.as_deref() != Some(fingerprint(&record.post_map()).as_str()) {
         return Err(invalid(
             id,
@@ -481,6 +561,14 @@ async fn drive(
         writes: restored.len(),
         deletes: deleted.len(),
     })?;
+    if let Some(found) = &checked.interrupted {
+        // The torn state the recovery found, by path and hash (D-11).
+        steps.emit(ApplyEvent::InterruptedRun {
+            phase: found.journal.phase.as_str(),
+            action: "restore",
+            hashes: found.live.clone(),
+        })?;
+    }
 
     let preflights = run_preflights(
         &PreflightInput {
@@ -518,6 +606,7 @@ async fn drive(
             "hold_s": opts.hold.hold_s,
             "discard_live_changes": opts.discard_live_changes,
             "discarded_live_changes": checked.live_changed,
+            "interrupted_phase": checked.interrupted.as_ref().map(|i| i.journal.phase.as_str()),
             "designers": opts.designers.mode.as_str(),
             "designers_timeout_s": opts.designers.timeout.as_secs(),
             "designers_seen": seen.map(|r| r.designers_seen
