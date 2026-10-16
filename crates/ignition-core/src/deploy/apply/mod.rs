@@ -14,18 +14,21 @@
 //! [`run_apply`] takes a plan the gates have passed and drives it, in this
 //! order, over the seams in [`ApplyContext`]:
 //!
-//! 1. the run directory (the git-ignore guard first), `run.json`, `plan.json`
-//!    and the events log;
-//! 2. the [`WriteSet`] and the new ledger, validated with `Ledger::parse`;
-//! 3. `ApplyHost::prepare`, outside the lock;
-//! 4. [`hold::HeldLock::acquire`];
-//! 5. exactly one `ApplyHost::commit`;
-//! 6. [`hold::HeldLock::check`], which must say `Held`;
-//! 7. `scan_and_wait` on the config scan, once (C11: a tag provider and its
+//! 1. the run directory (the git-ignore guard first) and the events log;
+//! 2. the [`WriteSet`];
+//! 3. the preflights ([`preflight::run_preflights`], 23-07): every failure
+//!    in one `deploy_preflight_failed` refusal, nothing staged or locked;
+//!    then `run.json` (once, pass or fail) and `plan.json`;
+//! 4. the new ledger, validated with `Ledger::parse`;
+//! 5. `ApplyHost::prepare`, outside the lock;
+//! 6. [`hold::HeldLock::acquire`];
+//! 7. exactly one `ApplyHost::commit`;
+//! 8. [`hold::HeldLock::check`], which must say `Held`;
+//! 9. `scan_and_wait` on the config scan, once (C11: a tag provider and its
 //!    definitions load in one scan);
-//! 8. `deploy_verify`, which must be green;
-//! 9. the post fingerprint, then `ApplyHost::finalize`;
-//! 10. the snapshot download into the run directory (a failure is a warning).
+//! 10. `deploy_verify`, which must be green;
+//! 11. the post fingerprint, then `ApplyHost::finalize`;
+//! 12. the snapshot download into the run directory (a failure is a warning).
 //!
 //! Only a green verify makes the outcome `applied`. Every other way the
 //! under-lock window can end (23-17):
@@ -43,8 +46,8 @@
 //! A host that refuses a commit before it wrote anything (a journal of
 //! another run, an invalid spec) is returned as its own typed error and the
 //! lock is left to lapse: a scan there could load another run's partial
-//! state. Added by later plans: the preflights (23-07), `.gwbk` and
-//! restart-pending (23-09), the journal refusal (23-12).
+//! state. Added by later plans: `.gwbk` and restart-pending (23-09), the
+//! journal refusal (23-12).
 //!
 //! Once the run directory exists, `run_apply` leaves through one exit point
 //! that writes `result.json` once.
@@ -54,6 +57,7 @@ pub mod gates;
 pub mod hold;
 pub mod host;
 pub mod journal;
+pub mod preflight;
 pub mod record;
 pub mod run_store;
 
@@ -83,6 +87,7 @@ use self::gates::GateFlags;
 use self::hold::{Clock, HeldLock, HoldModel, LOCK_MARGIN_S};
 use self::host::{ApplyHost, BatchSpec, DeleteOp, WriteOp};
 use self::journal::{Journal, JournalPhase};
+use self::preflight::{DesignersPolicy, PreflightInput, run_preflights};
 use self::record::{RecordState, RunRecord, TouchedEntry};
 use self::run_store::{EventLog, RunDir, RunId};
 
@@ -360,6 +365,11 @@ pub enum ApplyEvent {
     },
     /// The restore finished (23-17).
     Restored,
+    /// The preflights found a failed check; every verdict, by id and status.
+    PreflightChecks {
+        /// `(check id, status)` in report order.
+        checks: Vec<(String, String)>,
+    },
     /// The run failed.
     Failed {
         /// The error code slug.
@@ -382,6 +392,7 @@ impl ApplyEvent {
             ApplyEvent::Finalized => "finalized",
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
+            ApplyEvent::PreflightChecks { .. } => "preflight_checks",
             ApplyEvent::Failed { .. } => "failed",
         }
     }
@@ -402,6 +413,12 @@ impl ApplyEvent {
             ApplyEvent::LockVerdict { held } => json!({"held": held}),
             ApplyEvent::VerifyDone { ok } => json!({"ok": ok}),
             ApplyEvent::VerifyChecks { checks } => json!({
+                "checks": checks
+                    .iter()
+                    .map(|(id, status)| json!({"id": id, "status": status}))
+                    .collect::<Vec<_>>(),
+            }),
+            ApplyEvent::PreflightChecks { checks } => json!({
                 "checks": checks
                     .iter()
                     .map(|(id, status)| json!({"id": id, "status": status}))
@@ -442,6 +459,9 @@ pub struct ApplyContext<'a> {
     pub deploy: &'a dyn DeployApi,
     /// The gateway log and WebDev surface (verify).
     pub gateway: &'a dyn GatewayApi,
+    /// The backup node's REST surface, when the target has a backup node
+    /// (the `mode_backup` preflight).
+    pub backup_deploy: Option<&'a dyn DeployApi>,
     /// The monotonic clock the lock is judged by.
     pub clock: &'a dyn Clock,
     /// Hears each step.
@@ -463,6 +483,8 @@ pub struct ApplyOptions {
     pub poll: PollConfig,
     /// How the post-apply verify waits.
     pub verify: VerifyOptions,
+    /// What to do about open Designer sessions (D-14, D-15).
+    pub designers: DesignersPolicy,
 }
 
 /// How a run ended and what it did.
@@ -605,6 +627,36 @@ async fn drive(
     let env = declared.env.as_str();
     let (gateway, mode) = (plan.gateway.as_str(), plan.mode.as_str());
 
+    let started_at = rfc3339_now_utc();
+    steps.log = Some(EventLog::open(run_dir)?);
+
+    let set = write_set(plan, declared)?;
+    steps.emit(ApplyEvent::RunStarted {
+        run_id: run_id.as_str().to_string(),
+        writes: set.writes.len(),
+        deletes: set.deletes.len(),
+    })?;
+
+    // Every preflight, before anything is staged, locked or written. A check
+    // that could not be answered at all (an unreachable gateway or host) is
+    // its own error, after the run record has been written.
+    let preflights = run_preflights(
+        &PreflightInput {
+            target: &declared.target,
+            master: ctx.deploy,
+            backup: ctx.backup_deploy,
+            gateway: ctx.gateway,
+            reader: ctx.reader,
+            host: ctx.host,
+            touched_files: set.writes.len() + set.deletes.len(),
+            hold: &opts.hold,
+            designers: &opts.designers,
+            clock: ctx.clock,
+        },
+        steps,
+    )
+    .await;
+    let seen = preflights.as_ref().ok();
     run_dir.write_json(
         "run.json",
         &json!({
@@ -615,24 +667,39 @@ async fn drive(
             "mode": mode,
             "node": plan.node,
             "transport": plan.transport,
-            "started_at": rfc3339_now_utc(),
+            "started_at": started_at,
             "run_dir_git": run_dir.git_status().as_record(),
             "render_sha256": plan.render_sha256,
             "plan_sha256": plan.plan_sha256,
             "hold_s": opts.hold.hold_s,
             "allow_destructive": opts.gates.allow_destructive,
             "allow_drift": opts.gates.allow_drift,
+            "designers": opts.designers.mode.as_str(),
+            "designers_timeout_s": opts.designers.timeout.as_secs(),
+            "designers_seen": seen.map(|r| r.designers_seen
+                .iter()
+                .map(|(user, project, host)| json!({"user": user, "project": project, "host": host}))
+                .collect::<Vec<_>>()),
+            "preflights": seen.map(|r| r.findings
+                .iter()
+                .map(|f| json!({"check": f.check.as_str(), "status": f.status.as_str()}))
+                .collect::<Vec<_>>()),
         }),
     )?;
     run_dir.write_json("plan.json", plan)?;
-    steps.log = Some(EventLog::open(run_dir)?);
-
-    let set = write_set(plan, declared)?;
-    steps.emit(ApplyEvent::RunStarted {
-        run_id: run_id.as_str().to_string(),
-        writes: set.writes.len(),
-        deletes: set.deletes.len(),
-    })?;
+    let preflights = preflights?;
+    if !preflights.passed() {
+        steps.emit(ApplyEvent::PreflightChecks {
+            checks: preflights
+                .findings
+                .iter()
+                .map(|f| (f.check.as_str().to_string(), f.status.as_str().to_string()))
+                .collect(),
+        })?;
+        return Err(CoreError::DeployPreflightFailed {
+            failures: preflights.failures().into(),
+        });
+    }
 
     // The ledger: what it lists now, and what it will list.
     let old_bytes = ctx.reader.read_ledger(gateway, mode).await?;

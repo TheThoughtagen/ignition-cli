@@ -273,7 +273,9 @@ async fn rig_with_logs(
 ) -> Rig {
     fx.core(
         "ignition/system-properties/config.json",
-        json!({"systemName": RIG_GATEWAY_NAME}).to_string().as_bytes(),
+        json!({"systemName": RIG_GATEWAY_NAME})
+            .to_string()
+            .as_bytes(),
     );
     let (declared, reader) = fx.load("dev");
     let repo = fx.repo("dev");
@@ -1468,14 +1470,34 @@ fn only_run_dir(rig: &Rig) -> PathBuf {
     gateway_dir.join(&runs[0])
 }
 
+/// Every file below `dir`, as paths relative to it (empty when `dir` is
+/// absent). Directories are not listed.
+fn files_below(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.filter_map(Result::ok) {
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.path().is_dir() {
+                walk(&entry.path(), &format!("{name}/"), out);
+            } else {
+                out.push(name);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out);
+    out.sort();
+    out
+}
+
 /// Mounts the designers list answering `sessions`, ahead of the default
 /// empty one.
 async fn mount_designers(rig: &Rig, sessions: &[(&str, &str, &str)]) {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/data/api/v1/designers"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(designers_body(sessions)),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(designers_body(sessions)))
         .mount(&rig._server)
         .await;
 }
@@ -1486,6 +1508,7 @@ async fn preflight_mode_and_designers_reported_together() {
     // The master runs another mode than the target, and a Designer is open.
     rig.fake.set_deployment_mode(Some("production".to_string()));
     mount_designers(&rig, &[("alice", "PlantA", "10.0.0.5:52526")]).await;
+    let ledger_before = files_below(&rig.fx.data_dir().join("ign-deploy"));
 
     let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
     let err = rig
@@ -1516,7 +1539,11 @@ async fn preflight_mode_and_designers_reported_together() {
     assert_eq!(rig.host.calls(), ["probe"]);
     assert_eq!(rig.fake.lock_acquires(), 0);
     assert_eq!(rig.fake.scan_count(), 0);
-    assert!(!rig.fx.data_dir().join("ign-deploy").exists());
+    assert_eq!(
+        files_below(&rig.fx.data_dir().join("ign-deploy")),
+        ledger_before,
+        "the probe leaves empty directories and no new file"
+    );
 
     // The run directory records the refusal.
     let run_dir = only_run_dir(&rig);
