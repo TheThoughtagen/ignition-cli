@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-06-PLAN.md
-last_updated: "2026-10-16T20:52:10.412Z"
+stopped_at: Completed 23-17-PLAN.md
+last_updated: "2026-10-16T21:38:14.101Z"
 last_activity: 2026-10-16
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 39
+  completed_plans: 40
   percent: 50
 ---
 
@@ -29,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 9 of 21
+Plan: 10 of 21
 Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [████████░░] 75%
+Progress: [████████░░] 77%
 
 ## Performance Metrics
 
@@ -84,6 +84,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P19 | 1h45m | 3 tasks | 5 files |
 | Phase 23 P05 | 2h50m | 2 tasks | 6 files |
 | Phase 23 P06 | 5h | 3 tasks | 8 files |
+| Phase 23 P17 | 1h | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -121,8 +122,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T20:52:04.721Z
-**Stopped At:** Completed 23-06-PLAN.md
+**Last session:** 2026-10-16T21:38:14.077Z
+**Stopped At:** Completed 23-17-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -188,3 +189,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 23]: 23-05: a scan runs once (C11: provider and definitions load in one scan); a host Err that wrote nothing is returned typed with the engine filling deploy_journal_present's env; stale and a post-move commit failure are Internal until 23-17; no lock release or discard in failing branches until 23-17
 - [Phase 23]: 23-05: hold.rs carries D-02's formula, floor 10 and ceiling 300 only; hold_for is unclamped, hold_clamped separate; no measured constant until 23-10
 - [Phase ?]: 23-06: Linux ssh apply is one hash-checked POSIX sh call; operations with no staging directory use a throw-away .ign-ctl-* directory the script removes on exit; the journal hash seen outside the lock rides in the work list (J record)
+- [Phase ?]: 23-17: HeldLock remembers which hold is ours (timestamp and actor read once after the grant); another actor's lock reads as NotHeld, so the DAPL-07 lock-taken case ends rollback_failed
+- [Phase ?]: 23-17: restore_snapshot reuses the held lock on the gateway's remaining alone; the local clock can only read shorter, so it is not consulted
