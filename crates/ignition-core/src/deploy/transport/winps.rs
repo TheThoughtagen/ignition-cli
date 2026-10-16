@@ -75,7 +75,13 @@ pub const MOVE_REPLACE: &str = "Move-Item -LiteralPath $p.src -Destination $p.ds
 /// entry as `[relative path, is_dir, size, is_reparse_point, absolute path
 /// length]`. A reparse point is reported and not descended. A missing root is
 /// `x=0`. An unreadable directory is a terminating error.
-pub const ENUMERATE: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){$l=$b.Length+1;$s=New-Object Collections.Stack;$s.Push($b);while($s.Count){foreach($f in ([IO.DirectoryInfo]$s.Pop()).EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$n=$f.FullName;$e+=,@($n.Substring($l),$d,$z,$r,$n.Length);if($d -and !$r){$s.Push($n)}}}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
+///
+/// The relative path is built from entry names during the walk (`\`-joined),
+/// never by cutting the root off `FullName`: .NET rewrites a root it
+/// normalises (an 8.3 component such as `RUNNER~1` expanded, `.`, a doubled or
+/// trailing separator dropped), so the caller's spelling and `FullName` need
+/// not share a prefix length (G-22-1).
+pub const ENUMERATE: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b=$p.x+$p.r[$i];$e=@();$x=[IO.Directory]::Exists($b);if($x){$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$b,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;$d=[int](($a -band 16) -ne 0);$r=[int](($a -band 1024) -ne 0);$z=0;if(!$d){$z=$f.Length};$m=$q[1]+$f.Name;$e+=,@($m,$d,$z,$r,$f.FullName.Length);if($d -and !$r){$s.Push(@($f,($m+'\\')))}}}};$o+=@{i=$i;x=[int]$x;e=$e}};E @{ok=1;res=$o}";
 
 /// Why `name` cannot be ONE component of a path on a Windows host, or `None`.
 ///
@@ -843,6 +849,50 @@ mod tests {
                 .expect("the link is reported");
             // on macOS/Linux pwsh the ReparsePoint attribute is set for symlinks
             assert!(link.reparse, "a symlink is flagged: {link:?}");
+        }
+    }
+
+    /// G-22-1: the relative paths come from the walk, not from cutting the
+    /// caller's spelling of the root off each `FullName`. .NET rewrites a root
+    /// it normalises: it expands an 8.3 component (`RUNNER~1` becomes
+    /// `runneradmin` under the Windows runner's `%TEMP%`, 3 characters longer)
+    /// and drops `.`, doubled separators and a trailing separator, so a length
+    /// taken from the caller's string shifts every entry (`ot\a b` for `a b`).
+    #[test]
+    fn winps_enumerate_rel_paths_do_not_depend_on_the_root_spelling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a b").join("c")).expect("dirs");
+        std::fs::write(root.join("top.json"), b"12345").expect("file");
+        std::fs::write(root.join("a b").join("c").join("deep.json"), b"").expect("file");
+        let base = dir.path().to_str().expect("utf8");
+        let sep = std::path::MAIN_SEPARATOR;
+        let expected = [
+            ("a b".to_string(), true, 0, false),
+            ("a b/c".to_string(), true, 0, false),
+            ("a b/c/deep.json".to_string(), false, 0, false),
+            ("top.json".to_string(), false, 5, false),
+        ];
+        for spelling in [
+            // on the Windows runner this one is the 8.3 `RUNNER~1` path
+            format!("{base}{sep}root"),
+            format!("{base}{sep}.{sep}root"),
+            format!("{base}{sep}{sep}root"),
+            format!("{base}{sep}root{sep}"),
+        ] {
+            let roots = [spelling.clone()];
+            let out = run_script(&WinScript::enumerate("", &roots));
+            assert!(out.status.success(), "{spelling}: {out:?}");
+            let got = parse_enumeration(&parse_ign_result(&out.stdout).expect("sentinel"), 1)
+                .expect("enumeration");
+            let mut entries: Vec<(String, bool, u64, bool)> = got[0]
+                .as_ref()
+                .expect("root exists")
+                .iter()
+                .map(|e| (e.rel.clone(), e.dir, e.size, e.reparse))
+                .collect();
+            entries.sort();
+            assert_eq!(entries, expected, "root spelled {spelling:?}");
         }
     }
 
