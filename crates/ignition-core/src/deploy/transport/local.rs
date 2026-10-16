@@ -33,9 +33,12 @@ use super::{
     copy_to_temp, mirror_mode_problem, read_staged_copy, validate_mirror_inputs,
     validate_mirror_paths, validate_staging_root,
 };
+use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
-use crate::deploy::ledger::{LEDGER_MAX_BYTES, LedgerRoot, ledger_location, ledger_rel};
+use crate::deploy::ledger::{
+    LEDGER_MAX_BYTES, LedgerRoot, journal_location, journal_rel, ledger_location, ledger_rel,
+};
 use crate::deploy::plan::unit_key;
 #[cfg(unix)]
 use crate::deploy::tree::dirfd::{self, FdError, Kind};
@@ -329,28 +332,69 @@ impl LocalFsTransport {
         })
     }
 
-    /// The ledger bytes, or `None` when any level of its location is absent.
-    /// Every level is inspected with `symlink_metadata` and a symlink or a
-    /// non-regular file is refused; the bytes are read through
-    /// [`open_regular_file`], descriptor-relative from `data_dir`, at most
-    /// [`LEDGER_MAX_BYTES`] of them.
+    /// The ledger bytes, or `None` when any level of its location is absent
+    /// (see [`Self::read_regular_blocking`]).
     fn read_ledger_blocking(
         &self,
         gateway: &str,
         mode: &str,
     ) -> Result<Option<Vec<u8>>, CoreError> {
         let location = ledger_location(LedgerRoot::DataDir, gateway, mode);
-        let rel = ledger_rel(gateway, mode);
-        let bad = |problem: String| CoreError::DeployLedgerInvalid {
-            location: location.clone(),
-            problem,
-        };
-        for (what, value) in [("gateway", gateway), ("mode", mode)] {
+        self.read_regular_blocking(
+            &ledger_rel(gateway, mode),
+            LEDGER_MAX_BYTES,
+            "the ledger",
+            (gateway, mode),
+            &|problem| CoreError::DeployLedgerInvalid {
+                location: location.clone(),
+                problem,
+            },
+        )
+    }
+
+    /// The journal bytes, or `None` when any level of its location is absent.
+    /// A refusal is `deploy_run_invalid` naming the location (the run id is
+    /// not known before the journal is parsed).
+    fn read_journal_blocking(
+        &self,
+        gateway: &str,
+        mode: &str,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let location = journal_location(LedgerRoot::DataDir, gateway, mode);
+        self.read_regular_blocking(
+            &journal_rel(gateway, mode),
+            JOURNAL_MAX_BYTES,
+            "the journal",
+            (gateway, mode),
+            &|problem| CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {problem}"),
+            },
+        )
+    }
+
+    /// The bytes of the regular file `rel` below `data_dir`, or `None` when
+    /// any level of its path is absent. Every level is inspected with
+    /// `symlink_metadata` and a symlink or a non-regular file is refused; the
+    /// bytes are read through [`open_regular_file`], descriptor-relative from
+    /// `data_dir`, at most `cap` of them, the size checked from the metadata
+    /// first. Both the ledger and the journal read through here, so they fail
+    /// closed the same way. `bad` builds the refusal from a value-free
+    /// problem.
+    fn read_regular_blocking(
+        &self,
+        rel: &str,
+        cap: usize,
+        what: &str,
+        (gateway, mode): (&str, &str),
+        bad: &dyn Fn(String) -> CoreError,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        for (kind, value) in [("gateway", gateway), ("mode", mode)] {
             if let Some(why) = component_problem(value) {
-                return Err(bad(format!("the target {what} {why}")));
+                return Err(bad(format!("the target {kind} {why}")));
             }
         }
-        // An unreadable host is not an absent ledger.
+        // An unreadable host is not an absent file.
         self.require_data_dir()?;
 
         let parts: Vec<&str> = rel.split('/').collect();
@@ -366,7 +410,7 @@ impl LocalFsTransport {
                     ));
                 }
                 Ok(m) if last && !m.file_type().is_file() => {
-                    return Err(bad("the ledger is not a regular file".to_string()));
+                    return Err(bad(format!("{what} is not a regular file")));
                 }
                 Ok(m) if !last && !m.file_type().is_dir() => {
                     return Err(bad("a path component is not a directory".to_string()));
@@ -379,7 +423,13 @@ impl LocalFsTransport {
         let Some(before) = meta else {
             return Ok(None);
         };
-        let (file, held) = match open_regular_file(&self.data_dir, Path::new(&rel), &before) {
+        if before.len() > cap as u64 {
+            return Err(bad(format!(
+                "the file is {} bytes, over the {cap} byte cap",
+                before.len()
+            )));
+        }
+        let (file, held) = match open_regular_file(&self.data_dir, Path::new(rel), &before) {
             Ok(opened) => opened,
             Err(OpenError::Changed) => {
                 return Err(bad(
@@ -389,19 +439,19 @@ impl LocalFsTransport {
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(OpenError::Io(e)) => return Err(bad(format!("cannot be read ({})", e.kind()))),
         };
-        if held.len() > LEDGER_MAX_BYTES as u64 {
+        if held.len() > cap as u64 {
             return Err(bad(format!(
-                "the file is {} bytes, over the {LEDGER_MAX_BYTES} byte cap",
+                "the file is {} bytes, over the {cap} byte cap",
                 held.len()
             )));
         }
         let mut bytes = Vec::new();
-        file.take(LEDGER_MAX_BYTES as u64 + 1)
+        file.take(cap as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| bad(format!("cannot be read ({})", e.kind())))?;
-        if bytes.len() > LEDGER_MAX_BYTES {
+        if bytes.len() > cap {
             return Err(bad(format!(
-                "the file grew past the {LEDGER_MAX_BYTES} byte cap while it was read"
+                "the file grew past the {cap} byte cap while it was read"
             )));
         }
         Ok(Some(bytes))
@@ -492,6 +542,14 @@ impl TreeReader for LocalFsTransport {
         let this = self.clone();
         let (gateway, mode) = (gateway.to_string(), mode.to_string());
         tokio::task::spawn_blocking(move || this.read_ledger_blocking(&gateway, &mode))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        let (gateway, mode) = (gateway.to_string(), mode.to_string());
+        tokio::task::spawn_blocking(move || this.read_journal_blocking(&gateway, &mode))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }

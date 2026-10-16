@@ -66,9 +66,12 @@ use super::{
     read_staged_copy, validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
 };
 use crate::client::config_resources::validate_segment;
+use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
 use crate::deploy::component_problem;
 use crate::deploy::layout::{RelPath, TAG_TYPES};
-use crate::deploy::ledger::{LEDGER_MAX_BYTES, LedgerRoot, ledger_location, ledger_rel};
+use crate::deploy::ledger::{
+    LEDGER_MAX_BYTES, LedgerRoot, journal_location, journal_rel, ledger_location, ledger_rel,
+};
 use crate::deploy::plan::unit_key;
 use crate::deploy::tree::{OpenError, RenderedTree, open_regular_file, sha256_hex, walk_capped};
 use crate::error::CoreError;
@@ -1551,30 +1554,73 @@ impl TreeReader for SftpTransport {
         // Decision B(i): an ssh node keeps its ledger in the service account's
         // home, outside every collection and outside the data directory.
         let location = ledger_location(LedgerRoot::AccountHome, gateway, mode);
-        let rel = ledger_rel(gateway, mode);
-        let bad = |problem: String| CoreError::DeployLedgerInvalid {
-            location: location.clone(),
-            problem,
-        };
-        for (what, value) in [("gateway", gateway), ("mode", mode)] {
+        self.read_home_file(
+            &ledger_rel(gateway, mode),
+            LEDGER_MAX_BYTES,
+            "the ledger",
+            (gateway, mode),
+            &|problem| CoreError::DeployLedgerInvalid {
+                location: location.clone(),
+                problem,
+            },
+        )
+        .await
+    }
+
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        // Under the same root as the ledger (D-04). A refusal is
+        // `deploy_run_invalid` naming the location; the run id is not known
+        // before the journal is parsed.
+        let location = journal_location(LedgerRoot::AccountHome, gateway, mode);
+        self.read_home_file(
+            &journal_rel(gateway, mode),
+            JOURNAL_MAX_BYTES,
+            "the journal",
+            (gateway, mode),
+            &|problem| CoreError::DeployRunInvalid {
+                run_id: "unknown".to_string(),
+                problem: format!("{location}: {problem}"),
+            },
+        )
+        .await
+    }
+}
+
+impl SftpTransport {
+    /// The bytes of the regular file `rel` below the service account's home,
+    /// or `None` when any level of its path is absent. Names that are not one
+    /// safe component, a symlink or a non-directory on the way, a
+    /// non-regular file, a file over `cap` (checked from the listing before
+    /// any byte is fetched) and every read error are refused through `bad`,
+    /// which builds the refusal from a value-free problem. The ledger and the
+    /// journal both read through here, so they fail closed the same way.
+    async fn read_home_file(
+        &self,
+        rel: &str,
+        cap: usize,
+        what: &str,
+        (gateway, mode): (&str, &str),
+        bad: &(dyn Fn(String) -> CoreError + Sync),
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        for (kind, value) in [("gateway", gateway), ("mode", mode)] {
             if let Some(why) = component_problem(value) {
-                return Err(bad(format!("the target {what} {why}")));
+                return Err(bad(format!("the target {kind} {why}")));
             }
             if let Some(why) = self
                 .windows
                 .then(|| windows_component_problem(value))
                 .flatten()
             {
-                return Err(bad(format!("the target {what}: {why}")));
+                return Err(bad(format!("the target {kind}: {why}")));
             }
         }
         let parts: Vec<&str> = rel.split('/').collect();
-        // An unreadable host is not an absent ledger: the home must answer
+        // An unreadable host is not an absent file: the home must answer
         // `pwd` and list.
         let home = self.account_home().await?;
-        // Only the fixed names of the ledger path are looked up in the home,
-        // so names in it that cannot ride a batch line (a Windows profile
-        // holds `NTUSER.DAT{<guid>}.TM.blf`) are skipped, not refused.
+        // Only the fixed names of the path are looked up in the home, so
+        // names in it that cannot ride a batch line (a Windows profile holds
+        // `NTUSER.DAT{<guid>}.TM.blf`) are skipped, not refused.
         let mut budget = Budget::lenient();
         let found = self
             .descend_from(&home, &parts, &mut budget)
@@ -1590,11 +1636,11 @@ impl TreeReader for SftpTransport {
             return Ok(None);
         };
         if entry.kind != EntryKind::File {
-            return Err(bad("the ledger is not a regular file".to_string()));
+            return Err(bad(format!("{what} is not a regular file")));
         }
-        if entry.size > LEDGER_MAX_BYTES as u64 {
+        if entry.size > cap as u64 {
             return Err(bad(format!(
-                "the file is {} bytes, over the {LEDGER_MAX_BYTES} byte cap",
+                "the file is {} bytes, over the {cap} byte cap",
                 entry.size
             )));
         }
@@ -1612,7 +1658,7 @@ impl TreeReader for SftpTransport {
         let size = entry.size;
         let root = tmp.path().to_path_buf();
         let read = tokio::task::spawn_blocking(move || {
-            let result = read_downloaded(&root, Path::new("ledger"), size, LEDGER_MAX_BYTES as u64);
+            let result = read_downloaded(&root, Path::new("ledger"), size, cap as u64);
             drop(tmp);
             result
         })
@@ -1625,10 +1671,10 @@ impl TreeReader for SftpTransport {
                 "changed while it was read; symlinks are refused".to_string()
             )),
             Err(Readback::Capped(len)) => Err(bad(format!(
-                "the file is {len} bytes, over the {LEDGER_MAX_BYTES} byte cap"
+                "the file is {len} bytes, over the {cap} byte cap"
             ))),
             Err(Readback::Grew) => Err(bad(format!(
-                "the file grew past the {LEDGER_MAX_BYTES} byte cap while it was read"
+                "the file grew past the {cap} byte cap while it was read"
             ))),
             Err(Readback::SizeMismatch { listed, actual }) => Err(bad(format!(
                 "the file is {actual} bytes but was listed as {listed}; it changed while it was read"

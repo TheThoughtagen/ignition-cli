@@ -521,6 +521,10 @@ impl TreeReader for Counting {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.read_ledger(gateway, mode).await
     }
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_journal(gateway, mode).await
+    }
 }
 
 fn reader_for(repo: &Path, env: &str) -> Counting {

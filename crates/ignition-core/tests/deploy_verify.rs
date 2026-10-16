@@ -1388,6 +1388,10 @@ impl TreeReader for DeadTransport {
     async fn read_ledger(&self, _g: &str, _m: &str) -> Result<Option<Vec<u8>>, CoreError> {
         unreachable!("verify does not read the ledger")
     }
+
+    async fn read_journal(&self, _g: &str, _m: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        unreachable!("verify does not read the journal")
+    }
 }
 
 #[tokio::test]

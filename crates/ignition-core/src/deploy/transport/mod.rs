@@ -150,6 +150,18 @@ pub trait TreeReader: Send + Sync {
     /// bytes are not validated here; see
     /// [`Ledger::parse`](super::ledger::Ledger::parse).
     async fn read_ledger(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// The apply journal bytes of `gateway` and `mode` at
+    /// [`journal_location`](super::ledger::journal_location), under the same
+    /// root as the ledger. `None` means there is no journal at any level of
+    /// its path: no interrupted run. A journal that exists but cannot be read
+    /// (a symlink, a non-regular file, over
+    /// [`JOURNAL_MAX_BYTES`](super::apply::journal::JOURNAL_MAX_BYTES), a read
+    /// error) is [`CoreError::DeployRunInvalid`] naming the location, never
+    /// `None`: `plan`, `apply` and `rollback` must not proceed over a run
+    /// they cannot see (DAPL-09 fails closed). The bytes are not validated
+    /// here; see [`Journal::parse`](super::apply::journal::Journal::parse).
+    async fn read_journal(&self, gateway: &str, mode: &str) -> Result<Option<Vec<u8>>, CoreError>;
 }
 
 /// How a node's data directory is reached, resolved once for both halves.
