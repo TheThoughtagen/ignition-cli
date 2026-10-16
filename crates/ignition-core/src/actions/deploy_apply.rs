@@ -1,19 +1,27 @@
-//! `ign deploy apply` as library verbs (Phase 23, DAPL-01, DAPL-03,
-//! DAPL-06): [`deploy_apply_prepare`] re-plans and evaluates the gates,
-//! [`deploy_apply_execute`] drives the engine. Neither prints.
+//! `ign deploy apply` and `ign deploy rollback` as library verbs (Phase 23,
+//! DAPL-01, DAPL-03, DAPL-06, DAPL-08): [`deploy_apply_prepare`] re-plans and
+//! evaluates the gates, [`deploy_apply_execute`] drives the engine;
+//! [`deploy_rollback_prepare`] reads the on-box record of a past run and
+//! refuses what cannot be rolled back, [`deploy_rollback_execute`] restores
+//! it. None of them prints.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::actions::deploy::{Declared, DeployPlanResult, PlanOptions, deploy_plan};
+use crate::actions::deploy::{Declared, DeployPlanResult, PlanOptions, deploy_plan, load_target};
 use crate::deploy::apply::gates::{
     GateFlags, GateOutcome, evaluate_gates, validate_drift_reason, validate_plan_sha256,
 };
+use crate::deploy::apply::host::ApplyHost;
+use crate::deploy::apply::record::RunRecord;
+use crate::deploy::apply::run_store::RunId;
 use crate::deploy::apply::{
-    ApplyContext, ApplyOptions, OutcomeKind, ROLLED_BACK_SLUG, RollbackCause, run_apply,
+    ApplyContext, ApplyOptions, OutcomeKind, ROLLED_BACK_SLUG, RollbackCause, RollbackContext,
+    RollbackKind, RollbackOptions, check_rollback, restore_set, run_apply, run_rollback,
 };
 use crate::deploy::plan::PlanSummary;
+use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
 use crate::error::CoreError;
 
@@ -180,4 +188,174 @@ pub async fn deploy_apply_execute(
     result.restart_pending = outcome.restart_pending;
     result.restart_pending_new = outcome.restart_pending_new;
     Ok(result)
+}
+
+// ============================================================================
+// Rollback (23-11)
+// ============================================================================
+
+/// What `deploy_rollback_prepare` takes besides the run id.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RollbackPrepareOptions {
+    /// `--discard-live-changes`: carry changed files instead of refusing.
+    pub discard_live_changes: bool,
+}
+
+/// What `deploy_rollback_prepare` found: the rollback may go ahead.
+#[derive(Debug, Clone)]
+pub struct RollbackPrepared {
+    /// The on-box record of the run, at state `applied`.
+    pub record: RunRecord,
+    /// The confirmation text: run, gateway, mode, counts and `plan_sha256`.
+    pub prose: String,
+    /// Touched paths changed since the run (only with
+    /// `discard_live_changes`).
+    pub live_changed: Vec<String>,
+    /// The target the file names (the caller builds the rollback context
+    /// from it).
+    pub target: Target,
+    /// Repo-relative path of the target file.
+    pub target_file: String,
+}
+
+/// The `ign deploy rollback` result (the envelope's `data`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeployRollbackResult {
+    /// The `--env` value.
+    pub env: String,
+    /// Gateway directory name from the target.
+    pub gateway: String,
+    /// Deployment mode from the target.
+    pub mode: String,
+    /// This rollback's own run id.
+    pub run_id: String,
+    /// The run that was rolled back (`--run`).
+    pub target_run_id: String,
+    /// This rollback's run directory.
+    pub run_dir: String,
+    /// `restored`.
+    pub outcome: RollbackKind,
+    /// Always true: a rollback that cannot restore is an error, not a result.
+    pub ok: bool,
+    /// Collection paths put back from the snapshot.
+    pub restored: Vec<String>,
+    /// Collection paths the rolled-back run had created, now removed.
+    pub deleted: Vec<String>,
+    /// Touched paths that had changed since the run and were overwritten;
+    /// `[]` when none (never null).
+    pub discarded_live_changes: Vec<String>,
+    /// Engine warnings.
+    pub warnings: Vec<String>,
+    /// The pending restarts after the rollback; `[]` when none (never null).
+    pub restart_pending: Vec<String>,
+    /// The pending restarts the rollback added; `[]` when none (never null).
+    pub restart_pending_new: Vec<String>,
+}
+
+/// The confirmation prose of a rollback: byte-stable, no file content.
+fn rollback_prose(record: &RunRecord, live_changed: &[String]) -> String {
+    let (restored, deleted) = restore_set(record);
+    let ledger = record
+        .touched
+        .iter()
+        .find(|e| e.path == crate::deploy::apply::fingerprint::LEDGER_KEY)
+        .map(|e| {
+            if e.pre_sha256.is_some() {
+                ", and restore the ledger"
+            } else {
+                ", and remove the ledger"
+            }
+        })
+        .unwrap_or("");
+    let mut prose = format!(
+        "Roll back run {} on gateway {} (mode {}): restore {} file(s) from the on-box snapshot \
+         and delete {} file(s) the run created{}. The run applied plan_sha256 {}.",
+        record.run_id,
+        record.gateway,
+        record.mode,
+        restored.len(),
+        deleted.len(),
+        ledger,
+        record.plan_sha256,
+    );
+    if !live_changed.is_empty() {
+        prose.push_str(&format!(
+            " {} file(s) changed after the run and will be overwritten: {}.",
+            live_changed.len(),
+            live_changed
+                .iter()
+                .take(crate::error::APPLY_LIST_SHOWN)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    prose
+}
+
+/// Validate the run id, then read the host and decide whether the run can be
+/// rolled back.
+///
+/// The id is checked before any host contact (`invalid_input`). After that
+/// this reads the target file, the host's journal, the on-box record, the
+/// run's local run directory when it exists, and the live hashes of the
+/// touched set; it writes nothing and takes no lock. See
+/// [`check_rollback`] for the refusals.
+pub async fn deploy_rollback_prepare(
+    repo: &Path,
+    env: &str,
+    run_id_text: &str,
+    reader: &dyn TreeReader,
+    host: &dyn ApplyHost,
+    opts: &RollbackPrepareOptions,
+) -> Result<RollbackPrepared, CoreError> {
+    let run_id = RunId::parse(run_id_text)?;
+    let (target_file, target) = load_target(repo, env)?;
+    let checked = check_rollback(
+        env,
+        repo,
+        &target,
+        reader,
+        host,
+        &run_id,
+        opts.discard_live_changes,
+    )
+    .await?;
+    Ok(RollbackPrepared {
+        prose: rollback_prose(&checked.record, &checked.live_changed),
+        record: checked.record,
+        live_changed: checked.live_changed,
+        target,
+        target_file,
+    })
+}
+
+/// Run a prepared rollback through [`run_rollback`].
+pub async fn deploy_rollback_execute(
+    prepared: RollbackPrepared,
+    ctx: &RollbackContext<'_>,
+    opts: &RollbackOptions,
+) -> Result<DeployRollbackResult, CoreError> {
+    if prepared.record.run_id != opts.run_id.as_str() {
+        return Err(CoreError::Internal(
+            "the prepared rollback is for another run than the options name".to_string(),
+        ));
+    }
+    let outcome = run_rollback(ctx, opts).await?;
+    Ok(DeployRollbackResult {
+        env: ctx.env.to_string(),
+        gateway: ctx.target.gateway.clone(),
+        mode: ctx.target.mode.clone(),
+        run_id: outcome.run_id,
+        target_run_id: outcome.target_run_id,
+        run_dir: outcome.run_dir,
+        outcome: outcome.kind,
+        ok: true,
+        restored: outcome.restored,
+        deleted: outcome.deleted,
+        discarded_live_changes: outcome.discarded_live_changes,
+        warnings: outcome.warnings,
+        restart_pending: outcome.restart_pending,
+        restart_pending_new: outcome.restart_pending_new,
+    })
 }

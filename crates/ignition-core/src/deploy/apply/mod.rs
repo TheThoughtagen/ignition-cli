@@ -71,6 +71,7 @@ pub mod host;
 pub mod journal;
 pub mod preflight;
 pub mod record;
+pub mod rollback;
 pub mod run_store;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,6 +92,7 @@ use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{Ledger, LedgerRoot, journal_location, ledger_location};
 use crate::deploy::plan::PlanStatus;
+use crate::deploy::target::NodeTarget;
 use crate::deploy::transport::TreeReader;
 use crate::deploy::tree::sha256_hex;
 use crate::error::{CoreError, PreflightFailure, RollbackFailure};
@@ -104,6 +106,11 @@ use self::journal::{Journal, JournalPhase};
 use self::preflight::{DesignersPolicy, PreflightInput, run_preflights};
 use self::record::{RecordState, RunRecord, TouchedEntry};
 use self::run_store::{EventLog, RunDir, RunId};
+
+pub use self::rollback::{
+    RollbackChecked, RollbackContext, RollbackKind, RollbackOptions, RollbackOutcome,
+    check_rollback, restore_set, run_rollback,
+};
 
 /// The slug of the rolled-back apply verdict.
 ///
@@ -379,10 +386,19 @@ pub enum ApplyEvent {
         /// `(check id, status)` in report order.
         checks: Vec<(String, String)>,
     },
-    /// A restore began (23-17).
+    /// A restore began (23-17). `None` is a manual rollback (23-11): the
+    /// closed `data.cause` vocabulary of an apply is unchanged.
     RestoreStarted {
-        /// Why.
-        cause: RollbackCause,
+        /// Why an apply is being undone; `None` for a manual rollback.
+        cause: Option<RollbackCause>,
+    },
+    /// A rollback went ahead over live changes made after the run
+    /// (`--discard-live-changes`, 23-11): the first paths and the count.
+    LiveChangesDiscarded {
+        /// How many touched paths had changed.
+        count: usize,
+        /// The first [`crate::error::APPLY_LIST_SHOWN`], byte-sorted.
+        paths: Vec<String>,
     },
     /// The restore finished (23-17).
     Restored,
@@ -430,6 +446,7 @@ impl ApplyEvent {
             ApplyEvent::Finalized => "finalized",
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
+            ApplyEvent::LiveChangesDiscarded { .. } => "live_changes_discarded",
             ApplyEvent::PreflightChecks { .. } => "preflight_checks",
             ApplyEvent::DesignersPoll { .. } => "designers_poll",
             ApplyEvent::DesignersProceed { .. } => "designers_proceed",
@@ -473,7 +490,12 @@ impl ApplyEvent {
                     .map(|(user, project, host)| json!({"user": user, "project": project, "host": host}))
                     .collect::<Vec<_>>(),
             }),
-            ApplyEvent::RestoreStarted { cause } => json!({"cause": cause.as_str()}),
+            ApplyEvent::RestoreStarted { cause } => {
+                json!({"cause": cause.map(RollbackCause::as_str)})
+            }
+            ApplyEvent::LiveChangesDiscarded { count, paths } => {
+                json!({"count": count, "paths": paths})
+            }
             ApplyEvent::GwbkDownloaded { bytes } => json!({"bytes": bytes}),
             ApplyEvent::Failed { code } => json!({"code": code}),
             ApplyEvent::ScanDone
@@ -519,6 +541,20 @@ pub struct ApplyContext<'a> {
     pub clock: &'a dyn Clock,
     /// Hears each step.
     pub observer: &'a dyn ApplyObserver,
+}
+
+impl<'a> ApplyContext<'a> {
+    /// What [`restore_snapshot`] needs from this context.
+    fn restore_context(&'a self, opts: &'a ApplyOptions) -> RestoreContext<'a> {
+        RestoreContext {
+            master: &self.declared.target.nodes.master,
+            host: self.host,
+            deploy: self.deploy,
+            clock: self.clock,
+            hold: &opts.hold,
+            poll: &opts.poll,
+        }
+    }
 }
 
 /// What a run needs besides its context.
@@ -959,7 +995,7 @@ async fn drive(
 
     let mut warnings = verify.warnings;
     let (restart_pending, restart_pending_new) =
-        restart_report(ctx, restart_before.as_deref(), &mut warnings).await;
+        restart_report(ctx.deploy, restart_before.as_deref(), &mut warnings).await;
     let mut snapshot_sha256 = BTreeMap::new();
     match ctx.host.fetch_snapshot(run_id, run_dir.path()).await {
         Ok(hashes) => {
@@ -1002,11 +1038,11 @@ async fn drive(
 /// treated as empty, so everything now pending is reported as new rather than
 /// hidden. Read only (SF-3).
 async fn restart_report(
-    ctx: &ApplyContext<'_>,
+    deploy: &dyn DeployApi,
     before: Option<&[String]>,
     warnings: &mut Vec<String>,
 ) -> (Vec<String>, Vec<String>) {
-    let after = ctx.deploy.restart_pending().await.ok();
+    let after = deploy.restart_pending().await.ok();
     if before.is_none() || after.is_none() {
         warnings.push(RESTART_UNAVAILABLE.to_string());
     }
@@ -1139,21 +1175,20 @@ async fn roll_back(
     mut warnings: Vec<String>,
 ) -> Result<ApplyOutcome, CoreError> {
     let restored = restore_snapshot(
-        ctx,
+        &ctx.restore_context(opts),
         &RestoreInput {
             run_id: scope.run_id,
             run_dir: scope.run_dir,
             record: scope.record,
             held,
-            cause,
+            cause: Some(cause),
         },
-        opts,
         steps,
     )
     .await?;
     warnings.extend(restored.warnings);
     let (restart_pending, restart_pending_new) =
-        restart_report(ctx, scope.restart_before, &mut warnings).await;
+        restart_report(ctx.deploy, scope.restart_before, &mut warnings).await;
     Ok(ApplyOutcome {
         kind: OutcomeKind::RolledBack,
         run_id: Some(scope.run_id.as_str().to_string()),
@@ -1186,8 +1221,26 @@ pub struct RestoreInput<'a> {
     pub record: &'a RunRecord,
     /// The scan-lock this engine still holds, when it does.
     pub held: Option<&'a HeldLock>,
-    /// Why the restore runs.
-    pub cause: RollbackCause,
+    /// Why an apply is being undone; `None` for a manual rollback (23-11),
+    /// which keeps the closed `data.cause` vocabulary of an apply as it is.
+    pub cause: Option<RollbackCause>,
+}
+
+/// What [`restore_snapshot`] drives. It names no declared repo: a manual
+/// rollback (23-11) has only the target file and a run id.
+pub struct RestoreContext<'a> {
+    /// The target's master node (where the journal lives, for the error).
+    pub master: &'a NodeTarget,
+    /// The write seam of the master's host.
+    pub host: &'a dyn ApplyHost,
+    /// The gateway REST surface (lock, scan, mode).
+    pub deploy: &'a dyn DeployApi,
+    /// The monotonic clock the lock is judged by.
+    pub clock: &'a dyn Clock,
+    /// The hold a fresh lock is requested with, and its estimates.
+    pub hold: &'a HoldModel,
+    /// How the scan wait polls.
+    pub poll: &'a PollConfig,
 }
 
 /// What a finished restore did.
@@ -1231,19 +1284,18 @@ pub struct RestoreReport {
 /// Any failure is [`CoreError::RollbackFailed`] naming the run, its
 /// directory and the on-box journal, which stays (D-12).
 pub async fn restore_snapshot(
-    ctx: &ApplyContext<'_>,
+    ctx: &RestoreContext<'_>,
     input: &RestoreInput<'_>,
-    opts: &ApplyOptions,
     steps: &mut Steps<'_>,
 ) -> Result<RestoreReport, CoreError> {
     let record = input.record;
-    match restore_steps(ctx, input, opts, steps).await {
+    match restore_steps(ctx, input, steps).await {
         Ok(report) => Ok(report),
         Err(cause) => Err(CoreError::RollbackFailed(Box::new(RollbackFailure {
             run_id: record.run_id.clone(),
             run_dir: Some(input.run_dir.path().to_string_lossy().into_owned()),
             journal: journal_location(
-                LedgerRoot::for_node(&ctx.declared.target.nodes.master),
+                LedgerRoot::for_node(ctx.master),
                 &record.gateway,
                 &record.mode,
             ),
@@ -1254,9 +1306,8 @@ pub async fn restore_snapshot(
 
 /// The steps of [`restore_snapshot`]; an `Err` is a value-free reason.
 async fn restore_steps(
-    ctx: &ApplyContext<'_>,
+    ctx: &RestoreContext<'_>,
     input: &RestoreInput<'_>,
-    opts: &ApplyOptions,
     steps: &mut Steps<'_>,
 ) -> Result<RestoreReport, String> {
     // A gateway error is named by its code only; a host error already names
@@ -1272,7 +1323,7 @@ async fn restore_steps(
         .map_err(event)?;
 
     // The lock.
-    let need_s = opts.hold.estimate_commit_s(record.touched.len()).ceil() as i64 + LOCK_MARGIN_S;
+    let need_s = ctx.hold.estimate_commit_s(record.touched.len()).ceil() as i64 + LOCK_MARGIN_S;
     let reuse = match input.held {
         Some(lock) => match lock
             .check_gateway(deploy, need_s)
@@ -1281,7 +1332,7 @@ async fn restore_steps(
         {
             LockVerdict::Held { .. } => true,
             LockVerdict::Expiring { .. } => {
-                lock.wait_for_lapse(deploy, opts.poll.interval)
+                lock.wait_for_lapse(deploy, ctx.poll.interval)
                     .await
                     .map_err(gw("waiting for the scan-lock to lapse"))?;
                 false
@@ -1291,12 +1342,12 @@ async fn restore_steps(
         None => false,
     };
     if !reuse {
-        HeldLock::acquire(deploy, ScanKind::Config, opts.hold.hold_s, ctx.clock)
+        HeldLock::acquire(deploy, ScanKind::Config, ctx.hold.hold_s, ctx.clock)
             .await
             .map_err(gw("taking the scan-lock"))?;
         steps
             .emit(ApplyEvent::LockAcquired {
-                hold_s: opts.hold.hold_s,
+                hold_s: ctx.hold.hold_s,
             })
             .map_err(event)?;
     }
@@ -1309,7 +1360,7 @@ async fn restore_steps(
     if report.stale {
         return Err("restore: the host reported a stale pre-image".to_string());
     }
-    match scan_and_wait(deploy, ScanKind::Config, opts.poll.clone())
+    match scan_and_wait(deploy, ScanKind::Config, ctx.poll.clone())
         .await
         .map_err(gw("the scan after the restore"))?
     {

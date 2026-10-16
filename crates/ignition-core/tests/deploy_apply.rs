@@ -41,8 +41,8 @@ use ignition_core::deploy::apply::{
 };
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::target::Target;
-use ignition_core::deploy::transport::{self, TreeReader};
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
+use ignition_core::deploy::transport::{self, TreeReader};
 use ignition_core::deploy::tree::sha256_hex;
 use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
@@ -2876,7 +2876,10 @@ async fn rollback_fresh_process_from_record_only() {
     // The record, the journal and the staging.
     let record = rig.record(&target_run);
     assert_eq!(record.state, RecordState::RolledBack);
-    assert_eq!(record.rolled_back_by.as_deref(), Some(result.run_id.as_str()));
+    assert_eq!(
+        record.rolled_back_by.as_deref(),
+        Some(result.run_id.as_str())
+    );
     assert!(!rig.deploy_dir().join("journal.json").exists());
     assert!(!rig.deploy_dir().join("staging").join(&target_run).exists());
 
@@ -2885,7 +2888,13 @@ async fn rollback_fresh_process_from_record_only() {
     assert!(run_dir.ends_with(&result.run_id), "{}", result.run_dir);
     assert_eq!(
         names(&run_dir),
-        ["events.ndjson", "plan.json", "result.json", "run.json", "snapshot"]
+        [
+            "events.ndjson",
+            "plan.json",
+            "result.json",
+            "run.json",
+            "snapshot"
+        ]
     );
     let run_json = json_file(&run_dir.join("run.json"));
     assert_eq!(run_json["kind"], "rollback");
@@ -2916,8 +2925,15 @@ async fn rollback_fresh_process_from_record_only() {
     // The host calls: nothing but reads before the preflights' probe, one
     // restore, no commit.
     let calls = fresh.host.calls();
-    assert_eq!(calls.iter().filter(|c| **c == "restore").count(), 1, "{calls:?}");
-    assert!(!calls.contains(&"commit") && !calls.contains(&"prepare"), "{calls:?}");
+    assert_eq!(
+        calls.iter().filter(|c| **c == "restore").count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(
+        !calls.contains(&"commit") && !calls.contains(&"prepare"),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]
