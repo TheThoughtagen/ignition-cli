@@ -353,6 +353,11 @@ async fn changing_rig() -> Rig {
 }
 
 async fn changing_rig_with_logs(items: Vec<Value>) -> Rig {
+    changing_rig_faulted(items, None).await
+}
+
+/// `changing_rig_with_logs`, the local host carrying `fault` when given.
+async fn changing_rig_faulted(items: Vec<Value>, fault: Option<ApplyFault>) -> Rig {
     let fx = PlanFixture::new();
     let (declared, _) = fx.load("dev");
     fx.live_render(MODE, &declared);
@@ -362,6 +367,10 @@ async fn changing_rig_with_logs(items: Vec<Value>) -> Rig {
     fx.remove(MODE, ALARM_UNIT);
     fx.ledger(GATEWAY, MODE, &[DB_CONFIG, DB_RESOURCE]);
     let host = local_host(&fx);
+    let host = match fault {
+        Some(fault) => host.with_apply_fault(fault),
+        None => host,
+    };
     rig_with_logs(fx, host, None, items).await
 }
 
@@ -3437,4 +3446,231 @@ async fn rollback_lock_held_refuses() {
     assert_eq!(result["ok"], false);
     assert_eq!(result["error"]["code"], "scan_lock_held");
     assert_eq!(result["target_run_id"], target_run.as_str());
+}
+
+// ============================================================================
+// Interrupted-run recovery (23-12)
+// ============================================================================
+
+fn journal_path(rig: &Rig) -> PathBuf {
+    rig.deploy_dir().join("journal.json")
+}
+
+/// The journal on the box, parsed.
+fn read_journal(rig: &Rig) -> Journal {
+    Journal::parse(
+        "journal.json",
+        &std::fs::read(journal_path(rig)).expect("the journal"),
+        GATEWAY,
+        MODE,
+    )
+    .expect("the journal parses")
+}
+
+/// `plan_sha256` of a plain `deploy plan` of the rig's declared tree.
+async fn plan_hash(rig: &Rig) -> String {
+    deploy_plan(
+        &rig.declared,
+        rig.reader.as_ref(),
+        &PlanOptions {
+            base: None,
+            diff: false,
+        },
+    )
+    .await
+    .expect("a plan")
+    .plan_sha256
+}
+
+/// A real apply that was killed after its first move.
+struct Killed {
+    rig: Arc<Rig>,
+    /// The journal it left (`writing`).
+    journal: Journal,
+    /// The collection and ledger before the apply started.
+    before: BTreeMap<String, String>,
+    /// `plan_sha256` before the apply started.
+    plan_before: String,
+}
+
+/// Start a real apply task on a host that hangs after its first move, then
+/// abort the task: what is left is what a `kill -9` there leaves.
+async fn killed_mid_write() -> Killed {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let rig = Arc::new(
+        changing_rig_faulted(
+            Vec::new(),
+            Some(ApplyFault::HangAfterMove(1, notify.clone())),
+        )
+        .await,
+    );
+    let before = collection_state(&rig);
+    let plan_before = plan_hash(&rig).await;
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let task = tokio::spawn({
+        let rig = rig.clone();
+        async move { rig.run(prepared, &NoObserver).await }
+    });
+    tokio::time::timeout(Duration::from_secs(60), notify.notified())
+        .await
+        .expect("the commit reached the hang");
+    task.abort();
+    assert!(task.await.expect_err("aborted").is_cancelled());
+    let journal = read_journal(&rig);
+    Killed {
+        rig,
+        journal,
+        before,
+        plan_before,
+    }
+}
+
+/// `err` is `deploy_journal_present` for `run_id`, and its message holds the
+/// exact recovery command.
+fn assert_recovery_hint(err: &CoreError, run_id: &str) {
+    let CoreError::DeployJournalPresent {
+        run_id: named,
+        env,
+        location,
+    } = err
+    else {
+        panic!("expected deploy_journal_present, got {err:?}");
+    };
+    assert_eq!(named, run_id);
+    assert_eq!(env, "dev");
+    assert_eq!(err.exit_code(), 6);
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("ign deploy rollback --run {run_id} --env dev")),
+        "the command in {text}"
+    );
+    assert!(text.contains(location.as_str()), "the location in {text}");
+    assert!(location.ends_with("journal.json"), "{location}");
+}
+
+#[tokio::test]
+async fn journal_kill_mid_write_then_recover() {
+    let Killed {
+        rig,
+        journal,
+        before,
+        plan_before,
+    } = killed_mid_write().await;
+    let run_id = journal.run_id.clone();
+    assert_eq!(journal.phase, JournalPhase::Writing);
+    let torn = collection_state(&rig);
+    assert_ne!(torn, before, "one file moved before the kill");
+
+    // Plan, apply and a rollback of another run all refuse, with the command.
+    let err = deploy_plan(
+        &rig.declared,
+        rig.reader.as_ref(),
+        &PlanOptions {
+            base: None,
+            diff: false,
+        },
+    )
+    .await
+    .expect_err("plan refuses over a journal");
+    assert_recovery_hint(&err, &run_id);
+    let err = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect_err("apply refuses over a journal");
+    assert_recovery_hint(&err, &run_id);
+    let other = Fresh::new(&rig).await;
+    let err = other
+        .prepare(&rig, "20261016T000000Z-aaaaaa", false)
+        .await
+        .expect_err("a rollback of another run refuses");
+    assert_recovery_hint(&err, &run_id);
+    only_reads(&other);
+    assert_eq!(collection_state(&rig), torn, "the refusals wrote nothing");
+    assert!(journal_path(&rig).is_file());
+
+    // The recovery is the rollback of the journal's own run, from a fresh
+    // process, with no flag.
+    let fresh = Fresh::new(&rig).await;
+    let result = fresh
+        .rollback(&rig, &run_id, false)
+        .await
+        .expect("the journal's own run recovers");
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.ok);
+    assert_eq!(result.target_run_id, run_id);
+    assert!(result.discarded_live_changes.is_empty());
+
+    assert_eq!(collection_state(&rig), before, "the pre-apply tree is back");
+    assert!(!journal_path(&rig).exists(), "the journal is removed");
+    assert!(
+        !rig.deploy_dir().join("staging").join(&run_id).exists(),
+        "and the run's staging"
+    );
+    assert_eq!(fresh.fake.scan_count(), 1, "scanned once");
+    let record = rig.record(&run_id);
+    assert_eq!(record.state, RecordState::RolledBack);
+    assert_eq!(
+        record.rolled_back_by.as_deref(),
+        Some(result.run_id.as_str())
+    );
+    assert_eq!(plan_hash(&rig).await, plan_before, "the same plan again");
+
+    // The recovery run records the torn state it found (D-11).
+    let run_dir = PathBuf::from(&result.run_dir);
+    let found = event_lines(&run_dir, "interrupted_run");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["phase"], "writing");
+    assert_eq!(found[0]["action"], "restore");
+    assert_eq!(found[0]["touched"], journal.touched.len());
+    let expected: serde_json::Map<String, Value> = journal
+        .touched
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                torn.get(path).map_or(Value::Null, |hash| json!(hash)),
+            )
+        })
+        .collect();
+    assert_eq!(found[0]["hashes"], Value::Object(expected));
+    let run_json = json_file(&run_dir.join("run.json"));
+    assert_eq!(run_json["kind"], "rollback");
+    assert_eq!(run_json["target_run_id"], run_id.as_str());
+    assert_eq!(json_file(&run_dir.join("result.json"))["ok"], true);
+}
+
+#[tokio::test]
+async fn journal_corrupt_blocks() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    std::fs::create_dir_all(rig.deploy_dir()).expect("deploy dir");
+    std::fs::write(journal_path(&rig), b"{ this is not a journal").expect("journal");
+
+    let err = deploy_plan(
+        &rig.declared,
+        rig.reader.as_ref(),
+        &PlanOptions {
+            base: None,
+            diff: false,
+        },
+    )
+    .await
+    .expect_err("plan refuses over an unreadable journal");
+    assert_invalid(&err, "unknown", "journal.json");
+    let err = rig
+        .prepare(GateFlags::default())
+        .await
+        .expect_err("apply refuses");
+    assert_invalid(&err, "unknown", "journal.json");
+    let fresh = Fresh::new(&rig).await;
+    for run in ["20261016T000000Z-aaaaaa", "20261016T000000Z-bbbbbb"] {
+        let err = fresh
+            .prepare(&rig, run, false)
+            .await
+            .expect_err("rollback refuses");
+        assert_invalid(&err, "unknown", "journal.json");
+    }
+    only_reads(&fresh);
+    assert_eq!(collection_state(&rig), before);
+    assert!(!rig.repo.join(".ign").exists(), "no run was made");
 }
