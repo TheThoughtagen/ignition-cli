@@ -9,6 +9,7 @@
 //! - **Core never prints.** Findings ride [`crate::error::CoreError`]; the
 //!   binary renders them.
 
+pub mod apply;
 pub mod layout;
 pub mod ledger;
 pub mod lint;
