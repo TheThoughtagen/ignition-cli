@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
+mod common;
+use common::faulty_host::FaultyHost;
+
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::host::{ApplyHost, BatchReport, BatchSpec, DeleteOp, WriteOp};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
@@ -1183,6 +1186,147 @@ async fn hang_after_move_can_be_aborted() {
     let restored = c.clean_host().restore(&record).await.expect("restore");
     assert!(restored.failure.is_none(), "{restored:?}");
     assert_eq!(c.listing(), before);
+}
+
+// ---- FaultyHost -------------------------------------------------------------
+
+/// `FaultyHost` fails the named call on its nth invocation without calling the
+/// inner host, delegates every other invocation, and records the calls.
+#[tokio::test]
+async fn faulty_host_fails_the_nth_call() {
+    let c = Ctx::local();
+    let host = FaultyHost::new(c.clean_host())
+        .fail("restore", 1)
+        .fail("finalize", 1)
+        .fail("commit", 2);
+    let batch = three_writes(&c);
+    let before = c.listing();
+
+    let prepared = host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let report = host.commit(&prepared).await.expect("first commit runs");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let written = c.listing();
+    let record = c.record(RUN).expect("record");
+
+    let err = host
+        .restore(&record)
+        .await
+        .expect_err("the first restore fails");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert_eq!(c.listing(), written, "a failed call never reached the host");
+    assert_eq!(c.journal().expect("journal").phase, JournalPhase::Written);
+
+    let err = host
+        .finalize(&record)
+        .await
+        .expect_err("the first finalize fails");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(c.journal().is_some(), "finalize did not run");
+
+    let err = host
+        .commit(&prepared)
+        .await
+        .expect_err("the second commit fails");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+
+    let restored = host.restore(&record).await.expect("second restore runs");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before);
+    assert_eq!(
+        host.calls(),
+        vec![
+            "prepare", "commit", "restore", "finalize", "commit", "restore"
+        ]
+    );
+}
+
+/// A hung call signals, never calls the inner host, and is an await point a
+/// test can abort.
+#[tokio::test]
+async fn faulty_host_hangs_the_nth_call() {
+    let c = Ctx::local();
+    let notify = Arc::new(Notify::new());
+    let host = FaultyHost::new(c.clean_host()).hang("finalize", 1, notify.clone());
+    let batch = three_writes(&c);
+    let prepared = host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    host.commit(&prepared).await.expect("commit");
+    let mut record = c.record(RUN).expect("record");
+    record.state = RecordState::Applied;
+    let post = record.post_map();
+    record.post_fingerprint = Some(fingerprint(&post));
+
+    let task = tokio::spawn({
+        let host = host.clone();
+        async move { host.finalize(&record).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(20), notify.notified())
+        .await
+        .expect("finalize reached the hang");
+    task.abort();
+    assert!(task.await.expect_err("aborted").is_cancelled());
+
+    assert!(c.journal().is_some(), "finalize never ran");
+    assert!(c.staging_dir(RUN).is_dir());
+    assert_eq!(host.calls(), vec!["prepare", "commit", "finalize"]);
+}
+
+/// A hook registered for a call's nth invocation runs after the inner call
+/// returned and before the caller sees the result, once, and only for that
+/// invocation.
+#[tokio::test]
+async fn faulty_host_runs_a_hook_after_the_nth_call() {
+    let c = Ctx::local();
+    let marker = c.root().join("hook-marker");
+    let prepares = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host = FaultyHost::new(c.clean_host())
+        .after("commit", 1, {
+            let marker = marker.clone();
+            move || {
+                let marker = marker.clone();
+                async move {
+                    tokio::fs::write(&marker, b"ran").await.expect("marker");
+                }
+            }
+        })
+        .after("prepare", 1, {
+            let prepares = prepares.clone();
+            move || {
+                let prepares = prepares.clone();
+                async move {
+                    prepares.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+    let batch = three_writes(&c);
+
+    let prepared = host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    assert_eq!(prepares.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!marker.exists(), "the commit hook has not run yet");
+
+    let report = host.commit(&prepared).await.expect("commit");
+    assert!(marker.is_file(), "the hook ran before commit returned");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert_eq!(
+        report.moved,
+        vec![0, 1, 2],
+        "the result is the inner host's"
+    );
+
+    // A second prepare is invocation 2: the hook does not run again.
+    host.prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("second prepare");
+    assert_eq!(prepares.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(host.calls(), vec!["prepare", "commit", "prepare"]);
 }
 
 /// Every row has a test above, so adding a row without wiring it fails here.
