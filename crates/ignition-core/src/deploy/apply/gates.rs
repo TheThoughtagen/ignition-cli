@@ -4,8 +4,8 @@
 //! whether an apply may proceed. It reads no host, no gateway and no clock.
 
 use crate::actions::deploy::DeployPlanResult;
-use crate::deploy::plan::{CoreRelation, PlanStatus};
-use crate::error::CoreError;
+use crate::deploy::plan::{CoreRelation, PlanEntry, PlanStatus};
+use crate::error::{APPLY_LIST_SHOWN, CoreError};
 
 /// The longest accepted `--allow-drift` reason, in characters.
 pub const DRIFT_REASON_MAX_CHARS: usize = 500;
@@ -35,13 +35,30 @@ pub enum GateOutcome {
 
 /// Evaluate the gates in the confirmed order.
 ///
-/// A `--plan-sha256` that differs from the recomputed `plan_sha256` is
-/// `plan_stale` before anything else, so a flag the reviewer gave for an old
-/// plan can never satisfy a gate of a new one.
+/// 1. A malformed flag is `invalid_input` (exit 2), whatever the plan says.
+/// 2. A `--plan-sha256` that differs from the recomputed `plan_sha256` is
+///    `plan_stale` (exit 6), so a flag the reviewer gave for an old plan can
+///    never satisfy a gate of a new one.
+/// 3. A plan with nothing to add, change or remove is [`GateOutcome::Noop`].
+/// 4. Any entry whose `core` copy shadows its removal is `deploy_blocked`
+///    (exit 6), whatever the flags.
+/// 5. Destructive entries without `--allow-destructive`, then drifted
+///    entries without `--allow-drift`, are `destructive_change_refused`
+///    (exit 2).
+/// 6. Otherwise [`GateOutcome::Ready`].
+///
+/// `unmanaged` entries never gate, and drift is judged only where
+/// `drift == Some(true)`, which exists only with `--base`.
 pub fn evaluate_gates(
     plan: &DeployPlanResult,
     flags: &GateFlags,
 ) -> Result<GateOutcome, CoreError> {
+    if let Some(hash) = &flags.plan_sha256 {
+        validate_plan_sha256(hash)?;
+    }
+    if let Some(reason) = &flags.allow_drift {
+        validate_drift_reason(reason)?;
+    }
     if let Some(expected) = &flags.plan_sha256
         && *expected != plan.plan_sha256
     {
@@ -51,9 +68,53 @@ pub fn evaluate_gates(
             detail: "review hash".to_string(),
         });
     }
+    if !plan.summary.has_changes {
+        return Ok(GateOutcome::Noop);
+    }
+
+    let gated = || {
+        plan.entries
+            .iter()
+            .filter(|e| e.status != PlanStatus::Unmanaged)
+    };
+    let blocked = sorted_keys(gated().filter(|e| e.core == CoreRelation::ShadowsRemoval));
+    if !blocked.is_empty() {
+        return Err(CoreError::DeployBlocked { keys: blocked });
+    }
+    if !flags.allow_destructive {
+        let keys = sorted_keys(gated().filter(|e| e.destructive));
+        if !keys.is_empty() {
+            return Err(refusal("destructive", keys));
+        }
+    }
+    if flags.allow_drift.is_none() {
+        let keys = sorted_keys(gated().filter(|e| e.drift == Some(true)));
+        if !keys.is_empty() {
+            return Err(refusal("drift", keys));
+        }
+    }
     Ok(GateOutcome::Ready {
         prose: confirmation_prose(plan),
     })
+}
+
+/// The entry keys, byte-sorted.
+fn sorted_keys<'a>(entries: impl Iterator<Item = &'a PlanEntry>) -> Vec<String> {
+    let mut keys: Vec<String> = entries.map(|e| e.key.clone()).collect();
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys
+}
+
+/// A `destructive_change_refused` carrying the first
+/// [`APPLY_LIST_SHOWN`] keys and the full count.
+fn refusal(gate: &str, mut keys: Vec<String>) -> CoreError {
+    let count = keys.len();
+    keys.truncate(APPLY_LIST_SHOWN);
+    CoreError::DestructiveChangeRefused {
+        gate: gate.to_string(),
+        keys,
+        count,
+    }
 }
 
 /// The plan as the refusal text: the target, the counts, one line per
@@ -113,9 +174,26 @@ pub fn confirmation_prose(plan: &DeployPlanResult) -> String {
 }
 
 /// `--allow-drift` needs a non-empty reason of at most
-/// [`DRIFT_REASON_MAX_CHARS`] characters and no control characters.
-pub fn validate_drift_reason(_reason: &str) -> Result<(), CoreError> {
-    Ok(())
+/// [`DRIFT_REASON_MAX_CHARS`] characters and no control characters. The
+/// reason is recorded in run records and logs, so nothing else may ride it.
+pub fn validate_drift_reason(reason: &str) -> Result<(), CoreError> {
+    let problem = if reason.is_empty() {
+        Some("must not be empty".to_string())
+    } else if reason.chars().count() > DRIFT_REASON_MAX_CHARS {
+        Some(format!(
+            "must be at most {DRIFT_REASON_MAX_CHARS} characters"
+        ))
+    } else if reason.chars().any(char::is_control) {
+        Some("must not contain control characters".to_string())
+    } else {
+        None
+    };
+    match problem {
+        None => Ok(()),
+        Some(problem) => Err(CoreError::InvalidInput {
+            reason: format!("--allow-drift reason {problem}"),
+        }),
+    }
 }
 
 /// `--plan-sha256` must be 64 lowercase hex characters.

@@ -8,11 +8,11 @@
 //! | exit | class          | slugs
 //! |------|----------------|-----------------------------------------------
 //! | 1    | internal       | `internal`
-//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03) (clap renders its own usage errors — never hook clap)
+//! | 2    | usage          | `confirmation_required`, `invalid_import_file`, `invalid_input`, `gateway_client_error` (09-01), `deploy_tree_invalid`, `embedded_secret` (21-03), `destructive_change_refused` (23-02) (clap renders its own usage errors — never hook clap)
 //! | 3    | config         | `profile_not_found`, `no_active_profile`, `secret_unavailable`, `config_invalid`, `poll_interval_too_small` (08-01), `module_not_registered` (16-01)
 //! | 4    | network        | `network_error`, `module_feed_unreachable` (15-01), `transport_failed` (22-01)
 //! | 5    | auth           | `auth_rejected`
-//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale` (23-02)
+//! | 6    | target_state   | `gateway_too_old`, `gateway_not_commissioned`, `gateway_restarting`, `not_found`, `project_exists`, `resource_binary`, `trial_not_expired` (04-03), `provider_not_found` (05-04), `routes_not_deployed`, `webdev_unlicensed`, `route_version_mismatch`, `webdev_route_error` (05-03), `tag_collision` (05-05), `alarm_journal_missing` (05-06), `import_denied` (05-07), `session_not_prunable` (06-07), `eam_not_controller` (07-02), `eam_task_type_refused` (07-02), `eam_task_in_flight` (07-06), `script_exec_not_configured` (07-03), `lint_tool_absent` (07-04), `provider_root_unsupported` (07-06), `bundle_not_available` (09-07), `module_release_not_found`, `module_digest_mismatch`, `module_feed_unusable` (15-01), `module_digest_changed` (15-02), `module_uninstall_denied` (19-01), `scan_lock_held` (20-02), `resource_signature_rejected` (20-02), `resource_exists` (20-REVIEW WR-01), `mode_exists` (20-REVIEW WR-01), `deploy_ledger_invalid` (22-03), `plan_stale`, `deploy_blocked`, `deploy_preflight_failed`, `deploy_journal_present`, `deploy_live_changed`, `deploy_run_invalid`, `rollback_failed` (23-02)
 //! | 7    | rig            | `rig_error` (reserved — first used in Phase 4)
 //!
 //! Slugs are public contract: never respell them. Exit codes are public
@@ -851,6 +851,173 @@ pub enum CoreError {
         /// Where the mismatch was found, e.g. `review hash`; no file content.
         detail: String,
     },
+
+    /// A destructive or drifted plan was applied without its flag (23-02,
+    /// DAPL-02). Exit 2 - usage class: the caller must pass
+    /// `--allow-destructive` or `--allow-drift <reason>`. Carries unit keys
+    /// and counts only.
+    #[error("{}", destructive_change_refused_text(.gate, .keys, *.count))]
+    DestructiveChangeRefused {
+        /// Which gate refused: `destructive` or `drift`.
+        gate: String,
+        /// The first [`APPLY_LIST_SHOWN`] offending unit keys, byte-sorted.
+        keys: Vec<String>,
+        /// How many entries the gate refused in all.
+        count: usize,
+    },
+
+    /// A removal that cannot take effect (23-02, DAPL-01): the unit's `core`
+    /// copy shadows the mode collection, so deleting from the mode collection
+    /// changes nothing. No flag permits it. Exit 6.
+    #[error("{}", deploy_blocked_text(.keys))]
+    DeployBlocked {
+        /// The `shadows_removal` unit keys, byte-sorted.
+        keys: Vec<String>,
+    },
+
+    /// One or more apply preflight checks failed (23-02, DAPL-04). Exit 6.
+    /// Nothing was written to the gateway. The payload is BOXED so the large
+    /// list stays off every `Result<_, CoreError>`.
+    #[error("{}", deploy_preflight_failed_text(.failures))]
+    DeployPreflightFailed {
+        /// Every failed check, in the order the checks ran.
+        failures: Box<[PreflightFailure]>,
+    },
+
+    /// An interrupted deploy left its journal on the box (23-02, D-09). Exit
+    /// 6. The message, not the hint, carries the recovery command.
+    #[error(
+        "an interrupted deploy left the journal {location} for run {run_id}; \
+         recover it with: ign deploy rollback --run {run_id} --env {env}"
+    )]
+    DeployJournalPresent {
+        /// The interrupted run.
+        run_id: String,
+        /// The `--env` value the recovery command needs.
+        env: String,
+        /// The on-box journal location.
+        location: String,
+    },
+
+    /// Live files changed after the run wrote them, so a rollback would
+    /// overwrite someone's edit (23-02, DAPL-07). Exit 6. Carries paths and
+    /// counts only.
+    #[error("{}", deploy_live_changed_text(.run_id, .paths, *.count))]
+    DeployLiveChanged {
+        /// The run being rolled back.
+        run_id: String,
+        /// The first [`APPLY_LIST_SHOWN`] changed paths, byte-sorted.
+        paths: Vec<String>,
+        /// How many touched paths changed in all.
+        count: usize,
+    },
+
+    /// A run's record or snapshot cannot be trusted (23-02, D-04). Exit 6.
+    /// `problem` names fields and paths only, never file content.
+    #[error("deploy run {run_id} is unusable: {problem}")]
+    DeployRunInvalid {
+        /// The run id asked for.
+        run_id: String,
+        /// What is wrong.
+        problem: String,
+    },
+
+    /// A rollback could not restore the pre-apply files (23-02, D-12).
+    /// Exit 6. Boxed to keep `CoreError` under clippy's `result_large_err`.
+    #[error("{0}")]
+    RollbackFailed(Box<RollbackFailure>),
+}
+
+/// Items listed inline by the Phase 23 refusal Displays; the rest collapse
+/// into `and {m} more`.
+pub const APPLY_LIST_SHOWN: usize = 10;
+
+/// One failed apply preflight check (23-02). `detail` carries no value from
+/// the gateway, the host or the repo that could be a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightFailure {
+    /// The check id, e.g. `mode_master` or `run_dir_not_ignored`.
+    pub check: String,
+    /// What failed, value-free.
+    pub detail: String,
+}
+
+/// Payload of [`CoreError::RollbackFailed`] (23-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackFailure {
+    /// The run being restored.
+    pub run_id: String,
+    /// The local run directory holding the snapshot, when one was made.
+    pub run_dir: Option<String>,
+    /// The on-box journal path, left in place for a manual recovery.
+    pub journal: String,
+    /// Why the restore failed; names paths and causes, never file content.
+    pub cause: String,
+}
+
+impl std::fmt::Display for RollbackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rollback of run {} failed ({}); the gateway files may be half restored. \
+             run directory: {}; on-box journal: {}. Restore the files from the .gwbk \
+             backup or from the run-directory snapshot, then delete the journal at {} by hand",
+            self.run_id,
+            self.cause,
+            self.run_dir.as_deref().unwrap_or("none was created"),
+            self.journal,
+            self.journal,
+        )
+    }
+}
+
+/// `a, b, c and {m} more`: `shown` capped at [`APPLY_LIST_SHOWN`], then the
+/// remainder of `total`.
+fn listed(shown: &[String], total: usize) -> String {
+    let take = shown.len().min(APPLY_LIST_SHOWN);
+    let mut out = shown[..take].join(", ");
+    if total > take {
+        out.push_str(&format!(" and {} more", total - take));
+    }
+    out
+}
+
+fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) -> String {
+    let flag = if gate == "drift" {
+        "--allow-drift <reason>"
+    } else {
+        "--allow-destructive"
+    };
+    format!(
+        "{gate} change refused for {count} entr{}: {}; apply needs {flag}",
+        if count == 1 { "y" } else { "ies" },
+        listed(keys, count)
+    )
+}
+
+fn deploy_blocked_text(keys: &[String]) -> String {
+    format!(
+        "deploy blocked: {} unit(s) are removed from the declared tree but a core copy \
+         shadows them, so deleting them from the mode collection cannot take effect: {}",
+        keys.len(),
+        listed(keys, keys.len())
+    )
+}
+
+fn deploy_preflight_failed_text(failures: &[PreflightFailure]) -> String {
+    let mut out = format!("deploy preflight failed ({} check(s)):", failures.len());
+    for failure in failures {
+        out.push_str(&format!("\n  {}: {}", failure.check, failure.detail));
+    }
+    out
+}
+
+fn deploy_live_changed_text(run_id: &str, paths: &[String], count: usize) -> String {
+    format!(
+        "live files changed since run {run_id} wrote them ({count}): {}; restoring the \
+         snapshot would overwrite them",
+        listed(paths, count)
+    )
 }
 
 /// Findings shown inline by the deploy error Displays; the rest collapse
@@ -1085,6 +1252,13 @@ impl CoreError {
             Self::TransportFailed { .. } => "transport_failed",
             Self::DeployLedgerInvalid { .. } => "deploy_ledger_invalid",
             Self::PlanStale { .. } => "plan_stale",
+            Self::DestructiveChangeRefused { .. } => "destructive_change_refused",
+            Self::DeployBlocked { .. } => "deploy_blocked",
+            Self::DeployPreflightFailed { .. } => "deploy_preflight_failed",
+            Self::DeployJournalPresent { .. } => "deploy_journal_present",
+            Self::DeployLiveChanged { .. } => "deploy_live_changed",
+            Self::DeployRunInvalid { .. } => "deploy_run_invalid",
+            Self::RollbackFailed(..) => "rollback_failed",
         }
     }
 
@@ -1098,7 +1272,8 @@ impl CoreError {
             | Self::InvalidInput { .. }
             | Self::GatewayClientError { .. }
             | Self::DeployTreeInvalid(..)
-            | Self::EmbeddedSecret(..) => 2,
+            | Self::EmbeddedSecret(..)
+            | Self::DestructiveChangeRefused { .. } => 2,
             Self::ProfileNotFound { .. }
             | Self::NoActiveProfile
             | Self::SecretUnavailable { .. }
@@ -1144,7 +1319,13 @@ impl CoreError {
             | Self::ResourceExists { .. }
             | Self::ModeExists { .. }
             | Self::DeployLedgerInvalid { .. }
-            | Self::PlanStale { .. } => 6,
+            | Self::PlanStale { .. }
+            | Self::DeployBlocked { .. }
+            | Self::DeployPreflightFailed { .. }
+            | Self::DeployJournalPresent { .. }
+            | Self::DeployLiveChanged { .. }
+            | Self::DeployRunInvalid { .. }
+            | Self::RollbackFailed(..) => 6,
             Self::Rig(_) => 7,
         }
     }
@@ -1203,6 +1384,13 @@ impl CoreError {
                     // default, which is meaningless here (the file WAS readable).
                     "the loss report above names what this import would drop or \
                      coerce — re-run with --yes to import anyway"
+                } else if reason.starts_with("--plan-sha256 ")
+                    || reason.starts_with("--allow-drift ")
+                {
+                    // The deploy apply gate flags (23-02): the --file/stdin
+                    // default is meaningless for a flag value.
+                    "correct the flag value named above and rerun; no host or gateway \
+                     was contacted"
                 } else {
                     "fix the input source — a readable file path via --file, or `-` \
                      to pipe the content on stdin"
@@ -1539,6 +1727,49 @@ impl CoreError {
                  with its plan_sha256, nothing was written"
                     .to_string(),
             ),
+            Self::DestructiveChangeRefused { gate, .. } => Some(if gate == "drift" {
+                "live files differ from both the base render and the declared tree; review \
+                 the drift, then rerun with --allow-drift and a reason of at most 500 \
+                 characters"
+                    .to_string()
+            } else {
+                "review the destructive entries named above, then rerun with \
+                 --allow-destructive and the plan_sha256 you reviewed"
+                    .to_string()
+            }),
+            Self::DeployBlocked { .. } => Some(
+                "a core copy still shadows each unit named above, so no flag permits the \
+                 removal; keep the unit in the declared tree, or remove the core copy on \
+                 the gateway first"
+                    .to_string(),
+            ),
+            Self::DeployPreflightFailed { .. } => Some(
+                "fix each failed check named above and rerun; no gateway file was written"
+                    .to_string(),
+            ),
+            Self::DeployJournalPresent { .. } => Some(
+                "an earlier deploy was interrupted and its journal is still on the box; run \
+                 the recovery command in the message, then rerun; plan and apply refuse \
+                 until the journal is cleared"
+                    .to_string(),
+            ),
+            Self::DeployLiveChanged { .. } => Some(
+                "someone changed the files named above after the run wrote them; review \
+                 those changes, then rerun the rollback with --discard-live-changes to \
+                 restore the snapshot over them"
+                    .to_string(),
+            ),
+            Self::DeployRunInvalid { .. } => Some(
+                "the run directory or the on-box record is missing or damaged; restore the \
+                 files from the .gwbk backup or the run-directory snapshot instead"
+                    .to_string(),
+            ),
+            Self::RollbackFailed(..) => Some(
+                "do not apply again until the files are restored: restore from the .gwbk \
+                 backup or the run-directory snapshot, then delete the journal at the path \
+                 in the message by hand"
+                    .to_string(),
+            ),
         }
     }
 
@@ -1588,6 +1819,13 @@ impl CoreError {
         "transport_failed",
         "deploy_ledger_invalid",
         "plan_stale",
+        "destructive_change_refused",
+        "deploy_blocked",
+        "deploy_preflight_failed",
+        "deploy_journal_present",
+        "deploy_live_changed",
+        "deploy_run_invalid",
+        "rollback_failed",
     ];
 
     /// A single positioned (or file-only, when `line`/`column` are
@@ -1702,8 +1940,8 @@ mod tests {
     use super::{
         CoreError, DeployFinding, ErrorBody, ErrorEnvelope, GATEWAY_CLIENT_BODY_CAP_BYTES,
         GATEWAY_CLIENT_BODY_TRUNCATION_MARKER, LOSS_GATE_REFUSAL_REASON_PREFIX,
-        ModuleDigestChangedDetails, ModuleDigestMismatchDetails, SignatureReason,
-        TESTING_ROUTE_PREFIX, truncate_api_body,
+        ModuleDigestChangedDetails, ModuleDigestMismatchDetails, PreflightFailure, RollbackFailure,
+        SignatureReason, TESTING_ROUTE_PREFIX, truncate_api_body,
     };
 
     /// Build a real `reqwest::Error` for the Network variant: a request to
@@ -2165,6 +2403,69 @@ mod tests {
                 6,
                 "plan_stale",
             ),
+            (
+                CoreError::DestructiveChangeRefused {
+                    gate: "destructive".into(),
+                    keys: vec!["ignition/a/x".into()],
+                    count: 1,
+                },
+                2,
+                "destructive_change_refused",
+            ),
+            (
+                CoreError::DeployBlocked {
+                    keys: vec!["ignition/a/x".into()],
+                },
+                6,
+                "deploy_blocked",
+            ),
+            (
+                CoreError::DeployPreflightFailed {
+                    failures: vec![PreflightFailure {
+                        check: "mode_master".into(),
+                        detail: "the gateway is not in the declared mode".into(),
+                    }]
+                    .into(),
+                },
+                6,
+                "deploy_preflight_failed",
+            ),
+            (
+                CoreError::DeployJournalPresent {
+                    run_id: "r1".into(),
+                    env: "prod".into(),
+                    location: "ign-deploy/gw/m/journal.json".into(),
+                },
+                6,
+                "deploy_journal_present",
+            ),
+            (
+                CoreError::DeployLiveChanged {
+                    run_id: "r1".into(),
+                    paths: vec!["a/b.json".into()],
+                    count: 1,
+                },
+                6,
+                "deploy_live_changed",
+            ),
+            (
+                CoreError::DeployRunInvalid {
+                    run_id: "r1".into(),
+                    problem: "record.json is missing".into(),
+                },
+                6,
+                "deploy_run_invalid",
+            ),
+            (
+                CoreError::RollbackFailed(Box::new(RollbackFailure {
+                    run_id: "r1".into(),
+                    run_dir: Some(".ign/deploy/r1".into()),
+                    journal: "ign-deploy/gw/m/journal.json".into(),
+                    cause: "write_failed".into(),
+                })),
+                6,
+                "rollback_failed",
+            ),
         ];
         for (err, code, slug) in cases {
             assert_eq!(err.exit_code(), code, "wrong exit code for: {err}");
@@ -2189,6 +2490,7 @@ mod tests {
         (2, "gateway_client_error"),
         (2, "deploy_tree_invalid"),
         (2, "embedded_secret"),
+        (2, "destructive_change_refused"),
         (3, "profile_not_found"),
         (3, "no_active_profile"),
         (3, "secret_unavailable"),
@@ -2235,6 +2537,12 @@ mod tests {
         (6, "mode_exists"),
         (6, "deploy_ledger_invalid"),
         (6, "plan_stale"),
+        (6, "deploy_blocked"),
+        (6, "deploy_preflight_failed"),
+        (6, "deploy_journal_present"),
+        (6, "deploy_live_changed"),
+        (6, "deploy_run_invalid"),
+        (6, "rollback_failed"),
         (7, "rig_error"),
     ];
 
@@ -2974,6 +3282,62 @@ mod tests {
                 },
                 6,
             ),
+            (
+                CoreError::DestructiveChangeRefused {
+                    gate: "destructive".into(),
+                    keys: vec!["ignition/a/x".into()],
+                    count: 1,
+                },
+                2,
+            ),
+            (
+                CoreError::DeployBlocked {
+                    keys: vec!["ignition/a/x".into()],
+                },
+                6,
+            ),
+            (
+                CoreError::DeployPreflightFailed {
+                    failures: vec![PreflightFailure {
+                        check: "mode_master".into(),
+                        detail: "the gateway is not in the declared mode".into(),
+                    }]
+                    .into(),
+                },
+                6,
+            ),
+            (
+                CoreError::DeployJournalPresent {
+                    run_id: "20261015T142233Z-a1b2c3".into(),
+                    env: "prod".into(),
+                    location: "ign-deploy/gw/m/journal.json".into(),
+                },
+                6,
+            ),
+            (
+                CoreError::DeployLiveChanged {
+                    run_id: "r1".into(),
+                    paths: vec!["a/b.json".into()],
+                    count: 1,
+                },
+                6,
+            ),
+            (
+                CoreError::DeployRunInvalid {
+                    run_id: "r1".into(),
+                    problem: "record.json is missing".into(),
+                },
+                6,
+            ),
+            (
+                CoreError::RollbackFailed(Box::new(RollbackFailure {
+                    run_id: "r1".into(),
+                    run_dir: Some(".ign/deploy/r1".into()),
+                    journal: "ign-deploy/gw/m/journal.json".into(),
+                    cause: "write_failed".into(),
+                })),
+                6,
+            ),
         ];
         let codes: Vec<&str> = errs.iter().map(|(e, _)| e.code()).collect();
         assert_eq!(codes, CoreError::DEPLOY_SLUGS);
@@ -2986,5 +3350,131 @@ mod tests {
                 "hint must not name an ign subcommand: {hint}"
             );
         }
+    }
+
+    #[test]
+    fn apply_gate_flag_refusals_do_not_get_the_file_hint() {
+        for reason in [
+            "--plan-sha256 must be 64 lowercase hex characters",
+            "--allow-drift reason must not be empty",
+        ] {
+            let hint = CoreError::InvalidInput {
+                reason: reason.into(),
+            }
+            .hint()
+            .expect("hint");
+            assert!(!hint.contains("--file"), "{hint}");
+            assert!(hint.contains("flag value"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn phase_23_slugs_are_twelve_deploy_slugs_and_never_the_rolled_back_verdict() {
+        assert_eq!(CoreError::DEPLOY_SLUGS.len(), 12);
+        assert!(!CoreError::DEPLOY_SLUGS.contains(&"deploy_rolled_back"));
+    }
+
+    #[test]
+    fn journal_present_message_carries_the_recovery_command() {
+        let err = CoreError::DeployJournalPresent {
+            run_id: "20261015T142233Z-a1b2c3".into(),
+            env: "prod".into(),
+            location: "ign-deploy/gw/m/journal.json".into(),
+        };
+        let shown = err.to_string();
+        assert!(
+            shown.contains("ign deploy rollback --run 20261015T142233Z-a1b2c3 --env prod"),
+            "{shown}"
+        );
+        assert!(shown.contains("ign-deploy/gw/m/journal.json"), "{shown}");
+        let hint = err.hint().expect("hint");
+        assert!(
+            !hint.contains("ign deploy"),
+            "D-09: the command lives in Display: {hint}"
+        );
+    }
+
+    #[test]
+    fn rollback_failed_message_names_run_dir_journal_and_the_guidance() {
+        let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: "r-7".into(),
+            run_dir: Some(".ign/deploy/r-7".into()),
+            journal: "ign-deploy/gw/m/journal.json".into(),
+            cause: "write_failed".into(),
+        }));
+        let shown = err.to_string();
+        for needle in [
+            "r-7",
+            ".ign/deploy/r-7",
+            "ign-deploy/gw/m/journal.json",
+            ".gwbk",
+            "snapshot",
+            "by hand",
+        ] {
+            assert!(shown.contains(needle), "{needle} missing from: {shown}");
+        }
+        let none = CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: "r-7".into(),
+            run_dir: None,
+            journal: "j".into(),
+            cause: "c".into(),
+        }));
+        assert!(!none.to_string().contains("None"), "{none}");
+    }
+
+    #[test]
+    fn preflight_failed_lists_every_failure_in_order() {
+        let err = CoreError::DeployPreflightFailed {
+            failures: vec![
+                PreflightFailure {
+                    check: "mode_master".into(),
+                    detail: "first".into(),
+                },
+                PreflightFailure {
+                    check: "gwbk".into(),
+                    detail: "second".into(),
+                },
+            ]
+            .into(),
+        };
+        let shown = err.to_string();
+        let first = shown.find("mode_master: first").expect("first");
+        let second = shown.find("gwbk: second").expect("second");
+        assert!(first < second, "{shown}");
+        assert_eq!(shown.lines().count(), 3, "{shown}");
+    }
+
+    #[test]
+    fn apply_refusal_lists_cap_at_ten() {
+        let keys: Vec<String> = (0..10).map(|i| format!("u{i}")).collect();
+        let shown = CoreError::DestructiveChangeRefused {
+            gate: "destructive".into(),
+            keys: keys.clone(),
+            count: 13,
+        }
+        .to_string();
+        assert!(shown.contains("13 entries"), "{shown}");
+        assert!(shown.contains("and 3 more"), "{shown}");
+        assert!(shown.contains("--allow-destructive"), "{shown}");
+        let drift = CoreError::DestructiveChangeRefused {
+            gate: "drift".into(),
+            keys: keys[..1].to_vec(),
+            count: 1,
+        }
+        .to_string();
+        assert!(drift.contains("--allow-drift"), "{drift}");
+        assert!(drift.contains("1 entry"), "{drift}");
+
+        let many: Vec<String> = (0..25).map(|i| format!("a/{i:02}")).collect();
+        let blocked = CoreError::DeployBlocked { keys: many.clone() }.to_string();
+        assert!(blocked.contains("and 15 more"), "{blocked}");
+        assert!(!blocked.contains("a/10"), "{blocked}");
+        let live = CoreError::DeployLiveChanged {
+            run_id: "r".into(),
+            paths: many[..10].to_vec(),
+            count: 12,
+        }
+        .to_string();
+        assert!(live.contains("and 2 more"), "{live}");
     }
 }
