@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 
+use sha2::{Digest, Sha256};
+
 /// The hash recorded for a path that does not exist.
 pub const FINGERPRINT_ABSENT: &str = "-";
 
@@ -22,8 +24,16 @@ pub const LEDGER_KEY: &str = "ledger.json";
 /// The fingerprint of `entries` (path to lowercase hex SHA-256, `None` for
 /// absent): 64 lowercase hex digits.
 pub fn fingerprint(entries: &BTreeMap<String, Option<String>>) -> String {
-    let _ = entries;
-    String::new()
+    let mut hasher = Sha256::new();
+    // A `BTreeMap<String, _>` iterates in byte order of the key (`str`
+    // compares by UTF-8 bytes), which is the order the format pins.
+    for (path, sha256) in entries {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(sha256.as_deref().unwrap_or(FINGERPRINT_ABSENT).as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

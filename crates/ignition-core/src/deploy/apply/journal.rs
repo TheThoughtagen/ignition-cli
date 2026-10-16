@@ -26,8 +26,14 @@
 //! `deploy_run_invalid` naming the location and the problem, never a file
 //! value beyond a listed path, and never a fallback to a default (T-23-11).
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::fingerprint::LEDGER_KEY;
+use super::run_store::RunId;
+use crate::deploy::layout::RelPath;
+use crate::deploy::node::{self, Node};
+use crate::deploy::transport::mirror_path_problem;
 use crate::error::CoreError;
 
 /// File name of the journal.
@@ -57,9 +63,23 @@ impl JournalPhase {
     /// Whether no live file can have moved yet (D-10): `snapshotting` and
     /// `ready`.
     pub fn before_first_move(self) -> bool {
-        false
+        matches!(self, JournalPhase::Snapshotting | JournalPhase::Ready)
     }
 }
+
+/// The only schema version this build reads and writes.
+const SCHEMA_VERSION: u32 = 1;
+
+/// The journal's top-level keys, in write order.
+const FIELDS: [&str; 7] = [
+    "schema_version",
+    "run_id",
+    "gateway",
+    "mode",
+    "phase",
+    "pre_fingerprint",
+    "touched",
+];
 
 /// The journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,14 +110,193 @@ impl Journal {
         gateway: &str,
         mode: &str,
     ) -> Result<Journal, CoreError> {
-        let _ = (location, bytes, gateway, mode);
-        Err(CoreError::Internal("journal not built".to_string()))
+        let bad = |problem: String| refuse(location, bytes, problem);
+        let journal: Journal = parse_strict(
+            location,
+            bytes,
+            JOURNAL_MAX_BYTES,
+            &FIELDS,
+            &[(
+                "phase",
+                &["snapshotting", "ready", "writing", "written", "restoring"],
+            )],
+        )?
+        .0;
+        check_header(
+            journal.schema_version,
+            &journal.run_id,
+            (&journal.gateway, gateway),
+            (&journal.mode, mode),
+        )
+        .map_err(bad)?;
+        if !is_hex64(&journal.pre_fingerprint) {
+            return Err(bad(
+                "pre_fingerprint is not 64 lowercase hex digits".to_string()
+            ));
+        }
+        check_touched(journal.touched.iter().map(String::as_str)).map_err(bad)?;
+        Ok(journal)
     }
 
     /// The canonical bytes: pretty JSON in field order plus one LF.
     pub fn to_bytes(&self) -> Vec<u8> {
-        Vec::new()
+        canonical_bytes(self)
     }
+}
+
+/// The canonical bytes of `value`: pretty JSON plus one LF.
+pub(super) fn canonical_bytes(value: &impl Serialize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Whether `text` is 64 lowercase hex digits.
+pub(super) fn is_hex64(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// At most 64 printable characters of `text`, for a problem message.
+pub(super) fn shown(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+/// The refusal for a journal or record at `location`: `deploy_run_invalid`
+/// naming the location and the problem. The run id is the file's own when it
+/// is a valid id (the rule limits it to a safe charset), else `unknown`.
+pub(super) fn refuse(location: &str, bytes: &[u8], problem: String) -> CoreError {
+    let run_id = serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("run_id")?.as_str().map(str::to_string))
+        .filter(|id| RunId::parse(id).is_ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    CoreError::DeployRunInvalid {
+        run_id,
+        problem: format!("{location}: {problem}"),
+    }
+}
+
+/// The checks every format applies before it deserializes: not empty, within
+/// `cap`, strict UTF-8 without a repeated key or excess depth, a JSON object,
+/// no unknown key, every key of `fields` present, and each of `enums` one of
+/// its allowed strings. Then the typed read. Returns the value and the
+/// order-preserving document for per-element checks.
+pub(super) fn parse_strict<T: DeserializeOwned>(
+    location: &str,
+    bytes: &[u8],
+    cap: usize,
+    fields: &[&str],
+    enums: &[(&str, &[&str])],
+) -> Result<(T, Node), CoreError> {
+    let bad = |problem: String| refuse(location, bytes, problem);
+    if bytes.is_empty() {
+        return Err(bad("the file is empty".to_string()));
+    }
+    if bytes.len() > cap {
+        return Err(bad(format!(
+            "the file is {} bytes, over the {cap} byte cap",
+            bytes.len()
+        )));
+    }
+    let (_, root) = node::classify(bytes).map_err(bad)?;
+    let Node::Obj(members) = &root else {
+        return Err(bad("the top level is not a JSON object".to_string()));
+    };
+    for (key, _) in members {
+        if !fields.contains(&key.as_str()) {
+            return Err(bad(format!("unknown field `{}`", shown(key))));
+        }
+    }
+    for field in fields {
+        if root.get(field).is_none() {
+            return Err(bad(format!("missing field `{field}`")));
+        }
+    }
+    for (field, allowed) in enums {
+        let ok = root
+            .get(field)
+            .and_then(Node::as_str)
+            .is_some_and(|v| allowed.contains(&v));
+        if !ok {
+            return Err(bad(format!(
+                "`{field}` is not one of {}",
+                allowed.join(", ")
+            )));
+        }
+    }
+    let value: T = serde_json::from_slice(bytes).map_err(|e| {
+        bad(format!(
+            "a field has the wrong type (line {} column {})",
+            e.line(),
+            e.column()
+        ))
+    })?;
+    Ok((value, root))
+}
+
+/// The header checks both formats share: the schema version, the run id and
+/// that the file names this target's gateway and mode. The problem text never
+/// echoes the foreign names.
+pub(super) fn check_header(
+    schema_version: u32,
+    run_id: &str,
+    gateway: (&str, &str),
+    mode: (&str, &str),
+) -> Result<(), String> {
+    if schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "schema_version is not {SCHEMA_VERSION}, the only version this build reads"
+        ));
+    }
+    if RunId::parse(run_id).is_err() {
+        return Err(
+            "run_id is not 1 to 128 characters of [A-Za-z0-9._-] without a leading dot".to_string(),
+        );
+    }
+    if gateway.0 != gateway.1 {
+        return Err("gateway names a different gateway than the target".to_string());
+    }
+    if mode.0 != mode.1 {
+        return Err("mode names a different mode than the target".to_string());
+    }
+    Ok(())
+}
+
+/// The `touched` rules: each path is a collection path or exactly
+/// `ledger.json`, and the list is byte-sorted and unique.
+pub(super) fn check_touched<'a>(paths: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let mut previous: Option<&str> = None;
+    for (index, path) in paths.enumerate() {
+        let listed = shown(path);
+        if path != LEDGER_KEY {
+            let collection = RelPath::new(path)
+                .ok()
+                .is_some_and(|rel| mirror_path_problem(&rel).is_none());
+            if !collection {
+                return Err(format!(
+                    "touched[{index}] `{listed}` is neither a collection path nor `{LEDGER_KEY}`"
+                ));
+            }
+        }
+        if let Some(prev) = previous {
+            if path == prev {
+                return Err(format!(
+                    "touched[{index}] `{listed}` is listed twice (duplicate)"
+                ));
+            }
+            if path.as_bytes() < prev.as_bytes() {
+                return Err(format!(
+                    "touched is not byte-sorted: `{listed}` follows `{}`",
+                    shown(prev)
+                ));
+            }
+        }
+        previous = Some(path);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

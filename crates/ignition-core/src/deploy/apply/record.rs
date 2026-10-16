@@ -36,6 +36,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::journal::{
+    canonical_bytes, check_header, check_touched, is_hex64, parse_strict, refuse,
+};
+use super::run_store::RunId;
+use crate::deploy::node::Node;
 use crate::error::CoreError;
 
 /// File name of the run record.
@@ -43,6 +48,24 @@ pub const RECORD_FILE: &str = "record.json";
 
 /// The largest record accepted (8 MiB), checked before any parse.
 pub const RECORD_MAX_BYTES: usize = 8_388_608;
+
+/// The record's top-level keys, in write order.
+const FIELDS: [&str; 11] = [
+    "schema_version",
+    "run_id",
+    "gateway",
+    "mode",
+    "render_sha256",
+    "plan_sha256",
+    "state",
+    "rolled_back_by",
+    "touched",
+    "pre_fingerprint",
+    "post_fingerprint",
+];
+
+/// The keys of one `touched` entry.
+const ENTRY_FIELDS: [&str; 3] = ["path", "pre_sha256", "post_sha256"];
 
 /// Where a run stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,23 +128,102 @@ impl RunRecord {
         gateway: &str,
         mode: &str,
     ) -> Result<RunRecord, CoreError> {
-        let _ = (location, bytes, gateway, mode);
-        Err(CoreError::Internal("record not built".to_string()))
+        let bad = |problem: String| refuse(location, bytes, problem);
+        let (record, root): (RunRecord, Node) = parse_strict(
+            location,
+            bytes,
+            RECORD_MAX_BYTES,
+            &FIELDS,
+            &[("state", &["applying", "applied", "rolled_back"])],
+        )?;
+        // Each touched entry carries all three keys (a missing hash is an
+        // explicit null) and no other.
+        if let Some(Node::Arr(entries)) = root.get("touched") {
+            for (index, entry) in entries.iter().enumerate() {
+                let Node::Obj(members) = entry else {
+                    return Err(bad(format!("touched[{index}] is not a JSON object")));
+                };
+                if let Some((key, _)) = members
+                    .iter()
+                    .find(|(k, _)| !ENTRY_FIELDS.contains(&k.as_str()))
+                {
+                    return Err(bad(format!(
+                        "touched[{index}] has the unknown field `{}`",
+                        super::journal::shown(key)
+                    )));
+                }
+                if let Some(missing) = ENTRY_FIELDS.iter().find(|f| entry.get(f).is_none()) {
+                    return Err(bad(format!("touched[{index}] is missing `{missing}`")));
+                }
+            }
+        }
+        check_header(
+            record.schema_version,
+            &record.run_id,
+            (&record.gateway, gateway),
+            (&record.mode, mode),
+        )
+        .map_err(bad)?;
+        for (name, value) in [
+            ("render_sha256", Some(&record.render_sha256)),
+            ("plan_sha256", Some(&record.plan_sha256)),
+            ("pre_fingerprint", Some(&record.pre_fingerprint)),
+            ("post_fingerprint", record.post_fingerprint.as_ref()),
+        ] {
+            if value.is_some_and(|v| !is_hex64(v)) {
+                return Err(bad(format!("{name} is not 64 lowercase hex digits")));
+            }
+        }
+        if record.state == RecordState::Applying && record.post_fingerprint.is_some() {
+            return Err(bad(
+                "post_fingerprint is set while state is applying".to_string()
+            ));
+        }
+        if let Some(by) = &record.rolled_back_by {
+            if record.state != RecordState::RolledBack {
+                return Err(bad(
+                    "rolled_back_by is set while state is not rolled_back".to_string()
+                ));
+            }
+            if RunId::parse(by).is_err() {
+                return Err(bad("rolled_back_by is not a valid run id".to_string()));
+            }
+        }
+        check_touched(record.touched.iter().map(|e| e.path.as_str())).map_err(bad)?;
+        for (index, entry) in record.touched.iter().enumerate() {
+            for (name, value) in [
+                ("pre_sha256", &entry.pre_sha256),
+                ("post_sha256", &entry.post_sha256),
+            ] {
+                if value.as_deref().is_some_and(|v| !is_hex64(v)) {
+                    return Err(bad(format!(
+                        "touched[{index}].{name} is not 64 lowercase hex digits"
+                    )));
+                }
+            }
+        }
+        Ok(record)
     }
 
     /// The canonical bytes: pretty JSON in field order plus one LF.
     pub fn to_bytes(&self) -> Vec<u8> {
-        Vec::new()
+        canonical_bytes(self)
     }
 
     /// Path to pre-run hash, for the fingerprint.
     pub fn pre_map(&self) -> BTreeMap<String, Option<String>> {
-        BTreeMap::new()
+        self.touched
+            .iter()
+            .map(|e| (e.path.clone(), e.pre_sha256.clone()))
+            .collect()
     }
 
     /// Path to post-run hash, for the fingerprint.
     pub fn post_map(&self) -> BTreeMap<String, Option<String>> {
-        BTreeMap::new()
+        self.touched
+            .iter()
+            .map(|e| (e.path.clone(), e.post_sha256.clone()))
+            .collect()
     }
 }
 
