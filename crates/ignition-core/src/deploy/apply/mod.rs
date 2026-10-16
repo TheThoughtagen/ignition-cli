@@ -9,7 +9,10 @@
 //! the user confirmed at the 23-02 checkpoint; see `23-02-SUMMARY.md`
 //! `## Checkpoint outcome`.
 
+pub mod fingerprint;
 pub mod gates;
+pub mod journal;
+pub mod record;
 pub mod run_store;
 
 /// The slug of the rolled-back apply verdict.
