@@ -2,16 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
+current_phase: 23
+current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Phase 23 context gathered
-last_updated: "2026-10-16T12:48:24.018Z"
-last_activity: 2026-10-16 -- Phase 23 execution started
+stopped_at: Completed 23-01-PLAN.md
+last_updated: "2026-10-16T14:32:14.757Z"
+last_activity: 2026-10-16
+last_activity_desc: Phase 23 execution started
 progress:
-  total_phases: 4
+  total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 31
-  percent: 60
+  completed_plans: 32
+  percent: 50
 ---
 
 # Project State
@@ -26,11 +29,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 1 of 21
-Status: Executing Phase 23
+Plan: 2 of 21
+Status: Ready to execute
 Last activity: 2026-10-16 -- Phase 23 execution started
 
-Progress: [██████████] 97%
+Progress: [██████░░░░] 62%
 
 ## Performance Metrics
 
@@ -73,6 +76,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 22 P13 | 3h | 2 tasks | 14 files |
 | Phase 22 P14 | 15h | 3 tasks | 7 files |
 | Phase 22 P15 | 2h25m | 3 tasks | 6 files |
+| Phase 23 P01 | 27min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -110,9 +114,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-16T03:39:07.566Z
-**Stopped At:** Phase 23 context gathered
-**Resume file:** .planning/phases/23-guarded-apply-rollback/23-CONTEXT.md
+**Last session:** 2026-10-16T14:32:14.739Z
+**Stopped At:** Completed 23-01-PLAN.md
+**Resume file:** None
 
 ## Decisions
 
@@ -165,3 +169,5 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase ?]: 22-13: Windows listings are marked with pwd and every Windows read is cross-checked against a PowerShell \\?\ walk; ssh ledgers and staging live in the account home (B(i))
 - [Phase ?]: 22-14: hold budget measured at 152 files is 505 s (no Defender exclusion) and 699 s (exclusion), both above the 300 s ceiling: open for Phase 23; op_timeout_s default 120 to 1050; no Defender exclusion recommended on timing grounds
 - [Phase ?]: 22-15: N1 null normalisation is symmetric (null equals absent on file and REST side); N3 key lookup stays on raw REST map
+- [Phase ?]: [23-01] C2: the scan-lock queues another actor's API write until the hold lapses; a file written with no lock, under a held lock or across a lapse is not loaded without a scan (120 s); C11 provider and tags load in one scan; C-gwbk is a chunked ZIP, completeness = opens as ZIP
+- [Phase ?]: [23-01] Windows capture host recorded pending; stop point 23-08 Task 1; C-restart shape {pending:[string]} captured, no-token and no-level token get 401 HTML
