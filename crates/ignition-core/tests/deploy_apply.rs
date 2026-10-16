@@ -17,10 +17,12 @@ use common::fake_deploy::FakeGateway;
 use common::faulty_host::FaultyHost;
 use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
 use ignition_core::actions::deploy::{
-    Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan,
+    Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, load_target,
 };
 use ignition_core::actions::deploy_apply::{
-    ApplyPrepared, DeployApplyResult, PrepareOptions, deploy_apply_execute, deploy_apply_prepare,
+    ApplyPrepared, DeployApplyResult, DeployRollbackResult, PrepareOptions, RollbackPrepareOptions,
+    RollbackPrepared, deploy_apply_execute, deploy_apply_prepare, deploy_rollback_execute,
+    deploy_rollback_prepare,
 };
 use ignition_core::client::scan::ScanKind;
 use ignition_core::client::{DeployApi, ReqwestGatewayApi};
@@ -32,12 +34,14 @@ use ignition_core::deploy::apply::preflight::{
     DesignersMode, DesignersPolicy, PreflightInput, PreflightReport, run_preflights,
 };
 use ignition_core::deploy::apply::record::{RecordState, RunRecord};
+use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::apply::{
     ApplyContext, ApplyEvent, ApplyObserver, ApplyOptions, NoObserver, OutcomeKind, RollbackCause,
-    Steps, write_set,
+    RollbackContext, RollbackKind, RollbackOptions, Steps, write_set,
 };
 use ignition_core::deploy::ledger::Ledger;
-use ignition_core::deploy::transport::TreeReader;
+use ignition_core::deploy::target::Target;
+use ignition_core::deploy::transport::{self, TreeReader};
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::tree::sha256_hex;
 use ignition_core::error::CoreError;
@@ -970,7 +974,7 @@ async fn fault_write_failed_mid_commit_restores() {
     assert!(matches!(
         seen[5],
         ApplyEvent::RestoreStarted {
-            cause: RollbackCause::WriteFailed
+            cause: Some(RollbackCause::WriteFailed)
         }
     ));
 }
@@ -2704,4 +2708,242 @@ async fn run_dir_matrix() {
     };
     assert_eq!(failures[0].check, "run_dir_not_ignored");
     assert_no_ign_dir(&rig, "run_dir_not_ignored");
+}
+
+// ============================================================================
+// Manual rollback (23-11)
+// ============================================================================
+
+/// A fresh process: everything a rollback runner builds from the target file
+/// alone. A new host, reader, fake gateway client and REST server; nothing is
+/// shared with the rig that applied except the gateway's data directory.
+struct Fresh {
+    target_file: String,
+    target: Target,
+    reader: Box<dyn TreeReader>,
+    host: FaultyHost<LocalFsTransport>,
+    fake: FakeGateway,
+    api: ReqwestGatewayApi,
+    server: wiremock::MockServer,
+}
+
+impl Fresh {
+    async fn new(rig: &Rig) -> Fresh {
+        let (target_file, target) = load_target(&rig.repo, "dev").expect("the target file loads");
+        let reader = transport::for_node(
+            &rig.repo,
+            &target_file,
+            "nodes.master",
+            &target.nodes.master,
+        )
+        .expect("master has host access");
+        let server = wiremock::MockServer::start().await;
+        mount_passing_preflights(&server).await;
+        let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+        Fresh {
+            target_file,
+            target,
+            reader,
+            host: FaultyHost::new(local_host(&rig.fx)),
+            fake: FakeGateway::with_data_dir(rig.fx.data_dir(), MODE),
+            api,
+            server,
+        }
+    }
+
+    async fn prepare(
+        &self,
+        rig: &Rig,
+        run_id: &str,
+        discard: bool,
+    ) -> Result<RollbackPrepared, CoreError> {
+        deploy_rollback_prepare(
+            &rig.repo,
+            "dev",
+            run_id,
+            self.reader.as_ref(),
+            &self.host,
+            &RollbackPrepareOptions {
+                discard_live_changes: discard,
+            },
+        )
+        .await
+    }
+
+    async fn run(
+        &self,
+        rig: &Rig,
+        prepared: RollbackPrepared,
+        run_id: &str,
+        discard: bool,
+    ) -> Result<DeployRollbackResult, CoreError> {
+        let deploy = self.fake.client("rollback");
+        let ctx = RollbackContext {
+            env: "dev",
+            repo: &rig.repo,
+            target_file: &self.target_file,
+            target: &self.target,
+            reader: self.reader.as_ref(),
+            host: &self.host,
+            deploy: &deploy,
+            gateway: &self.api,
+            backup_deploy: None,
+            clock: &SystemClock,
+            observer: &NoObserver,
+        };
+        deploy_rollback_execute(prepared, &ctx, &rollback_options(run_id, discard)).await
+    }
+
+    /// `prepare` then `run`, the way the verb will.
+    async fn rollback(
+        &self,
+        rig: &Rig,
+        run_id: &str,
+        discard: bool,
+    ) -> Result<DeployRollbackResult, CoreError> {
+        let prepared = self.prepare(rig, run_id, discard).await?;
+        self.run(rig, prepared, run_id, discard).await
+    }
+}
+
+fn rollback_options(run_id: &str, discard: bool) -> RollbackOptions {
+    let base = options();
+    RollbackOptions {
+        run_id: RunId::parse(run_id).expect("a run id"),
+        discard_live_changes: discard,
+        designers: DesignersPolicy::default(),
+        hold: base.hold,
+        poll: base.poll,
+    }
+}
+
+/// Plan and apply `rig` once; the run id of the applied run.
+async fn apply_once(rig: &Rig) -> String {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    result.run_id.expect("a run id")
+}
+
+#[tokio::test]
+async fn rollback_fresh_process_from_record_only() {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let target_run = apply_once(&rig).await;
+    assert_ne!(collection_state(&rig), before, "the apply changed the host");
+
+    // The applying runner is gone: no run directory, manifest or render is
+    // left to read.
+    std::fs::remove_dir_all(rig.repo.join(".ign")).expect("remove the run directories");
+    let fresh = Fresh::new(&rig).await;
+
+    let prepared = fresh
+        .prepare(&rig, &target_run, false)
+        .await
+        .expect("prepare");
+    assert_eq!(prepared.record.state, RecordState::Applied);
+    assert!(prepared.prose.contains(&target_run), "{}", prepared.prose);
+    assert!(prepared.prose.contains(&prepared.record.plan_sha256));
+    assert!(prepared.live_changed.is_empty());
+    let result = fresh
+        .run(&rig, prepared, &target_run, false)
+        .await
+        .expect("rolled back");
+
+    assert_eq!(result.outcome, RollbackKind::Restored);
+    assert!(result.ok);
+    assert_eq!(result.target_run_id, target_run);
+    assert_ne!(result.run_id, target_run, "a rollback is a run of its own");
+    assert_eq!(result.gateway, GATEWAY);
+    assert_eq!(result.mode, MODE);
+    assert_eq!(
+        result.restored,
+        [DB_CONFIG.to_string(), DB_RESOURCE.to_string()]
+    );
+    assert_eq!(
+        result.deleted,
+        [ALARM_CONFIG.to_string(), ALARM_RESOURCE.to_string()]
+    );
+    assert!(result.discarded_live_changes.is_empty());
+    assert!(result.restart_pending.is_empty() && result.restart_pending_new.is_empty());
+
+    // The collection and the ledger are what they were before the apply, and
+    // the gateway was scanned once.
+    assert_eq!(collection_state(&rig), before);
+    assert_eq!(fresh.fake.scan_count(), 1);
+    assert_eq!(fresh.fake.lock_acquires(), 1);
+
+    // The record, the journal and the staging.
+    let record = rig.record(&target_run);
+    assert_eq!(record.state, RecordState::RolledBack);
+    assert_eq!(record.rolled_back_by.as_deref(), Some(result.run_id.as_str()));
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert!(!rig.deploy_dir().join("staging").join(&target_run).exists());
+
+    // The rollback's own run directory.
+    let run_dir = PathBuf::from(&result.run_dir);
+    assert!(run_dir.ends_with(&result.run_id), "{}", result.run_dir);
+    assert_eq!(
+        names(&run_dir),
+        ["events.ndjson", "plan.json", "result.json", "run.json", "snapshot"]
+    );
+    let run_json = json_file(&run_dir.join("run.json"));
+    assert_eq!(run_json["kind"], "rollback");
+    assert_eq!(run_json["run_id"], result.run_id.as_str());
+    assert_eq!(run_json["target_run_id"], target_run.as_str());
+    assert_eq!(run_json["discard_live_changes"], false);
+    let plan_json = json_file(&run_dir.join("plan.json"));
+    assert_eq!(plan_json["target_run_id"], target_run.as_str());
+    assert_eq!(plan_json["restore"], json!([DB_CONFIG, DB_RESOURCE]));
+    assert_eq!(plan_json["delete"], json!([ALARM_CONFIG, ALARM_RESOURCE]));
+    let result_json = json_file(&run_dir.join("result.json"));
+    assert_eq!(result_json["outcome"], "restored");
+    assert_eq!(result_json["ok"], true);
+    assert_eq!(result_json["kind"], "rollback");
+    assert_eq!(
+        event_names(&run_dir),
+        [
+            "run_started",
+            "lock_acquired",
+            "restore_started",
+            "scan_done",
+            "restored"
+        ]
+    );
+    let started = event_lines(&run_dir, "restore_started");
+    assert_eq!(started[0]["cause"], Value::Null, "{started:?}");
+
+    // The host calls: nothing but reads before the preflights' probe, one
+    // restore, no commit.
+    let calls = fresh.host.calls();
+    assert_eq!(calls.iter().filter(|c| **c == "restore").count(), 1, "{calls:?}");
+    assert!(!calls.contains(&"commit") && !calls.contains(&"prepare"), "{calls:?}");
+}
+
+#[tokio::test]
+async fn rollback_bad_run_id_is_invalid_input() {
+    let rig = changing_rig().await;
+    let fresh = Fresh::new(&rig).await;
+    for bad in ["../x", "", "a".repeat(129).as_str()] {
+        let err = fresh
+            .prepare(&rig, bad, false)
+            .await
+            .expect_err("a bad run id is refused");
+        assert_eq!(err.code(), "invalid_input", "{bad:?}: {err}");
+        assert_eq!(err.exit_code(), 2);
+    }
+    // Before any host contact.
+    assert!(fresh.host.calls().is_empty());
+    assert_eq!(fresh.fake.lock_acquires(), 0);
+    assert_eq!(fresh.fake.scan_count(), 0);
+    assert!(
+        fresh
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert!(!rig.repo.join(".ign").exists());
+    assert!(!rig.deploy_dir().join("snapshots").exists());
 }
