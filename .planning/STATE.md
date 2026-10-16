@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 22
-current_phase_name: transport-plan-pull-verify
-status: executing
-stopped_at: "22-16 complete: CI green (run 38838954722); phase 22 gap plans done, verification next"
-last_updated: "2026-10-15T22:21:31.200Z"
+current_phase: 23
+current_phase_name: Guarded Apply & Rollback
+status: planning
+stopped_at: "Phase 22 complete (UAT 2/2 passed); ready to plan Phase 23"
+last_updated: "2026-10-16T02:47:26.751Z"
 last_activity: 2026-10-15
-last_activity_desc: Phase 22 execution started
+last_activity_desc: Phase 22 UAT passed, phase complete
 progress:
   total_phases: 6
   completed_phases: 3
@@ -21,17 +21,17 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-13)
+See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** One binary that lets a developer (or an AI agent) fully operate and inspect an Ignition 8.3+ gateway — health, projects, tags, rigs — without opening the gateway webpage or Designer.
-**Current focus:** Phase 22 — transport-plan-pull-verify
+**Current focus:** Phase 23 — Guarded Apply & Rollback
 
 ## Current Position
 
-Phase: 22 (transport-plan-pull-verify) — EXECUTING
-Plan: 2 of 16
-Status: Ready to execute
-Last activity: 2026-10-15 — Phase 22 execution started
+Phase: 23 — Guarded Apply & Rollback
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-15 — Phase 22 complete, transitioned to Phase 23
 
 Progress: [██████████] 97%
 
@@ -96,6 +96,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [RESOLVED 22-04] WR-03 / R-03: `--out` refresh is not crash-safe (old `render.json` can stay valid over mixed content). Phase 22 re-hashes a `--base` render from its real bytes and never trusts the marker's hashes (21-SECURITY.md); the `--out` refresh itself is unchanged.
 - [Phase 21 residual, dev-only] WR-08 / R-01: `capture.sh` `assert_local` accepts `http://evil.example#@localhost` — one-line fix `authority=${rest%%[/?#]*}`.
 - [RESOLVED 22-13] svc-ignition-deploy has Modify on the Azure VM `production` collection (post-C6 grant of 2026-10-15, verified as the account); used by the 22-13 live proof and the 22-14 timings
+- [RESOLVED 22-15] G-22-2: pulled tree verifies green (symmetric N1); UAT re-test passed on a fresh rig 2026-10-15
 - [RESOLVED 22-16] G-22-1: CI run 38838954722 on ab8608a green on all four jobs (ubuntu, macos, windows, keyring-smoke); six CI rounds, see 22-16-SUMMARY.md
 
 ### Quick Tasks Completed
@@ -111,9 +112,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-15T22:21:31.179Z
-**Stopped At:** 22-16 complete: CI green (run 38838954722); phase 22 gap plans done, verification next
-**Resume file:** .planning/phases/22-transport-plan-pull-verify/22-16-SUMMARY.md
+**Last session:** 2026-10-15
+**Stopped At:** Phase 22 complete, ready to plan Phase 23 (open with the hold-budget blocker)
+**Resume file:** None
 
 ## Decisions
 
