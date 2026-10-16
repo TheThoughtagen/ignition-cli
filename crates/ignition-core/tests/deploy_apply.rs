@@ -7,7 +7,9 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -205,6 +207,16 @@ fn local_host(fx: &PlanFixture) -> LocalFsTransport {
 }
 
 async fn rig_with(fx: PlanFixture, host: LocalFsTransport, fake: Option<FakeGateway>) -> Rig {
+    rig_with_logs(fx, host, fake, Vec::new()).await
+}
+
+/// `rig_with`, the gateway log source answering `items`.
+async fn rig_with_logs(
+    fx: PlanFixture,
+    host: LocalFsTransport,
+    fake: Option<FakeGateway>,
+    items: Vec<Value>,
+) -> Rig {
     let (declared, reader) = fx.load("dev");
     let repo = fx.repo("dev");
     let fake = fake.unwrap_or_else(|| FakeGateway::with_data_dir(fx.data_dir(), MODE));
@@ -212,8 +224,8 @@ async fn rig_with(fx: PlanFixture, host: LocalFsTransport, fake: Option<FakeGate
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/data/api/v1/logs"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-            "items": [],
-            "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+            "items": items,
+            "metadata": {"total": items.len(), "matching": items.len(), "limit": 200, "offset": 0}
         })))
         .mount(&server)
         .await;
@@ -234,6 +246,10 @@ async fn rig_with(fx: PlanFixture, host: LocalFsTransport, fake: Option<FakeGate
 /// unit changed (POSTGRES, by one byte), one added (the alarm settings are
 /// removed from the collection) and a prior ledger listing POSTGRES.
 async fn changing_rig() -> Rig {
+    changing_rig_with_logs(Vec::new()).await
+}
+
+async fn changing_rig_with_logs(items: Vec<Value>) -> Rig {
     let fx = PlanFixture::new();
     let (declared, _) = fx.load("dev");
     fx.live_render(MODE, &declared);
@@ -243,7 +259,7 @@ async fn changing_rig() -> Rig {
     fx.remove(MODE, ALARM_UNIT);
     fx.ledger(GATEWAY, MODE, &[DB_CONFIG, DB_RESOURCE]);
     let host = local_host(&fx);
-    rig_with(fx, host, None).await
+    rig_with_logs(fx, host, None, items).await
 }
 
 fn fast_poll() -> PollConfig {
@@ -700,31 +716,6 @@ fn failed_result(rig: &Rig) -> Value {
 }
 
 #[tokio::test]
-async fn a_red_verify_is_never_applied() {
-    // A gateway that never loads the new files: its REST view stays empty.
-    let fx = PlanFixture::new();
-    let (declared, _) = fx.load("dev");
-    fx.live_render(MODE, &declared);
-    let mut bytes = fx.read(MODE, DB_CONFIG);
-    bytes.push(b' ');
-    fx.mode(DB_CONFIG, &bytes);
-    let host = local_host(&fx);
-    let blind = FakeGateway::new();
-    blind.set_deployment_mode(Some(MODE.to_string()));
-    let rig = rig_with(fx, host, Some(blind)).await;
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let err = rig
-        .run(prepared, &NoObserver)
-        .await
-        .expect_err("not applied");
-    assert_eq!(err.code(), "internal", "{err}");
-    assert!(err.to_string().contains("verify_failed"), "{err}");
-    assert_eq!(rig.fake.scan_count(), 1);
-    assert_eq!(failed_result(&rig)["ok"], false);
-}
-
-#[tokio::test]
 async fn a_journal_of_another_run_names_the_real_env() {
     let rig = changing_rig().await;
     let dir = rig.deploy_dir();
@@ -909,11 +900,60 @@ fn failed_error_code(rig: &Rig) -> String {
         .to_string()
 }
 
-/// A rig whose next hook after `commit` runs `after`, and which records the
-/// scan count when `restore` returns.
-fn rig_with_hooks(
+/// One run of a scenario: the rig it ran on, the collection before it, the
+/// scan counts seen when `restore` returned, and what the engine answered.
+struct Ran {
     rig: Rig,
-    after_commit: impl Fn() + Send + Sync + 'static,
+    before: BTreeMap<String, String>,
+    scans_at_restore: Arc<Mutex<Vec<usize>>>,
+    result: Result<DeployApplyResult, CoreError>,
+}
+
+impl Ran {
+    fn rolled_back(&self, cause: &str) -> &DeployApplyResult {
+        let result = self.result.as_ref().expect("a rollback is a result");
+        assert_rolled_back(result, cause);
+        assert_eq!(
+            collection_state(&self.rig),
+            self.before,
+            "the snapshot is back"
+        );
+        result
+    }
+
+    fn error(&self) -> &CoreError {
+        self.result.as_ref().expect_err("the run failed")
+    }
+
+    fn scans_seen_at_restore(&self) -> Vec<usize> {
+        self.scans_at_restore.lock().expect("seen").clone()
+    }
+}
+
+/// Run `rig` once with the options `opts` and `clock`, recording the scan
+/// count when its first `restore` returns.
+async fn ran(
+    rig: Rig,
+    before: BTreeMap<String, String>,
+    scans_at_restore: Arc<Mutex<Vec<usize>>>,
+    clock: &dyn Clock,
+    opts: &ApplyOptions,
+) -> Ran {
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run_with(prepared, &NoObserver, clock, opts).await;
+    Ran {
+        rig,
+        before,
+        scans_at_restore,
+        result,
+    }
+}
+
+/// `rig` with `after_commit` run once the first commit returned and the scan
+/// count recorded once the first restore returned.
+fn hooked(
+    rig: Rig,
+    after_commit: impl Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static,
 ) -> (Rig, Arc<Mutex<Vec<usize>>>) {
     let fake = rig.fake.clone();
     let scans_at_restore = Arc::new(Mutex::new(Vec::new()));
@@ -921,10 +961,7 @@ fn rig_with_hooks(
     let host = rig
         .host
         .clone()
-        .after("commit", 1, move || {
-            after_commit();
-            async {}
-        })
+        .after("commit", 1, after_commit)
         .after("restore", 1, move || {
             seen.lock().expect("seen").push(fake.scan_count());
             async {}
@@ -932,139 +969,65 @@ fn rig_with_hooks(
     (Rig { host, ..rig }, scans_at_restore)
 }
 
-#[tokio::test]
-async fn fault_lock_expired_before_scan_restores_then_scans() {
+fn quiet_hook() -> Arc<Mutex<Vec<usize>>> {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+async fn scenario_write_failed() -> Ran {
+    let rig = failing_move_rig().await;
+    let before = collection_state(&rig);
+    ran(rig, before, quiet_hook(), &SystemClock, &options()).await
+}
+
+async fn scenario_lock_expired() -> Ran {
     let rig = changing_rig().await;
     let before = collection_state(&rig);
     let fake = rig.fake.clone();
-    let (rig, scans_at_restore) = rig_with_hooks(rig, move || fake.tick(HOLD_S as i64 + 1));
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let result = rig.run(prepared, &NoObserver).await.expect("rolled back");
-
-    assert_rolled_back(&result, "lock_expired");
-    assert_eq!(collection_state(&rig), before);
-    assert_eq!(
-        *scans_at_restore.lock().expect("seen"),
-        [0],
-        "no scan ran before the restore"
-    );
-    assert_eq!(rig.fake.scan_count(), 1, "the restore's own scan");
-    assert_eq!(rig.fake.lock_acquires(), 2, "the restore took a fresh hold");
-    let run_dir = rig.run_dir(&result);
-    assert_eq!(
-        event_names(&run_dir),
-        [
-            "run_started",
-            "staged",
-            "lock_acquired",
-            "committed",
-            "lock_verdict",
-            "restore_started",
-            "lock_acquired",
-            "scan_done",
-            "restored"
-        ]
-    );
+    let (rig, seen) = hooked(rig, move || {
+        fake.tick(HOLD_S as i64 + 1);
+        Box::pin(async {})
+    });
+    ran(rig, before, seen, &SystemClock, &options()).await
 }
 
-#[tokio::test]
-async fn fault_local_clock_expired_restores_under_held_lock() {
+async fn scenario_local_clock_expired() -> Ran {
     let rig = changing_rig().await;
     let before = collection_state(&rig);
     let clock = Arc::new(ManualClock::new());
     let tick = clock.clone();
     // The gateway still reports a large remaining; only the local count ran out.
-    let (rig, scans_at_restore) = rig_with_hooks(rig, move || {
+    let (rig, seen) = hooked(rig, move || {
         tick.advance(Duration::from_secs(HOLD_S + 1));
+        Box::pin(async {})
     });
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let result = rig
-        .run_with(prepared, &NoObserver, clock.as_ref(), &options())
-        .await
-        .expect("rolled back");
-
-    assert_rolled_back(&result, "lock_expired");
-    assert_eq!(collection_state(&rig), before);
-    assert_eq!(
-        rig.fake.lock_acquires(),
-        1,
-        "no second acquire under a held lock"
-    );
-    assert_eq!(*scans_at_restore.lock().expect("seen"), [0]);
-    assert_eq!(rig.fake.scan_count(), 1);
+    ran(rig, before, seen, clock.as_ref(), &options()).await
 }
 
-#[tokio::test]
-async fn fault_short_remaining_waits_for_the_lapse_then_restores_under_a_fresh_lock() {
+async fn scenario_short_remaining() -> Ran {
     let rig = changing_rig().await;
     let before = collection_state(&rig);
     let clock = Arc::new(ManualClock::new());
-    let fake = rig.fake.clone();
-    let tick = clock.clone();
+    let (fake, tick) = (rig.fake.clone(), clock.clone());
     // The local count ran out and the gateway has a few seconds left: not
     // enough for the restore, so the restore waits for the lapse.
-    let (rig, scans_at_restore) = rig_with_hooks(rig, move || {
+    let (rig, seen) = hooked(rig, move || {
         tick.advance(Duration::from_secs(HOLD_S + 1));
         fake.tick(HOLD_S as i64 - 4);
+        Box::pin(async {})
     });
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let result = rig
-        .run_with(prepared, &NoObserver, clock.as_ref(), &options())
-        .await
-        .expect("rolled back");
-
-    assert_rolled_back(&result, "lock_expired");
-    assert_eq!(collection_state(&rig), before);
-    assert_eq!(rig.fake.lock_acquires(), 2);
-    assert_eq!(*scans_at_restore.lock().expect("seen"), [0]);
-    assert_eq!(rig.fake.scan_count(), 1);
+    ran(rig, before, seen, clock.as_ref(), &options()).await
 }
 
-#[tokio::test]
-async fn fault_scan_incomplete_restores() {
+async fn scenario_scan_incomplete() -> Ran {
     let rig = changing_rig().await;
     let before = collection_state(&rig);
     rig.fake.stall_scans(1);
     let mut opts = options();
     opts.poll.deadline = Duration::from_millis(300);
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let result = rig
-        .run_with(prepared, &NoObserver, &SystemClock, &opts)
-        .await
-        .expect("rolled back");
-
-    assert_rolled_back(&result, "scan_incomplete");
-    assert_eq!(collection_state(&rig), before);
-    assert_eq!(
-        rig.fake.scan_count(),
-        2,
-        "the stalled scan and the restore's own"
-    );
-    let run_dir = rig.run_dir(&result);
-    assert_eq!(
-        event_names(&run_dir),
-        [
-            "run_started",
-            "staged",
-            "lock_acquired",
-            "committed",
-            "lock_verdict",
-            "restore_started",
-            "lock_acquired",
-            "scan_done",
-            "restored"
-        ]
-    );
+    ran(rig, before, quiet_hook(), &SystemClock, &opts).await
 }
 
-#[tokio::test]
-async fn fault_pre_image_changed_is_plan_stale() {
-    // Edges DAPL-01 and DAPL-05 concurrency: a mode-collection file changed
-    // between the plan and the lock.
+async fn scenario_pre_image_changed() -> (Ran, String, Vec<u8>) {
     let rig = changing_rig().await;
     let target = rig.fx.collection_dir(MODE).join(DB_RESOURCE);
     let mut edited = std::fs::read(&target).expect("live file");
@@ -1077,12 +1040,152 @@ async fn fault_pre_image_changed_is_plan_stale() {
         async {}
     });
     let rig = Rig { host, ..rig };
+    let run = ran(rig, expected, quiet_hook(), &SystemClock, &options()).await;
+    (run, DB_RESOURCE.to_string(), edited)
+}
 
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let err = rig.run(prepared, &NoObserver).await.expect_err("stale");
+async fn scenario_competing_lock() -> Ran {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    rig.fake
+        .client("b")
+        .scan_lock_acquire(ScanKind::Config, 0, 600)
+        .await
+        .expect("B takes the lock");
+    ran(rig, before, quiet_hook(), &SystemClock, &options()).await
+}
 
+/// A log line saying the written database translator will not be loaded.
+fn unloaded_log_line() -> Value {
+    json!({
+        "timestamp": 1_792_000_000_050_i64,
+        "loggerName": "NamedResourceHandler-ignition/database-translator",
+        "level": "WARN",
+        "message": format!(
+            "Resource {DB_UNIT} does not have required UUID attribute, will not be loaded"
+        ),
+    })
+}
+
+async fn scenario_verify_red(
+    hook: impl FnOnce(&Rig) -> Option<FaultyHost<LocalFsTransport>>,
+) -> Ran {
+    let rig = changing_rig_with_logs(vec![unloaded_log_line()]).await;
+    let before = collection_state(&rig);
+    let rig = match hook(&rig) {
+        Some(host) => Rig { host, ..rig },
+        None => rig,
+    };
+    ran(rig, before, quiet_hook(), &SystemClock, &options()).await
+}
+
+async fn scenario_restore_fails() -> Ran {
+    scenario_verify_red(|rig| Some(rig.host.clone().fail("restore", 1))).await
+}
+
+async fn scenario_restore_check_mismatch() -> Ran {
+    scenario_verify_red(|rig| {
+        let target = rig.fx.collection_dir(MODE).join(DB_CONFIG);
+        Some(rig.host.clone().after("restore", 1, move || {
+            std::fs::write(&target, b"altered after the restore").expect("alter");
+            async {}
+        }))
+    })
+    .await
+}
+
+async fn scenario_lock_taken() -> Ran {
+    // Our hold lapses and another actor takes the lock before the restore.
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let fake = rig.fake.clone();
+    let host = rig.host.clone().after("commit", 1, move || {
+        let fake = fake.clone();
+        async move {
+            fake.tick(HOLD_S as i64 + 1);
+            fake.client("b")
+                .scan_lock_acquire(ScanKind::Config, 0, 600)
+                .await
+                .expect("B takes the lock");
+        }
+    });
+    let rig = Rig { host, ..rig };
+    ran(rig, before, quiet_hook(), &SystemClock, &options()).await
+}
+
+const LAPSED_EVENTS: [&str; 9] = [
+    "run_started",
+    "staged",
+    "lock_acquired",
+    "committed",
+    "lock_verdict",
+    "restore_started",
+    "lock_acquired",
+    "scan_done",
+    "restored",
+];
+
+#[tokio::test]
+async fn fault_lock_expired_before_scan_restores_then_scans() {
+    let run = scenario_lock_expired().await;
+    let result = run.rolled_back("lock_expired");
+    assert_eq!(
+        run.scans_seen_at_restore(),
+        [0],
+        "no scan ran before the restore"
+    );
+    assert_eq!(run.rig.fake.scan_count(), 1, "the restore's own scan");
+    assert_eq!(
+        run.rig.fake.lock_acquires(),
+        2,
+        "a fresh hold for the restore"
+    );
+    assert_eq!(event_names(&run.rig.run_dir(result)), LAPSED_EVENTS);
+}
+
+#[tokio::test]
+async fn fault_local_clock_expired_restores_under_held_lock() {
+    let run = scenario_local_clock_expired().await;
+    run.rolled_back("lock_expired");
+    assert_eq!(
+        run.rig.fake.lock_acquires(),
+        1,
+        "no second acquire under a held lock"
+    );
+    assert_eq!(run.scans_seen_at_restore(), [0]);
+    assert_eq!(run.rig.fake.scan_count(), 1);
+}
+
+#[tokio::test]
+async fn fault_short_remaining_waits_for_the_lapse_then_restores_under_a_fresh_lock() {
+    let run = scenario_short_remaining().await;
+    run.rolled_back("lock_expired");
+    assert_eq!(run.rig.fake.lock_acquires(), 2);
+    assert_eq!(run.scans_seen_at_restore(), [0]);
+    assert_eq!(run.rig.fake.scan_count(), 1);
+}
+
+#[tokio::test]
+async fn fault_scan_incomplete_restores() {
+    let run = scenario_scan_incomplete().await;
+    let result = run.rolled_back("scan_incomplete");
+    assert_eq!(
+        run.rig.fake.scan_count(),
+        2,
+        "the stalled scan and the restore's own"
+    );
+    assert_eq!(event_names(&run.rig.run_dir(result)), LAPSED_EVENTS);
+}
+
+#[tokio::test]
+async fn fault_pre_image_changed_is_plan_stale() {
+    // Edges DAPL-01 and DAPL-05 concurrency: a mode-collection file changed
+    // between the plan and the lock.
+    let (run, _, _) = scenario_pre_image_changed().await;
+    let rig = &run.rig;
+    let err = run.error();
     assert_eq!((err.code(), err.exit_code()), ("plan_stale", 6), "{err}");
-    assert_eq!(collection_state(&rig), expected, "nothing moved");
+    assert_eq!(collection_state(rig), run.before, "nothing moved");
     assert!(!rig.deploy_dir().join("journal.json").exists());
     assert!(names(&rig.deploy_dir().join("snapshots")).is_empty());
     assert!(names(&rig.deploy_dir().join("staging")).is_empty());
@@ -1092,33 +1195,197 @@ async fn fault_pre_image_changed_is_plan_stale() {
         rig.host.calls(),
         ["prepare", "commit", "discard_interrupted"]
     );
-    assert_eq!(failed_error_code(&rig), "plan_stale");
+    assert_eq!(failed_error_code(rig), "plan_stale");
 }
 
 #[tokio::test]
 async fn fault_competing_lock_is_scan_lock_held() {
     // Edge DAPL-06 concurrency: another actor holds the lock.
-    let rig = changing_rig().await;
-    let before = collection_state(&rig);
-    rig.fake
-        .client("b")
-        .scan_lock_acquire(ScanKind::Config, 0, 600)
-        .await
-        .expect("B takes the lock");
-
-    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
-    let err = rig.run(prepared, &NoObserver).await.expect_err("refused");
-
+    let run = scenario_competing_lock().await;
+    let rig = &run.rig;
+    let err = run.error();
     assert_eq!(
         (err.code(), err.exit_code()),
         ("scan_lock_held", 6),
         "{err}"
     );
-    assert_eq!(collection_state(&rig), before);
+    assert_eq!(collection_state(rig), run.before);
     assert!(!rig.deploy_dir().join("journal.json").exists());
     assert!(names(&rig.deploy_dir().join("staging")).is_empty());
     assert!(names(&rig.deploy_dir().join("snapshots")).is_empty());
     assert_eq!(rig.fake.scan_count(), 0);
     assert_eq!(rig.host.calls(), ["prepare", "discard_interrupted"]);
-    assert_eq!(failed_error_code(&rig), "scan_lock_held");
+    assert_eq!(failed_error_code(rig), "scan_lock_held");
+}
+
+#[tokio::test]
+async fn auto_rollback_verify_red_restores() {
+    let run = scenario_verify_red(|_| None).await;
+    let result = run.rolled_back("verify_failed");
+    let rig = &run.rig;
+    let run_id = result.run_id.clone().expect("run id");
+    assert!(!rig.deploy_dir().join("journal.json").exists());
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    assert_eq!(
+        rig.fake.scan_count(),
+        2,
+        "the apply's scan and the restore's"
+    );
+    assert_eq!(
+        rig.fake.lock_acquires(),
+        2,
+        "the apply's scan released the lock"
+    );
+
+    let run_dir = rig.run_dir(result);
+    let events = event_names(&run_dir);
+    assert_eq!(
+        events,
+        [
+            "run_started",
+            "staged",
+            "lock_acquired",
+            "committed",
+            "lock_verdict",
+            "scan_done",
+            "verify_done",
+            "verify_checks",
+            "restore_started",
+            "lock_acquired",
+            "scan_done",
+            "restored"
+        ]
+    );
+    // The verdict's checks are in the log by id and status, nothing else.
+    let log = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+    let checks: Value = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("line"))
+        .find(|v| v["event"] == "verify_checks")
+        .expect("verify_checks");
+    let listed: Vec<(&str, &str)> = checks["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .map(|c| {
+            (
+                c["id"].as_str().expect("id"),
+                c["status"].as_str().expect("status"),
+            )
+        })
+        .collect();
+    assert!(listed.contains(&("loaded", "fail")), "{listed:?}");
+    assert!(
+        !log.contains("UUID attribute"),
+        "no gateway text in the log"
+    );
+    let doc = json_file(&run_dir.join("result.json"));
+    assert_eq!(doc["cause"], "verify_failed");
+}
+
+#[tokio::test]
+async fn auto_rollback_restore_failure_is_rollback_failed() {
+    let run = scenario_restore_fails().await;
+    let rig = &run.rig;
+    let err = run.error();
+    let CoreError::RollbackFailed(failure) = err else {
+        panic!("expected rollback_failed, got {err:?}");
+    };
+    assert_eq!(err.exit_code(), 6);
+    assert!(!failure.run_id.is_empty());
+    let run_dir = failure.run_dir.as_deref().expect("a run directory");
+    assert!(Path::new(run_dir).is_dir(), "{run_dir}");
+    assert_eq!(
+        failure.journal,
+        format!("ign-deploy/{GATEWAY}/{MODE}/journal.json")
+    );
+    let text = err.to_string();
+    for part in [failure.run_id.as_str(), run_dir, failure.journal.as_str()] {
+        assert!(text.contains(part), "{text}");
+    }
+    assert!(
+        rig.deploy_dir().join("journal.json").exists(),
+        "the journal stays"
+    );
+    assert_ne!(collection_state(rig), run.before, "nothing was put back");
+    assert_eq!(failed_error_code(rig), "rollback_failed");
+}
+
+#[tokio::test]
+async fn auto_rollback_lock_taken_is_rollback_failed() {
+    // Edge DAPL-07 concurrency.
+    let run = scenario_lock_taken().await;
+    let rig = &run.rig;
+    let err = run.error();
+    let CoreError::RollbackFailed(failure) = err else {
+        panic!("expected rollback_failed, got {err:?}");
+    };
+    assert!(
+        failure.cause.contains("scan_lock_held"),
+        "{}",
+        failure.cause
+    );
+    assert!(rig.deploy_dir().join("journal.json").exists());
+    assert_eq!(rig.fake.scan_count(), 0, "no scan over the partial tree");
+    assert!(
+        !rig.host.calls().contains(&"restore"),
+        "the restore never ran"
+    );
+    assert_eq!(failed_error_code(rig), "rollback_failed");
+}
+
+#[tokio::test]
+async fn auto_rollback_restore_check_mismatch_is_rollback_failed() {
+    let run = scenario_restore_check_mismatch().await;
+    let rig = &run.rig;
+    let err = run.error();
+    let CoreError::RollbackFailed(failure) = err else {
+        panic!("expected rollback_failed, got {err:?}");
+    };
+    assert!(
+        failure.cause.contains("differ from the snapshot"),
+        "{}",
+        failure.cause
+    );
+    assert!(failure.cause.contains(DB_CONFIG), "{}", failure.cause);
+    assert!(rig.deploy_dir().join("journal.json").exists());
+    assert_eq!(failed_error_code(rig), "rollback_failed");
+}
+
+#[tokio::test]
+async fn never_applied_when_red() {
+    // The prohibition: whatever goes wrong, the answer is never `applied`,
+    // never `ok`, never exit 0.
+    let (stale, _, _) = scenario_pre_image_changed().await;
+    let runs = [
+        scenario_write_failed().await,
+        scenario_lock_expired().await,
+        scenario_local_clock_expired().await,
+        scenario_short_remaining().await,
+        scenario_scan_incomplete().await,
+        stale,
+        scenario_competing_lock().await,
+        scenario_verify_red(|_| None).await,
+        scenario_restore_fails().await,
+        scenario_lock_taken().await,
+        scenario_restore_check_mismatch().await,
+    ];
+    assert_eq!(runs.len(), 11);
+    for (index, run) in runs.iter().enumerate() {
+        match &run.result {
+            Ok(result) => {
+                assert_ne!(result.outcome, OutcomeKind::Applied, "scenario {index}");
+                assert!(!result.ok, "scenario {index}");
+                assert_eq!(result.failure_exit_code(), Some(6), "scenario {index}");
+            }
+            Err(e) => assert_eq!(e.exit_code(), 6, "scenario {index}: {e}"),
+        }
+        // Whatever the run dir holds, its result.json says the same.
+        let root = run.rig.repo.join(".ign/deploy").join(GATEWAY);
+        for dir in names(&root) {
+            let doc = json_file(&root.join(dir).join("result.json"));
+            assert_eq!(doc["ok"], false, "scenario {index}: {doc}");
+            assert_ne!(doc["outcome"], "applied", "scenario {index}");
+        }
+    }
 }
