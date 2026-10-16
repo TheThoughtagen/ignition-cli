@@ -38,6 +38,21 @@ NL='
 '
 WORK=$ST/work.tsv
 
+# A control directory (.ign-ctl-*, made by the runner for an operation that has
+# no staging directory of its own) holds this script and its work list; it is
+# removed when the script exits, whatever the outcome, so a staged copy the
+# script moved away never leaves the runner a file it cannot delete one by one.
+cleanup_ctl() {
+  case ${ST##*/} in
+    .ign-ctl-*)
+      if [ -d "$ST" ] && [ ! -L "$ST" ]; then
+        rm -rf -- "$ST"
+      fi
+      ;;
+  esac
+}
+trap cleanup_ctl EXIT
+
 # ---- output ------------------------------------------------------------------
 
 emit() {
@@ -84,9 +99,9 @@ real_dir() {
 }
 
 # classify BASE REL: what BASE/REL is, without following a symlink. KIND
-# becomes absent, file, dir or unsafe. A symlink or special file on the way, a
-# file where a directory is needed and a directory that cannot be searched
-# are unsafe.
+# becomes absent, file, dir, symlink or unsafe. A symlink on the way is
+# symlink; a special file, a file where a directory is needed and a directory
+# that cannot be searched are unsafe.
 classify() {
   KIND=dir
   if [ ! -e "$1" ] && [ ! -L "$1" ]; then
@@ -106,7 +121,7 @@ classify() {
     _cur=$_cur/$1
     shift
     if [ -L "$_cur" ]; then
-      KIND=unsafe
+      KIND=symlink
       return 0
     fi
     if [ -d "$_cur" ]; then
@@ -1059,6 +1074,102 @@ op_discard() {
   emit '{"ok":1}'
 }
 
+# mirror_check_one: refuse code for BASE/REL kind KIND of a mirror entry AT.
+# (name of the entry, as W<i> or X<i>, in the refusal's "at".)
+mirror_kind_refusal() {
+  case $KIND in
+    symlink) refuse symlink "a path is or is below a symlink" "\"at\":\"$1\"" ;;
+    unsafe) refuse not_regular "a path is not a regular file or has a file where a directory must be" "\"at\":\"$1\"" ;;
+  esac
+}
+
+# mirror_precheck: everything that can be refused is refused before the first
+# write, as the per-file path did: the resources directories, the collection,
+# every delete target, every write target and every staged copy.
+mirror_precheck() {
+  _res=${CO%/*}
+  _cfg=${_res%/*}
+  for _d in "$_cfg" "$_res"; do
+    if [ -L "$_d" ]; then
+      refuse symlink "config/resources is or is below a symlink" "\"at\":\"R\""
+    fi
+    [ -d "$_d" ] || refuse resources "config/resources is not a directory"
+  done
+  if [ -L "$CO" ]; then
+    refuse symlink "the mode collection is a symlink" "\"at\":\"C\""
+  fi
+  if [ -e "$CO" ] && [ ! -d "$CO" ]; then
+    refuse coll_not_dir "the mode collection is not a directory"
+  fi
+  while IFS=$TAB read -r k a b c d; do
+    case $k in
+      X)
+        classify "$CO" "$b"
+        mirror_kind_refusal "X$a"
+        [ "$KIND" = file ] || refuse not_file "a delete target is not a regular file" "\"at\":\"X$a\""
+        ;;
+      W)
+        classify "$CO" "$d"
+        mirror_kind_refusal "W$a"
+        [ "$KIND" != dir ] || refuse is_dir "a write target is a directory" "\"at\":\"W$a\""
+        ;;
+    esac
+  done <"$WORK"
+  if ! verify_staged; then
+    # the staged copies that failed are removed from the staging root, only
+    # regular files with no symlink above them, as the per-file path did
+    _removed=0
+    while IFS=$TAB read -r k a b c d; do
+      if [ "$k" = W ]; then
+        classify "$SRCDIR" "$d"
+        if [ "$KIND" = file ] && rm -f -- "$SRCDIR/$d"; then
+          _removed=$((_removed + 1))
+        fi
+      fi
+    done <"$WORK"
+    refuse staged "a staged copy does not match the work list" "\"bad\":[$BAD],\"removed\":$_removed"
+  fi
+}
+
+# mirror_deletes: the delete set, then the directories it emptied.
+mirror_deletes() {
+  while IFS=$TAB read -r k a b c d; do
+    if [ "$k" = X ]; then
+      classify "$CO" "$b"
+      if [ "$KIND" != file ]; then
+        FAIL="delete $a: the target is no longer a regular file"
+        return 1
+      fi
+      if ! rm -- "$CO/$b"; then
+        FAIL="delete $a: cannot delete the file"
+        return 1
+      fi
+      DELETED=${DELETED:+$DELETED,}$a
+    fi
+  done <"$WORK"
+  while IFS=$TAB read -r k a b c d; do
+    if [ "$k" = X ]; then
+      RMWHAT="delete $a"
+      rmdir_up "$a" "$b" || return 1
+    fi
+  done <"$WORK"
+  return 0
+}
+
+op_mirror() {
+  check_work
+  check_roots
+  srcdir
+  mirror_precheck
+  if ! ensure_collection; then
+    refuse resources "the mode collection could not be created"
+  fi
+  if moves && mirror_deletes; then
+    :
+  fi
+  emit "{\"ok\":1,\"moved\":[$MOVED],\"deleted\":[$DELETED],\"dirs\":[$DIRS],\"fail\":$(fail_json)}"
+}
+
 op_verify() {
   check_work
   check_roots
@@ -1161,6 +1272,7 @@ op_commit() {
 case $OP in
   commit) op_commit ;;
   restore) op_restore ;;
+  mirror) op_mirror ;;
   fingerprint) op_fingerprint ;;
   probe) op_probe ;;
   finalize) op_finalize ;;

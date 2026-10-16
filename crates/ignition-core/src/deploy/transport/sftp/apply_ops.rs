@@ -32,7 +32,7 @@ use std::sync::atomic::Ordering;
 
 use serde_json::Value;
 
-use super::{SftpTransport, Seen};
+use super::{Seen, SftpTransport};
 use crate::deploy::apply::fingerprint::LEDGER_KEY;
 use crate::deploy::apply::host::{
     ApplyHost, BatchReport, BatchSpec, Prepared, ProbeReport, restoring_journal,
@@ -40,6 +40,7 @@ use crate::deploy::apply::host::{
 use crate::deploy::apply::journal::{Journal, JournalPhase};
 use crate::deploy::apply::record::{RECORD_MAX_BYTES, RunRecord};
 use crate::deploy::apply::run_store::RunId;
+use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::{
     LEDGER_FILE, LedgerRoot, journal_location, location_of, record_rel, staging_rel,
 };
@@ -49,7 +50,8 @@ use crate::deploy::transport::batch::{
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
 use crate::deploy::transport::{
-    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, TreeReader, absolute_components,
+    DeleteSet, MirrorReport, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, TreeReader,
+    absolute_components, read_staged_copy,
 };
 use crate::deploy::tree::{RenderedTree, sha256_hex};
 use crate::error::CoreError;
@@ -137,8 +139,9 @@ impl SftpTransport {
     fn staging_abs(&self, home: &str, run: &str) -> Result<String, CoreError> {
         let setup = self.apply_setup("prepare")?;
         let root = format!("{home}/{}", staging_rel(&setup.gateway, &setup.mode, run));
-        safe_remote_path(&root)
-            .map_err(|why| self.mirror_fail("prepare", format!("the staging root is unsafe: {why}")))?;
+        safe_remote_path(&root).map_err(|why| {
+            self.mirror_fail("prepare", format!("the staging root is unsafe: {why}"))
+        })?;
         Ok(root)
     }
 
@@ -266,8 +269,8 @@ impl SftpTransport {
     }
 
     /// Run `op` for `work` from a throw-away directory below the home: upload
-    /// the script, the work list and `extra` files, run, remove them. The
-    /// directory is removed whether or not the run succeeded.
+    /// the script, the work list and `extra` files (a name may hold `/`), run,
+    /// remove them. The directory is removed whether or not the run succeeded.
     async fn run_ctl(
         &self,
         op: &str,
@@ -278,8 +281,23 @@ impl SftpTransport {
     ) -> Result<Value, CoreError> {
         let home = self.account_home().await?;
         let ctl = format!("{home}/{}", self.ctl_name());
-        safe_remote_path(&ctl)
-            .map_err(|why| self.mirror_fail(op, format!("the control directory is unsafe: {why}")))?;
+        self.run_ctl_in(op, &ctl, work, extra, coll, deploy).await
+    }
+
+    /// [`run_ctl`](Self::run_ctl) in the directory `ctl`, which the work list
+    /// may already name (a mirror's `S` record).
+    async fn run_ctl_in(
+        &self,
+        op: &str,
+        ctl: &str,
+        work: &WorkList,
+        extra: &[(String, Vec<u8>)],
+        coll: &str,
+        deploy: &str,
+    ) -> Result<Value, CoreError> {
+        safe_remote_path(ctl).map_err(|why| {
+            self.mirror_fail(op, format!("the control directory is unsafe: {why}"))
+        })?;
         let lines = work.to_lines();
         let work_sha = sha256_hex(&lines);
         let mut files: Vec<(String, Vec<u8>)> = vec![
@@ -290,33 +308,71 @@ impl SftpTransport {
         let temp = tempfile::Builder::new()
             .prefix("ign-ctl-")
             .tempdir()
-            .map_err(|e| self.mirror_fail(op, format!("cannot create a temp dir ({:?})", e.kind())))?;
+            .map_err(|e| {
+                self.mirror_fail(op, format!("cannot create a temp dir ({:?})", e.kind()))
+            })?;
+        let local = |name: &str| {
+            name.split('/')
+                .fold(temp.path().to_path_buf(), |path, part| path.join(part))
+        };
+        let mut dirs: std::collections::BTreeSet<(usize, String)> =
+            std::collections::BTreeSet::new();
         for (name, bytes) in &files {
-            std::fs::write(temp.path().join(name), bytes)
-                .map_err(|e| self.mirror_fail(op, format!("cannot stage {name} ({:?})", e.kind())))?;
+            let target = local(name);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    self.mirror_fail(op, format!("cannot stage {name} ({:?})", e.kind()))
+                })?;
+            }
+            std::fs::write(&target, bytes).map_err(|e| {
+                self.mirror_fail(op, format!("cannot stage {name} ({:?})", e.kind()))
+            })?;
+            let parts: Vec<&str> = name.split('/').collect();
+            for len in 1..parts.len() {
+                dirs.insert((len, parts[..len].join("/")));
+            }
         }
-        let mut upload = vec![SftpOp::Mkdir { path: ctl.clone() }];
+        let mut upload = vec![SftpOp::Mkdir {
+            path: ctl.to_string(),
+        }];
+        for (_, dir) in &dirs {
+            upload.push(SftpOp::Mkdir {
+                path: format!("{ctl}/{dir}"),
+            });
+        }
         for (name, _) in &files {
             upload.push(SftpOp::Put {
-                local: temp.path().join(name),
+                local: local(name),
                 remote: format!("{ctl}/{name}"),
             });
         }
         let ran = async {
             self.run_batch(op, upload).await?;
-            self.exec_script(op, &ctl, coll, deploy, &work_sha).await
+            self.exec_script(op, ctl, coll, deploy, &work_sha).await
         }
         .await;
-        let mut cleanup: Vec<SftpOp> = files
-            .iter()
-            .map(|(name, _)| SftpOp::Rm {
-                path: format!("{ctl}/{name}"),
-            })
-            .collect();
-        cleanup.push(SftpOp::Rmdir { path: ctl });
-        // best effort: a leftover control directory is harmless and the run's
-        // own result is what the caller needs
-        let _ = self.run_batch(op, cleanup).await;
+        if ran.is_err() {
+            // The script removes its own control directory when it exits. When
+            // it never ran (a refused upload, a stub that refused, a lost
+            // connection) every file is still where it was put, so they are
+            // removed here, best effort: a leftover control directory is
+            // harmless and the run's own error is what the caller needs.
+            let mut cleanup: Vec<SftpOp> = files
+                .iter()
+                .map(|(name, _)| SftpOp::Rm {
+                    path: format!("{ctl}/{name}"),
+                })
+                .collect();
+            for (_, dir) in dirs.iter().rev() {
+                cleanup.push(SftpOp::Rmdir {
+                    path: format!("{ctl}/{dir}"),
+                });
+            }
+            cleanup.push(SftpOp::Rmdir {
+                path: ctl.to_string(),
+            });
+            let _ = self.run_batch(op, cleanup).await;
+        }
         ran
     }
 
@@ -412,9 +468,8 @@ impl SftpTransport {
         work: &WorkList,
     ) -> Result<BatchReport, CoreError> {
         let restoring = work.op == WorkOp::Restore;
-        let malformed = |what: &str| {
-            self.mirror_fail(op, format!("the script result is malformed ({what})"))
-        };
+        let malformed =
+            |what: &str| self.mirror_fail(op, format!("the script result is malformed ({what})"));
         let phase = match value.get("phase").and_then(Value::as_str) {
             Some("snapshotting") => JournalPhase::Snapshotting,
             Some("ready") => JournalPhase::Ready,
@@ -452,7 +507,10 @@ impl SftpTransport {
             .and_then(Value::as_array)
             .ok_or_else(|| malformed("dirs"))?
         {
-            let pair = pair.as_array().filter(|p| p.len() == 2).ok_or_else(|| malformed("dirs"))?;
+            let pair = pair
+                .as_array()
+                .filter(|p| p.len() == 2)
+                .ok_or_else(|| malformed("dirs"))?;
             let index = pair[0]
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
@@ -513,6 +571,235 @@ impl SftpTransport {
     }
 }
 
+impl SftpTransport {
+    /// `TreeMirror::commit` of a Linux node (D-01): the staged copies, the
+    /// delete set and the collection go into one work list and the uploaded
+    /// script's `mirror` op does every check, move, delete and emptied-directory
+    /// removal in ONE call. `Separate` moves the copies staged at `remote_root`;
+    /// `InPlace` has no copy on the host, so the local staged copies are
+    /// uploaded with the script into a control directory and moved from there.
+    pub(super) async fn mirror_commit_script(
+        &self,
+        local: &Path,
+        files: &[(RelPath, String)],
+        remote_root: Option<&str>,
+        owner: &str,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError> {
+        const OP: &str = "commit";
+        let (setup, _sizes) = self
+            .mirror_precheck(local, files, remote_root, owner, delete_set)
+            .await?;
+        let mode = setup.mode.clone();
+        let coll = format!("{}/config/resources/{mode}", self.data_dir);
+        safe_remote_path(&coll)
+            .map_err(|why| self.mirror_fail(OP, format!("the collection is unsafe: {why}")))?;
+        let home = self.account_home().await?;
+        let mut deletes: Vec<RelPath> = delete_set.files.to_vec();
+        deletes.sort();
+
+        let ctl = format!("{home}/{}", self.ctl_name());
+        let (source, extra): (String, Vec<(String, Vec<u8>)>) = match remote_root {
+            Some(root) => (root.to_string(), Vec::new()),
+            None => {
+                let (base, copies) = (local.to_path_buf(), files.to_vec());
+                let read = tokio::task::spawn_blocking(move || {
+                    let mut out = Vec::with_capacity(copies.len());
+                    for (path, sha) in &copies {
+                        out.push((format!("files/{path}"), read_staged_copy(&base, path, sha)?));
+                    }
+                    Ok::<_, String>(out)
+                })
+                .await
+                .map_err(|e| CoreError::Internal(format!("sftp commit task failed: {e}")))?
+                .map_err(|why| self.mirror_fail(OP, why))?;
+                (format!("{ctl}/files"), read)
+            }
+        };
+        let work = WorkList::for_mirror(&mode, &source, files, &deletes)
+            .map_err(|why| self.mirror_fail(OP, why))?;
+        // the script's operation is `mirror`; every error of this commit is
+        // still named `commit`
+        let value = self
+            .run_ctl_in("mirror", &ctl, &work, &extra, &coll, &home)
+            .await?;
+        if !self.result_ok(OP, &value)? {
+            return Err(self.mirror_refusal(&value, &work, &mode, remote_root));
+        }
+        self.mirror_report(&value, &work, &mode)
+    }
+
+    /// The path an `at` (`W3`, `X1`, `R`, `C`) of a mirror refusal names.
+    fn mirror_at(work: &WorkList, mode: &str, at: &str) -> String {
+        match at {
+            "R" => "config/resources".to_string(),
+            "C" => format!("the {mode} collection"),
+            _ => {
+                let (kind, number) =
+                    at.split_at(at.find(|c: char| c.is_ascii_digit()).unwrap_or(at.len()));
+                let n: Option<usize> = number.parse().ok();
+                match (kind, n) {
+                    ("W", Some(n)) => work.writes.get(n).map(|w| w.path.as_str().to_string()),
+                    ("X", Some(n)) => work.mirror_deletes.get(n).map(|p| p.as_str().to_string()),
+                    _ => None,
+                }
+                .unwrap_or_else(|| "a path".to_string())
+            }
+        }
+    }
+
+    fn mirror_refusal(
+        &self,
+        value: &Value,
+        work: &WorkList,
+        mode: &str,
+        root: Option<&str>,
+    ) -> CoreError {
+        const OP: &str = "commit";
+        let code = value.get("err").and_then(Value::as_str).unwrap_or("");
+        let at = value.get("at").and_then(Value::as_str).unwrap_or("");
+        let shown = Self::mirror_at(work, mode, at);
+        let detail = match code {
+            "staged" => {
+                let bad: Vec<String> = value
+                    .get("bad")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|item| Self::mirror_at(work, mode, item))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let removed = value.get("removed").and_then(Value::as_u64).unwrap_or(0);
+                let place = root.unwrap_or("the upload directory");
+                format!(
+                    "the staged copy on the host is missing or does not match its SHA-256 for {}; nothing was changed. {removed} staged copies were removed from {place} (empty directories remain).",
+                    super::named(&bad)
+                )
+            }
+            "symlink" => format!(
+                "{shown} is or is below a symlink; symlinks are refused; nothing was changed"
+            ),
+            "not_regular" => format!(
+                "{shown} is not a regular file, or a file stands where a directory must be; nothing was changed"
+            ),
+            "not_file" => format!(
+                "{shown} is not a regular file in the {mode} collection; nothing was changed"
+            ),
+            "is_dir" => {
+                format!("{shown} is a directory in the {mode} collection; nothing was changed")
+            }
+            "resources" => {
+                "config/resources is not a directory; is data_dir a gateway data directory?"
+                    .to_string()
+            }
+            "coll_not_dir" => format!("the {mode} collection is not a directory"),
+            _ => format!(
+                "the host refused: {} ({})",
+                plain(value.get("detail").and_then(Value::as_str).unwrap_or("")),
+                plain(code)
+            ),
+        };
+        self.mirror_fail(OP, detail)
+    }
+
+    /// The report of a mirror result, or the error of a commit that stopped
+    /// part-way.
+    fn mirror_report(
+        &self,
+        value: &Value,
+        work: &WorkList,
+        mode: &str,
+    ) -> Result<MirrorReport, CoreError> {
+        const OP: &str = "commit";
+        let malformed =
+            |what: &str| self.mirror_fail(OP, format!("the script result is malformed ({what})"));
+        let indices = |key: &str, limit: usize| -> Result<Vec<usize>, CoreError> {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| malformed(key))?
+                .iter()
+                .map(|item| {
+                    item.as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .filter(|n| *n < limit)
+                        .ok_or_else(|| malformed(key))
+                })
+                .collect()
+        };
+        let moved = indices("moved", work.writes.len())?;
+        let deleted = indices("deleted", work.mirror_deletes.len())?;
+        if let Some(fail) = value.get("fail").filter(|v| !v.is_null()) {
+            let reason = plain(fail.as_str().ok_or_else(|| malformed("fail"))?);
+            let stopped = reason
+                .strip_prefix("write ")
+                .and_then(|r| r.split_once(':'))
+                .and_then(|(n, _)| n.parse::<usize>().ok())
+                .and_then(|n| work.writes.get(n).map(|w| w.path.as_str().to_string()))
+                .or_else(|| {
+                    reason
+                        .strip_prefix("delete ")
+                        .and_then(|r| r.split_once(':'))
+                        .and_then(|(n, _)| n.parse::<usize>().ok())
+                        .and_then(|n| work.mirror_deletes.get(n).map(|p| p.as_str().to_string()))
+                })
+                .unwrap_or_else(|| "a path".to_string());
+            let detail = if reason.contains("does not match its hash") {
+                format!(
+                    "content changed on the host during commit: the {mode} collection holds content that does not match the staged SHA-256 for {stopped}; the {} written files were not rolled back and no delete was run",
+                    moved.len()
+                )
+            } else {
+                format!(
+                    "the commit stopped at {stopped}: {reason}; {} of {} files were written and {} deleted, and nothing was rolled back",
+                    moved.len(),
+                    work.writes.len(),
+                    deleted.len()
+                )
+            };
+            return Err(self.mirror_fail(OP, detail));
+        }
+        let mut removed = std::collections::BTreeSet::new();
+        for pair in value
+            .get("dirs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("dirs"))?
+        {
+            let pair = pair
+                .as_array()
+                .filter(|p| p.len() == 2)
+                .ok_or_else(|| malformed("dirs"))?;
+            let index = pair[0]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n < work.mirror_deletes.len())
+                .ok_or_else(|| malformed("dirs"))?;
+            let path = work.mirror_deletes[index].as_str();
+            let levels = pair[1]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n >= crate::deploy::transport::MIRROR_MIN_COMPONENTS)
+                .filter(|n| *n < path.split('/').count())
+                .ok_or_else(|| malformed("dirs"))?;
+            removed.insert(first_components(path, levels));
+        }
+        Ok(MirrorReport {
+            written: moved
+                .iter()
+                .map(|i| work.writes[*i].path.as_str().to_string())
+                .collect(),
+            deleted: deleted
+                .iter()
+                .map(|i| work.mirror_deletes[*i].as_str().to_string())
+                .collect(),
+            removed_dirs: removed.into_iter().collect(),
+        })
+    }
+}
+
 /// `jiff`-free helper: the text of a `component_problem`.
 fn component_problem_text(name: &str) -> Option<&'static str> {
     crate::deploy::component_problem(name)
@@ -550,7 +837,9 @@ fn probe_problem(code: &str) -> String {
         "resources_unwritable" => {
             "config/resources is not writable, so the mode collection cannot be created"
         }
-        "resources_missing" => "config/resources does not exist; is data_dir a gateway data directory?",
+        "resources_missing" => {
+            "config/resources does not exist; is data_dir a gateway data directory?"
+        }
         "deploy_symlink" => "the ign-deploy directory is or is below a symlink",
         "deploy_not_dir" => "a level of the ign-deploy directory is not a directory",
         "deploy_uncreatable" => "the ign-deploy directory cannot be created or opened",
@@ -581,7 +870,9 @@ impl SftpTransport {
             let hash = if text == "-" {
                 None
             } else if text.len() == 64
-                && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             {
                 Some(text.to_string())
             } else {
@@ -622,10 +913,7 @@ impl SftpTransport {
             for (rel, entries) in frontier.iter().zip(listings) {
                 for entry in entries {
                     if let Some(why) = crate::deploy::component_problem(&entry.name) {
-                        return Err(self.mirror_fail(
-                            op,
-                            format!("a snapshot entry name {why}"),
-                        ));
+                        return Err(self.mirror_fail(op, format!("a snapshot entry name {why}")));
                     }
                     let child = if rel.is_empty() {
                         entry.name.clone()
@@ -656,10 +944,9 @@ impl SftpTransport {
                             }
                             total = total.saturating_add(entry.size);
                             if total > READ_MAX_TOTAL_BYTES {
-                                return Err(self.mirror_fail(
-                                    op,
-                                    "the snapshot exceeds the total size cap",
-                                ));
+                                return Err(
+                                    self.mirror_fail(op, "the snapshot exceeds the total size cap")
+                                );
                             }
                             files.push((child, entry.size));
                         }
@@ -700,32 +987,33 @@ impl SftpTransport {
             self.run_download(op, &ops, out, limit).await?;
             let root = out.to_path_buf();
             let wanted: Vec<(String, u64)> = files[start..next].to_vec();
-            let got = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
-                let mut got = Vec::new();
-                for (rel, size) in &wanted {
-                    let bytes = super::read_downloaded(
-                        &root,
-                        Path::new(rel),
-                        *size,
-                        READ_MAX_FILE_BYTES,
-                    )
-                    .map_err(|_| format!("{rel} could not be read back as listed"))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
-                            root.join(rel),
-                            std::fs::Permissions::from_mode(0o600),
+            let got =
+                tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
+                    let mut got = Vec::new();
+                    for (rel, size) in &wanted {
+                        let bytes = super::read_downloaded(
+                            &root,
+                            Path::new(rel),
+                            *size,
+                            READ_MAX_FILE_BYTES,
                         )
-                        .map_err(|e| format!("cannot restrict {rel} ({})", e.kind()))?;
+                        .map_err(|_| format!("{rel} could not be read back as listed"))?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(
+                                root.join(rel),
+                                std::fs::Permissions::from_mode(0o600),
+                            )
+                            .map_err(|e| format!("cannot restrict {rel} ({})", e.kind()))?;
+                        }
+                        got.push((rel.clone(), sha256_hex(&bytes)));
                     }
-                    got.push((rel.clone(), sha256_hex(&bytes)));
-                }
-                Ok(got)
-            })
-            .await
-            .map_err(|e| CoreError::Internal(format!("sftp snapshot task failed: {e}")))?
-            .map_err(|why| self.mirror_fail(op, why))?;
+                    Ok(got)
+                })
+                .await
+                .map_err(|e| CoreError::Internal(format!("sftp snapshot task failed: {e}")))?
+                .map_err(|why| self.mirror_fail(op, why))?;
             hashes.extend(got);
             downloaded = tokio::task::spawn_blocking({
                 let root = out.to_path_buf();
@@ -824,7 +1112,9 @@ impl ApplyHost for SftpTransport {
         let temp = tempfile::Builder::new()
             .prefix("ign-apply-")
             .tempdir()
-            .map_err(|e| self.mirror_fail(OP, format!("cannot create a temp dir ({:?})", e.kind())))?;
+            .map_err(|e| {
+                self.mirror_fail(OP, format!("cannot create a temp dir ({:?})", e.kind()))
+            })?;
         let mut entries: Vec<(String, u64)> = Vec::with_capacity(files.len());
         for (rel, bytes) in &files {
             let target = rel
@@ -835,21 +1125,30 @@ impl ApplyHost for SftpTransport {
                     self.mirror_fail(OP, format!("cannot stage {rel} ({:?})", e.kind()))
                 })?;
             }
-            std::fs::write(&target, bytes)
-                .map_err(|e| self.mirror_fail(OP, format!("cannot stage {rel} ({:?})", e.kind())))?;
+            std::fs::write(&target, bytes).map_err(|e| {
+                self.mirror_fail(OP, format!("cannot stage {rel} ({:?})", e.kind()))
+            })?;
             entries.push((rel.clone(), bytes.len() as u64));
         }
 
         // A stale staging directory of this run (an earlier attempt) is
         // replaced.
-        if !self.put_tree(OP, &staging, temp.path(), &entries, true).await? {
+        if !self
+            .put_tree(OP, &staging, temp.path(), &entries, true)
+            .await?
+        {
             let unstage = WorkList::for_unstage(spec.run_id.as_str(), &spec.gateway, &spec.mode)
                 .map_err(|why| self.mirror_fail(OP, why))?;
-            let value = self.run_ctl("unstage", &unstage, &[], &coll, &deploy).await?;
+            let value = self
+                .run_ctl("unstage", &unstage, &[], &coll, &deploy)
+                .await?;
             if !self.result_ok(OP, &value)? {
                 return Err(self.refusal(OP, &value, None).await);
             }
-            if !self.put_tree(OP, &staging, temp.path(), &entries, true).await? {
+            if !self
+                .put_tree(OP, &staging, temp.path(), &entries, true)
+                .await?
+            {
                 return Err(self.mirror_fail(OP, "a stale staging directory could not be removed"));
             }
         }
@@ -1028,7 +1327,13 @@ impl ApplyHost for SftpTransport {
         let found = self
             .descend_from(
                 &home,
-                &["ign-deploy", &setup.gateway, &setup.mode, "snapshots", run_id.as_str()],
+                &[
+                    "ign-deploy",
+                    &setup.gateway,
+                    &setup.mode,
+                    "snapshots",
+                    run_id.as_str(),
+                ],
                 &mut budget,
             )
             .await

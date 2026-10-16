@@ -1077,7 +1077,8 @@ impl RemoteShell {
             let tail = scrub_stderr(&out.stderr, self.temp_dir());
             let why = match out.code {
                 STUB_MISMATCH_EXIT => {
-                    "the staged script or work list does not match its hash; nothing ran".to_string()
+                    "the staged script or work list does not match its hash; nothing ran"
+                        .to_string()
                 }
                 code if tail.is_empty() => format!("exit code {code}"),
                 code => format!("exit code {code}: {tail}"),
@@ -1934,7 +1935,12 @@ mod tests {
             ),
             (
                 "the stub refuses",
-                ok(b"", b"ign: the staged script or work list does not match its hash\n", 97, false),
+                ok(
+                    b"",
+                    b"ign: the staged script or work list does not match its hash\n",
+                    97,
+                    false,
+                ),
                 "does not match its hash",
             ),
             (
@@ -1944,7 +1950,12 @@ mod tests {
             ),
             (
                 "two sentinel lines",
-                ok(b"IGN-RESULT:{\"ok\":1}\nIGN-RESULT:{\"ok\":1}\n", b"", 0, false),
+                ok(
+                    b"IGN-RESULT:{\"ok\":1}\nIGN-RESULT:{\"ok\":1}\n",
+                    b"",
+                    0,
+                    false,
+                ),
                 "more than one",
             ),
             ("a timeout", ok(b"", b"", -1, true), "timed out after 3s"),

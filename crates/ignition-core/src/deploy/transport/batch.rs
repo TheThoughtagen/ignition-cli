@@ -606,8 +606,11 @@ impl WorkList {
             return Err(format!("the work list does not start with `{HEADER}`"));
         }
         let (mut run_id, mut gateway, mut mode, mut op) = (None, None, None, None);
-        let (mut retries, mut journal, mut source): (Option<String>, Option<String>, Option<String>) =
-            (None, None, None);
+        let (mut retries, mut journal, mut source): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = (None, None, None);
         let mut list = WorkList::empty(WorkOp::Commit, "", "", "");
         let dash = |v: &str| (v != "-").then(|| v.to_string());
         for (n, line) in lines.enumerate() {

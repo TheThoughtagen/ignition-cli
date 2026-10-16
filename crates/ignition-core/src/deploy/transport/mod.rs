@@ -324,9 +324,14 @@ pub fn for_node(
 ///   [`READ_MAX_ENTRIES`].
 /// - **Atomic where the platform allows.** `Separate` moves each staged file
 ///   into place with a rename (a replace on the same filesystem); `InPlace`
-///   writes the target directly and is not atomic per file. A commit is not
-///   atomic across files: a failure part-way leaves the files already moved
-///   in place, which is why Phase 23 wraps it in a snapshot.
+///   writes the target directly and is not atomic per file. A Linux `ssh`
+///   node (23-06, D-01) does both inside ONE call of an uploaded POSIX script:
+///   `Separate` moves the copies staged on the host, and `InPlace` uploads the
+///   copies with the script into a throw-away directory below the account
+///   home and moves them from there, so on that host `InPlace` is a `mv` per
+///   file too. A commit is not atomic across files: a failure part-way leaves
+///   the files already moved in place, which is why Phase 23 wraps it in a
+///   snapshot.
 ///
 /// A [`Staged`] belongs to the mirror that made it and is consumed by its
 /// commit in `Separate` mode (the staged files are moved); stage again to
@@ -423,11 +428,13 @@ pub fn mirror_for_node(
 /// The apply half ([`ApplyHost`](super::apply::host::ApplyHost)) for `node`'s
 /// `mode` collection, for the target `gateway`.
 ///
-/// `local` builds the local-filesystem host. An `ssh` node is refused as
-/// `deploy_tree_invalid` naming the node: apply over ssh is not supported by
-/// this build yet (23-06 replaces the Linux arm and 23-20 the Windows arm; no
-/// verb exposes apply before 23-13, so the refusal is never user-visible).
-/// `gateway` and `mode` must be names a run may write under.
+/// `local` builds the local-filesystem host. A Linux `ssh` node builds the
+/// sftp host that runs every operation as one call of the uploaded POSIX `sh`
+/// script (23-06, D-01). A Windows `ssh` node is refused as
+/// `deploy_tree_invalid` naming the node: apply over ssh to Windows is not
+/// supported by this build yet (23-20 replaces that arm; no verb exposes apply
+/// before 23-13, so the refusal is never user-visible). `gateway` and `mode`
+/// must be names a run may write under.
 pub fn apply_host_for_node(
     repo: &Path,
     target_file: &str,
@@ -446,11 +453,20 @@ pub fn apply_host_for_node(
                 .with_apply(gateway, mode)
                 .map_err(|why| invalid(format!("{label}: {why}")))?,
         ),
-        NodeAccess::Ssh { .. } => {
+        NodeAccess::Ssh { windows: true, .. } => {
             return Err(invalid(format!(
-                "{label}: apply over ssh is not supported by this build"
+                "{label}: apply over ssh to a Windows host is not supported by this build"
             )));
         }
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows: false,
+        } => Box::new(
+            sftp_transport(*shell, data_dir, label, false)
+                .with_apply(gateway, mode)
+                .map_err(|why| invalid(format!("{label}: {why}")))?,
+        ),
     })
 }
 
@@ -786,4 +802,92 @@ pub(crate) fn read_staged_copy(
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deploy::target::{Ssh, TargetOs};
+
+    fn ssh_node(os: TargetOs, data_dir: &str) -> NodeTarget {
+        NodeTarget {
+            profile: "p".to_string(),
+            ssh: Some(Ssh {
+                host: "gw.example.test".to_string(),
+                port: None,
+                user: "svc".to_string(),
+                key_file: None,
+                key_env: None,
+                os,
+                data_dir: data_dir.to_string(),
+                known_hosts: "ssh/prod.known_hosts".to_string(),
+                connect_timeout_s: None,
+                op_timeout_s: None,
+            }),
+            local: None,
+        }
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join("ssh")).expect("ssh dir");
+        std::fs::write(
+            repo.path().join("ssh/prod.known_hosts"),
+            "gw.example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPinnedPinnedPinnedPinnedPinnedPinnedPinned\n",
+        )
+        .expect("known_hosts");
+        repo
+    }
+
+    /// A Linux ssh node gets the sftp-backed apply host; a Windows node keeps
+    /// the refusal until 23-20; names a run may not write under are refused
+    /// before any host is built.
+    #[test]
+    fn apply_host_for_node_linux_ssh() {
+        let repo = repo();
+        let linux = ssh_node(TargetOs::Linux, "/usr/local/bin/ignition/data");
+        assert!(
+            apply_host_for_node(
+                repo.path(),
+                "targets/prod.yaml",
+                "nodes.master",
+                &linux,
+                "gw",
+                "prod"
+            )
+            .is_ok(),
+            "a Linux ssh node builds an apply host"
+        );
+        let windows = ssh_node(TargetOs::Windows, "C:\\Ignition\\data");
+        let err = apply_host_for_node(
+            repo.path(),
+            "targets/prod.yaml",
+            "nodes.master",
+            &windows,
+            "gw",
+            "prod",
+        )
+        .err()
+        .expect("a Windows ssh node is refused until 23-20");
+        assert_eq!(err.code(), "deploy_tree_invalid");
+        assert!(err.to_string().contains("not supported"), "{err}");
+        for (gateway, mode) in [
+            (".hidden", "prod"),
+            ("gw", "core"),
+            ("gw", "local"),
+            ("g/w", "prod"),
+        ] {
+            let err = apply_host_for_node(
+                repo.path(),
+                "targets/prod.yaml",
+                "nodes.master",
+                &linux,
+                gateway,
+                mode,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{gateway}/{mode} is refused"));
+            assert_eq!(err.code(), "deploy_tree_invalid", "{gateway}/{mode}");
+        }
+    }
 }

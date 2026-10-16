@@ -1700,6 +1700,10 @@ impl SftpTransport {
 // The write half (22-07)
 // ---------------------------------------------------------------------------
 //
+// Linux nodes (23-06, D-01): `TreeMirror::commit` runs the uploaded POSIX
+// script's `mirror` op in one `ssh` call (`sftp/apply_ops.rs`); the per-file
+// flow described below is the Windows host's until 23-20.
+//
 // Integrity: a listing size says nothing about content, so before the first
 // rename (`Separate`) every staged copy on the host is fetched back with a
 // typed `get` into a per-operation temp dir and hashed HERE against the
@@ -2323,14 +2327,18 @@ impl SftpTransport {
         })
     }
 
-    async fn commit_inner(
+    /// Everything a mirror commit checks before any I/O on the host: the
+    /// owner, the staging mode, every path (Windows gate, mirror rules, batch
+    /// line) and the local staged copies, which are re-read and re-hashed.
+    /// Returns the setup and each staged copy's size.
+    async fn mirror_precheck(
         &self,
         local: &Path,
         files: &[(RelPath, String)],
         remote_root: Option<&str>,
         owner: &str,
         delete_set: &DeleteSet,
-    ) -> Result<MirrorReport, CoreError> {
+    ) -> Result<(&MirrorSetup, Vec<u64>), CoreError> {
         const OP: &str = "commit";
         let setup = self.mirror_setup(OP)?;
         if owner != self.mirror_owner(setup) {
@@ -2379,6 +2387,23 @@ impl SftpTransport {
             .map_err(|e| CoreError::Internal(format!("sftp commit task failed: {e}")))?
             .map_err(|why| self.mirror_fail(OP, why))?
         };
+        Ok((setup, sizes))
+    }
+
+    /// The per-file commit of a Windows host (Linux commits through the
+    /// script, `apply_ops.rs`; Windows follows in 23-20).
+    async fn commit_inner(
+        &self,
+        local: &Path,
+        files: &[(RelPath, String)],
+        remote_root: Option<&str>,
+        owner: &str,
+        delete_set: &DeleteSet,
+    ) -> Result<MirrorReport, CoreError> {
+        const OP: &str = "commit";
+        let (setup, sizes) = self
+            .mirror_precheck(local, files, remote_root, owner, delete_set)
+            .await?;
 
         let mode_chain = chain_of(&[RESOURCES[0], RESOURCES[1], setup.mode.as_str()]);
         let in_collection = |path: &RelPath| -> Vec<String> {
@@ -2647,6 +2672,18 @@ impl TreeMirror for SftpTransport {
         staged: &Staged,
         delete_set: &DeleteSet,
     ) -> Result<MirrorReport, CoreError> {
+        if !self.windows {
+            // D-01: a Linux commit is one script call, never a rename per file.
+            return self
+                .mirror_commit_script(
+                    staged.local.path(),
+                    &staged.files,
+                    staged.remote_root.as_deref(),
+                    &staged.owner,
+                    delete_set,
+                )
+                .await;
+        }
         self.commit_inner(
             staged.local.path(),
             &staged.files,
@@ -4796,6 +4833,130 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .collect()
     }
 
+    /// Runs sftp against the scripted server and answers every `ssh` with one
+    /// canned script result, recording the remote commands it was given.
+    struct OneExec {
+        fake: Arc<FakeSftp>,
+        execs: Mutex<Vec<String>>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for OneExec {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program == "ssh" {
+                self.execs
+                    .lock()
+                    .expect("execs")
+                    .push(args.last().expect("command").to_string_lossy().into_owned());
+                return ProcessOutput {
+                    stdout: format!("IGN-RESULT:{}\n", self.reply).into_bytes(),
+                    stderr: Vec::new(),
+                    code: 0,
+                    timed_out: false,
+                };
+            }
+            self.fake.run(program, args, stdin, timeout).await
+        }
+    }
+
+    /// D-01: on a Linux node the whole commit is ONE `ssh` call that runs the
+    /// uploaded script's `mirror` op; no per-file sftp `rename` is issued, and
+    /// the result's indices are mapped back to the paths of the work list.
+    #[tokio::test]
+    async fn linux_mirror_commit_is_one_exec() {
+        for separate in [true, false] {
+            let fake = FakeSftp::new();
+            fake.mkdirs("/home/svc");
+            fake.listed
+                .lock()
+                .expect("listed")
+                .extend(["/home".to_string(), "/home/svc".to_string()]);
+            let runner = Arc::new(OneExec {
+                fake: fake.clone(),
+                execs: Mutex::new(Vec::new()),
+                reply: r#"{"ok":1,"moved":[0,1],"deleted":[0],"dirs":[[0,3]],"fail":null}"#
+                    .to_string(),
+            });
+            let shell = RemoteShell::local_sftp_server(
+                Path::new("/unused/sftp-server"),
+                runner.clone(),
+                Duration::from_secs(30),
+            );
+            let staging = if separate {
+                StagingMode::Separate {
+                    root: "/home/svc/ign-deploy/gw/production/staging/run-1".to_string(),
+                }
+            } else {
+                StagingMode::InPlace
+            };
+            let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
+                .with_mirror("production", staging)
+                .expect("mirror");
+            let tree = win_tree_of(&[
+                (&format!("{DC}/Keep/config.json"), "{\"keep\":2}"),
+                (&format!("{DC}/New/config.json"), "{\"new\":1}"),
+            ]);
+            let staged = m.stage(&tree).await.expect("stage");
+            let before = fake.session_lines().len();
+            let report = m
+                .commit(
+                    &staged,
+                    &DeleteSet {
+                        files: vec![rel(&format!("{DC}/Old/config.json"))],
+                    },
+                )
+                .await
+                .expect("commit");
+
+            let execs = runner.execs.lock().expect("execs").clone();
+            assert_eq!(
+                execs.len(),
+                1,
+                "separate={separate}: one exec call: {execs:?}"
+            );
+            assert!(execs[0].contains("'mirror'"), "{}", execs[0]);
+            assert!(execs[0].contains("commit.sh"), "{}", execs[0]);
+            assert!(
+                !execs[0].contains("Old/config.json"),
+                "paths never reach the command line: {}",
+                execs[0]
+            );
+            let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("rename ")),
+                "separate={separate}: no per-file rename: {lines:?}"
+            );
+            assert!(fake.session_lines().len() >= before);
+            assert_eq!(
+                report.written,
+                [
+                    format!("{DC}/Keep/config.json"),
+                    format!("{DC}/New/config.json")
+                ]
+            );
+            assert_eq!(report.deleted, [format!("{DC}/Old/config.json")]);
+            assert_eq!(report.removed_dirs, [format!("{DC}/Old")]);
+            // the script removes its own control directory when it exits (the
+            // canned reply here never ran it; the integration tests check the
+            // real thing), so only what was uploaded is asserted: the script
+            // and the work list, below the account home
+            let fs = fake.fs.lock().expect("fs");
+            let ctl: Vec<&String> = fs.keys().filter(|k| k.contains("/.ign-ctl-")).collect();
+            assert!(
+                ctl.iter().any(|k| k.ends_with("/commit.sh"))
+                    && ctl.iter().any(|k| k.ends_with("/work.tsv")),
+                "{ctl:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn windows_commit_replaces_by_rename_and_never_renames_onto_itself() {
         let fake = windows_fake();
@@ -4938,22 +5099,35 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             1,
             "no retry on a refusal that is not a Failure"
         );
+    }
 
-        // a POSIX host does not retry at all
+    /// Was the POSIX segment of `windows_commit_retries_a_held_rename_a_bounded_number_of_times`
+    /// ("a POSIX host does not retry at all", one sftp `rename` that failed).
+    /// A Linux commit no longer renames over sftp at all (D-01): the script
+    /// moves, retrying a held target as many times as the work list's `T`
+    /// record says, and a move that still fails comes back as the script's
+    /// own result, which the transport reports as `transport_failed` naming
+    /// the entry by its path and saying nothing was rolled back.
+    #[tokio::test]
+    async fn linux_commit_never_renames_over_sftp_and_reports_a_failed_move() {
         let fake = FakeSftp::new();
-        fake.file(
-            &format!("{RES}/production/{DC}/Keep/config.json"),
-            "{\"keep\":1}",
-        );
         fake.mkdirs("/home/svc/ign-deploy/gw/production/staging");
         fake.listed
             .lock()
             .expect("listed")
-            .insert("/home".to_string());
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 99, "Failure"));
-        let m = transport(&fake)
+            .extend(["/home".to_string(), "/home/svc".to_string()]);
+        let runner = Arc::new(OneExec {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            reply: r#"{"ok":1,"moved":[],"deleted":[],"dirs":[],"fail":"write 0: cannot move the file into place"}"#
+                .to_string(),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        let m = SftpTransport::new(shell, DATA.to_string(), "nodes.master")
             .with_mirror(
                 "production",
                 StagingMode::Separate {
@@ -4968,10 +5142,24 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             )]))
             .await
             .expect("stage");
-        m.commit(&staged, &DeleteSet::default())
+        let err = m
+            .commit(&staged, &DeleteSet::default())
             .await
-            .expect_err("held");
-        assert_eq!(renames(&fake).len(), 1);
+            .expect_err("held for good");
+        let CoreError::TransportFailed {
+            operation, detail, ..
+        } = err
+        else {
+            panic!("not transport_failed")
+        };
+        assert_eq!(operation, "commit");
+        assert!(
+            detail.contains(&format!("{DC}/Keep/config.json")),
+            "{detail}"
+        );
+        assert!(detail.contains("nothing was rolled back"), "{detail}");
+        assert_eq!(renames(&fake).len(), 0, "no sftp rename on a POSIX host");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
     }
 
     #[tokio::test]

@@ -25,13 +25,13 @@ use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
-use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 #[cfg(unix)]
 use ignition_core::deploy::transport::process::TokioProcessRunner;
 #[cfg(unix)]
 use ignition_core::deploy::transport::remote::RemoteShell;
 #[cfg(unix)]
 use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 
 const GW: &str = "conf-gw";
 const MODE: &str = "dev";
@@ -1320,7 +1320,11 @@ async fn sh_moved_files_are_0644() {
             & 0o777
     };
     assert_eq!(mode(FILE_A), 0o644, "the moved file");
-    for dir in ["ignition", "ignition/tag-provider", "ignition/tag-provider/default"] {
+    for dir in [
+        "ignition",
+        "ignition/tag-provider",
+        "ignition/tag-provider/default",
+    ] {
         assert_eq!(mode(dir), 0o755, "{dir}");
     }
 }
@@ -1355,7 +1359,10 @@ async fn sh_failed_move_reports_index() {
     assert_eq!(report.moved, vec![0], "{report:?}");
     let failure = report.failure.clone().expect("a failure");
     assert!(failure.contains("write 1"), "{failure}");
-    assert!(!failure.contains("config.json"), "no path in the reason: {failure}");
+    assert!(
+        !failure.contains("config.json"),
+        "no path in the reason: {failure}"
+    );
     assert_eq!(c.listing().get(A), Some(&sha256_hex(b"new a")));
     assert_eq!(c.listing().get(B), Some(&sha256_hex(b"old b")));
 
