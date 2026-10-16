@@ -1623,6 +1623,52 @@ mod tests {
         assert_eq!(reader.read_ledger("gw", "prod").await.expect("read"), None);
     }
 
+    // ---- read_journal (23-18) ---------------------------------------------
+
+    fn sample_journal() -> crate::deploy::apply::journal::Journal {
+        use crate::deploy::apply::journal::{Journal, JournalPhase};
+        Journal {
+            schema_version: 1,
+            run_id: "run-1".to_string(),
+            gateway: "gw".to_string(),
+            mode: "prod".to_string(),
+            phase: JournalPhase::Writing,
+            pre_fingerprint: "0".repeat(64),
+            touched: vec!["ledger.json".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn read_journal_local_roundtrip() {
+        use crate::deploy::apply::journal::Journal;
+        use crate::deploy::ledger::{journal_location, journal_rel};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = LocalFsTransport::new(dir.path().to_path_buf(), "nodes.master");
+        let reader: &dyn TreeReader = &transport;
+
+        // no ign-deploy/ at all
+        assert_eq!(reader.read_journal("gw", "prod").await.expect("read"), None);
+
+        let journal = sample_journal();
+        let path = dir.path().join(journal_rel("gw", "prod"));
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, journal.to_bytes()).expect("write");
+
+        let bytes = reader
+            .read_journal("gw", "prod")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(bytes, journal.to_bytes());
+        let location = journal_location(LedgerRoot::DataDir, "gw", "prod");
+        assert_eq!(
+            Journal::parse(&location, &bytes, "gw", "prod").expect("parse"),
+            journal
+        );
+        // another mode is a different journal
+        assert_eq!(reader.read_journal("gw", "dev").await.expect("read"), None);
+    }
+
     // ---- F7: the commit's mutations are descriptor-relative (unix) --------
 
     #[cfg(unix)]
