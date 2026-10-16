@@ -2,19 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 23
-current_phase_name: Guarded Apply & Rollback
 status: planning
-stopped_at: "Phase 22 complete (UAT 2/2 passed); ready to plan Phase 23"
-last_updated: "2026-10-16T02:47:26.751Z"
-last_activity: 2026-10-15
-last_activity_desc: Phase 22 UAT passed, phase complete
+stopped_at: Phase 23 context gathered
+last_updated: "2026-10-16T03:39:07.611Z"
+last_activity: 2026-10-15 — Phase 22 complete, transitioned to Phase 23
 progress:
-  total_phases: 6
+  total_phases: 4
   completed_phases: 3
   total_plans: 31
   completed_plans: 31
-  percent: 50
+  percent: 100
 ---
 
 # Project State
@@ -112,9 +109,9 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-15
-**Stopped At:** Phase 22 complete, ready to plan Phase 23 (open with the hold-budget blocker)
-**Resume file:** None
+**Last session:** 2026-10-16T03:39:07.566Z
+**Stopped At:** Phase 23 context gathered
+**Resume file:** .planning/phases/23-guarded-apply-rollback/23-CONTEXT.md
 
 ## Decisions
 
