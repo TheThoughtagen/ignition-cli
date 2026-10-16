@@ -342,10 +342,39 @@ fn harden_dir(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-/// Owner-only access for a directory this module just created.
-#[cfg(not(unix))]
+/// Owner-only access for a directory this module just created: inheritance
+/// removed and a full-control grant (object and container inherit, so the
+/// files created inside are owner-only too) to `%USERNAME%` alone. A failed
+/// `icacls` refuses the run (the directory holds secrets).
+#[cfg(windows)]
+fn harden_dir(path: &Path) -> std::io::Result<()> {
+    let user = std::env::var("USERNAME")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "USERNAME is not set"))?;
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:(OI)(CI)F"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "icacls could not restrict the directory",
+        ))
+    }
+}
+
+/// No owner-only mechanism exists for this platform: refuse rather than
+/// create a directory for secrets that anyone could read.
+#[cfg(not(any(unix, windows)))]
 fn harden_dir(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no owner-only directory mode on this platform",
+    ))
 }
 
 /// The append-only `events.ndjson` of one run.
@@ -567,6 +596,25 @@ mod tests {
         assert_eq!(lines[0]["event"], "started");
         assert_eq!(lines[0]["count"], 2);
         assert!(lines[0]["t"].as_str().is_some_and(|t| t.ends_with('Z')));
+    }
+
+    /// The run directory's ACL names the current user and no broad group.
+    #[cfg(windows)]
+    #[test]
+    fn run_dir_created_private_windows() {
+        let repo = git_repo(Some(".ign/\n"));
+        let dir = RunDir::create(repo.path(), "gw", &id("r1")).expect("create");
+        let out = Command::new("icacls")
+            .arg(dir.path())
+            .output()
+            .expect("icacls runs");
+        let acl = String::from_utf8_lossy(&out.stdout).to_string();
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        assert!(acl.contains(&user), "{acl}");
+        for broad in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
+            assert!(!acl.contains(broad), "{broad} still has access: {acl}");
+        }
+        dir.write_json("run.json", &json!({"a": 1})).expect("write");
     }
 
     #[test]
