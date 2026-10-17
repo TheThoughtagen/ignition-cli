@@ -2124,6 +2124,48 @@ test wflwvm01_script_acl_and_reparse ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 141.83s
 ~~~
 
+## 23-20 PowerShell host ops
+
+Plan 23-20 needs no new gateway capture; it completes `commit.ps1` on the host 23-08 captured. These blocks are the live evidence for the ops 23-08 did not build, taken on `ign-win-836` (Windows PowerShell 5.1.20348, Win32-OpenSSH, `svc-ignition-deploy`) on 2026-10-17. Nothing here touched the gateway REST, the real `production` collection or the trial: every run worked in the scratch gateway `ign-live-scratch\data` below the account home.
+
+Command: `IGNITION_LIVE_WFLWVM01=1 cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_ps_ops -- --ignored --nocapture`, run 2026-10-17T21:47Z.
+
+~~~
+CAPTURE ps ops @ 2026-10-17T21:47:39Z
+TIMING probe (one script call): 5.67s
+CAPTURE probe: ProbeReport { writable: true, problems: [] }
+CAPTURE probe with CreateFiles denied: ProbeReport { writable: false, problems: ["the mode collection is not writable"] }
+TIMING fingerprint of a held file (bounded retries): 7.55s
+CAPTURE fingerprint of a held file: transport failed (fingerprint) on nodes.master: ignition/database-connection/Existing/config.json could not be read because another process holds it open; nothing was changed
+TIMING read_record (sftp get): 15.32s
+TIMING fetch_snapshot (sftp): 24.65s
+CAPTURE fetch_snapshot: {"files/ignition/database-connection/Doomed/config.json": "ea9eea61...", "files/ignition/database-connection/ReplaceMe/config.json": "79384ec1...", "record.json": "d0f93919..."}
+TIMING finalize (one script call): 13.79s
+TIMING mirror commit (one script call): 5.64s
+CAPTURE acl of a file the mirror moved in: protected False, "NT AUTHORITY\\SYSTEM:FullControl:Allow:I:None | BUILTIN\\Administrators:FullControl:Allow:I:None | ignwin836\\svc-ignition-deploy:FullControl:Allow:I:None"
+TIMING mirror commit over a held target: 9.26s
+CAPTURE mirror over a held target: transport failed (commit) on nodes.master: the commit stopped at ignition/database-connection/MirrorNew/config.json: write 0: cannot move the file into place; 0 of 1 files were written and 0 deleted, and nothing was rolled back
+CAPTURE mirror with the staged copy a hard link of the live file: Ok(MirrorReport { written: ["ignition/database-connection/MirrorNew/config.json"], deleted: [], removed_dirs: [] })
+cleanup: scratch gone true, staging gone true
+TIMING wflwvm01_ps_ops total: 581.79s
+PASS wflwvm01_ps_ops
+~~~
+
+The same session ran the whole test binary of `deploy_host_conformance` (47 tests: the shared table against the local host and against the PowerShell host, the PowerShell-only rows, the fault rows) and the `ignition-core` unit tests, both built for `x86_64-pc-windows-msvc` with `cargo xwin` on the Mac, copied to the account home and run there by ssh: the conformance binary 47 passed, 0 failed; the library tests 906 passed, 13 failed, every one of the 13 a `run_store` test that starts `git` (the VM has no git: `program not found`); `winps::tests::stub_refuses_hash_mismatch` passed. An earlier run of the same binary had three failures, all in the test code (a `\` in `tree_names`, a `/` in the path given to `mklink`, a control file made by the test process); they are fixed in `deploy_host_conformance.rs`.
+
+Two facts found while writing the tests:
+
+~~~
+$ icacls on a directory made by an ssh-session process, and a file made inside it by .NET and by cmd
+...\acl-probe\a\b                SYSTEM:(OI)(CI)(F)   Administrators:(OI)(CI)(F)   ignwin836\svc-ignition-deploy:(OI)(CI)(F)
+...\acl-probe\a\b\net.txt       SYSTEM:(F)           Administrators:(F)           ignwin836\svc-ignition-deploy:(F)
+...\acl-probe\a\b\cmd.txt       SYSTEM:(F)           Administrators:(F)           ignwin836\svc-ignition-deploy:(F)
+
+$ echo pwd | sftp -q -b - -D C:\Windows\System32\OpenSSH\sftp-server.exe
+sftp> pwd
+Remote working directory: /C:/Users/svc-ignition-deploy
+~~~
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above, not a hypothesis. Later plans read these entries by id.
@@ -2198,3 +2240,15 @@ Rests on `## C7b` (run 1 for the access list before the ACL step, run 2 for ever
 - **The longest path sftp can reach below the account home (Pitfalls 7 and 8, C7a-8).** A file at a native path of 259 characters is listed by `ls` of its directory and served by `get` (exit 0); at 260, 261 and 270 the listing omits it and `get` fails (exit 1; the listing of the 270-character directory itself fails). The checked lengths were 200, 230, 240, 250, 255, 258, 259, 260, 261 and 270, with 80-character directory components. **The limit is 259 characters, the C7a-8 limit, measured here for files below the home.** `WINDOWS_SNAPSHOT_PATH_MAX = 259` in `sftp/apply_ops.rs`. The Windows `probe_paths` refuses, in Rust and before any write, a touched path whose snapshot (`snapshots\<run>\files\<path>`) or staging (`staging\<run>\files\<path>`) copy below the account home would be longer than that, naming the path, as a `write_host` preflight failure; the longer prefix, `snapshots`, decides.
 - **Hold budget (for 23-10).** One script call moved 152 files in 6.92 s here; the call count is one per apply, the per-file cost is about 45 ms, of which the ACL reset is a part. 23-10 re-measures the p95 over 152 and 1,520 files for D-02.
 - **Access lists of what the script creates, and links (review follow-up, run 3).** The journal, ledger, snapshots, record, staging and moved files below the account home carry only the home's entries (28 files and directories checked: no entry at all for `Users`, `Everyone` or `Authenticated Users`). Files moved into the real `production` collection end with the collection's own inherited list, whose only broad entry is `BUILTIN\Users` ReadAndExecute (asserted: no write-capable entry for a broad principal). A restore whose directory had become a junction failed with `restore 0: the live path is not a regular file` and changed nothing at the link's target; a commit whose new file would go through a junction stopped at the pre-image check and wrote nothing through it.
+
+### 23-20
+
+Rests on `## 23-20 PowerShell host ops`.
+
+- **`probe` reads the access list, it does not write into the collection.** The gateway watches the collection, so a probe file there could be picked up. `CanAddFile` evaluates the directory's access rules against the account's own token (user and groups, an explicit deny wins, a rule that only inherits to children is skipped) for the create-file right. An explicit `CreateFiles` deny on `production` made the probe answer "the mode collection is not writable" and nothing changed. The `ign-deploy` side is written (a probe file created and removed): the deploy directories are ours. Limit: the right checked is create-file only; a collection where the account may create but not delete would pass the probe and fail the first replacing move (reported as `write N: cannot move the file into place` at phase `writing`, restorable).
+- **`fingerprint` of a file another process holds without sharing is a refusal** (`held`, after the bounded retries, naming the path), not `None` and not a hash of something else. A directory where a file should be is `not_regular`. Read-only: the collection and the deploy directory are unchanged after both.
+- **`mirror` moves through the commit path's `MoveOne`:** a file moved into the collection ends with inherited entries only (`protected False`, every entry `I`); a target held with `FileShare.Read` stops the move after the bounded retries with `write 0: cannot move the file into place` and nothing rolled back; the same commit works once the file is free; a staged copy that is a second name (hard link) for the live file does not lose the file (the move reports success and the bytes are unchanged), which differs from `sh`, where the inode comparison refuses it. Two staging modes (`Separate` at the Decision B(i) root, `InPlace` through a control directory) both ran.
+- **A file made by a process of an ssh session is not a model of a gateway-made file:** it gets explicit entries (`(F)`, no `(I)`) from the process's default access list although the directory has inheritable entries. The conformance test therefore asserts that a moved file has only inherited entries, and does not compare it with a file the test made.
+- **`fetch_snapshot` at the 259-character limit works** (a snapshot path of exactly `WINDOWS_SNAPSHOT_PATH_MAX`; hash equal to the pre-image) and `probe_paths` refuses the 260th; `read_record` of another run is `None`; `finalize` installs the final record, removes the journal and the run's staging and keeps the snapshot, and a restore of the finalized record still returns the pre-run listing; `discard_interrupted` drops a run whose journal says it never moved a file and refuses (`deploy_run_invalid`) a run that did.
+- **`sftp -D <sftp-server.exe>` works on a Win32-OpenSSH host** (the first sftp command answered `Remote working directory: /C:/Users/...`), so the windows-latest conformance rows can use the runner's own `C:\Windows\System32\OpenSSH\sftp-server.exe` if the runner has it. Not verified for windows-latest itself.
+

@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-08-PLAN.md
-last_updated: "2026-10-17T21:10:59.746Z"
+stopped_at: Completed 23-20-PLAN.md
+last_updated: "2026-10-17T22:53:04.927Z"
 last_activity: 2026-10-17
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 45
-  percent: 87
+  completed_plans: 46
+  percent: 88
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 15 of 21
+Plan: 16 of 21
 Status: Ready to execute
 Last activity: 2026-10-17
 
-Progress: [█████████░] 87%
+Progress: [█████████░] 88%
 
 ## Performance Metrics
 
@@ -89,6 +89,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P11 | ~40min | 2 tasks | 4 files |
 | Phase 23 P12 | 2h | 2 tasks | 7 files |
 | Phase 23 P08 | 2h40m | 2 tasks | 12 files |
+| Phase 23 P20 | 1h45m | 2 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -126,8 +127,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-17T21:10:59.565Z
-**Stopped At:** Completed 23-08-PLAN.md
+**Last session:** 2026-10-17T22:53:04.912Z
+**Stopped At:** Completed 23-20-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -201,3 +202,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 23]: 23-11: manual rollback cause is Option<RollbackCause> (None = manual); restore_snapshot takes a RestoreContext; rollback result carries restart_pending and restart_pending_new; run_rollback re-runs check_rollback
 - [Phase 23]: 23-12: the run's own journal selects recovery in check_rollback; D-10 clear only before the first move with the pre-run fingerprint; the snapshot is hashed before a recovery restores; a commit Err over this run's journal is reported as deploy_journal_present (no restore on a guess)
 - [Phase ?]: 23-08: Windows stub runs the hashed commit.ps1 text through [ScriptBlock]::Create (-File fails under AllSigned/Restricted); moved files get an ACL reset; a target that cannot be read is refused as held before any move; WINDOWS_SNAPSHOT_PATH_MAX = 259
+- [Phase ?]: [23-20] commit.ps1 has every op commit.sh has; the Windows probe reads the collection's access list against the account's token and never writes into it; a held file is the refusal 'held' for fingerprint as for commit; the Windows mirror commit is one script call and the per-file rename path is gone; apply_host_for_node hands a Windows ssh node the sftp host (commit 76107ed); the conformance table passed 47 of 47 on a real Windows host built with cargo xwin, windows-latest is still to run
