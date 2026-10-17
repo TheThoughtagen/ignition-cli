@@ -3957,3 +3957,76 @@ async fn journal_recover_twice_refuses() {
     only_reads(&second);
     assert_eq!(collection_state(&rig), killed.before);
 }
+
+/// 23-17 carry-over: over ssh a dropped connection mid-commit is an `Err`
+/// with the on-box state unknown. The engine must not call that "nothing was
+/// written": the journal stays, the run is reported as interrupted with the
+/// recovery command, and nothing is restored on a guess (the remote script
+/// may still be running).
+#[tokio::test]
+async fn journal_commit_error_after_moves_reports_the_interrupted_run() {
+    // One file moved, then the move failed: the journal is at `writing`.
+    let rig = changing_rig_faulted(Vec::new(), Some(ApplyFault::FailMoveAt(1))).await;
+    let before = collection_state(&rig);
+    let host = rig.host.clone().fail_after("commit", 1);
+    let rig = Rig { host, ..rig };
+
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("a commit that errs is not an applied run");
+    let journal = read_journal(&rig);
+    assert_eq!(journal.phase, JournalPhase::Writing, "the journal stays");
+    assert_recovery_hint(&err, &journal.run_id);
+    let torn = collection_state(&rig);
+    assert_ne!(torn, before, "a file had moved");
+
+    // Nothing was restored or finalized on a guess, and no scan was made.
+    let calls = rig.host.calls();
+    assert!(
+        !calls.contains(&"restore") && !calls.contains(&"finalize"),
+        "{calls:?}"
+    );
+    assert_eq!(rig.fake.scan_count(), 0);
+
+    // The run directory says what happened, including the original failure.
+    let result = failed_result(&rig);
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "deploy_journal_present");
+    let run_dir = rig
+        .repo
+        .join(".ign/deploy")
+        .join(GATEWAY)
+        .join(&journal.run_id);
+    let interrupted = event_lines(&run_dir, "commit_interrupted");
+    assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+    assert_eq!(interrupted[0]["code"], "transport_failed");
+
+    // And `rollback --run` recovers it.
+    let (_, recovered) = recover(&rig, &journal.run_id).await;
+    let recovered = recovered.expect("recovered");
+    assert_eq!(recovered.outcome, RollbackKind::Restored);
+    assert_eq!(collection_state(&rig), before);
+    assert!(!journal_path(&rig).exists());
+}
+
+#[tokio::test]
+async fn journal_commit_error_with_nothing_on_the_box_stays_the_original_error() {
+    // The host never ran: no journal, so "nothing was written" is true and the
+    // transport failure is what the caller gets.
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let host = rig.host.clone().fail("commit", 1);
+    let rig = Rig { host, ..rig };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let err = rig
+        .run(prepared, &NoObserver)
+        .await
+        .expect_err("the commit failed");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(!journal_path(&rig).exists());
+    assert_eq!(collection_state(&rig), before);
+    let result = failed_result(&rig);
+    assert_eq!(result["error"]["code"], "transport_failed");
+}

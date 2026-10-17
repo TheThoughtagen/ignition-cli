@@ -6,6 +6,8 @@
 //!
 //! - fail `commit`, `restore` or `finalize` on their nth invocation (the inner
 //!   host is not called, so the host state stays as it was),
+//! - run the nth invocation to its end and then fail it, the way a dropped
+//!   ssh connection fails a call whose work was done on the box,
 //! - hang the nth invocation at an await point a test can abort,
 //! - run an async hook after the nth invocation returned and before the
 //!   caller sees its result (tick a fake gateway past the hold, rewrite a
@@ -41,6 +43,7 @@ struct State {
     /// Every call, in order.
     log: Vec<&'static str>,
     fails: BTreeSet<(&'static str, usize)>,
+    fail_afters: BTreeSet<(&'static str, usize)>,
     hangs: BTreeMap<(&'static str, usize), Arc<Notify>>,
     hooks: BTreeMap<(&'static str, usize), Vec<Hook>>,
 }
@@ -48,6 +51,7 @@ struct State {
 /// What a call does, decided when it is entered.
 enum Plan {
     Fail,
+    RunThenFail,
     Hang(Arc<Notify>),
     Run(Vec<Hook>),
 }
@@ -84,6 +88,15 @@ impl<H: ApplyHost> FaultyHost<H> {
     /// inner host is not called.
     pub fn fail(self, call: &'static str, nth: usize) -> Self {
         self.state().fails.insert((call, nth));
+        self
+    }
+
+    /// Run invocation `nth` (from 1) of `call` on the inner host, then fail it
+    /// with `transport_failed` whatever the inner call returned: what the
+    /// caller sees when the connection drops after the work was done (or
+    /// part of it). The inner host's state is whatever the call left.
+    pub fn fail_after(self, call: &'static str, nth: usize) -> Self {
+        self.state().fail_afters.insert((call, nth));
         self
     }
 
@@ -129,6 +142,9 @@ impl<H: ApplyHost> FaultyHost<H> {
         if state.fails.contains(&(call, nth)) {
             return Plan::Fail;
         }
+        if state.fail_afters.contains(&(call, nth)) {
+            return Plan::RunThenFail;
+        }
         if let Some(notify) = state.hangs.get(&(call, nth)) {
             return Plan::Hang(notify.clone());
         }
@@ -149,6 +165,14 @@ impl<H: ApplyHost> FaultyHost<H> {
                 node: "faulty-host".to_string(),
                 detail: "injected fault".to_string(),
             }),
+            Plan::RunThenFail => {
+                let _ = run(self.inner.clone()).await;
+                Err(CoreError::TransportFailed {
+                    operation: call.to_string(),
+                    node: "faulty-host".to_string(),
+                    detail: "the connection dropped after the call ran".to_string(),
+                })
+            }
             Plan::Hang(notify) => {
                 notify.notify_one();
                 std::future::pending::<Result<T, CoreError>>().await
