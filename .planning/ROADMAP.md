@@ -422,7 +422,7 @@ Plans:
 
 **Wave 12** *(blocked on Wave 11 completion)*
 
-- [ ] 23-12-PLAN.md — Journal recovery: refusals with the exact command, D-10 clear, D-11, D-12 guidance, crash simulation (DAPL-09)
+- [x] 23-12-PLAN.md — Journal recovery: refusals with the exact command, D-10 clear, D-11, D-12 guidance, crash simulation (DAPL-09)
 
 **Wave 13** *(blocked on Wave 12 completion; first plan that needs the Windows host)*
 
@@ -515,7 +515,7 @@ Plans:
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
-| 23. Guarded Apply & Rollback | v1.6 | 12/21 | In Progress|  |
+| 23. Guarded Apply & Rollback | v1.6 | 13/21 | In Progress|  |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
