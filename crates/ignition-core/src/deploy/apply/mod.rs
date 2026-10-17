@@ -410,6 +410,9 @@ pub enum ApplyEvent {
     },
     /// The restore finished (23-17).
     Restored,
+    /// A recovery removed an interrupted run that had changed nothing
+    /// (23-12, D-10).
+    Cleared,
     /// A rollback found that the run it recovers was interrupted (23-12,
     /// D-09, D-11): the journal's phase, what recovery will do and the live
     /// hash of each path of the journal's touched list (`None` when absent).
@@ -465,6 +468,7 @@ impl ApplyEvent {
             ApplyEvent::Finalized => "finalized",
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
+            ApplyEvent::Cleared => "cleared",
             ApplyEvent::InterruptedRun { .. } => "interrupted_run",
             ApplyEvent::LiveChangesDiscarded { .. } => "live_changes_discarded",
             ApplyEvent::PreflightChecks { .. } => "preflight_checks",
@@ -531,6 +535,7 @@ impl ApplyEvent {
             ApplyEvent::ScanDone
             | ApplyEvent::Finalized
             | ApplyEvent::Restored
+            | ApplyEvent::Cleared
             | ApplyEvent::GwbkSkipped => Value::Null,
         }
     }

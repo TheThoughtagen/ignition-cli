@@ -14,12 +14,13 @@ use crate::deploy::apply::gates::{
     GateFlags, GateOutcome, evaluate_gates, validate_drift_reason, validate_plan_sha256,
 };
 use crate::deploy::apply::host::ApplyHost;
+use crate::deploy::apply::journal::RecoveryAction;
 use crate::deploy::apply::record::RunRecord;
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::apply::{
     ApplyContext, ApplyOptions, InterruptedRun, OutcomeKind, ROLLED_BACK_SLUG, RollbackCause,
-    RollbackContext, RollbackKind, RollbackOptions, check_rollback, restore_set, run_apply,
-    run_rollback,
+    RollbackChecked, RollbackContext, RollbackKind, RollbackOptions, check_rollback, restore_set,
+    run_apply, run_rollback,
 };
 use crate::deploy::plan::PlanSummary;
 use crate::deploy::target::Target;
@@ -205,8 +206,15 @@ pub struct RollbackPrepareOptions {
 /// What `deploy_rollback_prepare` found: the rollback may go ahead.
 #[derive(Debug, Clone)]
 pub struct RollbackPrepared {
-    /// The on-box record of the run, at state `applied`.
-    pub record: RunRecord,
+    /// The run to roll back or recover (`--run`).
+    pub run_id: String,
+    /// The on-box record of the run: at state `applied` for a rollback; for
+    /// the recovery of an interrupted run at any state, or `None` when the
+    /// record is lost.
+    pub record: Option<RunRecord>,
+    /// Set when the run's own journal is on the box: this is its recovery
+    /// (D-09), which restores or clears (D-10).
+    pub interrupted: Option<InterruptedRun>,
     /// The confirmation text: run, gateway, mode, counts and `plan_sha256`.
     pub prose: String,
     /// Touched paths changed since the run (only with
@@ -254,16 +262,15 @@ pub struct DeployRollbackResult {
 }
 
 /// The confirmation prose of a rollback: byte-stable, no file content.
-fn rollback_prose(
-    record: &RunRecord,
-    live_changed: &[String],
-    interrupted: Option<&InterruptedRun>,
-) -> String {
-    let (restored, deleted) = restore_set(record);
+fn rollback_prose(run_id: &str, target: &Target, checked: &RollbackChecked) -> String {
+    let record = checked.record.as_ref();
+    let (restored, deleted) = record.map(restore_set).unwrap_or_default();
     let ledger = record
-        .touched
-        .iter()
-        .find(|e| e.path == crate::deploy::apply::fingerprint::LEDGER_KEY)
+        .and_then(|r| {
+            r.touched
+                .iter()
+                .find(|e| e.path == crate::deploy::apply::fingerprint::LEDGER_KEY)
+        })
         .map(|e| {
             if e.pre_sha256.is_some() {
                 ", and restore the ledger"
@@ -272,37 +279,52 @@ fn rollback_prose(
             }
         })
         .unwrap_or("");
-    let mut prose = match interrupted {
-        Some(found) => format!(
-            "Recover run {} on gateway {} (mode {}), which was interrupted at phase {}: \
+    let mut prose = match (&checked.interrupted, record) {
+        (Some(found), _) if found.action == RecoveryAction::ClearWithoutRestore => format!(
+            "Clear run {run_id} on gateway {} (mode {}), which was interrupted at phase {} \
+             before any file moved and whose touched files are as they were before the run: \
+             remove its journal, partial snapshot and staging. Nothing is restored.",
+            target.gateway,
+            target.mode,
+            found.journal.phase.as_str(),
+        ),
+        (Some(found), Some(record)) => format!(
+            "Recover run {run_id} on gateway {} (mode {}), which was interrupted at phase {}: \
              restore {} file(s) from the on-box snapshot and delete {} file(s) the run \
-             created{}, then remove the journal. The run was applying plan_sha256 {}.",
-            record.run_id,
-            record.gateway,
-            record.mode,
+             created{ledger}, then remove the journal. The run was applying plan_sha256 {}.",
+            target.gateway,
+            target.mode,
             found.journal.phase.as_str(),
             restored.len(),
             deleted.len(),
-            ledger,
             record.plan_sha256,
         ),
-        None => format!(
-            "Roll back run {} on gateway {} (mode {}): restore {} file(s) from the on-box snapshot \
-             and delete {} file(s) the run created{}. The run applied plan_sha256 {}.",
-            record.run_id,
-            record.gateway,
-            record.mode,
+        (Some(found), None) => format!(
+            "Recover run {run_id} on gateway {} (mode {}), which was interrupted at phase {} \
+             and whose record is missing: restore the touched files from the on-box snapshot, \
+             then remove the journal.",
+            target.gateway,
+            target.mode,
+            found.journal.phase.as_str(),
+        ),
+        (None, Some(record)) => format!(
+            "Roll back run {run_id} on gateway {} (mode {}): restore {} file(s) from the on-box \
+             snapshot and delete {} file(s) the run created{ledger}. The run applied \
+             plan_sha256 {}.",
+            target.gateway,
+            target.mode,
             restored.len(),
             deleted.len(),
-            ledger,
             record.plan_sha256,
         ),
+        (None, None) => format!("Roll back run {run_id} on gateway {}.", target.gateway),
     };
-    if !live_changed.is_empty() {
+    if !checked.live_changed.is_empty() {
         prose.push_str(&format!(
             " {} file(s) changed after the run and will be overwritten: {}.",
-            live_changed.len(),
-            live_changed
+            checked.live_changed.len(),
+            checked
+                .live_changed
                 .iter()
                 .take(crate::error::APPLY_LIST_SHOWN)
                 .cloned()
@@ -342,12 +364,10 @@ pub async fn deploy_rollback_prepare(
     )
     .await?;
     Ok(RollbackPrepared {
-        prose: rollback_prose(
-            &checked.record,
-            &checked.live_changed,
-            checked.interrupted.as_ref(),
-        ),
+        prose: rollback_prose(run_id.as_str(), &target, &checked),
+        run_id: run_id.as_str().to_string(),
         record: checked.record,
+        interrupted: checked.interrupted,
         live_changed: checked.live_changed,
         target,
         target_file,
@@ -360,7 +380,7 @@ pub async fn deploy_rollback_execute(
     ctx: &RollbackContext<'_>,
     opts: &RollbackOptions,
 ) -> Result<DeployRollbackResult, CoreError> {
-    if prepared.record.run_id != opts.run_id.as_str() {
+    if prepared.run_id != opts.run_id.as_str() {
         return Err(CoreError::Internal(
             "the prepared rollback is for another run than the options name".to_string(),
         ));

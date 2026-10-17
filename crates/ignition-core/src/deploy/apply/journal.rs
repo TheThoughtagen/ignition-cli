@@ -26,10 +26,12 @@
 //! `deploy_run_invalid` naming the location and the problem, never a file
 //! value beyond a listed path, and never a fallback to a default (T-23-11).
 
+use std::collections::BTreeMap;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::fingerprint::LEDGER_KEY;
+use super::fingerprint::{LEDGER_KEY, fingerprint};
 use super::run_store::RunId;
 use crate::deploy::layout::RelPath;
 use crate::deploy::ledger::LedgerRoot;
@@ -156,6 +158,44 @@ impl Journal {
     /// The canonical bytes: pretty JSON in field order plus one LF.
     pub fn to_bytes(&self) -> Vec<u8> {
         canonical_bytes(self)
+    }
+}
+
+/// What recovering an interrupted run does (D-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// No move began and the touched set is what it was before the run:
+    /// remove the journal, the partial snapshot and the staging, and restore
+    /// nothing.
+    ClearWithoutRestore,
+    /// Put the snapshot back, scan, then remove the journal.
+    Restore,
+}
+
+impl RecoveryAction {
+    /// The action's name in the recovery run's events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveryAction::ClearWithoutRestore => "clear",
+            RecoveryAction::Restore => "restore",
+        }
+    }
+}
+
+/// Decide the recovery of `journal` from `live`, the live hash of each path of
+/// its touched list (`None` when absent). A journal whose phase is before the
+/// first move and whose live fingerprint equals its pre-run fingerprint died
+/// before it changed anything; every other journal is restored (D-10). There
+/// is no third answer: nothing discards a journal that might sit over a
+/// partial tree (D-12).
+pub fn recovery_action(
+    journal: &Journal,
+    live: &BTreeMap<String, Option<String>>,
+) -> RecoveryAction {
+    if journal.phase.before_first_move() && fingerprint(live) == journal.pre_fingerprint {
+        RecoveryAction::ClearWithoutRestore
+    } else {
+        RecoveryAction::Restore
     }
 }
 

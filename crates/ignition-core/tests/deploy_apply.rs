@@ -2853,9 +2853,10 @@ async fn rollback_fresh_process_from_record_only() {
         .prepare(&rig, &target_run, false)
         .await
         .expect("prepare");
-    assert_eq!(prepared.record.state, RecordState::Applied);
+    let record = prepared.record.as_ref().expect("a record");
+    assert_eq!(record.state, RecordState::Applied);
     assert!(prepared.prose.contains(&target_run), "{}", prepared.prose);
-    assert!(prepared.prose.contains(&prepared.record.plan_sha256));
+    assert!(prepared.prose.contains(&record.plan_sha256));
     assert!(prepared.live_changed.is_empty());
     let result = fresh
         .run(&rig, prepared, &target_run, false)
@@ -3865,7 +3866,7 @@ async fn journal_without_record_recovers() {
     assert_eq!(collection_state(&rig), killed.before);
     assert_eq!(
         result.restored,
-        [DB_CONFIG.to_string()],
+        [DB_CONFIG.to_string(), DB_RESOURCE.to_string()],
         "the pre-images the snapshot holds"
     );
     assert_eq!(
@@ -3895,15 +3896,11 @@ async fn journal_after_green_verify_restores() {
     // documented safe direction.
     let killed = killed_before_finalize().await;
     let (rig, run_id) = (killed.rig.clone(), killed.journal.run_id.clone());
-    let events = event_names(&PathBuf::from(
-        rig.repo.join(".ign/deploy").join(GATEWAY).join(&run_id),
-    ));
+    let killed_dir = rig.repo.join(".ign/deploy").join(GATEWAY).join(&run_id);
+    let events = event_names(&killed_dir);
     assert!(events.contains(&"verify_done".to_string()), "{events:?}");
     assert!(!events.contains(&"finalized".to_string()), "{events:?}");
-    let verified = event_lines(
-        &rig.repo.join(".ign/deploy").join(GATEWAY).join(&run_id),
-        "verify_done",
-    );
+    let verified = event_lines(&killed_dir, "verify_done");
     assert_eq!(verified[0]["ok"], true, "the verify was green");
 
     let (_, result) = recover(&rig, &run_id).await;

@@ -57,9 +57,11 @@ use serde_json::{Value, json};
 use super::fingerprint::{LEDGER_KEY, fingerprint};
 use super::hold::{Clock, HeldLock, HoldModel};
 use super::host::ApplyHost;
-use super::journal::{Journal, journal_on_box, journal_present};
+use super::journal::{
+    Journal, RecoveryAction, journal_location, journal_on_box, journal_present, recovery_action,
+};
 use super::preflight::{DesignersPolicy, PreflightInput, run_preflights};
-use super::record::{RECORD_FILE, RecordState, RunRecord};
+use super::record::{RECORD_FILE, RecordState, RunRecord, TouchedEntry};
 use super::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use super::{
     ApplyEvent, ApplyObserver, RestoreContext, RestoreInput, Steps, restart_report,
@@ -69,9 +71,10 @@ use crate::actions::workspace::rfc3339_now_utc;
 use crate::client::scan::ScanKind;
 use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::component_problem;
+use crate::deploy::ledger::LedgerRoot;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
-use crate::error::{APPLY_LIST_SHOWN, CoreError};
+use crate::error::{APPLY_LIST_SHOWN, CoreError, RollbackFailure};
 use crate::poll::PollConfig;
 
 /// The largest local `run.json` or `plan.json` read for the cross-check.
@@ -83,6 +86,10 @@ const LOCAL_FILE_MAX_BYTES: u64 = 8_388_608;
 pub enum RollbackKind {
     /// The run's pre-apply files are back and the gateway was scanned.
     Restored,
+    /// The recovered run had not changed anything (D-10): its journal, partial
+    /// snapshot and staging were removed, nothing was restored and no scan
+    /// was made.
+    Cleared,
 }
 
 /// What a rollback drives. The target file names the gateway, the mode and
@@ -133,8 +140,9 @@ pub struct RollbackOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackChecked {
     /// The on-box record of the run: at state `applied` for a rollback, at
-    /// any state for the recovery of an interrupted run.
-    pub record: RunRecord,
+    /// any state for the recovery of an interrupted run, and `None` only for
+    /// an interrupted run whose record was never written or is lost.
+    pub record: Option<RunRecord>,
     /// Touched paths whose live hash is not the record's post-run hash,
     /// byte-sorted. Only ever non-empty when the caller discards them.
     pub live_changed: Vec<String>,
@@ -152,6 +160,8 @@ pub struct InterruptedRun {
     /// recovery looked (`None` when absent): the torn state, recorded in the
     /// recovery run's events (D-11).
     pub live: BTreeMap<String, Option<String>>,
+    /// What recovery will do with it (D-10).
+    pub action: RecoveryAction,
 }
 
 /// How a manual rollback ended and what it did.
@@ -266,7 +276,7 @@ pub async fn check_rollback(
         });
     }
     Ok(RollbackChecked {
-        record,
+        record: Some(record),
         live_changed,
         interrupted: None,
     })
@@ -284,12 +294,13 @@ async fn read_run_record(
     })
 }
 
-/// The recovery of the run whose own journal is on the box (D-09, D-11).
+/// The recovery of the run whose own journal is on the box (D-09 to D-11).
 ///
 /// The tree may be partial, so the post-apply staleness check is skipped:
 /// there is no post-apply fingerprint to compare with and nothing is refused
-/// for live changes. The record may be at `applying` (the usual case), the
-/// journal's touched list and the record must agree.
+/// for live changes. The record may be at any state, or absent (Pitfall 14);
+/// when it is there it must agree with the journal. Recovery never depends on
+/// the record's post part.
 async fn check_interrupted(
     repo: &Path,
     target: &Target,
@@ -298,33 +309,35 @@ async fn check_interrupted(
     journal: Journal,
 ) -> Result<RollbackChecked, CoreError> {
     let id = run_id.as_str();
-    let Some(record) = read_run_record(host, run_id).await? else {
-        return Err(invalid(
-            id,
-            format!("the host has no {RECORD_FILE} for this run (snapshots/{id}/{RECORD_FILE})"),
-        ));
-    };
-    validate_identity(&record, target, run_id)?;
-    validate_pre(&record)?;
-    if journal.pre_fingerprint != record.pre_fingerprint
-        || journal.touched
-            != record
-                .touched
-                .iter()
-                .map(|e| e.path.clone())
-                .collect::<Vec<_>>()
-    {
-        return Err(invalid(
-            id,
-            "the journal and the record do not describe the same run",
-        ));
+    let record = read_run_record(host, run_id).await?;
+    if let Some(record) = &record {
+        validate_identity(record, target, run_id)?;
+        validate_pre(record)?;
+        if journal.pre_fingerprint != record.pre_fingerprint
+            || journal.touched
+                != record
+                    .touched
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(invalid(
+                id,
+                "the journal and the record do not describe the same run",
+            ));
+        }
+        cross_check_local(repo, record)?;
     }
-    cross_check_local(repo, &record)?;
     let live = host.fingerprint(&journal.touched).await?;
+    let action = recovery_action(&journal, &live);
     Ok(RollbackChecked {
         record,
         live_changed: Vec::new(),
-        interrupted: Some(InterruptedRun { journal, live }),
+        interrupted: Some(InterruptedRun {
+            journal,
+            live,
+            action,
+        }),
     })
 }
 
@@ -550,25 +563,49 @@ async fn drive(
     run_dir: &RunDir,
     steps: &mut Steps<'_>,
 ) -> Result<RollbackOutcome, CoreError> {
-    let record = &checked.record;
     let target = ctx.target;
-    let (restored, deleted) = restore_set(record);
 
     let started_at = rfc3339_now_utc();
     steps.log = Some(EventLog::open(run_dir)?);
+    // The counts of the record; a recovery whose record is lost does not know
+    // them yet and reports zero until the snapshot has been read.
+    let (writes, deletes) = checked.record.as_ref().map(restore_set).unwrap_or_default();
     steps.emit(ApplyEvent::RunStarted {
         run_id: run_id.as_str().to_string(),
-        writes: restored.len(),
-        deletes: deleted.len(),
+        writes: writes.len(),
+        deletes: deletes.len(),
     })?;
-    if let Some(found) = &checked.interrupted {
+    let interrupted = checked.interrupted.as_ref();
+    if let Some(found) = interrupted {
         // The torn state the recovery found, by path and hash (D-11).
         steps.emit(ApplyEvent::InterruptedRun {
             phase: found.journal.phase.as_str(),
-            action: "restore",
+            action: found.action.as_str(),
             hashes: found.live.clone(),
         })?;
+        if found.action == RecoveryAction::ClearWithoutRestore {
+            return clear_run(ctx, opts, checked, run_id, run_dir, steps, &started_at).await;
+        }
     }
+
+    // What the restore puts back: the record when there is one; otherwise (a
+    // recovery whose record is lost) the snapshot itself, checked against the
+    // journal's pre-run fingerprint. A recovery reads the snapshot before it
+    // restores anything, so a lost or damaged one is `rollback_failed` with
+    // nothing half restored (D-12).
+    let record = match (interrupted, &checked.record) {
+        (Some(found), record) => {
+            snapshot_record(ctx, opts, run_dir, found, record.as_ref()).await?
+        }
+        (None, Some(record)) => record.clone(),
+        (None, None) => {
+            return Err(CoreError::Internal(
+                "a rollback of a finished run has no record".to_string(),
+            ));
+        }
+    };
+    let record = &record;
+    let (restored, deleted) = restore_set(record);
 
     let preflights = run_preflights(
         &PreflightInput {
@@ -606,7 +643,8 @@ async fn drive(
             "hold_s": opts.hold.hold_s,
             "discard_live_changes": opts.discard_live_changes,
             "discarded_live_changes": checked.live_changed,
-            "interrupted_phase": checked.interrupted.as_ref().map(|i| i.journal.phase.as_str()),
+            "interrupted_phase": interrupted.map(|i| i.journal.phase.as_str()),
+            "recovery": interrupted.map(|i| i.action.as_str()),
             "designers": opts.designers.mode.as_str(),
             "designers_timeout_s": opts.designers.timeout.as_secs(),
             "designers_seen": seen.map(|r| r.designers_seen
@@ -709,5 +747,191 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256: report.snapshot_sha256,
+    })
+}
+
+/// The zero hash: what a recovery writes for the hashes of a plan and
+/// a render it never saw (the record was lost).
+const UNKNOWN_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// How the snapshot spells `path`: the ledger is `ledger.json`, a collection
+/// file is `files/<path>`.
+fn snapshot_key(path: &str) -> String {
+    if path == LEDGER_KEY {
+        LEDGER_KEY.to_string()
+    } else {
+        format!("files/{path}")
+    }
+}
+
+/// `a, b and N more`, at most [`APPLY_LIST_SHOWN`] named.
+fn named(paths: &[String]) -> String {
+    let shown = paths.len().min(APPLY_LIST_SHOWN);
+    let mut out = paths[..shown].join(", ");
+    if paths.len() > shown {
+        out.push_str(&format!(" and {} more", paths.len() - shown));
+    }
+    out
+}
+
+/// Read the interrupted run's snapshot from the host and return the record to
+/// restore from.
+///
+/// The snapshot is copied into a scratch directory below this run's directory
+/// (private, removed straight away) and every file hashed. With a record, each
+/// pre-image the record lists must be there with its hash. Without one, the
+/// pre-run state is what the snapshot holds, and it must hash to the journal's
+/// `pre_fingerprint`, which is how an incomplete snapshot is told from a
+/// created file. A snapshot that is missing, incomplete or fails its hashes is
+/// `rollback_failed` (D-12): the journal stays and nothing is restored.
+async fn snapshot_record(
+    ctx: &RollbackContext<'_>,
+    opts: &RollbackOptions,
+    run_dir: &RunDir,
+    found: &InterruptedRun,
+    record: Option<&RunRecord>,
+) -> Result<RunRecord, CoreError> {
+    let target = ctx.target;
+    let (gateway, mode) = (target.gateway.as_str(), target.mode.as_str());
+    let fail = |cause: String| {
+        CoreError::RollbackFailed(Box::new(RollbackFailure {
+            run_id: opts.run_id.as_str().to_string(),
+            run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
+            journal: journal_location(LedgerRoot::for_node(&target.nodes.master), gateway, mode),
+            cause,
+        }))
+    };
+
+    let scratch = run_dir.path().join("inspect");
+    std::fs::create_dir(&scratch)
+        .map_err(|e| fail(format!("cannot read the snapshot ({:?})", e.kind())))?;
+    let fetched = ctx.host.fetch_snapshot(&opts.run_id, &scratch).await;
+    // The copies were only for hashing; the run directory keeps the one the
+    // restore itself downloads.
+    let _ = std::fs::remove_dir_all(&scratch);
+    let hashes = fetched.map_err(|e| fail(format!("the snapshot cannot be read: {e}")))?;
+
+    if let Some(record) = record {
+        let bad: Vec<String> = record
+            .touched
+            .iter()
+            .filter_map(|entry| {
+                let pre = entry.pre_sha256.as_deref()?;
+                (hashes.get(&snapshot_key(&entry.path)).map(String::as_str) != Some(pre))
+                    .then(|| entry.path.clone())
+            })
+            .collect();
+        if !bad.is_empty() {
+            return Err(fail(format!(
+                "the snapshot is missing or damaged for {} path(s): {}",
+                bad.len(),
+                named(&bad)
+            )));
+        }
+        return Ok(record.clone());
+    }
+
+    let pre: BTreeMap<String, Option<String>> = found
+        .journal
+        .touched
+        .iter()
+        .map(|path| (path.clone(), hashes.get(&snapshot_key(path)).cloned()))
+        .collect();
+    if fingerprint(&pre) != found.journal.pre_fingerprint {
+        return Err(fail(
+            "the run's record is missing and the snapshot is incomplete: its files do not \
+             match the journal's pre-run fingerprint"
+                .to_string(),
+        ));
+    }
+    Ok(RunRecord {
+        schema_version: 1,
+        run_id: found.journal.run_id.clone(),
+        gateway: found.journal.gateway.clone(),
+        mode: found.journal.mode.clone(),
+        render_sha256: UNKNOWN_SHA256.to_string(),
+        plan_sha256: UNKNOWN_SHA256.to_string(),
+        state: RecordState::Applying,
+        rolled_back_by: None,
+        touched: found
+            .journal
+            .touched
+            .iter()
+            .map(|path| TouchedEntry {
+                path: path.clone(),
+                pre_sha256: pre.get(path).cloned().flatten(),
+                post_sha256: None,
+            })
+            .collect(),
+        pre_fingerprint: found.journal.pre_fingerprint.clone(),
+        post_fingerprint: None,
+    })
+}
+
+/// D-10: the run died before any move and the touched set is as it was. Drop
+/// the journal, the partial snapshot and the staging; no lock, no restore, no
+/// scan. The run directory still gets its `run.json` and `plan.json`.
+async fn clear_run(
+    ctx: &RollbackContext<'_>,
+    opts: &RollbackOptions,
+    checked: &RollbackChecked,
+    run_id: &RunId,
+    run_dir: &RunDir,
+    steps: &mut Steps<'_>,
+    started_at: &str,
+) -> Result<RollbackOutcome, CoreError> {
+    let target = ctx.target;
+    let phase = checked
+        .interrupted
+        .as_ref()
+        .map(|i| i.journal.phase.as_str());
+    run_dir.write_json(
+        "run.json",
+        &json!({
+            "schema_version": 1,
+            "kind": "rollback",
+            "run_id": run_id.as_str(),
+            "target_run_id": opts.run_id.as_str(),
+            "env": ctx.env,
+            "target_file": ctx.target_file,
+            "gateway": target.gateway,
+            "mode": target.mode,
+            "node": "master",
+            "started_at": started_at,
+            "run_dir_git": run_dir.git_status().as_record(),
+            "discard_live_changes": opts.discard_live_changes,
+            "discarded_live_changes": checked.live_changed,
+            "interrupted_phase": phase,
+            "recovery": RecoveryAction::ClearWithoutRestore.as_str(),
+        }),
+    )?;
+    run_dir.write_json(
+        "plan.json",
+        &json!({
+            "schema_version": 1,
+            "kind": "rollback",
+            "target_run_id": opts.run_id.as_str(),
+            "gateway": target.gateway,
+            "mode": target.mode,
+            "restore": Vec::<String>::new(),
+            "delete": Vec::<String>::new(),
+            "ledger": Value::Null,
+            "recovery": RecoveryAction::ClearWithoutRestore.as_str(),
+        }),
+    )?;
+    ctx.host.discard_interrupted(&opts.run_id).await?;
+    steps.emit(ApplyEvent::Cleared)?;
+    Ok(RollbackOutcome {
+        kind: RollbackKind::Cleared,
+        run_id: run_id.as_str().to_string(),
+        target_run_id: opts.run_id.as_str().to_string(),
+        run_dir: run_dir.path().to_string_lossy().into_owned(),
+        restored: Vec::new(),
+        deleted: Vec::new(),
+        discarded_live_changes: Vec::new(),
+        warnings: Vec::new(),
+        restart_pending: Vec::new(),
+        restart_pending_new: Vec::new(),
+        snapshot_sha256: BTreeMap::new(),
     })
 }
