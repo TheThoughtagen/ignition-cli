@@ -248,19 +248,30 @@ function ReplaceWith([string]$src, [string]$dst) {
     }
 }
 
-# reset_acl PATH: the file takes the access list its directory gives a new file
-# (inherited entries only). A file moved in from the account home otherwise
+# reset_acl BASE REL: the file takes the access list its directory gives a new
+# file (inherited entries only). A file moved in from the account home otherwise
 # keeps the list it had there: protected, with only SYSTEM, Administrators and
 # the deploy account, which is not what an untouched file of the collection has
-# (C7b).
-function ResetAcl([string]$pth) {
+# (C7b). The path is checked for a reparse point right before the descriptor is
+# set and again right after, so a link swapped in after the move is never
+# followed silently (the descriptor of its target would have been changed).
+function ResetAcl([string]$base, [string]$rel) {
+    if ((Classify $base $rel) -ne 'file') { throw 'the path is not a plain file' }
     $sec = New-Object Security.AccessControl.FileSecurity
     $sec.SetAccessRuleProtection($false, $false)
-    [IO.File]::SetAccessControl((Xp $pth), $sec)
+    [IO.File]::SetAccessControl((Xp (Sub $base $rel)), $sec)
+    if ((Classify $base $rel) -ne 'file') { throw 'the path changed under the descriptor change' }
 }
 
+# Remove a tree. .NET deletes a junction or symlink inside it as the link and
+# does not follow it into its target (Remove-Item -Recurse of Windows
+# PowerShell 5.1 can).
 function RemoveTree([string]$pth) {
-    if ((Attr $pth) -ge 0) { Remove-Item -LiteralPath (Xp $pth) -Recurse -Force }
+    $a = Attr $pth
+    if ($a -ge 0) {
+        if (IsLink $a) { [IO.Directory]::Delete((Xp $pth)) }
+        else { [IO.Directory]::Delete((Xp $pth), $true) }
+    }
 }
 
 # ---- the work list --------------------------------------------------------------
@@ -367,7 +378,7 @@ function CtlCleanup {
     if ($leaf.StartsWith('.ign-ctl-')) {
         $a = Attr $St
         if ((IsDir $a) -and -not (IsLink $a)) {
-            try { Remove-Item -LiteralPath (Xp $St) -Recurse -Force } catch { }
+            try { [IO.Directory]::Delete((Xp $St), $true) } catch { }
         }
     }
 }
@@ -546,11 +557,15 @@ function EnsureCollection {
     try { [void][IO.Directory]::CreateDirectory((Xp $Co)); return $true } catch { return $false }
 }
 
-# MoveWithRetries SRC DST: move SRC over DST, retrying a held target a bounded
-# number of times (C7a-4). True when it moved.
-function MoveWithRetries([string]$src, [string]$dst) {
+# MoveWithRetries SRC DST BASE REL: move SRC over DST (BASE\REL), retrying a held
+# target a bounded number of times (C7a-4). Before every attempt the target
+# path is checked again for a reparse point on the way, so a link swapped in
+# since the earlier check is refused, not followed. True when it moved.
+function MoveWithRetries([string]$src, [string]$dst, [string]$base, [string]$rel) {
     $attempt = 0
     while ($true) {
+        $k = Classify $base $rel
+        if ($k -ne 'absent' -and $k -ne 'file') { return $false }
         try {
             MoveReplace $src $dst
             return $true
@@ -580,11 +595,11 @@ function MoveOne([int]$i, [string]$rel, [string]$sha) {
         $S.Fail = "write ${i}: cannot create the directories"
         return $false
     }
-    if (-not (MoveWithRetries (Sub $src $rel) (Sub $Co $rel))) {
+    if (-not (MoveWithRetries (Sub $src $rel) (Sub $Co $rel) $Co $rel)) {
         $S.Fail = "write ${i}: cannot move the file into place"
         return $false
     }
-    try { ResetAcl (Sub $Co $rel) }
+    try { ResetAcl $Co $rel }
     catch {
         $S.Fail = "write ${i}: cannot reset the permissions of the file"
         return $false
@@ -824,12 +839,12 @@ function RestoreOne([int]$i, [string]$pth, [string]$pre) {
             $S.Fail = "restore ${i}: cannot stage the restore copy"
             return $false
         }
-        if (-not (MoveWithRetries $tmp (Sub $Co $pth))) {
+        if (-not (MoveWithRetries $tmp (Sub $Co $pth) $Co $pth)) {
             try { if ([IO.File]::Exists((Xp $tmp))) { [IO.File]::Delete((Xp $tmp)) } } catch { }
             $S.Fail = "restore ${i}: cannot move the file into place"
             return $false
         }
-        try { ResetAcl (Sub $Co $pth) }
+        try { ResetAcl $Co $pth }
         catch {
             $S.Fail = "restore ${i}: cannot reset the permissions of the file"
             return $false

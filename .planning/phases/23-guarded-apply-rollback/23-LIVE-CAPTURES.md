@@ -2105,6 +2105,25 @@ test wflwvm01_c7b ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 529.82s
 ~~~
 
+#### run 3: review follow-up (hardened `commit.ps1`)
+
+An automated review of the script flagged insecure permissions and check-then-use gaps on reparse points. After the script was hardened (a re-check of the path chain before each move attempt and around the descriptor change, `.NET` tree removal that does not follow a link) `wflwvm01_apply_script_run` (2026-10-17T20:36Z onward) and `wflwvm01_c7b` (with a new assertion that no moved production file lets `Users`, `Everyone` or `Authenticated Users` write) passed again, and this test checked what the script creates and what it does with links.
+
+`IGNITION_LIVE_WFLWVM01=1 cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_script_acl_and_reparse -- --ignored --nocapture` @ 2026-10-17T20:53:46Z
+
+~~~
+running 1 test
+test wflwvm01_script_acl_and_reparse has been running for over 60 seconds
+CAPTURE acl: 28 files and directories the script created or moved carry no entry for Users, Everyone or Authenticated Users
+CAPTURE restore through a junction: BatchReport { phase: Restoring, stale: false, moved: [], deleted: [], removed_dirs: [], failure: Some("restore 0: the live path is not a regular file") }
+CAPTURE commit through a junction: BatchReport { phase: Snapshotting, stale: true, moved: [], deleted: [], removed_dirs: [], failure: Some("1 path(s) are not what the plan was made against: ignition/database-connection/Linked/config.json") }
+cleanup: scratch gone true, staging gone true
+PASS wflwvm01_script_acl_and_reparse
+test wflwvm01_script_acl_and_reparse ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 141.83s
+~~~
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above, not a hypothesis. Later plans read these entries by id.
@@ -2178,3 +2197,4 @@ Rests on `## C7b` (run 1 for the access list before the ACL step, run 2 for ever
 - **Defender.** The account cannot read the Defender configuration (`Get-MpComputerStatus` and `Get-MpPreference` answer "Cannot connect to CIM server. Access denied"). The host record in `## Windows capture host (23-01)` has real-time protection on and no exclusions, and that is the state the timings below were taken in. The script commit of the 152-file corpus (`corpus_payload(1)`: 70 named units, 91,833 bytes, moved by one `exec_powershell`) took **6.92 s**; the prepare outside the lock took 86.0 s and the restore 18.03 s wall-clock including its uploads and journal read. The per-file commit this replaces took 234 to 348 s for the same 152-file tree on the earlier incarnation of this VM (22-LIVE-CAPTURES.md, OQ5-1; the VM was rebuilt on 2026-10-17, so the two figures are one tree on two builds of the same VM, not one host). A second run with an exclusion was not taken: adding one needs an administrator and this plan does not use the administrator credential, so "with and without the exclusion" is "as found" only.
 - **The longest path sftp can reach below the account home (Pitfalls 7 and 8, C7a-8).** A file at a native path of 259 characters is listed by `ls` of its directory and served by `get` (exit 0); at 260, 261 and 270 the listing omits it and `get` fails (exit 1; the listing of the 270-character directory itself fails). The checked lengths were 200, 230, 240, 250, 255, 258, 259, 260, 261 and 270, with 80-character directory components. **The limit is 259 characters, the C7a-8 limit, measured here for files below the home.** `WINDOWS_SNAPSHOT_PATH_MAX = 259` in `sftp/apply_ops.rs`. The Windows `probe_paths` refuses, in Rust and before any write, a touched path whose snapshot (`snapshots\<run>\files\<path>`) or staging (`staging\<run>\files\<path>`) copy below the account home would be longer than that, naming the path, as a `write_host` preflight failure; the longer prefix, `snapshots`, decides.
 - **Hold budget (for 23-10).** One script call moved 152 files in 6.92 s here; the call count is one per apply, the per-file cost is about 45 ms, of which the ACL reset is a part. 23-10 re-measures the p95 over 152 and 1,520 files for D-02.
+- **Access lists of what the script creates, and links (review follow-up, run 3).** The journal, ledger, snapshots, record, staging and moved files below the account home carry only the home's entries (28 files and directories checked: no entry at all for `Users`, `Everyone` or `Authenticated Users`). Files moved into the real `production` collection end with the collection's own inherited list, whose only broad entry is `BUILTIN\Users` ReadAndExecute (asserted: no write-capable entry for a broad principal). A restore whose directory had become a junction failed with `restore 0: the live path is not a regular file` and changed nothing at the link's target; a commit whose new file would go through a junction stopped at the pre-image check and wrote nothing through it.

@@ -2718,6 +2718,14 @@ async fn c7b_body(c: &C7b) -> Result<(), String> {
         }],
     )
     .await;
+    for (path, _, _, rules) in acl_rows(shell, &moved_files).await {
+        let broad = broad_write_rules(&rules);
+        if !broad.is_empty() {
+            return Err(format!(
+                "{path} lets Users, Everyone or Authenticated Users write: {broad:?}"
+            ));
+        }
+    }
     print_acls(
         shell,
         "a control file put by sftp into the same directory",
@@ -2972,4 +2980,221 @@ async fn c7b_body(c: &C7b) -> Result<(), String> {
     eprintln!("CAPTURE longest reachable file path (ls and get both work): {longest:?}");
     let _ = (&c.home, &c.home_native);
     Ok(())
+}
+
+// ---- 23-08 review follow-up: access lists of what the script creates, and links ----
+
+/// The ACL rows of the Windows access list text `"identity:rights:type:I|E:inheritance | ..."`
+/// that give `Users`, `Everyone` or `Authenticated Users` anything.
+fn broad_principal_rules(rules: &str) -> Vec<String> {
+    rules
+        .split(" | ")
+        .filter(|rule| {
+            let identity = rule.split(':').next().unwrap_or_default();
+            identity.ends_with("\\Users")
+                || identity == "Everyone"
+                || identity.ends_with("\\Authenticated Users")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The subset of [`broad_principal_rules`] that allows anything but reading:
+/// a named write right, `Modify`, `FullControl`, or a generic right with the
+/// write or all bit.
+fn broad_write_rules(rules: &str) -> Vec<String> {
+    broad_principal_rules(rules)
+        .into_iter()
+        .filter(|rule| {
+            let mut parts = rule.split(':');
+            let (_, rights, kind) = (parts.next(), parts.next().unwrap_or_default(), parts.next());
+            if kind != Some("Allow") {
+                return false;
+            }
+            let named = [
+                "Write",
+                "Modify",
+                "FullControl",
+                "CreateFiles",
+                "AppendData",
+                "Delete",
+                "ChangePermissions",
+                "TakeOwnership",
+            ];
+            let generic = rights
+                .trim()
+                .parse::<i64>()
+                .map(|n| (n as u32) & 0x5000_0000 != 0)
+                .unwrap_or(false);
+            named.iter().any(|w| rights.contains(w)) || generic
+        })
+        .collect()
+}
+
+#[test]
+fn broad_principal_rules_are_recognised() {
+    let rules = "ignwin836\\svc-ignition-deploy:Modify, Synchronize:Allow:I:None | BUILTIN\\Users:ReadAndExecute, Synchronize:Allow:I:None | BUILTIN\\Users:-1610612736:Allow:I:ContainerInherit, ObjectInherit | NT AUTHORITY\\SYSTEM:268435456:Allow:I:ContainerInherit";
+    assert_eq!(broad_principal_rules(rules).len(), 2);
+    assert!(broad_write_rules(rules).is_empty(), "read and execute only");
+    let bad = "BUILTIN\\Users:Modify, Synchronize:Allow:I:None | Everyone:268435456:Allow:I:None";
+    assert_eq!(broad_write_rules(bad).len(), 2);
+}
+
+/// What the script creates and moves has the access list the plan intends, and
+/// a link where a file or directory should be is refused, never followed.
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_script_acl_and_reparse() {
+    let Some(live) = live() else { return };
+    let w = WinScratch::new(&live).await;
+    let host = w.host();
+    let run = "20261017T140000Z-acl001";
+    let before = w.listing().await;
+    let unit = format!("{DC}/Caf\u{e9} DB,1/config.json");
+    let ledger = win_ledger(run, &[&unit]);
+    let (spec, tree) = win_batch(
+        run,
+        &[
+            (&unit, b"{\"new\":1}"),
+            (&format!("{DC}/ReplaceMe/config.json"), b"{\"pre\":\"new\"}"),
+        ],
+        &[],
+        Some(&ledger),
+        &before,
+        None,
+    );
+    let prepared = host.prepare(&spec, &tree).await.expect("prepare");
+    let report = host.commit(&prepared).await.expect("commit");
+    assert!(report.failure.is_none(), "{report:?}");
+
+    // 1. everything the script created below the account home, and the moved
+    // files (the scratch collection is below the home too), carry no entry for
+    // Users, Everyone or Authenticated Users
+    let deploy = w.deploy_native();
+    let (files, dirs) = hashes_below(&w.shell, &deploy).await;
+    let mut paths: Vec<String> = vec![deploy.clone()];
+    paths.extend(
+        files
+            .keys()
+            .map(|f| format!("{deploy}\\{}", f.replace('/', "\\"))),
+    );
+    paths.extend(
+        dirs.iter()
+            .map(|d| format!("{deploy}\\{}", d.replace('/', "\\"))),
+    );
+    for moved in [&unit, &format!("{DC}/ReplaceMe/config.json")] {
+        paths.push(format!("{}\\{}", w.prod_native, moved.replace('/', "\\")));
+    }
+    assert!(paths.len() > 8, "{paths:?}");
+    let mut checked = 0;
+    for chunk in paths.chunks(4) {
+        for (path, _owner, _protected, rules) in acl_rows(&w.shell, chunk).await {
+            assert_ne!(rules, "", "{path} has no access list");
+            let broad = broad_principal_rules(&rules);
+            assert!(broad.is_empty(), "{path} grants {broad:?}");
+            checked += 1;
+        }
+    }
+    eprintln!(
+        "CAPTURE acl: {checked} files and directories the script created or moved carry no entry for Users, Everyone or Authenticated Users"
+    );
+
+    // 2. a link where a file's directory should be: the restore refuses it and
+    // writes nothing through it
+    let outside = format!("{}\\outside", w.root_native);
+    let linked = format!(
+        "{}\\{}",
+        w.prod_native, "ignition\\database-connection\\Caf\u{e9} DB,1"
+    );
+    let restored_dir_gone = w
+        .shell
+        .exec_powershell(&script("remove_tree", REMOVE_TREE, path_params(&linked)))
+        .await
+        .expect("remove the unit directory");
+    assert_eq!(restored_dir_gone["gone"], 1);
+    w.shell
+        .exec_powershell(&script(
+            "make_junction",
+            MAKE_JUNCTION,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "link": linked, "target": outside }),
+        ))
+        .await
+        .expect("junction");
+    let outside_before = hashes_below(&w.shell, &outside).await;
+    let restored = host.restore(&spec.record).await.expect("restore answers");
+    eprintln!("CAPTURE restore through a junction: {restored:?}");
+    assert!(
+        restored.failure.is_some(),
+        "a restore must not write through a link: {restored:?}"
+    );
+    assert_eq!(
+        hashes_below(&w.shell, &outside).await,
+        outside_before,
+        "nothing was written or removed through the link"
+    );
+    w.shell
+        .exec_powershell(&script(
+            "drop_junction",
+            DROP_JUNCTION,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "link": linked }),
+        ))
+        .await
+        .expect("drop the junction");
+
+    // 3. a link where a new file would go: the commit stops at the pre-image
+    // check and writes nothing through it
+    let (live_now, _) = hashes_below(&w.shell, &w.prod_native).await;
+    let drop_journal_path = format!("{}\\journal.json", w.deploy_native());
+    w.shell
+        .exec_powershell(&script(
+            "remove_file",
+            REMOVE_FILE,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "path": drop_journal_path }),
+        ))
+        .await
+        .expect("drop the journal");
+    let link2 = format!("{}\\ignition\\database-connection\\Linked", w.prod_native);
+    w.shell
+        .exec_powershell(&script(
+            "make_junction",
+            MAKE_JUNCTION,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link2, "target": outside }),
+        ))
+        .await
+        .expect("junction 2");
+    let run2 = "20261017T140100Z-acl002";
+    let (spec2, tree2) = win_batch(
+        run2,
+        &[(
+            &format!("{DC}/Linked/config.json"),
+            b"{\"through\":\"link\"}",
+        )],
+        &[],
+        None,
+        &live_now,
+        None,
+    );
+    let prepared2 = host.prepare(&spec2, &tree2).await.expect("prepare 2");
+    let report2 = host.commit(&prepared2).await.expect("commit answers");
+    eprintln!("CAPTURE commit through a junction: {report2:?}");
+    assert!(
+        report2.stale || report2.failure.is_some(),
+        "a commit must not write through a link: {report2:?}"
+    );
+    assert!(report2.moved.is_empty());
+    assert_eq!(
+        hashes_below(&w.shell, &outside).await,
+        outside_before,
+        "nothing was written through the link"
+    );
+    w.shell
+        .exec_powershell(&script(
+            "drop_junction",
+            DROP_JUNCTION,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link2 }),
+        ))
+        .await
+        .expect("drop junction 2");
+    w.cleanup().await;
+    eprintln!("PASS wflwvm01_script_acl_and_reparse");
 }
