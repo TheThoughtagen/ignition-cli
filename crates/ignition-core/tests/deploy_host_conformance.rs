@@ -3,8 +3,9 @@
 //! `scenarios()` is host-agnostic data: each row is a name and an async body
 //! that drives a [`Ctx`] (a host plus the data directory it works on) and
 //! asserts on the files it finds. The local host runs every row here
-//! (`conformance_local_<row>`); the POSIX and PowerShell script hosts (23-06,
-//! 23-20) supply another `Ctx` and run the same rows.
+//! (`conformance_local_<row>`); the POSIX script host (23-06, unix) and the
+//! PowerShell script host (23-20, windows) supply another `Ctx` and run the
+//! same rows (`conformance_sh_<row>`, `conformance_ps_<row>`).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -25,12 +26,16 @@ use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::layout::RelPath;
 use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use ignition_core::deploy::transport::process::TokioProcessRunner;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use ignition_core::deploy::transport::remote::RemoteShell;
+#[cfg(any(unix, windows))]
+use ignition_core::deploy::transport::sftp::SftpTransport;
 #[cfg(unix)]
-use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+use ignition_core::deploy::transport::sftp::posix_root;
+#[cfg(windows)]
+use ignition_core::deploy::transport::sftp::windows_sftp_root;
 use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 
 const GW: &str = "conf-gw";
@@ -114,6 +119,23 @@ impl Ctx {
         std::fs::create_dir_all(data.path().join("config/resources").join(MODE))
             .expect("collection");
         let host = sh_host(data.path());
+        Ctx {
+            host: Box::new(host),
+            data,
+        }
+    }
+
+    /// The PowerShell script host, driven through the Win32-OpenSSH
+    /// `sftp-server.exe` of the runner and the local `cmd /C powershell` (the
+    /// `local_exec` seam): the same gateway data directory shape as
+    /// [`Ctx::local`], with the account home being the data directory so
+    /// `ign-deploy` lands where the rows look for it.
+    #[cfg(windows)]
+    pub fn ps() -> Ctx {
+        let data = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(data.path().join("config/resources").join(MODE))
+            .expect("collection");
+        let host = ps_host(data.path());
         Ctx {
             host: Box::new(host),
             data,
@@ -336,6 +358,24 @@ pub fn sh_host(root: &Path) -> SftpTransport {
         .expect("apply host")
 }
 
+/// An `SftpTransport` for a Windows node over `root` as the data directory and
+/// the account home: sftp to the runner's own `sftp-server.exe`, the script
+/// through the local `cmd /C powershell`.
+#[cfg(windows)]
+pub fn ps_host(root: &Path) -> SftpTransport {
+    let shell = RemoteShell::local_sftp_server(
+        &common::sftp_server::sftp_server_path(),
+        Arc::new(TokioProcessRunner),
+        std::time::Duration::from_secs(120),
+    )
+    .local_exec();
+    let data_dir = windows_sftp_root(&root.display().to_string()).expect("windows sftp root");
+    SftpTransport::new_windows(shell, data_dir.clone(), "nodes.ps")
+        .with_home(&data_dir)
+        .with_apply(GW, MODE)
+        .expect("apply host")
+}
+
 /// A ledger for the test gateway that lists `files`.
 pub fn ledger_bytes(run: &str, files: &[&str]) -> Vec<u8> {
     Ledger {
@@ -402,7 +442,8 @@ fn tree_names(dir: &Path) -> Vec<String> {
                 path.strip_prefix(base)
                     .expect("prefix")
                     .display()
-                    .to_string(),
+                    .to_string()
+                    .replace('\\', "/"),
             );
             if path.is_dir() {
                 walk(base, &path, out);
@@ -1372,6 +1413,338 @@ async fn sh_failed_move_reports_index() {
     assert_eq!(c.listing(), before, "restore returns the pre-run listing");
 }
 
+// ---- the PowerShell script host (23-20) ---------------------------------------
+//
+// Runs only on windows-latest: `commit.ps1` is executed by the runner's own
+// Windows PowerShell 5.1 through the fixed stub, and the files move over the
+// runner's Win32-OpenSSH `sftp-server.exe`. Each row of the shared table runs
+// against it, and the rows below are the ones where PowerShell differs from
+// `sh`: a target another process holds open, the access list after a move,
+// a second name for the live file, and a junction instead of a symlink.
+
+#[cfg(windows)]
+async fn run_ps(name: &str) {
+    let scenario = scenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no row named {name}"));
+    let ctx = Ctx::ps();
+    (scenario.run)(&ctx).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_add_one_file() {
+    run_ps("add_one_file").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_fingerprint_is_read_only() {
+    run_ps("fingerprint_is_read_only").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_finalize_removes_journal_and_staging_keeps_snapshot() {
+    run_ps("finalize_removes_journal_and_staging_keeps_snapshot").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_discard_interrupted_touches_no_collection_file() {
+    run_ps("discard_interrupted_touches_no_collection_file").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_fetch_snapshot_copies_with_hashes() {
+    run_ps("fetch_snapshot_copies_with_hashes").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_read_record_absent_is_none() {
+    run_ps("read_record_absent_is_none").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_probe_reports_writable_without_touching_the_collection() {
+    run_ps("probe_reports_writable_without_touching_the_collection").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_replace_file() {
+    run_ps("replace_file").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_delete_file_and_emptied_dirs() {
+    run_ps("delete_file_and_emptied_dirs").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_ledger_swap_and_restore() {
+    run_ps("ledger_swap_and_restore").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_pre_image_mismatch_aborts_before_any_move() {
+    run_ps("pre_image_mismatch_aborts_before_any_move").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_journal_present_refuses() {
+    run_ps("journal_present_refuses").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_self_move_refused() {
+    run_ps("self_move_refused").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_gateway_owned_file_refused() {
+    run_ps("gateway_owned_file_refused").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_directory_where_file_goes_is_stale() {
+    run_ps("directory_where_file_goes_is_stale").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_symlinked_target_dir_is_refused() {
+    run_ps("symlinked_target_dir_is_refused").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn conformance_ps_restore_twice_is_idempotent() {
+    run_ps("restore_twice_is_idempotent").await;
+}
+
+/// One byte of the staged script is changed after upload: the stub exits 97
+/// before running anything, the call is `transport_failed` and the collection,
+/// the journal and the snapshots are untouched (T-23-33).
+#[cfg(windows)]
+#[tokio::test]
+async fn ps_stub_refuses_a_tampered_script_or_work_list() {
+    for (file, tamper) in [("commit.ps1", 0usize), ("work.tsv", 1usize)] {
+        let c = Ctx::ps();
+        c.seed(FILE_B, b"live");
+        let before = (c.listing(), tree_names(c.root()));
+        let batch = c.batch(RUN, &[(FILE_A, br#"{"a":1}"#)], &[], None);
+        let prepared = c
+            .host
+            .prepare(&batch.spec, &batch.tree)
+            .await
+            .expect("prepare");
+        let path = c.staging_dir(RUN).join(file);
+        let mut bytes = std::fs::read(&path).expect("the file was uploaded");
+        let at = if tamper == 0 {
+            bytes.len() / 2
+        } else {
+            bytes.iter().position(|b| *b == b'a').expect("a letter")
+        };
+        bytes[at] ^= 0x01;
+        std::fs::write(&path, bytes).expect("tamper");
+        let staged = tree_names(c.root());
+
+        let err = c
+            .host
+            .commit(&prepared)
+            .await
+            .expect_err("a tampered file must not run");
+        assert_eq!(err.code(), "transport_failed", "{file}: {err}");
+        assert!(
+            err.to_string().contains("does not match its hash"),
+            "{file}: {err}"
+        );
+        assert_eq!(c.listing(), before.0, "{file}: the collection is untouched");
+        assert!(c.journal().is_none(), "{file}: no journal was written");
+        assert!(!c.snapshot_dir(RUN).exists(), "{file}: no snapshot");
+        assert_eq!(tree_names(c.root()), staged, "{file}: nothing else changed");
+    }
+}
+
+/// A target another process holds open without letting go of it. PowerShell
+/// differs from `sh` here (C7b): a target held with `FILE_SHARE_READ` can be
+/// read but not replaced, so the move fails after the bounded retries, the
+/// commit names that entry's index at phase `writing`, and `restore` returns
+/// the pre-run listing; a target held with no sharing at all cannot even be
+/// hashed, which is a refusal (`held`) before the first move, not a stale plan
+/// and not a partial write.
+#[cfg(windows)]
+#[tokio::test]
+async fn ps_held_target_reports_index() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const A: &str = "ignition/tag-provider/a/config.json";
+    const B: &str = "ignition/tag-provider/b/config.json";
+    let c = Ctx::ps();
+    c.seed(A, b"old a");
+    c.seed(B, b"old b");
+    let before = c.listing();
+    let batch = c.batch(RUN, &[(A, b"new a"), (B, b"new b")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ
+        .open(c.collection().join(B))
+        .expect("hold the target");
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert_eq!(report.phase, JournalPhase::Writing, "{report:?}");
+    assert_eq!(report.moved, vec![0], "{report:?}");
+    let failure = report.failure.clone().expect("a failure");
+    assert!(failure.contains("write 1"), "{failure}");
+    assert!(
+        !failure.contains("config.json"),
+        "no path in the reason: {failure}"
+    );
+    assert_eq!(c.listing().get(A), Some(&sha256_hex(b"new a")));
+    let record = c.record(RUN).expect("record");
+    // the restore works while B is still held: B already is its pre-image
+    let restored = c.host.restore(&record).await.expect("restore");
+    drop(held);
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(c.listing(), before, "restore returns the pre-run listing");
+
+    // no sharing at all: refused before the first move
+    std::fs::remove_file(c.deploy_dir().join("journal.json")).expect("drop the journal");
+    let batch = c.batch(RUN2, &[(A, b"newer a"), (B, b"newer b")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare 2");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(c.collection().join(B))
+        .expect("hold the target exclusively");
+    let err = c
+        .host
+        .commit(&prepared)
+        .await
+        .expect_err("an unreadable target is a refusal");
+    drop(held);
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(err.to_string().contains("holds it open"), "{err}");
+    assert_eq!(c.listing(), before, "nothing moved");
+    assert!(c.journal().is_none(), "no journal is left behind");
+    assert!(!c.snapshot_dir(RUN2).exists());
+}
+
+/// A file moved in takes the collection's inherited access list (C7b: a moved
+/// file otherwise keeps the protected list it had in the account home). Read
+/// with `icacls`: every entry of the moved file is inherited from the directory
+/// it was moved into. (A file made by this test process is no control: a
+/// process in an ssh session gets explicit entries from its token's default
+/// access list, which is not what the gateway's own files have.)
+#[cfg(windows)]
+#[tokio::test]
+async fn ps_moved_file_has_only_inherited_entries() {
+    let c = Ctx::ps();
+    let batch = c.batch(RUN, &[(FILE_A, b"x")], &[], None);
+    let report = c.apply(&batch).await;
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    let path = c.collection().join(FILE_A);
+    let out = std::process::Command::new("icacls")
+        .arg(&path)
+        .output()
+        .expect("icacls");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let shown = path.display().to_string();
+    let entries: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim())
+        .map(|l| l.strip_prefix(shown.as_str()).unwrap_or(l).trim())
+        .filter(|l| l.contains(":("))
+        .collect();
+    assert!(!entries.is_empty(), "icacls listed no entry:\n{text}");
+    assert!(
+        entries.iter().all(|e| e.contains("(I)")),
+        "an explicit entry on a moved file: {entries:?}"
+    );
+}
+
+/// A staged copy that is a second name (a hard link) for the live file: the
+/// script does not refuse it as `sh` does (it has no inode to compare), and the
+/// move onto it must never lose the file (C7a-4).
+#[cfg(windows)]
+#[tokio::test]
+async fn ps_self_move_through_a_hard_link_never_loses_the_file() {
+    let c = Ctx::ps();
+    c.seed(FILE_A, b"same bytes");
+    let batch = c.batch(RUN, &[(FILE_A, b"same bytes")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let staged = c.staging_dir(RUN).join("files").join(FILE_A);
+    std::fs::remove_file(&staged).expect("remove staged copy");
+    std::fs::hard_link(c.collection().join(FILE_A), &staged).expect("hard link");
+    let outcome = c.host.commit(&prepared).await;
+    eprintln!("a staged hard link of the live file: {outcome:?}");
+    assert_eq!(
+        std::fs::read(c.collection().join(FILE_A)).expect("the file survives"),
+        b"same bytes"
+    );
+}
+
+/// A directory of the target path that became a junction after the plan was
+/// made is not followed: the commit is `stale` and nothing is written through
+/// the link.
+#[cfg(windows)]
+#[tokio::test]
+async fn ps_junction_target_dir_is_refused() {
+    let c = Ctx::ps();
+    let batch = c.batch(RUN, &[(FILE_A, b"a")], &[], None);
+    let prepared = c
+        .host
+        .prepare(&batch.spec, &batch.tree)
+        .await
+        .expect("prepare");
+    let outside = tempfile::tempdir().expect("outside");
+    let link = c.collection().join("ignition");
+    // mklink reads a `/` as the start of a switch: native separators only
+    let native = |p: &Path| p.display().to_string().replace('/', "\\");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(native(&link))
+        .arg(native(outside.path()))
+        .output()
+        .expect("mklink");
+    assert!(made.status.success(), "{made:?}");
+
+    let report = c.host.commit(&prepared).await.expect("commit");
+    assert!(report.stale, "{report:?}");
+    assert!(report.moved.is_empty(), "{report:?}");
+    assert!(c.journal().is_none() && !c.snapshot_dir(RUN).exists());
+    assert_eq!(
+        std::fs::read_dir(outside.path()).expect("outside").count(),
+        0,
+        "nothing was written through the link"
+    );
+    // remove the junction itself, never its target
+    std::fs::remove_dir(&link).expect("drop the junction");
+}
+
 // ---- fault rows (local host only) ---------------------------------------------
 
 const FILE_C: &str = "ignition/tag-provider/default/third.json";
@@ -1639,6 +2012,24 @@ fn every_row_runs_against_the_sh_host() {
             "row {} is not run against the sh host",
             row.name
         );
+    }
+}
+
+/// Every row also runs against the PowerShell script host on windows. The test
+/// reads the source, so it checks the wiring on every platform and a row added
+/// without a `conformance_ps_` test fails on the machine that adds it.
+#[test]
+fn every_row_runs_against_the_powershell_host() {
+    let source = include_str!("deploy_host_conformance.rs");
+    for row in scenarios() {
+        let wired = format!("run_ps(\"{}\")", row.name);
+        assert!(
+            source.contains(&wired),
+            "row {} is not run against the PowerShell host",
+            row.name
+        );
+        let test = format!("async fn conformance_ps_{}()", row.name);
+        assert!(source.contains(&test), "no test for {}", row.name);
     }
 }
 

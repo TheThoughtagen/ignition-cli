@@ -816,8 +816,10 @@ impl RemoteShell {
     }
 
     /// Test seam: run [`exec_posix`](Self::exec_posix) commands with the local
-    /// `sh -c <command text>` instead of `ssh`, so the script host is
-    /// exercised end to end without an sshd. Pair it with
+    /// `sh -c <command text>` (and [`exec_powershell`](Self::exec_powershell)
+    /// commands with the local `cmd /C <command text>` on Windows, the way the
+    /// Win32-OpenSSH default shell receives them) instead of `ssh`, so the
+    /// script host is exercised end to end without an sshd. Pair it with
     /// [`local_sftp_server`](Self::local_sftp_server). Nothing in the binary
     /// calls it.
     #[doc(hidden)]
@@ -1017,15 +1019,32 @@ impl RemoteShell {
             detail,
         };
         let command = winps::encoded_command(script, COMMAND_BUDGET).map_err(failure)?;
-        let out = self
-            .runner
-            .run(
-                OsStr::new("ssh"),
-                &self.ssh_argv(Some(&command)),
-                None,
-                self.op_timeout,
-            )
-            .await;
+        let out = if self.local_exec {
+            // the test seam: the command text goes to the local shell as the
+            // Win32-OpenSSH default shell (`cmd.exe`) receives it
+            let (program, flag) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("sh", "-c")
+            };
+            self.runner
+                .run(
+                    OsStr::new(program),
+                    &[OsString::from(flag), OsString::from(command.as_str())],
+                    None,
+                    self.op_timeout,
+                )
+                .await
+        } else {
+            self.runner
+                .run(
+                    OsStr::new("ssh"),
+                    &self.ssh_argv(Some(&command)),
+                    None,
+                    self.op_timeout,
+                )
+                .await
+        };
         winps::interpret_output(&out, self.op_timeout.as_secs(), self.temp_dir())
             .map_err(|detail| failure(format!("{}: {detail}", script.name)))
     }
@@ -1839,6 +1858,38 @@ mod tests {
         );
         // the encoded command is ONE argv element, after `--` and the destination
         assert!(argv[0].1.iter().any(|a| a == "--"));
+    }
+
+    /// The `local_exec` seam runs the encoded command through the local shell
+    /// instead of `ssh`: `cmd /C <text>` on Windows, `sh -c <text>` elsewhere.
+    #[tokio::test]
+    async fn exec_powershell_with_local_exec_uses_the_local_shell_not_ssh() {
+        let (runner, shell) = exec_shell(ProcessOutput {
+            stdout: b"IGN-RESULT:{\"ok\":1}\r\n".to_vec(),
+            stderr: Vec::new(),
+            code: 0,
+            timed_out: false,
+        });
+        let shell = shell.local_exec();
+        let value = shell
+            .exec_powershell(&exec_script(serde_json::Value::Null))
+            .await
+            .expect("exec");
+        assert_eq!(value["ok"], 1);
+        let argv = runner.argv.lock().expect("argv");
+        let (program, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        assert_eq!(argv[0].0, program);
+        assert_eq!(argv[0].1[0], flag);
+        assert_eq!(argv[0].1.len(), 2, "the command text is one argument");
+        assert!(
+            argv[0].1[1].starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "{argv:?}"
+        );
+        assert!(!argv[0].1.iter().any(|a| a == "--"), "no ssh argv");
     }
 
     #[tokio::test]
