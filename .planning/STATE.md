@@ -2,19 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
-current_phase: 23
-current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-12-PLAN.md
-last_updated: "2026-10-17T00:19:38.046Z"
+stopped_at: Completed 23-08-PLAN.md
+last_updated: "2026-10-17T21:10:59.746Z"
 last_activity: 2026-10-17
-last_activity_desc: Completed 23-12 journal recovery
 progress:
-  total_phases: 6
+  total_phases: 4
   completed_phases: 3
   total_plans: 52
-  completed_plans: 44
-  percent: 85
+  completed_plans: 45
+  percent: 87
 ---
 
 # Project State
@@ -29,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 14 of 21
+Plan: 15 of 21
 Status: Ready to execute
 Last activity: 2026-10-17
 
-Progress: [█████████░] 85%
+Progress: [█████████░] 87%
 
 ## Performance Metrics
 
@@ -89,6 +86,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P09 | 2h | 3 tasks | 10 files |
 | Phase 23 P11 | ~40min | 2 tasks | 4 files |
 | Phase 23 P12 | 2h | 2 tasks | 7 files |
+| Phase 23 P08 | 2h40m | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -126,8 +124,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-17T00:19:38.003Z
-**Stopped At:** Completed 23-12-PLAN.md
+**Last session:** 2026-10-17T21:10:59.565Z
+**Stopped At:** Completed 23-08-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -200,3 +198,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 23]: 23-09: .gwbk completeness is the ZIP central directory (gateway sends no Content-Length); a refused .gwbk is deleted; unreadable restart-pending 'before' reports all pending as new plus restart_pending_unavailable
 - [Phase 23]: 23-11: manual rollback cause is Option<RollbackCause> (None = manual); restore_snapshot takes a RestoreContext; rollback result carries restart_pending and restart_pending_new; run_rollback re-runs check_rollback
 - [Phase 23]: 23-12: the run's own journal selects recovery in check_rollback; D-10 clear only before the first move with the pre-run fingerprint; the snapshot is hashed before a recovery restores; a commit Err over this run's journal is reported as deploy_journal_present (no restore on a guess)
+- [Phase ?]: 23-08: Windows stub runs the hashed commit.ps1 text through [ScriptBlock]::Create (-File fails under AllSigned/Restricted); moved files get an ACL reset; a target that cannot be read is refused as held before any move; WINDOWS_SNAPSHOT_PATH_MAX = 259

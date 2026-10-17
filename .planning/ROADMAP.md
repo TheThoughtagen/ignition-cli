@@ -426,7 +426,7 @@ Plans:
 
 **Wave 13** *(blocked on Wave 12 completion; first plan that needs the Windows host)*
 
-- [ ] 23-08-PLAN.md — Windows ssh host, captured: C-script-run and C7b live, `commit.ps1` `commit` and `restore` behind a hash-checked stub, ACL step, held targets, snapshot path gate (D-01)
+- [x] 23-08-PLAN.md — Windows ssh host, captured: C-script-run and C7b live, `commit.ps1` `commit` and `restore` behind a hash-checked stub, ACL step, held targets, snapshot path gate (D-01)
 
 **Wave 14** *(blocked on Wave 13 completion)*
 
@@ -515,7 +515,7 @@ Plans:
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
-| 23. Guarded Apply & Rollback | v1.6 | 13/21 | In Progress|  |
+| 23. Guarded Apply & Rollback | v1.6 | 14/21 | In Progress|  |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
