@@ -110,7 +110,7 @@ use self::fingerprint::{LEDGER_KEY, fingerprint};
 use self::gates::GateFlags;
 use self::hold::{Clock, HeldLock, HoldModel, LOCK_MARGIN_S};
 use self::host::{ApplyHost, BatchSpec, DeleteOp, WriteOp};
-use self::journal::{Journal, JournalPhase};
+use self::journal::{Journal, JournalPhase, journal_on_box};
 use self::preflight::{DesignersPolicy, PreflightInput, run_preflights};
 use self::record::{RecordState, RunRecord, TouchedEntry};
 use self::run_store::{EventLog, RunDir, RunId};
@@ -389,6 +389,13 @@ pub enum ApplyEvent {
     },
     /// The run was finalized.
     Finalized,
+    /// `commit` returned an error and this run's journal is still on the box:
+    /// what is on the host is unknown and the run is recovered with
+    /// `rollback --run` (23-12). Carries the code of the original failure.
+    CommitInterrupted {
+        /// The error code `commit` failed with.
+        code: String,
+    },
     /// The checks of a red verdict, by id and status.
     VerifyChecks {
         /// `(check id, status)` in report order.
@@ -466,6 +473,7 @@ impl ApplyEvent {
             ApplyEvent::VerifyDone { .. } => "verify_done",
             ApplyEvent::VerifyChecks { .. } => "verify_checks",
             ApplyEvent::Finalized => "finalized",
+            ApplyEvent::CommitInterrupted { .. } => "commit_interrupted",
             ApplyEvent::RestoreStarted { .. } => "restore_started",
             ApplyEvent::Restored => "restored",
             ApplyEvent::Cleared => "cleared",
@@ -531,7 +539,9 @@ impl ApplyEvent {
                 "hashes": hashes,
             }),
             ApplyEvent::GwbkDownloaded { bytes } => json!({"bytes": bytes}),
-            ApplyEvent::Failed { code } => json!({"code": code}),
+            ApplyEvent::CommitInterrupted { code } | ApplyEvent::Failed { code } => {
+                json!({"code": code})
+            }
             ApplyEvent::ScanDone
             | ApplyEvent::Finalized
             | ApplyEvent::Restored
@@ -757,6 +767,48 @@ fn with_env(err: CoreError, env: &str) -> CoreError {
     }
 }
 
+/// `commit` returned an `Err`. Over ssh a dropped connection is one, and what
+/// is on the box is unknown: the remote script may have moved files or may
+/// still be running (23-17 carry-over, DAPL-09).
+///
+/// Only the journal tells. When this run's own journal is on the box the run
+/// is reported as interrupted: `deploy_journal_present` with the recovery
+/// command (`ign deploy rollback --run <id> --env <env>`), and the original
+/// failure's code in a `commit_interrupted` event. Nothing is restored here: a
+/// restore on a guess could race a script that is still moving files, and the
+/// recovery path reads the snapshot before it writes. When no journal of this
+/// run is there (or the box cannot be read), nothing is known to have been
+/// written and the original error stands. A refusal that is already
+/// `deploy_journal_present` (another run's journal) is kept as it is.
+async fn commit_failed(
+    ctx: &ApplyContext<'_>,
+    run_id: &RunId,
+    plan: &DeployPlanResult,
+    steps: &mut Steps<'_>,
+    err: CoreError,
+) -> CoreError {
+    if matches!(err, CoreError::DeployJournalPresent { .. }) {
+        return err;
+    }
+    let master = &ctx.declared.target.nodes.master;
+    let found = journal_on_box(ctx.reader, master, &plan.gateway, &plan.mode).await;
+    match found {
+        Ok(Some(journal)) if journal.run_id == run_id.as_str() => {
+            let _ = steps.emit(ApplyEvent::CommitInterrupted {
+                code: err.code().to_string(),
+            });
+            journal::journal_present(
+                &journal,
+                &ctx.declared.env,
+                master,
+                &plan.gateway,
+                &plan.mode,
+            )
+        }
+        _ => err,
+    }
+}
+
 /// The steps of the module doc, in order. Returns `Ok` only for a verified,
 /// finalized deploy.
 async fn drive(
@@ -927,11 +979,10 @@ async fn drive(
     steps.emit(ApplyEvent::LockAcquired {
         hold_s: opts.hold.hold_s,
     })?;
-    let report = ctx
-        .host
-        .commit(&prepared)
-        .await
-        .map_err(|e| with_env(e, env))?;
+    let report = match ctx.host.commit(&prepared).await {
+        Ok(report) => report,
+        Err(e) => return Err(commit_failed(ctx, run_id, plan, steps, with_env(e, env)).await),
+    };
     steps.emit(ApplyEvent::Committed {
         moved: report.moved.len(),
         deleted: report.deleted.len(),
