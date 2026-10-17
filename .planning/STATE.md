@@ -2,12 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.6
 milestone_name: Declared Gateway Deploy
+current_phase: 23
+current_phase_name: guarded-apply-rollback
 status: executing
 stopped_at: Completed 23-08-PLAN.md
 last_updated: "2026-10-17T21:10:59.746Z"
 last_activity: 2026-10-17
 progress:
-  total_phases: 4
+  total_phases: 6
   completed_phases: 3
   total_plans: 52
   completed_plans: 45
