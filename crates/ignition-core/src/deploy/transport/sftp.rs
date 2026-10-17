@@ -966,6 +966,13 @@ impl SftpTransport {
 
     /// The directory chains a read of `scope` opens, each starting with
     /// `config/resources/<collection>`.
+    /// Whether this is a Windows OpenSSH host (the factory test of
+    /// `apply_host_for_node`).
+    #[cfg(test)]
+    pub(super) fn is_windows_for_tests(&self) -> bool {
+        self.windows
+    }
+
     /// The Windows half of the component gate: on a Windows host `name` must
     /// also pass [`windows_component_problem`]. `what` names it in the error.
     fn windows_gate(&self, what: &str, name: &str) -> Result<(), CoreError> {

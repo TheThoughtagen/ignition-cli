@@ -428,13 +428,12 @@ pub fn mirror_for_node(
 /// The apply half ([`ApplyHost`](super::apply::host::ApplyHost)) for `node`'s
 /// `mode` collection, for the target `gateway`.
 ///
-/// `local` builds the local-filesystem host. A Linux `ssh` node builds the
-/// sftp host that runs every operation as one call of the uploaded POSIX `sh`
-/// script (23-06, D-01). A Windows `ssh` node is refused as
-/// `deploy_tree_invalid` naming the node: apply over ssh to Windows is not
-/// supported by this build yet (23-20 replaces that arm; no verb exposes apply
-/// before 23-13, so the refusal is never user-visible). `gateway` and `mode`
-/// must be names a run may write under.
+/// `local` builds the local-filesystem host. An `ssh` node builds the sftp host
+/// that runs every operation as one call of the uploaded script, through a
+/// fixed stub that checks the script's and the work list's SHA-256 first
+/// (D-01): the POSIX `sh` script for a Linux node (23-06), the PowerShell
+/// script for a Windows node (23-08, 23-20). `gateway` and `mode` must be names
+/// a run may write under.
 pub fn apply_host_for_node(
     repo: &Path,
     target_file: &str,
@@ -447,26 +446,42 @@ pub fn apply_host_for_node(
     if let Some(why) = mirror_mode_problem(mode) {
         return Err(invalid(format!("{label}: {why}")));
     }
-    Ok(match node_access(repo, target_file, label, node)? {
-        NodeAccess::Local(data_dir) => Box::new(
+    let access = node_access(repo, target_file, label, node)?;
+    Ok(
+        match apply_host_kind(access, label, gateway, mode).map_err(invalid)? {
+            ApplyHostKind::Local(host) => Box::new(host),
+            ApplyHostKind::Sftp(host) => host,
+        },
+    )
+}
+
+/// The concrete host an access path resolves to, before it is boxed.
+enum ApplyHostKind {
+    Local(local::LocalFsTransport),
+    Sftp(Box<sftp::SftpTransport>),
+}
+
+fn apply_host_kind(
+    access: NodeAccess,
+    label: &str,
+    gateway: &str,
+    mode: &str,
+) -> Result<ApplyHostKind, String> {
+    Ok(match access {
+        NodeAccess::Local(data_dir) => ApplyHostKind::Local(
             local::LocalFsTransport::new(data_dir, label)
                 .with_apply(gateway, mode)
-                .map_err(|why| invalid(format!("{label}: {why}")))?,
+                .map_err(|why| format!("{label}: {why}"))?,
         ),
-        NodeAccess::Ssh { windows: true, .. } => {
-            return Err(invalid(format!(
-                "{label}: apply over ssh to a Windows host is not supported by this build"
-            )));
-        }
         NodeAccess::Ssh {
             shell,
             data_dir,
-            windows: false,
-        } => Box::new(
-            sftp_transport(*shell, data_dir, label, false)
+            windows,
+        } => ApplyHostKind::Sftp(Box::new(
+            sftp_transport(*shell, data_dir, label, windows)
                 .with_apply(gateway, mode)
-                .map_err(|why| invalid(format!("{label}: {why}")))?,
-        ),
+                .map_err(|why| format!("{label}: {why}"))?,
+        )),
     })
 }
 
@@ -840,9 +855,8 @@ mod tests {
         repo
     }
 
-    /// A Linux ssh node gets the sftp-backed apply host; a Windows node keeps
-    /// the refusal until 23-20; names a run may not write under are refused
-    /// before any host is built.
+    /// A Linux ssh node and a `local` node get their hosts; names a run may not
+    /// write under are refused before any host is built.
     #[test]
     fn apply_host_for_node_linux_ssh() {
         let repo = repo();
@@ -859,19 +873,28 @@ mod tests {
             .is_ok(),
             "a Linux ssh node builds an apply host"
         );
-        let windows = ssh_node(TargetOs::Windows, "C:\\Ignition\\data");
-        let err = apply_host_for_node(
-            repo.path(),
-            "targets/prod.yaml",
-            "nodes.master",
-            &windows,
-            "gw",
-            "prod",
-        )
-        .err()
-        .expect("a Windows ssh node is refused until 23-20");
-        assert_eq!(err.code(), "deploy_tree_invalid");
-        assert!(err.to_string().contains("not supported"), "{err}");
+        let access =
+            node_access(repo.path(), "targets/prod.yaml", "nodes.master", &linux).expect("access");
+        let ApplyHostKind::Sftp(host) =
+            apply_host_kind(access, "nodes.master", "gw", "prod").expect("host")
+        else {
+            panic!("an ssh node gets the sftp host");
+        };
+        assert!(!host.is_windows_for_tests());
+        let local = NodeTarget {
+            profile: "p".to_string(),
+            ssh: None,
+            local: Some(crate::deploy::target::Local {
+                data_dir: repo.path().join("data").display().to_string(),
+            }),
+            gateway_name: None,
+        };
+        let access =
+            node_access(repo.path(), "targets/prod.yaml", "nodes.master", &local).expect("access");
+        assert!(matches!(
+            apply_host_kind(access, "nodes.master", "gw", "prod").expect("host"),
+            ApplyHostKind::Local(_)
+        ));
         for (gateway, mode) in [
             (".hidden", "prod"),
             ("gw", "core"),
@@ -890,5 +913,46 @@ mod tests {
             .unwrap_or_else(|| panic!("{gateway}/{mode} is refused"));
             assert_eq!(err.code(), "deploy_tree_invalid", "{gateway}/{mode}");
         }
+    }
+
+    /// 23-20: a Windows ssh node gets the sftp host too, the one that runs the
+    /// PowerShell script. Until the PowerShell host was complete this arm was
+    /// the 23-04 `deploy_tree_invalid` refusal.
+    #[test]
+    fn apply_host_for_node_windows_ssh() {
+        let repo = repo();
+        let windows = ssh_node(TargetOs::Windows, "C:\\Ignition\\data");
+        assert!(
+            apply_host_for_node(
+                repo.path(),
+                "targets/prod.yaml",
+                "nodes.master",
+                &windows,
+                "gw",
+                "prod"
+            )
+            .is_ok(),
+            "a Windows ssh node builds an apply host"
+        );
+        let access = node_access(repo.path(), "targets/prod.yaml", "nodes.master", &windows)
+            .expect("access");
+        let ApplyHostKind::Sftp(host) =
+            apply_host_kind(access, "nodes.master", "gw", "prod").expect("host")
+        else {
+            panic!("a Windows ssh node gets the sftp host");
+        };
+        assert!(host.is_windows_for_tests());
+        // a name a run may not write under is refused for a Windows node too
+        let err = apply_host_for_node(
+            repo.path(),
+            "targets/prod.yaml",
+            "nodes.master",
+            &windows,
+            "gw",
+            "core",
+        )
+        .err()
+        .expect("core is refused");
+        assert_eq!(err.code(), "deploy_tree_invalid");
     }
 }
