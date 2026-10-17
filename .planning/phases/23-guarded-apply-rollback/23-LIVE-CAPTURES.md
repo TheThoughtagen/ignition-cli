@@ -17,7 +17,7 @@ Rule: every captured block is preceded by the exact command and a UTC time taken
 
 | Field | Value |
 | --- | --- |
-| State | `pending` |
+| State | `ready` (2026-10-17, see the dated line below; was `pending` on 2026-10-16) |
 | Host label | none (`ign-win-836` in resource group `rg-ign-cli-win-test` is gone; no replacement named) |
 | Account | `svc-ignition-deploy` (Modify on `data\config\resources\production`, granted 2026-10-15, now unreachable) |
 | Subscription or site | "Microsoft Azure Sponsorship" (default subscription); the two other subscriptions are inaccessible from the agent session (one needs `az login`, one is `AuthorizationFailed`) |
@@ -31,6 +31,22 @@ Matching row of `## Windows host outcome routing` in 23-01-PLAN.md, quoted:
 > | `pending` | 23-01 Tasks 2-3, 23-02..23-07, 23-18, 23-19, 23-17, 23-09, 23-11, 23-12 | the 23-08 Task 1 precondition (an unmet precondition halts with "Blocked by") | paused, not complete. When the host exists, the user exports the env and the executor re-runs the Task 1 verification (`az vm show`, `ssh ... pwd`), appends a dated `ready` line to `## Windows capture host (23-01)`, and execution resumes at 23-08. A host recorded `ready` that stops answering by 23-08 is treated as `pending` | one OPEN line: host pending, stop point 23-08 |
 
 Stop point: the 23-08 Task 1 precondition. Plans that will not run until a host is recorded `ready`: 23-08, 23-20, 23-10, 23-13, 23-21, 23-14, 23-15, 23-16. D-02's re-measure (23-10), C-script-run and C7b (23-08) stay owed in the table below.
+
+**2026-10-17 `ready`** (user, relayed by the orchestrator: "We will need to set one up", then "I provision via az"). The host was rebuilt with the az CLI under the same names. Task 1 verification, run 2026-10-17 by the orchestrator:
+
+| Field | Value |
+| --- | --- |
+| VM | `ign-win-836` (computer `ignwin836`), resource group `rg-ign-cli-win-test`, eastus, Standard_D2s_v4, Windows Server 2022 Datacenter g2. `az vm show -d` reports `VM running`, public IP `52.154.75.231` |
+| Inbound | NSG allows TCP 22 and 8088 from the operator's /32 only |
+| Gateway | Ignition 8.3.6 (b2026042713), standard edition, installed from the Windows zip as the `Ignition` service. `deploymentMode` = `production`: the mode was created with `POST /data/api/v1/mode`, then the gateway was restarted. Trial reset 2026-10-17 (it lasts 2 h; reset again with an authed `POST /data/api/v1/trial`) |
+| Account | `ignwin836\svc-ignition-deploy`, member of Users only, key login only. Explicit `(OI)(CI)(RX)` on `data\config\resources`, plus `(OI)(CI)(M)` on `data\config\resources\production` (granted 2026-10-17 by the exact icacls command in 22-12 deviation 3). No write ACE anywhere else under `data\` |
+| sftp `pwd` | `Remote working directory: /C:/Users/svc-ignition-deploy` |
+| ssh `whoami & cd` | `ignwin836\svc-ignition-deploy` / `C:\Users\svc-ignition-deploy` (Win32-OpenSSH 8.1p1, default shell cmd.exe) |
+| Host key | ED25519 `SHA256:Izw8z+3YPObb46VCy/CmWITrfunmruC2TuytpQhfOPA`. The trusted-channel (run-command) read matched ssh-keyscan, and the key is pinned in `~/.cache/ign-wflwvm01/known_hosts` (mode 0600). It replaces the 22-CONTEXT A-01 fingerprint, which belonged to the deleted host |
+| Profile | `azure-win` -> `http://52.154.75.231:8088`, adopted (API key `ign-cli`, OS keyring). `ign --profile azure-win status` reports RUNNING |
+| Defender | real-time protection on, no exclusions |
+
+The `IGN_WINVM_*` and `IGN_WFLWVM01_*` values are exported from the 0600 files under `~/.cache/ign-wflwvm01/`. No key text or password is recorded here. Execution resumes at 23-08.
 
 ## Captures Owed
 
