@@ -1814,7 +1814,7 @@ const PROBE_MOVE: &str = r#"$r=$p.x+$p.root;$out=@();function Fresh{if([IO.Direc
 
 /// Every file below `$p.path` (native, prefix added by `$p.x`) as relative
 /// path to SHA-256, and every directory.
-const LIST_HASHES: &str = r#"$b=$p.x+$p.path;$o=@{};$d=@();if([IO.Directory]::Exists($b)){$h=[Security.Cryptography.SHA256]::Create();foreach($f in [IO.Directory]::EnumerateFiles($b,'*',[IO.SearchOption]::AllDirectories)){$s=[IO.File]::OpenRead($f);$o[$f.Substring($b.Length+1).Replace('\','/')]=[BitConverter]::ToString($h.ComputeHash($s)).Replace('-','').ToLower();$s.Dispose()};foreach($f in [IO.Directory]::EnumerateDirectories($b,'*',[IO.SearchOption]::AllDirectories)){$d+=$f.Substring($b.Length+1).Replace('\','/')}};E @{ok=1;files=$o;dirs=$d}"#;
+const LIST_HASHES: &str = r#"$b=$p.x+$p.path;$o=@{};$d=@();if([IO.Directory]::Exists($b)){$h=[Security.Cryptography.SHA256]::Create();foreach($f in [IO.Directory]::EnumerateFiles($b,'*',[IO.SearchOption]::AllDirectories)){$k=$f.Substring($b.Length+1).Replace('\','/');try{$s=New-Object IO.FileStream($f,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]7);$o[$k]=[BitConverter]::ToString($h.ComputeHash($s)).Replace('-','').ToLower();$s.Dispose()}catch{$o[$k]='?'}};foreach($f in [IO.Directory]::EnumerateDirectories($b,'*',[IO.SearchOption]::AllDirectories)){$d+=$f.Substring($b.Length+1).Replace('\','/')}};E @{ok=1;files=$o;dirs=$d}"#;
 
 /// `(files: path to SHA-256, directories)` below `path` (native).
 async fn hashes_below(shell: &RemoteShell, path: &str) -> (BTreeMap<String, String>, Vec<String>) {
@@ -2303,4 +2303,673 @@ async fn wflwvm01_apply_script_run() {
     assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
     timed("wflwvm01_apply_script_run total", started, ());
     eprintln!("PASS wflwvm01_apply_script_run");
+}
+
+// ---- 23-08 Task 2: C7b on the real collection --------------------------------
+
+/// The gateway directory name the C7b runs write below `ign-deploy` (the batch
+/// builder names `GATEWAY`).
+const C7B_GATEWAY: &str = GATEWAY;
+
+/// ACLs of the given plain native paths: `[path, owner, rules protected,
+/// "identity:rights:type:I|E:inheritance | ..."]`.
+const ACLS: &str = r#"$o=@();foreach($e in $p.paths){if(-not (Test-Path -LiteralPath $e)){$o+=,@($e,'ABSENT','','');continue};$i=Get-Item -LiteralPath $e -Force;$a=$i.GetAccessControl();$o+=,@($e,[string]$a.Owner,[string]$a.AreAccessRulesProtected,(($a.Access|ForEach-Object{$_.IdentityReference.ToString()+':'+$_.FileSystemRights.ToString()+':'+$_.AccessControlType.ToString()+':'+$(if($_.IsInherited){'I'}else{'E'})+':'+$_.InheritanceFlags.ToString()}) -join ' | '))};E @{ok=1;r=$o}"#;
+
+const SERVICE: &str = r#"$q=(cmd /c 'sc qc Ignition 2>&1') -join ' ';$m=[regex]::Match($q,'SERVICE_START_NAME\s*:\s*(\S+)');E @{ok=1;start=$m.Groups[1].Value;raw=$q.Substring(0,[Math]::Min(160,$q.Length))}"#;
+
+const DEFENDER: &str = r#"try{$s=Get-MpComputerStatus;$m=Get-MpPreference;E @{ok=1;rtp=[string]$s.RealTimeProtectionEnabled;paths=@($m.ExclusionPath).Count;procs=@($m.ExclusionProcess).Count;exts=@($m.ExclusionExtension).Count}}catch{$t=[string]$_.Exception.Message;E @{ok=1;err=$t.Substring(0,[Math]::Min(100,$t.Length))}}"#;
+
+/// Hold `$p.path` open for `$p.s` seconds, sharing `$p.share` with other openers.
+const HOLD: &str = r#"$h=[IO.File]::Open($p.path,'Open','Read',[IO.FileShare]$p.share);Start-Sleep -Seconds $p.s;$h.Dispose();E @{ok=1}"#;
+
+/// Make `$p.dir` (prefix `$p.x`) and write `f.json` into it.
+const MAKE_FILE: &str = r#"$d=$p.x+$p.dir;[void][IO.Directory]::CreateDirectory($d);[IO.File]::WriteAllText($d+'\f.json','{}');E @{ok=1}"#;
+
+/// Remove one file (prefix `$p.x`).
+const REMOVE_FILE: &str =
+    r#"$f=$p.x+$p.path;if([IO.File]::Exists($f)){[IO.File]::Delete($f)};E @{ok=1}"#;
+
+/// Remove one empty directory (prefix `$p.x`).
+const REMOVE_EMPTY_DIR: &str =
+    r#"$d=$p.x+$p.path;if([IO.Directory]::Exists($d)){[IO.Directory]::Delete($d)};E @{ok=1}"#;
+
+async fn acl_rows(shell: &RemoteShell, paths: &[String]) -> Vec<(String, String, String, String)> {
+    let value = shell
+        .exec_powershell(&script("acls", ACLS, serde_json::json!({ "paths": paths })))
+        .await
+        .expect("acls");
+    value["r"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap_or_default().to_string(),
+                row[1].as_str().unwrap_or_default().to_string(),
+                row[2].as_str().unwrap_or_default().to_string(),
+                row[3].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+async fn print_acls(shell: &RemoteShell, label: &str, paths: &[String]) {
+    eprintln!("CAPTURE acl {label} @ {}", utc_now());
+    for (path, owner, protected, rules) in acl_rows(shell, paths).await {
+        eprintln!(
+            "CAPTURE acl   {path}\n                 owner={owner} protected={protected}\n                 {rules}"
+        );
+    }
+}
+
+/// The directory (native) below `base` whose `\\f.json` file has a native path
+/// of exactly `total` characters.
+fn dir_for_total(base: &str, total: usize) -> String {
+    let want = total - "\\f.json".len();
+    assert!(want > base.len() + 2, "{total} is too short for {base}");
+    let mut dir = base.to_string();
+    while dir.len() < want {
+        let left = want - dir.len() - 1;
+        let take = if left > 80 && left - 80 < 2 {
+            left - 2
+        } else {
+            left.min(80)
+        };
+        dir.push('\\');
+        dir.push_str(&"d".repeat(take));
+    }
+    assert_eq!(dir.len(), want);
+    dir
+}
+
+/// What `finalize` does to the journal (23-20 builds it for this host): the
+/// operator's equivalent between two runs.
+async fn drop_journal(shell: &RemoteShell, deploy_native: &str) {
+    shell
+        .exec_powershell(&script(
+            "remove_file",
+            REMOVE_FILE,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "path": format!("{deploy_native}\\{MODE}\\journal.json") }),
+        ))
+        .await
+        .expect("drop the journal");
+}
+
+fn first_db_unit(payload: &Payload) -> Vec<(String, Vec<u8>)> {
+    let unit = payload
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str().split('/').take(3).collect::<Vec<_>>().join("/"))
+        .find(|u| u.starts_with("ignition/database-connection/"))
+        .expect("the corpus holds a database connection");
+    payload
+        .tree
+        .files
+        .iter()
+        .filter(|(p, _)| p.as_str().starts_with(&format!("{unit}/")))
+        .map(|(p, b)| (p.as_str().to_string(), b.clone()))
+        .collect()
+}
+
+/// Put production back to `(files, dirs)`: delete the files that were not
+/// there, then the directories that were not there (deepest first).
+async fn put_back(
+    shell: &RemoteShell,
+    prod_native: &str,
+    files: &BTreeMap<String, String>,
+    dirs: &[String],
+) {
+    let (now_files, now_dirs) = hashes_below(shell, prod_native).await;
+    for rel_path in now_files.keys().filter(|p| !files.contains_key(*p)) {
+        shell
+            .exec_powershell(&script(
+                "remove_file",
+                REMOVE_FILE,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "path": format!("{prod_native}\\{}", rel_path.replace('/', "\\")) }),
+            ))
+            .await
+            .expect("remove stray file");
+    }
+    let mut stray: Vec<&String> = now_dirs.iter().filter(|d| !dirs.contains(d)).collect();
+    stray.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+    for dir in stray {
+        shell
+            .exec_powershell(&script(
+                "remove_dir",
+                REMOVE_EMPTY_DIR,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "path": format!("{prod_native}\\{}", dir.replace('/', "\\")) }),
+            ))
+            .await
+            .expect("remove stray directory");
+    }
+}
+
+/// The gateway, reached through the installed `ign` binary and the host's
+/// profile (`ign --profile <p> --json api call`). The profile's credential is in
+/// the OS keyring and only the installed binary may read it without a prompt,
+/// so this test never opens the keyring itself.
+struct GwCli {
+    profile: String,
+}
+
+impl GwCli {
+    /// `data.result.data` of one raw call; a non-2xx status is an error.
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Res<serde_json::Value> {
+        let mut cmd = tokio::process::Command::new("ign");
+        cmd.args([
+            "--profile",
+            &self.profile,
+            "--json",
+            "api",
+            "call",
+            "--method",
+            method,
+            "--path",
+            path,
+        ]);
+        for (k, v) in query {
+            cmd.args(["--query", &format!("{k}={v}")]);
+        }
+        let out = cmd.output().await.map_err(err_s)?;
+        let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+            format!(
+                "{method} {path}: no JSON ({e}); exit {:?}",
+                out.status.code()
+            )
+        })?;
+        let status = envelope["data"]["result"]["status"].as_i64().unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(format!("{method} {path}: status {status}"));
+        }
+        Ok(envelope["data"]["result"]["data"].clone())
+    }
+
+    async fn scan_status(&self) -> Res<(bool, i64, i64)> {
+        let v = self.call("GET", "/data/api/v1/scan/config", &[]).await?;
+        Ok((
+            v["scanActive"].as_bool().unwrap_or(true),
+            v["lastScanTimestamp"].as_i64().unwrap_or(0),
+            v["lastScanDuration"].as_i64().unwrap_or(0),
+        ))
+    }
+
+    /// A config scan, triggered and waited on: wall seconds and the gateway's
+    /// own duration in milliseconds.
+    async fn scan(&self) -> Res<(f64, i64)> {
+        let (active, before, _) = self.scan_status().await?;
+        if active {
+            return Err("a scan was already active before the trigger".to_string());
+        }
+        let started = Instant::now();
+        self.call("POST", "/data/api/v1/scan/config", &[]).await?;
+        loop {
+            let (active, ts, duration) = self.scan_status().await?;
+            if !active && ts > before {
+                return Ok((started.elapsed().as_secs_f64(), duration));
+            }
+            if started.elapsed() > Duration::from_secs(600) {
+                return Err("the scan did not complete in 600 s".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// Everything the C7b body works with.
+struct C7b {
+    shell: RemoteShell,
+    /// The temp repo the shells are built from (a second ssh session holds a
+    /// target open).
+    repo_path: PathBuf,
+    host: SftpTransport,
+    gw: GwCli,
+    home: String,
+    home_native: String,
+    prod_native: String,
+    prod_sftp: String,
+    deploy_native: String,
+    lenroot_native: String,
+    before_files: BTreeMap<String, String>,
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1; writes the real production collection and restores it"]
+async fn wflwvm01_c7b() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let profile = require_env("IGN_WFLWVM01_PROFILE");
+    let repo = repo(&live, "c7b", &live.data_dir, Some(150));
+    let shell = shell_of(repo.path(), "c7b");
+    let gw = GwCli { profile };
+    let home = home_sftp(&shell).await;
+    let home_native = native(&home);
+    let prod_native = format!("{}\\config\\resources\\{MODE}", live.data_dir);
+    let prod_sftp = format!(
+        "/{}/config/resources/{MODE}",
+        live.data_dir.replace('\\', "/")
+    );
+    let deploy_native = format!("{home_native}\\ign-deploy\\{C7B_GATEWAY}");
+    let lenroot_native = format!("{home_native}\\ign-live-c7b");
+    let (_, ssh, _) = ssh_of(repo.path(), "c7b");
+    let host = SftpTransport::new_windows(
+        shell_of(repo.path(), "c7b"),
+        windows_sftp_root(&ssh.data_dir).expect("data dir"),
+        "nodes.master",
+    )
+    .with_apply(C7B_GATEWAY, MODE)
+    .expect("apply half");
+
+    // leftovers of a cut-off run
+    remove_tree(&shell, &deploy_native).await;
+    remove_tree(&shell, &lenroot_native).await;
+
+    eprintln!("CAPTURE c7b @ {}", utc_now());
+    let service = shell
+        .exec_powershell(&script("service", SERVICE, serde_json::Value::Null))
+        .await
+        .expect("service");
+    eprintln!(
+        "CAPTURE gateway service (sc qc Ignition): runs as {} ; {}",
+        service["start"], service["raw"]
+    );
+    let defender = shell
+        .exec_powershell(&script("defender", DEFENDER, serde_json::Value::Null))
+        .await
+        .expect("defender");
+    eprintln!("CAPTURE defender as found: {defender}");
+
+    let (before_files, before_dirs) = hashes_below(&shell, &prod_native).await;
+    eprintln!(
+        "CAPTURE production before: {} files, {} directories: {:?}",
+        before_files.len(),
+        before_dirs.len(),
+        before_files.keys().collect::<Vec<_>>()
+    );
+    let scan_before = gw.scan().await.expect("a first scan");
+    eprintln!("CAPTURE scan before anything is written: {scan_before:?}");
+
+    let ctx = C7b {
+        repo_path: repo.path().to_path_buf(),
+        shell,
+        host,
+        gw,
+        home,
+        home_native,
+        prod_native: prod_native.clone(),
+        prod_sftp,
+        deploy_native: deploy_native.clone(),
+        lenroot_native: lenroot_native.clone(),
+        before_files: before_files.clone(),
+    };
+    // the body runs as its own task so that a panic in it still leaves the
+    // restore below to run
+    let ctx = Arc::new(ctx);
+    let outcome = match tokio::spawn({
+        let ctx = ctx.clone();
+        async move { c7b_body(&ctx).await }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(format!("the C7b body panicked: {e}")),
+    };
+
+    // whatever happened above: production goes back to its pre-run listing
+    put_back(&ctx.shell, &prod_native, &before_files, &before_dirs).await;
+    let (after_files, after_dirs) = hashes_below(&ctx.shell, &prod_native).await;
+    let equal = after_files == before_files && after_dirs == before_dirs;
+    eprintln!("CAPTURE production listing equals the pre-run listing: {equal}");
+    let scan_after = ctx.gw.scan().await.expect("the closing scan");
+    eprintln!("CAPTURE closing scan: {scan_after:?}");
+    let g = remove_tree(&ctx.shell, &deploy_native).await;
+    let l = remove_tree(&ctx.shell, &lenroot_native).await;
+    ctx.shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{}\\ign-deploy", ctx.home_native)),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    eprintln!("CAPTURE cleanup: deploy dir gone {g}, length probe gone {l}");
+    outcome.expect("the C7b body failed; production was put back");
+    assert!(
+        equal,
+        "the production collection differs from its pre-run listing"
+    );
+    assert!(g && l);
+    timed("wflwvm01_c7b total", started, ());
+    eprintln!("PASS wflwvm01_c7b");
+}
+
+async fn c7b_body(c: &C7b) -> Result<(), String> {
+    let shell = &c.shell;
+    let prod_native = c.prod_native.as_str();
+    let corpus = corpus_payload(1);
+    let unit = first_db_unit(&corpus);
+    let unit_dir = unit[0]
+        .0
+        .rsplit_once('/')
+        .map(|(d, _)| d.to_string())
+        .expect("unit dir");
+    let unit_name = unit_dir.rsplit('/').next().expect("name").to_string();
+    eprintln!("CAPTURE the probe unit: {unit_dir} ({} files)", unit.len());
+    let writes: Vec<(&str, &[u8])> = unit
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+
+    // ---- 1. one new resource unit, moved from the account home into production
+    let run1 = "20261017T130000Z-c7b001";
+    let (spec1, tree1) = win_batch(run1, &writes, &[], None, &c.before_files, None);
+    let prepared = c.host.prepare(&spec1, &tree1).await.map_err(err_s)?;
+    let staged_root = format!("{}\\{MODE}\\staging\\{run1}\\files", c.deploy_native);
+    let staged: Vec<String> = unit
+        .iter()
+        .map(|(p, _)| format!("{staged_root}\\{}", p.replace('/', "\\")))
+        .collect();
+    print_acls(
+        shell,
+        "the staged copies in the account home, before the move",
+        &staged,
+    )
+    .await;
+    let t = Instant::now();
+    let report = c.host.commit(&prepared).await.map_err(err_s)?;
+    timed("c7b: script commit of the probe unit", t, ());
+    eprintln!("CAPTURE commit report: {report:?}");
+    if report.failure.is_some() || report.moved.len() != unit.len() {
+        return Err(format!("the probe unit was not committed: {report:?}"));
+    }
+    let unit_native = format!("{prod_native}\\{}", unit_dir.replace('/', "\\"));
+    let type_native = unit_native
+        .rsplit_once('\\')
+        .map(|(d, _)| d.to_string())
+        .expect("type dir");
+    let moved_files: Vec<String> = unit
+        .iter()
+        .map(|(p, _)| format!("{prod_native}\\{}", p.replace('/', "\\")))
+        .collect();
+    let mut acl_paths = vec![
+        prod_native.to_string(),
+        format!("{prod_native}\\config-mode.json"),
+        type_native.clone(),
+        unit_native.clone(),
+    ];
+    acl_paths.extend(moved_files.iter().cloned());
+    print_acls(shell, "after the script moved the unit in", &acl_paths).await;
+
+    // a file made in place, for comparison: what inheritance gives a new file here
+    let control = format!("{unit_native}\\control.txt");
+    let control_dir = tempfile::tempdir().map_err(err_s)?;
+    let control_local = control_dir.path().join("control.txt");
+    std::fs::write(&control_local, b"control").map_err(err_s)?;
+    sftp(
+        shell,
+        &[SftpOp::Put {
+            local: control_local,
+            remote: format!("{}/{unit_dir}/control.txt", c.prod_sftp),
+        }],
+    )
+    .await;
+    print_acls(
+        shell,
+        "a control file put by sftp into the same directory",
+        std::slice::from_ref(&control),
+    )
+    .await;
+    shell
+        .exec_powershell(&script(
+            "remove_file",
+            REMOVE_FILE,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "path": control }),
+        ))
+        .await
+        .map_err(err_s)?;
+
+    // ---- 2. does the gateway load it after a scan
+    let (scan_s, scan_ms) = c.gw.scan().await?;
+    let (_, scan_ts, scan_duration) = c.gw.scan_status().await?;
+    let window_start = scan_ts - scan_duration - 1_000;
+    let listed =
+        c.gw.call(
+            "GET",
+            "/data/api/v1/resources/list/ignition/database-connection",
+            &[],
+        )
+        .await?;
+    let item = listed["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["name"] == unit_name.as_str()));
+    eprintln!(
+        "CAPTURE scan after the move: {scan_s:.2}s (gateway {scan_ms} ms); the REST view (resources/list) lists {unit_name}: {}",
+        item.is_some()
+    );
+    if let Some(item) = item {
+        eprintln!(
+            "CAPTURE   {unit_name}: collection {} enabled {} version {} health {}",
+            item["collection"], item["enabled"], item["version"], item["healthchecks"]
+        );
+    }
+    let logs =
+        c.gw.call(
+            "GET",
+            "/data/api/v1/logs",
+            &[
+                ("startTime", window_start.to_string()),
+                ("minLevel", "WARN".to_string()),
+                ("limit", "200".to_string()),
+            ],
+        )
+        .await?;
+    let lines = logs["items"].as_array().cloned().unwrap_or_default();
+    let relevant: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| {
+            let m = e["message"].as_str().unwrap_or_default();
+            m.contains(&unit_name) || m.contains("will not be loaded")
+        })
+        .collect();
+    eprintln!(
+        "CAPTURE gateway log since the scan: {} WARN+ lines, {} mention {unit_name} or `will not be loaded`",
+        lines.len(),
+        relevant.len()
+    );
+    for entry in relevant.iter().take(5) {
+        let message: String = entry["message"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(160)
+            .collect();
+        eprintln!(
+            "CAPTURE   log {} {} {message}",
+            entry["level"], entry["loggerName"]
+        );
+    }
+    print_acls(shell, "after the gateway scanned the unit", &moved_files).await;
+    // `finalize` is 23-20's; the operator's equivalent is dropping the journal
+    drop_journal(shell, &c.deploy_native).await;
+
+    // ---- 3. a held target. A reader that lets others read (FileShare.Read, what
+    // a JVM or a scanner usually does) leaves the file readable and blocks the
+    // replacement; a holder that shares nothing blocks the read as well.
+    let held_rel = unit[0].0.clone();
+    let held_native = format!("{prod_native}\\{}", held_rel.replace('/', "\\"));
+    for (case, share, run, expect_refusal) in [
+        ("share Read", "Read", "20261017T130100Z-c7b002", false),
+        ("share None", "None", "20261017T130110Z-c7b003", true),
+    ] {
+        let (live_now, _) = hashes_below(shell, prod_native).await;
+        let held_new = format!("{{\"replaced\":\"{case}\"}}").into_bytes();
+        let (spec2, tree2) = win_batch(
+            run,
+            &[(held_rel.as_str(), held_new.as_slice())],
+            &[],
+            None,
+            &live_now,
+            None,
+        );
+        let prepared2 = c.host.prepare(&spec2, &tree2).await.map_err(err_s)?;
+        let hold_secs = 60u64;
+        let holder = shell_of(&c.repo_path, "c7b");
+        let hold_path = held_native.clone();
+        let hold = tokio::spawn(async move {
+            holder
+                .exec_powershell(&script(
+                    "hold",
+                    HOLD,
+                    serde_json::json!({ "path": hold_path, "s": hold_secs, "share": share }),
+                ))
+                .await
+        });
+        // let the holder connect and open the file before the commit starts
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let t = Instant::now();
+        let held_report = c.host.commit(&prepared2).await;
+        let held_secs = t.elapsed().as_secs_f64();
+        eprintln!(
+            "CAPTURE commit with the target held open ({case}) @ {}: {held_secs:.1}s -> {held_report:?}",
+            utc_now()
+        );
+        let after_held = hashes_below(shell, prod_native).await.0;
+        eprintln!(
+            "CAPTURE held target ({case}) after the commit: production listing unchanged {}",
+            after_held.get(&held_rel).map(String::as_str)
+                == live_now.get(&held_rel).map(String::as_str)
+                || after_held.get(&held_rel).map(String::as_str) == Some("?")
+        );
+        if expect_refusal {
+            let err = held_report.expect_err("a file that cannot be read stops the commit");
+            if !err.to_string().contains("holds it open") {
+                return Err(format!("the held refusal reads wrong: {err}"));
+            }
+            let (files, _) = hashes_below(shell, &c.deploy_native).await;
+            if files.contains_key(&format!("{MODE}/journal.json")) {
+                return Err("a refused commit left a journal".to_string());
+            }
+        } else {
+            let held_report = held_report.map_err(err_s)?;
+            if held_report.failure.is_none() {
+                return Err(format!(
+                    "the held target did not stop the commit ({held_secs:.1}s): {held_report:?}"
+                ));
+            }
+            // the failed run is restored from its snapshot while the file is still held
+            let restored2 = c.host.restore(&spec2.record).await.map_err(err_s)?;
+            eprintln!("CAPTURE restore of the held run ({case}): {restored2:?}");
+            if restored2.failure.is_some() {
+                return Err(format!("the held run did not restore: {restored2:?}"));
+            }
+            drop_journal(shell, &c.deploy_native).await;
+        }
+        let _ = hold.await;
+        let back = hashes_below(shell, prod_native).await.0;
+        if back.get(&held_rel) != live_now.get(&held_rel) {
+            return Err(format!(
+                "the held file ({case}) is not back to its pre-run bytes"
+            ));
+        }
+    }
+
+    // restore run 1 too: production back to its listing, then a scan
+    let restored1 = c.host.restore(&spec1.record).await.map_err(err_s)?;
+    eprintln!("CAPTURE restore of the probe unit: {restored1:?}");
+    if restored1.failure.is_some() {
+        return Err(format!("the probe unit did not restore: {restored1:?}"));
+    }
+    drop_journal(shell, &c.deploy_native).await;
+
+    // ---- 4. the 152-file corpus through the script (Defender as found)
+    let run3 = "20261017T130200Z-c7b003";
+    let corpus_writes: Vec<(String, Vec<u8>)> = corpus
+        .tree
+        .files
+        .iter()
+        .map(|(p, b)| (p.as_str().to_string(), b.clone()))
+        .collect();
+    let writes3: Vec<(&str, &[u8])> = corpus_writes
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let (live3, _) = hashes_below(shell, prod_native).await;
+    let (spec3, tree3) = win_batch(run3, &writes3, &[], None, &live3, None);
+    let t = Instant::now();
+    let prepared3 = c.host.prepare(&spec3, &tree3).await.map_err(err_s)?;
+    let prepare_secs = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let report3 = c.host.commit(&prepared3).await.map_err(err_s)?;
+    let commit_secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "CAPTURE corpus: {} files ({} bytes); prepare {prepare_secs:.1}s; script commit {commit_secs:.2}s; moved {} failure {:?}",
+        corpus.files,
+        corpus.bytes,
+        report3.moved.len(),
+        report3.failure
+    );
+    let t = Instant::now();
+    let restored3 = c.host.restore(&spec3.record).await.map_err(err_s)?;
+    eprintln!(
+        "CAPTURE corpus restore: {:.2}s (including its uploads and journal read); failure {:?}",
+        t.elapsed().as_secs_f64(),
+        restored3.failure
+    );
+    drop_journal(shell, &c.deploy_native).await;
+    if report3.failure.is_some() || restored3.failure.is_some() {
+        return Err("the corpus commit or its restore failed".to_string());
+    }
+
+    // ---- 5. the longest path sftp can still reach below the account home
+    let mut rows = Vec::new();
+    for total in [200usize, 230, 240, 250, 255, 258, 259, 260, 261, 270] {
+        let dir = dir_for_total(&c.lenroot_native, total);
+        shell
+            .exec_powershell(&script(
+                "make_file",
+                MAKE_FILE,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "dir": dir }),
+            ))
+            .await
+            .map_err(err_s)?;
+        let file_native = format!("{dir}\\f.json");
+        assert_eq!(file_native.len(), total);
+        let sftp_dir = format!("/{}", dir.replace('\\', "/"));
+        let sftp_file = format!("/{}", file_native.replace('\\', "/"));
+        let local_dir = tempfile::tempdir().map_err(err_s)?;
+        let local_copy = local_dir.path().join("got.json");
+        let listing = shell
+            .sftp_batch(&[SftpOp::LsLong {
+                path: sftp_dir.clone(),
+            }])
+            .await
+            .map_err(err_s)?;
+        let listed = String::from_utf8_lossy(&listing.stdout).contains("f.json");
+        let got = shell
+            .sftp_batch(&[SftpOp::Get {
+                remote: sftp_file,
+                local: local_copy.clone(),
+            }])
+            .await
+            .map_err(err_s)?;
+        let got_ok = got.code == 0 && local_copy.is_file();
+        eprintln!(
+            "CAPTURE path length {total}: ls lists f.json {listed} (exit {}); get ok {got_ok} (exit {})",
+            listing.code, got.code
+        );
+        rows.push((total, listed, got_ok));
+    }
+    let longest = rows
+        .iter()
+        .filter(|(_, listed, got)| *listed && *got)
+        .map(|(n, _, _)| *n)
+        .max();
+    eprintln!("CAPTURE longest reachable file path (ls and get both work): {longest:?}");
+    let _ = (&c.home, &c.home_native);
+    Ok(())
 }

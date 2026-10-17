@@ -79,6 +79,58 @@ fn plain(text: &str) -> String {
         .collect()
 }
 
+/// The longest native path, in UTF-16 units, that the sftp server on a Windows
+/// host still lists and serves (C7b, 2026-10-17: see `23-LIVE-CAPTURES.md`
+/// `### C7b`). A snapshot or staging file below the account home whose path is
+/// longer cannot be downloaded again, so a rollback could not read it back.
+pub const WINDOWS_SNAPSHOT_PATH_MAX: usize = 259;
+
+/// Why a Windows host cannot take `touched`, one sentence per refused path: the
+/// copy this run would make below the account home (`snapshots\<run>\files\`
+/// and `staging\<run>\files\`, the longer of the two decides) would be longer
+/// than [`WINDOWS_SNAPSHOT_PATH_MAX`]. Pure: `home_native` is the account home in
+/// native form, `run_len` the length of the run id. The ledger key and paths
+/// that are not collection paths are not checked here. At most the first five
+/// paths are named; the rest are counted.
+pub fn windows_long_path_problems(
+    home_native: &str,
+    gateway: &str,
+    mode: &str,
+    run_len: usize,
+    touched: &[String],
+) -> Vec<String> {
+    let run = "r".repeat(run_len);
+    let prefixes = [
+        format!("{home_native}\\ign-deploy\\{gateway}\\{mode}\\snapshots\\{run}\\files\\"),
+        format!("{home_native}\\ign-deploy\\{gateway}\\{mode}\\staging\\{run}\\files\\"),
+    ];
+    let units = |text: &str| text.encode_utf16().count();
+    let prefix_len = prefixes.iter().map(|p| units(p)).max().unwrap_or(0);
+    let mut problems: Vec<String> = Vec::new();
+    let mut refused = 0usize;
+    for path in touched {
+        if path == LEDGER_KEY {
+            continue;
+        }
+        let total = prefix_len + units(path);
+        if total > WINDOWS_SNAPSHOT_PATH_MAX {
+            refused += 1;
+            if problems.len() < 5 {
+                problems.push(format!(
+                    "{path} would be {total} characters long once copied below the account home, over the {WINDOWS_SNAPSHOT_PATH_MAX} the sftp server can reach, so a rollback could not download it"
+                ));
+            }
+        }
+    }
+    if refused > problems.len() {
+        problems.push(format!(
+            "{} more path(s) are too long",
+            refused - problems.len()
+        ));
+    }
+    problems
+}
+
 /// The first `levels` components of `path`.
 fn first_components(path: &str, levels: usize) -> String {
     path.split('/').take(levels).collect::<Vec<_>>().join("/")
@@ -478,6 +530,26 @@ impl SftpTransport {
                     op,
                     format!(
                         "the staged copy on the host does not match its SHA-256 for {}; nothing was changed",
+                        super::named(&bad)
+                    ),
+                )
+            }
+            "held" => {
+                let bad: Vec<String> = value
+                    .get("bad")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|item| staged_name(item, work))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.mirror_fail(
+                    op,
+                    format!(
+                        "{} could not be read because another process holds it open; nothing was changed",
                         super::named(&bad)
                     ),
                 )
@@ -1123,6 +1195,34 @@ impl ApplyHost for SftpTransport {
         })
     }
 
+    async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
+        if !self.windows {
+            return self.probe().await;
+        }
+        const OP: &str = "probe";
+        // A Windows node refuses, in Rust and before anything is written, a
+        // path whose copy below the account home the sftp server could not
+        // reach again (C7a-8, C7b). The script's own probe is 23-20's; the
+        // gate runs first.
+        let setup = self.apply_setup_any(OP)?;
+        let home = self.account_home().await?;
+        let run_len = RunId::generate().as_str().len();
+        let problems = windows_long_path_problems(
+            &super::windows_native_path(&home),
+            &setup.gateway,
+            &setup.mode,
+            run_len,
+            touched,
+        );
+        if !problems.is_empty() {
+            return Ok(ProbeReport {
+                writable: false,
+                problems,
+            });
+        }
+        self.probe().await
+    }
+
     async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
         const OP: &str = "prepare";
         let setup = self.apply_setup_any(OP)?;
@@ -1467,5 +1567,98 @@ impl ApplyHost for SftpTransport {
             return Err(self.refusal(OP, &value, Some(&work)).await);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOME: &str = "C:\\Users\\svc-ignition-deploy";
+
+    /// The longest `touched` path (in characters) that still passes for `gateway`,
+    /// `mode` and a run id of `run_len` characters.
+    fn longest_ok(gateway: &str, mode: &str, run_len: usize) -> usize {
+        let prefix = format!(
+            "{HOME}\\ign-deploy\\{gateway}\\{mode}\\snapshots\\{}\\files\\",
+            "r".repeat(run_len)
+        )
+        .chars()
+        .count();
+        WINDOWS_SNAPSHOT_PATH_MAX - prefix
+    }
+
+    fn rel_of_len(len: usize) -> String {
+        // module/type/name/file: 3 separators; the name takes the rest
+        let name = "n".repeat(len - "m/t//config.json".len());
+        format!("m/t/{name}/config.json")
+    }
+
+    #[test]
+    fn a_snapshot_path_at_the_limit_passes_and_one_past_it_is_refused_naming_the_path() {
+        let ok = longest_ok("gw", "production", 23);
+        let at = rel_of_len(ok);
+        let past = rel_of_len(ok + 1);
+        assert_eq!(at.len(), ok);
+        assert!(
+            windows_long_path_problems(HOME, "gw", "production", 23, std::slice::from_ref(&at))
+                .is_empty(),
+            "a path of exactly the limit is reachable"
+        );
+        let problems =
+            windows_long_path_problems(HOME, "gw", "production", 23, &[at.clone(), past.clone()]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with(&past), "{problems:?}");
+        assert!(problems[0].contains(&WINDOWS_SNAPSHOT_PATH_MAX.to_string()));
+        assert!(!problems[0].contains(&at));
+    }
+
+    #[test]
+    fn the_longer_of_snapshot_and_staging_decides_and_units_are_utf16() {
+        // `snapshots` is two characters longer than `staging`, so the snapshot
+        // copy is the binding one
+        let ok = longest_ok("gw", "production", 23);
+        let past = rel_of_len(ok + 1);
+        assert_eq!(
+            windows_long_path_problems(HOME, "gw", "production", 23, &[past]).len(),
+            1
+        );
+        // an astral character is two UTF-16 units: a path of `ok` characters
+        // holding one is `ok + 1` units and is refused
+        let mut astral = rel_of_len(ok - 1);
+        astral.push('\u{1F600}');
+        assert_eq!(astral.chars().count(), ok);
+        assert_eq!(astral.encode_utf16().count(), ok + 1);
+        assert_eq!(
+            windows_long_path_problems(HOME, "gw", "production", 23, &[astral]).len(),
+            1
+        );
+        // a longer gateway name, mode or run id moves the limit down
+        let tight = rel_of_len(ok);
+        assert!(
+            !windows_long_path_problems(
+                HOME,
+                "gateway-with-a-long-name",
+                "production",
+                23,
+                &[tight]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_ledger_key_is_not_a_collection_path_and_many_refusals_are_counted() {
+        assert!(
+            windows_long_path_problems(HOME, "gw", "production", 23, &[LEDGER_KEY.to_string()])
+                .is_empty()
+        );
+        let long = rel_of_len(WINDOWS_SNAPSHOT_PATH_MAX);
+        let many: Vec<String> = (0..9)
+            .map(|i| format!("{}{i}", &long[..long.len() - 1]))
+            .collect();
+        let problems = windows_long_path_problems(HOME, "gw", "production", 23, &many);
+        assert_eq!(problems.len(), 6, "five named and one count: {problems:?}");
+        assert_eq!(problems[5], "4 more path(s) are too long");
     }
 }

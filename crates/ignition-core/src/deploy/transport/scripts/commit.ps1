@@ -43,6 +43,7 @@ $Moved = New-Object Collections.Generic.List[int]
 $Deleted = New-Object Collections.Generic.List[int]
 $Dirs = New-Object Collections.Generic.List[object]
 $Stale = New-Object Collections.Generic.List[string]
+$Held = New-Object Collections.Generic.List[string]
 $Removed = @{}
 $Created = New-Object Collections.Generic.List[int]
 $NL = "`n"
@@ -162,16 +163,32 @@ function Classify([string]$base, [string]$rel) {
     return $kind
 }
 
-# live BASE REL: the SHA-256 of BASE\REL, '-' when absent and '!' when it is
-# not a plain regular file reached without a reparse point.
+# live BASE REL: the SHA-256 of BASE\REL, '-' when absent, '!' when it is not a
+# plain regular file reached without a reparse point and '?' when it is a
+# regular file that cannot be read now (another process holds it open without
+# sharing, C7b).
 function Live([string]$base, [string]$rel) {
     $k = Classify $base $rel
     if ($k -eq 'absent') { return '-' }
     if ($k -eq 'file') {
         $h = Sha (Sub $base $rel)
         if ($h) { return $h }
+        return '?'
     }
     return '!'
+}
+
+# LiveRetry BASE REL: Live, with a file that cannot be read tried again a
+# bounded number of times, one second apart.
+function LiveRetry([string]$base, [string]$rel) {
+    $v = Live $base $rel
+    $n = 0
+    while ($v -eq '?' -and $n -lt $S.Retries) {
+        Start-Sleep -Seconds 1
+        $n++
+        $v = Live $base $rel
+    }
+    return $v
 }
 
 # An absolute native path of the shape the runner builds: a drive, then plain
@@ -229,6 +246,17 @@ function ReplaceWith([string]$src, [string]$dst) {
         try { if ([IO.File]::Exists((Xp $tmp))) { [IO.File]::Delete((Xp $tmp)) } } catch { }
         return $false
     }
+}
+
+# reset_acl PATH: the file takes the access list its directory gives a new file
+# (inherited entries only). A file moved in from the account home otherwise
+# keeps the list it had there: protected, with only SYSTEM, Administrators and
+# the deploy account, which is not what an untouched file of the collection has
+# (C7b).
+function ResetAcl([string]$pth) {
+    $sec = New-Object Security.AccessControl.FileSecurity
+    $sec.SetAccessRuleProtection($false, $false)
+    [IO.File]::SetAccessControl((Xp $pth), $sec)
 }
 
 function RemoveTree([string]$pth) {
@@ -422,16 +450,23 @@ function JournalUnchanged {
 # stale_check: fill $Stale with the entries whose live state is not the pre-image.
 function StaleCheck {
     $Stale.Clear()
+    $Held.Clear()
     foreach ($w in $Ws) {
-        if ((Live $Co $w.path) -cne $w.pre) { $Stale.Add('W' + $w.i) }
+        $v = LiveRetry $Co $w.path
+        if ($v -eq '?') { $Held.Add('W' + $w.i) }
+        elseif ($v -cne $w.pre) { $Stale.Add('W' + $w.i) }
     }
     foreach ($d in $Ds) {
-        if ((Live $Co $d.path) -cne $d.pre) { $Stale.Add('D' + $d.i) }
+        $v = LiveRetry $Co $d.path
+        if ($v -eq '?') { $Held.Add('D' + $d.i) }
+        elseif ($v -cne $d.pre) { $Stale.Add('D' + $d.i) }
     }
     if ($S.HaveL) {
-        if ((Live $De 'ledger.json') -cne $S.LPre) { $Stale.Add('L') }
+        $v = Live $De 'ledger.json'
+        if ($v -eq '?') { $Held.Add('L') }
+        elseif ($v -cne $S.LPre) { $Stale.Add('L') }
     }
-    return ($Stale.Count -eq 0)
+    return (($Stale.Count -eq 0) -and ($Held.Count -eq 0))
 }
 
 # snapshot_one BASE REL PRE DEST: copy BASE\REL to DEST and verify it. 1 when
@@ -549,6 +584,11 @@ function MoveOne([int]$i, [string]$rel, [string]$sha) {
         $S.Fail = "write ${i}: cannot move the file into place"
         return $false
     }
+    try { ResetAcl (Sub $Co $rel) }
+    catch {
+        $S.Fail = "write ${i}: cannot reset the permissions of the file"
+        return $false
+    }
     if ((Sha (Sub $Co $rel)) -cne $sha) {
         $S.Fail = "write ${i}: the file in place does not match its hash"
         return $false
@@ -651,6 +691,11 @@ function OpCommit {
     # 2. every touched path against its pre-image
     if (-not (StaleCheck)) {
         AbortBeforeMove
+        if ($Held.Count -gt 0) {
+            # a file that cannot be read cannot be compared with its pre-image;
+            # nothing has moved, so this is a refusal and not a stale plan
+            Refuse 'held' 'a file is held open by another process and cannot be read' @{ bad = $Held }
+        }
         Report 'snapshotting'
     }
     # 3. snapshot
@@ -782,6 +827,11 @@ function RestoreOne([int]$i, [string]$pth, [string]$pre) {
         if (-not (MoveWithRetries $tmp (Sub $Co $pth))) {
             try { if ([IO.File]::Exists((Xp $tmp))) { [IO.File]::Delete((Xp $tmp)) } } catch { }
             $S.Fail = "restore ${i}: cannot move the file into place"
+            return $false
+        }
+        try { ResetAcl (Sub $Co $pth) }
+        catch {
+            $S.Fail = "restore ${i}: cannot reset the permissions of the file"
             return $false
         }
     }

@@ -195,6 +195,9 @@ pub struct PreflightInput<'a> {
     pub host: &'a dyn ApplyHost,
     /// Files this run writes plus files it deletes.
     pub touched_files: usize,
+    /// The paths this run touches (collection paths, and the ledger key when
+    /// the ledger is swapped), for the limits a host puts on a path.
+    pub touched_paths: &'a [String],
     /// The hold the lock will be requested with and its estimates.
     pub hold: &'a HoldModel,
     /// What to do about open Designer sessions.
@@ -269,7 +272,7 @@ pub async fn run_preflights(
     });
     findings.push(wrong_target_finding(input).await?);
     findings.push(write_rest_finding(input.gateway).await?);
-    findings.push(write_host_finding(input.host).await?);
+    findings.push(write_host_finding(input.host, input.touched_paths).await?);
     let (designers, designers_seen) = designers_finding(input, steps).await?;
     findings.push(designers);
     findings.push(hold_budget_finding(input.hold, input.touched_files));
@@ -440,9 +443,12 @@ async fn write_rest_finding(gateway: &dyn GatewayApi) -> Result<PreflightFinding
 
 // ---- write_host -------------------------------------------------------------
 
-async fn write_host_finding(host: &dyn ApplyHost) -> Result<PreflightFinding, CoreError> {
+async fn write_host_finding(
+    host: &dyn ApplyHost,
+    touched: &[String],
+) -> Result<PreflightFinding, CoreError> {
     let check = PreflightCheck::WriteHost;
-    let report = host.probe().await?;
+    let report = host.probe_paths(touched).await?;
     if report.writable {
         return Ok(finding(
             check,

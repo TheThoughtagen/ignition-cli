@@ -836,6 +836,12 @@ async fn drive(
     // Every preflight, before anything is staged, locked or written. A check
     // that could not be answered at all (an unreachable gateway or host) is
     // its own error, after the run record has been written.
+    let touched_paths: Vec<String> = set
+        .writes
+        .iter()
+        .map(|w| w.path.as_str().to_string())
+        .chain(set.deletes.iter().map(|d| d.path.as_str().to_string()))
+        .collect();
     let preflights = run_preflights(
         &PreflightInput {
             target: &declared.target,
@@ -845,6 +851,7 @@ async fn drive(
             reader: ctx.reader,
             host: ctx.host,
             touched_files: set.writes.len() + set.deletes.len(),
+            touched_paths: &touched_paths,
             hold: &opts.hold,
             designers: &opts.designers,
             clock: ctx.clock,

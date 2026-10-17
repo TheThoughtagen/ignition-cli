@@ -359,6 +359,17 @@ pub trait ApplyHost: Send + Sync {
     /// `ign-deploy` root and never writes into the collection.
     async fn probe(&self) -> Result<ProbeReport, CoreError>;
 
+    /// [`probe`](Self::probe) for a run that will touch `touched` (collection
+    /// paths and [`LEDGER_KEY`]). A host with limits of its own on what a path
+    /// may be reports them here, before anything is written: the PowerShell
+    /// host refuses a path whose snapshot or staging copy under the account
+    /// home the sftp server could not reach again (23-08, C7b). The default
+    /// has no such limit and answers [`probe`](Self::probe).
+    async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
+        let _ = touched;
+        self.probe().await
+    }
+
     /// Stage the batch beside its work list: every file of `spec.writes` from
     /// `tree` (re-hashed after the copy), the new ledger, the work list and
     /// the pre-rendered journal and record files. Outside the lock. Writes

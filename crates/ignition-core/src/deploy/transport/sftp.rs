@@ -5065,6 +5065,58 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert_eq!(sha, crate::deploy::transport::batch::script_ps1_sha256());
     }
 
+    /// The `write_host` preflight reaches the Windows host through
+    /// `probe_paths`: a touched path whose copy below the account home the sftp
+    /// server could not serve again is a refusal that names the path, decided
+    /// in Rust from the account home alone, and writes nothing.
+    #[tokio::test]
+    async fn windows_probe_paths_refuses_a_path_the_sftp_server_could_not_reach() {
+        use crate::deploy::apply::host::ApplyHost;
+        let fake = windows_fake();
+        let t = windows_transport(&fake)
+            .with_apply("gw", "production")
+            .expect("apply half");
+        let long = format!(
+            "ignition/database-connection/{}/config.json",
+            "n".repeat(260)
+        );
+        let report = t
+            .probe_paths(&[
+                "ignition/database-connection/ok/config.json".to_string(),
+                long.clone(),
+            ])
+            .await
+            .expect("the gate answers");
+        assert!(!report.writable);
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert!(
+            report.problems[0].starts_with(&long),
+            "{:?}",
+            report.problems
+        );
+        // nothing was written: the only sftp work is the `pwd` for the home
+        assert!(
+            fake.sessions
+                .lock()
+                .expect("sessions")
+                .iter()
+                .flatten()
+                .all(|c| ["put", "mkdir", "rename", "rm"]
+                    .iter()
+                    .all(|w| !c.trim_start_matches('@').starts_with(w))),
+            "the gate writes nothing"
+        );
+        // a path that fits goes on to the script's own probe, which 23-20 builds
+        let err = t
+            .probe_paths(&["ignition/database-connection/ok/config.json".to_string()])
+            .await
+            .expect_err("the script probe is not built yet");
+        assert!(
+            err.to_string().contains("not supported by this build yet"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn windows_commit_retries_a_held_rename_a_bounded_number_of_times() {
         // a Defender-style handle on the target: Failure twice, then success

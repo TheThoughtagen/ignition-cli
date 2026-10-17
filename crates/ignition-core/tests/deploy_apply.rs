@@ -29,6 +29,9 @@ use ignition_core::client::{DeployApi, ReqwestGatewayApi};
 use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
 use ignition_core::deploy::apply::gates::{GateFlags, GateOutcome, evaluate_gates};
 use ignition_core::deploy::apply::hold::{Clock, HoldModel, ManualClock, SystemClock};
+use ignition_core::deploy::apply::host::{
+    ApplyHost, BatchReport, BatchSpec, Prepared, ProbeReport,
+};
 use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
 use ignition_core::deploy::apply::preflight::{
     DesignersMode, DesignersPolicy, PreflightInput, PreflightReport, run_preflights,
@@ -43,7 +46,7 @@ use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::target::Target;
 use ignition_core::deploy::transport::local::{ApplyFault, LocalFsTransport};
 use ignition_core::deploy::transport::{self, TreeReader};
-use ignition_core::deploy::tree::sha256_hex;
+use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
 use serde_json::{Value, json};
@@ -1714,6 +1717,7 @@ async fn preflights(
             reader: rig.reader.as_ref(),
             host: &rig.host,
             touched_files,
+            touched_paths: &[],
             hold: &opts.hold,
             designers: &opts.designers,
             clock: &SystemClock,
@@ -1721,6 +1725,113 @@ async fn preflights(
         &mut steps,
     )
     .await
+}
+
+/// A host with a limit of its own on touched paths (the PowerShell host's
+/// reachable snapshot length, 23-08): it forwards every call to `inner` and
+/// refuses, in `probe_paths`, a path that holds `TOO-LONG`.
+struct LimitedPaths<'a> {
+    inner: &'a dyn ApplyHost,
+}
+
+#[async_trait::async_trait]
+impl ApplyHost for LimitedPaths<'_> {
+    async fn probe(&self) -> Result<ProbeReport, CoreError> {
+        self.inner.probe().await
+    }
+    async fn probe_paths(&self, touched: &[String]) -> Result<ProbeReport, CoreError> {
+        let problems: Vec<String> = touched
+            .iter()
+            .filter(|p| p.contains("TOO-LONG"))
+            .map(|p| format!("{p} is too long to copy below the account home"))
+            .collect();
+        if problems.is_empty() {
+            return self.inner.probe().await;
+        }
+        Ok(ProbeReport {
+            writable: false,
+            problems,
+        })
+    }
+    async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
+        self.inner.prepare(spec, tree).await
+    }
+    async fn commit(&self, prepared: &Prepared) -> Result<BatchReport, CoreError> {
+        self.inner.commit(prepared).await
+    }
+    async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
+        self.inner.restore(record).await
+    }
+    async fn fingerprint(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, CoreError> {
+        self.inner.fingerprint(paths).await
+    }
+    async fn finalize(&self, record: &RunRecord) -> Result<(), CoreError> {
+        self.inner.finalize(record).await
+    }
+    async fn read_record(&self, run_id: &RunId) -> Result<Option<RunRecord>, CoreError> {
+        self.inner.read_record(run_id).await
+    }
+    async fn fetch_snapshot(
+        &self,
+        run_id: &RunId,
+        dest: &Path,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        self.inner.fetch_snapshot(run_id, dest).await
+    }
+    async fn discard_interrupted(&self, run_id: &RunId) -> Result<(), CoreError> {
+        self.inner.discard_interrupted(run_id).await
+    }
+}
+
+/// 23-08: the paths a run touches reach the host before anything is written, so
+/// a host can refuse one it could not read back; the refusal is the
+/// `write_host` finding with the host's own words, and a run that touches only
+/// fine paths passes.
+#[tokio::test]
+async fn preflight_write_host_reports_a_path_the_host_cannot_take() {
+    let rig = changing_rig().await;
+    let deploy = rig.fake.client("apply");
+    let limited = LimitedPaths { inner: &rig.host };
+    let run = |paths: Vec<String>| {
+        let (rig, deploy, limited) = (&rig, &deploy, &limited);
+        async move {
+            let opts = options();
+            let mut steps = Steps::new(None, &NoObserver);
+            run_preflights(
+                &PreflightInput {
+                    target: &rig.declared.target,
+                    master: deploy,
+                    backup: None,
+                    gateway: &rig.api,
+                    reader: rig.reader.as_ref(),
+                    host: limited,
+                    touched_files: paths.len(),
+                    touched_paths: &paths,
+                    hold: &opts.hold,
+                    designers: &opts.designers,
+                    clock: &SystemClock,
+                },
+                &mut steps,
+            )
+            .await
+            .expect("the preflights answer")
+        }
+    };
+    let bad = "ignition/database-connection/TOO-LONG/config.json".to_string();
+    let report = run(vec!["ignition/a/b/config.json".to_string(), bad.clone()]).await;
+    let failures = report.failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].check, "write_host");
+    assert!(
+        failures[0].detail.starts_with(&bad),
+        "{}",
+        failures[0].detail
+    );
+    let report = run(vec!["ignition/a/b/config.json".to_string()]).await;
+    assert!(report.passed(), "{:?}", report.failures());
 }
 
 #[tokio::test]

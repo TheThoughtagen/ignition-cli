@@ -607,6 +607,7 @@ async fn drive(
     let record = &record;
     let (restored, deleted) = restore_set(record);
 
+    let touched_paths: Vec<String> = record.touched.iter().map(|e| e.path.clone()).collect();
     let preflights = run_preflights(
         &PreflightInput {
             target,
@@ -616,6 +617,7 @@ async fn drive(
             reader: ctx.reader,
             host: ctx.host,
             touched_files: record.touched.len(),
+            touched_paths: &touched_paths,
             hold: &opts.hold,
             designers: &opts.designers,
             clock: ctx.clock,
