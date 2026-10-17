@@ -45,10 +45,13 @@ use crate::deploy::ledger::{
     LEDGER_FILE, LedgerRoot, journal_location, location_of, record_rel, staging_rel,
 };
 use crate::deploy::transport::batch::{
-    POSIX_STUB, SCRIPT_SH, SCRIPT_SH_FILE, SeenJournal, WORK_FILE, WorkList, WorkOp, journal_file,
-    record_file, script_sh_sha256,
+    POSIX_STUB, SCRIPT_PS1, SCRIPT_PS1_FILE, SCRIPT_SH, SCRIPT_SH_FILE, SeenJournal, WORK_FILE,
+    WorkList, WorkOp, journal_file, record_file, script_ps1_sha256, script_sh_sha256,
 };
-use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
+use crate::deploy::transport::remote::{
+    RemoteCommand, STUB_MISMATCH_EXIT, SftpOp, safe_remote_path,
+};
+use crate::deploy::transport::winps::{StubRoots, script_stub};
 use crate::deploy::transport::{
     DeleteSet, MirrorReport, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, TreeReader,
     absolute_components, read_staged_copy,
@@ -107,6 +110,9 @@ impl SftpTransport {
         self
     }
 
+    /// The apply half of a Linux node. A Windows node is refused here: the
+    /// operations that call this are built for the PowerShell host by 23-20
+    /// (the Windows arm of `apply_host_for_node` changes then).
     fn apply_setup(&self, op: &str) -> Result<&ApplySetup, CoreError> {
         if self.windows {
             return Err(self.mirror_fail(
@@ -114,6 +120,12 @@ impl SftpTransport {
                 "apply over ssh to a Windows host is not supported by this build yet",
             ));
         }
+        self.apply_setup_any(op)
+    }
+
+    /// The apply half of a node of either family. Used by the operations the
+    /// PowerShell host already has (`prepare`, `commit`, `restore`).
+    fn apply_setup_any(&self, op: &str) -> Result<&ApplySetup, CoreError> {
         self.apply.as_ref().ok_or_else(|| {
             self.mirror_fail(
                 op,
@@ -122,10 +134,26 @@ impl SftpTransport {
         })
     }
 
+    /// [`script_file`](Self::script_file) for the unit tests of the parent module.
+    #[cfg(test)]
+    pub(super) fn script_file_for_tests(&self) -> (&'static str, &'static str, String) {
+        self.script_file()
+    }
+
+    /// The script this node's family runs: its file name, its text and the
+    /// SHA-256 the stub compares.
+    fn script_file(&self) -> (&'static str, &'static str, String) {
+        if self.windows {
+            (SCRIPT_PS1_FILE, SCRIPT_PS1, script_ps1_sha256())
+        } else {
+            (SCRIPT_SH_FILE, SCRIPT_SH, script_sh_sha256())
+        }
+    }
+
     /// The `ign-deploy/<gateway>/<mode>` directory below the home, the mode
     /// collection, both checked for a batch line.
     async fn apply_roots(&self, op: &str) -> Result<(String, String, String), CoreError> {
-        let setup = self.apply_setup(op)?;
+        let setup = self.apply_setup_any(op)?;
         let home = self.account_home().await?;
         let deploy = format!("{home}/ign-deploy/{}/{}", setup.gateway, setup.mode);
         let coll = format!("{}/config/resources/{}", self.data_dir, setup.mode);
@@ -137,7 +165,7 @@ impl SftpTransport {
     }
 
     fn staging_abs(&self, home: &str, run: &str) -> Result<String, CoreError> {
-        let setup = self.apply_setup("prepare")?;
+        let setup = self.apply_setup_any("prepare")?;
         let root = format!("{home}/{}", staging_rel(&setup.gateway, &setup.mode, run));
         safe_remote_path(&root).map_err(|why| {
             self.mirror_fail("prepare", format!("the staging root is unsafe: {why}"))
@@ -254,8 +282,50 @@ impl SftpTransport {
         deploy: &str,
         work_sha: &str,
     ) -> Result<Value, CoreError> {
+        if self.windows {
+            return self.exec_stub(op, stage, coll, deploy, work_sha).await;
+        }
         let command = self.script_command(op, stage, coll, deploy, work_sha)?;
         self.shell.exec_posix(op, &command).await
+    }
+
+    /// The Windows call: ONE `exec_powershell` of the fixed stub, which checks
+    /// the SHA-256 of the uploaded `commit.ps1` and `work.tsv` and then runs
+    /// the script's `op` (D-01). The roots go in native form; no path is in the
+    /// command text.
+    async fn exec_stub(
+        &self,
+        op: &str,
+        stage: &str,
+        coll: &str,
+        deploy: &str,
+        work_sha: &str,
+    ) -> Result<Value, CoreError> {
+        let roots = StubRoots {
+            staging: super::windows_native_path(stage),
+            collection: super::windows_native_path(coll),
+            deploy: super::windows_native_path(deploy),
+        };
+        let stub = script_stub(&script_ps1_sha256(), work_sha, op, &roots);
+        self.shell
+            .exec_powershell(&stub)
+            .await
+            .map_err(|err| match err {
+                CoreError::TransportFailed {
+                    operation,
+                    node,
+                    detail,
+                } if detail.contains(&format!("exit code {STUB_MISMATCH_EXIT}")) => {
+                    CoreError::TransportFailed {
+                        operation,
+                        node,
+                        detail: format!(
+                            "{op}: the staged script or work list does not match its hash; nothing ran"
+                        ),
+                    }
+                }
+                other => other,
+            })
     }
 
     /// A fresh directory name below the home for one operation's files.
@@ -300,8 +370,9 @@ impl SftpTransport {
         })?;
         let lines = work.to_lines();
         let work_sha = sha256_hex(&lines);
+        let (script_name, script_text, _) = self.script_file();
         let mut files: Vec<(String, Vec<u8>)> = vec![
-            (SCRIPT_SH_FILE.to_string(), SCRIPT_SH.as_bytes().to_vec()),
+            (script_name.to_string(), script_text.as_bytes().to_vec()),
             (WORK_FILE.to_string(), lines),
         ];
         files.extend(extra.iter().cloned());
@@ -1054,7 +1125,7 @@ impl ApplyHost for SftpTransport {
 
     async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
         const OP: &str = "prepare";
-        let setup = self.apply_setup(OP)?;
+        let setup = self.apply_setup_any(OP)?;
         if spec.gateway != setup.gateway || spec.mode != setup.mode {
             return Err(self.mirror_fail(
                 OP,
@@ -1092,8 +1163,9 @@ impl ApplyHost for SftpTransport {
         let work_sha = sha256_hex(&lines);
 
         // everything the staging directory holds, built locally first
+        let (script_name, script_text, _) = self.script_file();
         let mut files: Vec<(String, Vec<u8>)> = vec![
-            (SCRIPT_SH_FILE.to_string(), SCRIPT_SH.as_bytes().to_vec()),
+            (script_name.to_string(), script_text.as_bytes().to_vec()),
             (WORK_FILE.to_string(), lines),
         ];
         for phase in crate::deploy::apply::host::PRERENDERED_PHASES {
@@ -1169,7 +1241,7 @@ impl ApplyHost for SftpTransport {
 
     async fn commit(&self, prepared: &Prepared) -> Result<BatchReport, CoreError> {
         const OP: &str = "commit";
-        self.apply_setup(OP)?;
+        self.apply_setup_any(OP)?;
         let (home, deploy, coll) = self.apply_roots(OP).await?;
         let staging = self.staging_abs(&home, prepared.run_id().as_str())?;
         if prepared.staging() != staging {
@@ -1198,7 +1270,7 @@ impl ApplyHost for SftpTransport {
 
     async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
         const OP: &str = "restore";
-        let setup = self.apply_setup(OP)?;
+        let setup = self.apply_setup_any(OP)?;
         if record.gateway != setup.gateway || record.mode != setup.mode {
             return Err(self.mirror_fail(
                 OP,

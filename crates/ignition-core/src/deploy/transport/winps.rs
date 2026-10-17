@@ -446,6 +446,72 @@ pub fn enumerate_chunks(
     Ok(chunks)
 }
 
+/// The three native absolute roots the uploaded script works in (Phase 23,
+/// 23-08): the run's staging directory (it holds `commit.ps1` and
+/// `work.tsv`), the mode collection and the `ign-deploy/<gateway>/<mode>`
+/// directory. Native form (`C:\Users\...`), not the sftp spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StubRoots {
+    /// The directory that holds the script, the work list and the staged files.
+    pub staging: String,
+    /// `<data dir>\config\resources\<mode>`.
+    pub collection: String,
+    /// `<home>\ign-deploy\<gateway>\<mode>`.
+    pub deploy: String,
+}
+
+/// The fixed body of the stub that runs the uploaded script (D-01, C-script-run).
+///
+/// It reads `commit.ps1` and `work.tsv` from the staging directory ONCE each,
+/// hashes the bytes it read with SHA-256 and compares them with the values the
+/// runner computed (`$p.ss`, `$p.ws`). On a mismatch it writes one fixed
+/// sentence to stderr and exits 97
+/// ([`STUB_MISMATCH_EXIT`](super::remote::STUB_MISMATCH_EXIT)) before it runs
+/// anything. Otherwise it runs
+/// the script text it hashed through `[ScriptBlock]::Create` (the execution
+/// policy does not govern a script block, so the same stub works under
+/// `Restricted` and `AllSigned`), passing the operation, the three roots and
+/// the text of the work list it hashed, so that the list the script acts on is
+/// the list that was checked. No path, hash or reason is part of the body:
+/// they travel in the base64 JSON parameters.
+pub const STUB: &str = concat!(
+    "$q='\\\\?\\';",
+    "$b=[IO.File]::ReadAllBytes($q+$p.t+'\\commit.ps1');",
+    "$w=[IO.File]::ReadAllBytes($q+$p.t+'\\work.tsv');",
+    "$a=[Security.Cryptography.SHA256]::Create();",
+    "$x=[BitConverter]::ToString($a.ComputeHash($b)).Replace('-','').ToLower();",
+    "$y=[BitConverter]::ToString($a.ComputeHash($w)).Replace('-','').ToLower();",
+    "if($x -cne $p.ss -or $y -cne $p.ws){",
+    "[Console]::Error.WriteLine('ign: the staged script or work list does not match its hash');exit 97};",
+    "& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($b))) ",
+    "$p.o $p.t $p.c $p.d ([Text.Encoding]::UTF8.GetString($w))"
+);
+
+/// The [`WinScript`] that verifies the uploaded `commit.ps1` and `work.tsv`
+/// against `script_sha256` and `work_sha256` and then runs the script's `op`
+/// over `roots` ([`STUB`]). The staging directory of `roots` must hold both
+/// files. Paths travel only in the parameters; the command is held to
+/// [`COMMAND_BUDGET`] by `exec_powershell`.
+pub fn script_stub(
+    script_sha256: &str,
+    work_sha256: &str,
+    op: &str,
+    roots: &StubRoots,
+) -> WinScript {
+    WinScript {
+        name: "script_stub",
+        body: STUB,
+        params: serde_json::json!({
+            "t": roots.staging,
+            "c": roots.collection,
+            "d": roots.deploy,
+            "o": op,
+            "ss": script_sha256,
+            "ws": work_sha256,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,6 +1085,200 @@ mod tests {
                 parse_enumeration(&entry(bad), 1).is_err(),
                 "{bad:?} must be refused"
             );
+        }
+    }
+
+    // ---- the script stub (23-08) --------------------------------------------
+
+    fn roots(staging: &str, collection: &str, deploy: &str) -> StubRoots {
+        StubRoots {
+            staging: staging.to_string(),
+            collection: collection.to_string(),
+            deploy: deploy.to_string(),
+        }
+    }
+
+    fn sha(fill: char) -> String {
+        std::iter::repeat_n(fill, 64).collect()
+    }
+
+    #[test]
+    fn stub_fits_the_budget() {
+        // the longest roots a legal node can make: the data directory is held to
+        // WINDOWS_DATA_DIR_MAX (150) characters and everything below the account
+        // home stays under LONG_PATH_LIMIT; 259-character roots are past both
+        for len in [60usize, 150, 240, 259] {
+            let root = |tag: char| format!("C:\\{}", tag.to_string().repeat(len - 3));
+            let stub = script_stub(
+                &sha('a'),
+                &sha('b'),
+                "restore",
+                &roots(&root('s'), &root('c'), &root('d')),
+            );
+            let command = encoded_command(&stub, COMMAND_BUDGET)
+                .unwrap_or_else(|why| panic!("{len}-character roots: {why}"));
+            eprintln!(
+                "stub with {len}-character roots: {} characters",
+                command.as_str().chars().count()
+            );
+            assert!(
+                command.as_str().chars().count() <= COMMAND_BUDGET,
+                "{len}-character roots"
+            );
+        }
+        // non-ASCII path characters travel as UTF-8 inside the JSON and still fit
+        let accented = format!("C:\\Users\\{}", "\u{e9}".repeat(100));
+        let stub = script_stub(
+            &sha('a'),
+            &sha('b'),
+            "commit",
+            &roots(&accented, &accented, &accented),
+        );
+        assert!(encoded_command(&stub, COMMAND_BUDGET).is_ok());
+    }
+
+    #[test]
+    fn stub_body_is_fixed_text_and_carries_no_path_or_hash() {
+        let stub = script_stub(
+            &sha('a'),
+            &sha('b'),
+            "commit",
+            &roots(
+                "C:\\Users\\svc\\ign-deploy\\gw\\production\\staging\\run-1",
+                "C:\\Data\\config\\resources\\production",
+                "C:\\Users\\svc\\ign-deploy\\gw\\production",
+            ),
+        );
+        assert_eq!(stub.body, STUB);
+        // the body is one line of printable ASCII
+        assert!(STUB.bytes().all(|b| (0x20..0x7f).contains(&b)), "{STUB}");
+        assert!(!STUB.contains("ign-deploy") && !STUB.contains("Users"));
+        // the parameters hold the roots, the operation and both hashes
+        let text = decode_command(&encoded_command(&stub, COMMAND_BUDGET).expect("command"));
+        let blob = text
+            .split("FromBase64String('")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("blob");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .expect("blob base64");
+        let value: Value = serde_json::from_slice(&json).expect("json");
+        assert_eq!(value["o"], "commit");
+        assert_eq!(value["ss"], sha('a'));
+        assert_eq!(value["ws"], sha('b'));
+        assert_eq!(
+            value["t"],
+            "C:\\Users\\svc\\ign-deploy\\gw\\production\\staging\\run-1"
+        );
+        // the command text itself shows no path (the parameters are base64)
+        assert!(!text.contains("staging"));
+        assert!(text.ends_with(STUB));
+    }
+
+    #[test]
+    fn stub_verifies_before_it_runs_and_hashes_the_bytes_it_runs() {
+        // exit 97 comes before the script block is created, and the script and
+        // the work list are each read once, hashed and then used from memory
+        let verify = STUB.find("exit 97").expect("the mismatch exit");
+        let run = STUB.find("[ScriptBlock]::Create").expect("the run");
+        assert!(verify < run);
+        assert_eq!(STUB.matches("ReadAllBytes").count(), 2);
+        assert!(STUB.contains("GetString($b)") && STUB.contains("GetString($w)"));
+        assert!(!STUB.contains("ReadAllText"));
+        assert!(!STUB.contains("-File") && !STUB.contains("Invoke-Expression"));
+    }
+
+    #[test]
+    fn the_shipped_script_is_ascii_text_the_stub_can_hash() {
+        use crate::deploy::transport::batch::{SCRIPT_PS1, script_ps1_sha256};
+        assert!(SCRIPT_PS1.is_ascii(), "the script is pure ASCII");
+        assert!(!SCRIPT_PS1.starts_with('\u{feff}'), "no byte order mark");
+        assert!(SCRIPT_PS1.contains("IGN-STOP") || SCRIPT_PS1.contains("E $S.Res"));
+        assert_eq!(
+            script_ps1_sha256(),
+            crate::deploy::tree::sha256_hex(SCRIPT_PS1.as_bytes())
+        );
+        assert_eq!(script_ps1_sha256().len(), 64);
+        // it starts with the parameter block after its comment header and uses
+        // none of the things a script block run by the stub cannot rely on
+        assert!(SCRIPT_PS1.contains("\nparam([string]$Op"));
+        assert!(!SCRIPT_PS1.contains("$MyInvocation") && !SCRIPT_PS1.contains("$PSScriptRoot"));
+    }
+
+    /// Windows PowerShell 5.1 resolves an alias before a function, so a script
+    /// function named like an alias is never called (`LP`, the alias of
+    /// `Out-Printer`, made every hash of the first live run empty). The list is
+    /// `Get-Alias` on the capture host (Windows PowerShell 5.1.20348, 2026-10-17).
+    const ALIASES_5_1: &str = "% ? ac asnp cat cd cfs chdir clc clear clhy cli clp cls clv cnsn compare copy cp cpi cpp curl cvpa dbp del diff dir dnsn ebp echo epal epcsv epsn erase etsn exsn fc fhx fl foreach ft fw gal gbp gc gci gcm gcs gdr ghy gi gjb gl gm gmo gp gps gpv group gsn gsnp gsv gu gv gwmi h history icm iex ihy ii ipal ipcsv ipmo ipsn irm ise iwmi iwr kill lp ls man md measure mi mount move mp mv nal ndr ni nmo npssc nsn nv ogv oh popd ps pushd pwd r rbp rcjb rcsn rd rdr ren ri rjb rm rmdir rmo rni rnp rp rsn rsnp rujb rv rvpa rwmi sajb sal saps sasv sbp sc select set shcm si sl sleep sls sort sp spjb spps spsv start sujb sv swmi tee trcm type wget where wjb write";
+
+    #[test]
+    fn the_shipped_script_names_no_function_like_an_alias_or_a_cmdlet() {
+        use crate::deploy::transport::batch::SCRIPT_PS1;
+        let aliases: std::collections::BTreeSet<&str> = ALIASES_5_1.split(' ').collect();
+        let mut seen = 0;
+        for line in SCRIPT_PS1.lines() {
+            let Some(rest) = line.strip_prefix("function ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            seen += 1;
+            assert!(
+                !aliases.contains(name.to_ascii_lowercase().as_str()),
+                "function {name} has the name of a Windows PowerShell alias, which wins over it"
+            );
+            assert!(!name.contains('-'), "function {name} reads like a cmdlet");
+        }
+        assert!(
+            seen > 20,
+            "the script defines its helpers as functions ({seen})"
+        );
+    }
+
+    /// A tampered script or work list makes the stub exit 97 before the script
+    /// runs. This needs Windows PowerShell (the stub reads `\\?\` paths), so it
+    /// runs on the windows-latest CI leg; the same property is asserted against
+    /// the real host in `wflwvm01_apply_script_run`.
+    #[cfg(windows)]
+    #[test]
+    fn stub_refuses_hash_mismatch() {
+        use crate::deploy::tree::sha256_hex;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = "param($o,$t,$c,$d,$w) [Console]::Out.WriteLine('RAN '+$o)\n";
+        let work = "ign-work 1\n";
+        std::fs::write(dir.path().join("commit.ps1"), script).expect("script");
+        std::fs::write(dir.path().join("work.tsv"), work).expect("work");
+        let staging = dir.path().to_string_lossy().into_owned();
+        let run = |script_sha: &str, work_sha: &str| {
+            let stub = script_stub(
+                script_sha,
+                work_sha,
+                "commit",
+                &roots(&staging, &staging, &staging),
+            );
+            let command = encoded_command(&stub, COMMAND_BUDGET).expect("command");
+            let text = command.as_str();
+            let b64 = text
+                .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+                .expect("prefix");
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", b64])
+                .output()
+                .expect("powershell")
+        };
+        let good = run(&sha256_hex(script.as_bytes()), &sha256_hex(work.as_bytes()));
+        assert_eq!(good.status.code(), Some(0), "{good:?}");
+        assert!(String::from_utf8_lossy(&good.stdout).contains("RAN commit"));
+        for (script_sha, work_sha) in [
+            (sha('0'), sha256_hex(work.as_bytes())),
+            (sha256_hex(script.as_bytes()), sha('0')),
+        ] {
+            let bad = run(&script_sha, &work_sha);
+            assert_eq!(bad.status.code(), Some(97), "{bad:?}");
+            assert!(!String::from_utf8_lossy(&bad.stdout).contains("RAN"));
         }
     }
 }

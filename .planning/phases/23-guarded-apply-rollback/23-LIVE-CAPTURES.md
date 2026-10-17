@@ -1886,6 +1886,62 @@ ls: /var/folders/jy/nmh43099607fl9kmv2s8gbdh0000gn/T/tmp.fHNOYXImcO/gwbk: No suc
 [exit 0]
 ~~~
 
+## C-script-run
+
+Windows capture host `ign-win-836` (Windows Server 2022, Windows PowerShell 5.1.20348.5756), account `svc-ignition-deploy`, the live test `wflwvm01_apply_script_run` of `crates/ignition-core/tests/live_transport_wflwvm01.rs`. The test uploads a two-line script to the account home and asks, in this order: which execution policy the host has; whether `-File` and `[ScriptBlock]::Create` run it under each policy (each case is a child `powershell` of the account, started with `-ExecutionPolicy`); what `Move-Item -Force`, `[IO.File]::Replace` and `[IO.File]::Move` do with a free target and with a target another handle holds open with each sharing mode, all on `\\?\` paths inside one script; how long the encoded stub is; and then it runs the real thing: a hash-checked stub that commits one batch (a new file with a non-ASCII name, a replaced file, a delete that empties a directory, a ledger) through `commit.ps1`, refuses a tampered work list and a tampered script, refuses a second commit over a leftover journal, restores the batch and restores it a second time. It works in `ign-live-scratch` below the account home, never in the gateway's data directory.
+
+#### live run
+
+`IGNITION_LIVE_WFLWVM01=1 cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_apply_script_run -- --ignored --nocapture` @ 2026-10-17T18:58:30Z
+
+~~~
+running 1 test
+CAPTURE c-script-run @ 2026-10-17T18:59:10Z
+CAPTURE policy: powershell "5.1.20348.5756" language mode "FullLanguage" execution policy ["MachinePolicy=Undefined,UserPolicy=Undefined,Process=Undefined,CurrentUser=Undefined,LocalMachine=Unrestricted"]
+CAPTURE run: "-File policy=default" -> exit 0 : "IGN-RESULT:{\"ok\":1,\"a\":\"x\",\"b\":\"y\"}"
+CAPTURE run: "-File policy=AllSigned" -> exit 1 : "File C:\\Users\\svc-ignition-deploy\\ign-live-scratch\\probe\\probe.ps1 cannot be loaded. The file  C:\\Users\\svc-ignition-deploy\\ign-live-scratch\\probe\\pro"
+CAPTURE run: "-File policy=Restricted" -> exit 1 : "File C:\\Users\\svc-ignition-deploy\\ign-live-scratch\\probe\\probe.ps1 cannot be loaded because running scripts is  disabled on this system. For more info"
+CAPTURE run: "-File policy=Bypass" -> exit 0 : "IGN-RESULT:{\"ok\":1,\"a\":\"x\",\"b\":\"y\"}"
+CAPTURE run: "ScriptBlock policy=default" -> exit 0 : "IGN-RESULT:{\"ok\":1,\"a\":\"x\",\"b\":\"y\"}"
+CAPTURE run: "ScriptBlock policy=AllSigned" -> exit 0 : "IGN-RESULT:{\"ok\":1,\"a\":\"x\",\"b\":\"y\"}"
+CAPTURE run: "ScriptBlock policy=Restricted" -> exit 0 : "IGN-RESULT:{\"ok\":1,\"a\":\"x\",\"b\":\"y\"}"
+CAPTURE move: "Move-Item -Force" target "free" -> "ok" ; target now "NEW-C" ; staged copy still there 0
+CAPTURE move: "Move-Item -Force" target "None" -> "ERR Cannot create a file when that file already exists." ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "Move-Item -Force" target "Read" -> "ERR Cannot create a file when that file already exists." ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "Move-Item -Force" target "ReadWrite" -> "ERR Cannot create a file when that file already exists." ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "Move-Item -Force" target "Delete" -> "ok" ; target now "NEW-C" ; staged copy still there 0
+CAPTURE move: "Move-Item -Force" target "ReadWrite,Delete" -> "ok" ; target now "NEW-C" ; staged copy still there 0
+CAPTURE move: "File.Replace" target "free" -> "ok" ; target now "NEW-C" ; staged copy still there 0
+CAPTURE move: "File.Replace" target "None" -> "ERR Exception calling \"Replace\" with \"3\" argument(s): \"The process cannot access the file because it is being used by another process.\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Replace" target "Read" -> "ERR Exception calling \"Replace\" with \"3\" argument(s): \"The process cannot access the file because it is being used by another process.\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Replace" target "ReadWrite" -> "ERR Exception calling \"Replace\" with \"3\" argument(s): \"The process cannot access the file because it is being used by another process.\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Replace" target "Delete" -> "ok" ; target now "NEW-C" ; staged copy still there 0
+CAPTURE move: "File.Replace" target "ReadWrite,Delete" -> "ok" ; target now "NEW-C" ; staged copy still there 0
+CAPTURE move: "File.Move" target "free" -> "ERR Exception calling \"Move\" with \"2\" argument(s): \"Cannot create a file when that file already exists.\r\n\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Move" target "None" -> "ERR Exception calling \"Move\" with \"2\" argument(s): \"Cannot create a file when that file already exists.\r\n\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Move" target "Read" -> "ERR Exception calling \"Move\" with \"2\" argument(s): \"Cannot create a file when that file already exists.\r\n\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Move" target "ReadWrite" -> "ERR Exception calling \"Move\" with \"2\" argument(s): \"Cannot create a file when that file already exists.\r\n\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Move" target "Delete" -> "ERR Exception calling \"Move\" with \"2\" argument(s): \"Cannot create a file when that file already exists.\r\n\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "File.Move" target "ReadWrite,Delete" -> "ERR Exception calling \"Move\" with \"2\" argument(s): \"Cannot create a file when that file already exists.\r\n\"" ; target now "OLD-C" ; staged copy still there 1
+CAPTURE move: "Move-Item -Force onto itself" target "-" -> "ok" ; target now "OLD-C" ; staged copy still there 0
+CAPTURE encoded stub: 4014 characters of the 8000 budget (real roots; staging 95 chars)
+TIMING prepare (upload + verify): 28.87s
+CAPTURE tampered work list: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+test wflwvm01_apply_script_run has been running for over 60 seconds
+CAPTURE tampered script: transport failed (exec) on nodes.master: commit: the staged script or work list does not match its hash; nothing ran
+TIMING commit (one script call): 2.69s
+CAPTURE commit report: BatchReport { phase: Written, stale: false, moved: [0, 1], deleted: [0], removed_dirs: ["ignition/database-connection/Doomed"], failure: None }
+CAPTURE second commit over a journal: an interrupted deploy left the journal ~/ign-deploy/live-scratch/production/journal.json for run 20261017T120000Z-aaaaaa; recover it with: ign deploy rollback --run 20261017T120000Z-aaaaaa --env <env>
+TIMING restore (one script call): 15.18s
+CAPTURE restore report: BatchReport { phase: Restoring, stale: false, moved: [1, 2], deleted: [0, 3], removed_dirs: ["ignition/database-connection/Café DB,1"], failure: None }
+cleanup: scratch gone true, staging gone true
+TIMING wflwvm01_apply_script_run total: 337.68s
+PASS wflwvm01_apply_script_run
+test wflwvm01_apply_script_run ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 337.70s
+~~~
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above, not a hypothesis. Later plans read these entries by id.
@@ -1936,3 +1992,15 @@ Rests on `## C-gwbk` (`type=all`, the type D-13 uses).
 - A copy truncated to half (1,837,256 bytes) fails at once: `unzip -tq` exit 9 "End-of-central-directory signature not found", Python `is_zipfile` False and `ZipFile()` raises `BadZipFile: File is not a zip file`. The ZIP central directory sits at the end of the file, so a truncated download cannot read as a ZIP.
 - The completeness check for D-13: the downloaded file must open as a ZIP (end-of-central-directory record found, central directory readable) with at least one entry; a CRC walk (`testzip`) is cheap at this size and may be added. What `download_to_file` itself does when the connection dies mid-stream (a chunked body cut short) was not exercised here; the ZIP open is the check that does not depend on it.
 - Handling: the file was downloaded into a temp directory outside the repo and deleted afterwards (`ls` after deletion: no such directory); only size, time, headers, the entry listing (first 60 lines, totals) and the sha-256 of the original were recorded.
+
+### C-script-run
+
+Rests on `## C-script-run` (the live run of 2026-10-17T18:58:30Z on `ign-win-836`).
+
+- **Mechanism: `[ScriptBlock]::Create` over the bytes the stub hashed.** The host's execution policy is `LocalMachine=Unrestricted` (every other scope Undefined), language mode `FullLanguage`. `& ([ScriptBlock]::Create([IO.File]::ReadAllText(path))) x y` printed the script's `IGN-RESULT` line with exit 0 under the policy as found, under `-ExecutionPolicy AllSigned` and under `-ExecutionPolicy Restricted`. The stub of `winps::script_stub` therefore reads `commit.ps1` and `work.tsv` once each as bytes, compares the SHA-256 of those bytes with the runner's values, and runs the very text it hashed through `[ScriptBlock]::Create` (it passes the operation, the three roots and the text of the work list as arguments, so the list the script acts on is the list that was checked).
+- **What `-File` does instead:** exit 0 under the policy as found (Unrestricted) and under `Bypass`; exit 1 under `AllSigned` ("is not digitally signed") and under `Restricted` ("running scripts is disabled on this system"). A `-File` stub would work on this host and stop working on any host whose policy is stricter, so it is not used. A staged `.ps1` is acceptable only because the stub never hands it to the policy.
+- **Encoded length:** the stub for the real roots (staging 95 characters, the real collection and deploy directories) is 4014 characters against `COMMAND_BUDGET` 8000. With every root at the longest a legal node can make (150-character data directory, staging under 240) the unit test `stub_fits_the_budget` measures 5678 characters at 240-character roots and 5882 at 259, so the budget holds for every legal node. Paths travel only in the base64 JSON parameters; the command text carries no path.
+- **Tamper stops at the stub:** a `work.tsv` replaced after `prepare` and a `commit.ps1` replaced after `prepare` each end in `transport_failed` ("the staged script or work list does not match its hash; nothing ran"), exit 97 from the stub, no journal on the host and the collection untouched.
+- **Replacing a file inside one script (PowerShell 5.1, `\\?\` paths):** `Move-Item -LiteralPath .. -Destination .. -Force` and `[IO.File]::Replace(src, dst, [NullString]::Value)` both replace an existing target when it is free or held open with a share mode that allows delete (`Delete`, `ReadWrite,Delete`), and both fail, leaving target and staged copy as they were, when it is held open with `None`, `Read` or `ReadWrite`. `[IO.File]::Move` refuses any existing target. `Move-Item` names a held target with the same words as an existing one ("Cannot create a file when that file already exists."), so the script reports a failed move by its index and a fixed sentence, never by that text. `Move-Item -Force` onto its own path reports no error and leaves the file, unlike an sftp rename onto itself (C7a-4); `commit.ps1` still refuses a self-move before it tries. `Move-Item -LiteralPath/-Destination` handled a name with a non-ASCII character, a space and a comma (`Café DB,1`) in the batch of the same run. `commit.ps1` uses `Move-Item -Force`, retried `RENAME_RETRIES` times with a one-second pause, then reports the entry as failed.
+- **A trap found on the way:** Windows PowerShell resolves an alias before a function. A helper named `LP` (the alias of `Out-Printer`) was never called and every hash came back empty on the first run; the helper is `Xp` now and the unit test `the_shipped_script_names_no_function_like_an_alias_or_a_cmdlet` holds the script to the alias list of this host.
+- **Timing of one call on the host:** the commit of that batch (journal, snapshot, five moves and deletes, ledger) was one `exec_powershell` call of 2.69 s; its restore (an upload of the work list and journal into a throw-away directory, the journal read, the script) took 15.18 s wall-clock of which the script is a small part; the 28.87 s of `prepare` is the sftp upload and is outside the lock. Every sftp batch on this link costs a fresh ssh handshake.

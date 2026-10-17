@@ -46,11 +46,20 @@ use ignition_core::actions::deploy::{
 };
 use ignition_core::client::DeployApi;
 use ignition_core::client::scan::{ScanKind, scan_complete};
+use ignition_core::deploy::apply::fingerprint::{LEDGER_KEY, fingerprint};
+use ignition_core::deploy::apply::host::{ApplyHost, BatchSpec, DeleteOp, WriteOp};
+use ignition_core::deploy::apply::journal::{Journal, JournalPhase};
+use ignition_core::deploy::apply::record::{RecordState, RunRecord, TouchedEntry};
+use ignition_core::deploy::apply::run_store::RunId;
 use ignition_core::deploy::layout::RelPath;
+use ignition_core::deploy::ledger::Ledger;
 use ignition_core::deploy::target::Ssh;
+use ignition_core::deploy::transport::batch::script_ps1_sha256;
 use ignition_core::deploy::transport::process::TokioProcessRunner;
 use ignition_core::deploy::transport::remote::{RemoteShell, SftpOp};
+use ignition_core::deploy::transport::sftp::{SftpTransport, windows_sftp_root};
 use ignition_core::deploy::transport::winps::{self, LONG_PATH_PREFIX, WinScript};
+use ignition_core::deploy::transport::winps::{COMMAND_BUDGET, StubRoots, script_stub};
 use ignition_core::deploy::transport::{self, DeleteSet, Scope, StagingMode, TreeReader};
 use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
@@ -1788,4 +1797,510 @@ fn oq5_percentile_is_nearest_rank() {
     assert_eq!(percentile(&mut ten, 95.0), 10.0);
     let mut twenty: Vec<f64> = (1..=20).map(f64::from).collect();
     assert_eq!(percentile(&mut twenty, 95.0), 19.0);
+}
+
+// ---- 23-08: the Windows script host (C-script-run, then commit and restore) ----
+
+/// Run the probes of C-script-run and report them as `CAPTURE` lines: the
+/// execution policy, `-File` against a script block under each policy, and the
+/// three ways to put a staged file over a target (`Move-Item -Force`,
+/// `File.Replace`, `File.Move`) with the target free and held with each share
+/// mode. Fixed `const` bodies, as everywhere else in this file.
+const PROBE_POLICY: &str = r#"$pol=(Get-ExecutionPolicy -List|ForEach-Object{$_.Scope.ToString()+'='+$_.ExecutionPolicy.ToString()}) -join ',';E @{ok=1;policy=$pol;ps=$PSVersionTable.PSVersion.ToString();mode=$ExecutionContext.SessionState.LanguageMode.ToString()}"#;
+
+const PROBE_RUN: &str = r#"$f=$p.f;$r=@();function C($l,$c){$o=(cmd /c ($c+' 2>&1')) -join ' ';if($o.Length -gt 150){$o=$o.Substring(0,150)};$script:r+=,@($l,[int]$LASTEXITCODE,$o)};foreach($e in 'default','AllSigned','Restricted','Bypass'){$x='';if($e -ne 'default'){$x=' -ExecutionPolicy '+$e};C ('-File policy='+$e) ('powershell -NoProfile -NonInteractive'+$x+' -File "'+$f+'" x y')};$cmd='& ([ScriptBlock]::Create([IO.File]::ReadAllText(''\\?\'+$f+'''))) ''x'' ''y''';$b=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd));foreach($e in 'default','AllSigned','Restricted'){$x='';if($e -ne 'default'){$x=' -ExecutionPolicy '+$e};C ('ScriptBlock policy='+$e) ('powershell -NoProfile -NonInteractive'+$x+' -EncodedCommand '+$b)};E @{ok=1;r=$r}"#;
+
+const PROBE_MOVE: &str = r#"$r=$p.x+$p.root;$out=@();function Fresh{if([IO.Directory]::Exists($r)){Remove-Item -LiteralPath $r -Recurse -Force};[void][IO.Directory]::CreateDirectory($r+'\coll');[void][IO.Directory]::CreateDirectory($r+'\stage');[IO.File]::WriteAllText($r+'\coll\c.json','OLD-C');[IO.File]::WriteAllText($r+'\stage\c.json','NEW-C')};foreach($how in 'Move-Item -Force','File.Replace','File.Move'){foreach($share in 'free','None','Read','ReadWrite','Delete','ReadWrite,Delete'){Fresh;$h=$null;if($share -ne 'free'){$h=[IO.File]::Open($r+'\coll\c.json','Open','Read',[IO.FileShare]$share)};$res='ok';try{switch($how){'Move-Item -Force'{Move-Item -LiteralPath ($r+'\stage\c.json') -Destination ($r+'\coll\c.json') -Force}'File.Replace'{[IO.File]::Replace($r+'\stage\c.json',$r+'\coll\c.json',[NullString]::Value)}'File.Move'{[IO.File]::Move($r+'\stage\c.json',$r+'\coll\c.json')}}}catch{$res='ERR '+$_.Exception.Message.Trim()};if($h){$h.Dispose()};$out+=,@($how,$share,$res,[IO.File]::ReadAllText($r+'\coll\c.json'),[int][IO.File]::Exists($r+'\stage\c.json'))}};Fresh;$res='ok';try{Move-Item -LiteralPath ($r+'\coll\c.json') -Destination ($r+'\coll\c.json') -Force}catch{$res='ERR '+$_.Exception.Message.Trim()};$out+=,@('Move-Item -Force onto itself','-',$res,[IO.File]::ReadAllText($r+'\coll\c.json'),0);Remove-Item -LiteralPath $r -Recurse -Force;E @{ok=1;r=$out}"#;
+
+/// Every file below `$p.path` (native, prefix added by `$p.x`) as relative
+/// path to SHA-256, and every directory.
+const LIST_HASHES: &str = r#"$b=$p.x+$p.path;$o=@{};$d=@();if([IO.Directory]::Exists($b)){$h=[Security.Cryptography.SHA256]::Create();foreach($f in [IO.Directory]::EnumerateFiles($b,'*',[IO.SearchOption]::AllDirectories)){$s=[IO.File]::OpenRead($f);$o[$f.Substring($b.Length+1).Replace('\','/')]=[BitConverter]::ToString($h.ComputeHash($s)).Replace('-','').ToLower();$s.Dispose()};foreach($f in [IO.Directory]::EnumerateDirectories($b,'*',[IO.SearchOption]::AllDirectories)){$d+=$f.Substring($b.Length+1).Replace('\','/')}};E @{ok=1;files=$o;dirs=$d}"#;
+
+/// `(files: path to SHA-256, directories)` below `path` (native).
+async fn hashes_below(shell: &RemoteShell, path: &str) -> (BTreeMap<String, String>, Vec<String>) {
+    let value = shell
+        .exec_powershell(&script("list_hashes", LIST_HASHES, path_params(path)))
+        .await
+        .expect("list_hashes");
+    let files = value["files"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut dirs: Vec<String> = match &value["dirs"] {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(one) => vec![one.clone()],
+        _ => Vec::new(),
+    };
+    dirs.sort();
+    (files, dirs)
+}
+
+fn utc_now() -> String {
+    let out = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .expect("date");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn win_ledger(run: &str, files: &[&str]) -> Vec<u8> {
+    Ledger {
+        schema_version: 1,
+        gateway: GATEWAY.to_string(),
+        mode: MODE.to_string(),
+        render_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .to_string(),
+        run_id: run.to_string(),
+        files: files.iter().map(|f| (*f).to_string()).collect(),
+    }
+    .to_bytes()
+}
+
+/// A batch for `run` made against the listing `live` (path to SHA-256) and the
+/// ledger hash `ledger_pre`: the same shape the engine builds.
+fn win_batch(
+    run: &str,
+    writes: &[(&str, &[u8])],
+    deletes: &[&str],
+    ledger: Option<&[u8]>,
+    live: &BTreeMap<String, String>,
+    ledger_pre: Option<String>,
+) -> (BatchSpec, RenderedTree) {
+    let mut tree = RenderedTree::default();
+    let mut write_ops = Vec::new();
+    for (path, bytes) in writes {
+        let r = rel(path);
+        tree.files.insert(r.clone(), bytes.to_vec());
+        write_ops.push(WriteOp {
+            path: r,
+            sha256: sha256_hex(bytes),
+            pre: live.get(*path).cloned(),
+        });
+    }
+    write_ops.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+    let mut delete_ops: Vec<DeleteOp> = deletes
+        .iter()
+        .map(|path| DeleteOp {
+            path: rel(path),
+            pre: live
+                .get(*path)
+                .cloned()
+                .expect("a delete names a live file"),
+        })
+        .collect();
+    delete_ops.sort_by(|a, b| a.path.as_str().as_bytes().cmp(b.path.as_str().as_bytes()));
+    let mut touched: Vec<TouchedEntry> = write_ops
+        .iter()
+        .map(|w| TouchedEntry {
+            path: w.path.as_str().to_string(),
+            pre_sha256: w.pre.clone(),
+            post_sha256: Some(w.sha256.clone()),
+        })
+        .chain(delete_ops.iter().map(|d| TouchedEntry {
+            path: d.path.as_str().to_string(),
+            pre_sha256: Some(d.pre.clone()),
+            post_sha256: None,
+        }))
+        .collect();
+    if let Some(bytes) = ledger {
+        touched.push(TouchedEntry {
+            path: LEDGER_KEY.to_string(),
+            pre_sha256: ledger_pre.clone(),
+            post_sha256: Some(sha256_hex(bytes)),
+        });
+    }
+    touched.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    let pre_map: BTreeMap<String, Option<String>> = touched
+        .iter()
+        .map(|e| (e.path.clone(), e.pre_sha256.clone()))
+        .collect();
+    let pre_fingerprint = fingerprint(&pre_map);
+    let journal = Journal {
+        schema_version: 1,
+        run_id: run.to_string(),
+        gateway: GATEWAY.to_string(),
+        mode: MODE.to_string(),
+        phase: JournalPhase::Snapshotting,
+        pre_fingerprint: pre_fingerprint.clone(),
+        touched: touched.iter().map(|e| e.path.clone()).collect(),
+    };
+    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+    let record = RunRecord {
+        schema_version: 1,
+        run_id: run.to_string(),
+        gateway: GATEWAY.to_string(),
+        mode: MODE.to_string(),
+        render_sha256: hash.clone(),
+        plan_sha256: hash,
+        state: RecordState::Applying,
+        rolled_back_by: None,
+        touched,
+        pre_fingerprint,
+        post_fingerprint: None,
+    };
+    (
+        BatchSpec {
+            run_id: RunId::parse(run).expect("run id"),
+            gateway: GATEWAY.to_string(),
+            mode: MODE.to_string(),
+            writes: write_ops,
+            deletes: delete_ops,
+            ledger_new: ledger.map(<[u8]>::to_vec),
+            ledger_pre,
+            journal,
+            record,
+        },
+        tree,
+    )
+}
+
+/// The scratch gateway the script-host tests work in: `ign-live-scratch\data`
+/// below the account home (never the gateway's own data directory, T-22-58),
+/// with a `production` collection that holds a gateway-owned `config-mode.json`
+/// and three database connections.
+struct WinScratch {
+    shell: RemoteShell,
+    home: String,
+    home_native: String,
+    root_native: String,
+    prod_native: String,
+    staging_native: String,
+    repo: tempfile::TempDir,
+}
+
+impl WinScratch {
+    async fn new(live: &Live) -> WinScratch {
+        let probe_repo = repo(live, "probe", &live.data_dir, None);
+        let shell = shell_of(probe_repo.path(), "probe");
+        let home = home_sftp(&shell).await;
+        let home_native = native(&home);
+        let data_native = scratch_native(&home_native);
+        assert!(
+            data_native.contains(SCRATCH)
+                && !data_native.to_ascii_lowercase().contains("program files"),
+            "{data_native}"
+        );
+        let root_native = format!("{home_native}\\{SCRATCH}");
+        let staging_native = format!("{home_native}\\ign-deploy\\{GATEWAY}");
+        let (a, b) = cleanup_scratch(&shell, &root_native, &staging_native, &home_native).await;
+        assert!(a && b, "leftovers removed before the run");
+        let res = format!("{home}/{SCRATCH}/data/config/resources");
+        let prod = format!("{res}/production");
+        let local = tempfile::tempdir().expect("local temp");
+        let put = |name: &str, bytes: &str| -> PathBuf {
+            let path = local.path().join(name);
+            std::fs::write(&path, bytes).expect("local file");
+            path
+        };
+        let mut ops = vec![
+            SftpOp::Mkdir {
+                path: format!("{home}/{SCRATCH}"),
+            },
+            SftpOp::Mkdir {
+                path: format!("{home}/{SCRATCH}/data"),
+            },
+            SftpOp::Mkdir {
+                path: format!("{home}/{SCRATCH}/data/config"),
+            },
+            SftpOp::Mkdir { path: res.clone() },
+            SftpOp::Mkdir { path: prod.clone() },
+            SftpOp::Put {
+                local: put("mode.json", "{\"mode\":\"production\",\"scratch\":true}"),
+                remote: format!("{prod}/config-mode.json"),
+            },
+            SftpOp::Mkdir {
+                path: format!("{prod}/ignition"),
+            },
+            SftpOp::Mkdir {
+                path: format!("{prod}/{DC}"),
+            },
+        ];
+        for (dir, body) in [
+            ("Existing", "{\"pre\":\"existing\"}"),
+            ("ReplaceMe", "{\"pre\":\"old\"}"),
+            ("Doomed", "{\"pre\":\"doomed\"}"),
+        ] {
+            ops.push(SftpOp::Mkdir {
+                path: format!("{prod}/{DC}/{dir}"),
+            });
+            ops.push(SftpOp::Put {
+                local: put(&format!("{dir}.json"), body),
+                remote: format!("{prod}/{DC}/{dir}/config.json"),
+            });
+        }
+        sftp(&shell, &ops).await;
+        let prod_native = format!("{data_native}\\config\\resources\\production");
+        WinScratch {
+            repo: repo(live, "scratch", &data_native, None),
+            shell,
+            home,
+            home_native,
+            root_native,
+            prod_native,
+            staging_native,
+        }
+    }
+
+    /// The Windows ApplyHost over the scratch data directory. The factory arm
+    /// for Windows is 23-20's, so the host is built directly.
+    fn host(&self) -> SftpTransport {
+        let (_, ssh, _) = ssh_of(self.repo.path(), "scratch");
+        let shell = shell_of(self.repo.path(), "scratch");
+        let data = windows_sftp_root(&ssh.data_dir).expect("scratch data dir");
+        SftpTransport::new_windows(shell, data, "nodes.master")
+            .with_apply(GATEWAY, MODE)
+            .expect("apply half")
+    }
+
+    async fn listing(&self) -> BTreeMap<String, String> {
+        hashes_below(&self.shell, &self.prod_native).await.0
+    }
+
+    /// The deploy directory (`ign-deploy\live-scratch\production`) in native form.
+    fn deploy_native(&self) -> String {
+        format!("{}\\{MODE}", self.staging_native)
+    }
+
+    async fn cleanup(&self) {
+        let (a, b) = cleanup_scratch(
+            &self.shell,
+            &self.root_native,
+            &self.staging_native,
+            &self.home_native,
+        )
+        .await;
+        eprintln!("cleanup: scratch gone {a}, staging gone {b}");
+        assert!(a && b);
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_apply_script_run() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let w = WinScratch::new(&live).await;
+    let run = "20261017T120000Z-aaaaaa";
+
+    // ---- C-script-run: how an uploaded script can run on this host
+    eprintln!("CAPTURE c-script-run @ {}", utc_now());
+    let policy = w
+        .shell
+        .exec_powershell(&script(
+            "probe_policy",
+            PROBE_POLICY,
+            serde_json::Value::Null,
+        ))
+        .await
+        .expect("policy");
+    eprintln!(
+        "CAPTURE policy: powershell {} language mode {} execution policy [{}]",
+        policy["ps"], policy["mode"], policy["policy"]
+    );
+    let probe_dir = format!("{}\\probe", w.root_native);
+    let probe_local = tempfile::tempdir().expect("probe dir");
+    let probe_file = probe_local.path().join("probe.ps1");
+    std::fs::write(
+        &probe_file,
+        "param($a,$b)\r\n[Console]::Out.WriteLine('IGN-RESULT:{\"ok\":1,\"a\":\"'+$a+'\",\"b\":\"'+$b+'\"}')\r\n",
+    )
+    .expect("probe script");
+    sftp(
+        &w.shell,
+        &[SftpOp::Mkdir {
+            path: format!("{}/{SCRATCH}/probe", w.home),
+        }],
+    )
+    .await;
+    sftp(
+        &w.shell,
+        &[SftpOp::Put {
+            local: probe_file,
+            remote: format!("{}/{SCRATCH}/probe/probe.ps1", w.home),
+        }],
+    )
+    .await;
+    let ran = w
+        .shell
+        .exec_powershell(&script(
+            "probe_run",
+            PROBE_RUN,
+            serde_json::json!({ "f": format!("{probe_dir}\\probe.ps1") }),
+        ))
+        .await
+        .expect("probe_run");
+    for row in ran["r"].as_array().expect("rows") {
+        eprintln!("CAPTURE run: {} -> exit {} : {}", row[0], row[1], row[2]);
+    }
+    let moved = w
+        .shell
+        .exec_powershell(&script(
+            "probe_move",
+            PROBE_MOVE,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "root": format!("{}\\mv", w.root_native) }),
+        ))
+        .await
+        .expect("probe_move");
+    for row in moved["r"].as_array().expect("rows") {
+        eprintln!(
+            "CAPTURE move: {} target {} -> {} ; target now {} ; staged copy still there {}",
+            row[0], row[1], row[2], row[3], row[4]
+        );
+    }
+
+    // ---- the host, the stub and its budget
+    let host = w.host();
+    let roots = StubRoots {
+        staging: format!("{}\\staging\\{run}", w.deploy_native()),
+        collection: w.prod_native.clone(),
+        deploy: w.deploy_native(),
+    };
+    let stub = script_stub(&script_ps1_sha256(), &"0".repeat(64), "commit", &roots);
+    let command = ignition_core::deploy::transport::winps::encoded_command(&stub, COMMAND_BUDGET)
+        .expect("the stub fits the budget");
+    eprintln!(
+        "CAPTURE encoded stub: {} characters of the {} budget (real roots; staging {} chars)",
+        command.as_str().chars().count(),
+        COMMAND_BUDGET,
+        roots.staging.len()
+    );
+
+    // ---- one batch: a new file, a replaced file, a delete that empties a directory, a ledger
+    let before = w.listing().await;
+    assert_eq!(before.len(), 4, "{before:?}");
+    let ledger = win_ledger(run, &[&format!("{DC}/Caf\u{e9} DB,1/config.json")]);
+    let (spec, tree) = win_batch(
+        run,
+        &[
+            (&format!("{DC}/Caf\u{e9} DB,1/config.json"), b"{\"new\":1}"),
+            (&format!("{DC}/ReplaceMe/config.json"), b"{\"pre\":\"new\"}"),
+        ],
+        &[&format!("{DC}/Doomed/config.json")],
+        Some(&ledger),
+        &before,
+        None,
+    );
+
+    // a tampered work list and a tampered script both stop at the stub, and
+    // nothing runs (no journal)
+    let t = Instant::now();
+    let prepared = host.prepare(&spec, &tree).await.expect("prepare");
+    timed("prepare (upload + verify)", t, ());
+    let staging_sftp = format!("{}/ign-deploy/{GATEWAY}/{MODE}/staging/{run}", w.home);
+    let local = tempfile::tempdir().expect("local");
+    for (what, name) in [("work list", "work.tsv"), ("script", "commit.ps1")] {
+        let garbage = local.path().join(name);
+        std::fs::write(&garbage, "tampered\n").expect("garbage");
+        sftp(
+            &w.shell,
+            &[SftpOp::Put {
+                local: garbage,
+                remote: format!("{staging_sftp}/{name}"),
+            }],
+        )
+        .await;
+        let err = host
+            .commit(&prepared)
+            .await
+            .expect_err("a tampered file must stop the stub");
+        eprintln!("CAPTURE tampered {what}: {err}");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("does not match its hash"), "{err}");
+        let (files, _) = hashes_below(&w.shell, &w.deploy_native()).await;
+        assert!(
+            !files.contains_key("journal.json"),
+            "nothing ran, so there is no journal ({what})"
+        );
+        assert_eq!(w.listing().await, before, "the collection is untouched");
+        // stage again, as a retry would
+        let _ = host.prepare(&spec, &tree).await.expect("prepare again");
+    }
+    let prepared = host.prepare(&spec, &tree).await.expect("prepare again");
+
+    // the commit: ONE exec_powershell call
+    let t = Instant::now();
+    let report = host.commit(&prepared).await.expect("commit");
+    timed("commit (one script call)", t, ());
+    eprintln!("CAPTURE commit report: {report:?}");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(!report.stale && report.failure.is_none(), "{report:?}");
+    assert_eq!(report.moved, vec![0, 1]);
+    assert_eq!(report.deleted, vec![0]);
+    assert_eq!(report.removed_dirs, vec![format!("{DC}/Doomed")]);
+    let after = w.listing().await;
+    assert_eq!(
+        after.get(&format!("{DC}/Caf\u{e9} DB,1/config.json")),
+        Some(&sha256_hex(b"{\"new\":1}"))
+    );
+    assert_eq!(
+        after.get(&format!("{DC}/ReplaceMe/config.json")),
+        Some(&sha256_hex(b"{\"pre\":\"new\"}"))
+    );
+    assert!(!after.contains_key(&format!("{DC}/Doomed/config.json")));
+    let (deploy_files, _) = hashes_below(&w.shell, &w.deploy_native()).await;
+    assert!(deploy_files.contains_key("journal.json"));
+    assert!(deploy_files.contains_key("ledger.json"));
+    assert!(deploy_files.contains_key(&format!("snapshots/{run}/record.json")));
+    assert!(
+        deploy_files.contains_key(&format!("snapshots/{run}/files/{DC}/ReplaceMe/config.json"))
+    );
+    assert!(deploy_files.contains_key(&format!("snapshots/{run}/files/{DC}/Doomed/config.json")));
+
+    // a second commit over a leftover journal is refused and writes nothing
+    let (spec2, tree2) = win_batch(
+        "20261017T120001Z-bbbbbb",
+        &[(&format!("{DC}/Extra/config.json"), b"{}")],
+        &[],
+        None,
+        &after,
+        None,
+    );
+    let prepared2 = host.prepare(&spec2, &tree2).await.expect("prepare 2");
+    let err = host
+        .commit(&prepared2)
+        .await
+        .expect_err("a journal of another run refuses");
+    eprintln!("CAPTURE second commit over a journal: {err}");
+    assert_eq!(err.code(), "deploy_journal_present", "{err}");
+    assert_eq!(w.listing().await, after);
+
+    // the restore: one script call, back to exactly the pre-run listing
+    let t = Instant::now();
+    let restored = host.restore(&spec.record).await.expect("restore");
+    timed("restore (one script call)", t, ());
+    eprintln!("CAPTURE restore report: {restored:?}");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(restored.phase, JournalPhase::Restoring);
+    let restored_listing = w.listing().await;
+    assert_eq!(
+        restored_listing, before,
+        "restore returns the pre-run listing"
+    );
+    let (deploy_files, _) = hashes_below(&w.shell, &w.deploy_native()).await;
+    assert!(
+        !deploy_files.contains_key("ledger.json"),
+        "the first ledger is removed"
+    );
+    assert!(
+        deploy_files.contains_key(&format!("snapshots/{run}/record.json")),
+        "the snapshot stays"
+    );
+    // a second restore changes nothing
+    let again = host.restore(&spec.record).await.expect("restore twice");
+    assert!(again.failure.is_none(), "{again:?}");
+    assert_eq!(w.listing().await, before);
+
+    // ---- cleanup, with evidence
+    w.cleanup().await;
+    assert!(enumerate(&w.shell, &w.root_native).await.is_none());
+    assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
+    timed("wflwvm01_apply_script_run total", started, ());
+    eprintln!("PASS wflwvm01_apply_script_run");
 }

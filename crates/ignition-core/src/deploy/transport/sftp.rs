@@ -5016,6 +5016,55 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         }
     }
 
+    /// 23-08 builds `prepare`, `commit` and `restore` of the PowerShell host;
+    /// every other `ApplyHost` call stays on the 23-04 refusal until 23-20, and
+    /// none of them starts an ssh or an sftp process.
+    #[tokio::test]
+    async fn windows_apply_half_refuses_the_calls_23_20_builds() {
+        use crate::deploy::apply::host::ApplyHost;
+        use crate::deploy::apply::run_store::RunId;
+        let fake = windows_fake();
+        let t = windows_transport(&fake)
+            .with_apply("gw", "production")
+            .expect("apply half");
+        let run = RunId::parse("20261017T120000Z-aaaaaa").expect("run id");
+        let mut refused: Vec<(&str, CoreError)> = Vec::new();
+        refused.push(("probe", t.probe().await.expect_err("probe")));
+        refused.push((
+            "fingerprint",
+            t.fingerprint(&["ledger.json".to_string()])
+                .await
+                .expect_err("fingerprint"),
+        ));
+        refused.push((
+            "read_record",
+            t.read_record(&run).await.expect_err("read_record"),
+        ));
+        refused.push((
+            "fetch_snapshot",
+            t.fetch_snapshot(&run, Path::new("/nonexistent"))
+                .await
+                .expect_err("fetch_snapshot"),
+        ));
+        refused.push((
+            "discard_interrupted",
+            t.discard_interrupted(&run).await.expect_err("discard"),
+        ));
+        for (name, err) in refused {
+            assert_eq!(err.code(), "transport_failed", "{name}: {err}");
+            assert!(
+                err.to_string().contains("not supported by this build yet"),
+                "{name}: {err}"
+            );
+        }
+        assert_eq!(t.sessions(), 0, "a refusal starts no sftp session");
+        // the script the Windows family runs is the PowerShell one
+        let (name, text, sha) = t.script_file_for_tests();
+        assert_eq!(name, "commit.ps1");
+        assert_eq!(text, crate::deploy::transport::batch::SCRIPT_PS1);
+        assert_eq!(sha, crate::deploy::transport::batch::script_ps1_sha256());
+    }
+
     #[tokio::test]
     async fn windows_commit_retries_a_held_rename_a_bounded_number_of_times() {
         // a Defender-style handle on the target: Failure twice, then success

@@ -63,6 +63,21 @@ pub const SCRIPT_SH: &str = include_str!("scripts/commit.sh");
 /// File name of the uploaded script inside a staging directory.
 pub const SCRIPT_SH_FILE: &str = "commit.sh";
 
+/// The Windows PowerShell 5.1 script a Windows ssh host runs: the `commit`
+/// and `restore` operations of the batch (Phase 23, 23-08; 23-20 adds the
+/// rest), uploaded beside the staged files and run by
+/// [`script_stub`](super::winps::script_stub).
+pub const SCRIPT_PS1: &str = include_str!("scripts/commit.ps1");
+
+/// File name of the uploaded PowerShell script inside a staging directory.
+pub const SCRIPT_PS1_FILE: &str = "commit.ps1";
+
+/// SHA-256 of [`SCRIPT_PS1`] as the Windows stub computes it: over the bytes
+/// of the uploaded file.
+pub fn script_ps1_sha256() -> String {
+    crate::deploy::tree::sha256_hex(SCRIPT_PS1.as_bytes())
+}
+
 /// The fixed text the remote shell runs with `sh -c`. Its arguments are the
 /// script path, the operation, the staging, collection and deploy roots, and
 /// the SHA-256 of the script and of the work list. It reads the script into
