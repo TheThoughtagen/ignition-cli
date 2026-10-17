@@ -57,16 +57,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod apply_ops;
 
-use super::remote::{RemoteShell, SftpFailure, SftpOp, classify_sftp_stderr, safe_remote_path};
+use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::winps::{
     self, LONG_PATH_LIMIT, LONG_PATH_PREFIX, windows_absolute_path_problem,
     windows_component_problem,
 };
 use super::{
-    CORE_COLLECTION, DeleteSet, FileBlob, MIRROR_MIN_COMPONENTS, MirrorReport, ObservedFiles,
-    READ_MAX_ENTRIES, READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode,
-    TreeMirror, TreeReader, absolute_components, copy_to_temp, mirror_mode_problem,
-    read_staged_copy, validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
+    CORE_COLLECTION, DeleteSet, FileBlob, MirrorReport, ObservedFiles, READ_MAX_ENTRIES,
+    READ_MAX_FILE_BYTES, READ_MAX_TOTAL_BYTES, Scope, Staged, StagingMode, TreeMirror, TreeReader,
+    absolute_components, copy_to_temp, mirror_mode_problem, read_staged_copy,
+    validate_mirror_inputs, validate_mirror_paths, validate_staging_root_for,
 };
 use crate::client::config_resources::validate_segment;
 use crate::deploy::apply::journal::JOURNAL_MAX_BYTES;
@@ -1700,22 +1700,12 @@ impl SftpTransport {
 // The write half (22-07)
 // ---------------------------------------------------------------------------
 //
-// Linux nodes (23-06, D-01): `TreeMirror::commit` runs the uploaded POSIX
-// script's `mirror` op in one `ssh` call (`sftp/apply_ops.rs`); the per-file
-// flow described below is the Windows host's until 23-20.
-//
-// Integrity: a listing size says nothing about content, so before the first
-// rename (`Separate`) every staged copy on the host is fetched back with a
-// typed `get` into a per-operation temp dir and hashed HERE against the
-// SHA-256 the stage recorded (no remote hash command). The directories to
-// create lead the same batch as the renames, so nothing sits between that
-// verification and the moves. sftp has no atomic verify-then-rename, so after
-// the moves (and for `InPlace`, which has no staged copy on the host) the
-// FINAL paths are read back and hashed again before the first delete; a
-// mismatch is `transport_failed` ("content changed on the host during
-// commit") and no delete runs. The read-backs use the read side's watchdog
-// and caps and `open_regular_file`. What remains is a host-side writer with
-// write access to the staging or collection directory.
+// `TreeMirror::commit` (D-01) runs the uploaded script's `mirror` op in one
+// `ssh` call on either family (`sftp/apply_ops.rs`: POSIX `sh` since 23-06,
+// Windows PowerShell since 23-20); there is no rename per file. `stage` still
+// uploads the staged copies with sftp `put` (nothing under the scan lock), and
+// the script, which checks the SHA-256 of every staged copy on the host before
+// the first move, does every check, move, delete and emptied-directory removal.
 
 /// What the write half needs: the mode collection and the staging mode (the
 /// staging root normalised to an absolute POSIX path).
@@ -1725,36 +1715,12 @@ struct MirrorSetup {
     staging: StagingMode,
 }
 
-use super::batch::RENAME_RETRIES;
-/// The pause before the first retry; it grows with each attempt.
-const RENAME_RETRY_PAUSE: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_millis(1)
-} else {
-    std::time::Duration::from_millis(300)
-};
-
-/// Quiet ops are not echoed, which would break counting echoed commands.
-fn op_is_quiet(op: &SftpOp) -> bool {
-    matches!(
-        op,
-        SftpOp::Ls { .. } | SftpOp::LsLong { .. } | SftpOp::LsLongAll { .. } | SftpOp::Pwd
-    )
-}
-
 /// What a survey listing says about one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
     Missing,
     Dir,
     File(u64),
-}
-
-/// A file on the host to read back and compare with its staged SHA-256.
-struct RemoteCopy {
-    rel: RelPath,
-    remote: String,
-    sha: String,
-    size: u64,
 }
 
 /// At most this many mismatches are named in an error.
@@ -1782,10 +1748,6 @@ fn named(items: &[String]) -> String {
         text.push_str(&format!(" and {} more", items.len() - MISMATCH_NAMED));
     }
     text
-}
-
-fn chain_of(parts: &[&str]) -> Vec<String> {
-    parts.iter().map(|p| (*p).to_string()).collect()
 }
 
 impl SftpTransport {
@@ -1881,46 +1843,17 @@ impl SftpTransport {
         format!("sftp:{}:{}:{}", self.label, self.data_dir, setup.mode)
     }
 
-    /// Run one mutating batch; an empty batch spawns nothing.
-    ///
-    /// On a Windows host a `rename` onto a target something else holds open
-    /// (Defender, a backup agent) answers `Failure` with nothing lost and the
-    /// same rename succeeds a moment later (C7a-4). The sftp client echoes each
-    /// command it starts, so the last echoed line is the one that failed; a
-    /// `Failure` on a `rename` is retried from that op a bounded number of
-    /// times with a growing pause, and then reported as the classified
-    /// `transport_failed`. Nothing else is retried: not a `put`, not a
-    /// `mkdir`, not a `Permission denied`.
+    /// Run one mutating batch; an empty batch spawns nothing. Nothing is
+    /// retried here: a held target is the script's business (D-01), and the
+    /// uploads and directory makes of this batch have no such case.
     async fn run_batch(&self, op: &str, ops: Vec<SftpOp>) -> Result<(), CoreError> {
         if ops.is_empty() {
             return Ok(());
         }
-        let echoed = self.windows && !ops.iter().any(op_is_quiet);
-        let mut remaining = ops;
-        let mut attempt = 0u32;
-        loop {
-            self.sessions.fetch_add(1, Ordering::Relaxed);
-            let out = self.shell.sftp_batch(&remaining).await?;
-            if out.code == 1 && !out.timed_out && echoed && attempt < RENAME_RETRIES {
-                let failure = classify_sftp_stderr(&String::from_utf8_lossy(&out.stderr));
-                let attempted = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|l| l.starts_with("sftp> "))
-                    .count();
-                if failure == SftpFailure::Failure
-                    && attempted >= 1
-                    && attempted <= remaining.len()
-                    && matches!(remaining[attempted - 1], SftpOp::Rename { .. })
-                {
-                    attempt += 1;
-                    remaining.drain(..attempted - 1);
-                    tokio::time::sleep(RENAME_RETRY_PAUSE * attempt).await;
-                    continue;
-                }
-            }
-            self.shell.require_success(op, out)?;
-            return Ok(());
-        }
+        self.sessions.fetch_add(1, Ordering::Relaxed);
+        let out = self.shell.sftp_batch(&ops).await?;
+        self.shell.require_success(op, out)?;
+        Ok(())
     }
 
     /// Read-only: what every path in `targets` (chains below the existing
@@ -2050,174 +1983,6 @@ impl SftpTransport {
             }
         }
         missing
-    }
-
-    /// Read every file of `copies` back from the host with typed `get` ops
-    /// into a private per-operation temp dir and hash it here (never with a
-    /// remote command). Downloads are chunked, the running total is checked
-    /// before each chunk and the temp dir is measured while sftp runs, as on
-    /// the read side; each downloaded file is re-read through
-    /// [`open_regular_file`] with the byte caps.
-    ///
-    /// Returns the files whose size or SHA-256 differs from what was expected
-    /// (empty when every copy is intact). A transfer or cap failure is an
-    /// `Err`.
-    async fn verify_remote_copies(
-        &self,
-        op: &str,
-        copies: &[RemoteCopy],
-    ) -> Result<Vec<String>, CoreError> {
-        if copies.is_empty() {
-            return Ok(Vec::new());
-        }
-        let tmp = self.download_dir(op)?;
-        let mut downloaded = 0u64;
-        let mut next = 0usize;
-        while next < copies.len() {
-            let mut ops = Vec::new();
-            let mut chunk = 0u64;
-            while next < copies.len() && ops.len() < DOWNLOAD_CHUNK_FILES {
-                let copy = &copies[next];
-                if !ops.is_empty() && chunk + copy.size > DOWNLOAD_CHUNK_BYTES {
-                    break;
-                }
-                if downloaded + chunk + copy.size > READ_MAX_TOTAL_BYTES {
-                    return Err(self.mirror_fail(
-                        op,
-                        format!(
-                            "reading the files back would exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {})",
-                            copy.rel
-                        ),
-                    ));
-                }
-                let local = copy
-                    .rel
-                    .components()
-                    .fold(tmp.path().to_path_buf(), |p, c| p.join(c));
-                if let Some(parent) = local.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        self.mirror_fail(
-                            op,
-                            format!("cannot create a download dir ({:?})", e.kind()),
-                        )
-                    })?;
-                }
-                ops.push(SftpOp::Get {
-                    remote: copy.remote.clone(),
-                    local,
-                });
-                chunk += copy.size;
-                next += 1;
-            }
-            let limit = downloaded + chunk + DOWNLOAD_SLACK_BYTES;
-            self.run_download(op, &ops, tmp.path(), limit).await?;
-            let root = tmp.path().to_path_buf();
-            downloaded = tokio::task::spawn_blocking(move || dir_bytes(&root))
-                .await
-                .map_err(|e| CoreError::Internal(format!("sftp verify task failed: {e}")))?;
-        }
-
-        let root = tmp.path().to_path_buf();
-        let wanted: Vec<(RelPath, String, u64)> = copies
-            .iter()
-            .map(|c| (c.rel.clone(), c.sha.clone(), c.size))
-            .collect();
-        let outcome = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-            let mut bad = Vec::new();
-            for (rel, sha, size) in &wanted {
-                match read_downloaded(&root, Path::new(rel.as_str()), *size, READ_MAX_FILE_BYTES)
-                {
-                    Ok(bytes) => {
-                        if sha256_hex(&bytes) != *sha {
-                            bad.push(format!("{rel} (SHA-256 differs)"));
-                        }
-                    }
-                    Err(Readback::SizeMismatch { listed, actual }) => {
-                        bad.push(format!(
-                            "{rel} (SHA-256 not matched: {actual} bytes, expected {listed})"
-                        ));
-                    }
-                    Err(Readback::Io(kind)) => {
-                        return Err(format!("cannot read {rel} back ({kind:?})"));
-                    }
-                    Err(Readback::Changed) => {
-                        return Err(format!("{rel} changed while it was read back"));
-                    }
-                    Err(Readback::Capped(len)) => {
-                        return Err(format!(
-                            "{rel} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
-                        ));
-                    }
-                    Err(Readback::Grew) => {
-                        return Err(format!(
-                            "{rel} grew past the {READ_MAX_FILE_BYTES} byte file cap while it was read back"
-                        ));
-                    }
-                }
-            }
-            Ok(bad)
-        })
-        .await
-        .map_err(|e| CoreError::Internal(format!("sftp verify task failed: {e}")))?
-        .map_err(|why| self.mirror_fail(op, why))?;
-        Ok(outcome)
-    }
-
-    /// After a staged copy failed verification: remove the staged files from
-    /// the staging root, but only after a fresh listing shows each one is
-    /// still a regular file with no symlink above it (an `rm` follows
-    /// directory symlinks). Never touches the collection. Returns a sentence
-    /// saying what was removed and what was left.
-    async fn discard_staged(&self, op: &str, root: &str, files: &[(RelPath, String)]) -> String {
-        let Ok(parts) = absolute_components(root) else {
-            return format!("The staged copies were left under {root}.");
-        };
-        let base = format!("/{}", parts[0]);
-        let rest: Vec<String> = parts[1..].to_vec();
-        let chains: Vec<Vec<String>> = files
-            .iter()
-            .map(|(path, _)| {
-                let mut chain = rest.clone();
-                chain.extend(path.components().map(str::to_string));
-                chain
-            })
-            .collect();
-        let mut budget = Budget::lenient();
-        let seen = match self.survey(op, &base, &chains, &mut budget).await {
-            Ok(seen) => seen,
-            Err(_) => {
-                return format!(
-                    "The staging root {root} could not be re-checked as a plain directory tree, so the staged copies were left in place under it."
-                );
-            }
-        };
-        let mut rms = Vec::new();
-        let mut kept = Vec::new();
-        for ((path, _), chain) in files.iter().zip(&chains) {
-            if matches!(seen.get(chain), Some(Seen::File(_))) {
-                rms.push((
-                    SftpOp::Rm {
-                        path: format!("{root}/{path}"),
-                    },
-                    0,
-                ));
-            } else if !matches!(seen.get(chain), Some(Seen::Missing) | None) {
-                kept.push(path.to_string());
-            }
-        }
-        let count = rms.len();
-        match self.run_chunked(op, rms).await {
-            Ok(()) if kept.is_empty() => format!(
-                "{count} staged copies were removed from {root} (empty directories remain)."
-            ),
-            Ok(()) => format!(
-                "{count} staged copies were removed from {root}; left in place: {}.",
-                kept.join(", ")
-            ),
-            Err(_) => {
-                format!("Removing the staged copies from {root} failed part-way; some may remain.")
-            }
-        }
     }
 
     /// Sessions of at most [`DOWNLOAD_CHUNK_FILES`] lines and, for `bytes`
@@ -2389,276 +2154,6 @@ impl SftpTransport {
         };
         Ok((setup, sizes))
     }
-
-    /// The per-file commit of a Windows host (Linux commits through the
-    /// script, `apply_ops.rs`; Windows follows in 23-20).
-    async fn commit_inner(
-        &self,
-        local: &Path,
-        files: &[(RelPath, String)],
-        remote_root: Option<&str>,
-        owner: &str,
-        delete_set: &DeleteSet,
-    ) -> Result<MirrorReport, CoreError> {
-        const OP: &str = "commit";
-        let (setup, sizes) = self
-            .mirror_precheck(local, files, remote_root, owner, delete_set)
-            .await?;
-
-        let mode_chain = chain_of(&[RESOURCES[0], RESOURCES[1], setup.mode.as_str()]);
-        let in_collection = |path: &RelPath| -> Vec<String> {
-            let mut chain = mode_chain.clone();
-            chain.extend(path.components().map(str::to_string));
-            chain
-        };
-        let mut deletes: Vec<&RelPath> = delete_set.files.iter().collect();
-        deletes.sort();
-        let mut targets: Vec<Vec<String>> = vec![
-            chain_of(&[RESOURCES[0]]),
-            chain_of(&[RESOURCES[0], RESOURCES[1]]),
-            mode_chain.clone(),
-        ];
-        let staged_chains: Vec<Vec<String>> = files.iter().map(|(p, _)| in_collection(p)).collect();
-        let delete_chains: Vec<Vec<String>> = deletes.iter().map(|p| in_collection(p)).collect();
-        targets.extend(staged_chains.iter().cloned());
-        targets.extend(delete_chains.iter().cloned());
-        let mut budget = Budget::default();
-        let seen = self
-            .survey(OP, &self.data_dir, &targets, &mut budget)
-            .await?;
-        for required in [
-            chain_of(&[RESOURCES[0]]),
-            chain_of(&[RESOURCES[0], RESOURCES[1]]),
-        ] {
-            if seen.get(&required) != Some(&Seen::Dir) {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "{} is not a directory; is data_dir a gateway data directory?",
-                        required.join("/")
-                    ),
-                ));
-            }
-        }
-        if let Some(Seen::File(_)) = seen.get(&mode_chain) {
-            return Err(self.mirror_fail(
-                OP,
-                format!("the {} collection is not a directory", setup.mode),
-            ));
-        }
-        for (path, chain) in deletes.iter().zip(&delete_chains) {
-            if !matches!(seen.get(chain), Some(Seen::File(_))) {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "{path} is not a regular file in the {} collection; nothing was changed",
-                        setup.mode
-                    ),
-                ));
-            }
-        }
-        for ((path, _), chain) in files.iter().zip(&staged_chains) {
-            if matches!(seen.get(chain), Some(Seen::Dir)) {
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "{path} is a directory in the {} collection; nothing was changed",
-                        setup.mode
-                    ),
-                ));
-            }
-        }
-        if let Some(root) = remote_root {
-            let parts = absolute_components(root).map_err(|why| self.mirror_fail(OP, why))?;
-            let base = format!("/{}", parts[0]);
-            let rest: Vec<String> = parts[1..].to_vec();
-            let chains: Vec<Vec<String>> = files
-                .iter()
-                .map(|(path, _)| {
-                    let mut chain = rest.clone();
-                    chain.extend(path.components().map(str::to_string));
-                    chain
-                })
-                .collect();
-            let mut staging_budget = Budget::lenient();
-            let staging_seen = self.survey(OP, &base, &chains, &mut staging_budget).await?;
-            for (((path, _), chain), size) in files.iter().zip(&chains).zip(&sizes) {
-                match staging_seen.get(chain) {
-                    Some(Seen::File(found)) if found == size => {}
-                    other => {
-                        return Err(self.mirror_fail(
-                            OP,
-                            format!(
-                                "the staged copy of {path} on the host is missing or the wrong size ({other:?}, expected {size} bytes); nothing was changed"
-                            ),
-                        ));
-                    }
-                }
-            }
-            // The size survey cannot tell same-size different bytes apart: read
-            // every staged copy back and hash it here before the first rename.
-            let copies: Vec<RemoteCopy> = files
-                .iter()
-                .zip(&sizes)
-                .map(|((path, sha), size)| RemoteCopy {
-                    rel: path.clone(),
-                    remote: format!("{root}/{path}"),
-                    sha: sha.clone(),
-                    size: *size,
-                })
-                .collect();
-            let bad = self.verify_remote_copies(OP, &copies).await?;
-            if !bad.is_empty() {
-                let cleanup = self.discard_staged(OP, root, files).await;
-                return Err(self.mirror_fail(
-                    OP,
-                    format!(
-                        "the staged copy on the host does not match its SHA-256 for {}; nothing was changed. {cleanup}",
-                        named(&bad)
-                    ),
-                ));
-            }
-        }
-
-        // ---- writes
-        let mut missing = Self::dirs_to_make(&seen, &staged_chains);
-        if seen.get(&mode_chain) == Some(&Seen::Missing) {
-            missing.insert(mode_chain.clone());
-        }
-        // The missing directories lead the SAME batch as the renames (a sorted
-        // set lists a parent before its children), so nothing but the batch
-        // itself sits between the pre-rename verification above and the moves.
-        let mut moves: Vec<(SftpOp, u64)> = Vec::with_capacity(missing.len() + files.len());
-        for chain in &missing {
-            moves.push((
-                SftpOp::Mkdir {
-                    path: join_abs(&self.data_dir, chain),
-                },
-                0,
-            ));
-        }
-        for (((path, _), chain), size) in files.iter().zip(&staged_chains).zip(&sizes) {
-            let target = join_abs(&self.data_dir, chain);
-            let op = match remote_root {
-                Some(root) => SftpOp::Rename {
-                    from: format!("{root}/{path}"),
-                    to: target,
-                },
-                None => SftpOp::Put {
-                    local: local.join(path.as_str()),
-                    remote: target,
-                },
-            };
-            moves.push((op, *size));
-        }
-        self.run_chunked(OP, moves).await?;
-
-        // ---- post-commit verification, before any delete. sftp has no atomic
-        // verify-then-rename, so a host-side writer can still change a staged
-        // copy between the read-back above and the rename (and `InPlace` has no
-        // pre-write check at all). Read the FINAL paths back and hash them: a
-        // mismatch is detected, reported, and stops before the first delete.
-        let copies: Vec<RemoteCopy> = files
-            .iter()
-            .zip(&staged_chains)
-            .zip(&sizes)
-            .map(|(((path, sha), chain), size)| RemoteCopy {
-                rel: path.clone(),
-                remote: join_abs(&self.data_dir, chain),
-                sha: sha.clone(),
-                size: *size,
-            })
-            .collect();
-        let bad = self.verify_remote_copies(OP, &copies).await?;
-        if !bad.is_empty() {
-            return Err(self.mirror_fail(
-                OP,
-                format!(
-                    "content changed on the host during commit: the {} collection holds content that does not match the staged SHA-256 for {}; the {} written files were not rolled back and no delete was run",
-                    setup.mode,
-                    named(&bad),
-                    files.len()
-                ),
-            ));
-        }
-        let written: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
-
-        // ---- deletes
-        let rms: Vec<(SftpOp, u64)> = delete_chains
-            .iter()
-            .map(|chain| {
-                (
-                    SftpOp::Rm {
-                        path: join_abs(&self.data_dir, chain),
-                    },
-                    0,
-                )
-            })
-            .collect();
-        self.run_chunked(OP, rms).await?;
-        let deleted: Vec<String> = deletes.iter().map(|path| path.to_string()).collect();
-
-        // ---- directories a delete emptied, never `<module>/<type>` or above
-        let removed = self
-            .remove_emptied(OP, &deletes, &mode_chain, &mut budget)
-            .await?;
-        Ok(MirrorReport {
-            written,
-            deleted,
-            removed_dirs: removed,
-        })
-    }
-
-    /// Remove the directories above `deletes` that are now empty, deepest
-    /// first, listing each candidate level in one session. A directory that is
-    /// not empty keeps its ancestors. Stops before `<module>/<type>`.
-    async fn remove_emptied(
-        &self,
-        op: &str,
-        deletes: &[&RelPath],
-        mode_chain: &[String],
-        budget: &mut Budget,
-    ) -> Result<Vec<String>, CoreError> {
-        let mut pending: BTreeMap<usize, BTreeSet<Vec<String>>> = BTreeMap::new();
-        for path in deletes {
-            let parts: Vec<&str> = path.components().collect();
-            for depth in MIRROR_MIN_COMPONENTS..parts.len() {
-                pending
-                    .entry(depth)
-                    .or_default()
-                    .insert(chain_of(&parts[..depth]));
-            }
-        }
-        let mut blocked: BTreeSet<Vec<String>> = BTreeSet::new();
-        let mut removed: Vec<String> = Vec::new();
-        let depths: Vec<usize> = pending.keys().rev().copied().collect();
-        for depth in depths {
-            let candidates: Vec<Vec<String>> = pending[&depth]
-                .iter()
-                .filter(|chain| !blocked.contains(*chain))
-                .cloned()
-                .collect();
-            let dirs: Vec<String> = candidates
-                .iter()
-                .map(|chain| join_abs(&join_abs(&self.data_dir, mode_chain), chain))
-                .collect();
-            let listings = self.list_level_as(op, &dirs, budget).await?;
-            let mut empty: Vec<SftpOp> = Vec::new();
-            for ((chain, dir), listing) in candidates.iter().zip(&dirs).zip(&listings) {
-                if listing.is_empty() {
-                    empty.push(SftpOp::Rmdir { path: dir.clone() });
-                    removed.push(chain.join("/"));
-                } else {
-                    for len in MIRROR_MIN_COMPONENTS..chain.len() {
-                        blocked.insert(chain[..len].to_vec());
-                    }
-                }
-            }
-            self.run_batch(op, empty).await?;
-        }
-        removed.sort();
-        Ok(removed)
-    }
 }
 
 #[async_trait::async_trait]
@@ -2672,19 +2167,9 @@ impl TreeMirror for SftpTransport {
         staged: &Staged,
         delete_set: &DeleteSet,
     ) -> Result<MirrorReport, CoreError> {
-        if !self.windows {
-            // D-01: a Linux commit is one script call, never a rename per file.
-            return self
-                .mirror_commit_script(
-                    staged.local.path(),
-                    &staged.files,
-                    staged.remote_root.as_deref(),
-                    &staged.owner,
-                    delete_set,
-                )
-                .await;
-        }
-        self.commit_inner(
+        // D-01: a commit is one script call on either family, never a rename
+        // per file.
+        self.mirror_commit_script(
             staged.local.path(),
             &staged.files,
             staged.remote_root.as_deref(),
@@ -2700,6 +2185,7 @@ mod tests {
     use super::*;
     use crate::deploy::apply::journal::JOURNAL_FILE;
     use crate::deploy::ledger::LEDGER_FILE;
+    use crate::deploy::transport::batch::RENAME_RETRIES;
     use crate::deploy::transport::process::{ProcessOutput, ProcessRunner};
     use std::collections::HashSet;
     use std::ffi::{OsStr, OsString};
@@ -4957,11 +4443,199 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         }
     }
 
-    #[tokio::test]
-    async fn windows_commit_replaces_by_rename_and_never_renames_onto_itself() {
+    /// The decoded parameters of the one `powershell -EncodedCommand` an exec
+    /// carried: the base64 JSON blob the fixed stub reads as `$p`.
+    fn stub_params(exec: &str) -> (String, serde_json::Value) {
+        use base64::Engine as _;
+        let b64 = exec
+            .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+            .or_else(|| {
+                exec.split("powershell -NoProfile -NonInteractive -EncodedCommand ")
+                    .nth(1)
+            })
+            .unwrap_or_else(|| panic!("not a powershell command: {exec}"))
+            .trim();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("outer base64");
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16(&units).expect("utf-16");
+        let blob = text
+            .split("FromBase64String('")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("parameter blob");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .expect("blob base64");
+        (text, serde_json::from_slice(&json).expect("json"))
+    }
+
+    /// The text of the work list the transport uploaded below the account home.
+    fn uploaded_work_list(fake: &FakeSftp) -> String {
+        let fs = fake.fs.lock().expect("fs");
+        let (_, node) = fs
+            .iter()
+            .find(|(k, _)| k.contains("/.ign-ctl-") && k.ends_with("/work.tsv"))
+            .expect("a work list was uploaded");
+        match node {
+            Node::File(bytes) => String::from_utf8(bytes.clone()).expect("utf-8"),
+            _ => panic!("work.tsv is not a file"),
+        }
+    }
+
+    /// A Windows mirror over `OneExec` answering every `ssh` with `reply`.
+    fn windows_mirror_with_reply(
+        separate: bool,
+        reply: &str,
+    ) -> (Arc<FakeSftp>, Arc<OneExec>, SftpTransport) {
         let fake = windows_fake();
         fixture_collection(&fake);
-        let m = mirror(&fake);
+        let runner = Arc::new(OneExec {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            reply: reply.to_string(),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        let staging = if separate {
+            StagingMode::Separate {
+                root: STAGING.to_string(),
+            }
+        } else {
+            StagingMode::InPlace
+        };
+        let m = SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master")
+            .with_mirror("production", staging)
+            .expect("mirror");
+        (fake, runner, m)
+    }
+
+    /// D-01 on Windows: the whole commit is ONE `ssh` call that runs the
+    /// uploaded PowerShell script's `mirror` op; no per-file sftp `rename` is
+    /// issued, the command line carries no path, the work list holds the
+    /// native staged-files directory and the result's indices are mapped back
+    /// to the paths of the work list.
+    #[tokio::test]
+    async fn windows_mirror_commit_is_one_exec() {
+        for separate in [true, false] {
+            let (fake, runner, m) = windows_mirror_with_reply(
+                separate,
+                r#"{"ok":1,"moved":[0,1],"deleted":[0],"dirs":[[0,3]],"fail":null}"#,
+            );
+            let tree = win_tree_of(&[
+                (&format!("{DC}/Keep/config.json"), "{\"keep\":2}"),
+                (&format!("{DC}/New One/config.json"), "{\"new\":1}"),
+            ]);
+            let staged = m.stage(&tree).await.expect("stage");
+            let report = m
+                .commit(
+                    &staged,
+                    &DeleteSet {
+                        files: vec![rel(&format!("{DC}/Old/config.json"))],
+                    },
+                )
+                .await
+                .expect("commit");
+
+            let execs = runner.execs.lock().expect("execs").clone();
+            assert_eq!(
+                execs.len(),
+                1,
+                "separate={separate}: one exec call: {execs:?}"
+            );
+            let (text, params) = stub_params(&execs[0]);
+            assert_eq!(params["o"], "mirror");
+            assert_eq!(params["c"], "C:\\gw\\data\\config\\resources\\production");
+            assert!(
+                params["t"]
+                    .as_str()
+                    .expect("t")
+                    .starts_with("C:\\Users\\svc\\.ign-ctl-"),
+                "{params}"
+            );
+            assert!(
+                !text.contains("Old") && !text.contains("config.json"),
+                "paths never reach the command line"
+            );
+            assert_eq!(
+                params["ss"],
+                crate::deploy::transport::batch::script_ps1_sha256()
+            );
+            let work = uploaded_work_list(&fake);
+            let source = work
+                .lines()
+                .find_map(|l| l.strip_prefix("S\t"))
+                .expect("an S record");
+            if separate {
+                assert_eq!(
+                    source,
+                    "C:\\Users\\svc\\ign-deploy\\gw\\production\\staging\\run-1"
+                );
+            } else {
+                assert!(
+                    source.starts_with("C:\\Users\\svc\\.ign-ctl-") && source.ends_with("\\files"),
+                    "{source}"
+                );
+            }
+            assert!(
+                work.contains(&format!("\nX\t0\t{DC}/Old/config.json\n")),
+                "{work}"
+            );
+            assert!(
+                work.contains("\nT\t3\n"),
+                "the retry bound travels in the list"
+            );
+            let lines: Vec<String> = fake.session_lines().into_iter().flatten().collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("rename ")),
+                "separate={separate}: no per-file rename: {lines:?}"
+            );
+            assert_eq!(
+                report.written,
+                [
+                    format!("{DC}/Keep/config.json"),
+                    format!("{DC}/New One/config.json")
+                ]
+            );
+            assert_eq!(report.deleted, [format!("{DC}/Old/config.json")]);
+            assert_eq!(report.removed_dirs, [format!("{DC}/Old")]);
+            // the script (not this process) touches the collection: the canned
+            // reply never ran it, so the fixture is as it was
+            let fs = fake.fs.lock().expect("fs");
+            assert!(matches!(
+                fs.get(&format!("{WRES}/production/{DC}/Keep/config.json")),
+                Some(Node::File(b)) if b == b"{\"keep\":1}"
+            ));
+            let ctl: Vec<&String> = fs.keys().filter(|k| k.contains("/.ign-ctl-")).collect();
+            assert!(
+                ctl.iter().any(|k| k.ends_with("/commit.ps1"))
+                    && ctl.iter().any(|k| k.ends_with("/work.tsv")),
+                "{ctl:?}"
+            );
+        }
+    }
+
+    /// Was `windows_commit_replaces_by_rename_and_never_renames_onto_itself`.
+    /// A Windows commit no longer renames over sftp (D-01): the replaced file,
+    /// the new one, the delete and the untouched `config-mode.json` are the
+    /// script's business, which the live host proves; here the scenario is
+    /// the report the script answers with and the two rules that were
+    /// asserted of the renames: nothing is renamed onto itself (the script
+    /// refuses it, and no sftp rename exists to try) and the staged copies
+    /// move only from the staging root into the collection.
+    #[tokio::test]
+    async fn windows_commit_replaces_through_the_script_and_never_renames_over_sftp() {
+        let (fake, runner, m) = windows_mirror_with_reply(
+            true,
+            r#"{"ok":1,"moved":[0,1],"deleted":[0],"dirs":[],"fail":null}"#,
+        );
         let tree = win_tree_of(&[
             (&format!("{DC}/Keep/config.json"), "{\"keep\":2}"),
             (&format!("{DC}/New One/config.json"), "{\"new\":1}"),
@@ -4978,86 +4652,193 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .expect("commit");
         assert_eq!(report.written.len(), 2);
         assert_eq!(report.deleted, [format!("{DC}/Old/config.json")]);
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert_eq!(renames(&fake).len(), 0, "no sftp rename on a Windows host");
+        // the staged copies are on the host before the call, in the staging
+        // root, and nowhere inside the collection
         let fs = fake.fs.lock().expect("fs");
-        let bytes = |p: &str| match fs.get(&format!("{WRES}/production/{p}")) {
-            Some(Node::File(b)) => Some(b.clone()),
-            _ => None,
-        };
-        // an existing file was replaced by the rename (C7a-4)
-        assert_eq!(
-            bytes(&format!("{DC}/Keep/config.json")).as_deref(),
-            Some(&b"{\"keep\":2}"[..])
-        );
-        assert_eq!(
-            bytes(&format!("{DC}/New One/config.json")).as_deref(),
-            Some(&b"{\"new\":1}"[..])
-        );
-        assert_eq!(bytes(&format!("{DC}/Old/config.json")), None, "deleted");
-        assert_eq!(
-            bytes("config-mode.json").as_deref(),
-            Some(&b"{\"mode\":1}"[..]),
-            "untouched"
-        );
-        // nothing dot-named was created below the collection
+        for p in ["Keep/config.json", "New One/config.json"] {
+            assert!(
+                matches!(fs.get(&format!("{STAGING}/{DC}/{p}")), Some(Node::File(_))),
+                "{p} is staged"
+            );
+        }
         assert!(
             fs.keys()
                 .filter(|k| k.starts_with(&format!("{WRES}/production/")))
                 .all(|k| !k.rsplit('/').next().expect("name").starts_with('.')),
-            "{:?}",
-            fs.keys().collect::<Vec<_>>()
+            "nothing dot-named in the collection"
         );
-        drop(fs);
-        let moves = renames(&fake);
-        assert_eq!(moves.len(), 2);
-        for (from, to) in &moves {
-            assert_ne!(from.to_ascii_lowercase(), to.to_ascii_lowercase(), "{from}");
-            assert!(from.starts_with(STAGING), "renamed from staging: {from}");
-            assert!(to.starts_with(&format!("{WRES}/production/")), "{to}");
+        // the script itself refuses a move onto itself and keeps the config
+        // file of the gateway out of every list (the work list gate)
+        assert!(
+            crate::deploy::transport::batch::SCRIPT_PS1.contains("a file cannot move onto itself")
+        );
+    }
+
+    /// Was `windows_commit_retries_a_held_rename_a_bounded_number_of_times`
+    /// (a held rename retried by the transport, three segments). The retry is
+    /// the script's now: the work list's `T` record carries the bound, a move
+    /// that still fails comes back as the script's own result and is reported
+    /// as `transport_failed` naming the entry by its path, saying nothing was
+    /// rolled back, and the transport itself never repeats the call or issues
+    /// an sftp `rename`.
+    #[tokio::test]
+    async fn windows_commit_holds_retry_in_the_script_and_reports_a_failed_move() {
+        // segment 1 (held twice, then success): the script retried; the bound
+        // is in the list, the call is made once
+        let (fake, runner, m) = windows_mirror_with_reply(
+            true,
+            r#"{"ok":1,"moved":[0],"deleted":[],"dirs":[],"fail":null}"#,
+        );
+        let staged = m
+            .stage(&win_tree_of(&[(
+                &format!("{DC}/Keep/config.json"),
+                "{\"keep\":2}",
+            )]))
+            .await
+            .expect("stage");
+        m.commit(&staged, &DeleteSet::default())
+            .await
+            .expect("commit");
+        assert!(uploaded_work_list(&fake).contains(&format!("\nT\t{RENAME_RETRIES}\n")));
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert_eq!(renames(&fake).len(), 0);
+
+        // segment 2 (held for good) and 3 (permission denied): the script's
+        // failure comes back as transport_failed naming the path; not
+        // repeated by the transport
+        for fail in [
+            "write 0: cannot move the file into place",
+            "write 0: cannot reset the permissions of the file",
+        ] {
+            let (fake, runner, m) = windows_mirror_with_reply(
+                true,
+                &format!(r#"{{"ok":1,"moved":[],"deleted":[],"dirs":[],"fail":"{fail}"}}"#),
+            );
+            let staged = m
+                .stage(&win_tree_of(&[(
+                    &format!("{DC}/Keep/config.json"),
+                    "{\"keep\":2}",
+                )]))
+                .await
+                .expect("stage");
+            let err = m
+                .commit(&staged, &DeleteSet::default())
+                .await
+                .expect_err("held for good");
+            let CoreError::TransportFailed {
+                operation, detail, ..
+            } = err
+            else {
+                panic!("not transport_failed")
+            };
+            assert_eq!(operation, "commit");
+            assert!(
+                detail.contains(&format!("{DC}/Keep/config.json")),
+                "{detail}"
+            );
+            assert!(detail.contains("nothing was rolled back"), "{detail}");
+            assert_eq!(runner.execs.lock().expect("execs").len(), 1, "{fail}");
+            assert_eq!(renames(&fake).len(), 0, "no sftp rename on a Windows host");
+            // the old content is still there
+            let fs = fake.fs.lock().expect("fs");
+            assert!(matches!(
+                fs.get(&format!("{WRES}/production/{DC}/Keep/config.json")),
+                Some(Node::File(b)) if b == b"{\"keep\":1}"
+            ));
         }
     }
 
-    /// 23-08 builds `prepare`, `commit` and `restore` of the PowerShell host;
-    /// every other `ApplyHost` call stays on the 23-04 refusal until 23-20, and
-    /// none of them starts an ssh or an sftp process.
+    /// 23-20: every `ApplyHost` call of a Windows node runs the PowerShell
+    /// script (`probe`, `fingerprint`, `finalize`, `discard_interrupted`) or
+    /// reads over sftp outside the lock (`read_record`, `fetch_snapshot`); none
+    /// is refused as unsupported any more.
     #[tokio::test]
-    async fn windows_apply_half_refuses_the_calls_23_20_builds() {
+    async fn windows_apply_calls_run_the_script_or_read_over_sftp() {
         use crate::deploy::apply::host::ApplyHost;
         use crate::deploy::apply::run_store::RunId;
-        let fake = windows_fake();
-        let t = windows_transport(&fake)
-            .with_apply("gw", "production")
-            .expect("apply half");
         let run = RunId::parse("20261017T120000Z-aaaaaa").expect("run id");
-        let mut refused: Vec<(&str, CoreError)> = Vec::new();
-        refused.push(("probe", t.probe().await.expect_err("probe")));
-        refused.push((
-            "fingerprint",
-            t.fingerprint(&["ledger.json".to_string()])
-                .await
-                .expect_err("fingerprint"),
-        ));
-        refused.push((
-            "read_record",
-            t.read_record(&run).await.expect_err("read_record"),
-        ));
-        refused.push((
-            "fetch_snapshot",
-            t.fetch_snapshot(&run, Path::new("/nonexistent"))
-                .await
-                .expect_err("fetch_snapshot"),
-        ));
-        refused.push((
-            "discard_interrupted",
-            t.discard_interrupted(&run).await.expect_err("discard"),
-        ));
-        for (name, err) in refused {
-            assert_eq!(err.code(), "transport_failed", "{name}: {err}");
-            assert!(
-                err.to_string().contains("not supported by this build yet"),
-                "{name}: {err}"
+        let host = |reply: &str| {
+            let fake = windows_fake();
+            let runner = Arc::new(OneExec {
+                fake: fake.clone(),
+                execs: Mutex::new(Vec::new()),
+                reply: reply.to_string(),
+            });
+            let shell = RemoteShell::local_sftp_server(
+                Path::new("/unused/sftp-server"),
+                runner.clone(),
+                Duration::from_secs(30),
             );
-        }
-        assert_eq!(t.sessions(), 0, "a refusal starts no sftp session");
+            let t = SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master")
+                .with_apply("gw", "production")
+                .expect("apply half");
+            (fake, runner, t)
+        };
+
+        // probe: the script's problem words come back as sentences
+        let (_, runner, t) = host(r#"{"ok":1,"problems":["coll_unwritable","deploy_unwritable"]}"#);
+        let report = t.probe().await.expect("probe");
+        assert!(!report.writable);
+        assert_eq!(report.problems.len(), 2, "{:?}", report.problems);
+        let execs = runner.execs.lock().expect("execs").clone();
+        assert_eq!(execs.len(), 1);
+        let (_, params) = stub_params(&execs[0]);
+        assert_eq!(params["o"], "probe");
+        assert_eq!(params["d"], "C:\\Users\\svc\\ign-deploy\\gw\\production");
+        assert_eq!(params["c"], "C:\\gw\\data\\config\\resources\\production");
+        let (_, runner, t) = host(r#"{"ok":1,"problems":[]}"#);
+        assert!(t.probe().await.expect("probe").writable);
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+
+        // fingerprint: hashes by path; a held file is a refusal naming the path
+        let hash = "ab".repeat(32);
+        let (fake, runner, t) = host(&format!(r#"{{"ok":1,"hashes":["{hash}","-"]}}"#));
+        let got = t
+            .fingerprint(&[format!("{DC}/Keep/config.json"), "ledger.json".to_string()])
+            .await
+            .expect("fingerprint");
+        assert_eq!(
+            got.get(&format!("{DC}/Keep/config.json")),
+            Some(&Some(hash))
+        );
+        assert_eq!(got.get("ledger.json"), Some(&None));
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert!(uploaded_work_list(&fake).contains("\nO\tfingerprint\n"));
+        let (_, _, t) = host(r#"{"ok":0,"err":"held","detail":"x","bad":["P0"]}"#);
+        let err = t
+            .fingerprint(&[format!("{DC}/Keep/config.json")])
+            .await
+            .expect_err("held");
+        assert!(
+            err.to_string().contains(&format!("{DC}/Keep/config.json"))
+                && err.to_string().contains("holds it open"),
+            "{err}"
+        );
+
+        // discard_interrupted: no journal on the host, the script drops the run
+        let (fake, runner, t) = host(r#"{"ok":1}"#);
+        t.discard_interrupted(&run).await.expect("discard");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
+        assert!(uploaded_work_list(&fake).contains("\nO\tdiscard\n"));
+
+        // read_record and fetch_snapshot read over sftp and start no process
+        let (fake, runner, t) = host(r#"{"ok":1}"#);
+        assert!(t.read_record(&run).await.expect("read_record").is_none());
+        let dest = tempfile::tempdir().expect("dest");
+        let err = t
+            .fetch_snapshot(&run, dest.path())
+            .await
+            .expect_err("no snapshot");
+        assert!(
+            err.to_string().contains("has no snapshot on this host"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("not supported"), "{err}");
+        assert!(t.sessions() > 0, "they read over sftp");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 0, "no ssh exec");
+        let _ = fake;
         // the script the Windows family runs is the PowerShell one
         let (name, text, sha) = t.script_file_for_tests();
         assert_eq!(name, "commit.ps1");
@@ -5106,103 +4887,30 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
                     .all(|w| !c.trim_start_matches('@').starts_with(w))),
             "the gate writes nothing"
         );
-        // a path that fits goes on to the script's own probe, which 23-20 builds
-        let err = t
+        // a path that fits goes on to the script's own probe
+        let runner = Arc::new(OneExec {
+            fake: fake.clone(),
+            execs: Mutex::new(Vec::new()),
+            reply: r#"{"ok":1,"problems":[]}"#.to_string(),
+        });
+        let shell = RemoteShell::local_sftp_server(
+            Path::new("/unused/sftp-server"),
+            runner.clone(),
+            Duration::from_secs(30),
+        );
+        let t = SftpTransport::new_windows(shell, WDATA.to_string(), "nodes.master")
+            .with_apply("gw", "production")
+            .expect("apply half");
+        let report = t
             .probe_paths(&["ignition/database-connection/ok/config.json".to_string()])
             .await
-            .expect_err("the script probe is not built yet");
-        assert!(
-            err.to_string().contains("not supported by this build yet"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn windows_commit_retries_a_held_rename_a_bounded_number_of_times() {
-        // a Defender-style handle on the target: Failure twice, then success
-        let fake = windows_fake();
-        fixture_collection(&fake);
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 2, "Failure"));
-        let m = mirror(&fake);
-        let staged = m
-            .stage(&win_tree_of(&[(
-                &format!("{DC}/Keep/config.json"),
-                "{\"keep\":2}",
-            )]))
-            .await
-            .expect("stage");
-        m.commit(&staged, &DeleteSet::default())
-            .await
-            .expect("commit retried");
-        assert_eq!(
-            renames(&fake).len(),
-            3,
-            "two refused attempts and the one that worked"
-        );
-
-        // held for good: classified transport_failed after the bound
-        let fake = windows_fake();
-        fixture_collection(&fake);
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 99, "Failure"));
-        let m = mirror(&fake);
-        let staged = m
-            .stage(&win_tree_of(&[(
-                &format!("{DC}/Keep/config.json"),
-                "{\"keep\":2}",
-            )]))
-            .await
-            .expect("stage");
-        let err = m
-            .commit(&staged, &DeleteSet::default())
-            .await
-            .expect_err("held");
-        let CoreError::TransportFailed {
-            operation, detail, ..
-        } = err
-        else {
-            panic!("not transport_failed")
-        };
-        assert_eq!(operation, "commit");
-        assert!(detail.contains("refused with no reason"), "{detail}");
-        assert_eq!(renames(&fake).len(), 1 + RENAME_RETRIES as usize);
-        // the old content is still there
-        {
-            let fs = fake.fs.lock().expect("fs");
-            assert!(matches!(
-                fs.get(&format!("{WRES}/production/{DC}/Keep/config.json")),
-                Some(Node::File(b)) if b == b"{\"keep\":1}"
-            ));
-        }
-
-        // permission denied is not retried
-        let fake = windows_fake();
-        fixture_collection(&fake);
-        fake.knobs()
-            .rename_fails
-            .push(("Keep/config.json".to_string(), 99, "Permission denied"));
-        let m = mirror(&fake);
-        let staged = m
-            .stage(&win_tree_of(&[(
-                &format!("{DC}/Keep/config.json"),
-                "{\"keep\":2}",
-            )]))
-            .await
-            .expect("stage");
-        m.commit(&staged, &DeleteSet::default())
-            .await
-            .expect_err("denied");
-        assert_eq!(
-            renames(&fake).len(),
-            1,
-            "no retry on a refusal that is not a Failure"
-        );
+            .expect("the script probe answers");
+        assert!(report.writable, "{report:?}");
+        assert_eq!(runner.execs.lock().expect("execs").len(), 1);
     }
 
     /// Was the POSIX segment of `windows_commit_retries_a_held_rename_a_bounded_number_of_times`
+    /// (now `windows_commit_holds_retry_in_the_script_and_reports_a_failed_move`)
     /// ("a POSIX host does not retry at all", one sftp `rename` that failed).
     /// A Linux commit no longer renames over sftp at all (D-01): the script
     /// moves, retrying a held target as many times as the work list's `T`

@@ -3198,3 +3198,483 @@ async fn wflwvm01_script_acl_and_reparse() {
     w.cleanup().await;
     eprintln!("PASS wflwvm01_script_acl_and_reparse");
 }
+
+// ---- 23-20: the rest of the PowerShell host, on the scratch gateway ---------------
+
+/// The longest native path below the account home the sftp server still
+/// lists and serves (C7b; `WINDOWS_SNAPSHOT_PATH_MAX` in the product).
+const SNAPSHOT_PATH_MAX: usize = 259;
+
+/// Add (`$p.on` 1) or remove (0) an explicit deny of creating files in the
+/// directory `$p.path` for the account this session runs as.
+const DENY_CREATE: &str = r#"$d=$p.path;$a=[IO.Directory]::GetAccessControl($d);$me=[Security.Principal.WindowsIdentity]::GetCurrent().User;$r=New-Object Security.AccessControl.FileSystemAccessRule($me,'CreateFiles','None','None','Deny');if($p.on -eq 1){$a.AddAccessRule($r)}else{[void]$a.RemoveAccessRule($r)};[IO.Directory]::SetAccessControl($d,$a);E @{ok=1}"#;
+
+/// Copy `$p.src` to `$p.dst` (both plain native paths), replacing `dst`.
+const COPY_FILE: &str = r#"[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p.dst))|Out-Null;[IO.File]::Copy($p.src,$p.dst,$true);E @{ok=1}"#;
+
+/// Make `$p.link` a second name (a hard link) for the file `$p.src`.
+const MAKE_HARDLINK: &str = r#"$l=$p.link;if([IO.File]::Exists($l)){[IO.File]::Delete($l)};cmd /c mklink /H $l $p.src|Out-Null;if($LASTEXITCODE -ne 0){throw 'mklink failed'};E @{ok=1}"#;
+
+/// Create the directory `$p.dir` (and its parents).
+const MAKE_DIR: &str = r#"[void][IO.Directory]::CreateDirectory($p.x+$p.dir);E @{ok=1}"#;
+
+async fn set_deny_create(shell: &RemoteShell, dir: &str, on: bool) {
+    shell
+        .exec_powershell(&script(
+            "deny_create",
+            DENY_CREATE,
+            serde_json::json!({ "path": dir, "on": i32::from(on) }),
+        ))
+        .await
+        .expect("deny_create");
+}
+
+/// Hold `path` open for `secs` seconds from a second ssh session, sharing
+/// `share`, and give the holder time to connect.
+async fn hold_file(
+    w: &WinScratch,
+    path: &str,
+    share: &'static str,
+    secs: u64,
+) -> tokio::task::JoinHandle<Result<serde_json::Value, CoreError>> {
+    let holder = shell_of(w.repo.path(), "scratch");
+    let path = path.to_string();
+    let task = tokio::spawn(async move {
+        holder
+            .exec_powershell(&script(
+                "hold",
+                HOLD,
+                serde_json::json!({ "path": path, "s": secs, "share": share }),
+            ))
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    task
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WFLWVM01=1"]
+async fn wflwvm01_ps_ops() {
+    let Some(live) = live() else { return };
+    let started = Instant::now();
+    let w = WinScratch::new(&live).await;
+    let host = w.host();
+    let before = w.listing().await;
+    let existing = format!("{DC}/Existing/config.json");
+
+    // ---- probe: writable, nothing written to the collection or left in the deploy dir
+    eprintln!("CAPTURE ps ops @ {}", utc_now());
+    let t = Instant::now();
+    let report = host.probe().await.expect("probe");
+    timed("probe (one script call)", t, ());
+    eprintln!("CAPTURE probe: {report:?}");
+    assert!(report.writable && report.problems.is_empty(), "{report:?}");
+    assert_eq!(w.listing().await, before, "probe writes nothing");
+    let (deploy_files, _) = hashes_below(&w.shell, &w.deploy_native()).await;
+    assert!(
+        deploy_files.is_empty(),
+        "the probe file is removed: {deploy_files:?}"
+    );
+    // an explicit deny of creating files in the collection is reported
+    set_deny_create(&w.shell, &w.prod_native, true).await;
+    let denied = host.probe().await;
+    set_deny_create(&w.shell, &w.prod_native, false).await;
+    let denied = denied.expect("probe (denied)");
+    eprintln!("CAPTURE probe with CreateFiles denied: {denied:?}");
+    assert!(!denied.writable, "{denied:?}");
+    assert!(
+        denied.problems.iter().any(|p| p.contains("not writable")),
+        "{denied:?}"
+    );
+    assert_eq!(w.listing().await, before);
+    assert!(host.probe().await.expect("probe again").writable);
+
+    // ---- fingerprint: read-only, absent is None, a directory is an error, a held file is held
+    let absent = format!("{DC}/Nope/config.json");
+    let got = host
+        .fingerprint(&[existing.clone(), absent.clone(), LEDGER_KEY.to_string()])
+        .await
+        .expect("fingerprint");
+    assert_eq!(
+        got.get(&existing),
+        Some(&Some(sha256_hex(b"{\"pre\":\"existing\"}")))
+    );
+    assert_eq!(got.get(&absent), Some(&None));
+    assert_eq!(got.get(LEDGER_KEY), Some(&None));
+    assert_eq!(w.listing().await, before);
+    let err = host
+        .fingerprint(&[format!("{DC}/Existing")])
+        .await
+        .expect_err("a directory is not a regular file");
+    assert!(err.to_string().contains("not a regular file"), "{err}");
+    let held = format!("{}\\{}", w.prod_native, existing.replace('/', "\\"));
+    let hold = hold_file(&w, &held, "None", 30).await;
+    let t = Instant::now();
+    let err = host
+        .fingerprint(std::slice::from_ref(&existing))
+        .await
+        .expect_err("a held file cannot be fingerprinted");
+    timed("fingerprint of a held file (bounded retries)", t, ());
+    eprintln!("CAPTURE fingerprint of a held file: {err}");
+    assert!(err.to_string().contains("holds it open"), "{err}");
+    let _ = hold.await;
+    assert_eq!(w.listing().await, before);
+
+    // ---- a run: commit, read_record, fetch_snapshot, finalize, restore
+    let run = "20261017T150000Z-psops1";
+    let run_id = RunId::parse(run).expect("run id");
+    let ledger = win_ledger(run, &[&format!("{DC}/Fresh/config.json")]);
+    let (spec, tree1) = win_batch(
+        run,
+        &[
+            (&format!("{DC}/Fresh/config.json"), b"{\"new\":1}"),
+            (&format!("{DC}/ReplaceMe/config.json"), b"{\"pre\":\"new\"}"),
+        ],
+        &[&format!("{DC}/Doomed/config.json")],
+        Some(&ledger),
+        &before,
+        None,
+    );
+    let prepared = host.prepare(&spec, &tree1).await.expect("prepare");
+    let report = host.commit(&prepared).await.expect("commit");
+    assert_eq!(report.phase, JournalPhase::Written, "{report:?}");
+    assert!(report.failure.is_none(), "{report:?}");
+    assert!(
+        host.read_record(&RunId::parse("20261017T150000Z-psops9").expect("run id"))
+            .await
+            .expect("read_record of another run")
+            .is_none()
+    );
+    let t = Instant::now();
+    let record = host
+        .read_record(&run_id)
+        .await
+        .expect("read_record")
+        .expect("the record");
+    timed("read_record (sftp get)", t, ());
+    assert_eq!(record.run_id, run);
+    assert_eq!(record.state, RecordState::Applying);
+    let dest = tempfile::tempdir().expect("dest");
+    let t = Instant::now();
+    let hashes = host
+        .fetch_snapshot(&run_id, dest.path())
+        .await
+        .expect("fetch_snapshot");
+    timed("fetch_snapshot (sftp)", t, ());
+    eprintln!("CAPTURE fetch_snapshot: {hashes:?}");
+    assert_eq!(
+        hashes.get(&format!("files/{DC}/ReplaceMe/config.json")),
+        Some(&sha256_hex(b"{\"pre\":\"old\"}"))
+    );
+    assert_eq!(
+        hashes.get(&format!("files/{DC}/Doomed/config.json")),
+        Some(&sha256_hex(b"{\"pre\":\"doomed\"}"))
+    );
+    assert!(hashes.contains_key("record.json"));
+    assert_eq!(hashes.len(), 3, "{hashes:?}");
+    // finalize: the final record, no journal, no staging
+    let mut finished = record;
+    finished.state = RecordState::Applied;
+    finished.post_fingerprint = Some(fingerprint(&finished.post_map()));
+    let t = Instant::now();
+    host.finalize(&finished).await.expect("finalize");
+    timed("finalize (one script call)", t, ());
+    let (deploy_files, _) = hashes_below(&w.shell, &w.deploy_native()).await;
+    assert!(
+        !deploy_files.contains_key("journal.json"),
+        "{deploy_files:?}"
+    );
+    assert!(
+        !deploy_files
+            .keys()
+            .any(|k| k.starts_with(&format!("staging/{run}/"))),
+        "{deploy_files:?}"
+    );
+    assert!(deploy_files.contains_key(&format!("snapshots/{run}/record.json")));
+    assert_eq!(
+        host.read_record(&run_id)
+            .await
+            .expect("read_record")
+            .expect("record")
+            .state,
+        RecordState::Applied
+    );
+    // a rollback of a finalized run still restores from the snapshot
+    let restored = host.restore(&finished).await.expect("restore");
+    assert!(restored.failure.is_none(), "{restored:?}");
+    assert_eq!(w.listing().await, before);
+    drop_journal(&w.shell, &w.staging_native).await;
+
+    // ---- discard_interrupted: a run that never moved a file, then a run that did
+    let run2 = "20261017T150100Z-psops2";
+    let (spec2, tree2) = win_batch(
+        run2,
+        &[(&format!("{DC}/Fresh2/config.json"), b"{\"new\":2}")],
+        &[],
+        None,
+        &before,
+        None,
+    );
+    let _prepared2 = host.prepare(&spec2, &tree2).await.expect("prepare 2");
+    let deploy = w.deploy_native();
+    w.shell
+        .exec_powershell(&script(
+            "copy_file",
+            COPY_FILE,
+            serde_json::json!({
+                "src": format!("{deploy}\\staging\\{run2}\\journal.ready.json"),
+                "dst": format!("{deploy}\\journal.json"),
+            }),
+        ))
+        .await
+        .expect("an interrupted run's journal");
+    w.shell
+        .exec_powershell(&script(
+            "make_dir",
+            MAKE_DIR,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "dir": format!("{deploy}\\snapshots\\{run2}\\files") }),
+        ))
+        .await
+        .expect("a started snapshot");
+    host.discard_interrupted(&RunId::parse(run2).expect("run id"))
+        .await
+        .expect("discard");
+    let (deploy_files, deploy_dirs) = hashes_below(&w.shell, &deploy).await;
+    assert!(
+        !deploy_files.contains_key("journal.json"),
+        "{deploy_files:?}"
+    );
+    assert!(
+        !deploy_dirs.iter().any(|d| d.ends_with(run2)),
+        "snapshot and staging of the run are gone: {deploy_dirs:?}"
+    );
+    assert_eq!(w.listing().await, before);
+    let run3 = "20261017T150200Z-psops3";
+    let (spec3, tree3) = win_batch(
+        run3,
+        &[(&format!("{DC}/Fresh3/config.json"), b"{\"new\":3}")],
+        &[],
+        None,
+        &before,
+        None,
+    );
+    let prepared3 = host.prepare(&spec3, &tree3).await.expect("prepare 3");
+    let report3 = host.commit(&prepared3).await.expect("commit 3");
+    assert_eq!(report3.phase, JournalPhase::Written, "{report3:?}");
+    let err = host
+        .discard_interrupted(&RunId::parse(run3).expect("run id"))
+        .await
+        .expect_err("a written run is restored, not discarded");
+    assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    assert!(
+        w.listing()
+            .await
+            .contains_key(&format!("{DC}/Fresh3/config.json"))
+    );
+    let restored3 = host.restore(&spec3.record).await.expect("restore 3");
+    assert!(restored3.failure.is_none(), "{restored3:?}");
+    assert_eq!(w.listing().await, before);
+    drop_journal(&w.shell, &w.staging_native).await;
+
+    // ---- fetch_snapshot at the 259-character limit, and the 260 refusal
+    let run4 = "20261017T150300Z-psops4";
+    let prefix = format!("{deploy}\\snapshots\\{run4}\\files\\ignition\\database-connection\\");
+    let tail = "\\config.json";
+    let name_len = SNAPSHOT_PATH_MAX - prefix.chars().count() - tail.len();
+    let long_dir = format!("{DC}/{}", "n".repeat(name_len));
+    let long_rel = format!("{long_dir}/config.json");
+    sftp(
+        &w.shell,
+        &[
+            SftpOp::Mkdir {
+                path: format!(
+                    "{}/{SCRATCH}/data/config/resources/production/{long_dir}",
+                    w.home
+                ),
+            },
+            SftpOp::Put {
+                local: {
+                    let p = tempfile::tempdir().expect("t").keep().join("old.json");
+                    std::fs::write(&p, "{\"long\":\"old\"}").expect("old");
+                    p
+                },
+                remote: format!(
+                    "{}/{SCRATCH}/data/config/resources/production/{long_rel}",
+                    w.home
+                ),
+            },
+        ],
+    )
+    .await;
+    let live_long = w.listing().await;
+    let (spec4, tree4) = win_batch(
+        run4,
+        &[(&long_rel, b"{\"long\":\"new\"}")],
+        &[],
+        None,
+        &live_long,
+        None,
+    );
+    let ok = host
+        .probe_paths(std::slice::from_ref(&long_rel))
+        .await
+        .expect("probe_paths");
+    assert!(
+        ok.writable,
+        "a snapshot path of 259 characters is reachable: {ok:?}"
+    );
+    let too_long = format!("{long_dir}n/config.json");
+    let refused = host.probe_paths(&[too_long]).await.expect("probe_paths");
+    assert!(!refused.writable, "260 characters is refused: {refused:?}");
+    let prepared4 = host.prepare(&spec4, &tree4).await.expect("prepare 4");
+    let report4 = host.commit(&prepared4).await.expect("commit 4");
+    assert_eq!(report4.phase, JournalPhase::Written, "{report4:?}");
+    let dest4 = tempfile::tempdir().expect("dest 4");
+    let hashes4 = host
+        .fetch_snapshot(&RunId::parse(run4).expect("run id"), dest4.path())
+        .await
+        .expect("fetch_snapshot of a 259-character path");
+    assert_eq!(
+        hashes4.get(&format!("files/{long_rel}")),
+        Some(&sha256_hex(b"{\"long\":\"old\"}")),
+        "{hashes4:?}"
+    );
+    let restored4 = host.restore(&spec4.record).await.expect("restore 4");
+    assert!(restored4.failure.is_none(), "{restored4:?}");
+    drop_journal(&w.shell, &w.staging_native).await;
+    // the long unit was made for this check: take it out
+    let long_unit_native = format!("{}\\{}", w.prod_native, long_dir.replace('/', "\\"));
+    assert!(remove_tree(&w.shell, &long_unit_native).await);
+    assert_eq!(w.listing().await, before);
+
+    // ---- the mirror commit on the script: ACL, a held target, a second name for the live file
+    let (target_file, _, node) = ssh_of(w.repo.path(), "scratch");
+    let staging_root = format!("{}/ign-deploy/{GATEWAY}/{MODE}/staging/live-mirror", w.home);
+    let mirror = |staging: StagingMode| {
+        transport::mirror_for_node(
+            w.repo.path(),
+            &target_file,
+            "nodes.master",
+            &node,
+            MODE,
+            staging,
+        )
+        .expect("mirror")
+    };
+    let m = mirror(StagingMode::Separate {
+        root: staging_root.clone(),
+    });
+    let fresh = format!("{DC}/MirrorNew/config.json");
+    let staged = m
+        .stage(&tree(&[(&fresh, "{\"mirror\":1}")]))
+        .await
+        .expect("stage");
+    let t = Instant::now();
+    let report = m
+        .commit(&staged, &DeleteSet::default())
+        .await
+        .expect("mirror commit");
+    timed("mirror commit (one script call)", t, ());
+    assert_eq!(report.written, std::slice::from_ref(&fresh));
+    let moved_native = format!("{}\\{}", w.prod_native, fresh.replace('/', "\\"));
+    let rows = acl_rows(&w.shell, std::slice::from_ref(&moved_native)).await;
+    eprintln!("CAPTURE acl of a file the mirror moved in: {rows:?}");
+    assert_eq!(
+        rows[0].2, "False",
+        "the moved file is not protected: {rows:?}"
+    );
+    assert!(
+        !rows[0].3.contains(":E:"),
+        "only inherited entries after a mirror move: {rows:?}"
+    );
+    assert!(broad_write_rules(&rows[0].3).is_empty(), "{rows:?}");
+    // a target held without sharing delete: the move fails after the bounded
+    // retries and reports where it stopped; nothing is rolled back; the file
+    // is unchanged
+    let m = mirror(StagingMode::Separate {
+        root: staging_root.clone(),
+    });
+    let staged = m
+        .stage(&tree(&[(&fresh, "{\"mirror\":2}")]))
+        .await
+        .expect("stage 2");
+    let hold = hold_file(&w, &moved_native, "Read", 40).await;
+    let t = Instant::now();
+    let err = m
+        .commit(&staged, &DeleteSet::default())
+        .await
+        .expect_err("a held target stops the mirror");
+    timed("mirror commit over a held target", t, ());
+    eprintln!("CAPTURE mirror over a held target: {err}");
+    assert!(err.to_string().contains(&fresh), "{err}");
+    assert!(
+        err.to_string().contains("cannot move the file into place"),
+        "{err}"
+    );
+    let _ = hold.await;
+    assert_eq!(
+        w.listing().await.get(&fresh),
+        Some(&sha256_hex(b"{\"mirror\":1}")),
+        "the held file is unchanged"
+    );
+    // the same commit works once the file is free
+    let m = mirror(StagingMode::Separate {
+        root: staging_root.clone(),
+    });
+    let staged = m
+        .stage(&tree(&[(&fresh, "{\"mirror\":2}")]))
+        .await
+        .expect("stage 3");
+    m.commit(&staged, &DeleteSet::default())
+        .await
+        .expect("mirror commit once free");
+    assert_eq!(
+        w.listing().await.get(&fresh),
+        Some(&sha256_hex(b"{\"mirror\":2}"))
+    );
+    // a staged copy that is a second name (a hard link) for the live file
+    let m = mirror(StagingMode::Separate {
+        root: staging_root.clone(),
+    });
+    let staged = m
+        .stage(&tree(&[(&fresh, "{\"mirror\":2}")]))
+        .await
+        .expect("stage 4");
+    let staged_native = format!("{}\\{}", native(&staging_root), fresh.replace('/', "\\"));
+    w.shell
+        .exec_powershell(&script(
+            "make_hardlink",
+            MAKE_HARDLINK,
+            serde_json::json!({ "src": moved_native, "link": staged_native }),
+        ))
+        .await
+        .expect("hard link");
+    let outcome = m.commit(&staged, &DeleteSet::default()).await;
+    eprintln!("CAPTURE mirror with the staged copy a hard link of the live file: {outcome:?}");
+    assert_eq!(
+        w.listing().await.get(&fresh),
+        Some(&sha256_hex(b"{\"mirror\":2}")),
+        "the live file survives a move onto its own second name"
+    );
+    // a delete set and an emptied directory through the same script
+    let m = mirror(StagingMode::InPlace);
+    let staged = m.stage(&tree(&[])).await.expect("stage 5");
+    let report = m
+        .commit(
+            &staged,
+            &DeleteSet {
+                files: vec![rel(&fresh)],
+            },
+        )
+        .await
+        .expect("mirror delete");
+    assert_eq!(report.deleted, std::slice::from_ref(&fresh));
+    assert_eq!(report.removed_dirs, [format!("{DC}/MirrorNew")]);
+    assert_eq!(w.listing().await, before);
+
+    w.cleanup().await;
+    assert!(enumerate(&w.shell, &w.root_native).await.is_none());
+    assert!(enumerate(&w.shell, &w.staging_native).await.is_none());
+    timed("wflwvm01_ps_ops total", started, ());
+    eprintln!("PASS wflwvm01_ps_ops");
+}

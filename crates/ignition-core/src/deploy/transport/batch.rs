@@ -508,13 +508,13 @@ impl WorkList {
         }
         if let Some(source) = &self.source {
             clean(source)?;
-            if super::remote::safe_remote_path(source).is_err()
-                || !source.starts_with('/')
-                || source
+            let posix = super::remote::safe_remote_path(source).is_ok()
+                && source.starts_with('/')
+                && !source
                     .split('/')
                     .skip(1)
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-            {
+                    .any(|part| part.is_empty() || part == "." || part == "..");
+            if !posix && !windows_native_dir_ok(source) {
                 return Err("the staged files directory is not a plain absolute path".to_string());
             }
         }
@@ -767,6 +767,25 @@ impl WorkList {
 }
 
 /// Whether `name` is a pre-rendered journal or record file name.
+/// Whether `path` is a native absolute Windows directory (`C:\a\b`) of plain
+/// components: the form the PowerShell script's `S` record takes (23-20). A
+/// drive letter, at least one more component, no `/`, and every component
+/// passing the Windows component gate.
+fn windows_native_dir_ok(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+        || path.contains('/')
+    {
+        return false;
+    }
+    path[3..]
+        .split('\\')
+        .all(|part| super::winps::windows_component_problem(part).is_none())
+}
+
 fn doc_name_ok(name: &str) -> bool {
     let phases = [
         JournalPhase::Snapshotting,
@@ -1034,6 +1053,35 @@ mod tests {
         // a mirror needs an absolute, plain source; only a mirror has one
         assert!(WorkList::for_mirror("dev", "relative", &[], &[]).is_err());
         assert!(WorkList::for_mirror("dev", "/a/../b", &[], &[]).is_err());
+        // the PowerShell script takes the source as a native Windows path
+        let windows = WorkList::for_mirror(
+            "dev",
+            "C:\\Users\\svc\\.ign-ctl-1\\files",
+            &[(rel("ignition/type/a/config.json"), H1.to_string())],
+            &[],
+        )
+        .expect("a native Windows source");
+        assert_eq!(
+            WorkList::parse_lines(&windows.to_lines()).expect("parse"),
+            windows
+        );
+        for bad in [
+            "C:",
+            "C:\\",
+            "C:/Users/svc",
+            "C:\\Users\\..\\x",
+            "C:\\Users\\\\x",
+            "C:\\Users\\x:y",
+            "C:\\Users\\x\\",
+            "\\\\host\\share\\x",
+            "\\\\?\\C:\\x",
+            "1:\\x",
+        ] {
+            assert!(
+                WorkList::for_mirror("dev", bad, &[], &[]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
         let mut list = commit_list();
         list.source = Some("/a/b".to_string());
         assert!(list.validate().is_err());

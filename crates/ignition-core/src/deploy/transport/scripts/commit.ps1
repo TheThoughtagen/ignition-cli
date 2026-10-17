@@ -1,5 +1,6 @@
 # ign deploy: the on-box batch for a Windows PowerShell 5.1 host (Phase 23,
-# plan 23-08, D-01). The commit and restore ops; 23-20 adds the rest.
+# plans 23-08 and 23-20, D-01). Every operation commit.sh has: commit, restore,
+# mirror, fingerprint, probe, finalize, discard, verify and unstage.
 #
 # Run by a fixed stub (deploy/transport/winps.rs, script_stub) that has already
 # compared the SHA-256 of this file and of work.tsv with the values the runner
@@ -8,9 +9,12 @@
 #
 #   OP STAGING COLLECTION DEPLOY WORKTEXT
 #
-# OP is commit, restore, verify or unstage. STAGING holds the files the work
-# list names, COLLECTION is <data dir>\config\resources\<mode> and DEPLOY is
-# <home>\ign-deploy\<gateway>\<mode>, all native absolute paths. WORKTEXT is the
+# OP is commit, restore, mirror, fingerprint, probe, finalize, discard, verify
+# or unstage. STAGING holds the files the work list names (or this script and
+# the work list only, for an operation that stages nothing), COLLECTION is
+# <data dir>\config\resources\<mode> and DEPLOY is
+# <home>\ign-deploy\<gateway>\<mode> (the home for a mirror), all native
+# absolute paths. WORKTEXT is the
 # text of work.tsv exactly as the stub hashed it, so the list this script acts
 # on is the list that was checked.
 #
@@ -33,10 +37,11 @@ $ErrorActionPreference = 'Stop'
 $S = @{
     Res = $null; Phase = ''; Run = ''; Gw = ''; Md = ''; WOp = ''
     Retries = 3; JSeen = '-'; HaveJ = $false; HaveL = $false; LNew = ''
-    RecDoc = ''; Fail = ''; RootsOk = $false; LPre = '-'; SnapBad = ''; Restored = ''
+    RecDoc = ''; Fail = ''; RootsOk = $false; LPre = '-'; SnapBad = ''; Restored = ''; Src = ''
 }
 $Ws = New-Object Collections.Generic.List[object]
 $Ds = New-Object Collections.Generic.List[object]
+$Xs = New-Object Collections.Generic.List[object]
 $Ps = New-Object Collections.Generic.List[object]
 $Fs = New-Object Collections.Generic.List[object]
 $Moved = New-Object Collections.Generic.List[int]
@@ -282,11 +287,12 @@ function CheckWork {
     if ($lines.Length -lt 2 -or $lines[$lines.Length - 1] -ne '') { Refuse 'bad_work' 'the work list does not end with a newline' }
     if ($lines[0] -cne 'ign-work 1') { Refuse 'bad_work' 'the work list header is wrong' }
     $haveR = $false; $haveG = $false; $haveM = $false; $haveO = $false; $haveT = $false
-    $arity = @{ R = 2; G = 2; M = 2; O = 2; T = 2; J = 2; F = 3; W = 5; D = 4; L = 3; P = 4 }
+    $haveS = $false
+    $arity = @{ R = 2; G = 2; M = 2; O = 2; T = 2; J = 2; S = 2; F = 3; X = 3; W = 5; D = 4; L = 3; P = 4 }
     for ($n = 1; $n -lt $lines.Length - 1; $n++) {
         $f = $lines[$n].Split("`t")
         $k = $f[0]
-        if ($k -cnotmatch '^[RGMOTJFWDLP]$') { Refuse 'bad_work' 'the work list holds a record this script does not know' }
+        if ($k -cnotmatch '^[RGMOTJSFXWDLP]$') { Refuse 'bad_work' 'the work list holds a record this script does not know' }
         if ($f.Length -ne $arity[$k]) { Refuse 'bad_work' 'a record has the wrong number of fields' }
         switch -CaseSensitive ($k) {
             'R' { if ($haveR -or $f[1] -eq '') { Refuse 'bad_work' 'a run record is repeated' }; $haveR = $true; $S.Run = $f[1] }
@@ -304,6 +310,17 @@ function CheckWork {
                 $S.HaveJ = $true
                 if (-not (IsHexOrDash $f[1])) { Refuse 'bad_work' 'the journal hash is wrong' }
                 $S.JSeen = $f[1]
+            }
+            'S' {
+                if ($haveS) { Refuse 'bad_work' 'a source record is repeated' }
+                $haveS = $true
+                if (-not (PlainAbs $f[1])) { Refuse 'bad_work' 'the staged files directory is wrong' }
+                $S.Src = $f[1]
+            }
+            'X' {
+                if ($f[1] -ne [string]$Xs.Count) { Refuse 'bad_work' 'a mirror delete index is wrong' }
+                if (-not (CollectionPath $f[2])) { Refuse 'bad_work' 'a mirror delete path is wrong' }
+                $Xs.Add(@{ i = $Xs.Count; path = $f[2] })
             }
             'F' {
                 if ($f[1] -cnotmatch '^(journal\.(snapshotting|ready|writing|written|restoring)|record\.(applying|applied|rolled_back))\.json$') { Refuse 'bad_work' 'a staged file name is wrong' }
@@ -344,9 +361,19 @@ function CheckWork {
     # verify reads the commit list a commit is about to run
     if (-not (($Op -eq 'verify' -and $S.WOp -eq 'commit') -or $S.WOp -eq $Op)) { Refuse 'bad_work' 'the work list is for another operation' }
     if (-not (PlainName $S.Md)) { Refuse 'bad_work' 'the mode is wrong' }
-    if (-not ((PlainName $S.Run) -and (PlainName $S.Gw))) { Refuse 'bad_work' 'the run or gateway is wrong' }
-    if ($S.Run -cnotmatch '^[A-Za-z0-9._-]{1,128}$') { Refuse 'bad_work' 'the run id is wrong' }
-    if (($Op -eq 'restore') -and (-not $S.HaveJ)) { Refuse 'bad_work' 'the work list does not say which journal was seen' }
+    if ($Op -eq 'probe' -or $Op -eq 'fingerprint') {
+        if ($S.Run -cne '-') { Refuse 'bad_work' 'this operation belongs to no run' }
+        if (-not (PlainName $S.Gw)) { Refuse 'bad_work' 'the gateway is wrong' }
+    }
+    elseif ($Op -eq 'mirror') {
+        if (($S.Run -cne '-') -or ($S.Gw -cne '-')) { Refuse 'bad_work' 'this operation belongs to no run' }
+        if ($S.Src -eq '') { Refuse 'bad_work' 'the work list names no staged files directory' }
+    }
+    else {
+        if (-not ((PlainName $S.Run) -and (PlainName $S.Gw))) { Refuse 'bad_work' 'the run or gateway is wrong' }
+        if ($S.Run -cnotmatch '^[A-Za-z0-9._-]{1,128}$') { Refuse 'bad_work' 'the run id is wrong' }
+    }
+    if (($Op -eq 'restore' -or $Op -eq 'finalize' -or $Op -eq 'discard') -and (-not $S.HaveJ)) { Refuse 'bad_work' 'the work list does not say which journal was seen' }
 }
 
 # check_roots: the three roots are plain absolute paths of the shape the runner
@@ -357,11 +384,15 @@ function CheckRoots {
     $S.RootsOk = $true
     if (-not $Co.EndsWith('\config\resources\' + $S.Md, [StringComparison]::OrdinalIgnoreCase)) { Refuse 'bad_roots' 'the collection is not the mode collection' }
     if (IsLink (Attr $Co)) { Refuse 'unsafe' 'the mode collection is a reparse point' }
-    if (-not $De.EndsWith('\ign-deploy\' + $S.Gw + '\' + $S.Md, [StringComparison]::OrdinalIgnoreCase)) { Refuse 'bad_roots' 'the deploy directory is not this gateway and mode' }
-    $d = $De
-    for ($n = 0; $n -lt 3; $n++) {
-        if (IsLink (Attr $d)) { Refuse 'unsafe' 'the deploy directory is or is below a reparse point' }
-        $d = $d.Substring(0, $d.LastIndexOf('\'))
+    # a mirror belongs to no gateway: its deploy root is the account home and
+    # nothing is created below it
+    if ($Op -ne 'mirror') {
+        if (-not $De.EndsWith('\ign-deploy\' + $S.Gw + '\' + $S.Md, [StringComparison]::OrdinalIgnoreCase)) { Refuse 'bad_roots' 'the deploy directory is not this gateway and mode' }
+        $d = $De
+        for ($n = 0; $n -lt 3; $n++) {
+            if (IsLink (Attr $d)) { Refuse 'unsafe' 'the deploy directory is or is below a reparse point' }
+            $d = $d.Substring(0, $d.LastIndexOf('\'))
+        }
     }
     if ($St.StartsWith($Co + '\', [StringComparison]::OrdinalIgnoreCase) -or $Co.StartsWith($St + '\', [StringComparison]::OrdinalIgnoreCase)) { Refuse 'bad_roots' 'the staging directory and the collection overlap' }
     if ($Op -eq 'commit' -or $Op -eq 'verify') {
@@ -385,12 +416,18 @@ function CtlCleanup {
 
 # ---- staged files ------------------------------------------------------------------
 
+# srcdir: where the staged files are.
+function SrcDir {
+    if ($S.Src) { return $S.Src }
+    return $St + '\files'
+}
+
 # verify_staged: every pre-rendered file, staged copy and the staged ledger is
 # a regular file with the hash the work list gives. The indices of those that
 # are not are in $Bad.
 function VerifyStaged {
     $bad = New-Object Collections.Generic.List[string]
-    $src = $St + '\files'
+    $src = SrcDir
     foreach ($f in $Fs) {
         $pth = $St + '\' + $f.name
         if ((IsLink (Attr $pth)) -or ((Sha $pth) -cne $f.sha)) { $bad.Add('F' + $f.name) }
@@ -581,7 +618,7 @@ function MoveWithRetries([string]$src, [string]$dst, [string]$base, [string]$rel
 # move_one INDEX REL SHA: move the staged copy over the target. Sets $S.Fail and
 # returns $false when it cannot.
 function MoveOne([int]$i, [string]$rel, [string]$sha) {
-    $src = $St + '\files'
+    $src = SrcDir
     $k = Classify $Co $rel
     if ($k -ne 'absent' -and $k -ne 'file') {
         $S.Fail = "write ${i}: the target is no longer a regular file"
@@ -925,12 +962,251 @@ function OpUnstage {
     Fin @{ ok = 1 }
 }
 
+# ---- fingerprint, probe, finalize and discard ---------------------------------------------
+
+# fingerprint: the live hash of each P path, read-only. A path that is not a
+# regular file is refused; a file another process holds open without sharing is
+# tried again a bounded number of times and then refused as held, never
+# reported as absent or as some other hash.
+function OpFingerprint {
+    CheckWork
+    CheckRoots
+    $hs = New-Object Collections.Generic.List[string]
+    foreach ($p in $Ps) {
+        if ($p.path -ceq 'ledger.json') { $v = LiveRetry $De 'ledger.json' }
+        else { $v = LiveRetry $Co $p.path }
+        if ($v -eq '!') { Refuse 'not_regular' 'a path is not a regular file' @{ at = $p.i } }
+        if ($v -eq '?') { Refuse 'held' 'a file is held open by another process and cannot be read' @{ bad = @('P' + $p.i) } }
+        $hs.Add($v)
+    }
+    Fin @{ ok = 1; hashes = $hs }
+}
+
+# CanAddFile DIR: whether the account can create a file in DIR, read from the
+# directory's access list against the account's own token (the collection is
+# never written to find out: the gateway watches it). An explicit deny of the
+# right wins; a rule that only inherits to children is not about DIR itself.
+function CanAddFile([string]$dir) {
+    try {
+        $acl = [IO.Directory]::GetAccessControl((Xp $dir), [Security.AccessControl.AccessControlSections]::Access)
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $mine = New-Object Collections.Generic.HashSet[string]
+        [void]$mine.Add($me.User.Value)
+        foreach ($g in $me.Groups) { [void]$mine.Add($g.Value) }
+        $allow = 0
+        $deny = 0
+        foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if (-not $mine.Contains($r.IdentityReference.Value)) { continue }
+            if (([int]$r.PropagationFlags -band 2) -ne 0) { continue }
+            $m = [int]$r.FileSystemRights
+            if ($r.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { $deny = $deny -bor $m }
+            else { $allow = $allow -bor $m }
+        }
+        return ((($allow -band 2) -ne 0) -and (($deny -band 2) -eq 0))
+    }
+    catch { return $false }
+}
+
+# probe: whether the collection (or, when it does not exist yet, config\resources)
+# takes a new file and the ign-deploy directory can be made and written. The
+# collection is read, never written; the deploy directory is made and a probe
+# file is created in it and removed.
+function OpProbe {
+    CheckWork
+    CheckRoots
+    $problems = New-Object Collections.Generic.List[string]
+    $ca = Attr $Co
+    if (IsLink $ca) { $problems.Add('coll_symlink') }
+    elseif (IsDir $ca) {
+        if (-not (CanAddFile $Co)) { $problems.Add('coll_unwritable') }
+    }
+    elseif ($ca -ne -1) { $problems.Add('coll_not_dir') }
+    else {
+        $res = $Co.Substring(0, $Co.LastIndexOf('\'))
+        $ra = Attr $res
+        if ((IsDir $ra) -and -not (IsLink $ra)) {
+            if (-not (CanAddFile $res)) { $problems.Add('resources_unwritable') }
+        }
+        else { $problems.Add('resources_missing') }
+    }
+    $ok = $true
+    $up2 = $De.Substring(0, $De.LastIndexOf('\'))
+    $up2 = $up2.Substring(0, $up2.LastIndexOf('\'))
+    $up1 = $De.Substring(0, $De.LastIndexOf('\'))
+    foreach ($dd in @($up2, $up1, $De)) {
+        $da = Attr $dd
+        if (IsLink $da) { $problems.Add('deploy_symlink'); $ok = $false; break }
+        elseif (IsDir $da) { continue }
+        elseif ($da -ne -1) { $problems.Add('deploy_not_dir'); $ok = $false; break }
+        else {
+            try { [void][IO.Directory]::CreateDirectory((Xp $dd)) }
+            catch { $problems.Add('deploy_uncreatable'); $ok = $false; break }
+        }
+    }
+    if ($ok) {
+        $pf = $De + '\probe-' + $PID + '.tmp'
+        $made = $false
+        try {
+            if ([IO.File]::Exists((Xp $pf))) { [IO.File]::Delete((Xp $pf)) }
+            $fh = [IO.File]::Open((Xp $pf), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $fh.Dispose()
+            $made = $true
+            [IO.File]::Delete((Xp $pf))
+        }
+        catch {
+            try { if ([IO.File]::Exists((Xp $pf))) { [IO.File]::Delete((Xp $pf)) } } catch { }
+            if (-not $made) { $problems.Add('deploy_unwritable') }
+        }
+    }
+    Fin @{ ok = 1; problems = $problems }
+}
+
+# finalize: install the final record, remove the journal and this run's staging.
+function OpFinalize {
+    CheckWork
+    CheckRoots
+    if (-not $S.RecDoc) { Refuse 'bad_work' 'the work list names no record' }
+    RequireStaged
+    $snapRoot = $De + '\snapshots\' + $S.Run
+    $sa = Attr ($De + '\snapshots')
+    $ra = Attr $snapRoot
+    if ((-not (IsDir $ra)) -or (IsLink $sa) -or (IsLink $ra)) { Refuse 'no_snapshot' 'the run has no snapshot on this host' }
+    if (-not (JournalUnchanged)) { Refuse 'journal_changed' 'the journal changed since it was read' }
+    if (-not (ReplaceWith ($St + '\' + $S.RecDoc) ($snapRoot + '\record.json'))) { Refuse 'record' 'the run record could not be installed' }
+    if ($S.JSeen -ne '-') {
+        try { [IO.File]::Delete((Xp ($De + '\journal.json'))) }
+        catch { Refuse 'journal' 'the journal could not be removed' }
+    }
+    $stg = $De + '\staging'
+    $ga = Attr $stg
+    if ((IsDir $ga) -and -not (IsLink $ga)) {
+        try { RemoveTree ($stg + '\' + $S.Run) }
+        catch { Refuse 'staging' 'the staging directory could not be removed' }
+    }
+    Fin @{ ok = 1 }
+}
+
+# discard: drop a run that never moved a file (its snapshot, staging and journal).
+function OpDiscard {
+    CheckWork
+    CheckRoots
+    if (-not (JournalUnchanged)) { Refuse 'journal_changed' 'the journal changed since it was read' }
+    $snaps = $De + '\snapshots'
+    $sa = Attr $snaps
+    if ((IsDir $sa) -and -not (IsLink $sa)) {
+        try { RemoveTree ($snaps + '\' + $S.Run) }
+        catch { Refuse 'snapshot' 'the snapshot could not be removed' }
+    }
+    $stg = $De + '\staging'
+    $ga = Attr $stg
+    if ((IsDir $ga) -and -not (IsLink $ga)) {
+        try { RemoveTree ($stg + '\' + $S.Run) }
+        catch { Refuse 'staging' 'the staging directory could not be removed' }
+    }
+    if ($S.JSeen -ne '-') {
+        try { [IO.File]::Delete((Xp ($De + '\journal.json'))) }
+        catch { Refuse 'journal' 'the journal could not be removed' }
+    }
+    Fin @{ ok = 1 }
+}
+
+# ---- mirror ----------------------------------------------------------------------------------
+
+# MirrorKind AT KIND: the refusal a path of the wrong kind stands for.
+function MirrorKind([string]$at, [string]$kind) {
+    if ($kind -eq 'symlink') { Refuse 'symlink' 'a path is or is below a reparse point' @{ at = $at } }
+    if ($kind -eq 'unsafe') { Refuse 'not_regular' 'a path is not a regular file or has a file where a directory must be' @{ at = $at } }
+}
+
+# mirror_precheck: everything that can be refused is refused before the first
+# write: the resources directories, the collection, every delete target, every
+# write target and every staged copy.
+function MirrorPrecheck {
+    $res = $Co.Substring(0, $Co.LastIndexOf('\'))
+    $cfg = $res.Substring(0, $res.LastIndexOf('\'))
+    foreach ($dd in @($cfg, $res)) {
+        $da = Attr $dd
+        if (IsLink $da) { Refuse 'symlink' 'config/resources is or is below a reparse point' @{ at = 'R' } }
+        if (-not (IsDir $da)) { Refuse 'resources' 'config/resources is not a directory' }
+    }
+    $ca = Attr $Co
+    if (IsLink $ca) { Refuse 'symlink' 'the mode collection is a reparse point' @{ at = 'C' } }
+    if (($ca -ne -1) -and -not (IsDir $ca)) { Refuse 'coll_not_dir' 'the mode collection is not a directory' }
+    foreach ($x in $Xs) {
+        $kind = Classify $Co $x.path
+        MirrorKind ('X' + $x.i) $kind
+        if ($kind -ne 'file') { Refuse 'not_file' 'a delete target is not a regular file' @{ at = ('X' + $x.i) } }
+    }
+    foreach ($w in $Ws) {
+        $kind = Classify $Co $w.path
+        MirrorKind ('W' + $w.i) $kind
+        if ($kind -eq 'dir') { Refuse 'is_dir' 'a write target is a directory' @{ at = ('W' + $w.i) } }
+    }
+    $bad = VerifyStaged
+    if ($bad.Count -gt 0) {
+        # the staged copies are removed from the staging root, only regular
+        # files with no reparse point above them, as the per-file path did
+        $src = SrcDir
+        $removed = 0
+        foreach ($w in $Ws) {
+            if ((Classify $src $w.path) -eq 'file') {
+                try { [IO.File]::Delete((Xp (Sub $src $w.path))); $removed++ } catch { }
+            }
+        }
+        Refuse 'staged' 'a staged copy does not match the work list' @{ bad = $bad; removed = $removed }
+    }
+}
+
+# mirror_deletes: the delete set, then the directories it emptied.
+function MirrorDeletes {
+    foreach ($x in $Xs) {
+        if ((Classify $Co $x.path) -ne 'file') {
+            $S.Fail = "delete $($x.i): the target is no longer a regular file"
+            return $false
+        }
+        try { [IO.File]::Delete((Xp (Sub $Co $x.path))) }
+        catch {
+            $S.Fail = "delete $($x.i): cannot delete the file"
+            return $false
+        }
+        $Deleted.Add($x.i)
+    }
+    foreach ($x in $Xs) {
+        if (-not (RmdirUp $x.i $x.path "delete $($x.i)")) { return $false }
+    }
+    return $true
+}
+
+# mirror: move the staged files into the collection and delete the delete set,
+# with no journal, snapshot or record (the Phase 22 TreeMirror::commit). Every
+# move is MoveOne, so each moved file takes the collection's access list and a
+# held target is retried the same bounded number of times.
+function OpMirror {
+    CheckWork
+    CheckRoots
+    $src = SrcDir
+    if ($src.StartsWith($Co + '\', [StringComparison]::OrdinalIgnoreCase) -or $Co.StartsWith($src + '\', [StringComparison]::OrdinalIgnoreCase) -or ($src -ieq $Co)) {
+        Refuse 'bad_roots' 'the staged files directory and the collection overlap'
+    }
+    MirrorPrecheck
+    if (-not (EnsureCollection)) { Refuse 'resources' 'the mode collection could not be created' }
+    if (Moves) { [void](MirrorDeletes) }
+    $f = $null
+    if ($S.Fail) { $f = $S.Fail }
+    Fin @{ ok = 1; moved = $Moved; deleted = $Deleted; dirs = $Dirs; fail = $f }
+}
+
 # ---- main ----------------------------------------------------------------------------------
 
 try {
     switch ($Op) {
         'commit' { OpCommit }
         'restore' { OpRestore }
+        'mirror' { OpMirror }
+        'fingerprint' { OpFingerprint }
+        'probe' { OpProbe }
+        'finalize' { OpFinalize }
+        'discard' { OpDiscard }
         'verify' { OpVerify }
         'unstage' { OpUnstage }
         default { Refuse 'bad_op' 'this script does not know the operation' }

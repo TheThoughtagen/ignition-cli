@@ -162,22 +162,9 @@ impl SftpTransport {
         self
     }
 
-    /// The apply half of a Linux node. A Windows node is refused here: the
-    /// operations that call this are built for the PowerShell host by 23-20
-    /// (the Windows arm of `apply_host_for_node` changes then).
+    /// The apply half of a node of either family (23-20: the PowerShell host
+    /// has every operation the POSIX host has).
     fn apply_setup(&self, op: &str) -> Result<&ApplySetup, CoreError> {
-        if self.windows {
-            return Err(self.mirror_fail(
-                op,
-                "apply over ssh to a Windows host is not supported by this build yet",
-            ));
-        }
-        self.apply_setup_any(op)
-    }
-
-    /// The apply half of a node of either family. Used by the operations the
-    /// PowerShell host already has (`prepare`, `commit`, `restore`).
-    fn apply_setup_any(&self, op: &str) -> Result<&ApplySetup, CoreError> {
         self.apply.as_ref().ok_or_else(|| {
             self.mirror_fail(
                 op,
@@ -205,7 +192,7 @@ impl SftpTransport {
     /// The `ign-deploy/<gateway>/<mode>` directory below the home, the mode
     /// collection, both checked for a batch line.
     async fn apply_roots(&self, op: &str) -> Result<(String, String, String), CoreError> {
-        let setup = self.apply_setup_any(op)?;
+        let setup = self.apply_setup(op)?;
         let home = self.account_home().await?;
         let deploy = format!("{home}/ign-deploy/{}/{}", setup.gateway, setup.mode);
         let coll = format!("{}/config/resources/{}", self.data_dir, setup.mode);
@@ -217,7 +204,7 @@ impl SftpTransport {
     }
 
     fn staging_abs(&self, home: &str, run: &str) -> Result<String, CoreError> {
-        let setup = self.apply_setup_any("prepare")?;
+        let setup = self.apply_setup("prepare")?;
         let root = format!("{home}/{}", staging_rel(&setup.gateway, &setup.mode, run));
         safe_remote_path(&root).map_err(|why| {
             self.mirror_fail("prepare", format!("the staging root is unsafe: {why}"))
@@ -715,7 +702,7 @@ impl SftpTransport {
 }
 
 impl SftpTransport {
-    /// `TreeMirror::commit` of a Linux node (D-01): the staged copies, the
+    /// `TreeMirror::commit` of a Linux or Windows node (D-01): the staged copies, the
     /// delete set and the collection go into one work list and the uploaded
     /// script's `mirror` op does every check, move, delete and emptied-directory
     /// removal in ONE call. `Separate` moves the copies staged at `remote_root`;
@@ -758,6 +745,13 @@ impl SftpTransport {
                 .map_err(|why| self.mirror_fail(OP, why))?;
                 (format!("{ctl}/files"), read)
             }
+        };
+        // the PowerShell script takes the staged files directory in native
+        // form (`C:\a\b`), the POSIX one in the sftp spelling
+        let source = if self.windows {
+            super::windows_native_path(&source)
+        } else {
+            source
         };
         let work = WorkList::for_mirror(&mode, &source, files, &deletes)
             .map_err(|why| self.mirror_fail(OP, why))?;
@@ -948,7 +942,7 @@ fn component_problem_text(name: &str) -> Option<&'static str> {
     crate::deploy::component_problem(name)
 }
 
-/// The path a stale or bad index names, as `W3`, `D1`, `L`.
+/// The path a stale or bad index names, as `W3`, `D1`, `P2`, `L`.
 fn stale_path(item: &str, work: &WorkList) -> Option<String> {
     if item == "L" {
         return Some(LEDGER_KEY.to_string());
@@ -958,6 +952,7 @@ fn stale_path(item: &str, work: &WorkList) -> Option<String> {
     match kind {
         "W" => work.writes.get(n).map(|w| w.path.as_str().to_string()),
         "D" => work.deletes.get(n).map(|d| d.path.as_str().to_string()),
+        "P" => work.restores.get(n).map(|r| r.path.clone()),
         _ => None,
     }
 }
@@ -1202,9 +1197,9 @@ impl ApplyHost for SftpTransport {
         const OP: &str = "probe";
         // A Windows node refuses, in Rust and before anything is written, a
         // path whose copy below the account home the sftp server could not
-        // reach again (C7a-8, C7b). The script's own probe is 23-20's; the
-        // gate runs first.
-        let setup = self.apply_setup_any(OP)?;
+        // reach again (C7a-8, C7b). The script's own probe runs only after
+        // this gate.
+        let setup = self.apply_setup(OP)?;
         let home = self.account_home().await?;
         let run_len = RunId::generate().as_str().len();
         let problems = windows_long_path_problems(
@@ -1225,7 +1220,7 @@ impl ApplyHost for SftpTransport {
 
     async fn prepare(&self, spec: &BatchSpec, tree: &RenderedTree) -> Result<Prepared, CoreError> {
         const OP: &str = "prepare";
-        let setup = self.apply_setup_any(OP)?;
+        let setup = self.apply_setup(OP)?;
         if spec.gateway != setup.gateway || spec.mode != setup.mode {
             return Err(self.mirror_fail(
                 OP,
@@ -1341,7 +1336,7 @@ impl ApplyHost for SftpTransport {
 
     async fn commit(&self, prepared: &Prepared) -> Result<BatchReport, CoreError> {
         const OP: &str = "commit";
-        self.apply_setup_any(OP)?;
+        self.apply_setup(OP)?;
         let (home, deploy, coll) = self.apply_roots(OP).await?;
         let staging = self.staging_abs(&home, prepared.run_id().as_str())?;
         if prepared.staging() != staging {
@@ -1370,7 +1365,7 @@ impl ApplyHost for SftpTransport {
 
     async fn restore(&self, record: &RunRecord) -> Result<BatchReport, CoreError> {
         const OP: &str = "restore";
-        let setup = self.apply_setup_any(OP)?;
+        let setup = self.apply_setup(OP)?;
         if record.gateway != setup.gateway || record.mode != setup.mode {
             return Err(self.mirror_fail(
                 OP,

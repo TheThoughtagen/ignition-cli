@@ -1238,6 +1238,78 @@ mod tests {
         );
     }
 
+    /// 23-20: the PowerShell script has every operation the POSIX script has,
+    /// in the same dispatch, and the 23-08 hardening holds in the new ones: a
+    /// file is moved only by `MoveReplace` (so `mirror` reuses `MoveOne` and
+    /// gets the access-list reset), a tree is removed with .NET
+    /// `Directory.Delete` and never with `Remove-Item -Recurse`, which in Windows
+    /// PowerShell 5.1 can follow a junction.
+    #[test]
+    fn the_shipped_script_runs_every_operation_commit_sh_has_and_keeps_the_hardening() {
+        use crate::deploy::transport::batch::{SCRIPT_PS1, SCRIPT_SH};
+        let ops = [
+            "commit",
+            "restore",
+            "mirror",
+            "fingerprint",
+            "probe",
+            "finalize",
+            "discard",
+            "verify",
+            "unstage",
+        ];
+        let mut sh_order: Vec<usize> = Vec::new();
+        let mut ps_order: Vec<usize> = Vec::new();
+        for op in ops {
+            sh_order.push(
+                SCRIPT_SH
+                    .find(&format!("  {op}) op_{op} ;;"))
+                    .unwrap_or_else(|| panic!("commit.sh has no {op}")),
+            );
+            let ps = SCRIPT_PS1
+                .find(&format!("        '{op}' {{ "))
+                .unwrap_or_else(|| panic!("commit.ps1 has no {op}"));
+            ps_order.push(ps);
+        }
+        let ranks = |v: &[usize]| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by_key(|i| v[*i]);
+            idx
+        };
+        assert_eq!(
+            ranks(&sh_order),
+            ranks(&ps_order),
+            "the same dispatch order"
+        );
+        let code: Vec<&str> = SCRIPT_PS1
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        let uses = |needle: &str| code.iter().filter(|l| l.contains(needle)).count();
+        assert_eq!(uses("Move-Item"), 1, "only MoveReplace moves a file");
+        assert_eq!(uses("Remove-Item"), 0, "trees go with Directory.Delete");
+        assert!(uses("[IO.Directory]::Delete((Xp $pth), $true)") >= 1);
+        // mirror moves through MoveOne, which resets the access list
+        let mirror = SCRIPT_PS1
+            .split("function OpMirror")
+            .nth(1)
+            .and_then(|rest| rest.split("# ---- main").next())
+            .expect("OpMirror");
+        assert!(mirror.contains("Moves"), "{mirror}");
+        let moves = SCRIPT_PS1
+            .split("function Moves")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("Moves");
+        assert!(moves.contains("MoveOne"));
+        let move_one = SCRIPT_PS1
+            .split("function MoveOne")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("MoveOne");
+        assert!(move_one.contains("MoveWithRetries") && move_one.contains("ResetAcl"));
+    }
+
     /// A tampered script or work list makes the stub exit 97 before the script
     /// runs. This needs Windows PowerShell (the stub reads `\\?\` paths), so it
     /// runs on the windows-latest CI leg; the same property is asserted against
