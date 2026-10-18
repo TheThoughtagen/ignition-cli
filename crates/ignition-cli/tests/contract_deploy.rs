@@ -1880,14 +1880,19 @@ fn apply_flags_are_exactly_these() {
 /// `system-properties` share (the `wrong_target` preflight compares them).
 const APPLY_SYSTEM_NAME: &str = "apply-gw";
 
-/// A small valid ZIP standing in for a `.gwbk`.
-fn apply_gwbk_zip() -> Vec<u8> {
+/// A small valid ZIP standing in for a `.gwbk`, the stored member carrying
+/// `secret` when given (a `.gwbk` holds the gateway's secrets, so the 23-15
+/// canary seeds one).
+fn apply_gwbk_zip(secret: Option<&str>) -> Vec<u8> {
     use std::io::Write as _;
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     writer.start_file("data.bin", options).expect("member");
     writer.write_all(&[7u8; 4096]).expect("write");
+    if let Some(secret) = secret {
+        writer.write_all(secret.as_bytes()).expect("write secret");
+    }
     writer.finish().expect("finish").into_inner()
 }
 
@@ -1933,6 +1938,18 @@ fn apply_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
 /// `log_items` are the lines the gateway log returns; a "will not be
 /// loaded" line for a written resource turns the verify red.
 async fn mount_apply_gateway(server: &wiremock::MockServer, data: &Path, log_items: Vec<Value>) {
+    mount_apply_gateway_seeded(server, data, log_items, None).await;
+}
+
+/// [`mount_apply_gateway`] with a secret planted where a gateway could leak
+/// one (23-15): the `.gwbk` bytes carry `canary`, and the optional
+/// restart-pending route answers 500 with a body that names it.
+async fn mount_apply_gateway_seeded(
+    server: &wiremock::MockServer,
+    data: &Path,
+    log_items: Vec<Value>,
+    canary: Option<&str>,
+) {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path, query_param};
@@ -2040,13 +2057,19 @@ async fn mount_apply_gateway(server: &wiremock::MockServer, data: &Path, log_ite
                     "content-type",
                     "application/x-ignition-gateway-backup;charset=utf-8",
                 )
-                .set_body_bytes(apply_gwbk_zip()),
+                .set_body_bytes(apply_gwbk_zip(canary)),
         )
         .mount(server)
         .await;
+    let pending = match canary {
+        Some(secret) => ResponseTemplate::new(500).set_body_string(format!(
+            "restart route failed: password={secret} rejected by the gateway"
+        )),
+        None => ResponseTemplate::new(200).set_body_json(json!({"pending": []})),
+    };
     Mock::given(method("GET"))
         .and(path("/data/api/v1/restart-tasks/pending"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pending": []})))
+        .respond_with(pending)
         .mount(server)
         .await;
 
@@ -3112,4 +3135,267 @@ async fn journal_recovery_clears_a_run_that_changed_nothing() {
         !seen[requests..].iter().any(|r| r.contains("scan")),
         "a cleared run is not scanned: {seen:?}"
     );
+}
+
+// ============================================================================
+// The secret canary over apply and rollback (23-15, DSURF-03)
+// ============================================================================
+
+/// The 23-15 canary. It is seeded wherever the gateway or the host could hand
+/// a secret to the runner: a secret field of the live mode-collection
+/// resources the apply replaces, the `.gwbk` bytes the gateway serves, a log
+/// entry of an unrelated logger and the error body of an optional route.
+const CANARY_APPLY: &str = "IGN-CANARY-23-15";
+
+/// The two run-directory entries that legitimately hold secrets (D-05): the
+/// pre-apply `snapshot/` subtree (copies of the gateway's files) and the
+/// `<run-id>.gwbk` backup. Everything else a run writes (`run.json`,
+/// `result.json`, `plan.json`, `events.ndjson`) is value-free and is scanned.
+/// The exemption is not a gap: [`assert_exempt_private`] asserts that these
+/// entries exist, are owner-only on unix and are ignored by git, which is the
+/// reason they may hold secrets.
+const CANARY_EXEMPT: &[&str] = &["snapshot", "*.gwbk"];
+
+/// Whether `rel` (a path below the run directory) is named by
+/// [`CANARY_EXEMPT`]. A bare name matches the top-level entry and everything
+/// below it; `*.suffix` matches a top-level file with that suffix.
+fn is_canary_exempt(rel: &Path) -> bool {
+    let mut parts = rel.components();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let first = first.as_os_str().to_string_lossy();
+    let is_top_level_file = parts.next().is_none();
+    CANARY_EXEMPT
+        .iter()
+        .any(|pattern| match pattern.strip_prefix('*') {
+            Some(suffix) => is_top_level_file && first.ends_with(suffix),
+            None => first == *pattern,
+        })
+}
+
+/// Every file below `dir` (recursive), as paths relative to `dir`.
+fn files_relative(dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            } else {
+                found.push(path.strip_prefix(root).expect("below root").to_path_buf());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, dir, &mut found);
+    found.sort();
+    found
+}
+
+/// The files of `run_dir` that contain `canary`, skipping exactly the entries
+/// [`CANARY_EXEMPT`] names. A scan that walked nothing would pass vacuously,
+/// so the caller also asserts the files it expects exist.
+fn scan_run_dir_for(canary: &str, run_dir: &Path) -> Vec<PathBuf> {
+    files_relative(run_dir)
+        .into_iter()
+        .filter(|rel| !is_canary_exempt(rel))
+        .filter(|rel| {
+            std::fs::read(run_dir.join(rel))
+                .expect("read run-dir file")
+                .windows(canary.len())
+                .any(|w| w == canary.as_bytes())
+        })
+        .collect()
+}
+
+/// The exempt entries of an applied run's directory exist, are private and
+/// are ignored by git. `repo` is the git repository the run lives in.
+fn assert_exempt_private(repo: &Path, run_dir: &Path) {
+    let snapshot = run_dir.join("snapshot");
+    assert!(snapshot.is_dir(), "the exempt snapshot/ exists");
+    let exempt: Vec<PathBuf> = files_relative(run_dir)
+        .into_iter()
+        .filter(|rel| is_canary_exempt(rel))
+        .collect();
+    assert!(
+        exempt
+            .iter()
+            .any(|rel| rel.extension().is_some_and(|e| e == "gwbk")),
+        "the exempt .gwbk exists: {exempt:?}"
+    );
+    assert!(
+        exempt.iter().any(|rel| rel.starts_with("snapshot")),
+        "the snapshot holds files: {exempt:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        // Every exempt file is owner-only, below a run directory only the
+        // owner can enter. (The directories inside `snapshot/` keep the
+        // umask's mode; the 0700 run directory above them is the barrier.)
+        assert_eq!(mode(run_dir), 0o700, "the run directory is 0700");
+        for rel in &exempt {
+            assert_eq!(mode(&run_dir.join(rel)), 0o600, "{rel:?} is 0600");
+        }
+    }
+    for rel in std::iter::once(PathBuf::from("snapshot")).chain(exempt) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["check-ignore", "-q", "--"])
+            .arg(run_dir.join(&rel))
+            .status()
+            .expect("git check-ignore");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "git ignores {rel:?} (exit 0 from `git check-ignore -q`)"
+        );
+    }
+}
+
+/// Every run directory below `repo/.ign/deploy/<gateway>/`.
+fn run_dirs(repo: &Path) -> Vec<PathBuf> {
+    let root = repo.join(".ign/deploy");
+    let Ok(gateways) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for gateway in gateways {
+        for run in std::fs::read_dir(gateway.expect("gateway dir").path()).expect("read_dir") {
+            dirs.push(run.expect("run dir").path());
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+/// The canary is on neither stream of `out`.
+fn assert_streams_canary_free(out: &std::process::Output, what: &str) {
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(CANARY_APPLY),
+        "canary on stdout: {what}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(CANARY_APPLY),
+        "canary on stderr: {what}"
+    );
+}
+
+/// The canary is on neither stream and in no scanned file of any run
+/// directory below `repo`. Returns the number of run directories scanned.
+fn assert_canary_free(out: &std::process::Output, repo: &Path, what: &str) -> usize {
+    assert_streams_canary_free(out, what);
+    let dirs = run_dirs(repo);
+    for dir in &dirs {
+        let leaks = scan_run_dir_for(CANARY_APPLY, dir);
+        assert!(leaks.is_empty(), "canary in {leaks:?} of {dir:?}: {what}");
+        for file in ["run.json", "events.ndjson"] {
+            assert!(dir.join(file).is_file(), "{file} was scanned in {dir:?}");
+        }
+    }
+    dirs.len()
+}
+
+/// `apply_tracer()` whose live `POSTGRES` and alarm-settings files carry the
+/// canary in secret fields. The apply replaces both, so the pre-images (and
+/// only the pre-images, in the exempt `snapshot/`) hold it afterwards.
+fn canary_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (scratch, repo, data) = apply_tracer();
+    let live = data.join("config/resources/dev");
+    std::fs::write(
+        live.join(APPLY_UNIT).join("config.json"),
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_APPLY}"}}}}}}"#),
+    )
+    .expect("seed embedded secret");
+    std::fs::write(
+        live.join("ignition/general-alarm-settings/config.json"),
+        format!(r#"{{"password":"{CANARY_APPLY}"}}"#),
+    )
+    .expect("seed password");
+    (scratch, repo, data)
+}
+
+/// A log entry of an unrelated logger whose message holds the canary.
+fn canary_log_items() -> Vec<Value> {
+    vec![serde_json::json!({
+        "timestamp": 1_792_999_999_000_i64,
+        "loggerName": "Unrelated.Logger",
+        "level": "WARN",
+        "message": format!("connection refused for password={CANARY_APPLY}"),
+    })]
+}
+
+/// Mount the canary-seeded apply gateway (`.gwbk`, logs, restart route).
+async fn mount_canary_gateway(server: &wiremock::MockServer, data: &Path) {
+    mount_apply_gateway_seeded(server, data, canary_log_items(), Some(CANARY_APPLY)).await;
+}
+
+#[tokio::test]
+async fn apply_canary() {
+    let (_scratch, repo, data) = canary_tracer();
+    let hash = plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    mount_canary_gateway(&server, &data).await;
+
+    let out = run_apply(&server, &repo, &hash, &[]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope on stdout");
+    assert_eq!(envelope["data"]["outcome"], "applied", "{envelope}");
+    let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+
+    // The seeds were real: the host held the canary before the apply, and the
+    // gateway served it in the .gwbk the run kept.
+    let gwbk = run_dir.join(envelope["data"]["gwbk"].as_str().expect("gwbk"));
+    assert!(
+        std::fs::read(&gwbk)
+            .expect("gwbk")
+            .windows(CANARY_APPLY.len())
+            .any(|w| w == CANARY_APPLY.as_bytes()),
+        "the .gwbk carries the canary, so the scan skips something real"
+    );
+    let pre_image = run_dir
+        .join("snapshot/files")
+        .join(format!("{APPLY_UNIT}/config.json"));
+    assert!(
+        std::fs::read_to_string(&pre_image)
+            .expect("pre-image")
+            .contains(CANARY_APPLY),
+        "the snapshot holds the replaced secret"
+    );
+    assert!(
+        !std::fs::read_to_string(
+            data.join("config/resources/dev")
+                .join(APPLY_UNIT)
+                .join("config.json")
+        )
+        .expect("live")
+        .contains(CANARY_APPLY),
+        "the apply replaced the secret field"
+    );
+
+    // Nothing else holds it: both streams and every non-exempt file.
+    let seen = seen_requests(&server).await;
+    for route in [
+        "GET /data/api/v1/backup",
+        "GET /data/api/v1/restart-tasks/pending",
+        "GET /data/api/v1/logs",
+    ] {
+        assert!(
+            seen.iter().any(|r| r == route),
+            "the seeded route {route} was served: {seen:?}"
+        );
+    }
+    assert_eq!(assert_canary_free(&out, &repo, "applied"), 1);
+    for file in ["run.json", "result.json", "plan.json", "events.ndjson"] {
+        assert!(run_dir.join(file).is_file(), "{file} was scanned");
+    }
+    // The exempt entries are private and ignored: that is why they may hold it.
+    assert_exempt_private(&repo, &run_dir);
 }
