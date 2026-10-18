@@ -2613,3 +2613,76 @@ ok
 
 test result: ok. 1 passed (selected from the four-test run below)
 ~~~
+
+## Live gate: rig faults (23-16)
+
+Same rig, same repo, same guards as the section above. These tests drive the library entries with an explicit `HoldModel` (the verbs have one hold, 176 s, and no override), a `FaultyHost` around the `local:` apply host and the real `ReqwestGatewayApi`.
+
+- **`live_kill_mid_write_then_recover`:** `ApplyFault::HangAfterMove(1, ..)` on a spawned task (hold 30 s); the task is aborted at the hang. The journal is on the host at phase `writing`; `deploy plan`, a new apply and a rollback of another run each refuse with `deploy_journal_present` naming the recovery command, and write nothing; the rollback of the journal's own run, from a fresh context, restores the pre-apply tree, removes the journal and ends with the plan equal to the start. Observation: **the recovery tried 0.1 s after the kill failed with `scan_lock_held`** (the dead apply still holds its scan-lock, `api-token:cap-a:...`); the lock read free 30.6 s after the kill, which is the dead apply's hold (30 s here, 176 s for the shipped hold), and the recovery then succeeded. This is the "wait for the dead apply's hold" residual the README states for an ssh drop, seen on a real gateway.
+- **`live_kill_after_green_verify_then_recover` (the A9 window):** the run is aborted at `finalize`, after the scan and a green verify. The journal is at phase `written`, the REST view lists `POSTGRES` (the gateway loaded a good deploy), a new apply refuses, and the rollback of the journal's own run restores the pre-apply tree and the gateway drops the unit after the restore scan. The recovery at once (0.6 s) succeeded: the scan released the lock (D12), so there is no wait in this window.
+- **`live_lock_lapse_restores`:** hold 10 s (`HOLD_FLOOR_S`); a hook after `commit` sleeps 13 s, so the lock lapses before the engine's check. What `### C2` predicted for (e): a lapsing lock does not trigger a scan, and a file written into the collection is not loaded. What happened inside the engine: `lastScanTimestamp` the same before and after the lapse (`1792297141956` both), the lock read free, the REST view of the mode held no translator while the four files sat on disk. Then the engine found the lock gone, restored the host and scanned once: outcome `rolled_back`, cause `lock_expired`, exit 6 verdict slug `deploy_rolled_back`; the restore scan's timestamp is later than the lapse's, the REST view holds none of the units, no `will not be loaded` WARN line since the restore scan (CV1 rule), and the plan is equal to the start. Prediction and result agree.
+
+`IGNITION_LIVE_DEPLOY=1 IGNITION_LIVE_URL=http://localhost:18290 IGNITION_LIVE_TOKEN=$IGN_TOKEN_CAP_A IGN_DEPLOY_RIG_DATA=$HOME/.cache/ign-deploy-rig/data IGN_DEPLOY_RIG_MODE=production cargo test -p ignition-core --test live_deploy_apply -- --ignored --nocapture --test-threads=1` @ 2026-10-18T04:17:53Z
+
+~~~
+running 3 tests
+test live_kill_after_green_verify_then_recover ... live_kill_after_green_verify_then_recover @ 2026-10-18T04:18:20Z
+killed past the green verify, before finalize @ 2026-10-18T04:18:26Z
+journal: run 20261018T041820Z-6a3346 phase written
+REST translators in the mode while the journal stands: ["POSTGRES"]
+recovery at once (0.6s after the kill): ok
+PASS live_kill_after_green_verify_then_recover in 7.1s
+ok
+test live_kill_mid_write_then_recover ... live_kill_mid_write_then_recover @ 2026-10-18T04:18:27Z
+killed after the first move @ 2026-10-18T04:18:28Z
+journal: run 20261018T041827Z-4ad582 phase writing
+recovery at once (0.1s after the kill) failed: scan_lock_held / the config scan-lock is held by api-token:cap-a:192.168.117.1
+lock free 30.6s after the kill
+PASS live_kill_mid_write_then_recover in 35.6s
+ok
+test live_lock_lapse_restores ... live_lock_lapse_restores @ 2026-10-18T04:19:03Z
+C2e in the engine: scan timestamp across the lapse: 1792297141956 -> 1792297141956 (active false); lock free; REST translators in the mode: []
+C2e in the engine: scan unchanged across the lapse: true
+C2e in the engine: translators_visible: 0
+apply: outcome RolledBack cause Some(LockExpired) ok false slug Some("deploy_rolled_back")
+PASS live_lock_lapse_restores in 24.5s
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 83.05s (the same run also ran live_apply_then_rollback)
+~~~
+
+## Spec §9 amendment draft (23-16)
+
+Target: `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` in `whk-environment-orchestration` (PR #60, branch `docs/prod-gateway-config-as-code`). The text below was drafted against the spec as it stands on that local branch (read with `git show`, nothing checked out or changed there). Owed by 22-LIVE-CAPTURES `### Decision B (recorded 2026-10-15 ...)`, caveat 1. Nothing here has been applied to the spec or pushed.
+
+### What the spec says today (§9, "Pipeline identities")
+
+> - **SSH account `svc-ignition-deploy` on each node.** Key-only auth, with write access limited to `data/config/resources/<mode>`. Its key is a GitHub environment secret.
+
+### Replacement text for that bullet
+
+> - **SSH account `svc-ignition-deploy` on each node.** Key-only auth. It is not an administrator and holds these write rights and no others:
+>   1. **Modify on each mode collection** a deploy target names, `data/config/resources/<mode>` (granted on the directory, so the files it moves in are inherited into the collection's access list). Read and execute on `data/config/resources` and on `core` stay as provisioned. It holds no write right anywhere else under `data/`.
+>   2. **Create, write and delete under `ign-deploy/<gateway>/<mode>/` in its own home directory** (Windows `C:\Users\svc-ignition-deploy\ign-deploy\<gateway>\<mode>\`, Linux `~/ign-deploy/<gateway>/<mode>/`). That tree is outside `data/` and outside every collection, so the gateway never reads it. It holds the deploy ledger (`ledger.json`), the in-flight journal (`journal.json`), the staged files of a run (`staging/<run_id>/`) and the snapshot and run record of each run (`snapshots/<run_id>/`, with `record.json`).
+>
+>   The home directory is readable by the account, `SYSTEM` and the administrators only (the Windows home grants nothing to `Users`, `Everyone` or `Authenticated Users`); nothing `ign` creates there grants anything either. The snapshots hold the pre-images of the files a run replaced or deleted, which can contain secret values, so that privacy is part of the control: the declared-resource lint (no embedded secrets) does not cover them. `ign` never prunes `ign-deploy/`; retention of runs and snapshots on the node is the operator's, and removing a run's snapshot makes `ign deploy rollback --run <id>` for that run impossible. (The 30 days of §8 are the CI run artifacts, not this tree.) Its key is a GitHub environment secret.
+
+### Evidence pointers
+
+| Claim in the replacement | Evidence |
+|---|---|
+| The account can create, write, rename and delete in its home, which has Full control for it; the home is outside `data/` and a collection | 22-LIVE-CAPTURES `### C6` row 1, blocks `C6-1`; scan state identical before and after (`C6-scan-before`, `C6-scan-after`) |
+| The account cannot write the collection as provisioned and cannot create `data/ign-deploy/`; so Modify on the collection is a separate grant, and the home tree is the only other write place | `### C6` rows 2 and 3 (`C6-2`, `C6-3`); `C6-post-1` (after the grant of 2026-10-15, put, rename onto an existing file, mkdir, rmdir and rm work in `production`) |
+| Why the home and not the data directory: Decision B(i) and the on-box layout | 22-LIVE-CAPTURES `### Decision B (recorded 2026-10-15 ...)`; `ign-deploy/<gateway>/<mode>/` for ledger, journal, `staging/<run_id>/`; `snapshots/<run_id>/` and `record.json` are 23-02's layout |
+| Files moved into the collection need the account to own them (the access-list reset needs WRITE_DAC), and end with the collection's inherited list | 23-LIVE-CAPTURES `### C7b` (ACL of a moved file; the reset after each move; `BUILTIN\Users` ReadAndExecute is the only broad entry) |
+| Nothing the account creates in its home grants `Users`, `Everyone` or `Authenticated Users` | 23-LIVE-CAPTURES `### C7b` (28 created or moved paths checked), `wflwvm01_script_acl_and_reparse` |
+| The probe needs create-file on the collection and reads the access list instead of writing a probe file in it | 23-LIVE-CAPTURES `### 23-20` |
+| Snapshots and the `.gwbk` hold secrets; everything else a run writes or prints does not | README `deploy apply`, "Where secrets can be, and where they cannot" (23-15, D-05); the canary tests `apply_canary`, `rollback_canary`, `canary_on_box_files_clean`, `canary_aborted_run_clean` |
+| Nothing is pruned | 23-CONTEXT D-08; README "Runs are never pruned" |
+| The whole flow runs under this account with these rights | `## Live gate: Windows binary apply and rollback (23-16)` below (if it has run) and `wflwvm01_apply_script_run`, `wflwvm01_ps_ops` |
+
+### Open points for the spec author
+
+- **Linux nodes are unproven.** The text says `~/ign-deploy/...` for Linux, but `commit.sh` has been run only under a local `dash`; the file modes it sets (0644 files, 0755 directories) and a staged-file move across file systems (a copy and delete, not an atomic rename) are uncaptured (FA-23-05). If the spec prefers to say nothing about Linux until it is captured, drop the Linux path in item 2.
+- **Rollback is part of §8, not only §6.** §8's "Config or tags" row says "Restore the pre-deploy collection snapshot under scan-lock, then scan". `ign deploy rollback --run <id>` is that restore, from the node's own snapshot, and §8's "Automatic rollback fires only when post-apply verification fails" is what `ign deploy apply` does (exit 6, `deploy_rolled_back`). A follow-up edit to §8 may want to name the command; it needs no new account right.
+- **The lock hold.** §6 step 4.3 describes `holdTimeout = 2x(write+scan)+1`, measured on the real transport. 23-10 measured it: one fixed hold of 176 s for every target, and a change of 1,528 or more files is refused. This is a §6 fact, not a §9 one; it is mentioned here only so the author can update both in one pass.

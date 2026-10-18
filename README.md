@@ -3214,6 +3214,12 @@ the confirmation write nothing:
    the rolling-back run's id. No `.gwbk` is taken: the restore point is the
    on-box snapshot.
 
+A rollback removes the files the run created and the directories that emptied
+below `<module>/<type>`. The `<module>/<type>` directory itself and the module
+directory above it are never removed, so an empty one can remain after rolling
+back a run that created the first resource of a type; the live rollback (23-16)
+left such directories and `deploy plan` and the REST view were as before.
+
 Runs and snapshots are never pruned, and a run whose snapshot was removed can no
 longer be rolled back: see "Runs are never pruned" under
 [`deploy apply`](#deploy-apply), which also says when `journal.json` may be
@@ -3256,6 +3262,10 @@ journal:
 
 A recovery started right after a dropped ssh connection should wait out the 176 s
 hold first (see "After an ssh drop" under [`deploy apply`](#deploy-apply)).
+Seen live (23-16): a run killed during the write still holds its scan-lock, and a
+recovery started at once is refused `scan_lock_held` (exit 6, naming the dead
+run's token) until that hold lapses; a run killed after the scan, in the A9
+window, has already released the lock and recovers at once.
 There is no Ctrl-C handler in v1.6 (A10): an interrupt leaves the lock to expire
 with its hold and, once the journal exists, a journal to recover as above.
 
