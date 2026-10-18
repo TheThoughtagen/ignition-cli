@@ -174,6 +174,77 @@ fn every_deploy_leaf_has_a_projects_route_row() {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
+/// DAPL-07, Decision A: the `deploy apply` rolled-back verdict exception is
+/// documented under `## Output contract (for agents)` in a dated `###`
+/// section that names the envelope fields, exit 6 and Decision A, and the
+/// verdict slug is NOT an exit-table row (it lives only in `data.slug`).
+#[test]
+fn rolled_back_verdict_exception_is_dated_and_documented() {
+    let body = dated_exception_body("### The `deploy apply` rolled-back verdict exception (");
+    for needle in [
+        "data.ok",
+        "data.slug",
+        "data.cause",
+        "deploy_rolled_back",
+        "exit 6",
+        "`ok: true`",
+        "Decision A",
+    ] {
+        assert!(
+            body.contains(needle),
+            "exception text must mention {needle}: {body}"
+        );
+    }
+    assert!(
+        !section("Exit codes").contains("deploy_rolled_back"),
+        "`deploy_rolled_back` is a verdict slug, never an exit-table row"
+    );
+    assert!(
+        !CoreError::DEPLOY_SLUGS.contains(&"deploy_rolled_back"),
+        "the verdict slug is not a CoreError slug"
+    );
+    // The exception heading sits under the output contract, and the README
+    // tells an agent the `deploy apply` verb's own section exists.
+    assert!(
+        README.contains("\n### `deploy apply`\n"),
+        "the README has a `### `deploy apply`` section"
+    );
+}
+
+/// The body of the dated `###` section under `## Output contract (for
+/// agents)` whose heading starts with `prefix`; asserts the heading closes
+/// with a `YYYY-MM-DD)` date.
+fn dated_exception_body(prefix: &str) -> &'static str {
+    let contract = section("Output contract (for agents)");
+    let start = contract
+        .find(prefix)
+        .unwrap_or_else(|| panic!("no `{prefix}<YYYY-MM-DD>)` heading under the output contract"));
+    let after = &contract[start + prefix.len()..];
+    // `lines()` drops a CRLF too: git for Windows checks the README out with
+    // CRLF line endings.
+    let date = after
+        .lines()
+        .next()
+        .and_then(|line| line.strip_suffix(')'))
+        .expect("the heading closes with `)`");
+    let bytes = date.as_bytes();
+    assert!(
+        bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit()),
+        "the heading date must be YYYY-MM-DD, got {date:?}"
+    );
+    let body_start = &after[date.len()..];
+    let body_end = body_start[3..]
+        .find("\n### ")
+        .map_or(body_start.len(), |i| i + 3);
+    &body_start[..body_end]
+}
+
 /// DSURF-04: the `deploy verify` verdict exception is documented under
 /// `## Output contract (for agents)` in a dated `###` section, names the
 /// envelope fields and exit 6, and the verdict slug is NOT an exit-table row
