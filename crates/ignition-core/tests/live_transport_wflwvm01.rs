@@ -3678,3 +3678,567 @@ async fn wflwvm01_ps_ops() {
     timed("wflwvm01_ps_ops total", started, ());
     eprintln!("PASS wflwvm01_ps_ops");
 }
+
+// ---- OQ5b: the batched commit, scan and restore timed (23-10, D-01, D-02) ----
+//
+// 22-14 measured the per-file sftp commit (234 to 348 s for 152 files). D-01
+// replaced it with one script call per commit and per restore; this measures
+// what the lock window costs now, at the 152-file corpus (scale 1) and the
+// 1,520-file corpus (scale 10), through the Windows `ApplyHost` the engine
+// uses. The gateway is reached through the installed `ign` binary (see
+// `GwCli`): the profile's credential is in the keyring and only that binary
+// reads it without a prompt.
+//
+// A commit moves the staged copies out of the staging directory, so a payload
+// staged once cannot be committed ten times. `prepare` runs once per batch
+// (and is timed); before every iteration the harness puts the staging
+// directory back from a copy made on the host with `robocopy`, and drops the
+// journal, the ledger and the run's snapshot, which `finalize` and
+// `discard_interrupted` do in the engine. Those steps are outside every timed
+// call and are timed on their own (`reset`).
+//
+// | var | meaning |
+// |---|---|
+// | `IGNITION_LIVE_OQ5B` | must equal `1` |
+// | `IGN_OQ5B_ITERS` | write iterations per scale (default 10) |
+// | `IGN_OQ5B_REPLACE_ITERS` | replace iterations per scale (default 5) |
+// | `IGN_OQ5B_SCALES` | comma separated scales (default `1,10`) |
+
+/// Make the run's directories ready: drop the journal, the ledger, the run's
+/// snapshot and staging, and, when `$p.src` is not empty, mirror `$p.src` into
+/// the staging directory (`robocopy`, which handles a tree of 1,520 files in
+/// one call).
+const OQ5B_RESET: &str = r#"$x=$p.x;$d=$p.deploy;foreach($f in @('\journal.json','\ledger.json')){if([IO.File]::Exists($x+$d+$f)){[IO.File]::Delete($x+$d+$f)}};$s=$x+$d+'\snapshots\'+$p.run;if([IO.Directory]::Exists($s)){[IO.Directory]::Delete($s,$true)};$g=$x+$d+'\staging\'+$p.run;if([IO.Directory]::Exists($g)){[IO.Directory]::Delete($g,$true)};$rc=0;if($p.src -ne ''){$null=& robocopy $p.src $p.dst /MIR /NFL /NDL /NJH /NJS /NP /NC /NS /R:1 /W:1 /MT:16;$rc=$LASTEXITCODE;if($rc -ge 8){throw 'the staging copy failed'}};E @{ok=1;rc=$rc}"#;
+
+/// Remove every measurement unit (`<module>/<type>/<name>-oq5-NN`) below the
+/// collection in one call.
+const OQ5B_UNITS: &str = r#"$b=$p.x+$p.path;$n=0;if([IO.Directory]::Exists($b)){foreach($m in [IO.Directory]::GetDirectories($b)){foreach($t in [IO.Directory]::GetDirectories($m)){foreach($u in [IO.Directory]::GetDirectories($t)){if([IO.Path]::GetFileName($u) -match '-oq5-\d\d$'){[IO.Directory]::Delete($u,$true);$n++}}}}};E @{ok=1;removed=$n}"#;
+
+/// Two-point linear fit of a p95 commit time against the file count:
+/// `(fixed seconds, seconds per file)`, the fixed part floored at 0.
+fn oq5b_fit(small: (usize, f64), large: (usize, f64)) -> (f64, f64) {
+    let slope = (large.1 - small.1) / (large.0 as f64 - small.0 as f64);
+    let fixed = (small.1 - small.0 as f64 * slope).max(0.0);
+    (fixed, slope)
+}
+
+struct Oq5b {
+    shell: RemoteShell,
+    host: SftpTransport,
+    gw: GwCli,
+    prod_native: String,
+    /// `<home>\ign-deploy\<gateway>\<mode>`: the `DEPLOY` root of the script.
+    deploy_native: String,
+    before_files: BTreeMap<String, String>,
+}
+
+impl Oq5b {
+    fn staging(&self, run: &str) -> String {
+        format!("{}\\staging\\{run}", self.deploy_native)
+    }
+
+    fn master(&self, run: &str) -> String {
+        format!("{}\\oq5b-master-{run}", self.deploy_native)
+    }
+
+    /// Reset the run's on-box state; with `sync`, put `src` into the staging
+    /// directory. Returns the seconds it took.
+    async fn reset(&self, run: &str, src: &str, dst: &str) -> Res<f64> {
+        let t = Instant::now();
+        let value = self
+            .shell
+            .exec_powershell(&script(
+                "oq5b_reset",
+                OQ5B_RESET,
+                serde_json::json!({
+                    "x": LONG_PATH_PREFIX, "deploy": self.deploy_native, "run": run,
+                    "src": src, "dst": dst,
+                }),
+            ))
+            .await
+            .map_err(err_s)?;
+        if value["ok"] != 1 {
+            return Err(format!("reset of {run}: {value}"));
+        }
+        Ok(t.elapsed().as_secs_f64())
+    }
+
+    async fn files(&self) -> BTreeMap<String, String> {
+        hashes_below(&self.shell, &self.prod_native).await.0
+    }
+
+    async fn scan(&self) -> Res<(f64, i64)> {
+        self.gw.scan().await
+    }
+}
+
+fn oq5b_check(what: &str, report: &ignition_core::deploy::apply::host::BatchReport) -> Res<()> {
+    if report.failure.is_some() || report.stale {
+        return Err(format!(
+            "{what} did not run clean: stale {} failure {:?}",
+            report.stale, report.failure
+        ));
+    }
+    Ok(())
+}
+
+/// `n` iterations of (the caller has made the master copy of the staging
+/// directory `prepare` built): put the staging back, time `commit`, time its scan, time
+/// `restore`, time its scan, and check the collection is what `after_restore`
+/// says. `prefix` names the series.
+#[allow(clippy::too_many_arguments)]
+async fn oq5b_cycles(
+    c: &Oq5b,
+    rec: &mut Recorder,
+    prefix: &str,
+    n: usize,
+    run: &str,
+    spec: &BatchSpec,
+    prepared: &ignition_core::deploy::apply::host::Prepared,
+    after_restore: &BTreeMap<String, String>,
+    count_after_commit: Option<usize>,
+) -> Res<()> {
+    let (master, staging) = (c.master(run), c.staging(run));
+    for i in 1..=n {
+        let reset_s = c.reset(run, &master, &staging).await?;
+        rec.record(&format!("{prefix}reset"), i, reset_s, serde_json::json!({}));
+
+        let t = Instant::now();
+        let report = c.host.commit(prepared).await.map_err(err_s)?;
+        let commit_s = t.elapsed().as_secs_f64();
+        rec.record(
+            &format!("{prefix}commit"),
+            i,
+            commit_s,
+            serde_json::json!({"moved": report.moved.len(), "deleted": report.deleted.len()}),
+        );
+        oq5b_check("commit", &report)?;
+        if report.moved.len() != spec.writes.len() || report.deleted.len() != spec.deletes.len() {
+            return Err(format!(
+                "commit moved {} of {} and deleted {} of {}",
+                report.moved.len(),
+                spec.writes.len(),
+                report.deleted.len(),
+                spec.deletes.len()
+            ));
+        }
+        if let (1, Some(expected)) = (i, count_after_commit) {
+            let now = c.files().await.len();
+            if now != expected {
+                return Err(format!(
+                    "production holds {now} files after the commit, expected {expected}"
+                ));
+            }
+        }
+        let (scan_s, scan_ms) = c.scan().await?;
+        rec.record(&format!("{prefix}scan"), i, scan_s, serde_json::json!({}));
+        rec.record(
+            &format!("{prefix}scan_gateway_ms"),
+            i,
+            scan_ms as f64,
+            serde_json::json!({}),
+        );
+
+        let t = Instant::now();
+        let report = c.host.restore(&spec.record).await.map_err(err_s)?;
+        let restore_s = t.elapsed().as_secs_f64();
+        rec.record(
+            &format!("{prefix}restore"),
+            i,
+            restore_s,
+            serde_json::json!({"moved": report.moved.len(), "deleted": report.deleted.len()}),
+        );
+        oq5b_check("restore", &report)?;
+        let (scan_s, scan_ms) = c.scan().await?;
+        rec.record(
+            &format!("{prefix}restore_scan"),
+            i,
+            scan_s,
+            serde_json::json!({}),
+        );
+        rec.record(
+            &format!("{prefix}restore_scan_gateway_ms"),
+            i,
+            scan_ms as f64,
+            serde_json::json!({}),
+        );
+        let now = c.files().await;
+        if &now != after_restore {
+            return Err(format!(
+                "after the restore production holds {} files, expected {}",
+                now.len(),
+                after_restore.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One scale: write cycles, replace cycles, one delete-set commit.
+async fn oq5b_scale(
+    c: &Oq5b,
+    scale: usize,
+    iters: usize,
+    replace_iters: usize,
+) -> Res<serde_json::Value> {
+    let payload = corpus_payload(scale);
+    let mut rec = Recorder::new(&format!("b-scale{scale}"));
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"label": rec.label, "payload": {
+            "source": payload.source, "files": payload.files, "bytes": payload.bytes,
+            "units": payload.units, "types": payload.types.len(),
+        }, "iters": iters, "replace_iters": replace_iters, "utc": utc_now()})
+    );
+    let paths: Vec<String> = payload
+        .tree
+        .files
+        .keys()
+        .map(|p| p.as_str().to_string())
+        .collect();
+
+    // ---- write: new files, with a ledger, as an apply of a new tree
+    let run_w = format!("oq5b-s{scale}-w");
+    let ledger = win_ledger(
+        &run_w,
+        &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let writes: Vec<(&str, &[u8])> = payload
+        .tree
+        .files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let (spec_w, tree_w) = win_batch(&run_w, &writes, &[], Some(&ledger), &c.before_files, None);
+    c.reset(&run_w, "", "").await?;
+    let t = Instant::now();
+    let prepared_w = c.host.prepare(&spec_w, &tree_w).await.map_err(err_s)?;
+    rec.record(
+        "prepare_write",
+        1,
+        t.elapsed().as_secs_f64(),
+        serde_json::json!({"files": payload.files}),
+    );
+    let t = Instant::now();
+    c.shell
+        .exec_powershell(&script(
+            "oq5b_master",
+            OQ5B_RESET_MASTER,
+            serde_json::json!({"src": c.staging(&run_w), "dst": c.master(&run_w)}),
+        ))
+        .await
+        .map_err(err_s)?;
+    rec.record(
+        "master_copy",
+        1,
+        t.elapsed().as_secs_f64(),
+        serde_json::json!({}),
+    );
+    oq5b_cycles(
+        c,
+        &mut rec,
+        "",
+        iters,
+        &run_w,
+        &spec_w,
+        &prepared_w,
+        &c.before_files,
+        Some(c.before_files.len() + payload.files),
+    )
+    .await?;
+
+    // ---- install the payload once (untimed), so replace and delete have
+    // pre-images
+    c.reset(&run_w, &c.master(&run_w), &c.staging(&run_w))
+        .await?;
+    let report = c.host.commit(&prepared_w).await.map_err(err_s)?;
+    oq5b_check("install commit", &report)?;
+    let (scan_s, _) = c.scan().await?;
+    rec.record("install_scan", 1, scan_s, serde_json::json!({}));
+    c.reset(&run_w, "", "").await?;
+    let live_v1 = c.files().await;
+    if live_v1.len() != c.before_files.len() + payload.files {
+        return Err(format!(
+            "the install left {} files, expected {}",
+            live_v1.len(),
+            c.before_files.len() + payload.files
+        ));
+    }
+
+    // ---- replace: every file replaced by a new version, the costlier path
+    // (every pre-image is copied)
+    if replace_iters > 0 {
+        let run_r = format!("oq5b-s{scale}-r");
+        let v2: Vec<(String, Vec<u8>)> = payload
+            .tree
+            .files
+            .iter()
+            .map(|(p, b)| {
+                let mut b = b.clone();
+                b.push(b'\n');
+                (p.as_str().to_string(), b)
+            })
+            .collect();
+        let writes_r: Vec<(&str, &[u8])> =
+            v2.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        let (spec_r, tree_r) = win_batch(&run_r, &writes_r, &[], None, &live_v1, None);
+        c.reset(&run_r, "", "").await?;
+        let t = Instant::now();
+        let prepared_r = c.host.prepare(&spec_r, &tree_r).await.map_err(err_s)?;
+        rec.record(
+            "prepare_replace",
+            1,
+            t.elapsed().as_secs_f64(),
+            serde_json::json!({"files": payload.files}),
+        );
+        c.shell
+            .exec_powershell(&script(
+                "oq5b_master",
+                OQ5B_RESET_MASTER,
+                serde_json::json!({"src": c.staging(&run_r), "dst": c.master(&run_r)}),
+            ))
+            .await
+            .map_err(err_s)?;
+        oq5b_cycles(
+            c,
+            &mut rec,
+            "replace_",
+            replace_iters,
+            &run_r,
+            &spec_r,
+            &prepared_r,
+            &live_v1,
+            None,
+        )
+        .await?;
+    }
+
+    // ---- delete: the whole payload removed by one commit (this also puts
+    // production back)
+    let run_d = format!("oq5b-s{scale}-d");
+    let deletes: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let (spec_d, tree_d) = win_batch(&run_d, &[], &deletes, None, &live_v1, None);
+    c.reset(&run_d, "", "").await?;
+    let t = Instant::now();
+    let prepared_d = c.host.prepare(&spec_d, &tree_d).await.map_err(err_s)?;
+    rec.record(
+        "prepare_delete",
+        1,
+        t.elapsed().as_secs_f64(),
+        serde_json::json!({"files": payload.files}),
+    );
+    let t = Instant::now();
+    let report = c.host.commit(&prepared_d).await.map_err(err_s)?;
+    let delete_s = t.elapsed().as_secs_f64();
+    rec.record(
+        "commit_delete",
+        1,
+        delete_s,
+        serde_json::json!({"deleted": report.deleted.len(), "removed_dirs": report.removed_dirs.len()}),
+    );
+    oq5b_check("delete commit", &report)?;
+    if report.deleted.len() != payload.files {
+        return Err(format!(
+            "the delete commit removed {} of {} files",
+            report.deleted.len(),
+            payload.files
+        ));
+    }
+    let (scan_s, scan_ms) = c.scan().await?;
+    rec.record("scan_after_delete", 1, scan_s, serde_json::json!({}));
+    rec.record(
+        "scan_after_delete_gateway_ms",
+        1,
+        scan_ms as f64,
+        serde_json::json!({}),
+    );
+    let now = c.files().await;
+    if now != c.before_files {
+        return Err(format!(
+            "after the delete commit production holds {} files, expected {}",
+            now.len(),
+            c.before_files.len()
+        ));
+    }
+    Ok(rec.summary(&payload))
+}
+
+/// Mirror `$p.src` into `$p.dst` (robocopy), once.
+const OQ5B_RESET_MASTER: &str = r#"$null=& robocopy $p.src $p.dst /MIR /NFL /NDL /NJH /NJS /NP /NC /NS /R:1 /W:1 /MT:16;$rc=$LASTEXITCODE;if($rc -ge 8){throw 'the master copy failed'};E @{ok=1;rc=$rc}"#;
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WFLWVM01=1 and IGNITION_LIVE_OQ5B=1; writes the real production collection and restores it"]
+async fn oq5b_timings() {
+    let Some(live) = live() else { return };
+    if std::env::var("IGNITION_LIVE_OQ5B").as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_OQ5B is not 1");
+        return;
+    }
+    let num = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a number"))
+            })
+            .unwrap_or(default)
+    };
+    let iters = num("IGN_OQ5B_ITERS", 10);
+    let replace_iters = num("IGN_OQ5B_REPLACE_ITERS", 5);
+    let scales: Vec<usize> = std::env::var("IGN_OQ5B_SCALES")
+        .unwrap_or_else(|_| "1,10".to_string())
+        .split(',')
+        .map(|s| s.trim().parse().expect("a scale is a number"))
+        .collect();
+    let started = Instant::now();
+    let profile = require_env("IGN_WFLWVM01_PROFILE");
+    let repo = repo(&live, "oq5b", &live.data_dir, Some(3600));
+    let shell = shell_of(repo.path(), "oq5b");
+    let home = home_sftp(&shell).await;
+    let home_native = native(&home);
+    let prod_native = format!("{}\\config\\resources\\{MODE}", live.data_dir);
+    let staging_root_native = format!("{home_native}\\ign-deploy\\{GATEWAY}");
+    let deploy_native = format!("{staging_root_native}\\{MODE}");
+    let (_, ssh, _) = ssh_of(repo.path(), "oq5b");
+    let host = SftpTransport::new_windows(
+        shell_of(repo.path(), "oq5b"),
+        windows_sftp_root(&ssh.data_dir).expect("data dir"),
+        "nodes.master",
+    )
+    .with_apply(GATEWAY, MODE)
+    .expect("apply half");
+
+    // leftovers of a cut-off run
+    remove_tree(&shell, &staging_root_native).await;
+
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"oq5b": "header", "utc": utc_now(), "host": live.host,
+        "iters": iters, "replace_iters": replace_iters, "scales": scales})
+    );
+    let defender = shell
+        .exec_powershell(&script("defender", DEFENDER, serde_json::Value::Null))
+        .await
+        .expect("defender");
+    println!("OQ5 {}", serde_json::json!({"defender_as_found": defender}));
+    let gw = GwCli { profile };
+    let (before_files, before_dirs) = hashes_below(&shell, &prod_native).await;
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"production_before": {
+            "files": before_files.keys().collect::<Vec<_>>(), "dirs": before_dirs}})
+    );
+    assert_eq!(
+        before_files.keys().collect::<Vec<_>>(),
+        ["config-mode.json"],
+        "production must hold only config-mode.json before the run"
+    );
+    let first_scan = gw.scan().await.expect("a first scan");
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"scan_before_anything": {"wall_s": first_scan.0, "gateway_ms": first_scan.1}})
+    );
+
+    let ctx = Arc::new(Oq5b {
+        shell,
+        host,
+        gw,
+        prod_native: prod_native.clone(),
+        deploy_native: deploy_native.clone(),
+        before_files: before_files.clone(),
+    });
+    // the body runs as its own task so a panic in it still leaves the restore
+    // below to run
+    let outcome = match tokio::spawn({
+        let ctx = ctx.clone();
+        let scales = scales.clone();
+        async move {
+            let mut summaries = Vec::new();
+            for scale in scales {
+                let summary = oq5b_scale(&ctx, scale, iters, replace_iters).await?;
+                println!("OQ5 {}", serde_json::json!({"summary": summary}));
+                summaries.push(summary);
+                // between scales: the units and the run's directories go
+                remove_units(&ctx).await;
+                remove_tree(&ctx.shell, &staging_root_native_of(&ctx)).await;
+            }
+            Ok::<_, String>(summaries)
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(format!("the OQ5b body panicked: {e}")),
+    };
+
+    // whatever happened above: production goes back to its pre-run listing
+    remove_units(&ctx).await;
+    put_back(&ctx.shell, &prod_native, &before_files, &before_dirs).await;
+    let (after_files, after_dirs) = hashes_below(&ctx.shell, &prod_native).await;
+    let equal = after_files == before_files && after_dirs == before_dirs;
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"restore_assertion": {
+            "production_listing_equals_pre_run": equal,
+            "files_before": before_files.len(), "files_after": after_files.len(),
+            "dirs_before": before_dirs.len(), "dirs_after": after_dirs.len()}})
+    );
+    let closing = ctx.gw.scan().await.expect("the closing scan");
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"closing_scan": {"wall_s": closing.0, "gateway_ms": closing.1}})
+    );
+    let gone = remove_tree(&ctx.shell, &staging_root_native).await;
+    ctx.shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    println!(
+        "OQ5 {}",
+        serde_json::json!({"cleanup": {"deploy_dir_gone": gone}, "total_secs": started.elapsed().as_secs_f64()})
+    );
+    outcome.expect("the OQ5b body failed; production was put back");
+    assert!(
+        equal,
+        "the production collection differs from its pre-run listing"
+    );
+    assert!(gone);
+    eprintln!("PASS oq5b_timings");
+}
+
+fn staging_root_native_of(c: &Oq5b) -> String {
+    c.deploy_native
+        .rsplit_once('\\')
+        .map(|(root, _)| root.to_string())
+        .expect("the deploy directory has a parent")
+}
+
+async fn remove_units(c: &Oq5b) {
+    c.shell
+        .exec_powershell(&script(
+            "oq5b_units",
+            OQ5B_UNITS,
+            path_params(&c.prod_native),
+        ))
+        .await
+        .expect("remove the measurement units");
+}
+
+#[test]
+fn oq5b_fit_is_two_point_linear() {
+    // 152 files in 7 s, 1,520 files in 70 s: 63 s over 1,368 files
+    let (fixed, slope) = oq5b_fit((152, 7.0), (1520, 70.0));
+    assert!((slope - 63.0 / 1368.0).abs() < 1e-12);
+    assert!((fixed - (7.0 - 152.0 * 63.0 / 1368.0)).abs() < 1e-12);
+    // the line goes through both points
+    assert!((fixed + 152.0 * slope - 7.0).abs() < 1e-9);
+    assert!((fixed + 1520.0 * slope - 70.0).abs() < 1e-9);
+    // a negative intercept is floored at 0
+    let (fixed, slope) = oq5b_fit((152, 1.0), (1520, 100.0));
+    assert_eq!(fixed, 0.0);
+    assert!(slope > 0.0);
+}

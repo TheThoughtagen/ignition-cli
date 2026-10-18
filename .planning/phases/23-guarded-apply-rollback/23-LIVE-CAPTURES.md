@@ -2166,6 +2166,286 @@ sftp> pwd
 Remote working directory: /C:/Users/svc-ignition-deploy
 ~~~
 
+## OQ5b (batched commit, 23-10)
+
+The lock window of the batched commit (D-01), measured through the Windows `ApplyHost` the engine uses (`SftpTransport::new_windows(..).with_apply(..)`: `prepare`, `commit`, `restore`, all through `commit.ps1`), on the Windows capture host `ign-win-836` (computer `ignwin836`, 52.154.75.231, Windows Server 2022, Ignition 8.3.6, eastus, Standard_D2s_v4), as `svc-ignition-deploy` with the pinned host key, from the macOS runner over the public internet. Test: `oq5b_timings` of `crates/ignition-core/tests/live_transport_wflwvm01.rs` (`IGNITION_LIVE_OQ5B=1`).
+
+| Field | Value |
+| --- | --- |
+| Command | `IGNITION_LIVE_WFLWVM01=1 IGNITION_LIVE_OQ5B=1 IGN_OQ5B_SCALES=<1 or 10> cargo test -p ignition-core --test live_transport_wflwvm01 oq5b_timings -- --ignored --nocapture` (`IGN_OQ5B_ITERS` 10 and `IGN_OQ5B_REPLACE_ITERS` 5, the defaults); one invocation per scale |
+| Scale 1 run | 2026-10-17T23:07:28Z, 767.6 s: the 152-file corpus (70 named units, 91,833 bytes) |
+| Scale 10 run | 2026-10-17T23:20:54Z, 3147.8 s: the 1,520-file corpus (700 named units, 918,330 bytes) |
+| Smoke run (not pooled) | 2026-10-17T23:00:40Z, scale 1, 2 write iterations and 1 replace iteration, 391 s; it found nothing to change |
+| Gateway | `ign --profile azure-win`, Ignition 8.3.6, trial `AllInDemo` live throughout (7,023 s left at 22:56Z; 2,412 s left after the scale 10 run). The reset `ign --profile azure-win --json api call --method POST --path /data/api/v1/trial` was tried once at 2026-10-17T23:20:36Z and answered `auth_rejected` (HTTP 403); the trial was live (5,596 s left) so nothing depended on it. No reset took effect during this plan |
+| Defender | not readable by the account (`Cannot connect to CIM server. Access denied`, both runs); the host record in `## Windows capture host (23-01)` says real-time protection on, no exclusions, and that is the state of every number below |
+| Production before and after | `config-mode.json` only, no directories; both runs end with the listing equal to the pre-run listing (`production_listing_equals_pre_run: true`), the deploy directory in the account home gone, and a closing scan of 0.79 s and 0.64 s |
+| Failures | none; every commit and restore reported `failure: None`, `stale: false` with the expected moved and deleted counts; the `ign-deploy` staging and snapshots of the measurement runs are removed (measurement artefacts, not deploys) |
+
+What each series is (all seconds, wall clock at the runner):
+
+- `commit`: the one `ApplyHost::commit` call for a batch of NEW files plus the ledger (152 or 1,520 writes), ssh connect included. The staged copies are put back from a host-side `robocopy` copy before every iteration (`reset`, outside the timing), because a commit moves them out of staging; `prepare_*` is the one sftp upload of the batch (outside the lock).
+- `scan`, `restore_scan`: a config scan requested and waited on to completion through `ign api call` (process start, keyring read and a 200 ms poll are included, so the wall time is longer than the engine's own REST client would see); `*_gateway_ms` is the gateway's `lastScanDuration`.
+- `restore`: the one `ApplyHost::restore` call that undoes the commit (journal read, work list upload, script).
+- `replace_*`: the same with every file REPLACED (a second version of the payload over the installed one), the costlier path because every pre-image is copied into the snapshot first. Not asked for by the plan; added because an apply of a changed tree replaces files, and the hold must cover that path.
+- `commit_delete`: one commit that deletes the whole installed payload (and the directories it empties); one sample per scale as the plan says.
+- Not under the lock in the engine (checked in `deploy/apply/mod.rs`): `prepare`, the post-write `fingerprint`, `finalize` and `fetch_snapshot`. The lock is taken after `prepare`, held across `commit`, the `lock.check` and the scan (the scan releases it, D12), and the fingerprint and finalize come after the scan and after `deploy_verify`.
+
+### scale 1 (152 files) raw output
+
+~~~
+OQ5 {"host":"52.154.75.231","iters":10,"oq5b":"header","replace_iters":5,"scales":[1],"utc":"2026-10-17T23:07:32Z"}
+OQ5 {"defender_as_found":{"err":"Cannot connect to CIM server. Access denied ","ok":1}}
+OQ5 {"production_before":{"dirs":[],"files":["config-mode.json"]}}
+OQ5 {"scan_before_anything":{"gateway_ms":390,"wall_s":0.790893542}}
+OQ5 {"iters":10,"label":"b-scale1","payload":{"bytes":91833,"files":152,"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","types":27,"units":70},"replace_iters":5,"utc":"2026-10-17T23:07:47Z"}
+OQ5 {"extra":{"files":152},"iter":1,"label":"b-scale1","phase":"prepare_write","value":81.537}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"master_copy","value":1.702}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"reset","value":1.833}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":1,"label":"b-scale1","phase":"commit","value":8.158}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"scan","value":0.745}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"scan_gateway_ms","value":554.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":1,"label":"b-scale1","phase":"restore","value":15.364}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"restore_scan","value":0.845}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":429.0}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"reset","value":1.755}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":2,"label":"b-scale1","phase":"commit","value":8.336}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"scan","value":0.812}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"scan_gateway_ms","value":573.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":2,"label":"b-scale1","phase":"restore","value":15.759}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"restore_scan","value":0.832}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":453.0}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"reset","value":1.713}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":3,"label":"b-scale1","phase":"commit","value":8.359}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"scan","value":1.104}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"scan_gateway_ms","value":592.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":3,"label":"b-scale1","phase":"restore","value":15.283}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"restore_scan","value":0.794}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":439.0}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"reset","value":1.856}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":4,"label":"b-scale1","phase":"commit","value":8.219}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"scan","value":1.221}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"scan_gateway_ms","value":664.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":4,"label":"b-scale1","phase":"restore","value":15.463}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"restore_scan","value":0.685}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":499.0}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"reset","value":1.735}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":5,"label":"b-scale1","phase":"commit","value":8.311}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"scan","value":0.79}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"scan_gateway_ms","value":553.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":5,"label":"b-scale1","phase":"restore","value":15.103}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"restore_scan","value":0.704}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":443.0}
+OQ5 {"extra":{},"iter":6,"label":"b-scale1","phase":"reset","value":1.864}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":6,"label":"b-scale1","phase":"commit","value":8.263}
+OQ5 {"extra":{},"iter":6,"label":"b-scale1","phase":"scan","value":0.758}
+OQ5 {"extra":{},"iter":6,"label":"b-scale1","phase":"scan_gateway_ms","value":541.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":6,"label":"b-scale1","phase":"restore","value":15.555}
+OQ5 {"extra":{},"iter":6,"label":"b-scale1","phase":"restore_scan","value":0.822}
+OQ5 {"extra":{},"iter":6,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":490.0}
+OQ5 {"extra":{},"iter":7,"label":"b-scale1","phase":"reset","value":1.674}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":7,"label":"b-scale1","phase":"commit","value":8.258}
+OQ5 {"extra":{},"iter":7,"label":"b-scale1","phase":"scan","value":0.837}
+OQ5 {"extra":{},"iter":7,"label":"b-scale1","phase":"scan_gateway_ms","value":556.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":7,"label":"b-scale1","phase":"restore","value":15.267}
+OQ5 {"extra":{},"iter":7,"label":"b-scale1","phase":"restore_scan","value":0.807}
+OQ5 {"extra":{},"iter":7,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":416.0}
+OQ5 {"extra":{},"iter":8,"label":"b-scale1","phase":"reset","value":1.921}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":8,"label":"b-scale1","phase":"commit","value":8.374}
+OQ5 {"extra":{},"iter":8,"label":"b-scale1","phase":"scan","value":1.064}
+OQ5 {"extra":{},"iter":8,"label":"b-scale1","phase":"scan_gateway_ms","value":573.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":8,"label":"b-scale1","phase":"restore","value":15.723}
+OQ5 {"extra":{},"iter":8,"label":"b-scale1","phase":"restore_scan","value":0.812}
+OQ5 {"extra":{},"iter":8,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":424.0}
+OQ5 {"extra":{},"iter":9,"label":"b-scale1","phase":"reset","value":1.888}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":9,"label":"b-scale1","phase":"commit","value":8.266}
+OQ5 {"extra":{},"iter":9,"label":"b-scale1","phase":"scan","value":1.047}
+OQ5 {"extra":{},"iter":9,"label":"b-scale1","phase":"scan_gateway_ms","value":572.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":9,"label":"b-scale1","phase":"restore","value":16.006}
+OQ5 {"extra":{},"iter":9,"label":"b-scale1","phase":"restore_scan","value":0.704}
+OQ5 {"extra":{},"iter":9,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":439.0}
+OQ5 {"extra":{},"iter":10,"label":"b-scale1","phase":"reset","value":1.923}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":10,"label":"b-scale1","phase":"commit","value":8.731}
+OQ5 {"extra":{},"iter":10,"label":"b-scale1","phase":"scan","value":1.097}
+OQ5 {"extra":{},"iter":10,"label":"b-scale1","phase":"scan_gateway_ms","value":705.0}
+OQ5 {"extra":{"deleted":153,"moved":0},"iter":10,"label":"b-scale1","phase":"restore","value":14.849}
+OQ5 {"extra":{},"iter":10,"label":"b-scale1","phase":"restore_scan","value":0.671}
+OQ5 {"extra":{},"iter":10,"label":"b-scale1","phase":"restore_scan_gateway_ms","value":438.0}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"install_scan","value":0.976}
+OQ5 {"extra":{"files":152},"iter":1,"label":"b-scale1","phase":"prepare_replace","value":79.436}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"replace_reset","value":1.753}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":1,"label":"b-scale1","phase":"replace_commit","value":10.065}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"replace_scan","value":0.832}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"replace_scan_gateway_ms","value":651.0}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":1,"label":"b-scale1","phase":"replace_restore","value":20.064}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"replace_restore_scan","value":1.185}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"replace_restore_scan_gateway_ms","value":590.0}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"replace_reset","value":1.837}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":2,"label":"b-scale1","phase":"replace_commit","value":10.123}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"replace_scan","value":0.789}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"replace_scan_gateway_ms","value":544.0}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":2,"label":"b-scale1","phase":"replace_restore","value":18.906}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"replace_restore_scan","value":0.755}
+OQ5 {"extra":{},"iter":2,"label":"b-scale1","phase":"replace_restore_scan_gateway_ms","value":546.0}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"replace_reset","value":1.875}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":3,"label":"b-scale1","phase":"replace_commit","value":10.045}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"replace_scan","value":0.929}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"replace_scan_gateway_ms","value":544.0}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":3,"label":"b-scale1","phase":"replace_restore","value":19.216}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"replace_restore_scan","value":1.073}
+OQ5 {"extra":{},"iter":3,"label":"b-scale1","phase":"replace_restore_scan_gateway_ms","value":551.0}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"replace_reset","value":1.788}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":4,"label":"b-scale1","phase":"replace_commit","value":9.879}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"replace_scan","value":1.158}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"replace_scan_gateway_ms","value":569.0}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":4,"label":"b-scale1","phase":"replace_restore","value":18.591}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"replace_restore_scan","value":0.727}
+OQ5 {"extra":{},"iter":4,"label":"b-scale1","phase":"replace_restore_scan_gateway_ms","value":562.0}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"replace_reset","value":1.691}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":5,"label":"b-scale1","phase":"replace_commit","value":9.802}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"replace_scan","value":0.778}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"replace_scan_gateway_ms","value":559.0}
+OQ5 {"extra":{"deleted":0,"moved":152},"iter":5,"label":"b-scale1","phase":"replace_restore","value":21.026}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"replace_restore_scan","value":0.914}
+OQ5 {"extra":{},"iter":5,"label":"b-scale1","phase":"replace_restore_scan_gateway_ms","value":572.0}
+OQ5 {"extra":{"files":152},"iter":1,"label":"b-scale1","phase":"prepare_delete","value":21.218}
+OQ5 {"extra":{"deleted":152,"removed_dirs":70},"iter":1,"label":"b-scale1","phase":"commit_delete","value":6.13}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"scan_after_delete","value":0.679}
+OQ5 {"extra":{},"iter":1,"label":"b-scale1","phase":"scan_after_delete_gateway_ms","value":447.0}
+OQ5 {"summary":{"bytes":91833,"files":152,"label":"b-scale1","percentile":"nearest rank","phases":{"commit":{"max":8.730658125,"min":8.157653875,"n":10,"p50":8.266489791,"p95":8.730658125},"commit_delete":{"max":6.1295775,"min":6.1295775,"n":1,"p50":6.1295775,"p95":6.1295775},"install_scan":{"max":0.976113208,"min":0.976113208,"n":1,"p50":0.976113208,"p95":0.976113208},"master_copy":{"max":1.702039875,"min":1.702039875,"n":1,"p50":1.702039875,"p95":1.702039875},"prepare_delete":{"max":21.217672834,"min":21.217672834,"n":1,"p50":21.217672834,"p95":21.217672834},"prepare_replace":{"max":79.435769916,"min":79.435769916,"n":1,"p50":79.435769916,"p95":79.435769916},"prepare_write":{"max":81.536957791,"min":81.536957791,"n":1,"p50":81.536957791,"p95":81.536957791},"replace_commit":{"max":10.123231709,"min":9.801627667,"n":5,"p50":10.044742083,"p95":10.123231709},"replace_reset":{"max":1.874855083,"min":1.690589917,"n":5,"p50":1.788394,"p95":1.874855083},"replace_restore":{"max":21.026326958,"min":18.591281666,"n":5,"p50":19.215784,"p95":21.026326958},"replace_restore_scan":{"max":1.184980083,"min":0.726859334,"n":5,"p50":0.914096125,"p95":1.184980083},"replace_restore_scan_gateway_ms":{"max":590.0,"min":546.0,"n":5,"p50":562.0,"p95":590.0},"replace_scan":{"max":1.157903959,"min":0.778244125,"n":5,"p50":0.831806375,"p95":1.157903959},"replace_scan_gateway_ms":{"max":651.0,"min":544.0,"n":5,"p50":559.0,"p95":651.0},"reset":{"max":1.922878709,"min":1.6744531249999999,"n":10,"p50":1.8326245829999999,"p95":1.922878709},"restore":{"max":16.00593125,"min":14.848553208,"n":10,"p50":15.363554333,"p95":16.00593125},"restore_scan":{"max":0.844810417,"min":0.671075917,"n":10,"p50":0.794310959,"p95":0.844810417},"restore_scan_gateway_ms":{"max":499.0,"min":416.0,"n":10,"p50":439.0,"p95":499.0},"scan":{"max":1.220650209,"min":0.745441541,"n":10,"p50":0.837305209,"p95":1.220650209},"scan_after_delete":{"max":0.678961792,"min":0.678961792,"n":1,"p50":0.678961792,"p95":0.678961792},"scan_after_delete_gateway_ms":{"max":447.0,"min":447.0,"n":1,"p50":447.0,"p95":447.0},"scan_gateway_ms":{"max":705.0,"min":541.0,"n":10,"p50":572.0,"p95":705.0}},"source":"sanitized corpus (183 .json, 195 files) x 1, named units only","unit":"seconds unless the phase name ends in _ms","units":70}}
+OQ5 {"restore_assertion":{"dirs_after":0,"dirs_before":0,"files_after":1,"files_before":1,"production_listing_equals_pre_run":true}}
+OQ5 {"closing_scan":{"gateway_ms":433,"wall_s":0.788610083}}
+OQ5 {"cleanup":{"deploy_dir_gone":true},"total_secs":767.614461375}
+PASS oq5b_timings
+~~~
+
+### scale 10 (1,520 files) raw output
+
+~~~
+OQ5 {"host":"52.154.75.231","iters":10,"oq5b":"header","replace_iters":5,"scales":[10],"utc":"2026-10-17T23:20:58Z"}
+OQ5 {"defender_as_found":{"err":"Cannot connect to CIM server. Access denied ","ok":1}}
+OQ5 {"production_before":{"dirs":[],"files":["config-mode.json"]}}
+OQ5 {"scan_before_anything":{"gateway_ms":438,"wall_s":0.77563975}}
+OQ5 {"iters":10,"label":"b-scale10","payload":{"bytes":918330,"files":1520,"source":"sanitized corpus (183 .json, 195 files) x 10, named units only","types":27,"units":700},"replace_iters":5,"utc":"2026-10-17T23:21:13Z"}
+OQ5 {"extra":{"files":1520},"iter":1,"label":"b-scale10","phase":"prepare_write","value":553.482}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"master_copy","value":3.343}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"reset","value":3.654}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":1,"label":"b-scale10","phase":"commit","value":56.367}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"scan","value":1.106}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"scan_gateway_ms","value":789.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":1,"label":"b-scale10","phase":"restore","value":27.054}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"restore_scan","value":1.096}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":570.0}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"reset","value":5.57}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":2,"label":"b-scale10","phase":"commit","value":59.6}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"scan","value":1.567}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"scan_gateway_ms","value":817.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":2,"label":"b-scale10","phase":"restore","value":28.937}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"restore_scan","value":0.86}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":583.0}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"reset","value":5.597}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":3,"label":"b-scale10","phase":"commit","value":60.185}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"scan","value":1.055}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"scan_gateway_ms","value":818.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":3,"label":"b-scale10","phase":"restore","value":27.711}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"restore_scan","value":0.854}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":567.0}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"reset","value":5.817}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":4,"label":"b-scale10","phase":"commit","value":61.772}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"scan","value":1.205}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"scan_gateway_ms","value":846.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":4,"label":"b-scale10","phase":"restore","value":26.487}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"restore_scan","value":0.803}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":567.0}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"reset","value":6.157}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":5,"label":"b-scale10","phase":"commit","value":61.487}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"scan","value":1.106}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"scan_gateway_ms","value":832.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":5,"label":"b-scale10","phase":"restore","value":27.134}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"restore_scan","value":0.964}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":587.0}
+OQ5 {"extra":{},"iter":6,"label":"b-scale10","phase":"reset","value":6.838}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":6,"label":"b-scale10","phase":"commit","value":59.349}
+OQ5 {"extra":{},"iter":6,"label":"b-scale10","phase":"scan","value":1.079}
+OQ5 {"extra":{},"iter":6,"label":"b-scale10","phase":"scan_gateway_ms","value":814.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":6,"label":"b-scale10","phase":"restore","value":25.905}
+OQ5 {"extra":{},"iter":6,"label":"b-scale10","phase":"restore_scan","value":0.749}
+OQ5 {"extra":{},"iter":6,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":561.0}
+OQ5 {"extra":{},"iter":7,"label":"b-scale10","phase":"reset","value":5.246}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":7,"label":"b-scale10","phase":"commit","value":61.157}
+OQ5 {"extra":{},"iter":7,"label":"b-scale10","phase":"scan","value":1.171}
+OQ5 {"extra":{},"iter":7,"label":"b-scale10","phase":"scan_gateway_ms","value":844.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":7,"label":"b-scale10","phase":"restore","value":28.67}
+OQ5 {"extra":{},"iter":7,"label":"b-scale10","phase":"restore_scan","value":1.213}
+OQ5 {"extra":{},"iter":7,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":575.0}
+OQ5 {"extra":{},"iter":8,"label":"b-scale10","phase":"reset","value":5.44}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":8,"label":"b-scale10","phase":"commit","value":60.565}
+OQ5 {"extra":{},"iter":8,"label":"b-scale10","phase":"scan","value":1.113}
+OQ5 {"extra":{},"iter":8,"label":"b-scale10","phase":"scan_gateway_ms","value":792.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":8,"label":"b-scale10","phase":"restore","value":28.591}
+OQ5 {"extra":{},"iter":8,"label":"b-scale10","phase":"restore_scan","value":1.033}
+OQ5 {"extra":{},"iter":8,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":628.0}
+OQ5 {"extra":{},"iter":9,"label":"b-scale10","phase":"reset","value":5.403}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":9,"label":"b-scale10","phase":"commit","value":60.291}
+OQ5 {"extra":{},"iter":9,"label":"b-scale10","phase":"scan","value":1.146}
+OQ5 {"extra":{},"iter":9,"label":"b-scale10","phase":"scan_gateway_ms","value":783.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":9,"label":"b-scale10","phase":"restore","value":27.134}
+OQ5 {"extra":{},"iter":9,"label":"b-scale10","phase":"restore_scan","value":0.826}
+OQ5 {"extra":{},"iter":9,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":572.0}
+OQ5 {"extra":{},"iter":10,"label":"b-scale10","phase":"reset","value":6.267}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":10,"label":"b-scale10","phase":"commit","value":62.04}
+OQ5 {"extra":{},"iter":10,"label":"b-scale10","phase":"scan","value":1.18}
+OQ5 {"extra":{},"iter":10,"label":"b-scale10","phase":"scan_gateway_ms","value":806.0}
+OQ5 {"extra":{"deleted":1521,"moved":0},"iter":10,"label":"b-scale10","phase":"restore","value":26.578}
+OQ5 {"extra":{},"iter":10,"label":"b-scale10","phase":"restore_scan","value":0.734}
+OQ5 {"extra":{},"iter":10,"label":"b-scale10","phase":"restore_scan_gateway_ms","value":561.0}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"install_scan","value":1.212}
+OQ5 {"extra":{"files":1520},"iter":1,"label":"b-scale10","phase":"prepare_replace","value":533.198}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"replace_reset","value":3.602}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":1,"label":"b-scale10","phase":"replace_commit","value":77.425}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"replace_scan","value":1.549}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"replace_scan_gateway_ms","value":952.0}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":1,"label":"b-scale10","phase":"replace_restore","value":71.839}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"replace_restore_scan","value":1.542}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"replace_restore_scan_gateway_ms","value":1020.0}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"replace_reset","value":5.689}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":2,"label":"b-scale10","phase":"replace_commit","value":83.409}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"replace_scan","value":1.57}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"replace_scan_gateway_ms","value":1004.0}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":2,"label":"b-scale10","phase":"replace_restore","value":69.267}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"replace_restore_scan","value":1.521}
+OQ5 {"extra":{},"iter":2,"label":"b-scale10","phase":"replace_restore_scan_gateway_ms","value":995.0}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"replace_reset","value":5.28}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":3,"label":"b-scale10","phase":"replace_commit","value":85.496}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"replace_scan","value":1.497}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"replace_scan_gateway_ms","value":1133.0}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":3,"label":"b-scale10","phase":"replace_restore","value":70.86}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"replace_restore_scan","value":1.48}
+OQ5 {"extra":{},"iter":3,"label":"b-scale10","phase":"replace_restore_scan_gateway_ms","value":995.0}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"replace_reset","value":4.993}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":4,"label":"b-scale10","phase":"replace_commit","value":84.559}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"replace_scan","value":1.461}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"replace_scan_gateway_ms","value":952.0}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":4,"label":"b-scale10","phase":"replace_restore","value":70.136}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"replace_restore_scan","value":1.475}
+OQ5 {"extra":{},"iter":4,"label":"b-scale10","phase":"replace_restore_scan_gateway_ms","value":988.0}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"replace_reset","value":5.108}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":5,"label":"b-scale10","phase":"replace_commit","value":83.092}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"replace_scan","value":1.579}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"replace_scan_gateway_ms","value":987.0}
+OQ5 {"extra":{"deleted":0,"moved":1520},"iter":5,"label":"b-scale10","phase":"replace_restore","value":71.027}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"replace_restore_scan","value":1.235}
+OQ5 {"extra":{},"iter":5,"label":"b-scale10","phase":"replace_restore_scan_gateway_ms","value":948.0}
+OQ5 {"extra":{"files":1520},"iter":1,"label":"b-scale10","phase":"prepare_delete","value":26.171}
+OQ5 {"extra":{"deleted":1520,"removed_dirs":700},"iter":1,"label":"b-scale10","phase":"commit_delete","value":34.459}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"scan_after_delete","value":1.098}
+OQ5 {"extra":{},"iter":1,"label":"b-scale10","phase":"scan_after_delete_gateway_ms","value":569.0}
+OQ5 {"summary":{"bytes":918330,"files":1520,"label":"b-scale10","percentile":"nearest rank","phases":{"commit":{"max":62.0403075,"min":56.367028917,"n":10,"p50":60.2908875,"p95":62.0403075},"commit_delete":{"max":34.459301125,"min":34.459301125,"n":1,"p50":34.459301125,"p95":34.459301125},"install_scan":{"max":1.211642834,"min":1.211642834,"n":1,"p50":1.211642834,"p95":1.211642834},"master_copy":{"max":3.342881,"min":3.342881,"n":1,"p50":3.342881,"p95":3.342881},"prepare_delete":{"max":26.171453667,"min":26.171453667,"n":1,"p50":26.171453667,"p95":26.171453667},"prepare_replace":{"max":533.197846208,"min":533.197846208,"n":1,"p50":533.197846208,"p95":533.197846208},"prepare_write":{"max":553.482100458,"min":553.482100458,"n":1,"p50":553.482100458,"p95":553.482100458},"replace_commit":{"max":85.495882458,"min":77.424884333,"n":5,"p50":83.409136542,"p95":85.495882458},"replace_reset":{"max":5.688521791,"min":3.602199125,"n":5,"p50":5.108476625,"p95":5.688521791},"replace_restore":{"max":71.83902125,"min":69.266901292,"n":5,"p50":70.859791042,"p95":71.83902125},"replace_restore_scan":{"max":1.5422485,"min":1.234754125,"n":5,"p50":1.480215791,"p95":1.5422485},"replace_restore_scan_gateway_ms":{"max":1020.0,"min":948.0,"n":5,"p50":995.0,"p95":1020.0},"replace_scan":{"max":1.578508792,"min":1.461005125,"n":5,"p50":1.549346084,"p95":1.578508792},"replace_scan_gateway_ms":{"max":1133.0,"min":952.0,"n":5,"p50":987.0,"p95":1133.0},"reset":{"max":6.8375907080000005,"min":3.654172833,"n":10,"p50":5.569739709,"p95":6.8375907080000005},"restore":{"max":28.937364209,"min":25.905104,"n":10,"p50":27.133897417,"p95":28.937364209},"restore_scan":{"max":1.213304291,"min":0.73444175,"n":10,"p50":0.854057375,"p95":1.213304291},"restore_scan_gateway_ms":{"max":628.0,"min":561.0,"n":10,"p50":570.0,"p95":628.0},"scan":{"max":1.566750417,"min":1.055023292,"n":10,"p50":1.112894833,"p95":1.566750417},"scan_after_delete":{"max":1.097678209,"min":1.097678209,"n":1,"p50":1.097678209,"p95":1.097678209},"scan_after_delete_gateway_ms":{"max":569.0,"min":569.0,"n":1,"p50":569.0,"p95":569.0},"scan_gateway_ms":{"max":846.0,"min":783.0,"n":10,"p50":814.0,"p95":846.0}},"source":"sanitized corpus (183 .json, 195 files) x 10, named units only","unit":"seconds unless the phase name ends in _ms","units":700}}
+OQ5 {"restore_assertion":{"dirs_after":0,"dirs_before":0,"files_after":1,"files_before":1,"production_listing_equals_pre_run":true}}
+OQ5 {"closing_scan":{"gateway_ms":425,"wall_s":0.63946875}}
+OQ5 {"cleanup":{"deploy_dir_gone":true},"total_secs":3147.775127458}
+PASS oq5b_timings
+~~~
+
 ## Decisions
 
 Each entry is an answer taken from the blocks above, not a hypothesis. Later plans read these entries by id.
