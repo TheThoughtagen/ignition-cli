@@ -239,6 +239,11 @@ enum ActionOutput {
     /// verdict is a SUCCESS envelope (`data.ok: false`) and exit 6, set in
     /// `main` after the envelope is rendered (Decision A, DPLN-09).
     DeployVerify(actions::deploy::DeployVerifyResult),
+    /// `ign deploy apply` (23-13): the first write verb. Outcome `applied`,
+    /// `noop` or `rolled_back`; a rollback is a SUCCESS envelope
+    /// (`data.ok: false`, `data.slug: deploy_rolled_back`) and exit 6, set in
+    /// `main` after the envelope is rendered (Decision A, DAPL-07).
+    DeployApply(actions::deploy_apply::DeployApplyResult),
     /// `ign api call` — the raw passthrough's outcome: method/path
     /// echo plus the gateway's verbatim answer (status + RawValue
     /// body; the README's documented contract exception).
@@ -420,6 +425,7 @@ impl ActionOutput {
             ActionOutput::DeployPlan(result) => render_success(profile, result, compact),
             ActionOutput::DeployPull(result) => render_success(profile, result, compact),
             ActionOutput::DeployVerify(result) => render_success(profile, result, compact),
+            ActionOutput::DeployApply(result) => render_success(profile, result, compact),
             ActionOutput::ApiCall(result) => render_success(profile, result, compact),
             ActionOutput::LicenseStatus(result) => render_success(profile, result, compact),
             ActionOutput::RedundancyStatus(result) => render_success(profile, result, compact),
@@ -3217,6 +3223,95 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 .map(ActionOutput::DeployVerify);
                 (profile, result)
             }
+            // `ign deploy apply` (23-13, DAPL-01): the first write verb.
+            // Decision C comes first (no host or gateway contact), then the
+            // plan is re-drawn against the host and the gates run; the plan
+            // prose is the `confirmation_required` refusal at the guarded
+            // marker below. Nothing here names the write half of the host:
+            // the library entry builds it.
+            DeployCommand::Apply {
+                env,
+                repo,
+                base,
+                project,
+                plan_sha256,
+                allow_destructive,
+                allow_drift,
+                designers,
+                designers_timeout,
+                skip_gwbk,
+            } => {
+                // Decision C (23-02 item 3): an unattended caller must name
+                // the plan it reviewed.
+                if plan_sha256.is_none()
+                    && (cli.json
+                        || cli.compact
+                        || !std::io::stdin().is_terminal()
+                        || !std::io::stdout().is_terminal())
+                {
+                    return (
+                        None,
+                        Err(CoreError::InvalidInput {
+                            reason: "deploy apply needs --plan-sha256 when --json is given or \
+                                     stdin or stdout is not a terminal (Decision C): run \
+                                     `ign deploy plan --env <ENV> --json`, review it and pass its \
+                                     `plan_sha256`"
+                                .to_string(),
+                        }),
+                    );
+                }
+                let declared = match actions::deploy::load_declared(&repo, &env) {
+                    Ok(declared) => declared,
+                    Err(err) => return (None, Err(err)),
+                };
+                let master = &declared.target.nodes.master;
+                let profile = Some(master.profile.clone());
+                let reader = match ignition_core::deploy::transport::for_node(
+                    &repo,
+                    &declared.target_file,
+                    "nodes.master",
+                    master,
+                ) {
+                    Ok(reader) => reader,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let prepared = match actions::deploy_apply::deploy_apply_prepare(
+                    &declared,
+                    reader.as_ref(),
+                    &actions::deploy_apply::PrepareOptions {
+                        base: base.clone(),
+                        gates: ignition_core::deploy::apply::gates::GateFlags {
+                            plan_sha256: plan_sha256.clone(),
+                            allow_destructive,
+                            allow_drift: allow_drift.clone(),
+                        },
+                    },
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => return (profile, Err(err)),
+                };
+                if let actions::deploy_apply::ApplyPrepared::Ready { prose, .. } = &prepared {
+                    // guarded:deploy apply
+                    if let Err(err) = require_confirmation(cli.yes, prose) {
+                        return (profile, Err(err));
+                    }
+                }
+                let _ = (project, designers, designers_timeout, skip_gwbk);
+                match prepared {
+                    actions::deploy_apply::ApplyPrepared::Noop(result) => {
+                        (profile, Ok(ActionOutput::DeployApply(result)))
+                    }
+                    actions::deploy_apply::ApplyPrepared::Ready { .. } => (
+                        profile,
+                        Err(CoreError::Internal(
+                            "deploy apply: the confirmed run is wired in the next commit"
+                                .to_string(),
+                        )),
+                    ),
+                }
+            }
         },
         Commands::Lint(LintArgs {
             paths,
@@ -4046,6 +4141,16 @@ pub(crate) const GUARDED_OPS: &[(&str, &str)] = &[
     (
         "deploy pull",
         "deploy pull would replace gateways/<name>/resources, tags and modes/<env> with the live tree of nodes.master (<n> existing files, e.g. ...)",
+    ),
+    // 23-13: apply writes the declared tree into the gateway's mode
+    // collection under the scan-lock (DAPL-01). A DYNAMIC-prose site: the
+    // refusal message IS `deploy_apply_prepare`'s plan prose (env, gateway,
+    // mode, each changing entry with its flags, the delete-set count and
+    // `plan_sha256`). Excluded from the MCP catalog by `EXCLUDED_PATHS`
+    // (Decision D); the only other guarded-and-excluded verb is `edit`.
+    (
+        "deploy apply",
+        "deploy apply writes the declared tree into the gateway mode collection under the scan-lock",
     ),
 ];
 

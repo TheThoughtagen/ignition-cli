@@ -295,6 +295,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployPlan(result) => render_deploy_plan_human(result),
         ActionOutput::DeployPull(result) => render_deploy_pull_human(result),
         ActionOutput::DeployVerify(result) => render_deploy_verify_human(result),
+        ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1516,6 +1517,58 @@ fn render_deploy_verify_human(result: &ignition_core::actions::deploy::DeployVer
             println!("  {} {} {}", finding.code, finding.subject, finding.detail);
         }
     }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `ign deploy apply` human form: the outcome line, the run, the counts, the
+/// backup, the restart-pending lines, then the warnings. Counts, ids, paths and
+/// codes only; no file bytes. Progress lines went to stderr while the run
+/// went (`ign deploy apply:` prefix); warnings repeat on stderr.
+fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::DeployApplyResult) {
+    use ignition_core::deploy::apply::OutcomeKind;
+    println!(
+        "apply {} ({}, mode {}) via {}: {}",
+        result.gateway,
+        result.env,
+        result.mode,
+        result.transport,
+        result.outcome.as_str()
+    );
+    match (&result.run_id, &result.run_dir) {
+        (Some(id), Some(dir)) => {
+            println!("run {id}");
+            println!("run directory {dir}");
+        }
+        _ => println!("run none (nothing to apply)"),
+    }
+    println!(
+        "{} written, {} deleted",
+        result.written.len(),
+        result.deleted.len()
+    );
+    if result.outcome == OutcomeKind::RolledBack {
+        let cause = result.cause.map_or("unknown", |c| c.as_str());
+        println!("rolled back: {cause}");
+        println!("the pre-apply snapshot was restored; the gateway runs what it ran before");
+    }
+    if result.outcome != OutcomeKind::Noop {
+        match (&result.gwbk, result.skip_gwbk) {
+            (Some(name), _) => println!("backup {name}"),
+            (None, true) => println!("backup skipped (--skip-gwbk)"),
+            (None, false) => println!("backup none taken"),
+        }
+        for entry in &result.restart_pending_new {
+            println!("restart pending (new): {entry}");
+        }
+        for entry in &result.restart_pending {
+            if !result.restart_pending_new.contains(entry) {
+                println!("restart pending: {entry}");
+            }
+        }
+    }
+    println!("plan_sha256 {}", result.plan_sha256);
     for warning in &result.warnings {
         eprintln!("warning: {warning}");
     }

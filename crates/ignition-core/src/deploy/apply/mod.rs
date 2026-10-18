@@ -148,6 +148,17 @@ pub enum OutcomeKind {
     RolledBack,
 }
 
+impl OutcomeKind {
+    /// The `data.outcome` word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutcomeKind::Applied => "applied",
+            OutcomeKind::Noop => "noop",
+            OutcomeKind::RolledBack => "rolled_back",
+        }
+    }
+}
+
 /// Why a run rolled back (23-17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

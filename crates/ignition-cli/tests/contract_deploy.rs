@@ -1770,3 +1770,108 @@ async fn verify_cli_human_lines() {
         "{stdout}"
     );
 }
+
+// ============================================================================
+// `ign deploy apply` (23-13)
+// ============================================================================
+
+const APPLY_UNIT: &str = "ignition/database-translator/POSTGRES";
+
+/// `local_tracer()` with one live unit changed by a trailing space (a JSON
+/// document that reads the same, bytes that differ), so the plan has one
+/// `changed` entry. Returns `(scratch, repo, data_dir)`.
+fn changed_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (scratch, repo, data) = local_tracer();
+    let config = data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    let mut bytes = std::fs::read(&config).expect("live config");
+    bytes.push(b' ');
+    std::fs::write(&config, bytes).expect("change the live unit");
+    (scratch, repo, data)
+}
+
+/// `plan_sha256` of `deploy plan` over `repo`, from the binary.
+fn plan_hash(repo: &Path) -> String {
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("plan envelope");
+    envelope["data"]["plan_sha256"]
+        .as_str()
+        .expect("plan_sha256")
+        .to_string()
+}
+
+#[test]
+fn apply_without_yes_prints_plan() {
+    let (_scratch, repo, data) = changed_tracer();
+    let hash = plan_hash(&repo);
+    let before = read_tree(&data);
+
+    let (_cfg, mut cmd) = ign();
+    let out = cmd
+        .args(["--json", "deploy", "apply", "--env", "dev", "--repo"])
+        .arg(&repo)
+        .args(["--plan-sha256", &hash])
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "no envelope on stdout");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains("plan_sha256"), "{message}");
+    assert!(message.contains(&hash), "{message}");
+    assert!(message.contains(APPLY_UNIT), "{message}");
+    assert!(message.contains("tracer-gw"), "{message}");
+    assert!(!repo.join(".ign").exists(), "no run directory");
+    assert_eq!(read_tree(&data), before, "nothing written to the host");
+}
+
+#[test]
+fn apply_flags_are_exactly_these() {
+    use clap::CommandFactory;
+    let cli = ignition_cli::cli::Cli::command();
+    let deploy = cli.find_subcommand("deploy").expect("deploy");
+    let apply = deploy.find_subcommand("apply").expect("deploy apply");
+    let mut longs: Vec<&str> = apply
+        .get_arguments()
+        .filter(|a| !a.is_global_set())
+        .filter_map(|a| a.get_long())
+        .filter(|l| !matches!(*l, "help" | "version"))
+        .collect();
+    longs.sort_unstable();
+    assert_eq!(
+        longs,
+        [
+            "allow-destructive",
+            "allow-drift",
+            "base",
+            "designers",
+            "designers-timeout",
+            "env",
+            "plan-sha256",
+            "project",
+            "repo",
+            "skip-gwbk",
+        ],
+        "the flag set is the contract; a flag that skips the plan hash, the verify or the rollback is never added"
+    );
+    // The global confirmation flag is the only way past the guard.
+    assert!(
+        cli.get_arguments().any(|a| a.get_long() == Some("yes")),
+        "--yes is a global flag"
+    );
+}
