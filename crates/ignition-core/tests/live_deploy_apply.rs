@@ -1,7 +1,8 @@
 //! Phase 23's rig gates for the write flow against a real Ignition 8.3.6
 //! gateway whose `config/resources` is bind-mounted (23-16): a guarded apply,
-//! a rollback from a fresh context by run id, an apply killed mid-write, and
-//! an apply whose scan-lock lapses before the scan.
+//! a rollback from a fresh context by run id, an apply killed mid-write, an
+//! apply whose scan-lock lapses before the scan, and a gateway config save
+//! queued during the scan-lock hold (C2b).
 //!
 //! The host is a `local:` node on the rig's bind-mounted data directory, so
 //! the engine writes the mode collection with plain file moves and the real
@@ -26,6 +27,7 @@
 //! | `IGNITION_LIVE_TOKEN` | cap-a's full `name:key` API token (never printed) |
 //! | `IGN_DEPLOY_RIG_DATA` | the host data directory whose `config/resources` is bind-mounted into the rig |
 //! | `IGN_DEPLOY_RIG_MODE` | the rig's active mode (`production` on the rig recipe) |
+//! | `IGNITION_LIVE_TOKEN_B` | optional: a second `name:key` API token for the foreign writer of the queued-save gate (never printed); absent means the engine's token is used |
 //!
 //! Safety: the URL guard refuses a non-loopback host before a request is made
 //! and a name guard refuses any gateway whose `gateway-info` name is not
@@ -52,9 +54,10 @@ use ignition_core::actions::deploy_apply::{
     deploy_apply_prepare, deploy_apply_run, deploy_rollback_execute, deploy_rollback_prepare,
     deploy_rollback_prepare_for_env, deploy_rollback_run,
 };
-use ignition_core::client::deploy_api::resource_list_in_collection;
+use ignition_core::client::config_resources::{MutationOutcome, ResourceCreate, ResourceUpdate};
+use ignition_core::client::deploy_api::{resource_list_in_collection, scan_and_wait};
 use ignition_core::client::logs::LogQuery;
-use ignition_core::client::scan::{LockObservation, ScanKind};
+use ignition_core::client::scan::{LockObservation, ScanKind, ScanOutcome};
 use ignition_core::client::{DeployApi, GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{Credential, Secret};
 use ignition_core::deploy::apply::gates::GateFlags;
@@ -159,6 +162,9 @@ fn local_url_guard_accepts_loopback() {
 struct Rig {
     url: String,
     token: String,
+    /// `IGNITION_LIVE_TOKEN_B`, when set: the foreign writer of the
+    /// queued-save gate. Never printed.
+    writer_token: Option<String>,
     data_dir: PathBuf,
     mode: String,
 }
@@ -170,6 +176,32 @@ impl Rig {
             &self.url,
             Some(Credential::Token(Secret::new(self.token.clone()))),
         )
+    }
+
+    /// The foreign writer's REST handle: the second token when one is set,
+    /// else the engine's own token.
+    fn writer_api(&self) -> ReqwestGatewayApi {
+        let token = self.writer_token.as_ref().unwrap_or(&self.token);
+        ReqwestGatewayApi::for_tests(
+            &self.url,
+            Some(Credential::Token(Secret::new(token.clone()))),
+        )
+    }
+
+    /// What the foreign writer is called in output (never its key).
+    fn writer_label(&self) -> &'static str {
+        if self.writer_token.is_some() {
+            "second token (IGNITION_LIVE_TOKEN_B)"
+        } else {
+            "engine token"
+        }
+    }
+
+    /// The gateway names a lock holder `api-token:<token name>`; the name is
+    /// the text of the engine token before its first `:`, which is not secret.
+    fn engine_actor_prefix(&self) -> String {
+        let name = self.token.split(':').next().unwrap_or_default();
+        format!("api-token:{name}")
     }
 
     fn mode_root(&self) -> PathBuf {
@@ -201,9 +233,14 @@ async fn rig() -> Option<Rig> {
         data_dir.join("config").join("resources").is_dir(),
         "IGN_DEPLOY_RIG_DATA must be the host data dir whose config/resources is bind-mounted"
     );
+    let writer_token = std::env::var("IGNITION_LIVE_TOKEN_B")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let rig = Rig {
         url,
         token,
+        writer_token,
         data_dir,
         mode,
     };
@@ -1207,6 +1244,491 @@ async fn live_kill_after_green_verify_then_recover() {
     );
     eprintln!(
         "PASS live_kill_after_green_verify_then_recover in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+// ---- live_queued_config_save_during_apply (C2b, UAT U1) ----------------------------------
+
+/// The seed the test creates over the API, and the foreign save it queues.
+const SEED_MARKER: &str = "lqg-seed";
+const FOREIGN_MARKER: &str = "lqg-foreign";
+/// A translator field the verify `read_back` compares.
+const MARKED_FIELD: &str = "currentTimeQuery";
+/// How long the foreign write is watched before the hook hands control back.
+const QUEUE_PROBE: Duration = Duration::from_secs(3);
+/// The foreign write must be answered within this long after it was sent.
+const PUT_DEADLINE: Duration = Duration::from_secs(60);
+const TRANSLATOR_NAME: &str = "POSTGRES";
+
+/// The translator config the tracer declares.
+fn rendered_translator_config() -> serde_json::Value {
+    let path = Path::new(TRACER_GATEWAY)
+        .join("resources")
+        .join(TRANSLATOR.0)
+        .join(TRANSLATOR.1)
+        .join(TRANSLATOR_NAME)
+        .join("config.json");
+    serde_json::from_slice(&std::fs::read(path).expect("tracer translator config"))
+        .expect("tracer translator config is JSON")
+}
+
+/// `config` with [`MARKED_FIELD`] carrying `marker`.
+fn marked(config: &serde_json::Value, marker: &str) -> serde_json::Value {
+    let mut out = config.clone();
+    out[MARKED_FIELD] =
+        serde_json::Value::String(format!("SELECT CURRENT_TIMESTAMP /* {marker} */"));
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Missing,
+    Seed,
+    Foreign,
+    Declared,
+    Other,
+}
+
+/// The object without its `null` members: the gateway's REST view omits them.
+fn without_nulls(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn classify(value: &serde_json::Value) -> Seen {
+    let field = value[MARKED_FIELD].as_str().unwrap_or_default();
+    if field.contains(FOREIGN_MARKER) {
+        Seen::Foreign
+    } else if field.contains(SEED_MARKER) {
+        Seen::Seed
+    } else if without_nulls(value) == without_nulls(&rendered_translator_config()) {
+        Seen::Declared
+    } else {
+        Seen::Other
+    }
+}
+
+/// The translator config file in the mode collection.
+fn on_disk(rig: &Rig) -> Seen {
+    let path = rig.mode_root().join(TRANSLATOR_UNIT).join("config.json");
+    match std::fs::read(&path) {
+        Err(_) => Seen::Missing,
+        Ok(bytes) => serde_json::from_slice(&bytes).map_or(Seen::Other, |v| classify(&v)),
+    }
+}
+
+/// The gateway's REST view of the mode copy of the translator.
+async fn in_rest(api: &dyn DeployApi, mode: &str) -> Seen {
+    match api
+        .resource_find(TRANSLATOR.0, TRANSLATOR.1, TRANSLATOR_NAME, Some(mode))
+        .await
+    {
+        Ok(record) => classify(&record.config),
+        Err(err) if err.code() == "not_found" => Seen::Missing,
+        Err(_) => Seen::Other,
+    }
+}
+
+/// Sweep the test's units off the host and run one config scan, so the gateway
+/// forgets them; returns the translators the mode collection still lists.
+async fn forget_units(rig: &Rig, api: &dyn DeployApi) -> Vec<String> {
+    Clean::new(rig).sweep();
+    let outcome = scan_and_wait(
+        api,
+        ScanKind::Config,
+        production_poll("config scan to forget the test units"),
+    )
+    .await
+    .expect("config scan to forget the test units");
+    assert!(
+        matches!(outcome, ScanOutcome::Complete(_)),
+        "the forgetting scan completed"
+    );
+    translators_in_mode(rig, api).await
+}
+
+/// What the hook saw, written by the hook and read by the test.
+#[derive(Default)]
+struct Probe {
+    actor_at_send: Option<String>,
+    sent_at: Option<Instant>,
+    pending_after_probe: Option<bool>,
+    actor_after_probe: Option<String>,
+    hook_returned_at: Option<Instant>,
+    handle: Option<tokio::task::JoinHandle<(Result<MutationOutcome, CoreError>, Instant)>>,
+}
+
+fn probe_guard(probe: &std::sync::Mutex<Probe>) -> std::sync::MutexGuard<'_, Probe> {
+    probe
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Who holds the config scan-lock, as the gateway names it.
+async fn lock_actor(api: &dyn DeployApi) -> String {
+    match api.scan_lock_info(ScanKind::Config).await {
+        Ok(LockObservation::Held(info)) => info.actor.unwrap_or_else(|| "<held, no actor>".into()),
+        Ok(LockObservation::Free) => "free".to_string(),
+        Err(err) => format!("<lock read failed: {}>", err.code()),
+    }
+}
+
+/// A foreign gateway save to a file the plan writes, queued while the engine
+/// holds the config scan-lock: does the apply report `applied` over it?
+#[tokio::test]
+#[ignore = "live: needs the ign-deploy-rig fixture and IGNITION_LIVE_DEPLOY=1"]
+#[allow(clippy::too_many_lines)]
+async fn live_queued_config_save_during_apply() {
+    let Some(rig) = rig().await else { return };
+    let _serial = RIG_LOCK.lock().await;
+    let _clean = Clean::new(&rig);
+    let started = Instant::now();
+    eprintln!("live_queued_config_save_during_apply @ {}", utc_now());
+    let api = Arc::new(rig.api());
+    // A cut-off earlier run cannot leave a seed in gateway memory.
+    let leftovers = forget_units(&rig, api.as_ref()).await;
+    assert!(
+        leftovers.is_empty(),
+        "rig not clean at start: {leftovers:?}"
+    );
+
+    let repo = apply_repo(&rig);
+    let ctx = Context::new(repo.path());
+    let rendered = rendered_translator_config();
+
+    // Seed the production POSTGRES through the resource API, so the gateway
+    // writes the file and holds a signature the foreign save can quote.
+    api.resource_create(
+        TRANSLATOR.0,
+        TRANSLATOR.1,
+        &[
+            ResourceCreate::new(TRANSLATOR_NAME, marked(&rendered, SEED_MARKER))
+                .with_collection(&rig.mode),
+        ],
+    )
+    .await
+    .expect("seed create");
+    let seed = api
+        .resource_find(TRANSLATOR.0, TRANSLATOR.1, TRANSLATOR_NAME, Some(&rig.mode))
+        .await
+        .expect("seed read");
+    assert_eq!(seed.collection.as_deref(), Some(rig.mode.as_str()));
+    let seed_signature = seed.signature.clone().unwrap_or_default();
+    assert!(!seed_signature.is_empty(), "the seed has a signature");
+    assert_eq!(in_rest(api.as_ref(), &rig.mode).await, Seen::Seed);
+    assert_eq!(on_disk(&rig), Seen::Seed);
+    eprintln!("seed: POSTGRES created in {} (signature present)", rig.mode);
+
+    let before = collection_state(&rig);
+    let plan_before = ctx.plan_hash().await;
+    let prepared = deploy_apply_prepare(
+        &ctx.declared,
+        ctx.reader.as_ref(),
+        &PrepareOptions {
+            base: None,
+            gates: gates_for(&plan_before),
+        },
+    )
+    .await
+    .expect("prepare over the seed");
+    let ApplyPrepared::Ready { plan, .. } = &prepared else {
+        panic!("the seed leaves the tracer to apply: {prepared:?}");
+    };
+    eprintln!(
+        "plan: added {} changed {} removed {}",
+        plan.summary.added, plan.summary.changed, plan.summary.removed
+    );
+    assert!(plan.summary.changed >= 1, "{:?}", plan.summary);
+    assert!(plan.summary.has_changes);
+
+    // The foreign save: the translator with another marker, quoting the seed
+    // signature, sent by the writer inside the engine's hold.
+    let writer = Arc::new(rig.writer_api());
+    let update = ResourceUpdate::new(
+        TRANSLATOR_NAME,
+        seed_signature,
+        marked(&rendered, FOREIGN_MARKER),
+    )
+    .expect("update")
+    .with_collection(&rig.mode);
+
+    // A 4-file local commit holds the lock well under a second, too short to
+    // land a write in from outside by polling. The hook runs after the files
+    // moved and before the engine's lock check and release scan, so the write
+    // is sent and watched inside the hold, deterministically.
+    let probe: Arc<std::sync::Mutex<Probe>> = Arc::default();
+    let host = FaultyHost::new(
+        LocalFsTransport::new(rig.data_dir.clone(), "nodes.master")
+            .with_apply(GATEWAY_DIR, &rig.mode)
+            .expect("apply host"),
+    )
+    .after("commit", 1, {
+        let engine = api.clone();
+        let writer = writer.clone();
+        let probe = probe.clone();
+        move || {
+            let engine = engine.clone();
+            let writer = writer.clone();
+            let probe = probe.clone();
+            let update = update.clone();
+            async move {
+                let actor = lock_actor(engine.as_ref()).await;
+                let handle = tokio::spawn(async move {
+                    let result = writer
+                        .resource_update(TRANSLATOR.0, TRANSLATOR.1, &[update])
+                        .await;
+                    (result, Instant::now())
+                });
+                {
+                    let mut p = probe_guard(&probe);
+                    p.actor_at_send = Some(actor);
+                    p.sent_at = Some(Instant::now());
+                }
+                tokio::time::sleep(QUEUE_PROBE).await;
+                let pending = !handle.is_finished();
+                let actor = lock_actor(engine.as_ref()).await;
+                let mut p = probe_guard(&probe);
+                p.pending_after_probe = Some(pending);
+                p.actor_after_probe = Some(actor);
+                p.handle = Some(handle);
+                p.hook_returned_at = Some(Instant::now());
+            }
+        }
+    });
+
+    let run_ctx = ApplyContext {
+        declared: &ctx.declared,
+        repo: &ctx.repo,
+        reader: ctx.reader.as_ref(),
+        host: &host,
+        deploy: api.as_ref(),
+        gateway: api.as_ref(),
+        backup_deploy: None,
+        clock: &SystemClock,
+        observer: &NoObserver,
+    };
+    let run = deploy_apply_execute(
+        prepared,
+        &run_ctx,
+        &engine_options(short_hold(30), gates_for(&plan_before)),
+    )
+    .await;
+
+    // The foreign write's answer.
+    let handle = probe_guard(&probe).handle.take();
+    let put = match handle {
+        Some(handle) => tokio::time::timeout(PUT_DEADLINE, handle)
+            .await
+            .ok()
+            .and_then(Result::ok),
+        None => None,
+    };
+
+    // Observations before any cleanup.
+    let disk = on_disk(&rig);
+    let state_after = collection_state(&rig);
+    let rest = in_rest(api.as_ref(), &rig.mode).await;
+    let mut result_json: Option<serde_json::Value> = None;
+    let mut events: Vec<String> = Vec::new();
+    if let Ok(done) = &run
+        && let Some(dir) = done.run_dir.as_deref()
+    {
+        let dir = PathBuf::from(dir);
+        result_json = std::fs::read(dir.join("result.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        events = std::fs::read_to_string(dir.join("events.ndjson"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["event"].as_str().map(str::to_string))
+            .collect();
+    }
+    let applied = matches!(&run, Ok(done) if done.outcome == OutcomeKind::Applied);
+    let rolled_back = matches!(&run, Ok(done) if done.outcome == OutcomeKind::RolledBack);
+    let fresh_verify_ok = if applied {
+        Some(
+            ignition_core::actions::deploy::deploy_verify(
+                &ctx.declared,
+                "ign-cli",
+                api.as_ref(),
+                api.as_ref(),
+                ctx.reader.as_ref(),
+                &VerifyOptions::default(),
+            )
+            .await
+            .map(|r| r.ok),
+        )
+    } else {
+        None
+    };
+    let plan_after: Option<Result<String, CoreError>> = if rolled_back {
+        let again = Context::new(repo.path());
+        Some(
+            deploy_plan(
+                &again.declared,
+                again.reader.as_ref(),
+                &PlanOptions {
+                    base: None,
+                    diff: false,
+                },
+            )
+            .await
+            .map(|p| p.plan_sha256),
+        )
+    } else {
+        None
+    };
+
+    let (actor_at_send, pending, actor_after, hook_returned_at, sent_at) = {
+        let p = probe_guard(&probe);
+        (
+            p.actor_at_send.clone(),
+            p.pending_after_probe,
+            p.actor_after_probe.clone(),
+            p.hook_returned_at,
+            p.sent_at,
+        )
+    };
+    let put_verdict = match &put {
+        Some((Ok(_), _)) => "accepted".to_string(),
+        Some((Err(err), _)) => err.code().to_string(),
+        None => "no answer".to_string(),
+    };
+    let put_after_hook_s = match (&put, hook_returned_at) {
+        (Some((_, at)), Some(hook)) => Some(at.saturating_duration_since(hook).as_secs_f64()),
+        _ => None,
+    };
+    let put_total_s = match (&put, sent_at) {
+        (Some((_, at)), Some(sent)) => Some(at.saturating_duration_since(sent).as_secs_f64()),
+        _ => None,
+    };
+    let (run_outcome, run_cause, run_id) = match &run {
+        Ok(done) => (
+            format!("{:?}", done.outcome),
+            format!("{:?}", done.cause),
+            done.run_id.clone().unwrap_or_default(),
+        ),
+        Err(err) => (
+            format!("engine error {} ({err})", err.code()),
+            "n/a".into(),
+            String::new(),
+        ),
+    };
+    eprintln!("---- findings @ {}", utc_now());
+    eprintln!("writer: {}", rig.writer_label());
+    eprintln!("lock actor at send: {actor_at_send:?}");
+    eprintln!("write still unanswered after {QUEUE_PROBE:?}: {pending:?}");
+    eprintln!("lock actor after the probe: {actor_after:?}");
+    eprintln!("foreign write verdict: {put_verdict}");
+    eprintln!("seconds from hook return to the answer: {put_after_hook_s:?}");
+    eprintln!("seconds from send to the answer: {put_total_s:?}");
+    eprintln!("run: outcome {run_outcome} cause {run_cause} id {run_id}");
+    eprintln!(
+        "result.json: outcome {:?} ok {:?} cause {:?}",
+        result_json.as_ref().map(|j| j["outcome"].clone()),
+        result_json.as_ref().map(|j| j["ok"].clone()),
+        result_json.as_ref().map(|j| j["cause"].clone()),
+    );
+    eprintln!("POSTGRES config on disk: {disk:?}; in REST: {rest:?}");
+    eprintln!(
+        "fresh deploy verify ok: {:?}",
+        fresh_verify_ok
+            .as_ref()
+            .map(|r| r.as_ref().map_err(CoreError::code))
+    );
+    eprintln!("events: {}", events.join(" "));
+
+    // Cleanup before the assertions.
+    let remaining = forget_units(&rig, api.as_ref()).await;
+
+    // (a) The scenario happened: the write was queued under the engine's hold.
+    let prefix = rig.engine_actor_prefix();
+    assert!(
+        actor_at_send
+            .as_deref()
+            .is_some_and(|a| a.starts_with(&prefix)),
+        "the lock was not the engine's when the write was sent: {actor_at_send:?} (want {prefix})"
+    );
+    assert_eq!(
+        pending,
+        Some(true),
+        "C2 contradicted: the gateway answered the write while the engine held the lock (not queued); writer: {}",
+        rig.writer_label()
+    );
+    assert!(
+        actor_after
+            .as_deref()
+            .is_some_and(|a| a.starts_with(&prefix)),
+        "the lock was not the engine's after the probe: {actor_after:?}"
+    );
+    let (put_result, put_at) = put
+        .as_ref()
+        .unwrap_or_else(|| panic!("the foreign write got no answer within {PUT_DEADLINE:?}"));
+    assert!(
+        Some(*put_at) > hook_returned_at,
+        "the write was answered before the hook returned control to the engine"
+    );
+
+    // (b) The gap: applied over a foreign save.
+    if applied {
+        let verify_ok = matches!(fresh_verify_ok, Some(Ok(true)));
+        if put_result.is_ok() || disk != Seen::Declared || rest != Seen::Declared || !verify_ok {
+            panic!(
+                "PHASE 23 GAP: deploy apply reported applied (run {run_id}) while the deployed POSTGRES config was replaced by the queued foreign save: on disk {disk:?}, in REST {rest:?}, foreign write {put_verdict}, fresh verify ok {verify_ok}"
+            );
+        }
+    }
+
+    let branch = if rolled_back {
+        // (c) Rolled back: the seed tree is back.
+        let done = run.as_ref().expect("a run");
+        assert!(done.cause.is_some(), "a rollback has a cause");
+        assert_eq!(state_after, before, "the pre-apply (seed) tree is back");
+        let json = result_json.as_ref().expect("result.json");
+        assert_eq!(json["outcome"], "rolled_back");
+        assert_eq!(json["ok"], false);
+        assert_eq!(
+            plan_after.as_ref().expect("post-run plan").as_ref().ok(),
+            Some(&plan_before),
+            "the plan is back to the pre-apply plan"
+        );
+        assert!(
+            events.iter().any(|e| e == "restore_started"),
+            "restore_started in {events:?}"
+        );
+        "rolled_back"
+    } else if applied {
+        // (d) Applied with the write refused.
+        let err = put_result
+            .as_ref()
+            .expect_err("the queued write is refused");
+        eprintln!("queued write refused with {}", err.code());
+        assert_eq!(disk, Seen::Declared);
+        assert_eq!(rest, Seen::Declared);
+        let json = result_json.as_ref().expect("result.json");
+        assert_eq!(json["outcome"], "applied");
+        "applied_write_refused"
+    } else {
+        // (e) Anything else is a finding.
+        panic!("unexpected result: {run_outcome} / {run_cause}");
+    };
+
+    // (f) The rig is clean for the other gates.
+    assert!(
+        remaining.is_empty(),
+        "a production translator is left on the rig: {remaining:?}"
+    );
+    eprintln!(
+        "PASS live_queued_config_save_during_apply in {:.1}s ({branch})",
         started.elapsed().as_secs_f64()
     );
 }
