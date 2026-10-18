@@ -1590,7 +1590,14 @@ fn render_deploy_rollback_human(
         result.mode,
         result.outcome.as_str()
     );
-    println!("rolled back run {}", result.target_run_id);
+    use ignition_core::deploy::apply::RollbackKind;
+    match result.outcome {
+        RollbackKind::Restored => println!("rolled back run {}", result.target_run_id),
+        RollbackKind::Cleared => println!(
+            "cleared interrupted run {}: it had changed nothing, so nothing was restored",
+            result.target_run_id
+        ),
+    }
     println!("run {}", result.run_id);
     println!("run directory {}", result.run_dir);
     println!(

@@ -2764,3 +2764,352 @@ async fn rollback_bad_run_id_exit_2() {
     assert_eq!(read_tree(&data), before);
     assert!(!repo.join(".ign").exists());
 }
+
+/// Plant the journal a killed apply leaves for `run` on the local host: the
+/// run's own record supplies the touched set and the pre-run fingerprint, the
+/// phase is `written` (every move done, not finalized). The snapshot the
+/// recovery restores from is the one the apply took.
+fn plant_journal(data: &Path, run: &str) {
+    plant_journal_at(
+        data,
+        run,
+        ignition_core::deploy::apply::journal::JournalPhase::Written,
+    );
+}
+
+/// [`plant_journal`] at an explicit phase.
+fn plant_journal_at(
+    data: &Path,
+    run: &str,
+    phase: ignition_core::deploy::apply::journal::JournalPhase,
+) {
+    use ignition_core::deploy::apply::journal::Journal;
+    let deploy_dir = data.join("ign-deploy/tracer-gw/dev");
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(deploy_dir.join("snapshots").join(run).join("record.json"))
+            .expect("the run's record"),
+    )
+    .expect("record.json is JSON");
+    let mut touched: Vec<String> = record["touched"]
+        .as_array()
+        .expect("touched")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path").to_string())
+        .collect();
+    touched.sort();
+    let journal = Journal {
+        schema_version: 1,
+        run_id: run.to_string(),
+        gateway: "tracer-gw".to_string(),
+        mode: "dev".to_string(),
+        phase,
+        pre_fingerprint: record["pre_fingerprint"]
+            .as_str()
+            .expect("pre_fingerprint")
+            .to_string(),
+        touched,
+    };
+    std::fs::write(deploy_dir.join("journal.json"), journal.to_bytes()).expect("plant journal");
+}
+
+#[tokio::test]
+async fn journal_blocks_cli_then_recovers() {
+    let (_scratch, repo, data) = apply_tracer();
+    let before = config_tree(read_tree(&data));
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+    plant_journal(&data, &run);
+    let planted = read_tree(&data);
+    let requests = seen_requests(&server).await.len();
+    let command = format!("ign deploy rollback --run {run} --env dev");
+
+    // `deploy plan` refuses.
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_journal_present");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains(&command), "{message}");
+
+    // `deploy apply` refuses (Decision C is met by the flag; the journal is
+    // checked before the hash).
+    let out = run_apply(&server, &repo, &"0".repeat(64), &[]).await;
+    assert_eq!(out.status.code(), Some(6));
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_journal_present");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains(&command)
+    );
+
+    // A rollback of another run refuses the same way.
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, "20261016T000000Z-aaaaaa", true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(6));
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_journal_present");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains(&command)
+    );
+
+    assert_eq!(read_tree(&data), planted, "the refusals wrote nothing");
+    assert_eq!(
+        seen_requests(&server).await.len(),
+        requests,
+        "and sent nothing to the gateway"
+    );
+
+    // The recovery command the message printed recovers the run.
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["outcome"], "restored", "{envelope}");
+    assert_eq!(envelope["data"]["target_run_id"], run);
+    assert_eq!(config_tree(read_tree(&data)), before);
+    assert!(
+        !data.join("ign-deploy/tracer-gw/dev/journal.json").exists(),
+        "the journal is gone"
+    );
+
+    // The next plan exits 0 and sees the pre-apply difference again.
+    let (_cfg, mut cmd) = ign();
+    let out = plan_json(&repo, &mut cmd);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).expect("plan");
+    assert_eq!(plan["data"]["summary"]["has_changes"], true, "{plan}");
+}
+
+/// Change the live unit once more after the apply (a Designer edit, say).
+fn edit_live_unit(data: &Path) {
+    let config = data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    let mut bytes = std::fs::read(&config).expect("live config");
+    bytes.extend_from_slice(b"\n\n");
+    std::fs::write(config, bytes).expect("edit the live unit");
+}
+
+#[tokio::test]
+async fn rollback_live_changed_exit_6() {
+    let (_scratch, repo, data) = apply_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+    edit_live_unit(&data);
+    let edited = read_tree(&data);
+    let requests = seen_requests(&server).await.len();
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "a refusal prints no stdout");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "deploy_live_changed");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("POSTGRES"),
+        "names the changed file: {err}"
+    );
+    assert_eq!(read_tree(&data), edited, "nothing was restored");
+    assert_eq!(
+        seen_requests(&server).await.len(),
+        requests,
+        "no lock or scan request"
+    );
+}
+
+#[tokio::test]
+async fn rollback_discard_live_changes_exit_0() {
+    let (_scratch, repo, data) = apply_tracer();
+    let before = config_tree(read_tree(&data));
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+    edit_live_unit(&data);
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .arg("--discard-live-changes")
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["outcome"], "restored", "{envelope}");
+    let discarded: Vec<&str> = envelope["data"]["discarded_live_changes"]
+        .as_array()
+        .expect("discarded_live_changes")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        discarded.iter().any(|p| p.contains("POSTGRES")),
+        "{discarded:?}"
+    );
+    assert_eq!(
+        config_tree(read_tree(&data)),
+        before,
+        "restored over the edit"
+    );
+    // The discarded paths are recorded in the rollback's run directory.
+    let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).expect("run.json"))
+            .expect("run.json is JSON");
+    assert!(
+        run_json["discarded_live_changes"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "{run_json}"
+    );
+}
+
+#[tokio::test]
+async fn rollback_human_output() {
+    let (_scratch, repo, data) = apply_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, false, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "rollback tracer-gw (dev, mode dev): restored",
+        "{stdout}"
+    );
+    assert_eq!(lines[1], format!("rolled back run {run}"), "{stdout}");
+    assert!(lines[2].starts_with("run "), "{stdout}");
+    assert!(lines[3].starts_with("run directory "), "{stdout}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" restored, ") && l.ends_with(" deleted")),
+        "{stdout}"
+    );
+    // Progress rides stderr under its own prefix; stdout carries none of it.
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.starts_with("ign deploy rollback: ")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("ign deploy apply:"), "{stderr}");
+    assert!(stderr.contains("scan-lock taken for 176 s"), "{stderr}");
+    assert!(stderr.contains("snapshot restored"), "{stderr}");
+    assert!(!stdout.contains("ign deploy rollback:"), "{stdout}");
+}
+
+#[tokio::test]
+async fn journal_recovery_clears_a_run_that_changed_nothing() {
+    use ignition_core::deploy::apply::journal::JournalPhase;
+    let (_scratch, repo, data) = apply_tracer();
+    let before = config_tree(read_tree(&data));
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+    // Put the host back to its pre-apply state, then leave the journal a run
+    // killed before its first move would leave (D-10).
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(out.status.code(), Some(0));
+    plant_journal_at(&data, &run, JournalPhase::Ready);
+    let journal = data.join("ign-deploy/tracer-gw/dev/journal.json");
+    assert!(journal.is_file());
+    let requests = seen_requests(&server).await.len();
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, false, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("tracer-gw (dev, mode dev): cleared"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("cleared interrupted run {run}")),
+        "{stdout}"
+    );
+    assert!(!journal.exists(), "the journal is removed");
+    assert_eq!(
+        config_tree(read_tree(&data)),
+        before,
+        "nothing was restored"
+    );
+    let seen = seen_requests(&server).await;
+    assert!(
+        !seen[requests..].iter().any(|r| r.contains("scan")),
+        "a cleared run is not scanned: {seen:?}"
+    );
+}

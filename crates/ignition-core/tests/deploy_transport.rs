@@ -2848,11 +2848,14 @@ mod sftp_mirror {
     }
 }
 
-/// No Phase 22 verb or surface can reach the write half (T-22-30): the three
-/// sources that dispatch verbs name none of its identifiers. `deploy_plan`,
-/// `deploy_pull` and `deploy_verify` live in `actions/deploy.rs`, receive a
-/// `Box<dyn TreeReader>` from `for_node`, and the CLI and MCP surfaces only
-/// call those actions.
+/// No read-only verb or surface can reach the write half (T-22-30, T-23-59):
+/// the three sources that dispatch the read-only verbs name none of its
+/// identifiers. `deploy_plan`, `deploy_pull` and `deploy_verify` live in
+/// `actions/deploy.rs`, receive a `Box<dyn TreeReader>` from `for_node`, and
+/// the CLI and MCP surfaces only call those actions. Phase 23 added the
+/// apply host (`ApplyHost`, `apply_host_for_node`) to the forbidden names: the
+/// write verbs reach it only through `actions/deploy_apply.rs`, which builds
+/// it (`apply_host_is_confined`, run at the end of this test).
 #[test]
 fn write_half_unreachable() {
     let sources: [(&str, &str); 3] = [
@@ -2875,14 +2878,82 @@ fn write_half_unreachable() {
         "StagingMode",
         ".stage(",
         ".commit(",
+        "ApplyHost",
+        "apply_host_for_node",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
         for identifier in forbidden {
             assert!(
                 !text.contains(identifier),
-                "{file} names `{identifier}`: no Phase 22 verb or surface may reach the transport write half"
+                "{file} names `{identifier}`: no read-only verb or surface (plan, pull, verify, the CLI dispatch, the MCP bridge) may reach the transport write half or the apply host"
             );
         }
+    }
+    apply_host_is_confined();
+}
+
+/// Every `.rs` file below `dir`, depth first.
+fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The positive half of `write_half_unreachable` (T-23-59): the apply host is
+/// built in exactly three places. Only files under `deploy/apply/`,
+/// `deploy/transport/` and `actions/deploy_apply.rs` name `ApplyHost` or
+/// `apply_host_for_node`; the CLI crate names neither, so a verb that wants
+/// the write half must go through `actions/deploy_apply.rs`.
+fn apply_host_is_confined() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&manifest.join("src"), &mut files);
+    rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
+    let allowed = [
+        "ignition-core/src/deploy/apply/",
+        "ignition-core/src/deploy/transport/",
+        "ignition-core/src/actions/deploy_apply.rs",
+    ];
+    let mut naming = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !(text.contains("ApplyHost") || text.contains("apply_host_for_node")) {
+            continue;
+        }
+        let shown = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            allowed.iter().any(|ok| shown.contains(ok)),
+            "{shown} names `ApplyHost` or `apply_host_for_node` but is outside deploy/apply/, \
+             deploy/transport/ and actions/deploy_apply.rs"
+        );
+        naming.push(shown);
+    }
+    // The walk really saw the three places (a path typo would make the
+    // confinement check vacuous).
+    for expected in allowed {
+        assert!(
+            naming.iter().any(|shown| shown.contains(expected)),
+            "no file under {expected} names the apply host: the walk is not looking where it should; saw {naming:?}"
+        );
     }
 }

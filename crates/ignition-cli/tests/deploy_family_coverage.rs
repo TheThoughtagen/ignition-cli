@@ -295,3 +295,84 @@ fn verify_verdict_exception_is_dated_and_documented() {
         "the verdict slug is not a CoreError slug"
     );
 }
+
+/// The text of a `### ` section of the README, from its heading line to the
+/// next `### ` or `## ` heading (CRLF-safe).
+fn subsection(heading_line: &str) -> String {
+    let mut lines = README.lines();
+    let mut out = Vec::new();
+    for line in lines.by_ref() {
+        if line == heading_line {
+            break;
+        }
+    }
+    for line in lines {
+        if line.starts_with("### ") || line.starts_with("## ") {
+            break;
+        }
+        out.push(line);
+    }
+    assert!(!out.is_empty(), "README has no `{heading_line}` section");
+    // Whitespace runs collapse, so a phrase the README wraps still matches.
+    out.join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 23-14 (DAPL-08, DAPL-09): the `deploy rollback` section agrees with the
+/// `deploy apply` section on the recovery command, snapshot removal and the
+/// hand-deleted journal; carries the Linux live gap (FA-23-05) and the 176 s
+/// wait after an ssh drop; and leaves the dated apply exception alone (a
+/// rollback has no verdict exit).
+#[test]
+fn rollback_section_agrees_with_apply_section() {
+    let apply = subsection("### `deploy apply`");
+    let rollback = subsection("### `deploy rollback`");
+    assert_eq!(
+        README.matches("\n### `deploy rollback`").count(),
+        1,
+        "exactly one rollback section"
+    );
+    let command = "ign deploy rollback --run <id> --env <env>";
+    assert!(apply.contains(command), "the apply section names {command}");
+    assert!(
+        rollback.contains(command),
+        "the rollback section names {command}"
+    );
+    // Removing a snapshot makes a run unrollbackable: said once, in the
+    // apply section; the rollback section points to it.
+    assert!(apply.contains("can no longer be rolled back"));
+    assert!(rollback.contains("Runs are never pruned"));
+    // A journal is deleted by hand only when `rollback_failed` says so.
+    assert!(apply.contains("Never delete a `journal.json` by hand unless the"));
+    assert!(rollback.contains("rollback_failed"));
+    assert!(rollback.contains("delete the journal at the path"));
+    // The Linux live gap and the ssh-drop wait.
+    assert!(rollback.contains("FA-23-05"));
+    assert!(rollback.contains("unproven against a live host"));
+    assert!(rollback.contains("176 s"));
+    assert!(rollback.contains("After an ssh drop"));
+    assert!(apply.contains("**After an ssh drop.**"));
+    // The recovery states the D-09..D-12 rules and the windows A9 and A10.
+    for needle in [
+        "cleared",
+        "interrupted_run",
+        "`--discard-live-changes`",
+        "A9",
+        "A10",
+        "no Ctrl-C handler",
+    ] {
+        assert!(rollback.contains(needle), "rollback section lacks {needle}");
+    }
+    // The dated exception covers apply only.
+    assert!(
+        !rollback.contains("deploy_rolled_back"),
+        "rollback has no verdict slug"
+    );
+    let plan = subsection("### `deploy plan`");
+    assert!(
+        plan.contains("deploy_journal_present") && plan.contains("`deploy rollback`"),
+        "`deploy plan` says it refuses over a journal"
+    );
+}

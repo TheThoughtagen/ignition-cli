@@ -2560,6 +2560,11 @@ from the target file, used as a label only. The host is read through
 naming `nodes.master`; a host that cannot be read exits 4 `transport_failed`
 naming `nodes.master`. A read failure is never treated as an empty gateway.
 
+**A journal blocks the plan.** While an interrupted `deploy apply` has left its
+`journal.json` on the host, `deploy plan` refuses with `deploy_journal_present`
+(exit 6) before it reads the collections, and the message prints the recovery
+command; see [`deploy rollback`](#deploy-rollback).
+
 **Exit 0 always.** A plan that finds changes still exits 0 (the success
 envelope carries `data.summary.has_changes`); only a refusal exits non-zero.
 
@@ -3148,6 +3153,123 @@ keys listed in the Commands row.
 `scan_lock_held`, `rollback_failed`, and for a **rolled-back** apply, which prints
 its envelope first; see
 [the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18).
+
+### `deploy rollback`
+
+`ign deploy rollback --env <ENV> --run <ID> [--repo DIR] [--discard-live-changes]
+[--designers fail|wait|proceed] [--designers-timeout SECS]` puts a past run back:
+it restores the pre-run files from the run's on-box snapshot into the **master**
+node's mode collection, deletes the files that run created, scans, and records
+the rollback. It also **recovers an interrupted run** (below). The Commands row
+has the flag summary. The verb is **guarded** (it needs the global `--yes`; the
+refusal message names what it would do) and is **not in the MCP catalog**.
+
+**From a fresh process.** `--run` is the `run_id` that `deploy apply` printed, or
+the name of its run directory. Only `targets/<ENV>.yaml` is read: the declared
+tree is not rendered, and no run directory has to exist (the on-box record is
+the source of truth; a local run directory that does exist is cross-checked
+against it). A malformed `--run` is `invalid_input` (exit 2) before the target
+file, any host or any gateway is touched.
+
+**Order.** Each step refuses before the next one starts, and the refusals up to
+the confirmation write nothing:
+
+1. A journal of **another** run is `deploy_journal_present` (exit 6) and prints
+   the recovery command for that run (below).
+2. The run's on-box record is read. A record that is missing or damaged, for
+   another gateway or mode, still `applying` with no journal, or already rolled
+   back is `deploy_run_invalid` (exit 6), naming the run; a run is rolled back
+   once.
+3. Files the run touched that **changed after it** (a later apply, a Designer
+   save) are `deploy_live_changed` (exit 6), naming the first ten paths and the
+   count, unless `--discard-live-changes` is given. With the flag they are
+   overwritten, and listed in the rollback's `run.json`, its `events.ndjson`
+   and `result.json` (`discarded_live_changes`, `[]` when none). Files the run
+   never touched are left alone and never block. Rolling back an older run
+   while a newer run changed the same file therefore refuses; roll back the
+   newer run first, or discard.
+4. Without `--yes`, `confirmation_required` (exit 2) prints the run, the
+   gateway, the mode, how many files it would restore and delete, the
+   `plan_sha256` of the run, and any live change it would overwrite.
+5. The rollback gets a run directory of its own (`kind: rollback`, same layout
+   and `.ign/` ignore rule as [`deploy apply`](#deploy-apply)), the same seven
+   preflights and `--designers` policy as an apply (the `hold_budget` check is
+   sized by the run's touched set), the same one 176 s lock hold, then the
+   restore, the config scan and the on-box record is marked `rolled_back` with
+   the rolling-back run's id. No `.gwbk` is taken: the restore point is the
+   on-box snapshot.
+
+Runs and snapshots are never pruned, and a run whose snapshot was removed can no
+longer be rolled back: see "Runs are never pruned" under
+[`deploy apply`](#deploy-apply), which also says when `journal.json` may be
+deleted by hand. The restart-pending lists are reported, never acted on, as for
+an apply.
+
+**Recovering an interrupted run (DAPL-09).** An apply that was killed after it
+began leaves `journal.json` on the host. While it is there, `deploy plan`,
+`deploy apply` and `deploy rollback --run <another run>` all refuse with
+`deploy_journal_present`, and the message ends with the exact command that
+recovers it:
+
+```text
+ign deploy rollback --run <id> --env <env>
+```
+
+That command is the whole recovery; no flag is needed and none discards a
+journal (D-09, D-12). It skips the live-change check, because a killed run has
+no post-run state to compare against (D-11), and records the files' hashes as it
+found them in the new run's `interrupted_run` event. What it does depends on the
+journal:
+
+- A run that died **before any file moved**, whose touched files are still what
+  they were before the run, is cleared: the journal, the partial snapshot and
+  the staging are removed, nothing is restored and nothing is scanned
+  (`data.outcome` `cleared`, D-10).
+- Anything else is restored from the snapshot exactly as a rollback is
+  (`restored`). That includes a journal whose files a foreign edit changed
+  before the first move: the snapshot overwrites that edit.
+- The post-verify window (A9): an apply killed after a **green** verify and
+  before it recorded itself leaves a journal for a good deploy. Recovery cannot
+  tell the difference and restores the pre-apply files. Re-run the apply
+  afterwards.
+- Recovery reads the snapshot and checks it against the journal before it
+  restores anything. A lost or corrupt snapshot is `rollback_failed` (exit 6)
+  with the journal left in place; restore the files from the run's `.gwbk` or
+  from the run-directory snapshot by hand, then delete the journal at the path
+  the message prints. That message is the only case in which the journal is
+  deleted by hand (D-12).
+
+A recovery started right after a dropped ssh connection should wait out the 176 s
+hold first (see "After an ssh drop" under [`deploy apply`](#deploy-apply)).
+There is no Ctrl-C handler in v1.6 (A10): an interrupt leaves the lock to expire
+with its hold and, once the journal exists, a journal to recover as above.
+
+**Hosts.** The local host is covered by the CLI tests, and the Windows ssh
+host's script was run on a live Windows host; the Windows notes under
+[`deploy apply`](#deploy-apply) apply to the restore too. **Linux ssh is
+unproven against a live host (FA-23-05, OQ8):** `commit.sh` and its restore
+operation pass the shared host conformance table under a local `sh` (dash, with
+`shasum`) only. The file modes it sets (0644 files, 0755 directories), the move
+of staged files when the account home and the gateway data directory are on
+different file systems (a copy and delete, not an atomic rename) and the sha
+tool on a real Linux host have not been captured. Run a Linux ssh apply or
+rollback against a disposable gateway first, and keep the `.gwbk`.
+
+**Output.** Human output is `rollback <gateway> (<env>, mode <mode>): <outcome>`,
+then `rolled back run <id>`, `run <id>`, `run directory <dir>`, the counts
+restored and deleted, any discarded live changes and the restart lines; progress
+lines are prefixed `ign deploy rollback:` on stderr, in human mode only. With
+`--json`, `data` carries the keys listed in the Commands row; `data.ok` is
+always `true` because a rollback that cannot restore is an error envelope.
+
+**Exit codes.** 0 `restored` or `cleared`. 2 `confirmation_required` and
+`invalid_input`. 3, 4 and 5 for configuration, network (including
+`transport_failed`) and authentication. 6 for `deploy_journal_present`,
+`deploy_run_invalid`, `deploy_live_changed`, `deploy_preflight_failed`,
+`scan_lock_held` and `rollback_failed`. A rollback has no verdict exit: unlike
+`deploy apply`, it never ends in a success envelope with a non-zero code, so
+[the rolled-back verdict exception](#the-deploy-apply-rolled-back-verdict-exception-2026-10-18)
+does not apply to it.
 
 ## Linting (`ign lint`)
 

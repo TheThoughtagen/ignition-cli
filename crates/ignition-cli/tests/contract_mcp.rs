@@ -1126,6 +1126,106 @@ async fn protocol_errors_map_correctly_and_survive_malformed_input() {
     );
 }
 
+/// Edge DSURF-02 concurrency (23-14, T-23-58): a `tools/call` naming
+/// `deploy_apply` or `deploy_rollback` is answered as an unknown tool and
+/// runs nothing, whatever else the server is doing. The fake gateway answers
+/// every request slowly, so a `status` call is in flight while the two write
+/// calls arrive; both are answered at once with -32601 naming the tool, and
+/// the gateway never sees a lock, scan, backup or restart request.
+#[tokio::test]
+async fn mcp_tools_call_write_verbs_unknown() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    write_wiremock_profile_config(&config, &server.uri());
+    let mut client =
+        ScriptedClient::spawn_with_config(&config, dir, &[("IGNITION_TOKEN", MOCK_TOKEN)]);
+    let tools = client.tools();
+    for name in ["deploy_apply", "deploy_rollback"] {
+        assert!(
+            !tools.iter().any(|t| t["name"] == name),
+            "{name} is not in the catalog"
+        );
+    }
+
+    // A slow call is in flight.
+    client.request(
+        json!(30),
+        "tools/call",
+        json!({ "name": "status", "arguments": {} }),
+    );
+    let started = Instant::now();
+    let calls = [
+        (
+            31,
+            "deploy_apply",
+            json!({ "env": "dev", "plan-sha256": "0".repeat(64), "confirm": true }),
+        ),
+        (
+            32,
+            "deploy_rollback",
+            json!({ "env": "dev", "run": "20261016T000000Z-aaaaaa", "confirm": true }),
+        ),
+    ];
+    for (id, name, arguments) in &calls {
+        client.request(
+            json!(id),
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        );
+    }
+    for (id, name, _) in &calls {
+        let response = client.expect_response(&json!(id), RESPONSE_BUDGET_SECS);
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32601),
+            "{name} is an unknown tool: {response}"
+        );
+        assert!(
+            response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains(*name)),
+            "the error names {name}: {response}"
+        );
+        assert!(response.get("result").is_none(), "{name} ran nothing");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the refusals did not wait behind the slow call: {:?}",
+        started.elapsed()
+    );
+
+    // Let the slow call finish, so every request it makes is recorded.
+    let _ = client.expect_response(&json!(30), RESPONSE_BUDGET_SECS);
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !paths.is_empty(),
+        "the in-flight status call reached the gateway, so the check below looks at something"
+    );
+    for forbidden in ["scan", "lock", "backup", "restart", "webdev", "resource"] {
+        assert!(
+            !paths.iter().any(|p| p.contains(forbidden)),
+            "the gateway saw {forbidden}: {paths:?}"
+        );
+    }
+}
+
 /// SC-5, THE PERMANENT STARVATION PIN: with an in-flight tools/call
 /// hung on a dead gateway (a bound-but-never-accepting listener — the
 /// TCP connect SUCCEEDS into the kernel backlog, so the reqwest client
