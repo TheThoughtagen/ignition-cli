@@ -442,7 +442,7 @@ Plans:
 
 **Wave 17** *(blocked on Wave 16 completion)*
 
-- [ ] 23-21-PLAN.md — `deploy apply` README section and dated rolled-back verdict exception; gate-exit matrix through the binary (DAPL-01, DAPL-02, DAPL-07)
+- [x] 23-21-PLAN.md — `deploy apply` README section and dated rolled-back verdict exception; gate-exit matrix through the binary (DAPL-01, DAPL-02, DAPL-07)
 
 **Wave 18** *(blocked on Wave 17 completion)*
 
@@ -515,7 +515,7 @@ Plans:
 | 20. Config API Client | v1.6 | 6/6 | Complete    | 2026-10-12 |
 | 21. Deploy Render | v1.6 | 9/9 | Complete    | 2026-10-13 |
 | 22. Transport, Plan, Pull & Verify | v1.6 | 16/16 | Complete    | 2026-10-15 |
-| 23. Guarded Apply & Rollback | v1.6 | 17/21 | In Progress|  |
+| 23. Guarded Apply & Rollback | v1.6 | 18/21 | In Progress|  |
 | 24. Redundant Pair | v1.6 | 0/? | Not started | — |
 | 25. Guarded Project Deploy | v1.6 | 0/? | Not started | — |
 
