@@ -718,7 +718,7 @@ pub enum DeployCommand {
     /// more files (writes plus deletes) is refused by the `hold_budget`
     /// preflight. There is no flag that skips the plan hash, the verify or
     /// the rollback. Staging a large tree is silent on the wire and can take
-    /// minutes; progress lines go to stderr
+    /// minutes; in human mode progress lines go to stderr
     Apply {
         /// Environment name; selects `targets/<ENV>.yaml`
         #[arg(long, value_name = "ENV")]
