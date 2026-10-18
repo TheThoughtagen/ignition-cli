@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 23 (guarded-apply-rollback) — EXECUTING
 Plan: 21 of 21 done (23-16, the live gates, completed 2026-10-18); phase verification is next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review
 Status: Phase 23 plans complete, ready for verification
-Last activity: 2026-10-18 - Completed quick task 261018-nmf: Make the deploy apply README heading check line-ending agnostic (windows-latest CRLF)
+Last activity: 2026-10-18 - Quick task 261018-nr2 found a phase 23 gap: POSIX sftp listing parser rejects Ubuntu OpenSSH bare-name output
 
 Progress: [██████████] 100%
 
@@ -133,6 +133,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 261018-lqg | Live rig test: apply with a queued config save during the scan-lock hold | 2026-10-18 | 12754c9 | [261018-lqg-live-rig-test-apply-with-a-queued-config](./quick/261018-lqg-live-rig-test-apply-with-a-queued-config/) |
 | 261018-n1b | Fix headless build: IsTerminal import gated on tui feature | 2026-10-18 | d55502d | [261018-n1b-fix-headless-build-isterminal-import-gat](./quick/261018-n1b-fix-headless-build-isterminal-import-gat/) |
 | 261018-nmf | Make the deploy apply README heading check line-ending agnostic (windows-latest CRLF) | 2026-10-18 | 17b1730 | [261018-nmf-make-the-deploy-apply-readme-heading-che](./quick/261018-nmf-make-the-deploy-apply-readme-heading-che/) |
+| 261018-nr2 | Live ssh gate for the Linux ApplyHost (commit.sh) against ign-lnx-836 (incomplete: sftp listing gap) | 2026-10-18 | 1372a55 | [261018-nr2-live-ssh-gate-for-the-linux-applyhost-co](./quick/261018-nr2-live-ssh-gate-for-the-linux-applyhost-co/) |
 
 ## Session Continuity
 
