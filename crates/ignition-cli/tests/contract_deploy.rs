@@ -1875,3 +1875,513 @@ fn apply_flags_are_exactly_these() {
         "--yes is a global flag"
     );
 }
+
+/// The system name the apply gateway's REST answer and the host's
+/// `system-properties` share (the `wrong_target` preflight compares them).
+const APPLY_SYSTEM_NAME: &str = "apply-gw";
+
+/// A small valid ZIP standing in for a `.gwbk`.
+fn apply_gwbk_zip() -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("data.bin", options).expect("member");
+    writer.write_all(&[7u8; 4096]).expect("write");
+    writer.finish().expect("finish").into_inner()
+}
+
+/// What the stateful apply gateway remembers between requests.
+struct ApplyGwState {
+    lock_held: bool,
+    lock_stamp: i64,
+    scan_ts: i64,
+    pending_scan_ts: Option<i64>,
+    active_reads: u32,
+}
+
+/// `changed_tracer()` made ready for an apply: the host's
+/// `system-properties` carry [`APPLY_SYSTEM_NAME`], the repo is a git repo
+/// whose `.gitignore` holds `.ign/`. Returns `(scratch, repo, data_dir)`.
+fn apply_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (scratch, repo, data) = changed_tracer();
+    let props = data.join("config/resources/core/ignition/system-properties");
+    std::fs::create_dir_all(&props).expect("system-properties dir");
+    std::fs::write(
+        props.join("config.json"),
+        format!("{{\"systemName\":\"{APPLY_SYSTEM_NAME}\"}}"),
+    )
+    .expect("system-properties config");
+    std::fs::write(repo.join(".gitignore"), ".ign/\n").expect(".gitignore");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .status()
+        .expect("git init");
+    assert!(init.success());
+    (scratch, repo, data)
+}
+
+/// A stateful mock gateway for `deploy apply` (23-13; 23-21 reuses it). Every
+/// route the engine calls is served: the scan-lock (acquire, then info with a
+/// remaining counter, free again once a scan is requested), the config scan
+/// (inactive, then active for one read after a trigger, then inactive with an
+/// advanced timestamp), gateway identity and mode, an empty Designer list, a
+/// small valid `.gwbk`, an empty restart-pending list, the project scan, and
+/// the REST view of the translator and the alarm singleton, read from the
+/// local data directory at the time of the request (so a restore is seen).
+/// `log_items` are the lines the gateway log returns; a "will not be
+/// loaded" line for a written resource turns the verify red.
+async fn mount_apply_gateway(server: &wiremock::MockServer, data: &Path, log_items: Vec<Value>) {
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, Request, ResponseTemplate};
+
+    let state = Arc::new(Mutex::new(ApplyGwState {
+        lock_held: false,
+        lock_stamp: 1_000,
+        scan_ts: 1_792_000_000_000,
+        pending_scan_ts: None,
+        active_reads: 0,
+    }));
+
+    let s = state.clone();
+    Mock::given(method("POST"))
+        .and(path("/data/api/v1/scan-lock/config"))
+        .respond_with(move |_: &Request| {
+            let mut st = s.lock().expect("state");
+            st.lock_held = true;
+            st.lock_stamp += 1;
+            ResponseTemplate::new(200)
+        })
+        .mount(server)
+        .await;
+    let s = state.clone();
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/scan-lock/config"))
+        .respond_with(move |_: &Request| {
+            let st = s.lock().expect("state");
+            if st.lock_held {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "timestamp": st.lock_stamp,
+                    "remaining": 170,
+                    "actor": "apply-test"
+                }))
+            } else {
+                ResponseTemplate::new(204)
+            }
+        })
+        .mount(server)
+        .await;
+    let s = state.clone();
+    Mock::given(method("POST"))
+        .and(path("/data/api/v1/scan/config"))
+        .respond_with(move |_: &Request| {
+            let mut st = s.lock().expect("state");
+            st.lock_held = false;
+            st.pending_scan_ts = Some(st.scan_ts + 1_000);
+            st.active_reads = 1;
+            ResponseTemplate::new(200)
+        })
+        .mount(server)
+        .await;
+    let s = state.clone();
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/scan/config"))
+        .respond_with(move |_: &Request| {
+            let mut st = s.lock().expect("state");
+            if st.active_reads > 0 {
+                st.active_reads -= 1;
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "scanActive": true,
+                    "lastScanTimestamp": st.scan_ts,
+                    "lastScanDuration": 300
+                }));
+            }
+            if let Some(next) = st.pending_scan_ts.take() {
+                st.scan_ts = next;
+            }
+            ResponseTemplate::new(200).set_body_json(json!({
+                "scanActive": false,
+                "lastScanTimestamp": st.scan_ts,
+                "lastScanDuration": 300
+            }))
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/data/api/v1/scan/projects"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/gateway-info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": APPLY_SYSTEM_NAME,
+            "deploymentMode": "dev",
+            "ignitionVersion": "8.3.6 (b2026042713)"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/designers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/backup"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "content-type",
+                    "application/x-ignition-gateway-backup;charset=utf-8",
+                )
+                .set_body_bytes(apply_gwbk_zip()),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/restart-tasks/pending"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pending": []})))
+        .mount(server)
+        .await;
+
+    // The REST view of the live tree, read when the request arrives.
+    let live = data.to_path_buf();
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/list/ignition/database-translator",
+        ))
+        .respond_with(move |_: &Request| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{
+                    "type": "ignition/database-translator",
+                    "name": "POSTGRES",
+                    "collection": "dev",
+                    "config": rest_config(&live, NAMED_TRANSLATOR)
+                }],
+                "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+            }))
+        })
+        .mount(server)
+        .await;
+    let live = data.to_path_buf();
+    Mock::given(method("GET"))
+        .and(path(
+            "/data/api/v1/resources/singleton/ignition/general-alarm-settings",
+        ))
+        .respond_with(move |_: &Request| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "type": "ignition/general-alarm-settings",
+                "collection": "dev",
+                "config": rest_config(&live, "ignition/general-alarm-settings")
+            }))
+        })
+        .mount(server)
+        .await;
+    // The cheap "has the gateway logged since the scan?" probe finds a line,
+    // so the log settle wait is skipped.
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"timestamp": 1_792_999_999_999_i64, "loggerName": "x", "level": "INFO", "message": "m"}],
+            "metadata": {"total": 1, "matching": 1, "limit": 1, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/api/v1/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": log_items,
+            "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The request paths the mock gateway saw, as `METHOD /path`.
+async fn seen_requests(server: &wiremock::MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+/// `ign --json --yes deploy apply` over `repo`, the mock at `url`.
+fn apply_args(repo: &Path, hash: Option<&str>, json: bool, yes: bool) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if json {
+        args.push("--json".into());
+    }
+    if yes {
+        args.push("--yes".into());
+    }
+    for a in ["deploy", "apply", "--env", "dev", "--repo"] {
+        args.push(a.into());
+    }
+    args.push(repo.as_os_str().to_owned());
+    if let Some(hash) = hash {
+        args.push("--plan-sha256".into());
+        args.push(hash.into());
+    }
+    args
+}
+
+#[tokio::test]
+async fn apply_applied_exit_0() {
+    let (_scratch, repo, data) = apply_tracer();
+    let hash = plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(apply_args(&repo, Some(&hash), true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope on stdout");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["profile"], "dev");
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "applied");
+    assert_eq!(data_json["ok"], true);
+    assert!(data_json["slug"].is_null());
+    assert!(data_json["cause"].is_null());
+    assert_eq!(data_json["plan_sha256"], hash);
+    assert_eq!(data_json["restart_pending"], serde_json::json!([]));
+    assert_eq!(data_json["restart_pending_new"], serde_json::json!([]));
+    assert_eq!(data_json["skip_gwbk"], false);
+    let gwbk = data_json["gwbk"].as_str().expect("a .gwbk was taken");
+    assert!(gwbk.ends_with(".gwbk"), "{gwbk}");
+    let written: Vec<&str> = data_json["written"]
+        .as_array()
+        .expect("written")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        written.iter().any(|p| p.ends_with("POSTGRES/config.json")),
+        "{written:?}"
+    );
+    let run_dir = PathBuf::from(data_json["run_dir"].as_str().expect("run dir"));
+    assert!(run_dir.is_dir(), "the run directory exists: {run_dir:?}");
+    assert!(run_dir.starts_with(repo.join(".ign")), "{run_dir:?}");
+    assert!(run_dir.join(gwbk).is_file());
+    // The host now holds the declared bytes: a second plan is empty.
+    let (_cfg, mut plan) = ign();
+    let out = plan_json(&repo, &mut plan);
+    let again: Value = serde_json::from_slice(&out.stdout).expect("plan");
+    assert_eq!(again["data"]["summary"]["has_changes"], false, "{again}");
+    let seen = seen_requests(&server).await;
+    assert!(
+        seen.iter().any(|r| r == "POST /data/api/v1/scan/config"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_rolled_back_exit_6() {
+    use serde_json::json;
+    let (_scratch, repo, data) = apply_tracer();
+    let hash = plan_hash(&repo);
+    let before = read_tree(&data);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(
+        &server,
+        &data,
+        vec![json!({
+            "timestamp": 1_792_999_999_000_i64,
+            "loggerName": "NamedResourceHandler-ignition/database-translator",
+            "level": "WARN",
+            "message": format!(
+                "Resource {NAMED_TRANSLATOR} does not have required UUID attribute, will not be loaded {VERIFY_CANARY}"
+            ),
+        })],
+    )
+    .await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(apply_args(&repo, Some(&hash), true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope on stdout");
+    assert_eq!(envelope["ok"], true, "a verdict, not an error envelope");
+    assert!(envelope.get("error").is_none());
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "rolled_back");
+    assert_eq!(data_json["ok"], false);
+    assert_eq!(data_json["slug"], "deploy_rolled_back");
+    assert_eq!(data_json["cause"], "verify_failed");
+    assert!(data_json["run_id"].is_string());
+    // The verdict names no log text.
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(VERIFY_CANARY));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(VERIFY_CANARY));
+    // The snapshot was restored: the configuration tree is what it was. The
+    // host keeps the run's record and snapshot below `ign-deploy/` (the
+    // record says `rolled_back`), which is not configuration.
+    let config_of = |tree: std::collections::BTreeMap<String, Vec<u8>>| {
+        tree.into_iter()
+            .filter(|(path, _)| path.starts_with("config/"))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        config_of(read_tree(&data)),
+        config_of(before),
+        "the config tree equals its pre-apply listing"
+    );
+    let after = read_tree(&data);
+    let record = after
+        .iter()
+        .find(|(path, _)| path.starts_with("ign-deploy/") && path.ends_with("/record.json"))
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .expect("the host keeps the run record");
+    assert!(record.contains("\"state\": \"rolled_back\""), "{record}");
+}
+
+#[tokio::test]
+async fn apply_noop_exit_0() {
+    let (_scratch, repo, data) = apply_tracer();
+    // Make the host equal to the render: drop the extra byte.
+    let config = data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    let mut bytes = std::fs::read(&config).expect("live config");
+    bytes.pop();
+    std::fs::write(&config, bytes).expect("equal again");
+    let hash = plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(apply_args(&repo, Some(&hash), true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let data_json = &envelope["data"];
+    assert_eq!(data_json["outcome"], "noop");
+    assert_eq!(data_json["ok"], true);
+    assert!(data_json["run_id"].is_null());
+    assert!(data_json["run_dir"].is_null());
+    assert!(!repo.join(".ign").exists(), "no .ign/ directory");
+    let seen = seen_requests(&server).await;
+    assert!(
+        seen.is_empty(),
+        "a no-op sends no lock, backup, scan or restart request: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_requires_plan_hash_when_noninteractive() {
+    let (_scratch, repo, data) = apply_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let before = read_tree(&data);
+    // No terminal under assert_cmd; --json is given as well.
+    for json in [true, false] {
+        let (_cfg, mut cmd) = verify_ign(&server.uri());
+        let out = cmd
+            .args(apply_args(&repo, None, json, true))
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "json={json}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if json {
+            assert_eq!(stderr_json(&out)["error"]["code"], "invalid_input");
+        } else {
+            assert!(stderr.contains("invalid input"), "{stderr}");
+        }
+        assert!(stderr.contains("Decision C"), "json={json}: {stderr}");
+    }
+    assert_eq!(
+        seen_requests(&server).await,
+        Vec::<String>::new(),
+        "no gateway contact"
+    );
+    assert_eq!(read_tree(&data), before);
+    assert!(!repo.join(".ign").exists());
+}
+
+#[tokio::test]
+async fn apply_human_output() {
+    let (_scratch, repo, data) = apply_tracer();
+    let hash = plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(apply_args(&repo, Some(&hash), false, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with("[profile:"))
+        .collect();
+    assert_eq!(
+        lines[0], "apply tracer-gw (dev, mode dev) via local: applied",
+        "{stdout}"
+    );
+    assert!(lines[1].starts_with("run "), "{stdout}");
+    assert!(lines[2].starts_with("run directory "), "{stdout}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" written, ") && l.ends_with(" deleted")),
+        "{stdout}"
+    );
+    assert!(lines.iter().any(|l| l.starts_with("backup ")), "{stdout}");
+    assert!(
+        lines.iter().any(|l| *l == format!("plan_sha256 {hash}")),
+        "{stdout}"
+    );
+    // Progress goes to stderr, prefixed; stdout carries none of it.
+    assert!(
+        stderr.lines().any(|l| l.starts_with("ign deploy apply: ")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("scan-lock taken for 176 s"), "{stderr}");
+    assert!(
+        stderr.contains("staging "),
+        "the staging notice precedes the upload: {stderr}"
+    );
+    assert!(!stdout.contains("ign deploy apply:"), "{stdout}");
+}

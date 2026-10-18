@@ -9,12 +9,19 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::actions::deploy::{Declared, DeployPlanResult, PlanOptions, deploy_plan, load_target};
+use std::time::Duration;
+
+use crate::actions::deploy::{
+    Declared, DeployPlanResult, PlanOptions, VerifyOptions, deploy_plan, load_target,
+};
+use crate::client::{DeployApi, GatewayApi};
 use crate::deploy::apply::gates::{
     GateFlags, GateOutcome, evaluate_gates, validate_drift_reason, validate_plan_sha256,
 };
+use crate::deploy::apply::hold::{HoldModel, SystemClock};
 use crate::deploy::apply::host::ApplyHost;
 use crate::deploy::apply::journal::RecoveryAction;
+use crate::deploy::apply::preflight::DesignersPolicy;
 use crate::deploy::apply::record::RunRecord;
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::apply::{
@@ -22,10 +29,13 @@ use crate::deploy::apply::{
     RollbackChecked, RollbackContext, RollbackKind, RollbackOptions, check_rollback, restore_set,
     run_apply, run_rollback,
 };
+use crate::deploy::apply::{ApplyObserver, ApplyOptions as EngineOptions};
 use crate::deploy::plan::PlanSummary;
 use crate::deploy::target::Target;
 use crate::deploy::transport::TreeReader;
+use crate::deploy::transport::apply_host_for_node;
 use crate::error::CoreError;
+use crate::poll::PollConfig;
 
 /// What `prepare` needs.
 #[derive(Debug, Clone, Default)]
@@ -190,6 +200,95 @@ pub async fn deploy_apply_execute(
     result.restart_pending = outcome.restart_pending;
     result.restart_pending_new = outcome.restart_pending_new;
     Ok(result)
+}
+
+/// The gateway surfaces a confirmed apply talks to.
+pub struct ApplySurfaces<'a> {
+    /// The master's REST surface (lock, scan, mode, read-back).
+    pub deploy: &'a dyn DeployApi,
+    /// The backup node's REST surface, when the target has a backup node.
+    pub backup_deploy: Option<&'a dyn DeployApi>,
+    /// The master's log, WebDev and Designer surface.
+    pub gateway: &'a dyn GatewayApi,
+}
+
+/// What a confirmed apply needs besides the prepared plan.
+#[derive(Debug, Clone)]
+pub struct ApplyRunOptions {
+    /// The `--base` the plan was drawn against.
+    pub base: Option<PathBuf>,
+    /// The gate flags the plan passed with.
+    pub gates: GateFlags,
+    /// The WebDev project the verify tag probes read through.
+    pub project: String,
+    /// `--designers` and `--designers-timeout`.
+    pub designers: DesignersPolicy,
+    /// `--skip-gwbk`.
+    pub skip_gwbk: bool,
+}
+
+/// Seconds between two reads of the scan status while a config scan runs.
+const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a config scan may take before the run rolls back with
+/// `scan_incomplete`. The longest scan measured (23-10) took under 1.6 s.
+const SCAN_WAIT: Duration = Duration::from_secs(120);
+
+/// Run a prepared apply against the master's host: the production entry of
+/// `ign deploy apply` after the confirmation (DAPL-01).
+///
+/// A no-op returns at once, touching neither the host nor the gateway. A
+/// ready plan builds the master's apply host here (so a caller never names
+/// the write half), takes the one measured hold ([`HoldModel::MEASURED`]: no
+/// override exists, D-02) and the real clock, and runs the engine. The
+/// engine's steps reach `observer` as they happen.
+pub async fn deploy_apply_run(
+    prepared: ApplyPrepared,
+    declared: &Declared,
+    repo: &Path,
+    reader: &dyn TreeReader,
+    surfaces: &ApplySurfaces<'_>,
+    opts: &ApplyRunOptions,
+    observer: &dyn ApplyObserver,
+) -> Result<DeployApplyResult, CoreError> {
+    if let ApplyPrepared::Noop(result) = prepared {
+        return Ok(result);
+    }
+    let host = apply_host_for_node(
+        repo,
+        &declared.target_file,
+        "nodes.master",
+        &declared.target.nodes.master,
+        &declared.target.gateway,
+        &declared.target.mode,
+    )?;
+    let ctx = ApplyContext {
+        declared,
+        repo,
+        reader,
+        host: host.as_ref(),
+        deploy: surfaces.deploy,
+        gateway: surfaces.gateway,
+        backup_deploy: surfaces.backup_deploy,
+        clock: &SystemClock,
+        observer,
+    };
+    let engine = EngineOptions {
+        base: opts.base.clone(),
+        gates: opts.gates.clone(),
+        project: opts.project.clone(),
+        hold: HoldModel::MEASURED,
+        poll: PollConfig {
+            subject: "config scan after apply".to_string(),
+            interval: SCAN_POLL_INTERVAL,
+            max: Duration::from_secs(2),
+            deadline: SCAN_WAIT,
+        },
+        verify: VerifyOptions::default(),
+        designers: opts.designers,
+        skip_gwbk: opts.skip_gwbk,
+    };
+    deploy_apply_execute(prepared, &ctx, &engine).await
 }
 
 // ============================================================================

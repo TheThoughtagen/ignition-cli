@@ -1574,6 +1574,133 @@ fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::Depl
     }
 }
 
+/// The progress prefix of `ign deploy apply` (stderr, human mode only).
+pub(crate) const APPLY_PROGRESS_PREFIX: &str = "ign deploy apply:";
+
+/// Prints one stderr progress line per engine step, prefixed
+/// [`APPLY_PROGRESS_PREFIX`]. Stdout stays the envelope (T-23-56). The
+/// engine reports no event before the sftp upload of a large tree, which is
+/// silent for up to about 9 minutes at 1,520 files (23-10), so the observer
+/// remembers the file count of `run_started` and announces the staging at
+/// the step that always precedes it (`gwbk_downloaded` or `gwbk_skipped`).
+/// Only ids, counts, codes and paths are printed (the events carry nothing
+/// else).
+#[derive(Default)]
+pub(crate) struct StderrApplyObserver {
+    files: std::sync::atomic::AtomicUsize,
+}
+
+impl ignition_core::deploy::apply::ApplyObserver for StderrApplyObserver {
+    fn event(&self, e: &ignition_core::deploy::apply::ApplyEvent) {
+        use ignition_core::deploy::apply::ApplyEvent;
+        use std::sync::atomic::Ordering;
+        if let ApplyEvent::RunStarted {
+            writes, deletes, ..
+        } = e
+        {
+            self.files.store(writes + deletes, Ordering::Relaxed);
+        }
+        for line in describe_apply_event(e, self.files.load(Ordering::Relaxed)) {
+            eprintln!("{APPLY_PROGRESS_PREFIX} {line}");
+        }
+    }
+}
+
+/// The progress lines of one engine event (without the prefix). `files` is
+/// the run's write plus delete count from `run_started`.
+pub(crate) fn describe_apply_event(
+    e: &ignition_core::deploy::apply::ApplyEvent,
+    files: usize,
+) -> Vec<String> {
+    use ignition_core::deploy::apply::ApplyEvent;
+    let staging = || {
+        format!(
+            "staging {files} file(s) on the host before the lock is taken: this step prints \
+             nothing until it ends and can take several minutes for a large tree"
+        )
+    };
+    match e {
+        ApplyEvent::RunStarted {
+            run_id,
+            writes,
+            deletes,
+        } => vec![format!(
+            "run {run_id} started: {writes} write(s), {deletes} delete(s)"
+        )],
+        ApplyEvent::PreflightChecks { checks } => vec![format!(
+            "preflight checks: {}",
+            checks
+                .iter()
+                .map(|(id, status)| format!("{id}={status}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )],
+        ApplyEvent::DesignersPoll { open } => {
+            vec![format!(
+                "waiting for Designer sessions to close: {open} open"
+            )]
+        }
+        ApplyEvent::DesignersProceed { sessions } => vec![format!(
+            "proceeding over {} open Designer session(s) (--designers proceed)",
+            sessions.len()
+        )],
+        ApplyEvent::GwbkDownloaded { bytes } => {
+            vec![format!("backup taken ({bytes} bytes)"), staging()]
+        }
+        ApplyEvent::GwbkSkipped => vec!["backup skipped (--skip-gwbk)".to_string(), staging()],
+        ApplyEvent::Staged { files } => vec![format!("staged {files} file(s)")],
+        ApplyEvent::LockAcquired { hold_s } => {
+            vec![format!("scan-lock taken for {hold_s} s")]
+        }
+        ApplyEvent::Committed { moved, deleted } => {
+            vec![format!("committed: {moved} moved, {deleted} deleted")]
+        }
+        ApplyEvent::LockVerdict { held } => vec![if *held {
+            "scan-lock still held".to_string()
+        } else {
+            "scan-lock lapsed before the scan".to_string()
+        }],
+        ApplyEvent::ScanDone => vec!["config scan complete".to_string()],
+        ApplyEvent::VerifyDone { ok } => {
+            vec![format!("verify {}", if *ok { "green" } else { "red" })]
+        }
+        ApplyEvent::VerifyChecks { checks } => vec![format!(
+            "verify checks: {}",
+            checks
+                .iter()
+                .map(|(id, status)| format!("{id}={status}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )],
+        ApplyEvent::Finalized => vec!["run recorded".to_string()],
+        ApplyEvent::CommitInterrupted { code } => vec![format!(
+            "the commit failed ({code}) and left this run's journal on the host: recover it \
+             with `ign deploy rollback --run <run id>`"
+        )],
+        ApplyEvent::RestoreStarted { cause } => vec![match cause {
+            Some(cause) => format!("restoring the pre-apply snapshot ({})", cause.as_str()),
+            None => "restoring the snapshot of the run".to_string(),
+        }],
+        ApplyEvent::LiveChangesDiscarded { count, paths } => vec![format!(
+            "going ahead over {count} live change(s) made after the run: {}",
+            paths.join(", ")
+        )],
+        ApplyEvent::Restored => vec!["snapshot restored".to_string()],
+        ApplyEvent::Cleared => {
+            vec!["interrupted run removed: it had changed nothing".to_string()]
+        }
+        ApplyEvent::InterruptedRun {
+            phase,
+            action,
+            hashes,
+        } => vec![format!(
+            "interrupted run found (journal phase {phase}, {} touched path(s)): recovery will {action}",
+            hashes.len()
+        )],
+        ApplyEvent::Failed { code } => vec![format!("failed: {code}")],
+    }
+}
+
 fn render_lint_human(result: &LintResult) {
     println!(
         "lint: {} issue(s), child exit {}",
@@ -2434,8 +2561,56 @@ fn human_bytes(bytes: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, iso_utc, orphan_lines};
+    use super::{civil_from_days, describe_apply_event, iso_utc, orphan_lines};
+    use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
+
+    /// 23-13: every engine event has a progress line, the new ones from
+    /// 23-07 (preflight), 23-09 (gwbk), 23-11 (rollback) and 23-12 (journal
+    /// recovery) included, and the staging notice follows the backup step
+    /// with the file count of the run.
+    #[test]
+    fn apply_events_render_progress_lines() {
+        let one = |e: &ApplyEvent| -> String {
+            let lines = describe_apply_event(e, 7);
+            assert!(!lines.is_empty(), "{e:?} has a line");
+            lines.join(" | ")
+        };
+        assert!(one(&ApplyEvent::GwbkSkipped).contains("backup skipped"));
+        let downloaded = one(&ApplyEvent::GwbkDownloaded { bytes: 4096 });
+        assert!(
+            downloaded.contains("backup taken (4096 bytes)"),
+            "{downloaded}"
+        );
+        assert!(downloaded.contains("staging 7 file(s)"), "{downloaded}");
+        assert!(
+            one(&ApplyEvent::PreflightChecks {
+                checks: vec![("hold_budget".into(), "fail".into())]
+            })
+            .contains("hold_budget=fail")
+        );
+        assert!(one(&ApplyEvent::DesignersPoll { open: 2 }).contains("2 open"));
+        assert!(
+            one(&ApplyEvent::RestoreStarted {
+                cause: Some(RollbackCause::VerifyFailed)
+            })
+            .contains("verify_failed")
+        );
+        assert!(one(&ApplyEvent::RestoreStarted { cause: None }).contains("snapshot of the run"));
+        assert!(one(&ApplyEvent::Cleared).contains("changed nothing"));
+        assert!(
+            one(&ApplyEvent::InterruptedRun {
+                phase: "written",
+                action: "restore",
+                hashes: Default::default()
+            })
+            .contains("recovery will restore")
+        );
+        assert!(
+            one(&ApplyEvent::CommitInterrupted { code: "x".into() })
+                .contains("ign deploy rollback --run")
+        );
+    }
 
     fn orphan(id: &str, gateway: &str) -> OrphanedModule {
         OrphanedModule {

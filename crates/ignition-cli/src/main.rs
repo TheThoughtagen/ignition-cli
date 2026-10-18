@@ -580,6 +580,19 @@ fn main() -> ExitCode {
             {
                 return ExitCode::from(code);
             }
+            // The FOURTH sanctioned success-path EXIT exception (23-13,
+            // Decision A, DAPL-07), the same shape as `deploy verify`: a
+            // red post-apply verify restored the snapshot, and the envelope
+            // rendered above carries `data.outcome: rolled_back`,
+            // `data.ok: false`, `data.slug: deploy_rolled_back` and
+            // `data.cause`; the process then exits 6. The slug is NOT a
+            // `CoreError` and never belongs in the exit-code table; the
+            // README's dated verdict exception documents it (23-21).
+            if let ActionOutput::DeployApply(apply) = &out
+                && let Some(code) = apply.failure_exit_code()
+            {
+                return ExitCode::from(code);
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -3298,19 +3311,69 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                         return (profile, Err(err));
                     }
                 }
-                let _ = (project, designers, designers_timeout, skip_gwbk);
-                match prepared {
-                    actions::deploy_apply::ApplyPrepared::Noop(result) => {
-                        (profile, Ok(ActionOutput::DeployApply(result)))
-                    }
-                    actions::deploy_apply::ApplyPrepared::Ready { .. } => (
-                        profile,
-                        Err(CoreError::Internal(
-                            "deploy apply: the confirmed run is wired in the next commit"
-                                .to_string(),
-                        )),
-                    ),
+                let designers_policy = ignition_core::deploy::apply::preflight::DesignersPolicy {
+                    mode: match designers {
+                        cli::DesignersArg::Fail => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Fail
+                        }
+                        cli::DesignersArg::Wait => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Wait
+                        }
+                        cli::DesignersArg::Proceed => {
+                            ignition_core::deploy::apply::preflight::DesignersMode::Proceed
+                        }
+                    },
+                    timeout: std::time::Duration::from_secs(designers_timeout),
+                    ..Default::default()
+                };
+                // A no-op touches neither a gateway nor the host: no session
+                // is resolved for it (DAPL-03).
+                if let actions::deploy_apply::ApplyPrepared::Noop(result) = prepared {
+                    return (profile, Ok(ActionOutput::DeployApply(result)));
                 }
+                let master_session = match named_profile_client(&mut config, &master.profile) {
+                    Ok(session) => session,
+                    Err(err) => return (profile, Err(err)),
+                };
+                let backup_session = match &declared.target.nodes.backup {
+                    Some(backup) => match named_profile_client(&mut config, &backup.profile) {
+                        Ok(session) => Some(session),
+                        Err(err) => return (profile, Err(err)),
+                    },
+                    None => None,
+                };
+                let observer: Box<dyn ignition_core::deploy::apply::ApplyObserver> =
+                    if mode == RenderMode::Human {
+                        Box::new(render::StderrApplyObserver::default())
+                    } else {
+                        Box::new(ignition_core::deploy::apply::NoObserver)
+                    };
+                let surfaces = actions::deploy_apply::ApplySurfaces {
+                    deploy: master_session.api(),
+                    backup_deploy: backup_session.as_ref().map(|s| s.api() as _),
+                    gateway: master_session.api(),
+                };
+                let result = actions::deploy_apply::deploy_apply_run(
+                    prepared,
+                    &declared,
+                    &repo,
+                    reader.as_ref(),
+                    &surfaces,
+                    &actions::deploy_apply::ApplyRunOptions {
+                        base,
+                        gates: ignition_core::deploy::apply::gates::GateFlags {
+                            plan_sha256,
+                            allow_destructive,
+                            allow_drift,
+                        },
+                        project,
+                        designers: designers_policy,
+                        skip_gwbk,
+                    },
+                    observer.as_ref(),
+                )
+                .await;
+                (profile, result.map(ActionOutput::DeployApply))
             }
         },
         Commands::Lint(LintArgs {
