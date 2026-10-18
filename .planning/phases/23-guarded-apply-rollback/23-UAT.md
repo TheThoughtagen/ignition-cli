@@ -3,7 +3,7 @@ status: testing
 phase: 23-guarded-apply-rollback
 source: [23-VERIFICATION.md]
 started: 2026-10-18T19:30:00Z
-updated: 2026-10-18T23:50:00Z
+updated: 2026-10-19T00:10:00Z
 ---
 
 ## Current Test
@@ -34,7 +34,7 @@ result: pass (user decision 2026-10-18: keep `HOLD_S = 176` s, 1,527-file ceilin
 
 ### 5. Windows CI on windows-latest
 expected: The Windows conformance job runs green on GitHub's windows-latest runner (including `sftp-server.exe` availability), not only on the Azure host.
-result: [pending]
+result: issue (draft PR #21, 2026-10-18). Fixed on the way: headless build (d55502d) and CRLF README check (17b1730); ubuntu and macos green on run 39175065312. windows-latest still fails 18 PowerShell conformance tests in deploy_host_conformance.rs, see ## Gaps.
 
 ### 6. Rig live gates after the review fixes
 expected: `live_deploy_apply -- --ignored` passes on the local 8.3.6 rig with CR-01, WR-01 and WR-04 in place.
@@ -44,8 +44,8 @@ result: pass — 4 passed, 0 failed, 2026-10-18T19:24:05Z to 19:25:20Z (live_app
 
 total: 6
 passed: 4
-issues: 1
-pending: 1
+issues: 2
+pending: 0
 skipped: 0
 blocked: 0
 
@@ -58,3 +58,11 @@ blocked: 0
   test: 2
   artifacts: [".planning/phases/23-guarded-apply-rollback/23-LIVE-CAPTURES.md ## Live gate: Linux ssh host (FA-23-05)"]
   missing: ["A listing format that does not need the server to prefix names (the Marked pwd-marker form, or detection) for POSIX hosts; then a rerun of the four gates"]
+
+- truth: "The deploy_host_conformance PowerShell rows pass on GitHub's windows-latest runner, not only on the Azure host."
+  status: failed
+  reason: "CI run 39175065312, job check (windows-latest): 18 of 47 tests in deploy_host_conformance fail (all conformance_ps_* rows and the ps_* tests), every one with the same prepare error: `TransportFailed { operation: \"prepare\", node: \"nodes.test\", detail: \"exit code 1 (refused with no reason: a held or non-empty target): remote mkdir \\\"/C:/Users/RUNNER~1\\\": Failure\" }`. The runner's temp dir is under the 8.3 short name C:\\Users\\RUNNER~1; the sftp mkdir-all walk tries to create that existing component and the failure is misclassified as a held or non-empty target. Root cause unconfirmed: test-setup only, or an engine gap if an account home can appear in 8.3 form. First time these tests ran on windows-latest (the file is new in phase 23)."
+  severity: blocker
+  test: 5
+  artifacts: ["https://github.com/TheThoughtagen/ignition-cli/actions/runs/39175065312"]
+  missing: ["Root cause on a Windows host (the Azure VM ign-win-836 can reproduce with an 8.3 path)", "A fix (mkdir-all tolerant of an existing component, or long-path normalization) plus a correct classification of the error", "A green windows-latest run"]
