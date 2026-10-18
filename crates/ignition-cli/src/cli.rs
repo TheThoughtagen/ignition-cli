@@ -770,9 +770,54 @@ pub enum DeployCommand {
         #[arg(long)]
         skip_gwbk: bool,
     },
+    /// Roll back one past run by id, from a fresh process: restore the
+    /// on-box snapshot the run took into the master node's mode collection,
+    /// delete the files the run created, scan, and record the rollback (a
+    /// run directory of its own, `kind: rollback`). The run id is
+    /// `data.run_id` of the `deploy apply` that made it, or its run
+    /// directory's name. Also recovers an interrupted run: a refusal that
+    /// prints `ign deploy rollback --run <id> --env <env>` names the id to
+    /// pass. Guarded: without the global `--yes` it exits 2
+    /// `confirmation_required` and the message names the run, the gateway,
+    /// the mode and how many files it would restore and delete. A file
+    /// changed since the run refuses (`deploy_live_changed`, exit 6) unless
+    /// `--discard-live-changes`. One fixed lock hold (176 s) serves the
+    /// rollback. Not in the MCP catalog. In human mode progress lines go to
+    /// stderr
+    Rollback {
+        /// Environment name; selects `targets/<ENV>.yaml`
+        #[arg(long, value_name = "ENV")]
+        env: String,
+        /// Declared repo root (default: the current directory). Only the
+        /// target file is read; the tree is not rendered
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: PathBuf,
+        /// The run to roll back: the `run_id` that `deploy apply` printed
+        /// (or its directory below `.ign/deploy/<gateway>/`)
+        #[arg(long, value_name = "ID")]
+        run: String,
+        /// Overwrite files changed after that run and record which. Without
+        /// it a changed file refuses the rollback (`deploy_live_changed`,
+        /// exit 6)
+        #[arg(long)]
+        discard_live_changes: bool,
+        /// What to do about open Designer sessions: `fail` refuses while any
+        /// is open, `wait` polls until none is or `--designers-timeout`
+        /// passes, `proceed` goes ahead and records the sessions
+        #[arg(long, value_enum, value_name = "MODE", default_value = "fail")]
+        designers: DesignersArg,
+        /// Seconds `--designers wait` polls before it refuses
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 600,
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        designers_timeout: u64,
+    },
 }
 
-/// The `--designers` words of `deploy apply` (D-14, D-15).
+/// The `--designers` words of `deploy apply` and `deploy rollback` (D-14, D-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DesignersArg {
     /// Refuse while any Designer session is open (the default)

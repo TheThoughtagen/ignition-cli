@@ -234,6 +234,16 @@ const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// `scan_incomplete`. The longest scan measured (23-10) took under 1.6 s.
 const SCAN_WAIT: Duration = Duration::from_secs(120);
 
+/// How the production verbs wait for a config scan to finish.
+fn scan_poll(subject: &str) -> PollConfig {
+    PollConfig {
+        subject: subject.to_string(),
+        interval: SCAN_POLL_INTERVAL,
+        max: Duration::from_secs(2),
+        deadline: SCAN_WAIT,
+    }
+}
+
 /// Run a prepared apply against the master's host: the production entry of
 /// `ign deploy apply` after the confirmation (DAPL-01).
 ///
@@ -278,12 +288,7 @@ pub async fn deploy_apply_run(
         gates: opts.gates.clone(),
         project: opts.project.clone(),
         hold: HoldModel::MEASURED,
-        poll: PollConfig {
-            subject: "config scan after apply".to_string(),
-            interval: SCAN_POLL_INTERVAL,
-            max: Duration::from_secs(2),
-            deadline: SCAN_WAIT,
-        },
+        poll: scan_poll("config scan after apply"),
         verify: VerifyOptions::default(),
         designers: opts.designers,
         skip_gwbk: opts.skip_gwbk,
@@ -501,4 +506,86 @@ pub async fn deploy_rollback_execute(
         restart_pending: outcome.restart_pending,
         restart_pending_new: outcome.restart_pending_new,
     })
+}
+
+/// [`deploy_rollback_prepare`] for the production verb: builds the master's
+/// apply host from the target file itself, so a caller never names the write
+/// half. The run id is checked first, before the target is read or any host
+/// is touched.
+pub async fn deploy_rollback_prepare_for_env(
+    repo: &Path,
+    env: &str,
+    run_id_text: &str,
+    reader: &dyn TreeReader,
+    opts: &RollbackPrepareOptions,
+) -> Result<RollbackPrepared, CoreError> {
+    RunId::parse(run_id_text)?;
+    let (target_file, target) = load_target(repo, env)?;
+    let host = apply_host_for_node(
+        repo,
+        &target_file,
+        "nodes.master",
+        &target.nodes.master,
+        &target.gateway,
+        &target.mode,
+    )?;
+    deploy_rollback_prepare(repo, env, run_id_text, reader, host.as_ref(), opts).await
+}
+
+/// What a confirmed rollback needs besides the prepared value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RollbackRunOptions {
+    /// `--discard-live-changes`, as given to the prepare.
+    pub discard_live_changes: bool,
+    /// `--designers` and `--designers-timeout`.
+    pub designers: DesignersPolicy,
+}
+
+/// Run a prepared rollback against the master's host: the production entry
+/// of `ign deploy rollback` after the confirmation (DAPL-08).
+///
+/// Builds the host here, takes the one measured hold ([`HoldModel::MEASURED`],
+/// no override: D-02) and the real clock, and drives [`run_rollback`] with the
+/// engine's own scan wait. The engine's steps reach `observer`.
+pub async fn deploy_rollback_run(
+    prepared: RollbackPrepared,
+    env: &str,
+    repo: &Path,
+    reader: &dyn TreeReader,
+    surfaces: &ApplySurfaces<'_>,
+    opts: &RollbackRunOptions,
+    observer: &dyn ApplyObserver,
+) -> Result<DeployRollbackResult, CoreError> {
+    let host = apply_host_for_node(
+        repo,
+        &prepared.target_file,
+        "nodes.master",
+        &prepared.target.nodes.master,
+        &prepared.target.gateway,
+        &prepared.target.mode,
+    )?;
+    let run_id = RunId::parse(&prepared.run_id)?;
+    let target = prepared.target.clone();
+    let target_file = prepared.target_file.clone();
+    let ctx = RollbackContext {
+        env,
+        repo,
+        target_file: &target_file,
+        target: &target,
+        reader,
+        host: host.as_ref(),
+        deploy: surfaces.deploy,
+        gateway: surfaces.gateway,
+        backup_deploy: surfaces.backup_deploy,
+        clock: &SystemClock,
+        observer,
+    };
+    let engine = RollbackOptions {
+        run_id,
+        discard_live_changes: opts.discard_live_changes,
+        designers: opts.designers,
+        hold: HoldModel::MEASURED,
+        poll: scan_poll("config scan after rollback"),
+    };
+    deploy_rollback_execute(prepared, &ctx, &engine).await
 }

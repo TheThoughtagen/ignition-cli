@@ -296,6 +296,7 @@ fn render_human(out: &ActionOutput, profile: Option<&str>) {
         ActionOutput::DeployPull(result) => render_deploy_pull_human(result),
         ActionOutput::DeployVerify(result) => render_deploy_verify_human(result),
         ActionOutput::DeployApply(result) => render_deploy_apply_human(result),
+        ActionOutput::DeployRollback(result) => render_deploy_rollback_human(result),
         ActionOutput::ApiCall(result) => render_api_call_human(result),
         ActionOutput::LicenseStatus(result) => render_license_status_human(result),
         ActionOutput::RedundancyStatus(result) => render_redundancy_status_human(result),
@@ -1574,20 +1575,85 @@ fn render_deploy_apply_human(result: &ignition_core::actions::deploy_apply::Depl
     }
 }
 
+/// `ign deploy rollback` human form: the outcome line, the run being rolled
+/// back, this rollback's own run, the counts, any live change that was
+/// overwritten, the restart-pending lines, then the warnings. Counts, ids,
+/// paths and codes only. Progress lines went to stderr while the run went
+/// (`ign deploy rollback:` prefix); warnings repeat on stderr.
+fn render_deploy_rollback_human(
+    result: &ignition_core::actions::deploy_apply::DeployRollbackResult,
+) {
+    println!(
+        "rollback {} ({}, mode {}): {}",
+        result.gateway,
+        result.env,
+        result.mode,
+        result.outcome.as_str()
+    );
+    println!("rolled back run {}", result.target_run_id);
+    println!("run {}", result.run_id);
+    println!("run directory {}", result.run_dir);
+    println!(
+        "{} restored, {} deleted",
+        result.restored.len(),
+        result.deleted.len()
+    );
+    if !result.discarded_live_changes.is_empty() {
+        println!(
+            "discarded {} live change(s) made after the run:",
+            result.discarded_live_changes.len()
+        );
+        for path in &result.discarded_live_changes {
+            println!("  {path}");
+        }
+    }
+    for entry in &result.restart_pending_new {
+        println!("restart pending (new): {entry}");
+    }
+    for entry in &result.restart_pending {
+        if !result.restart_pending_new.contains(entry) {
+            println!("restart pending: {entry}");
+        }
+    }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
 /// The progress prefix of `ign deploy apply` (stderr, human mode only).
 pub(crate) const APPLY_PROGRESS_PREFIX: &str = "ign deploy apply:";
 
-/// Prints one stderr progress line per engine step, prefixed
-/// [`APPLY_PROGRESS_PREFIX`]. Stdout stays the envelope (T-23-56). The
+/// The progress prefix of `ign deploy rollback` (stderr, human mode only).
+pub(crate) const ROLLBACK_PROGRESS_PREFIX: &str = "ign deploy rollback:";
+
+/// Prints one stderr progress line per engine step, prefixed with the verb
+/// that is running ([`APPLY_PROGRESS_PREFIX`] or [`ROLLBACK_PROGRESS_PREFIX`]).
+/// Stdout stays the envelope (T-23-56). The
 /// engine reports no event before the sftp upload of a large tree, which is
 /// silent for up to about 9 minutes at 1,520 files (23-10), so the observer
 /// remembers the file count of `run_started` and announces the staging at
 /// the step that always precedes it (`gwbk_downloaded` or `gwbk_skipped`).
 /// Only ids, counts, codes and paths are printed (the events carry nothing
 /// else).
-#[derive(Default)]
 pub(crate) struct StderrApplyObserver {
+    prefix: &'static str,
     files: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for StderrApplyObserver {
+    fn default() -> Self {
+        Self::with_prefix(APPLY_PROGRESS_PREFIX)
+    }
+}
+
+impl StderrApplyObserver {
+    /// An observer that prints `prefix` before each line.
+    pub(crate) fn with_prefix(prefix: &'static str) -> Self {
+        Self {
+            prefix,
+            files: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 impl ignition_core::deploy::apply::ApplyObserver for StderrApplyObserver {
@@ -1601,7 +1667,7 @@ impl ignition_core::deploy::apply::ApplyObserver for StderrApplyObserver {
             self.files.store(writes + deletes, Ordering::Relaxed);
         }
         for line in describe_apply_event(e, self.files.load(Ordering::Relaxed)) {
-            eprintln!("{APPLY_PROGRESS_PREFIX} {line}");
+            eprintln!("{} {line}", self.prefix);
         }
     }
 }

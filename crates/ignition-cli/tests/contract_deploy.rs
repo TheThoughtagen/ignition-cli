@@ -2578,3 +2578,189 @@ async fn apply_drift_with_reason_records_it() {
     assert_eq!(run_json["allow_drift"], reason);
     assert_eq!(run_json["allow_destructive"], false);
 }
+
+// ============================================================================
+// `ign deploy rollback` through the binary (23-14, DAPL-08, DAPL-09, DSURF-02)
+// ============================================================================
+
+/// `ign [--json] [--yes] deploy rollback --env dev --run RUN --repo REPO`.
+fn rollback_args(repo: &Path, run: &str, json: bool, yes: bool) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if json {
+        args.push("--json".into());
+    }
+    if yes {
+        args.push("--yes".into());
+    }
+    for a in ["deploy", "rollback", "--env", "dev", "--run", run, "--repo"] {
+        args.push(a.into());
+    }
+    args.push(repo.as_os_str().to_owned());
+    args
+}
+
+/// The configuration tree of a host listing: a run keeps its record and
+/// snapshot below `ign-deploy/`, which is not configuration.
+fn config_tree(
+    tree: std::collections::BTreeMap<String, Vec<u8>>,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    tree.into_iter()
+        .filter(|(path, _)| path.starts_with("config/"))
+        .collect()
+}
+
+/// Run `ign deploy apply --yes` through the binary over `repo` and return the
+/// applied run's id.
+async fn apply_through_binary(
+    server: &wiremock::MockServer,
+    repo: &Path,
+    extra: &[&str],
+) -> String {
+    let hash = plan_hash(repo);
+    let out = run_apply(server, repo, &hash, extra).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "apply stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("apply envelope");
+    assert_eq!(envelope["data"]["outcome"], "applied", "{envelope}");
+    envelope["data"]["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn rollback_after_apply_restores() {
+    let (_scratch, repo, data) = apply_tracer();
+    let before = config_tree(read_tree(&data));
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+    assert_ne!(
+        config_tree(read_tree(&data)),
+        before,
+        "the apply changed it"
+    );
+
+    // A fresh process with no run directory: only the target file and the
+    // run id remain.
+    std::fs::remove_dir_all(repo.join(".ign")).expect("delete the run directories");
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope on stdout");
+    assert_eq!(envelope["ok"], true);
+    let result = &envelope["data"];
+    assert_eq!(result["outcome"], "restored", "{result}");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["target_run_id"], run);
+    assert_ne!(result["run_id"], run, "a rollback has its own run id");
+    assert_eq!(
+        config_tree(read_tree(&data)),
+        before,
+        "the configuration tree equals its pre-apply listing"
+    );
+    let run_dir = PathBuf::from(result["run_dir"].as_str().expect("run dir"));
+    assert!(run_dir.starts_with(repo.join(".ign")), "{run_dir:?}");
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).expect("run.json"))
+            .expect("run.json is JSON");
+    assert_eq!(run_json["kind"], "rollback");
+    assert_eq!(run_json["target_run_id"], run);
+    let seen = seen_requests(&server).await;
+    assert!(
+        seen.iter().any(|r| r == "POST /data/api/v1/scan/config"),
+        "the rollback scans: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn rollback_without_yes_prints_what_it_restores() {
+    let (_scratch, repo, data) = apply_tracer();
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = apply_through_binary(&server, &repo, &[]).await;
+    let after = read_tree(&data);
+    let requests_before = seen_requests(&server).await.len();
+
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    let out = cmd
+        .args(rollback_args(&repo, &run, true, false))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "no envelope on stdout");
+    let err = stderr_json(&out);
+    assert_eq!(err["error"]["code"], "confirmation_required");
+    let message = err["error"]["message"].as_str().expect("message");
+    assert!(message.contains(&run), "names the run: {message}");
+    assert!(
+        message.contains("apply-gw") || message.contains("tracer-gw"),
+        "{message}"
+    );
+    assert!(message.contains("mode dev"), "{message}");
+    let restore = message
+        .split("restore ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("a restore count in: {message}"));
+    assert!(restore >= 1, "{message}");
+    assert!(
+        message.contains("file(s) from the on-box snapshot and delete "),
+        "names the delete count: {message}"
+    );
+    assert_eq!(read_tree(&data), after, "nothing written to the host");
+    assert_eq!(
+        seen_requests(&server).await.len(),
+        requests_before,
+        "the refusal sent no lock, scan or other request"
+    );
+}
+
+#[tokio::test]
+async fn rollback_bad_run_id_exit_2() {
+    let (_scratch, repo, data) = apply_tracer();
+    let before = read_tree(&data);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    for bad in ["../x", "", "a/b"] {
+        let (_cfg, mut cmd) = verify_ign(&server.uri());
+        let out = cmd
+            .args(rollback_args(&repo, bad, true, true))
+            .output()
+            .expect("spawn ign");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "run {bad:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            stderr_json(&out)["error"]["code"],
+            "invalid_input",
+            "{bad:?}"
+        );
+    }
+    assert_eq!(seen_requests(&server).await, Vec::<String>::new());
+    assert_eq!(read_tree(&data), before);
+    assert!(!repo.join(".ign").exists());
+}

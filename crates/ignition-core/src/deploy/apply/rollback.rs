@@ -92,6 +92,16 @@ pub enum RollbackKind {
     Cleared,
 }
 
+impl RollbackKind {
+    /// The word `data.outcome` carries (the serde form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RollbackKind::Restored => "restored",
+            RollbackKind::Cleared => "cleared",
+        }
+    }
+}
+
 /// What a rollback drives. The target file names the gateway, the mode and
 /// the master node; nothing else of the declared repo is read.
 pub struct RollbackContext<'a> {
