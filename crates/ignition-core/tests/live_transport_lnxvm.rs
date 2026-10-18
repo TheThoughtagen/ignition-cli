@@ -1611,3 +1611,143 @@ async fn cli_body(c: &CliRun) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---- the conformance table on the host ---------------------------------------------
+
+/// `cd $1`, then the test binary lists its tests and runs them all on one
+/// thread with `TMPDIR` under `$1`; the exit code and the uid are reported.
+const RUN_CONFORMANCE: &str = r##"cd "$1" || exit 3; chmod 700 ./conf; mkdir -p tmp; TMPDIR="$1/tmp" ./conf --list > list.txt 2>&1; TMPDIR="$1/tmp" ./conf --test-threads=1 > out.txt 2>&1; rc=$?; echo "IGN-RESULT:{\"ok\":1,\"rc\":$rc,\"uid\":$(id -u)}""##;
+
+/// `(ok, passed, failed)` from the libtest summary line
+/// `test result: ok. N passed; M failed; ...`, if the text has one.
+fn libtest_summary(text: &str) -> Option<(bool, usize, usize)> {
+    let line = text
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("test result: "))?;
+    let (verdict, rest) = line.split_once(". ")?;
+    let count = |word: &str| -> Option<usize> {
+        rest.split(';')
+            .find_map(|part| part.trim().strip_suffix(word))
+            .and_then(|n| n.trim().parse().ok())
+    };
+    Some((verdict == "ok", count(" passed")?, count(" failed")?))
+}
+
+#[test]
+fn libtest_summary_reads_the_result_line() {
+    let text = "running 3 tests\ntest a ... ok\n\ntest result: ok. 48 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.20s\n";
+    assert_eq!(libtest_summary(text), Some((true, 48, 0)));
+    let bad = "test result: FAILED. 40 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n";
+    assert_eq!(libtest_summary(bad), Some((false, 40, 8)));
+    assert_eq!(libtest_summary("no summary here\n"), None);
+}
+
+/// The shared scenario table (`deploy_host_conformance`) under the host's own
+/// dash, GNU coreutils and `/usr/lib/openssh/sftp-server`. The rows inspect
+/// results through the runner's `std::fs`, so the test binary built for linux
+/// x86_64 (see the module doc) is uploaded and run ON the host as the non-root
+/// deploy account, confined to `<home>/ign-live-conf`.
+#[tokio::test]
+#[ignore = "live: needs ign-lnx-836, IGNITION_LIVE_LNXVM=1 and IGN_LNXVM_CONFORMANCE_BIN (a linux x86_64 build of deploy_host_conformance)"]
+async fn lnxvm_conformance_table_on_host() {
+    let Some(live) = live() else { return };
+    let Some(bin) = std::env::var("IGN_LNXVM_CONFORMANCE_BIN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        skip("IGN_LNXVM_CONFORMANCE_BIN is not set (see the module doc for the docker build)");
+        return;
+    };
+    let bin = PathBuf::from(bin);
+    assert!(
+        bin.is_file(),
+        "IGN_LNXVM_CONFORMANCE_BIN must name the built test binary"
+    );
+    let started = Instant::now();
+    let probe_repo = repo(&live, "probe", &live.data_dir, None);
+    let shell = shell_of(probe_repo.path(), "probe");
+    let home = home_sftp(&shell).await;
+    let conf = format!("{home}/{CONF}");
+    assert!(remove_tree(&shell, &home, &conf).await, "leftovers removed");
+    sftp(
+        &shell,
+        &[
+            SftpOp::Mkdir { path: conf.clone() },
+            SftpOp::Put {
+                local: bin,
+                remote: format!("{conf}/conf"),
+            },
+        ],
+    )
+    .await;
+
+    eprintln!("CAPTURE conformance table on the host @ {}", utc_now());
+    let t = Instant::now();
+    let result = sh_json(&shell, "conformance", RUN_CONFORMANCE, &[&conf]).await;
+    timed("conformance run on the host", t, ());
+    let outcome = match &result {
+        Ok(v) => Some((v["rc"].as_i64(), v["uid"].as_i64())),
+        Err(_) => None,
+    };
+    let local = tempfile::tempdir().expect("local temp");
+    let (list_path, out_path) = (local.path().join("list.txt"), local.path().join("out.txt"));
+    let fetched = if outcome.is_some() {
+        let out = shell
+            .sftp_batch(&[
+                SftpOp::Get {
+                    remote: format!("{conf}/list.txt"),
+                    local: list_path.clone(),
+                },
+                SftpOp::Get {
+                    remote: format!("{conf}/out.txt"),
+                    local: out_path.clone(),
+                },
+            ])
+            .await;
+        out.is_ok_and(|o| o.code == 0)
+    } else {
+        false
+    };
+    let gone = remove_tree(&shell, &home, &conf).await;
+    eprintln!("CAPTURE cleanup: conformance dir gone {gone}");
+    let value = result.expect("the conformance run");
+    assert!(fetched, "list.txt and out.txt were downloaded");
+    let list = std::fs::read_to_string(&list_path).expect("list.txt");
+    let out = std::fs::read_to_string(&out_path).expect("out.txt");
+    eprintln!("CAPTURE conformance output (names and results only):\n{out}");
+    let listed = list.lines().filter(|l| l.ends_with(": test")).count();
+    let summary = libtest_summary(&out);
+    eprintln!(
+        "CAPTURE conformance: rc {} uid {} listed {listed} summary {summary:?}",
+        value["rc"], value["uid"]
+    );
+    assert_ne!(
+        value["uid"].as_i64(),
+        Some(0),
+        "the chmod rows need non-root"
+    );
+    assert_eq!(value["rc"].as_i64(), Some(0), "the test binary's exit code");
+    let (ok, passed, failed) = summary.expect("a libtest summary line");
+    assert!(ok && failed == 0, "{passed} passed, {failed} failed");
+    assert_eq!(passed, listed, "every listed test ran and passed");
+    for name in [
+        "every_row_runs_against_the_sh_host",
+        "sh_moved_files_are_0644",
+        "sh_failed_move_reports_index",
+        "sh_commit_stops_when_its_time_budget_runs_out",
+        "stub_refuses_a_tampered_script",
+    ] {
+        assert!(list.contains(name), "{name} is in the list");
+    }
+    assert!(
+        list.lines()
+            .filter(|l| l.contains("conformance_sh_"))
+            .count()
+            >= 17,
+        "at least 17 conformance_sh_ rows"
+    );
+    assert!(gone);
+    timed("lnxvm_conformance_table_on_host total", started, ());
+    eprintln!("PASS lnxvm_conformance_table_on_host");
+}
