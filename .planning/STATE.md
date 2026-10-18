@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 23 (guarded-apply-rollback) — EXECUTING
 Plan: 21 of 21 done (23-16, the live gates, completed 2026-10-18); phase verification is next. Spec §9 amendment is whk-environment-orchestration PR #63 (stacked on #60), awaiting review
 Status: Phase 23 plans complete, ready for verification
-Last activity: 2026-10-18
+Last activity: 2026-10-18 - Completed quick task 261018-lqg: Live rig test: apply with a queued config save during the scan-lock hold
 
 Progress: [██████████] 100%
 
@@ -130,6 +130,7 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 | 260921-96c | Register workspace push in GUARDED_OPS so it is confirmable over MCP (confirm: true → --yes; rig down stays unguarded by design) | 2026-09-21 | 7800ba6 | [260921-96c-register-workspace-push-in-guarded-ops-s](./quick/260921-96c-register-workspace-push-in-guarded-ops-s/) |
 | 5 | fix(tui): watch/alarm workers race in-flight polls against shutdown (Windows CI flake root cause) | 2026-09-22 | d64280c | — |
 | 261013-neg | Fix 21-REVIEW WR-02: strict Referenced secret shape, no key-name exemption | 2026-10-13 | ae0338a | [261013-neg-fix-wr-02-referenced-wrapper-secret-fail](./quick/261013-neg-fix-wr-02-referenced-wrapper-secret-fail/) |
+| 261018-lqg | Live rig test: apply with a queued config save during the scan-lock hold | 2026-10-18 | 12754c9 | [261018-lqg-live-rig-test-apply-with-a-queued-config](./quick/261018-lqg-live-rig-test-apply-with-a-queued-config/) |
 
 ## Session Continuity
 
