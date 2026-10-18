@@ -1401,7 +1401,15 @@ NOT RUN BY THE DRIVER. A Designer or gateway-UI save under a held lock is an int
 
 4. `GET /data/api/v1/scan-lock/config` after each save, then end the hold with one `POST /data/api/v1/scan/config` and remove what was saved.
 
-Result: PENDING (human check, owed to the user).
+Result: RUN 2026-10-18 on the local 8.3.6 rig (`ign-deploy-rig-gw-1`, localhost:18290), gateway web UI as admin. No Designer was used.
+
+- 21:17:04Z: lock acquired by `api-token:cap-a` (`holdTimeout` 300, gateway log `Scan lock 'config-scan-lock' acquired ... Holding for 300 sec`).
+- During the hold, the user edited the `Ignition OPC UA Server` opc-connection description (resource stamp `lastModification` 21:20:26Z) and added a SQLite database connection `Test` in production. The UI showed HTTP 503 and nothing appeared to happen.
+- 21:21:13.344Z: lock released by one `POST /data/api/v1/scan/config` (200, then `GET scan-lock/config` 204).
+- 21:21:13.6Z: both queued UI writes were applied (gateway log routes `/v1/resources/ignition/opc-connection` and `/v1/resources/ignition/database-connection`, actor admin). Files on disk were written at 21:21:13Z, and a store-and-forward engine `Test` came up at 21:21:14Z.
+- Cleanup: the user deleted the `Test` connection and the store-and-forward engine and reverted the description. The rig was rechecked clean (no production database-connection, original description, no lock held).
+
+Conclusion: the config scan-lock does not reject a gateway-UI save. It queues the save and applies it right after release, and the UI reports 503. For an apply, a UI save made during the hold lands after the engine's release, so it overwrites the deployed file rather than being blocked. The post-release fingerprint and verify read the tree after that write. This matches the C2 API-write queuing, and it confirms the Designer and editor preflight as the guard against a concurrent editor. The Designer save path is not tested.
 
 ## C11
 

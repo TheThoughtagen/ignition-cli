@@ -3,25 +3,22 @@ status: testing
 phase: 23-guarded-apply-rollback
 source: [23-VERIFICATION.md]
 started: 2026-10-18T19:30:00Z
-updated: 2026-10-18T19:30:00Z
+updated: 2026-10-18T21:30:00Z
 ---
 
 ## Current Test
 
-number: 1
-name: C2b — Designer or gateway-UI save while the scan-lock is held
+number: 2
+name: FA-23-05 — Linux ssh host (`commit.sh`) against a live Linux gateway
 expected: |
-  With an `ign deploy apply` holding the scan-lock on the rig or the Azure host, a Designer
-  (or gateway-UI) save of a resource the plan touches does not land silently over the deploy:
-  either the save is blocked or the run detects it and restores. Record the observed behavior
-  in 23-LIVE-CAPTURES.md. Until recorded, the Designer preflight is the only assumed guard.
+  apply and rollback over ssh to a live Linux Ignition host commit, verify and restore like the Azure Windows host, including the WR-04 deadline stop.
 awaiting: user response
 
 ## Tests
 
 ### 1. C2b — Designer or gateway-UI save while the scan-lock is held
 expected: The save is blocked, or the run detects it and restores. The outcome is recorded in 23-LIVE-CAPTURES.md.
-result: [pending]
+result: pass (recorded, 2026-10-18T21:17Z to 21:21Z, gateway web UI only). The lock queues the UI save: the UI shows 503 and the save is applied 0.3 s after release. It is not blocked. Recorded under 23-LIVE-CAPTURES.md `## C2b (manual)`. The preflight remains the guard against a concurrent editor, and the Designer path is untested.
 
 ### 2. FA-23-05 — Linux ssh host (`commit.sh`) against a live Linux gateway
 expected: `ign deploy apply` and `ign deploy rollback --run` over ssh to a live Linux Ignition host commit, verify and restore the same way the Azure Windows host does, including the WR-04 `deadline` stop.
@@ -46,9 +43,9 @@ result: pass — 4 passed, 0 failed, 2026-10-18T19:24:05Z to 19:25:20Z (live_app
 ## Summary
 
 total: 6
-passed: 1
+passed: 2
 issues: 0
-pending: 5
+pending: 4
 skipped: 0
 blocked: 0
 
