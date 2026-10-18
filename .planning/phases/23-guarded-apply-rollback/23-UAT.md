@@ -3,7 +3,7 @@ status: testing
 phase: 23-guarded-apply-rollback
 source: [23-VERIFICATION.md]
 started: 2026-10-18T19:30:00Z
-updated: 2026-10-18T22:12:00Z
+updated: 2026-10-18T22:30:00Z
 ---
 
 ## Current Test
@@ -26,11 +26,11 @@ result: [pending]
 
 ### 3. FA-23-06 — gateway backup type
 expected: The user confirms the pre-apply `.gwbk` should use `BackupType::All`.
-result: [pending]
+result: pass (user decision 2026-10-18: keep `BackupType::All`).
 
 ### 4. FA-23-08 — scan-lock hold size
 expected: The user accepts `HOLD_S = 176` s (sized from the replace commit, 85.496 s at 1,520 files) instead of the plan's 129 s, or asks to switch back (two literals in `hold.rs`).
-result: [pending]
+result: pass (user decision 2026-10-18: keep `HOLD_S = 176` s, 1,527-file ceiling).
 
 ### 5. Windows CI on windows-latest
 expected: The Windows conformance job runs green on GitHub's windows-latest runner (including `sftp-server.exe` availability), not only on the Azure host.
@@ -43,9 +43,9 @@ result: pass — 4 passed, 0 failed, 2026-10-18T19:24:05Z to 19:25:20Z (live_app
 ## Summary
 
 total: 6
-passed: 2
+passed: 4
 issues: 0
-pending: 4
+pending: 2
 skipped: 0
 blocked: 0
 
