@@ -2655,6 +2655,8 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; fini
 
 Target: `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md` in `whk-environment-orchestration` (PR #60, branch `docs/prod-gateway-config-as-code`). The text below was drafted against the spec as it stands on that local branch (read with `git show`, nothing checked out or changed there). Owed by 22-LIVE-CAPTURES `### Decision B (recorded 2026-10-15 ...)`, caveat 1. Nothing here has been applied to the spec or pushed.
 
+**Decision (Task 3, 2026-10-18): user chose: a PR for that repo (stacked on #60).** Landed as <https://github.com/WhiskeyHouse/whk-environment-orchestration/pull/63> (base `docs/prod-gateway-config-as-code`, head `docs/spec9-deploy-account-scope`, one commit `675e583` from a fresh clone; the user's local clone and PR #60's own branch were not touched). The PR text lists the three open points below. The line "Nothing here has been applied to the spec or pushed" above described the draft at the time it was written.
+
 ### What the spec says today (§9, "Pipeline identities")
 
 > - **SSH account `svc-ignition-deploy` on each node.** Key-only auth, with write access limited to `data/config/resources/<mode>`. Its key is a GitHub environment secret.
