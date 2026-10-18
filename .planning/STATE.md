@@ -5,15 +5,15 @@ milestone_name: Declared Gateway Deploy
 current_phase: 23
 current_phase_name: guarded-apply-rollback
 status: executing
-stopped_at: Completed 23-10-PLAN.md
-last_updated: "2026-10-18T00:21:53.696Z"
+stopped_at: Completed 23-13-PLAN.md
+last_updated: "2026-10-18T01:00:36.175Z"
 last_activity: 2026-10-18
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 52
-  completed_plans: 47
-  percent: 90
+  completed_plans: 48
+  percent: 92
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 ## Current Position
 
 Phase: 23 (guarded-apply-rollback) — EXECUTING
-Plan: 13 of 21 next (23-10 done; remaining 23-13, 23-21, 23-14, 23-15, 23-16)
+Plan: 14 of 21 next (23-13 done; remaining 23-21, 23-14, 23-15, 23-16)
 Status: Ready to execute
 Last activity: 2026-10-18
 
-Progress: [█████████░] 90%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -91,6 +91,7 @@ Phase velocity highlights: capture-first phases (10, 13) ran slowest (~127 min/p
 | Phase 23 P08 | 2h40m | 2 tasks | 12 files |
 | Phase 23 P20 | 1h45m | 2 tasks | 11 files |
 | Phase 23 P10 | 1h25m | 3 tasks | 4 files |
+| Phase 23 P13 | ~3h | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -128,8 +129,8 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 
 ## Session Continuity
 
-**Last session:** 2026-10-18T00:21:53.684Z
-**Stopped At:** Completed 23-10-PLAN.md
+**Last session:** 2026-10-18T01:00:36.159Z
+**Stopped At:** Completed 23-13-PLAN.md
 **Resume file:** None
 
 ## Decisions
@@ -204,3 +205,4 @@ Full v1.1 decision log preserved in: phase `*-SUMMARY.md` files (authoritative p
 - [Phase 23]: 23-12: the run's own journal selects recovery in check_rollback; D-10 clear only before the first move with the pre-run fingerprint; the snapshot is hashed before a recovery restores; a commit Err over this run's journal is reported as deploy_journal_present (no restore on a guess)
 - [Phase ?]: 23-08: Windows stub runs the hashed commit.ps1 text through [ScriptBlock]::Create (-File fails under AllSigned/Restricted); moved files get an ACL reset; a target that cannot be read is refused as held before any move; WINDOWS_SNAPSHOT_PATH_MAX = 259
 - [Phase ?]: [23-20] commit.ps1 has every op commit.sh has; the Windows probe reads the collection's access list against the account's token and never writes into it; a held file is the refusal 'held' for fingerprint as for commit; the Windows mirror commit is one script call and the per-file rename path is gone; apply_host_for_node hands a Windows ssh node the sftp host (commit 76107ed); the conformance table passed 47 of 47 on a real Windows host built with cargo xwin, windows-latest is still to run
+- [Phase ?]: 23-13: deploy apply is wired in main.rs through deploy_apply_run (core builds the host with HoldModel::MEASURED); progress lines are human-mode stderr only; deploy apply is excluded from MCP by EXCLUDED_PATHS (a full-path list)
