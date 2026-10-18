@@ -3,7 +3,7 @@ status: testing
 phase: 23-guarded-apply-rollback
 source: [23-VERIFICATION.md]
 started: 2026-10-18T19:30:00Z
-updated: 2026-10-18T21:30:00Z
+updated: 2026-10-18T22:12:00Z
 ---
 
 ## Current Test
@@ -18,7 +18,7 @@ awaiting: user response
 
 ### 1. C2b — Designer or gateway-UI save while the scan-lock is held
 expected: The save is blocked, or the run detects it and restores. The outcome is recorded in 23-LIVE-CAPTURES.md.
-result: pass (recorded, 2026-10-18T21:17Z to 21:21Z, gateway web UI only). The lock queues the UI save: the UI shows 503 and the save is applied 0.3 s after release. It is not blocked. Recorded under 23-LIVE-CAPTURES.md `## C2b (manual)`. The Designer run (21:34Z to 21:38Z) found that project saves are not under the config lock and land immediately. They are outside the apply's write set (mode collection config only), so there is no conflict. Still owed: whether an apply detects a config save queued during its hold, covered by a live rig test in a quick task.
+result: pass (recorded, 2026-10-18T21:17Z to 21:21Z, gateway web UI only). The lock queues the UI save: the UI shows 503 and the save is applied 0.3 s after release. It is not blocked. Recorded under 23-LIVE-CAPTURES.md `## C2b (manual)`. The Designer run (21:34Z to 21:38Z) found that project saves are not under the config lock and land immediately. They are outside the apply's write set (mode collection config only), so there is no conflict. Rig test `live_queued_config_save_during_apply` (2026-10-18T22:09Z): a config save queued during the apply's hold is refused as stale (`resource_signature_rejected`) because the engine's release scan reloaded the deployed copy first; the apply reported applied with the declared config on disk and in REST and a green fresh verify. Recorded under 23-LIVE-CAPTURES.md `## C2b (manual)`.
 
 ### 2. FA-23-05 — Linux ssh host (`commit.sh`) against a live Linux gateway
 expected: `ign deploy apply` and `ign deploy rollback --run` over ssh to a live Linux Ignition host commit, verify and restore the same way the Azure Windows host does, including the WR-04 `deadline` stop.
