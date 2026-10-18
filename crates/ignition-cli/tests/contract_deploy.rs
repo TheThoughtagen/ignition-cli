@@ -2385,3 +2385,196 @@ async fn apply_human_output() {
     );
     assert!(!stdout.contains("ign deploy apply:"), "{stdout}");
 }
+
+// ============================================================================
+// `ign deploy apply` gate exits through the binary (23-21, DAPL-01, DAPL-02)
+// ============================================================================
+
+/// Run `ign deploy apply` over `repo` against the mock gateway with `extra`
+/// flags after the standard ones (`--json --yes` and the plan hash).
+async fn run_apply(
+    server: &wiremock::MockServer,
+    repo: &Path,
+    hash: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    let (_cfg, mut cmd) = verify_ign(&server.uri());
+    cmd.args(apply_args(repo, Some(hash), true, true))
+        .args(extra)
+        .output()
+        .expect("spawn ign")
+}
+
+/// A gate refusal through the binary: the exit code and error slug, one JSON
+/// value on stderr, nothing on stdout, no request to the gateway (so no lock,
+/// backup or scan), no `.ign/` directory and the host tree untouched.
+async fn assert_refused_before_any_write(
+    out: &std::process::Output,
+    exit: i32,
+    slug: &str,
+    server: &wiremock::MockServer,
+    repo: &Path,
+    data: &Path,
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+) {
+    assert_eq!(
+        out.status.code(),
+        Some(exit),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "a refusal prints no stdout");
+    assert_eq!(stderr_json(out)["error"]["code"], slug);
+    let seen = seen_requests(server).await;
+    assert!(
+        seen.is_empty(),
+        "no lock, backup, scan or any other request: {seen:?}"
+    );
+    assert!(!repo.join(".ign").exists(), "no .ign/ directory");
+    assert_eq!(&read_tree(data), before, "the host tree is unchanged");
+}
+
+/// Add a core copy of the `OLD` unit that `seed_old_unit_and_ledger` leaves
+/// in the mode collection, so removing it would not take effect.
+fn shadow_old_unit_in_core(data: &Path) {
+    let file = data.join("config/resources/core/ignition/database-translator/OLD/config.json");
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("core unit dir");
+    std::fs::write(file, b"{}").expect("core copy");
+}
+
+#[tokio::test]
+async fn apply_stale_hash_exit_6() {
+    let (_scratch, repo, data) = apply_tracer();
+    let reviewed = plan_hash(&repo);
+    // The live file moves on after the plan was reviewed.
+    let config = data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    let mut bytes = std::fs::read(&config).expect("live config");
+    bytes.extend_from_slice(b"  ");
+    std::fs::write(&config, bytes).expect("change the live unit again");
+    assert_ne!(plan_hash(&repo), reviewed, "the plan changed");
+    let before = read_tree(&data);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+
+    let out = run_apply(&server, &repo, &reviewed, &[]).await;
+    assert_refused_before_any_write(&out, 6, "plan_stale", &server, &repo, &data, &before).await;
+    // The refusal names both hashes, so the reviewer sees what moved.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&reviewed), "{stderr}");
+}
+
+#[tokio::test]
+async fn apply_destructive_without_flag_exit_2() {
+    let (_scratch, repo, data) = apply_tracer();
+    seed_old_unit_and_ledger(&data);
+    let hash = plan_hash(&repo);
+    let before = read_tree(&data);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+
+    let out = run_apply(&server, &repo, &hash, &[]).await;
+    assert_refused_before_any_write(
+        &out,
+        2,
+        "destructive_change_refused",
+        &server,
+        &repo,
+        &data,
+        &before,
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ignition/database-translator/OLD"),
+        "the refusal names the entry"
+    );
+
+    // With the flag (and --yes) the same plan applies and the unit is gone.
+    let out = run_apply(&server, &repo, &hash, &["--allow-destructive"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["outcome"], "applied");
+    assert!(
+        !data
+            .join("config/resources/dev/ignition/database-translator/OLD/config.json")
+            .exists(),
+        "the removed unit was deleted from the mode collection"
+    );
+}
+
+#[tokio::test]
+async fn apply_shadows_removal_exit_6() {
+    let (_scratch, repo, data) = apply_tracer();
+    seed_old_unit_and_ledger(&data);
+    shadow_old_unit_in_core(&data);
+    let hash = plan_hash(&repo);
+    let before = read_tree(&data);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+
+    // Whatever the flags: no override exists for a removal a core copy shadows.
+    for extra in [
+        &[][..],
+        &["--allow-destructive"][..],
+        &["--allow-destructive", "--allow-drift", "reviewed in PR 12"][..],
+    ] {
+        let out = run_apply(&server, &repo, &hash, extra).await;
+        assert_refused_before_any_write(&out, 6, "deploy_blocked", &server, &repo, &data, &before)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn apply_drift_with_reason_records_it() {
+    let (scratch, repo, data) = apply_tracer();
+    // `local_tracer` left the render of the declared tree in `out`; the live
+    // unit was then edited, so against that base the entry is drift.
+    let base = scratch.path().join("out");
+    let base_arg = base.to_str().expect("utf-8 path");
+    let hash = plan_hash(&repo);
+    let before = read_tree(&data);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+
+    let out = run_apply(&server, &repo, &hash, &["--base", base_arg]).await;
+    assert_refused_before_any_write(
+        &out,
+        2,
+        "destructive_change_refused",
+        &server,
+        &repo,
+        &data,
+        &before,
+    )
+    .await;
+
+    let reason = "reviewed in PR 12";
+    let out = run_apply(
+        &server,
+        &repo,
+        &hash,
+        &["--base", base_arg, "--allow-drift", reason],
+    )
+    .await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["outcome"], "applied");
+    let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).expect("run.json"))
+            .expect("run.json is JSON");
+    assert_eq!(run_json["allow_drift"], reason);
+    assert_eq!(run_json["allow_destructive"], false);
+}
