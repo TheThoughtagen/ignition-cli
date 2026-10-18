@@ -204,9 +204,10 @@ fn rolled_back_verdict_exception_is_dated_and_documented() {
         "the verdict slug is not a CoreError slug"
     );
     // The exception heading sits under the output contract, and the README
-    // tells an agent the `deploy apply` verb's own section exists.
+    // tells an agent the `deploy apply` verb's own section exists. `lines()`
+    // drops a CRLF too: git for Windows checks the README out with CRLF.
     assert!(
-        README.contains("\n### `deploy apply`\n"),
+        README.lines().any(|line| line == "### `deploy apply`"),
         "the README has a `### `deploy apply`` section"
     );
 }
