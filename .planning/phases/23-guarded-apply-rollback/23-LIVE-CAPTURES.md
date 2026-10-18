@@ -2532,3 +2532,57 @@ Rests on `## 23-20 PowerShell host ops`.
 - **`fetch_snapshot` at the 259-character limit works** (a snapshot path of exactly `WINDOWS_SNAPSHOT_PATH_MAX`; hash equal to the pre-image) and `probe_paths` refuses the 260th; `read_record` of another run is `None`; `finalize` installs the final record, removes the journal and the run's staging and keeps the snapshot, and a restore of the finalized record still returns the pre-run listing; `discard_interrupted` drops a run whose journal says it never moved a file and refuses (`deploy_run_invalid`) a run that did.
 - **`sftp -D <sftp-server.exe>` works on a Win32-OpenSSH host** (the first sftp command answered `Remote working directory: /C:/Users/...`), so the windows-latest conformance rows can use the runner's own `C:\Windows\System32\OpenSSH\sftp-server.exe` if the runner has it. Not verified for windows-latest itself.
 
+## Decisions: OQ5b
+
+Rests on `## OQ5b (batched commit, 23-10)` (two runs, 2026-10-17, host `ign-win-836`, Defender as found: real-time protection on, no exclusions). D-02 and D-03 read this section; `crates/ignition-core/src/deploy/apply/hold.rs` carries the literals and `hold_s_is_derived_from_recorded_measurements` recomputes the hold from them. Percentiles are nearest rank: with n = 10 the p95 is the maximum, with n = 5 it is the maximum, with n = 1 it is the one sample.
+
+### OQ5b-1: p50 and p95 per scale (seconds, wall clock at the runner)
+
+| Series | n | 152 files p50 | 152 files p95 | 1,520 files p50 | 1,520 files p95 |
+|---|---|---|---|---|---|
+| `commit`, new files plus the ledger | 10 | 8.266 | 8.731 | 60.291 | 62.040 |
+| `replace_commit`, every file replaced (pre-images copied) | 5 | 10.045 | 10.123 | 83.409 | **85.496** |
+| `commit_delete`, the whole payload deleted | 1 | 6.130 | 6.130 | 34.459 | 34.459 |
+| `restore` after the new-file commit | 10 | 15.364 | 16.006 | 27.134 | 28.937 |
+| `replace_restore` | 5 | 19.216 | 21.026 | 70.860 | 71.839 |
+| `scan` after the new-file commit (wall) | 10 | 0.837 | 1.221 | 1.113 | 1.567 |
+| `replace_scan` (wall) | 5 | 0.832 | 1.158 | 1.549 | **1.579** |
+| `restore_scan` | 10 | 0.794 | 0.845 | 0.854 | 1.213 |
+| `replace_restore_scan` | 5 | 0.914 | 1.185 | 1.480 | 1.542 |
+| `scan_after_delete` | 1 | 0.679 | 0.679 | 1.098 | 1.098 |
+| gateway `lastScanDuration` after the new-file commit (ms) | 10 | 572 | 705 | 814 | 846 |
+| `prepare` of the new-file batch (outside the lock) | 1 | 81.537 | | 553.482 | |
+| `prepare` of the replace batch (outside the lock) | 1 | 79.436 | | 533.198 | |
+
+- Per file: the new-file commit costs 57 ms (152 files) and 41 ms (1,520); the replace commit 67 ms and 56 ms; the 2-file commit of 23-08 cost 2.7 to 3.1 s. The 22-14 per-file commit cost 1.6 to 2.3 s a file. At 152 files the p95 commit fell from 251.063 and 348.225 s to 8.731 s (replace: 10.123 s), 29 to 40 times; at 1,520 files the 22-14 extrapolation was 2,500 to 3,500 s and the measurement is 62.040 s (replace: 85.496 s).
+- A scan is not the bottleneck: 1.6 s at most with 1,520 extra resources loaded (700 named units), 0.85 s at the gateway. The wall figures include the `ign api call` process start and the 200 ms poll.
+- The restore is not proportional to the tree at small sizes: 15 to 21 s for 152 files and 27 to 72 s for 1,520. About 14 s of it is the fixed cost of the restore (journal read, upload of the work list and journal: several fresh ssh sessions), which the 2-file restore of 23-08 showed (14.6 s). The commit has no such floor (2.7 s for two files).
+- Where the lock is held (read from `deploy/apply/mod.rs`): `prepare` first and outside it; then `HeldLock::acquire`, `commit`, one `lock.check` (a REST read), and the config scan, which releases the lock (D12). The post-write `fingerprint`, `deploy_verify`, `finalize` and `fetch_snapshot` come after the scan, so they are outside the hold (23-20: fingerprint, finalize 13.8 s, `fetch_snapshot` 24.7 s are single runs outside the window). The rollback path takes a lock for `restore` and its scan the same way.
+
+### OQ5b-2: the hold
+
+D-02: `hold = ceil(2 x (p95 commit + p95 scan) + 1)`, floor 10 s, ceiling 300 s, one constant, no per-run scaling, no per-target override.
+
+- **Scale (FA-23-07):** the largest measured scale, 1,520 files, so a change up to that size fits.
+- **Which commit (FA-23-08):** the plan names the new-file commit. The replace commit, which copies every pre-image into the snapshot first, is slower (85.496 s against 62.040 s at 1,520 files), and an apply of a changed tree is mostly replacements. The hold must cover the slowest call the lock is held across, so the constant uses the slowest commit variant measured, the replace commit: `P95_COMMIT_S_SCALE10 = 85.496`, `P95_COMMIT_S_SCALE1 = 10.123`. The scan figure is the largest p95 scan wall measured at that scale, the scan after a replace commit: `P95_SCAN_S = 1.579`.
+- **Unclamped:** `ceil(2 x (85.496 + 1.579) + 1) = ceil(175.15) = 176` s. **Clamped** to [10, 300]: **176 s**. `HOLD_S = 176`.
+- With the plan's literal choice (the new-file commit, 62.040 s, and its scan, 1.567 s) the hold would be `ceil(2 x (62.040 + 1.567) + 1) = 129` s. At 129 s a 1,520-file replace commit and its scan (85.496 + 1.579 = 87.1 s) would use 68% of the hold instead of 49%; the 2x margin D-02 asks for would be 1.5x. The difference is 47 s of lock window. To use the plan's literal, change the two `P95_COMMIT_S_*` literals to 8.731 and 62.040 and `P95_SCAN_S` to 1.567 in `hold.rs` and the same three numbers in the test; nothing else depends on the choice.
+- **D-03a not triggered: unclamped hold 176 s, ceiling 300 s.** The blocker of Phase 22 (505 s and 699 s, per-file renames) does not apply to the batched commit: the previous VM build's 234 to 348 s for 152 files is now 8.7 to 10.1 s on the rebuilt host with the one-call script, and the old extrapolation (hold of roughly 5,000 to 7,000 s at 1,520 files) is now 176 s.
+- A hold of 176 s is also long enough for the restore of the worst measured case (replace restore p95 71.839 s plus its scan 1.542 s, doubled plus one is 148 s) and for the restore at 152 files (21.026 s, which is above the 152-file replace commit of 10.123 s and below its hold).
+
+### OQ5b-3: the per-file model behind the D-03 refusal
+
+`HoldModel::MEASURED` fits the p95 commit through the two scales: `commit_per_file_s = (85.496 - 10.123) / (1520 - 152) = 0.055097...` and `commit_fixed_s = 10.123 - 152 x 0.055097... = 1.748...` (positive, so the floor at 0 does not apply). The model estimate at 1,520 files is 85.496 s, so `fits(1520)` holds (176 s needed, 176 s of hold). The count `touched_files` is `writes + deletes` (the ledger is not counted, as in the measurement).
+
+- **Largest change that fits the hold: 1,527 files (writes plus deletes); 1,528 is the smallest that does not fit** (estimate 85.94 s, hold needed 177 s). The D-03 refusal names the estimate and the 176 s budget for such a change.
+- The fit is exact at the two measured sizes and linear between and beyond them, which was not measured. A delete-only change costs less per file (34.459 s for 1,520 deletes), so the refusal is conservative for deletes. A change of 2 files is estimated at 1.9 s; it measured 2.7 to 3.1 s (23-08), still far inside the hold.
+
+### OQ5b-4: timeouts (OQ5-4 revisited)
+
+The slowest call made through the transport in these runs is `prepare` of the 1,520-file batch (553.482 s: one sftp upload, 0.364 s a file), which is under `DEFAULT_OP_TIMEOUT_S` (1050 s) and far under the 3600 s cap; the commit (85.496 s), the restore (71.839 s) and the delete commit (34.459 s) are well inside it. Nothing measured approaches either value, so **`DEFAULT_OP_TIMEOUT_S` and the 3600 s cap are unchanged.** A batch of more than about 2,900 files would need a `prepare` longer than 1050 s at this rate and sets `op_timeout_s` explicitly (the upload is outside the lock, so it does not affect the hold). The 22-14 note that the cap would bind at 1,520 files came from the per-file commit and no longer applies.
+
+### OQ5b-5: what stays open
+
+- The percentiles come from one run per scale on one WAN link and one VM build; the replace series has 5 samples, not 10 (FA-23-08). The 2x factor and the extra second of D-02 are the margin for that. A different link or Defender configuration moves the commit (22-14 saw +39% for an exclusion on the old path).
+- Defender could not be read or changed by the account; the numbers are for the state the host record names.
+- No Linux timing was taken; the sh host (23-06) has no measured hold. `HOLD_S` is one constant for every target by D-02.

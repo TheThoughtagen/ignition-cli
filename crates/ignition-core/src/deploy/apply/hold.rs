@@ -18,16 +18,19 @@
 //! is the separate step that applies floor and ceiling, so nothing clamps
 //! silently.
 //!
-//! # No measured value here
+//! # The measured value
 //!
 //! 505 s and 699 s, which the formula gives for the 22-14 timings, came from
 //! the old per-file sftp commit that D-01 replaces. They appear in this
-//! file's tests as formula regression values and are never a hold. The
-//! measured p95 literals, the shipped hold and `HoldModel::MEASURED` are
-//! added by 23-10 Task 2 from `## Decisions: OQ5b` and are absent until
-//! then. Until then every caller passes an explicit [`HoldModel`], and the
-//! apply verb (23-13) names `HoldModel::MEASURED`, so it cannot compile
-//! before the re-measure (D-02, D-03a).
+//! file's tests as formula regression values and are never a hold. The hold
+//! the engine ships with is [`HOLD_S`], computed from the batched commit
+//! measured on the Windows capture host (23-10, `23-LIVE-CAPTURES.md`
+//! `## OQ5b` and `## Decisions: OQ5b`): the p95 literals below, the formula
+//! on the largest measured scale, and D-02's clamp. [`HoldModel::MEASURED`]
+//! is the model the apply verb (23-13) names. The literals are written here
+//! and nowhere else; `hold_s_is_derived_from_recorded_measurements`
+//! recomputes the hold and the fit from the recorded numbers and fails if
+//! either drifts.
 //!
 //! # Two clocks
 //!
@@ -84,6 +87,46 @@ pub fn fits(hold_s: u64, est_commit_s: f64, p95_scan_s: f64) -> bool {
     hold_for(est_commit_s, p95_scan_s) <= hold_s
 }
 
+/// Files in the scale 1 corpus the commit was timed with (22-14, 23-10).
+pub const FILES_SCALE1: usize = 152;
+
+/// Files in the scale 10 corpus, the largest tree measured.
+pub const FILES_SCALE10: usize = 1520;
+
+/// p95 seconds of the slowest commit variant at 152 files: the replace
+/// commit, every file replaced and every pre-image copied (`## Decisions:
+/// OQ5b`, OQ5b-1 and OQ5b-2; n = 5, so the nearest-rank p95 is the maximum).
+pub const P95_COMMIT_S_SCALE1: f64 = 10.123;
+
+/// p95 seconds of the slowest commit variant at 1,520 files, the largest
+/// measured scale (FA-23-07): the replace commit (`## Decisions: OQ5b`,
+/// OQ5b-1 and OQ5b-2; FA-23-08). The new-file commit measured 62.040 s.
+pub const P95_COMMIT_S_SCALE10: f64 = 85.496;
+
+/// p95 seconds of the slowest config scan at 1,520 files, wall clock through
+/// `ign api call` (`## Decisions: OQ5b`, OQ5b-1): the scan after the replace
+/// commit. The gateway's own figure is under 1.2 s.
+pub const P95_SCAN_S: f64 = 1.579;
+
+/// The hold the apply engine requests, in seconds: D-02's formula on the
+/// largest measured scale, clamped. `ceil(2 x (85.496 + 1.579) + 1)` is 176,
+/// inside the ceiling, so D-03a did not trigger. A literal so that it reads in
+/// `grep`; `hold_s_is_derived_from_recorded_measurements` recomputes it from
+/// the three literals above and fails if any of the four drifts. One constant:
+/// no per-run scaling and no per-target override (D-02).
+pub const HOLD_S: u64 = 176;
+
+/// The two-scale fit of the p95 commit time against the file count: seconds
+/// per file, `(p95 at 1,520 - p95 at 152) / (1520 - 152)`.
+const FIT_PER_FILE_S: f64 =
+    (P95_COMMIT_S_SCALE10 - P95_COMMIT_S_SCALE1) / (FILES_SCALE10 as f64 - FILES_SCALE1 as f64);
+
+/// The fixed part of the fit: `p95 at 152 - 152 x per file`, floored at 0.
+const FIT_FIXED_S: f64 = {
+    let fixed = P95_COMMIT_S_SCALE1 - FILES_SCALE1 as f64 * FIT_PER_FILE_S;
+    if fixed > 0.0 { fixed } else { 0.0 }
+};
+
 /// Seconds of margin a lock needs left at a check: one REST round trip from
 /// the check to the scan request, which releases the lock (D12).
 pub const LOCK_MARGIN_S: i64 = 2;
@@ -102,6 +145,16 @@ pub struct HoldModel {
 }
 
 impl HoldModel {
+    /// The model measured on the Windows capture host (23-10): the shipped
+    /// hold, the p95 scan and the two-scale fit of the commit time. The D-03
+    /// refusal (23-07) and the apply verb (23-13) use this and no other.
+    pub const MEASURED: HoldModel = HoldModel {
+        hold_s: HOLD_S,
+        commit_fixed_s: FIT_FIXED_S,
+        commit_per_file_s: FIT_PER_FILE_S,
+        p95_scan_s: P95_SCAN_S,
+    };
+
     /// Seconds a commit of `files` files is estimated to take.
     pub fn estimate_commit_s(&self, files: usize) -> f64 {
         self.commit_fixed_s + files as f64 * self.commit_per_file_s
@@ -342,6 +395,76 @@ mod tests {
     #[test]
     fn d02_numbers_are_the_users() {
         assert_eq!((HOLD_FLOOR_S, HOLD_CEILING_S), (10, 300));
+    }
+
+    // ---- the measured hold (23-10, `## Decisions: OQ5b`) ---------------------
+
+    /// The numbers recorded in `23-LIVE-CAPTURES.md` `## Decisions: OQ5b`,
+    /// copied here so a change to a constant in the source fails this test
+    /// until the record and the test are changed with it.
+    const RECORDED_COMMIT_S_152: f64 = 10.123;
+    const RECORDED_COMMIT_S_1520: f64 = 85.496;
+    const RECORDED_SCAN_S: f64 = 1.579;
+    const RECORDED_HOLD_S: u64 = 176;
+
+    #[test]
+    fn hold_s_is_derived_from_recorded_measurements() {
+        assert_eq!(P95_COMMIT_S_SCALE1, RECORDED_COMMIT_S_152);
+        assert_eq!(P95_COMMIT_S_SCALE10, RECORDED_COMMIT_S_1520);
+        assert_eq!(P95_SCAN_S, RECORDED_SCAN_S);
+        assert_eq!((FILES_SCALE1, FILES_SCALE10), (152, 1520));
+
+        // D-02's formula on the largest measured scale, then its clamp.
+        let unclamped = hold_for(RECORDED_COMMIT_S_1520, RECORDED_SCAN_S);
+        assert_eq!(
+            unclamped, 176,
+            "ceil(2 x (85.496 + 1.579) + 1) = ceil(175.15)"
+        );
+        assert!(
+            unclamped <= HOLD_CEILING_S,
+            "D-03a is not triggered: the unclamped hold is inside the ceiling"
+        );
+        assert_eq!(HOLD_S, hold_clamped(unclamped));
+        assert_eq!(HOLD_S, RECORDED_HOLD_S);
+
+        // The fit through the two scales, recomputed from the literals.
+        let per_file = (RECORDED_COMMIT_S_1520 - RECORDED_COMMIT_S_152) / (1520.0 - 152.0);
+        let fixed = (RECORDED_COMMIT_S_152 - 152.0 * per_file).max(0.0);
+        assert!(fixed > 0.0, "the floor at 0 did not apply");
+        assert_eq!(HoldModel::MEASURED.commit_per_file_s, per_file);
+        assert_eq!(HoldModel::MEASURED.commit_fixed_s, fixed);
+        assert_eq!(HoldModel::MEASURED.p95_scan_s, RECORDED_SCAN_S);
+        assert_eq!(HoldModel::MEASURED.hold_s, HOLD_S);
+        // The fit goes through both measured points.
+        assert!((HoldModel::MEASURED.estimate_commit_s(152) - RECORDED_COMMIT_S_152).abs() < 1e-9);
+        assert!(
+            (HoldModel::MEASURED.estimate_commit_s(1520) - RECORDED_COMMIT_S_1520).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn hold_model_fits_the_measured_largest_tree() {
+        let model = HoldModel::MEASURED;
+        assert!(model.fits(1520), "the largest measured tree fits");
+        assert!(model.fits(0));
+        // The smallest change that does not fit; recorded in OQ5b-3.
+        let first_over = (1520..4000)
+            .find(|files| !model.fits(*files))
+            .expect("some size does not fit");
+        assert_eq!(
+            first_over,
+            1528,
+            "1,527 files is the largest change that fits {} s; 1,528 needs {} s",
+            model.hold_s,
+            hold_for(model.estimate_commit_s(1528), model.p95_scan_s)
+        );
+        assert!(model.fits(first_over - 1));
+        assert!(!model.fits(first_over));
+        // The refusal reads the same numbers the hold was built from.
+        assert_eq!(
+            hold_for(model.estimate_commit_s(1520), model.p95_scan_s),
+            HOLD_S
+        );
     }
 
     #[test]
