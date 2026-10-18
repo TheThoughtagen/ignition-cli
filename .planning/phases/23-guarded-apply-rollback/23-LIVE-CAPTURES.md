@@ -2586,3 +2586,30 @@ The slowest call made through the transport in these runs is `prepare` of the 1,
 - The percentiles come from one run per scale on one WAN link and one VM build; the replace series has 5 samples, not 10 (FA-23-08). The 2x factor and the extra second of D-02 are the margin for that. A different link or Defender configuration moves the commit (22-14 saw +39% for an exclusion on the old path).
 - Defender could not be read or changed by the account; the numbers are for the state the host record names.
 - No Linux timing was taken; the sh host (23-06) has no measured hold. `HOLD_S` is one constant for every target by D-02.
+
+## Live gate: rig apply and rollback (23-16)
+
+Rig: `inductiveautomation/ignition:8.3.6` (b2026042713), project `ign-deploy-rig`, bind-mounted `config/resources`, `deploymentMode` production, gateway name `ign-deploy-rig`; started 2026-10-18T2026-10-18T03:52:03Z by `capture22.sh up22` then `setup22` after a `down -v` (the first start reused a stale `gw-data` volume and faulted at commissioning). A local node on the bind mount, the tracer's two units (`ignition/database-translator/POSTGRES` and `ignition/general-alarm-settings`, four files), a real `ReqwestGatewayApi` with token A for both `DeployApi` and `GatewayApi`, `.gwbk` on, `--designers fail`.
+
+Steps the test takes: plan (record `plan_sha256`); `deploy_apply_run` (the production entry: factory host, `HoldModel::MEASURED`, the production scan wait); check outcome `applied`, the run directory, the `.gwbk` (a ZIP), the event sequence (`verify_done` with `ok: true`, `finalized`, no `restore_started`), the REST view of the mode collection; drop every handle and the repo's `.ign/`; rebuild reader, REST handle and host from the target file; `deploy_rollback_prepare_for_env` then `deploy_rollback_run` by run id; check outcome `restored`, a completed scan after the rollback (`lastScanTimestamp` advanced, `scanActive` false), the collection listing equal to the pre-apply listing, the REST view equal to its pre-apply view, every file and every directory below `<module>/<type>` as before (a `<module>/<type>` directory that an apply created is never removed by the host ops, by design, so it is not compared), no `will not be loaded` WARN line since the restore scan began (CV1 rule), and `deploy plan` equal to the first plan.
+
+**First run (04:07:56Z) found a bug, fixed in `84dca10`:** the apply stopped at the scan-lock acquire with `unexpected HTTP 400 Bad Request ... Error 400: Timeouts must be positive.` The engine sent `acquireTimeout: 0` ("no wait"); the real gateway refuses a non-positive timeout, and never waits out a positive one (D1: a held lock is an immediate 409), so the engine now sends 1 (`ACQUIRE_WAIT_S`). Every offline gateway had accepted 0; the fake gateway now refuses it as the real one does (mutation-checked: with the constant at 0 `apply_happy_path_local` fails with that message). Every `ign deploy apply` and `ign deploy rollback` before this commit would have failed at the lock on a real gateway.
+
+The plan says `changed 2` and not `added`: the effective view already holds both units from the `core` collection, so the apply writes the `production` copies (four files) over them and the rollback deletes those four.
+
+`IGNITION_LIVE_DEPLOY=1 IGNITION_LIVE_URL=http://localhost:18290 IGNITION_LIVE_TOKEN=$IGN_TOKEN_CAP_A IGN_DEPLOY_RIG_DATA=$HOME/.cache/ign-deploy-rig/data IGN_DEPLOY_RIG_MODE=production cargo test -p ignition-core --test live_deploy_apply -- --ignored --nocapture --test-threads=1` @ 2026-10-18T04:17:53Z
+
+~~~
+running 1 test
+test live_apply_then_rollback ... live_apply_then_rollback @ 2026-10-18T04:18:07Z
+plan: added 0 changed 2 removed 0 plan_sha256 bc0b21e0b7281f4239af3aed513031c2c6eb8777144a2bb8e698c51de57ddef4
+apply: outcome Applied run Some("20261018T041807Z-e4168e") written 4 deleted 0 gwbk Some("20261018T041807Z-e4168e.gwbk")
+apply warning: probes: the manifest declares no `verify.tag_probes`; nothing was probed
+gwbk: 3673753 bytes
+apply events: run_started gwbk_downloaded staged lock_acquired committed lock_verdict scan_done verify_done finalized
+rollback: outcome Restored run 20261018T041813Z-02b834 of 20261018T041807Z-e4168e restored 0 deleted 4
+PASS live_apply_then_rollback in 13.3s (plan bc0b21e0b7281f4239af3aed513031c2c6eb8777144a2bb8e698c51de57ddef4)
+ok
+
+test result: ok. 1 passed (selected from the four-test run below)
+~~~
