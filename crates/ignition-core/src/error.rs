@@ -947,6 +947,8 @@ pub struct PreflightFailure {
 pub struct RollbackFailure {
     /// The run being restored.
     pub run_id: String,
+    /// The `--env` value the retry command needs.
+    pub env: String,
     /// The local run directory holding the snapshot, when one was made.
     pub run_dir: Option<String>,
     /// The on-box journal path, left in place for a manual recovery.
@@ -955,18 +957,37 @@ pub struct RollbackFailure {
     pub cause: String,
 }
 
+impl RollbackFailure {
+    /// The on-box directory holding the run's pre-images
+    /// (`snapshots/<run>/`), next to the journal.
+    pub fn snapshot_dir(&self) -> String {
+        match self.journal.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/snapshots/{}/", self.run_id),
+            None => format!("snapshots/{}/", self.run_id),
+        }
+    }
+}
+
 impl std::fmt::Display for RollbackFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The run directory's `snapshot/` is made only after a restore has
+        // succeeded, so it is never offered here: the intact pre-images are
+        // the on-box `snapshots/<run>/` directory and, when one was taken, the
+        // `.gwbk`.
         write!(
             f,
-            "rollback of run {} failed ({}); the gateway files may be half restored. \
-             run directory: {}; on-box journal: {}. Restore the files from the .gwbk \
-             backup or from the run-directory snapshot, then delete the journal at {} by hand",
-            self.run_id,
-            self.cause,
-            self.run_dir.as_deref().unwrap_or("none was created"),
-            self.journal,
-            self.journal,
+            "rollback of run {run} failed ({cause}); the gateway files may be half restored. \
+             Retry with: ign deploy rollback --run {run} --env {env} (the journal at {journal} \
+             and the snapshot are still on the host). If the retry reports a lost or damaged \
+             snapshot, restore the files from the .gwbk backup (when this run took one) or from \
+             the on-box snapshot {snapshot}, then delete the journal by hand. \
+             run directory: {run_dir}",
+            run = self.run_id,
+            cause = self.cause,
+            env = self.env,
+            journal = self.journal,
+            snapshot = self.snapshot_dir(),
+            run_dir = self.run_dir.as_deref().unwrap_or("none was created"),
         )
     }
 }
@@ -1765,8 +1786,10 @@ impl CoreError {
                     .to_string(),
             ),
             Self::RollbackFailed(..) => Some(
-                "do not apply again until the files are restored: restore from the .gwbk \
-                 backup or the run-directory snapshot, then delete the journal at the path \
+                "do not apply again until the files are restored: run the retry command in \
+                 the message first, because the journal and the snapshot are usually intact; \
+                 only if it reports a lost or damaged snapshot restore from the .gwbk backup \
+                 or the on-box snapshot named there, and then delete the journal at the path \
                  in the message by hand"
                     .to_string(),
             ),
@@ -2459,6 +2482,7 @@ mod tests {
             (
                 CoreError::RollbackFailed(Box::new(RollbackFailure {
                     run_id: "r1".into(),
+                    env: "dev".into(),
                     run_dir: Some(".ign/deploy/r1".into()),
                     journal: "ign-deploy/gw/m/journal.json".into(),
                     cause: "write_failed".into(),
@@ -3332,6 +3356,7 @@ mod tests {
             (
                 CoreError::RollbackFailed(Box::new(RollbackFailure {
                     run_id: "r1".into(),
+                    env: "dev".into(),
                     run_dir: Some(".ign/deploy/r1".into()),
                     journal: "ign-deploy/gw/m/journal.json".into(),
                     cause: "write_failed".into(),
@@ -3398,6 +3423,7 @@ mod tests {
     fn rollback_failed_message_names_run_dir_journal_and_the_guidance() {
         let err = CoreError::RollbackFailed(Box::new(RollbackFailure {
             run_id: "r-7".into(),
+            env: "prod".into(),
             run_dir: Some(".ign/deploy/r-7".into()),
             journal: "ign-deploy/gw/m/journal.json".into(),
             cause: "write_failed".into(),
@@ -3410,11 +3436,29 @@ mod tests {
             ".gwbk",
             "snapshot",
             "by hand",
+            // The retry comes first, with the real env, and the intact
+            // pre-images are the on-box directory (review WR-02).
+            "ign deploy rollback --run r-7 --env prod",
+            "ign-deploy/gw/m/snapshots/r-7/",
         ] {
             assert!(shown.contains(needle), "{needle} missing from: {shown}");
         }
+        assert!(
+            shown.find("Retry with").expect("retry") < shown.find("by hand").expect("by hand"),
+            "the retry precedes the hand deletion: {shown}"
+        );
+        assert!(
+            !shown.contains("run-directory snapshot"),
+            "the run directory has no snapshot to offer: {shown}"
+        );
+        let hint = err.hint().expect("hint");
+        assert!(
+            hint.contains("retry") && !hint.contains("run-directory snapshot"),
+            "{hint}"
+        );
         let none = CoreError::RollbackFailed(Box::new(RollbackFailure {
             run_id: "r-7".into(),
+            env: "prod".into(),
             run_dir: None,
             journal: "j".into(),
             cause: "c".into(),

@@ -772,6 +772,7 @@ async fn drive(
     }
     let report = restore_snapshot(
         &RestoreContext {
+            env: ctx.env,
             master: &target.nodes.master,
             host: ctx.host,
             deploy: ctx.deploy,
@@ -854,6 +855,7 @@ async fn snapshot_record(
     let fail = |cause: String| {
         CoreError::RollbackFailed(Box::new(RollbackFailure {
             run_id: opts.run_id.as_str().to_string(),
+            env: ctx.env.to_string(),
             run_dir: Some(run_dir.path().to_string_lossy().into_owned()),
             journal: journal_location(LedgerRoot::for_node(&target.nodes.master), gateway, mode),
             cause,

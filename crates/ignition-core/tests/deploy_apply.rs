@@ -3985,7 +3985,17 @@ async fn journal_snapshot_lost_is_rollback_failed() {
     assert!(failure.journal.ends_with("journal.json"), "{failure:?}");
     let text = err.to_string();
     assert!(text.contains(".gwbk"), "{text}");
-    assert!(text.contains("run-directory snapshot"), "{text}");
+    // The retry first, then the intact pre-images on the box (review WR-02);
+    // the run directory has no snapshot to offer after a failed restore.
+    assert!(
+        text.contains(&format!("ign deploy rollback --run {run_id} --env dev")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("snapshots/{run_id}/")),
+        "the on-box snapshot is named: {text}"
+    );
+    assert!(!text.contains("run-directory snapshot"), "{text}");
     assert!(text.contains(&failure.journal), "{text}");
     assert!(text.contains(DB_CONFIG), "the path is named: {text}");
     assert_eq!(err.exit_code(), 6);

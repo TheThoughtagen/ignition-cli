@@ -609,6 +609,7 @@ impl<'a> ApplyContext<'a> {
     /// What [`restore_snapshot`] needs from this context.
     fn restore_context(&'a self, opts: &'a ApplyOptions) -> RestoreContext<'a> {
         RestoreContext {
+            env: &self.declared.env,
             master: &self.declared.target.nodes.master,
             host: self.host,
             deploy: self.deploy,
@@ -1509,6 +1510,8 @@ pub struct RestoreInput<'a> {
 /// What [`restore_snapshot`] drives. It names no declared repo: a manual
 /// rollback (23-11) has only the target file and a run id.
 pub struct RestoreContext<'a> {
+    /// The `--env` value, named in the retry command of a `rollback_failed`.
+    pub env: &'a str,
     /// The target's master node (where the journal lives, for the error).
     pub master: &'a NodeTarget,
     /// The write seam of the master's host.
@@ -1573,6 +1576,7 @@ pub async fn restore_snapshot(
         Ok(report) => Ok(report),
         Err(cause) => Err(CoreError::RollbackFailed(Box::new(RollbackFailure {
             run_id: record.run_id.clone(),
+            env: ctx.env.to_string(),
             run_dir: Some(input.run_dir.path().to_string_lossy().into_owned()),
             journal: journal_location(
                 LedgerRoot::for_node(ctx.master),
@@ -1593,7 +1597,7 @@ async fn restore_steps(
     // A gateway error is named by its code only; a host error already names
     // entries by index and never their content.
     let gw = |step: &'static str| move |e: CoreError| format!("{step}: {}", e.code());
-    let host = |step: &'static str| move |e: CoreError| format!("{step}: {e}");
+    let host = |step: &'static str| move |e: CoreError| format!("{step}: {}", with_env(e, ctx.env));
     let event = |e: CoreError| format!("events: {}", e.code());
 
     let record = input.record;

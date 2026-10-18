@@ -3259,10 +3259,15 @@ journal:
   afterwards.
 - Recovery reads the snapshot and checks it against the journal before it
   restores anything. A lost or corrupt snapshot is `rollback_failed` (exit 6)
-  with the journal left in place; restore the files from the run's `.gwbk` or
-  from the run-directory snapshot by hand, then delete the journal at the path
-  the message prints. That message is the only case in which the journal is
-  deleted by hand (D-12).
+  with the journal left in place. Any `rollback_failed` leaves the journal and
+  the on-box snapshot `snapshots/<run-id>/` (beside the journal) as they were,
+  so first retry `ign deploy rollback --run <id> --env <env>`, which the
+  message prints. Only when the retry reports a lost or damaged snapshot,
+  restore the files by hand from the run's `.gwbk` (when it took one) or from
+  that on-box snapshot, then delete the journal at the path the message
+  prints. That message is the only case in which the journal is deleted by
+  hand (D-12). The run directory's `snapshot/` copy is made only after a
+  restore has succeeded, so it is not a source here.
 
 A recovery started right after a dropped ssh connection should wait out the 176 s
 hold first (see "After an ssh drop" under [`deploy apply`](#deploy-apply)).
