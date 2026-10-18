@@ -54,6 +54,8 @@
 //! | the lock is not ours or has no margin left after the commit (either clock) | [`restore_snapshot`], cause `lock_expired`, no scan before it |
 //! | the scan does not complete | [`restore_snapshot`], cause `scan_incomplete` |
 //! | the post-apply verify is red | [`restore_snapshot`], cause `verify_failed` |
+//! | a step that cannot be answered before the verdict (the lock read, the scan or the verify fails with an `Err`) | the same restore as a red verify, with the closest cause (`lock_expired`, `scan_incomplete`, `verify_failed`); the step and the error's code are the warning `post_commit_error (<step>: <code>)` (review CR-01) |
+//! | a host call fails after a green verify (the fingerprint, the finalize) | the interrupted run: `deploy_journal_present` with `ign deploy rollback --run <id> --env <env>`, the tree left as written; a finalize whose answer was lost but whose journal is gone is `applied` with the warning `finalize_reported_error (<code>)` (review CR-01) |
 //! | a restore that cannot finish | `rollback_failed`, the journal stays on the box (D-12) |
 //!
 //! A host that refuses a commit before it wrote anything (a journal of
@@ -135,6 +137,10 @@ const GWBK_CHECK: &str = "gwbk";
 /// The warning for a pending-restart list that could not be read (23-02
 /// item 9).
 const RESTART_UNAVAILABLE: &str = "restart_pending_unavailable";
+
+/// The warning for an event log that could not be appended to after the run
+/// was recorded (the deploy is live and verified; the log is the casualty).
+const EVENTS_UNWRITABLE: &str = "events_log_unwritable";
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -778,6 +784,51 @@ fn with_env(err: CoreError, env: &str) -> CoreError {
     }
 }
 
+/// What this run's journal says about the box after a failure whose effect on
+/// the box is not known.
+enum BoxState {
+    /// This run's own journal is there.
+    Mine(Journal),
+    /// Another run's journal is there.
+    Other,
+    /// The box was read and holds no journal.
+    Absent,
+    /// The box (or the journal on it) could not be read.
+    Unknown,
+}
+
+async fn box_state(ctx: &ApplyContext<'_>, plan: &DeployPlanResult, run_id: &RunId) -> BoxState {
+    let master = &ctx.declared.target.nodes.master;
+    match journal_on_box(ctx.reader, master, &plan.gateway, &plan.mode).await {
+        Ok(Some(journal)) if journal.run_id == run_id.as_str() => BoxState::Mine(journal),
+        Ok(Some(_)) => BoxState::Other,
+        Ok(None) => BoxState::Absent,
+        Err(_) => BoxState::Unknown,
+    }
+}
+
+/// This run's journal is on the box: the run is interrupted. Reported as
+/// `deploy_journal_present` with the recovery command, and the original
+/// failure's code in a `commit_interrupted` event.
+fn interrupted(
+    ctx: &ApplyContext<'_>,
+    plan: &DeployPlanResult,
+    steps: &mut Steps<'_>,
+    journal: &Journal,
+    err: &CoreError,
+) -> CoreError {
+    let _ = steps.emit(ApplyEvent::CommitInterrupted {
+        code: err.code().to_string(),
+    });
+    journal::journal_present(
+        journal,
+        &ctx.declared.env,
+        &ctx.declared.target.nodes.master,
+        &plan.gateway,
+        &plan.mode,
+    )
+}
+
 /// `commit` returned an `Err`. Over ssh a dropped connection is one, and what
 /// is on the box is unknown: the remote script may have moved files or may
 /// still be running (23-17 carry-over, DAPL-09).
@@ -801,22 +852,65 @@ async fn commit_failed(
     if matches!(err, CoreError::DeployJournalPresent { .. }) {
         return err;
     }
-    let master = &ctx.declared.target.nodes.master;
-    let found = journal_on_box(ctx.reader, master, &plan.gateway, &plan.mode).await;
-    match found {
-        Ok(Some(journal)) if journal.run_id == run_id.as_str() => {
-            let _ = steps.emit(ApplyEvent::CommitInterrupted {
-                code: err.code().to_string(),
-            });
-            journal::journal_present(
-                &journal,
-                &ctx.declared.env,
-                master,
+    match box_state(ctx, plan, run_id).await {
+        BoxState::Mine(journal) => interrupted(ctx, plan, steps, &journal, &err),
+        _ => err,
+    }
+}
+
+/// A host call failed after a green verify: the deploy is live and verified
+/// but not recorded (CR-01). It is never a plain error. This run's own
+/// journal on the box makes it the interrupted run (`deploy_journal_present`
+/// with the recovery command: `rollback --run` restores the pre-apply files,
+/// as for a kill past a green verify, A9). When the journal cannot be told
+/// from the error alone the recovery command is named all the same.
+async fn unfinished_after_green(
+    ctx: &ApplyContext<'_>,
+    run_id: &RunId,
+    plan: &DeployPlanResult,
+    steps: &mut Steps<'_>,
+    err: CoreError,
+) -> CoreError {
+    match box_state(ctx, plan, run_id).await {
+        BoxState::Mine(journal) => interrupted(ctx, plan, steps, &journal, &err),
+        _ => recovery_pointer(ctx, plan, run_id, err),
+    }
+}
+
+/// `err`, saying that this run may have left a journal on the host and how to
+/// recover it. A transport failure keeps its slug and exit code (4) and gains
+/// the sentence; anything else becomes `deploy_journal_present` for this run,
+/// whose message carries the same command.
+fn recovery_pointer(
+    ctx: &ApplyContext<'_>,
+    plan: &DeployPlanResult,
+    run_id: &RunId,
+    err: CoreError,
+) -> CoreError {
+    let env = &ctx.declared.env;
+    match err {
+        CoreError::TransportFailed {
+            operation,
+            node,
+            detail,
+        } => CoreError::TransportFailed {
+            operation,
+            node,
+            detail: format!(
+                "{detail}; this run's journal may be on the host: recover it with: \
+                 ign deploy rollback --run {run} --env {env}",
+                run = run_id.as_str()
+            ),
+        },
+        _ => CoreError::DeployJournalPresent {
+            run_id: run_id.as_str().to_string(),
+            env: env.clone(),
+            location: journal_location(
+                LedgerRoot::for_node(&ctx.declared.target.nodes.master),
                 &plan.gateway,
                 &plan.mode,
-            )
-        }
-        _ => err,
+            ),
+        },
     }
 }
 
@@ -1001,10 +1095,14 @@ async fn drive(
         Ok(report) => report,
         Err(e) => return Err(commit_failed(ctx, run_id, plan, steps, with_env(e, env)).await),
     };
-    steps.emit(ApplyEvent::Committed {
+    if let Err(e) = steps.emit(ApplyEvent::Committed {
         moved: report.moved.len(),
         deleted: report.deleted.len(),
-    })?;
+    }) {
+        // The event log failed with the journal possibly on the box: no
+        // restore can be logged either, so the run is reported as it stands.
+        return Err(commit_failed(ctx, run_id, plan, steps, e).await);
+    }
     if report.stale {
         return Err(plan_stale(ctx, plan, opts, run_id).await);
     }
@@ -1023,81 +1121,45 @@ async fn drive(
         .await;
     }
 
-    // Only a lock still held, with the margin left, may be followed by a scan.
-    let verdict = lock.check(ctx.deploy, LOCK_MARGIN_S, ctx.clock).await?;
-    let held = matches!(verdict, LockVerdict::Held { .. });
-    steps.emit(ApplyEvent::LockVerdict { held })?;
-    if !held {
-        // No scan before the restore: a scan would load the partial tree.
-        return roll_back(
-            ctx,
-            opts,
-            &scope,
-            Some(&lock),
-            RollbackCause::LockExpired,
-            steps,
-            Vec::new(),
-        )
-        .await;
-    }
-    // C11: a tag provider and its definitions load in one scan.
-    match scan_and_wait(ctx.deploy, ScanKind::Config, opts.poll.clone()).await? {
-        ScanOutcome::Complete(_) => steps.emit(ApplyEvent::ScanDone)?,
-        ScanOutcome::NotComplete { .. } => {
-            return roll_back(
-                ctx,
-                opts,
-                &scope,
-                Some(&lock),
-                RollbackCause::ScanIncomplete,
-                steps,
-                Vec::new(),
-            )
-            .await;
+    // From here the files have moved and the journal is on the box: every
+    // way out is a restore, a typed refusal or the verified deploy (CR-01).
+    let mut warnings = match confirm(ctx, opts, &lock, steps).await {
+        Ok(Confirmed::Green { warnings }) => warnings,
+        Ok(Confirmed::Abort { cause, warnings }) => {
+            return roll_back(ctx, opts, &scope, Some(&lock), cause, steps, warnings).await;
         }
-    }
-
-    let verify = deploy_verify(
-        declared,
-        &opts.project,
-        ctx.deploy,
-        ctx.gateway,
-        ctx.reader,
-        &opts.verify,
-    )
-    .await?;
-    steps.emit(ApplyEvent::VerifyDone { ok: verify.ok })?;
-    if !verify.ok {
-        // The verdict is kept in the log by check id and status only.
-        steps.emit(ApplyEvent::VerifyChecks {
-            checks: verify
-                .checks
-                .iter()
-                .map(|c| (c.id.word().to_string(), c.status.word().to_string()))
-                .collect(),
-        })?;
-        return roll_back(
-            ctx,
-            opts,
-            &scope,
-            Some(&lock),
-            RollbackCause::VerifyFailed,
-            steps,
-            verify.warnings,
-        )
-        .await;
-    }
+        Err(Unconfirmed::Restore { cause, step, error }) => {
+            // The deploy could not be shown good; fail closed like a red
+            // verify. The step and the error's code (never its text) are kept.
+            let note = format!("post_commit_error ({step}: {})", error.code());
+            return roll_back(ctx, opts, &scope, Some(&lock), cause, steps, vec![note]).await;
+        }
+        Err(Unconfirmed::Green(error)) => {
+            return Err(unfinished_after_green(ctx, run_id, plan, steps, error).await);
+        }
+    };
 
     // Green: record what is live now, finalize, keep the snapshot locally.
-    let post = ctx.host.fingerprint(&spec.touched_paths()).await?;
+    let post = match ctx.host.fingerprint(&spec.touched_paths()).await {
+        Ok(post) => post,
+        Err(e) => return Err(unfinished_after_green(ctx, run_id, plan, steps, e).await),
+    };
     let post_fingerprint = fingerprint(&post);
     let mut record = spec.record.clone();
     record.state = RecordState::Applied;
     record.post_fingerprint = Some(post_fingerprint.clone());
-    ctx.host.finalize(&record).await?;
-    steps.emit(ApplyEvent::Finalized)?;
+    if let Err(e) = ctx.host.finalize(&record).await {
+        // The record is installed before the journal is removed, so a journal
+        // that is gone means the box finished and only the answer was lost.
+        if !matches!(box_state(ctx, plan, run_id).await, BoxState::Absent) {
+            return Err(unfinished_after_green(ctx, run_id, plan, steps, e).await);
+        }
+        warnings.push(format!("finalize_reported_error ({})", e.code()));
+    }
+    if steps.emit(ApplyEvent::Finalized).is_err() {
+        warnings.push(EVENTS_UNWRITABLE.to_string());
+    }
 
-    let mut warnings = verify.warnings;
     let (restart_pending, restart_pending_new) =
         restart_report(ctx.deploy, restart_before.as_deref(), &mut warnings).await;
     let mut snapshot_sha256 = BTreeMap::new();
@@ -1132,6 +1194,109 @@ async fn drive(
         restart_pending,
         restart_pending_new,
         snapshot_sha256,
+    })
+}
+
+/// How the under-lock window after a clean commit ended when every step could
+/// be answered.
+enum Confirmed {
+    /// The lock held, the scan completed and the verify is green.
+    Green { warnings: Vec<String> },
+    /// The deploy must not stay: restore with `cause`.
+    Abort {
+        cause: RollbackCause,
+        warnings: Vec<String>,
+    },
+}
+
+/// A step after the commit that could not be answered at all.
+enum Unconfirmed {
+    /// Before a green verdict: the deploy is unproven, so it is restored
+    /// like a red verify. `step` names the step, `cause` is the closest
+    /// option-a cause.
+    Restore {
+        cause: RollbackCause,
+        step: &'static str,
+        error: CoreError,
+    },
+    /// After a green verdict (the event log): the deploy is verified.
+    Green(CoreError),
+}
+
+/// Judge the files the commit moved: the lock must still be ours with its
+/// margin, the config scan must complete, the verify must be green. A step
+/// that fails with an `Err` (a gateway or log error, an event that cannot be
+/// written) is [`Unconfirmed::Restore`] with the closest cause: the lock read
+/// is `lock_expired`, the scan `scan_incomplete`, the verify and its events
+/// `verify_failed`.
+async fn confirm(
+    ctx: &ApplyContext<'_>,
+    opts: &ApplyOptions,
+    lock: &HeldLock,
+    steps: &mut Steps<'_>,
+) -> Result<Confirmed, Unconfirmed> {
+    fn undone(cause: RollbackCause, step: &'static str) -> impl FnOnce(CoreError) -> Unconfirmed {
+        move |error| Unconfirmed::Restore { cause, step, error }
+    }
+    let abort = |cause, warnings| Ok(Confirmed::Abort { cause, warnings });
+
+    // Only a lock still held, with the margin left, may be followed by a scan.
+    let verdict = lock
+        .check(ctx.deploy, LOCK_MARGIN_S, ctx.clock)
+        .await
+        .map_err(undone(RollbackCause::LockExpired, "lock_check"))?;
+    let held = matches!(verdict, LockVerdict::Held { .. });
+    steps
+        .emit(ApplyEvent::LockVerdict { held })
+        .map_err(undone(RollbackCause::LockExpired, "events"))?;
+    if !held {
+        // No scan before the restore: a scan would load the partial tree.
+        return abort(RollbackCause::LockExpired, Vec::new());
+    }
+    // C11: a tag provider and its definitions load in one scan.
+    match scan_and_wait(ctx.deploy, ScanKind::Config, opts.poll.clone())
+        .await
+        .map_err(undone(RollbackCause::ScanIncomplete, "scan"))?
+    {
+        ScanOutcome::Complete(_) => steps
+            .emit(ApplyEvent::ScanDone)
+            .map_err(undone(RollbackCause::ScanIncomplete, "events"))?,
+        ScanOutcome::NotComplete { .. } => {
+            return abort(RollbackCause::ScanIncomplete, Vec::new());
+        }
+    }
+
+    let verify = deploy_verify(
+        ctx.declared,
+        &opts.project,
+        ctx.deploy,
+        ctx.gateway,
+        ctx.reader,
+        &opts.verify,
+    )
+    .await
+    .map_err(undone(RollbackCause::VerifyFailed, "verify"))?;
+    if !verify.ok {
+        steps
+            .emit(ApplyEvent::VerifyDone { ok: false })
+            .map_err(undone(RollbackCause::VerifyFailed, "events"))?;
+        // The verdict is kept in the log by check id and status only.
+        steps
+            .emit(ApplyEvent::VerifyChecks {
+                checks: verify
+                    .checks
+                    .iter()
+                    .map(|c| (c.id.word().to_string(), c.status.word().to_string()))
+                    .collect(),
+            })
+            .map_err(undone(RollbackCause::VerifyFailed, "events"))?;
+        return abort(RollbackCause::VerifyFailed, verify.warnings);
+    }
+    steps
+        .emit(ApplyEvent::VerifyDone { ok: true })
+        .map_err(Unconfirmed::Green)?;
+    Ok(Confirmed::Green {
+        warnings: verify.warnings,
     })
 }
 

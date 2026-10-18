@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::fake_deploy::FakeGateway;
+use common::faulty_deploy::{DeployFaults, FaultyDeploy};
 use common::faulty_host::FaultyHost;
 use common::plan_fixture::{GATEWAY, MODE, PlanFixture};
 use ignition_core::actions::deploy::{
@@ -207,6 +208,8 @@ struct Rig {
     fake: FakeGateway,
     api: ReqwestGatewayApi,
     host: FaultyHost<LocalFsTransport>,
+    /// Gateway calls to fail once armed (review fix CR-01); none by default.
+    faults: DeployFaults,
     /// The backup node's deploy surface, when the test gives the target one.
     backup: Option<common::fake_deploy::FakeDeploy>,
     _server: wiremock::MockServer,
@@ -352,6 +355,7 @@ async fn rig_with_logs(
         fake,
         api,
         host: FaultyHost::new(host),
+        faults: DeployFaults::default(),
         backup: None,
         _server: server,
     }
@@ -456,7 +460,7 @@ impl Rig {
         clock: &dyn Clock,
         opts: &ApplyOptions,
     ) -> Result<DeployApplyResult, CoreError> {
-        let deploy = self.fake.client("apply");
+        let deploy = FaultyDeploy::new(self.fake.client("apply"), self.faults.clone());
         let ctx = ApplyContext {
             declared: &self.declared,
             repo: &self.repo,
@@ -4149,6 +4153,199 @@ async fn journal_commit_error_with_nothing_on_the_box_stays_the_original_error()
     assert_eq!(collection_state(&rig), before);
     let result = failed_result(&rig);
     assert_eq!(result["error"]["code"], "transport_failed");
+}
+
+// ============================================================================
+// Every failure after the commit is a restore or a typed refusal (review CR-01)
+// ============================================================================
+
+/// `rig` with `faults` armed once its first commit returned: the preflights,
+/// the lock and the commit see a healthy gateway, what follows does not.
+fn armed_after_commit(rig: Rig, faults: DeployFaults) -> Rig {
+    let arm = faults.clone();
+    let host = rig.host.clone().after("commit", 1, move || {
+        arm.arm();
+        async {}
+    });
+    Rig {
+        host,
+        faults,
+        ..rig
+    }
+}
+
+/// An apply over `rig` whose gateway calls named by `faults` fail after the
+/// commit.
+async fn apply_with_post_commit_faults(
+    rig: Rig,
+    faults: DeployFaults,
+) -> (Rig, Result<DeployApplyResult, CoreError>) {
+    let rig = armed_after_commit(rig, faults);
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await;
+    (rig, result)
+}
+
+/// The one warning of a rolled-back result that names the failed step.
+fn post_commit_warning(result: &DeployApplyResult) -> &str {
+    result
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("post_commit_error"))
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("no post_commit_error warning in {:?}", result.warnings))
+}
+
+/// A gateway error before the verdict puts the snapshot back, like a red
+/// verify does, and says which step failed.
+async fn assert_post_commit_error_restores(method: &'static str, step: &str, cause: &str) {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let faults = DeployFaults::default().fail(method, 1);
+    let (rig, result) = apply_with_post_commit_faults(rig, faults.clone()).await;
+
+    let result = result.expect("a post-commit error is a restore, not an error");
+    assert_eq!(faults.failed(method), 1, "the fault was reached");
+    assert_rolled_back(&result, cause);
+    assert_eq!(collection_state(&rig), before, "the snapshot is back");
+    let warning = post_commit_warning(&result);
+    assert!(
+        warning.contains(step) && warning.contains("network_error"),
+        "{warning}"
+    );
+    let run_id = result.run_id.clone().expect("run id");
+    assert!(!journal_path(&rig).exists(), "the restore finalized");
+    assert_eq!(rig.record(&run_id).state, RecordState::RolledBack);
+    assert!(rig.host.calls().contains(&"restore"));
+}
+
+#[tokio::test]
+async fn post_commit_lock_check_error_restores_as_lock_expired() {
+    assert_post_commit_error_restores("scan_lock_info", "lock_check", "lock_expired").await;
+}
+
+#[tokio::test]
+async fn post_commit_scan_error_restores_as_scan_incomplete() {
+    assert_post_commit_error_restores("scan_request", "scan", "scan_incomplete").await;
+}
+
+#[tokio::test]
+async fn post_commit_verify_error_restores_as_verify_failed() {
+    assert_post_commit_error_restores("deployment_mode", "verify", "verify_failed").await;
+}
+
+#[tokio::test]
+async fn post_commit_error_with_the_gateway_gone_is_rollback_failed_with_the_journal() {
+    // The lock read fails and so does the restore's own: nothing can be put
+    // back, so the run ends as a typed refusal that names the journal.
+    let rig = changing_rig().await;
+    let faults = DeployFaults::default().fail("scan_lock_info", 100);
+    let (rig, result) = apply_with_post_commit_faults(rig, faults).await;
+    let err = result.expect_err("the restore could not run");
+    let CoreError::RollbackFailed(failure) = &err else {
+        panic!("expected rollback_failed, got {err:?}");
+    };
+    assert!(failure.journal.ends_with("journal.json"), "{failure:?}");
+    assert_eq!(err.exit_code(), 6);
+    assert!(journal_path(&rig).is_file(), "the journal stays");
+    assert!(
+        !rig.host.calls().contains(&"restore"),
+        "the restore never ran"
+    );
+}
+
+/// An apply whose host fails `call` (the `nth` time, with `after` when the
+/// work was done first) once the verify was green: the deploy is live and
+/// verified but not recorded.
+async fn green_then_host_error(
+    call: &'static str,
+    after: bool,
+) -> (
+    Rig,
+    BTreeMap<String, String>,
+    Result<DeployApplyResult, CoreError>,
+) {
+    let rig = changing_rig().await;
+    let before = collection_state(&rig);
+    let host = if after {
+        rig.host.clone().fail_after(call, 1)
+    } else {
+        rig.host.clone().fail(call, 1)
+    };
+    let rig = Rig { host, ..rig };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await;
+    (rig, before, result)
+}
+
+/// The interrupted-run error a failure past a green verify ends as: the
+/// recovery command with the real env, the tree left as written, nothing
+/// restored on a guess.
+async fn assert_interrupted_after_green(
+    rig: &Rig,
+    before: &BTreeMap<String, String>,
+    err: &CoreError,
+) {
+    let journal = read_journal(rig);
+    assert_recovery_hint(err, &journal.run_id);
+    assert_ne!(&collection_state(rig), before, "the new tree stays live");
+    let calls = rig.host.calls();
+    assert!(!calls.contains(&"restore"), "{calls:?}");
+    let result = failed_result(rig);
+    assert_eq!(result["error"]["code"], "deploy_journal_present");
+    let run_dir = rig
+        .repo
+        .join(".ign/deploy")
+        .join(GATEWAY)
+        .join(&journal.run_id);
+    let interrupted = event_lines(&run_dir, "commit_interrupted");
+    assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+    assert_eq!(interrupted[0]["code"], "transport_failed");
+    assert!(event_names(&run_dir).contains(&"verify_done".to_string()));
+
+    // `rollback --run` is the recovery, as for a kill past a green verify.
+    let (_, recovered) = recover(rig, &journal.run_id).await;
+    assert_eq!(
+        recovered.expect("recovered").outcome,
+        RollbackKind::Restored
+    );
+    assert_eq!(&collection_state(rig), before);
+    assert!(!journal_path(rig).exists());
+}
+
+#[tokio::test]
+async fn green_verify_then_fingerprint_error_is_the_interrupted_run() {
+    let (rig, before, result) = green_then_host_error("fingerprint", false).await;
+    let err = result.expect_err("a deploy that was not recorded is not applied");
+    assert_interrupted_after_green(&rig, &before, &err).await;
+}
+
+#[tokio::test]
+async fn green_verify_then_finalize_error_is_the_interrupted_run() {
+    let (rig, before, result) = green_then_host_error("finalize", false).await;
+    let err = result.expect_err("a deploy that was not recorded is not applied");
+    assert_interrupted_after_green(&rig, &before, &err).await;
+}
+
+#[tokio::test]
+async fn green_verify_then_a_finalize_that_ran_but_reported_an_error_is_applied() {
+    // The connection dropped after the box finished: the record is installed
+    // and the journal is gone, so the deploy is complete and says so.
+    let (rig, _, result) = green_then_host_error("finalize", true).await;
+    let result = result.expect("the box finished the run");
+    assert_eq!(result.outcome, OutcomeKind::Applied, "{result:?}");
+    assert!(result.ok);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("finalize_reported_error")),
+        "{:?}",
+        result.warnings
+    );
+    assert!(!journal_path(&rig).exists());
+    let run_id = result.run_id.clone().expect("run id");
+    assert_eq!(rig.record(&run_id).state, RecordState::Applied);
 }
 
 // ============================================================================
