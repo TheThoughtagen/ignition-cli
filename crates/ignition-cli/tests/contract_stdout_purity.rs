@@ -25,6 +25,8 @@
 //! would otherwise change the envelope bytes (profile echo / render mode)
 //! and turn a byte-exact assertion into a shell-dependent flake.
 
+mod common;
+
 use assert_cmd::Command;
 
 /// Expected `ign profile list --json` stdout for the empty config, byte for
@@ -635,4 +637,207 @@ async fn deploy_verify_json_stdout_is_the_envelope_only() {
         *b"\n",
         "nothing but the newline follows the envelope"
     );
+}
+
+// ============================================================================
+// 23-15: `deploy apply` and `deploy rollback` keep stdout to one envelope
+// ============================================================================
+
+/// `ign` pointed at the mock gateway at `url`, under the same noise as
+/// [`noisy_ign`]: an unknown config key on every load and
+/// `IGNITION_LOG=trace`. A tracing line on stdout fails the byte checks below.
+fn noisy_gateway_ign(url: &str) -> (tempfile::TempDir, Command) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "bogus_key = 1\nactive = \"dev\"\n\n[profiles.dev]\nurl = \"{url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
+        ),
+    )
+    .expect("write noisy config");
+    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
+    cmd.env("IGNITION_CLI_CONFIG", &config)
+        .env("IGNITION_TOKEN", "mock:name-key")
+        .env("IGNITION_LOG", "trace");
+    for var in [
+        "IGNITION_URL",
+        "IGNITION_PROFILE",
+        "IGNITION_JSON",
+        "IGNITION_YES",
+    ] {
+        cmd.env_remove(var);
+    }
+    (dir, cmd)
+}
+
+/// Stdout is exactly one JSON value followed by its single newline.
+fn assert_one_envelope(stdout: &[u8], label: &str) -> serde_json::Value {
+    assert!(
+        stdout.ends_with(b"\n") && !stdout.ends_with(b"\n\n"),
+        "{label}: exactly one trailing newline: {:?}",
+        String::from_utf8_lossy(stdout)
+    );
+    let mut stream = serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>();
+    let envelope = stream
+        .next()
+        .unwrap_or_else(|| panic!("{label}: one JSON value"))
+        .unwrap_or_else(|e| panic!("{label}: stdout parses as JSON: {e}"));
+    let value_end = stream.byte_offset();
+    assert!(
+        stream.next().is_none(),
+        "{label}: stdout holds exactly one JSON value"
+    );
+    assert_eq!(
+        stdout[value_end..],
+        *b"\n",
+        "{label}: nothing but the newline follows the envelope"
+    );
+    envelope
+}
+
+/// The JSON-mode apply and rollback args for `repo`, `--yes` unless `yes`
+/// is false.
+fn apply_cmd(
+    server: &wiremock::MockServer,
+    repo: &std::path::Path,
+    hash: &str,
+    yes: bool,
+) -> std::process::Output {
+    let (_cfg, mut cmd) = noisy_gateway_ign(&server.uri());
+    cmd.args(common::apply_args(repo, Some(hash), true, yes))
+        .output()
+        .expect("spawn ign")
+}
+
+fn rollback_cmd(
+    server: &wiremock::MockServer,
+    repo: &std::path::Path,
+    run: &str,
+) -> std::process::Output {
+    let (_cfg, mut cmd) = noisy_gateway_ign(&server.uri());
+    cmd.args(common::rollback_args(repo, run, true, true))
+        .output()
+        .expect("spawn ign")
+}
+
+/// Apply through the quiet harness and return the run id.
+async fn applied_run(server: &wiremock::MockServer, repo: &std::path::Path) -> String {
+    common::apply_through_binary(server, repo, &[]).await
+}
+
+/// `deploy apply --json` writes one envelope to stdout and nothing else, for
+/// an applied run, a rolled-back verdict (exit 6) and an error (no stdout).
+#[tokio::test]
+async fn deploy_apply_json_stdout_is_the_envelope_only() {
+    use serde_json::json;
+
+    // applied
+    let (_scratch, repo, data) = common::apply_tracer();
+    let hash = common::plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    common::mount_apply_gateway(&server, &data, Vec::new()).await;
+    let out = apply_cmd(&server, &repo, &hash, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = assert_one_envelope(&out.stdout, "apply applied");
+    assert_eq!(envelope["data"]["outcome"], "applied");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bogus_key"),
+        "the noise really fired (precondition): {stderr}"
+    );
+
+    // error: no --yes is a refusal, stdout stays empty
+    let (_scratch, repo, data) = common::apply_tracer();
+    let hash = common::plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    common::mount_apply_gateway(&server, &data, Vec::new()).await;
+    let out = apply_cmd(&server, &repo, &hash, false);
+    assert_eq!(out.status.code(), Some(2));
+    assert_stdout_bytes(&out.stdout, b"", "apply confirmation refusal");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("confirmation_required"));
+
+    // rolled back: a verdict envelope on stdout and exit 6
+    let (_scratch, repo, data) = common::apply_tracer();
+    let hash = common::plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    common::mount_apply_gateway(
+        &server,
+        &data,
+        vec![json!({
+            "timestamp": 1_792_999_999_000_i64,
+            "loggerName": "NamedResourceHandler-ignition/database-translator",
+            "level": "WARN",
+            "message": format!(
+                "Resource {} does not have required UUID attribute, will not be loaded",
+                common::NAMED_TRANSLATOR
+            ),
+        })],
+    )
+    .await;
+    let out = apply_cmd(&server, &repo, &hash, true);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = assert_one_envelope(&out.stdout, "apply rolled back");
+    assert_eq!(envelope["data"]["outcome"], "rolled_back");
+    assert_eq!(envelope["data"]["slug"], "deploy_rolled_back");
+}
+
+/// `deploy rollback --json` writes one envelope to stdout for a restore and a
+/// cleared interrupted run, and leaves stdout empty on an error.
+#[tokio::test]
+async fn deploy_rollback_json_stdout_is_the_envelope_only() {
+    use ignition_core::deploy::apply::journal::JournalPhase;
+
+    // restored
+    let (_scratch, repo, data) = common::apply_tracer();
+    let server = wiremock::MockServer::start().await;
+    common::mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = applied_run(&server, &repo).await;
+    let out = rollback_cmd(&server, &repo, &run);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = assert_one_envelope(&out.stdout, "rollback restored");
+    assert_eq!(envelope["data"]["outcome"], "restored");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("bogus_key"),
+        "the noise really fired (precondition)"
+    );
+
+    // cleared: a journal a run killed before its first move leaves, over a
+    // host that equals its pre-apply state (the rollback above put it back)
+    common::plant_journal_at(&data, &run, JournalPhase::Ready);
+    let out = rollback_cmd(&server, &repo, &run);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = assert_one_envelope(&out.stdout, "rollback cleared");
+    assert_eq!(envelope["data"]["outcome"], "cleared");
+
+    // error: a later edit refuses the rollback; stdout stays empty
+    let (_scratch, repo, data) = common::apply_tracer();
+    let server = wiremock::MockServer::start().await;
+    common::mount_apply_gateway(&server, &data, Vec::new()).await;
+    let run = applied_run(&server, &repo).await;
+    common::edit_live_unit(&data);
+    let out = rollback_cmd(&server, &repo, &run);
+    assert_eq!(out.status.code(), Some(6));
+    assert_stdout_bytes(&out.stdout, b"", "rollback live-changed refusal");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("deploy_live_changed"));
 }

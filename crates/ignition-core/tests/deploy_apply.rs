@@ -245,6 +245,12 @@ async fn mount_passing_preflights(server: &wiremock::MockServer) {
 /// A small valid ZIP standing in for a `.gwbk`: one stored member, so that
 /// cutting the file anywhere in the second half loses the central directory.
 fn gwbk_zip() -> Vec<u8> {
+    gwbk_zip_holding(None)
+}
+
+/// [`gwbk_zip`], the member carrying `secret` when given (23-15's canary: a
+/// `.gwbk` holds the gateway's secrets).
+fn gwbk_zip_holding(secret: Option<&str>) -> Vec<u8> {
     use std::io::Write as _;
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options =
@@ -253,6 +259,9 @@ fn gwbk_zip() -> Vec<u8> {
         .start_file("data.bin", options)
         .expect("member starts");
     writer.write_all(&[7u8; 4096]).expect("member writes");
+    if let Some(secret) = secret {
+        writer.write_all(secret.as_bytes()).expect("secret writes");
+    }
     writer.finish().expect("finalizes").into_inner()
 }
 
@@ -4140,4 +4149,221 @@ async fn journal_commit_error_with_nothing_on_the_box_stays_the_original_error()
     assert_eq!(collection_state(&rig), before);
     let result = failed_result(&rig);
     assert_eq!(result["error"]["code"], "transport_failed");
+}
+
+// ============================================================================
+// The secret canary over the on-box files and an aborted run (23-15, DSURF-03)
+// ============================================================================
+
+/// The 23-15 canary. Seeded in a secret field of the live resource the apply
+/// replaces, in the `.gwbk` the gateway serves and in gateway log lines.
+const CANARY: &str = "IGN-CANARY-23-15";
+
+fn holds_canary(bytes: &[u8]) -> bool {
+    bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes())
+}
+
+/// A rig whose live `POSTGRES` config holds [`CANARY`] in an `Embedded`
+/// secret (the apply replaces it), whose `.gwbk` carries it and whose log
+/// source returns an unrelated line naming it, plus `extra_logs`.
+async fn canary_rig(extra_logs: Vec<Value>, fault: Option<ApplyFault>) -> Rig {
+    let fx = PlanFixture::new();
+    let (declared, _) = fx.load("dev");
+    fx.live_render(MODE, &declared);
+    fx.mode(
+        DB_CONFIG,
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY}"}}}}}}"#).as_bytes(),
+    );
+    fx.remove(MODE, ALARM_UNIT);
+    fx.ledger(GATEWAY, MODE, &[DB_CONFIG, DB_RESOURCE]);
+    let host = local_host(&fx);
+    let host = match fault {
+        Some(fault) => host.with_apply_fault(fault),
+        None => host,
+    };
+    let mut logs = vec![json!({
+        "timestamp": 1_792_000_000_010_i64,
+        "loggerName": "Unrelated.Logger",
+        "level": "WARN",
+        "message": format!("connection refused for password={CANARY}"),
+    })];
+    logs.extend(extra_logs);
+    let rig = rig_with_logs(fx, host, None, logs).await;
+    mount_gwbk(&rig._server, gwbk_zip_holding(Some(CANARY)), 1).await;
+    rig
+}
+
+/// The run-directory files that hold [`CANARY`], skipping the two entries
+/// that legitimately hold secrets (D-05): `snapshot/` and `*.gwbk`.
+fn run_dir_canary_leaks(run_dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<String>, seen: &mut usize) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            let rel = path.strip_prefix(root).expect("below root");
+            let exempt = rel.starts_with("snapshot")
+                || (rel.components().count() == 1 && rel.extension().is_some_and(|e| e == "gwbk"));
+            if exempt {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, found, seen);
+            } else {
+                *seen += 1;
+                if holds_canary(&std::fs::read(&path).expect("read")) {
+                    found.push(rel.display().to_string());
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut seen = 0;
+    walk(run_dir, run_dir, &mut found, &mut seen);
+    assert!(
+        seen >= 3,
+        "the scan walked the run files, not nothing: {seen}"
+    );
+    found
+}
+
+/// The on-box files of `run_id` that must be secret-free: the journal bytes
+/// given (read while it existed), `record.json` and `ledger.json`.
+fn assert_on_box_clean(rig: &Rig, run_id: &str, journal: Option<&[u8]>, what: &str) {
+    if let Some(journal) = journal {
+        assert!(!journal.is_empty(), "{what}: the journal was read");
+        assert!(!holds_canary(journal), "{what}: canary in journal.json");
+    }
+    for rel in [
+        format!("snapshots/{run_id}/record.json"),
+        "ledger.json".to_string(),
+    ] {
+        let bytes = std::fs::read(rig.deploy_dir().join(&rel)).expect("on-box file");
+        assert!(!holds_canary(&bytes), "{what}: canary in {rel}");
+    }
+}
+
+/// The seeds are real: the pre-image the run keeps and the `.gwbk` hold the
+/// canary, so the scans above skip something that matters.
+fn assert_exempt_holds_canary(run_dir: &Path, run_id: &str) {
+    let pre_image = run_dir.join("snapshot/files").join(DB_CONFIG);
+    assert!(
+        holds_canary(&std::fs::read(&pre_image).expect("pre-image")),
+        "the snapshot holds the replaced secret"
+    );
+    let gwbk = run_dir.join(format!("{run_id}.gwbk"));
+    assert!(
+        holds_canary(&std::fs::read(&gwbk).expect(".gwbk")),
+        "the .gwbk holds the canary"
+    );
+}
+
+#[tokio::test]
+async fn canary_on_box_files_clean() {
+    // applied: the journal is read at the point it exists (after the commit,
+    // before the finalize removes it).
+    let rig = canary_rig(Vec::new(), None).await;
+    let journal: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let journal_file = rig.deploy_dir().join("journal.json");
+    let captured = journal.clone();
+    let host = rig.host.clone().after("commit", 1, move || {
+        *captured.lock().expect("journal") = std::fs::read(&journal_file).unwrap_or_default();
+        async {}
+    });
+    let rig = Rig { host, ..rig };
+    let recorder = Recorder::default();
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &recorder).await.expect("applied");
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    let run_id = result.run_id.clone().expect("run id");
+    let journal = journal.lock().expect("journal").clone();
+    assert_on_box_clean(&rig, &run_id, Some(&journal), "applied");
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(run_dir_canary_leaks(&run_dir), Vec::<String>::new());
+    assert_exempt_holds_canary(&run_dir, &run_id);
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(!serialized.contains(CANARY), "canary in the result");
+    let events = format!("{:?}", recorder.0.lock().expect("events"));
+    assert!(!events.contains(CANARY), "canary in the observer events");
+
+    // restored: a fresh-process rollback of that run.
+    let restored = Fresh::new(&rig)
+        .await
+        .rollback(&rig, &run_id, false)
+        .await
+        .expect("restored");
+    assert_eq!(restored.outcome, RollbackKind::Restored);
+    assert_on_box_clean(&rig, &run_id, None, "restored");
+    assert_eq!(
+        run_dir_canary_leaks(Path::new(&restored.run_dir)),
+        Vec::<String>::new()
+    );
+    let serialized = serde_json::to_string(&restored).expect("result serializes");
+    assert!(
+        !serialized.contains(CANARY),
+        "canary in the rollback result"
+    );
+
+    // rolled back: a red verify (the unloaded line carries the canary).
+    let mut red = unloaded_log_line();
+    red["message"] = json!(format!("{} {CANARY}", red["message"].as_str().expect("m")));
+    let rig = canary_rig(vec![red], None).await;
+    let journal: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let journal_file = rig.deploy_dir().join("journal.json");
+    let captured = journal.clone();
+    let host = rig.host.clone().after("commit", 1, move || {
+        *captured.lock().expect("journal") = std::fs::read(&journal_file).unwrap_or_default();
+        async {}
+    });
+    let rig = Rig { host, ..rig };
+    let prepared = rig.prepare(GateFlags::default()).await.expect("prepare");
+    let result = rig.run(prepared, &NoObserver).await.expect("a verdict");
+    assert_eq!(result.outcome, OutcomeKind::RolledBack);
+    let run_id = result.run_id.clone().expect("run id");
+    let journal = journal.lock().expect("journal").clone();
+    assert_on_box_clean(&rig, &run_id, Some(&journal), "rolled_back");
+    let run_dir = rig.run_dir(&result);
+    assert_eq!(run_dir_canary_leaks(&run_dir), Vec::<String>::new());
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(
+        !serialized.contains(CANARY),
+        "canary in the rolled-back result"
+    );
+}
+
+#[tokio::test]
+async fn canary_aborted_run_clean() {
+    // Edge DSURF-03 concurrency: an apply killed after its first move leaves
+    // a journal, a record and a partial events.ndjson. None holds the canary.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let rig = canary_rig(
+        Vec::new(),
+        Some(ApplyFault::HangAfterMove(1, notify.clone())),
+    )
+    .await;
+    let Killed { rig, journal, .. } = kill_apply(rig, notify).await;
+    assert_eq!(journal.phase, JournalPhase::Writing);
+
+    let journal_bytes = std::fs::read(journal_path(&rig)).expect("the journal");
+    assert_on_box_clean(&rig, &journal.run_id, Some(&journal_bytes), "aborted");
+    let run_dir = rig
+        .repo
+        .join(".ign/deploy")
+        .join(GATEWAY)
+        .join(&journal.run_id);
+    let events = std::fs::read(run_dir.join("events.ndjson")).expect("partial events");
+    assert!(!events.is_empty(), "the aborted run began its events");
+    assert!(!holds_canary(&events), "canary in the partial events");
+    assert_eq!(run_dir_canary_leaks(&run_dir), Vec::<String>::new());
+    // The aborted run really was mid-write over the secret: the on-box
+    // snapshot (a secret-bearing copy, exempt like the run directory's) holds
+    // the pre-image the move replaced.
+    let pre_image = rig
+        .deploy_dir()
+        .join("snapshots")
+        .join(&journal.run_id)
+        .join("files")
+        .join(DB_CONFIG);
+    assert!(
+        holds_canary(&std::fs::read(&pre_image).expect("a pre-image on the box")),
+        "the pre-image holds the secret the move replaced"
+    );
 }

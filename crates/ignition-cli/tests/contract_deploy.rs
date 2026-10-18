@@ -12,15 +12,13 @@
 //! done | shasum -a 256
 //! ```
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use common::*;
 use serde_json::Value;
-
-const TRACER_REPO: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../ignition-core/tests/fixtures/deploy/repos/tracer"
-);
 
 /// `render_sha256` of the tracer repo for `--env dev`. Pinned on purpose:
 /// a change here means the listing format or the tracer bytes changed.
@@ -41,49 +39,11 @@ const DATA_KEYS: &[&str] = &[
     "warnings",
 ];
 
-/// `ign` with an absent isolated config and no ambient gateway knobs.
-fn ign() -> (tempfile::TempDir, Command) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
-    cmd.env("IGNITION_CLI_CONFIG", dir.path().join("config.toml"));
-    for var in [
-        "IGNITION_URL",
-        "IGNITION_TOKEN",
-        "IGNITION_PROFILE",
-        "IGNITION_JSON",
-    ] {
-        cmd.env_remove(var);
-    }
-    (dir, cmd)
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("mkdir");
-    for entry in std::fs::read_dir(from).expect("read_dir") {
-        let entry = entry.expect("entry");
-        let dest = to.join(entry.file_name());
-        if entry.file_type().expect("type").is_dir() {
-            copy_dir(&entry.path(), &dest);
-        } else {
-            std::fs::copy(entry.path(), &dest).expect("copy");
-        }
-    }
-}
-
 fn tracer_copy() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path().join("repo");
     copy_dir(Path::new(TRACER_REPO), &repo);
     (dir, repo)
-}
-
-fn stderr_json(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stderr).unwrap_or_else(|e| {
-        panic!(
-            "stderr is not one JSON value ({e}): {}",
-            String::from_utf8_lossy(&out.stderr)
-        )
-    })
 }
 
 #[test]
@@ -608,44 +568,6 @@ fn tracer_with_master(master_extra: &str) -> (tempfile::TempDir, PathBuf) {
     (tmp, repo)
 }
 
-/// A `local:` tracer copy with a live data directory equal to the ACTUAL
-/// render (render may mint a uuid, so the live tree is built from
-/// `ign deploy render --out`, never from the source files). Returns
-/// `(scratch, repo, data_dir)`; the live mode collection is
-/// `<data_dir>/config/resources/dev/`.
-fn local_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let scratch = tempfile::tempdir().expect("tempdir");
-    let repo = scratch.path().join("repo");
-    copy_dir(Path::new(TRACER_REPO), &repo);
-    let data = scratch.path().join("data");
-    let live = data.join("config").join("resources").join("dev");
-    std::fs::create_dir_all(&live).expect("live dir");
-    let yaml = format!(
-        "schema_version: 1\ngateway: tracer-gw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
-        data.display()
-    );
-    std::fs::write(repo.join("targets/dev.yaml"), yaml).expect("target file");
-
-    let out_dir = scratch.path().join("out");
-    let (_cfg, mut cmd) = ign();
-    let out = cmd
-        .args(["deploy", "render", "--env", "dev", "--repo"])
-        .arg(&repo)
-        .arg("--out")
-        .arg(&out_dir)
-        .output()
-        .expect("spawn ign");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    copy_dir(&out_dir, &live);
-    std::fs::remove_file(live.join("render.json")).expect("drop render.json");
-    (scratch, repo, data)
-}
-
 /// The first rendered file in the live mode collection, byte order.
 fn first_live_file(data: &Path) -> PathBuf {
     fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
@@ -662,13 +584,6 @@ fn first_live_file(data: &Path) -> PathBuf {
     walk(&data.join("config/resources/dev"), &mut found);
     found.sort();
     found.into_iter().next().expect("a live file")
-}
-
-fn plan_json(repo: &Path, cmd: &mut Command) -> std::process::Output {
-    cmd.args(["--json", "deploy", "plan", "--env", "dev", "--repo"])
-        .arg(repo)
-        .output()
-        .expect("spawn ign")
 }
 
 #[test]
@@ -1111,32 +1026,6 @@ fn plan_base_cli_marks_drift_and_refuses_a_tampered_base() {
 /// Canary seeded into live Embedded ciphertext that pull must never write.
 const CANARY_PULL: &str = "IGN-CANARY-22-08-CIPHERTEXT";
 
-/// Every file below `dir`, relative path to bytes.
-fn read_tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
-    fn walk(dir: &Path, rel: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
-        let Ok(read) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in read {
-            let entry = entry.expect("entry");
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child = if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            };
-            if entry.path().is_dir() {
-                walk(&entry.path(), &child, out);
-            } else {
-                out.insert(child, std::fs::read(entry.path()).expect("read"));
-            }
-        }
-    }
-    let mut out = std::collections::BTreeMap::new();
-    walk(dir, "", &mut out);
-    out
-}
-
 /// A local tracer whose live mode collection also holds an Embedded-secret
 /// unit; the declared gateway directory is removed so the pull starts from
 /// an empty repo.
@@ -1358,31 +1247,6 @@ fn pull_cli_master_without_host_access_exits_2() {
 // ---- 22-11: `ign deploy verify` (DPLN-07, DPLN-09, DSURF-04) -----------------
 
 const VERIFY_CANARY: &str = "CANARY-VERIFY-LOG-22";
-const NAMED_TRANSLATOR: &str = "ignition/database-translator/POSTGRES";
-
-/// The rendered `config.json` of `key` from the live tree, with JSON null
-/// members removed. Most types' REST view omits null members, and this helper
-/// models that shape. `ignition/cobranding` is the exception: it echoes unset
-/// members as explicit `null`, which `rest_config_raw` models.
-fn rest_config(data: &Path, key: &str) -> Value {
-    fn strip(v: &Value) -> Value {
-        match v {
-            Value::Object(m) => Value::Object(
-                m.iter()
-                    .filter(|(_, v)| !v.is_null())
-                    .map(|(k, v)| (k.clone(), strip(v)))
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-    let path = data
-        .join("config/resources/dev")
-        .join(key)
-        .join("config.json");
-    strip(&serde_json::from_slice(&std::fs::read(path).expect("live config")).expect("json"))
-}
-
 /// The rendered `config.json` of `key` from the live tree with its null
 /// members KEPT: a REST view that echoes unset members as explicit `null`
 /// (`ignition/cobranding`; G-22-2).
@@ -1479,27 +1343,6 @@ async fn mount_verify_gateway(
         })))
         .mount(server)
         .await;
-}
-
-/// An isolated config whose `[profiles.dev]` points at `url`, and `ign` with
-/// the mock token in the environment.
-fn verify_ign(url: &str) -> (tempfile::TempDir, Command) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = dir.path().join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "active = \"dev\"\n\n[profiles.dev]\nurl = \"{url}\"\nauth = {{ token_env = \"IGNITION_TOKEN\" }}\n"
-        ),
-    )
-    .expect("write config");
-    let mut cmd = Command::cargo_bin("ign").expect("binary 'ign' not found");
-    cmd.env("IGNITION_CLI_CONFIG", &config)
-        .env("IGNITION_TOKEN", "mock:name-key");
-    for var in ["IGNITION_URL", "IGNITION_PROFILE", "IGNITION_JSON"] {
-        cmd.env_remove(var);
-    }
-    (dir, cmd)
 }
 
 fn verify_args(repo: &Path, json: bool) -> Vec<std::ffi::OsString> {
@@ -1775,40 +1618,6 @@ async fn verify_cli_human_lines() {
 // `ign deploy apply` (23-13)
 // ============================================================================
 
-const APPLY_UNIT: &str = "ignition/database-translator/POSTGRES";
-
-/// `local_tracer()` with one live unit changed by a trailing space (a JSON
-/// document that reads the same, bytes that differ), so the plan has one
-/// `changed` entry. Returns `(scratch, repo, data_dir)`.
-fn changed_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let (scratch, repo, data) = local_tracer();
-    let config = data
-        .join("config/resources/dev")
-        .join(APPLY_UNIT)
-        .join("config.json");
-    let mut bytes = std::fs::read(&config).expect("live config");
-    bytes.push(b' ');
-    std::fs::write(&config, bytes).expect("change the live unit");
-    (scratch, repo, data)
-}
-
-/// `plan_sha256` of `deploy plan` over `repo`, from the binary.
-fn plan_hash(repo: &Path) -> String {
-    let (_cfg, mut cmd) = ign();
-    let out = plan_json(repo, &mut cmd);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let envelope: Value = serde_json::from_slice(&out.stdout).expect("plan envelope");
-    envelope["data"]["plan_sha256"]
-        .as_str()
-        .expect("plan_sha256")
-        .to_string()
-}
-
 #[test]
 fn apply_without_yes_prints_plan() {
     let (_scratch, repo, data) = changed_tracer();
@@ -1874,288 +1683,6 @@ fn apply_flags_are_exactly_these() {
         cli.get_arguments().any(|a| a.get_long() == Some("yes")),
         "--yes is a global flag"
     );
-}
-
-/// The system name the apply gateway's REST answer and the host's
-/// `system-properties` share (the `wrong_target` preflight compares them).
-const APPLY_SYSTEM_NAME: &str = "apply-gw";
-
-/// A small valid ZIP standing in for a `.gwbk`, the stored member carrying
-/// `secret` when given (a `.gwbk` holds the gateway's secrets, so the 23-15
-/// canary seeds one).
-fn apply_gwbk_zip(secret: Option<&str>) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    writer.start_file("data.bin", options).expect("member");
-    writer.write_all(&[7u8; 4096]).expect("write");
-    if let Some(secret) = secret {
-        writer.write_all(secret.as_bytes()).expect("write secret");
-    }
-    writer.finish().expect("finish").into_inner()
-}
-
-/// What the stateful apply gateway remembers between requests.
-struct ApplyGwState {
-    lock_held: bool,
-    lock_stamp: i64,
-    scan_ts: i64,
-    pending_scan_ts: Option<i64>,
-    active_reads: u32,
-}
-
-/// `changed_tracer()` made ready for an apply: the host's
-/// `system-properties` carry [`APPLY_SYSTEM_NAME`], the repo is a git repo
-/// whose `.gitignore` holds `.ign/`. Returns `(scratch, repo, data_dir)`.
-fn apply_tracer() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let (scratch, repo, data) = changed_tracer();
-    let props = data.join("config/resources/core/ignition/system-properties");
-    std::fs::create_dir_all(&props).expect("system-properties dir");
-    std::fs::write(
-        props.join("config.json"),
-        format!("{{\"systemName\":\"{APPLY_SYSTEM_NAME}\"}}"),
-    )
-    .expect("system-properties config");
-    std::fs::write(repo.join(".gitignore"), ".ign/\n").expect(".gitignore");
-    let init = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&repo)
-        .status()
-        .expect("git init");
-    assert!(init.success());
-    (scratch, repo, data)
-}
-
-/// A stateful mock gateway for `deploy apply` (23-13; 23-21 reuses it). Every
-/// route the engine calls is served: the scan-lock (acquire, then info with a
-/// remaining counter, free again once a scan is requested), the config scan
-/// (inactive, then active for one read after a trigger, then inactive with an
-/// advanced timestamp), gateway identity and mode, an empty Designer list, a
-/// small valid `.gwbk`, an empty restart-pending list, the project scan, and
-/// the REST view of the translator and the alarm singleton, read from the
-/// local data directory at the time of the request (so a restore is seen).
-/// `log_items` are the lines the gateway log returns; a "will not be
-/// loaded" line for a written resource turns the verify red.
-async fn mount_apply_gateway(server: &wiremock::MockServer, data: &Path, log_items: Vec<Value>) {
-    mount_apply_gateway_seeded(server, data, log_items, None).await;
-}
-
-/// [`mount_apply_gateway`] with a secret planted where a gateway could leak
-/// one (23-15): the `.gwbk` bytes carry `canary`, and the optional
-/// restart-pending route answers 500 with a body that names it.
-async fn mount_apply_gateway_seeded(
-    server: &wiremock::MockServer,
-    data: &Path,
-    log_items: Vec<Value>,
-    canary: Option<&str>,
-) {
-    use serde_json::json;
-    use std::sync::{Arc, Mutex};
-    use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, Request, ResponseTemplate};
-
-    let state = Arc::new(Mutex::new(ApplyGwState {
-        lock_held: false,
-        lock_stamp: 1_000,
-        scan_ts: 1_792_000_000_000,
-        pending_scan_ts: None,
-        active_reads: 0,
-    }));
-
-    let s = state.clone();
-    Mock::given(method("POST"))
-        .and(path("/data/api/v1/scan-lock/config"))
-        .respond_with(move |_: &Request| {
-            let mut st = s.lock().expect("state");
-            st.lock_held = true;
-            st.lock_stamp += 1;
-            ResponseTemplate::new(200)
-        })
-        .mount(server)
-        .await;
-    let s = state.clone();
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/scan-lock/config"))
-        .respond_with(move |_: &Request| {
-            let st = s.lock().expect("state");
-            if st.lock_held {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "timestamp": st.lock_stamp,
-                    "remaining": 170,
-                    "actor": "apply-test"
-                }))
-            } else {
-                ResponseTemplate::new(204)
-            }
-        })
-        .mount(server)
-        .await;
-    let s = state.clone();
-    Mock::given(method("POST"))
-        .and(path("/data/api/v1/scan/config"))
-        .respond_with(move |_: &Request| {
-            let mut st = s.lock().expect("state");
-            st.lock_held = false;
-            st.pending_scan_ts = Some(st.scan_ts + 1_000);
-            st.active_reads = 1;
-            ResponseTemplate::new(200)
-        })
-        .mount(server)
-        .await;
-    let s = state.clone();
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/scan/config"))
-        .respond_with(move |_: &Request| {
-            let mut st = s.lock().expect("state");
-            if st.active_reads > 0 {
-                st.active_reads -= 1;
-                return ResponseTemplate::new(200).set_body_json(json!({
-                    "scanActive": true,
-                    "lastScanTimestamp": st.scan_ts,
-                    "lastScanDuration": 300
-                }));
-            }
-            if let Some(next) = st.pending_scan_ts.take() {
-                st.scan_ts = next;
-            }
-            ResponseTemplate::new(200).set_body_json(json!({
-                "scanActive": false,
-                "lastScanTimestamp": st.scan_ts,
-                "lastScanDuration": 300
-            }))
-        })
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/data/api/v1/scan/projects"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/gateway-info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "name": APPLY_SYSTEM_NAME,
-            "deploymentMode": "dev",
-            "ignitionVersion": "8.3.6 (b2026042713)"
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/designers"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [],
-            "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/backup"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header(
-                    "content-type",
-                    "application/x-ignition-gateway-backup;charset=utf-8",
-                )
-                .set_body_bytes(apply_gwbk_zip(canary)),
-        )
-        .mount(server)
-        .await;
-    let pending = match canary {
-        Some(secret) => ResponseTemplate::new(500).set_body_string(format!(
-            "restart route failed: password={secret} rejected by the gateway"
-        )),
-        None => ResponseTemplate::new(200).set_body_json(json!({"pending": []})),
-    };
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/restart-tasks/pending"))
-        .respond_with(pending)
-        .mount(server)
-        .await;
-
-    // The REST view of the live tree, read when the request arrives.
-    let live = data.to_path_buf();
-    Mock::given(method("GET"))
-        .and(path(
-            "/data/api/v1/resources/list/ignition/database-translator",
-        ))
-        .respond_with(move |_: &Request| {
-            ResponseTemplate::new(200).set_body_json(json!({
-                "items": [{
-                    "type": "ignition/database-translator",
-                    "name": "POSTGRES",
-                    "collection": "dev",
-                    "config": rest_config(&live, NAMED_TRANSLATOR)
-                }],
-                "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
-            }))
-        })
-        .mount(server)
-        .await;
-    let live = data.to_path_buf();
-    Mock::given(method("GET"))
-        .and(path(
-            "/data/api/v1/resources/singleton/ignition/general-alarm-settings",
-        ))
-        .respond_with(move |_: &Request| {
-            ResponseTemplate::new(200).set_body_json(json!({
-                "type": "ignition/general-alarm-settings",
-                "collection": "dev",
-                "config": rest_config(&live, "ignition/general-alarm-settings")
-            }))
-        })
-        .mount(server)
-        .await;
-    // The cheap "has the gateway logged since the scan?" probe finds a line,
-    // so the log settle wait is skipped.
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/logs"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [{"timestamp": 1_792_999_999_999_i64, "loggerName": "x", "level": "INFO", "message": "m"}],
-            "metadata": {"total": 1, "matching": 1, "limit": 1, "offset": 0}
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/data/api/v1/logs"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": log_items,
-            "metadata": {"total": 0, "matching": 0, "limit": 200, "offset": 0}
-        })))
-        .mount(server)
-        .await;
-}
-
-/// The request paths the mock gateway saw, as `METHOD /path`.
-async fn seen_requests(server: &wiremock::MockServer) -> Vec<String> {
-    server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|r| format!("{} {}", r.method, r.url.path()))
-        .collect()
-}
-
-/// `ign --json --yes deploy apply` over `repo`, the mock at `url`.
-fn apply_args(repo: &Path, hash: Option<&str>, json: bool, yes: bool) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    if json {
-        args.push("--json".into());
-    }
-    if yes {
-        args.push("--yes".into());
-    }
-    for a in ["deploy", "apply", "--env", "dev", "--repo"] {
-        args.push(a.into());
-    }
-    args.push(repo.as_os_str().to_owned());
-    if let Some(hash) = hash {
-        args.push("--plan-sha256".into());
-        args.push(hash.into());
-    }
-    args
 }
 
 #[tokio::test]
@@ -2413,21 +1940,6 @@ async fn apply_human_output() {
 // `ign deploy apply` gate exits through the binary (23-21, DAPL-01, DAPL-02)
 // ============================================================================
 
-/// Run `ign deploy apply` over `repo` against the mock gateway with `extra`
-/// flags after the standard ones (`--json --yes` and the plan hash).
-async fn run_apply(
-    server: &wiremock::MockServer,
-    repo: &Path,
-    hash: &str,
-    extra: &[&str],
-) -> std::process::Output {
-    let (_cfg, mut cmd) = verify_ign(&server.uri());
-    cmd.args(apply_args(repo, Some(hash), true, true))
-        .args(extra)
-        .output()
-        .expect("spawn ign")
-}
-
 /// A gate refusal through the binary: the exit code and error slug, one JSON
 /// value on stderr, nothing on stdout, no request to the gateway (so no lock,
 /// backup or scan), no `.ign/` directory and the host tree untouched.
@@ -2606,55 +2118,6 @@ async fn apply_drift_with_reason_records_it() {
 // `ign deploy rollback` through the binary (23-14, DAPL-08, DAPL-09, DSURF-02)
 // ============================================================================
 
-/// `ign [--json] [--yes] deploy rollback --env dev --run RUN --repo REPO`.
-fn rollback_args(repo: &Path, run: &str, json: bool, yes: bool) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    if json {
-        args.push("--json".into());
-    }
-    if yes {
-        args.push("--yes".into());
-    }
-    for a in ["deploy", "rollback", "--env", "dev", "--run", run, "--repo"] {
-        args.push(a.into());
-    }
-    args.push(repo.as_os_str().to_owned());
-    args
-}
-
-/// The configuration tree of a host listing: a run keeps its record and
-/// snapshot below `ign-deploy/`, which is not configuration.
-fn config_tree(
-    tree: std::collections::BTreeMap<String, Vec<u8>>,
-) -> std::collections::BTreeMap<String, Vec<u8>> {
-    tree.into_iter()
-        .filter(|(path, _)| path.starts_with("config/"))
-        .collect()
-}
-
-/// Run `ign deploy apply --yes` through the binary over `repo` and return the
-/// applied run's id.
-async fn apply_through_binary(
-    server: &wiremock::MockServer,
-    repo: &Path,
-    extra: &[&str],
-) -> String {
-    let hash = plan_hash(repo);
-    let out = run_apply(server, repo, &hash, extra).await;
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "apply stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let envelope: Value = serde_json::from_slice(&out.stdout).expect("apply envelope");
-    assert_eq!(envelope["data"]["outcome"], "applied", "{envelope}");
-    envelope["data"]["run_id"]
-        .as_str()
-        .expect("run id")
-        .to_string()
-}
-
 #[tokio::test]
 async fn rollback_after_apply_restores() {
     let (_scratch, repo, data) = apply_tracer();
@@ -2788,53 +2251,6 @@ async fn rollback_bad_run_id_exit_2() {
     assert!(!repo.join(".ign").exists());
 }
 
-/// Plant the journal a killed apply leaves for `run` on the local host: the
-/// run's own record supplies the touched set and the pre-run fingerprint, the
-/// phase is `written` (every move done, not finalized). The snapshot the
-/// recovery restores from is the one the apply took.
-fn plant_journal(data: &Path, run: &str) {
-    plant_journal_at(
-        data,
-        run,
-        ignition_core::deploy::apply::journal::JournalPhase::Written,
-    );
-}
-
-/// [`plant_journal`] at an explicit phase.
-fn plant_journal_at(
-    data: &Path,
-    run: &str,
-    phase: ignition_core::deploy::apply::journal::JournalPhase,
-) {
-    use ignition_core::deploy::apply::journal::Journal;
-    let deploy_dir = data.join("ign-deploy/tracer-gw/dev");
-    let record: Value = serde_json::from_slice(
-        &std::fs::read(deploy_dir.join("snapshots").join(run).join("record.json"))
-            .expect("the run's record"),
-    )
-    .expect("record.json is JSON");
-    let mut touched: Vec<String> = record["touched"]
-        .as_array()
-        .expect("touched")
-        .iter()
-        .map(|entry| entry["path"].as_str().expect("path").to_string())
-        .collect();
-    touched.sort();
-    let journal = Journal {
-        schema_version: 1,
-        run_id: run.to_string(),
-        gateway: "tracer-gw".to_string(),
-        mode: "dev".to_string(),
-        phase,
-        pre_fingerprint: record["pre_fingerprint"]
-            .as_str()
-            .expect("pre_fingerprint")
-            .to_string(),
-        touched,
-    };
-    std::fs::write(deploy_dir.join("journal.json"), journal.to_bytes()).expect("plant journal");
-}
-
 #[tokio::test]
 async fn journal_blocks_cli_then_recovers() {
     let (_scratch, repo, data) = apply_tracer();
@@ -2930,17 +2346,6 @@ async fn journal_blocks_cli_then_recovers() {
     );
     let plan: Value = serde_json::from_slice(&out.stdout).expect("plan");
     assert_eq!(plan["data"]["summary"]["has_changes"], true, "{plan}");
-}
-
-/// Change the live unit once more after the apply (a Designer edit, say).
-fn edit_live_unit(data: &Path) {
-    let config = data
-        .join("config/resources/dev")
-        .join(APPLY_UNIT)
-        .join("config.json");
-    let mut bytes = std::fs::read(&config).expect("live config");
-    bytes.extend_from_slice(b"\n\n");
-    std::fs::write(config, bytes).expect("edit the live unit");
 }
 
 #[tokio::test]
@@ -3346,6 +2751,11 @@ async fn apply_canary() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(
+        out.stderr.is_empty(),
+        "a --json apply leaves stderr silent: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let envelope: Value = serde_json::from_slice(&out.stdout).expect("one envelope on stdout");
     assert_eq!(envelope["data"]["outcome"], "applied", "{envelope}");
     let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
@@ -3398,4 +2808,341 @@ async fn apply_canary() {
     }
     // The exempt entries are private and ignored: that is why they may hold it.
     assert_exempt_private(&repo, &run_dir);
+}
+
+/// A canary-seeded repo, host and gateway, ready for a run.
+struct CanaryRun {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    data: PathBuf,
+    server: wiremock::MockServer,
+}
+
+impl CanaryRun {
+    async fn new() -> CanaryRun {
+        let (scratch, repo, data) = canary_tracer();
+        let server = wiremock::MockServer::start().await;
+        mount_canary_gateway(&server, &data).await;
+        CanaryRun {
+            _scratch: scratch,
+            repo,
+            data,
+            server,
+        }
+    }
+
+    /// `ign deploy rollback --yes --json` (plus `extra`) of `run`.
+    async fn rollback(&self, run: &str, extra: &[&str]) -> std::process::Output {
+        let (_cfg, mut cmd) = verify_ign(&self.server.uri());
+        cmd.args(rollback_args(&self.repo, run, true, true))
+            .args(extra)
+            .output()
+            .expect("spawn ign")
+    }
+}
+
+/// An error envelope: exit `exit`, `code` on stderr as one JSON value, and
+/// nothing on stdout.
+fn assert_error_envelope(out: &std::process::Output, exit: i32, code: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(exit),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "an error prints no stdout");
+    assert_eq!(stderr_json(out)["error"]["code"], code);
+}
+
+#[tokio::test]
+async fn apply_canary_all_outcomes() {
+    use serde_json::json;
+
+    // noop: the host already equals the render. The only secret in reach is
+    // an unmanaged unit the apply never touches. A no-op contacts nothing.
+    {
+        let (_scratch, repo, data) = apply_tracer();
+        let config = data
+            .join("config/resources/dev")
+            .join(APPLY_UNIT)
+            .join("config.json");
+        let mut bytes = std::fs::read(&config).expect("live config");
+        bytes.pop();
+        std::fs::write(&config, bytes).expect("equal again");
+        let leak = data.join("config/resources/dev/ignition/database-translator/LEAK");
+        std::fs::create_dir_all(&leak).expect("leak dir");
+        std::fs::write(
+            leak.join("config.json"),
+            format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_APPLY}"}}}}}}"#),
+        )
+        .expect("seed unmanaged secret");
+        let hash = plan_hash(&repo);
+        let server = wiremock::MockServer::start().await;
+        mount_canary_gateway(&server, &data).await;
+        let out = run_apply(&server, &repo, &hash, &[]).await;
+        assert_eq!(out.status.code(), Some(0));
+        let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+        assert_eq!(envelope["data"]["outcome"], "noop", "{envelope}");
+        assert_eq!(assert_canary_free(&out, &repo, "noop"), 0);
+    }
+
+    // rolled_back: a red verify. The log line that turns it red carries the
+    // canary, as does an unrelated one.
+    {
+        let (_scratch, repo, data) = canary_tracer();
+        let hash = plan_hash(&repo);
+        let server = wiremock::MockServer::start().await;
+        let mut logs = canary_log_items();
+        logs.push(json!({
+            "timestamp": 1_792_999_999_000_i64,
+            "loggerName": "NamedResourceHandler-ignition/database-translator",
+            "level": "WARN",
+            "message": format!(
+                "Resource {NAMED_TRANSLATOR} does not have required UUID attribute, will not be loaded {CANARY_APPLY}"
+            ),
+        }));
+        mount_apply_gateway_seeded(&server, &data, logs, Some(CANARY_APPLY)).await;
+        let out = run_apply(&server, &repo, &hash, &[]).await;
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+        assert_eq!(envelope["data"]["outcome"], "rolled_back", "{envelope}");
+        assert_eq!(assert_canary_free(&out, &repo, "rolled_back"), 1);
+        let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+        assert_exempt_private(&repo, &run_dir);
+    }
+
+    // confirmation_required: no --yes. The prose names counts and paths.
+    {
+        let run = CanaryRun::new().await;
+        let hash = plan_hash(&run.repo);
+        let (_cfg, mut cmd) = verify_ign(&run.server.uri());
+        let out = cmd
+            .args(apply_args(&run.repo, Some(&hash), true, false))
+            .output()
+            .expect("spawn ign");
+        assert_error_envelope(&out, 2, "confirmation_required");
+        assert_eq!(assert_canary_free(&out, &run.repo, "confirmation"), 0);
+        assert!(seen_requests(&run.server).await.is_empty());
+    }
+
+    // plan_stale: the live file moved on after review, still holding it.
+    {
+        let run = CanaryRun::new().await;
+        let reviewed = plan_hash(&run.repo);
+        let config = run
+            .data
+            .join("config/resources/dev")
+            .join(APPLY_UNIT)
+            .join("config.json");
+        let mut bytes = std::fs::read(&config).expect("live config");
+        bytes.extend_from_slice(b"  ");
+        std::fs::write(&config, bytes).expect("move the live file on");
+        let out = run_apply(&run.server, &run.repo, &reviewed, &[]).await;
+        assert_error_envelope(&out, 6, "plan_stale");
+        assert_eq!(assert_canary_free(&out, &run.repo, "plan_stale"), 0);
+    }
+
+    // deploy_preflight_failed: a Designer is open. The run directory exists
+    // (run.json, result.json) and is scanned.
+    {
+        let run = CanaryRun::new().await;
+        let hash = plan_hash(&run.repo);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/data/api/v1/designers"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{
+                    "id": "d-0", "user": "dev1", "project": "main",
+                    "address": "10.0.0.7", "uptime": 1, "lastcomm": 1,
+                    "timeout": 1, "memory": {}
+                }],
+                "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+            })))
+            .with_priority(1)
+            .mount(&run.server)
+            .await;
+        let out = run_apply(&run.server, &run.repo, &hash, &[]).await;
+        assert_error_envelope(&out, 6, "deploy_preflight_failed");
+        assert_eq!(assert_canary_free(&out, &run.repo, "preflight_failed"), 1);
+    }
+}
+
+#[tokio::test]
+async fn rollback_canary() {
+    let run = CanaryRun::new().await;
+    let applied = apply_through_binary(&run.server, &run.repo, &[]).await;
+
+    // A Designer edit then puts a secret of its own into the live file: the
+    // refusal and the discard record paths, never content.
+    let live = run
+        .data
+        .join("config/resources/dev")
+        .join(APPLY_UNIT)
+        .join("config.json");
+    std::fs::write(
+        &live,
+        format!(r#"{{"x":{{"type":"Embedded","data":{{"ciphertext":"{CANARY_APPLY}"}}}}}}"#),
+    )
+    .expect("a later edit holding a secret");
+
+    // deploy_live_changed: a refusal.
+    let out = run.rollback(&applied, &[]).await;
+    assert_error_envelope(&out, 6, "deploy_live_changed");
+    assert_eq!(assert_canary_free(&out, &run.repo, "live_changed"), 1);
+
+    // restored, over the later edit: the discarded path is recorded.
+    let out = run.rollback(&applied, &["--discard-live-changes"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["outcome"], "restored", "{envelope}");
+    assert!(
+        envelope["data"]["discarded_live_changes"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "{envelope}"
+    );
+    assert_eq!(assert_canary_free(&out, &run.repo, "restored"), 2);
+    // A rollback takes no .gwbk; only the apply's run directory has one.
+    let rollback_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+    assert!(
+        !files_relative(&rollback_dir)
+            .iter()
+            .any(|rel| rel.extension().is_some_and(|e| e == "gwbk")),
+        "a rollback has no .gwbk"
+    );
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(rollback_dir.join("run.json")).expect("run.json"))
+            .expect("json");
+    assert_eq!(run_json["kind"], "rollback");
+    assert!(run_json["discarded_live_changes"].is_array());
+
+    // The interrupted-run recovery: a journal left for the applied run, a
+    // rollback of it. Its events name every touched path and its live hash.
+    plant_journal(&run.data, &applied);
+    let out = run.rollback(&applied, &[]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(envelope["data"]["outcome"], "restored", "{envelope}");
+    let recovery_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+    let events = std::fs::read_to_string(recovery_dir.join("events.ndjson")).expect("events");
+    assert!(
+        events.contains("interrupted_run"),
+        "the recovery recorded the torn state: {events}"
+    );
+    assert_eq!(assert_canary_free(&out, &run.repo, "recovered"), 3);
+    // The apply's own directory is still the one that holds the exempt files.
+    let apply_dir = run_dirs(&run.repo)
+        .into_iter()
+        .find(|dir| dir.ends_with(&applied))
+        .expect("the apply's run directory");
+    assert_exempt_private(&run.repo, &apply_dir);
+}
+
+#[tokio::test]
+async fn canary_repeat_runs_clean() {
+    // Edge DSURF-03 idempotency: apply, rollback and a second apply in one
+    // repo. Each run directory scans clean, as do all the outputs.
+    let run = CanaryRun::new().await;
+    let first = apply_through_binary(&run.server, &run.repo, &[]).await;
+    assert_eq!(run_dirs(&run.repo).len(), 1);
+
+    let out = run.rollback(&first, &[]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(assert_canary_free(&out, &run.repo, "rollback"), 2);
+
+    // The second apply, in human mode this time (progress on stderr).
+    let hash = plan_hash(&run.repo);
+    let (_cfg, mut cmd) = verify_ign(&run.server.uri());
+    let out = cmd
+        .args(apply_args(&run.repo, Some(&hash), false, true))
+        .output()
+        .expect("spawn ign");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ign deploy apply: "),
+        "human mode printed its progress, so stderr was scanned"
+    );
+    assert_eq!(assert_canary_free(&out, &run.repo, "second apply"), 3);
+    for dir in run_dirs(&run.repo) {
+        assert!(dir.join("run.json").is_file());
+    }
+}
+
+#[tokio::test]
+async fn apply_canary_drift_reason() {
+    // A `--allow-drift` reason is free text a person typed. It is recorded
+    // once, in `run.json` (the audit record, 23-21), and nowhere else: not on
+    // either stream, not in the events, the result or the plan.
+    let (scratch, repo, data) = apply_tracer();
+    let base = scratch.path().join("out");
+    let base_arg = base.to_str().expect("utf-8 path");
+    let hash = plan_hash(&repo);
+    let server = wiremock::MockServer::start().await;
+    mount_apply_gateway(&server, &data, Vec::new()).await;
+    let reason = format!("reviewed in PR 12 {CANARY_APPLY}");
+
+    let out = run_apply(
+        &server,
+        &repo,
+        &hash,
+        &["--base", base_arg, "--allow-drift", &reason],
+    )
+    .await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "a --json apply leaves stderr silent: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_streams_canary_free(&out, "drift reason");
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    let run_dir = PathBuf::from(envelope["data"]["run_dir"].as_str().expect("run dir"));
+
+    let holders: Vec<PathBuf> = files_relative(&run_dir)
+        .into_iter()
+        .filter(|rel| !is_canary_exempt(rel))
+        .filter(|rel| {
+            std::fs::read_to_string(run_dir.join(rel))
+                .expect("read")
+                .contains(CANARY_APPLY)
+        })
+        .collect();
+    assert_eq!(
+        holders,
+        [PathBuf::from("run.json")],
+        "only the run record holds the reason"
+    );
+    let run_json: Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).expect("run.json"))
+            .expect("json");
+    assert_eq!(run_json["allow_drift"], reason.as_str());
 }

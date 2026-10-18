@@ -3112,6 +3112,21 @@ pre-apply files and the backup, so apply refuses before any write when git would
 commit it (`deploy_preflight_failed`, check `run_dir_not_ignored`; a directory
 that is not a git work tree proceeds and says so in `run.json`).
 
+**Where secrets can be, and where they cannot.** The run directory holds secrets
+in exactly two places: `snapshot/` (copies of the gateway files the run replaced
+or deleted) and the `.gwbk`. That is why the directory must be git-ignored and
+owner-only. Nothing else a run writes or prints carries a secret value: not
+`run.json`, `result.json`, `plan.json` or `events.ndjson`, not stdout, stderr or
+the `--json` envelope, not the on-box `journal.json` and `record.json`, and not
+the confirmation text, which names the run, gateway, mode, counts, `plan_sha256`
+and changed paths only. Tests plant a canary value in a secret field of the live
+resources apply replaces, in the `.gwbk` the gateway serves, in gateway log lines
+and in an error body, then run apply (applied, no-op, rolled back, refused) and
+rollback (restored, refused, recovered) and assert it appears in no file or
+stream except those two named, private, git-ignored artifacts. Free text you type
+is recorded once: an `--allow-drift` reason is written to `run.json` as given and
+is not echoed anywhere else, so do not put a secret in it.
+
 **Runs are never pruned.** Nothing deletes a run directory or an on-box
 snapshot, in this release. To remove a run by hand, delete its run directory and
 the host's `snapshots/<run-id>/` directory under the
