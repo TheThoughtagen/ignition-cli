@@ -1184,7 +1184,7 @@ async fn scenario_competing_lock() -> Ran {
     let before = collection_state(&rig);
     rig.fake
         .client("b")
-        .scan_lock_acquire(ScanKind::Config, 0, 600)
+        .scan_lock_acquire(ScanKind::Config, 1, 600)
         .await
         .expect("B takes the lock");
     ran(rig, before, quiet_hook(), &SystemClock, &options()).await
@@ -1239,7 +1239,7 @@ async fn scenario_lock_taken() -> Ran {
         async move {
             fake.tick(HOLD_S as i64 + 1);
             fake.client("b")
-                .scan_lock_acquire(ScanKind::Config, 0, 600)
+                .scan_lock_acquire(ScanKind::Config, 1, 600)
                 .await
                 .expect("B takes the lock");
         }
@@ -3534,7 +3534,7 @@ async fn rollback_lock_held_refuses() {
     fresh
         .fake
         .client("b")
-        .scan_lock_acquire(ScanKind::Config, 0, 600)
+        .scan_lock_acquire(ScanKind::Config, 1, 600)
         .await
         .expect("B takes the lock");
     let err = fresh

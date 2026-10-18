@@ -715,9 +715,17 @@ impl DeployApi for FakeDeploy {
     async fn scan_lock_acquire(
         &self,
         kind: ScanKind,
-        _acquire_s: u64,
+        acquire_s: u64,
         hold_s: u64,
     ) -> Result<(), CoreError> {
+        // The real gateway refuses a non-positive timeout (23-16 live gate:
+        // `400 Timeouts must be positive.`), before it looks at the lock.
+        if acquire_s == 0 || hold_s == 0 {
+            return Err(CoreError::Internal(format!(
+                "unexpected HTTP 400 Bad Request from /data/api/v1/scan-lock/{} (gateway error page: Error 400: Timeouts must be positive.)",
+                kind.as_str()
+            )));
+        }
         let mut state = self.state();
         state.lock_attempts += 1;
         state.counter += 1;

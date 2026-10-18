@@ -59,6 +59,13 @@ use crate::client::DeployApi;
 use crate::client::scan::{LockObservation, LockVerdict, ScanKind, ScanLockInfo, lock_verdict};
 use crate::error::CoreError;
 
+/// Seconds the engine asks the gateway to wait for a lock held by someone
+/// else (`acquireTimeout`). The gateway refuses 0 (and any non-positive
+/// timeout) with a 400 "Timeouts must be positive" (23-16 live gate), and it
+/// never waits out a positive one: a held lock is an immediate 409 (D1,
+/// `20-LIVE-CAPTURES.md`), so the smallest positive value is "no wait".
+pub const ACQUIRE_WAIT_S: u64 = 1;
+
 /// D-02's floor: the shortest hold the engine ever requests, in seconds.
 /// A user decision, not a measurement.
 pub const HOLD_FLOOR_S: u64 = 10;
@@ -221,7 +228,9 @@ impl HeldLock {
         clock: &dyn Clock,
     ) -> Result<HeldLock, CoreError> {
         let acquired = clock.now();
-        deploy.scan_lock_acquire(kind, 0, hold_s).await?;
+        deploy
+            .scan_lock_acquire(kind, ACQUIRE_WAIT_S, hold_s)
+            .await?;
         let identity = match deploy.scan_lock_info(kind).await? {
             LockObservation::Held(info) => Some(LockIdentity::of(&info)),
             LockObservation::Free => None,
@@ -619,13 +628,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_lock_acquires_the_config_lock_with_the_hold_and_no_wait() {
+    async fn held_lock_acquires_the_config_lock_with_the_hold_and_the_smallest_wait() {
         let gateway = LockGateway::holding(HOLD as i64, None);
         let clock = ManualClock::new();
         let lock = lock_on(&gateway, &clock).await;
         assert_eq!(
             *gateway.acquired.lock().expect("acquired"),
-            [(ScanKind::Config, 0, HOLD)]
+            [(ScanKind::Config, ACQUIRE_WAIT_S, HOLD)]
         );
         assert_eq!((lock.kind(), lock.hold_s()), (ScanKind::Config, HOLD));
     }
