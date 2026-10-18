@@ -2686,3 +2686,37 @@ Target: `docs/superpowers/specs/2026-10-09-prod-gateway-config-as-code-design.md
 - **Linux nodes are unproven.** The text says `~/ign-deploy/...` for Linux, but `commit.sh` has been run only under a local `dash`; the file modes it sets (0644 files, 0755 directories) and a staged-file move across file systems (a copy and delete, not an atomic rename) are uncaptured (FA-23-05). If the spec prefers to say nothing about Linux until it is captured, drop the Linux path in item 2.
 - **Rollback is part of §8, not only §6.** §8's "Config or tags" row says "Restore the pre-deploy collection snapshot under scan-lock, then scan". `ign deploy rollback --run <id>` is that restore, from the node's own snapshot, and §8's "Automatic rollback fires only when post-apply verification fails" is what `ign deploy apply` does (exit 6, `deploy_rolled_back`). A follow-up edit to §8 may want to name the command; it needs no new account right.
 - **The lock hold.** §6 step 4.3 describes `holdTimeout = 2x(write+scan)+1`, measured on the real transport. 23-10 measured it: one fixed hold of 176 s for every target, and a change of 1,528 or more files is refused. This is a §6 fact, not a §9 one; it is mentioned here only so the author can update both in one pass.
+
+## Live gate: Windows binary apply and rollback (23-16)
+
+Host: `ign-win-836` (Windows Server 2022, Win32-OpenSSH, Ignition 8.3.6 `Ignition-ignwin836`, the real `production` collection, account `svc-ignition-deploy`), profile `azure-win`. The installed `ign` (`cargo install --path crates/ignition-cli --force` at the `84dca10` state, 2026-10-18T04:25Z) ran `deploy plan`, `deploy apply --yes --plan-sha256 <h>` and `deploy rollback --yes --run <id>` with `--json` against a temp repo holding the tracer's two units (four files), through `apply_host_for_node` (the Windows ssh arm), with the `.gwbk` on and `--designers fail`.
+
+Trial: the gateway showed `expired: true`, `trialSecondsLeft` 0 at 2026-10-18T13:54:55Z; **reset at 2026-10-18T13:55:14Z** with `ign --profile azure-win --json api call --method POST --path /data/api/v1/trial` (HTTP 200, 7199 s left). The first Keychain read after the reinstall had blocked from 04:26Z until the user allowed it.
+
+Results: apply `applied` in 166.0 s wall (4 files written, `.gwbk` 3,710,688 bytes, `snapshot/record.json` present, events run_started gwbk_downloaded staged lock_acquired committed lock_verdict scan_done verify_done finalized); **apply lock window (lock_acquired to scan_done) 3.808 s against HOLD_S 176 s**. Rollback by run id `restored` in 125.7 s wall (4 deleted), its lock window 13.232 s against 176 s. `deploy plan` after the rollback equals the first plan (`f7403f25...`), and, inside the test body, the production files equal the pre-run files exactly (one file, `config-mode.json`) with no directory left below `<module>/<type>`. Empty `<module>/<type>` directories may remain after a rollback by design; the test then removes any stray directory itself (`put_back`) before the final check, and the final listing of files and directories equals the pre-run listing (`true`). The test removed its `ign-deploy` tree below the account home. The closing scan completed (0.97 s).
+
+Whole-apply wall time (166 s) is dominated by ssh handshakes (prepare, fingerprint, finalize, `fetch_snapshot` at about 14 to 25 s each on this link, 23-20) and a plan of 32.5 s (read of the scoped collection); the lock is held for 3.8 s of it.
+
+`IGNITION_LIVE_WFLWVM01=1 IGN_WFLWVM01_HOST=... IGN_WFLWVM01_KEY=... IGN_WFLWVM01_PROFILE=azure-win cargo test -p ignition-core --test live_transport_wflwvm01 wflwvm01_cli_apply_rollback -- --ignored --nocapture --test-threads=1` @ 2026-10-18T13:55:52Z
+
+~~~
+running 1 test
+test wflwvm01_cli_apply_rollback ... CAPTURE cli apply and rollback @ 2026-10-18T13:55:57Z
+CAPTURE production before: 1 files, 0 directories: ["config-mode.json"]
+CAPTURE ign deploy plan: exit 0 in 32.5s, summary {"added":0,"changed":2,"drifted":null,"has_changes":true,"removed":0,"same":0,"unmanaged":5}, plan_sha256 f7403f2574495451f1315c5f26ffc4688e21444b956e4322c18bc107ece36b14
+CAPTURE ign deploy apply: exit 0 in 166.0s, outcome "applied", run "20261018T135706Z-bcfdef", written 4, deleted 0, gwbk "20261018T135706Z-bcfdef.gwbk", warnings ["probes: the manifest declares no `verify.tag_probes`; nothing was probed"]
+CAPTURE apply run directory: .gwbk 3710688 bytes, snapshot/record.json present, events ["run_started", "gwbk_downloaded", "staged", "lock_acquired", "committed", "lock_verdict", "scan_done", "verify_done", "finalized"]
+CAPTURE apply lock window (lock_acquired to scan_done): 3.808s against HOLD_S 176s
+CAPTURE production after the apply: 5 files (was 1)
+CAPTURE ign deploy rollback: exit 0 in 125.7s, outcome "restored", run "20261018T140017Z-b08526", restored 0, deleted 4, discarded []
+CAPTURE rollback lock window (lock_acquired to scan_done): 13.232s against HOLD_S 176s; events ["run_started", "lock_acquired", "restore_started", "scan_done", "restored"]
+CAPTURE plan after the rollback: exit 0, plan_sha256 f7403f2574495451f1315c5f26ffc4688e21444b956e4322c18bc107ece36b14
+CAPTURE production listing equals the pre-run listing: true
+CAPTURE closing scan: (0.972923291, 430)
+CAPTURE cleanup: deploy dir gone true
+TIMING wflwvm01_cli_apply_rollback total: 395.18s
+PASS wflwvm01_cli_apply_rollback
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 395.22s
+~~~
